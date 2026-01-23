@@ -81,6 +81,8 @@ spec:
   dataFrom:
     - extract:
         key: /murmur-database
+    - extract:
+        key: /murmur-jwt        
 ---
 apiVersion: v1
 kind: Service
