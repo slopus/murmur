@@ -12,6 +12,8 @@ import { profileRoutes } from './routes/v1/profile';
 import { messageRoutes } from './routes/v1/messages';
 import { preKeyRoutes } from './routes/v1/prekeys';
 import { Fastify } from '@/types';
+import { registerRateLimiting } from './rateLimit';
+import { httpRequestsTotal, httpRequestDuration } from '@/metrics/prometheus';
 
 export async function startApi() {
     // Start API
@@ -20,6 +22,24 @@ export async function startApi() {
 
     app.setValidatorCompiler(validatorCompiler);
     app.setSerializerCompiler(serializerCompiler);
+
+    // Register rate limiting
+    await registerRateLimiting(app);
+
+    // Metrics middleware - track all HTTP requests
+    app.addHook('onRequest', async (request) => {
+        (request as any).startTime = Date.now();
+    });
+
+    app.addHook('onResponse', async (request, reply) => {
+        const duration = (Date.now() - (request as any).startTime) / 1000;
+        const route = request.routeOptions?.url || 'unknown';
+        const method = request.method;
+        const statusCode = reply.statusCode.toString();
+
+        httpRequestsTotal.inc({ method, route, status_code: statusCode });
+        httpRequestDuration.observe({ method, route, status_code: statusCode }, duration);
+    });
 
     app.register(import('@fastify/cors'), {
         origin: '*',

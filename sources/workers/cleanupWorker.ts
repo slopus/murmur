@@ -2,6 +2,7 @@ import { db } from '@/db';
 import { log } from '@/log';
 import { forever } from '@/utils/timing';
 import { getShutdownSignal } from '@/shutdown';
+import { cleanupRunsTotal, messagesExpiredTotal } from '@/metrics/prometheus';
 
 /**
  * Cleanup function that deletes expired messages
@@ -21,9 +22,13 @@ async function cleanup(): Promise<void> {
 
         if (result.count > 0) {
             log(`Cleanup: Deleted ${result.count} expired messages`);
+            messagesExpiredTotal.inc(result.count);
         }
+
+        cleanupRunsTotal.inc({ status: 'success' });
     } catch (error) {
         log(`Error during cleanup: ${error}`);
+        cleanupRunsTotal.inc({ status: 'error' });
         throw error;
     }
 }

@@ -54,6 +54,8 @@ model Message {
     signature   Bytes // Binary NaCl signature of (blob + messageId) by sender's identity key
 
     @@index([recipientId, createdAt])
+    @@index([recipientId, deliveredAt]) // For finding undelivered messages in SSE
+    @@index([recipientId, createdAt, expiresAt]) // For paginated inbox queries
     @@index([expiresAt]) // For cleanup worker
     @@index([senderId])
 }

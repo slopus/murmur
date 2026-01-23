@@ -3,6 +3,9 @@ import type { Fastify } from '@/types';
 import { db } from '@/db';
 import { isValidPublicKey, verifySignature } from '@/utils/crypto';
 import { generateToken, refreshAccessToken } from '@/utils/jwt';
+import { rateLimitConfigs } from '@/api/rateLimit';
+import { registrationsTotal, loginsTotal, tokenRefreshesTotal } from '@/metrics/prometheus';
+import { validateProfileData } from '@/api/validation';
 
 const RegisterSchema = z.object({
     identityPublicKey: z.string(),
@@ -32,6 +35,9 @@ export async function authRoutes(app: Fastify) {
         schema: {
             body: RegisterSchema,
         },
+        config: {
+            rateLimit: rateLimitConfigs.auth,
+        },
     }, async (request, reply) => {
         const {
             identityPublicKey,
@@ -42,18 +48,29 @@ export async function authRoutes(app: Fastify) {
             signature,
         } = request.body;
 
-        // Validate public keys format
-        if (!isValidPublicKey(identityPublicKey)) {
-            return reply.status(400).send({ error: 'Invalid identity public key format' });
-        }
+        try {
+            // Validate public keys format
+            if (!isValidPublicKey(identityPublicKey)) {
+                registrationsTotal.inc({ status: 'invalid_key' });
+                return reply.status(400).send({ error: 'Invalid identity public key format' });
+            }
 
-        if (!isValidPublicKey(profilePublicKey)) {
-            return reply.status(400).send({ error: 'Invalid profile public key format' });
+            if (!isValidPublicKey(profilePublicKey)) {
+                registrationsTotal.inc({ status: 'invalid_key' });
+                return reply.status(400).send({ error: 'Invalid profile public key format' });
+            }
+
+            // Validate size limits
+            validateProfileData({ profilePublicKey, profileKeySignature, encryptedProfile });
+        } catch (error: any) {
+            registrationsTotal.inc({ status: 'validation_failed' });
+            return reply.status(400).send({ error: error.message });
         }
 
         // Verify timestamp is recent (within 5 minutes)
         const now = Date.now();
         if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            registrationsTotal.inc({ status: 'timestamp_expired' });
             return reply.status(400).send({ error: 'Request timestamp too old' });
         }
 
@@ -67,11 +84,13 @@ export async function authRoutes(app: Fastify) {
         });
 
         if (!verifySignature(message, signature, identityPublicKey)) {
+            registrationsTotal.inc({ status: 'invalid_signature' });
             return reply.status(400).send({ error: 'Invalid request signature' });
         }
 
         // Verify profile key signature (profile key signed by identity key)
         if (!verifySignature(profilePublicKey, profileKeySignature, identityPublicKey)) {
+            registrationsTotal.inc({ status: 'invalid_profile_signature' });
             return reply.status(400).send({ error: 'Invalid profile key signature' });
         }
 
@@ -92,6 +111,7 @@ export async function authRoutes(app: Fastify) {
                 Buffer.compare(user.encryptedProfile, encryptedProfileBuffer) === 0
             ) {
                 // Same profile - return success with tokens (idempotent)
+                registrationsTotal.inc({ status: 'idempotent' });
                 const tokens = await generateToken(identityPublicKey);
                 return reply.send({
                     success: true,
@@ -104,6 +124,7 @@ export async function authRoutes(app: Fastify) {
                 });
             } else {
                 // Different profile - this is an update, not a registration
+                registrationsTotal.inc({ status: 'conflict' });
                 return reply.status(400).send({ error: 'User exists with different profile. Use /v1/profile/update to update profile.' });
             }
         }
@@ -122,6 +143,7 @@ export async function authRoutes(app: Fastify) {
         // Generate token pair (access + refresh)
         const tokens = await generateToken(identityPublicKey);
 
+        registrationsTotal.inc({ status: 'success' });
         return reply.send({
             success: true,
             accessToken: tokens.accessToken,
@@ -138,23 +160,29 @@ export async function authRoutes(app: Fastify) {
         schema: {
             body: LoginSchema,
         },
+        config: {
+            rateLimit: rateLimitConfigs.auth,
+        },
     }, async (request, reply) => {
         const { identityPublicKey, timestamp, signature } = request.body;
 
         // Validate public key format
         if (!isValidPublicKey(identityPublicKey)) {
+            loginsTotal.inc({ status: 'invalid_key' });
             return reply.status(400).send({ error: 'Invalid identity public key format' });
         }
 
         // Verify timestamp is recent (within 5 minutes)
         const now = Date.now();
         if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            loginsTotal.inc({ status: 'timestamp_expired' });
             return reply.status(400).send({ error: 'Request timestamp too old' });
         }
 
         // Verify signature
         const message = `${identityPublicKey}:${timestamp}`;
         if (!verifySignature(message, signature, identityPublicKey)) {
+            loginsTotal.inc({ status: 'invalid_signature' });
             return reply.status(400).send({ error: 'Invalid signature' });
         }
 
@@ -164,12 +192,14 @@ export async function authRoutes(app: Fastify) {
         });
 
         if (!user) {
+            loginsTotal.inc({ status: 'user_not_found' });
             return reply.status(404).send({ error: 'User not found' });
         }
 
         // Generate token pair (access + refresh)
         const tokens = await generateToken(identityPublicKey);
 
+        loginsTotal.inc({ status: 'success' });
         return reply.send({
             success: true,
             accessToken: tokens.accessToken,
@@ -186,6 +216,9 @@ export async function authRoutes(app: Fastify) {
         schema: {
             body: RefreshSchema,
         },
+        config: {
+            rateLimit: rateLimitConfigs.auth,
+        },
     }, async (request, reply) => {
         const { refreshToken } = request.body;
 
@@ -193,9 +226,11 @@ export async function authRoutes(app: Fastify) {
         const newAccessToken = await refreshAccessToken(refreshToken);
 
         if (!newAccessToken) {
+            tokenRefreshesTotal.inc({ status: 'invalid_token' });
             return reply.status(401).send({ error: 'Invalid or expired refresh token' });
         }
 
+        tokenRefreshesTotal.inc({ status: 'success' });
         return reply.send({
             success: true,
             accessToken: newAccessToken,

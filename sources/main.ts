@@ -5,6 +5,7 @@ import { log } from './log';
 import { awaitShutdown, onShutdown } from './shutdown';
 import { startCleanupWorker } from './workers/cleanupWorker';
 import { initializeJWT } from './utils/jwt';
+import { startMetricsServer } from './metrics/startMetricsServer';
 
 export async function main() {
     log('Starting Murmur Server...');
@@ -29,6 +30,9 @@ export async function main() {
     startCleanupWorker().catch(err => {
         log(`Cleanup worker error: ${err}`);
     });
+
+    log('Starting metrics server...');
+    await startMetricsServer();
 
     log('Starting API...');
     await startApi();

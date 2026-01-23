@@ -4,6 +4,9 @@ import { db } from '@/db';
 import { getAuthUserId } from '@/api/auth';
 import { isValidPublicKey, verifySignature } from '@/utils/crypto';
 import { events } from '@/events';
+import { rateLimitConfigs } from '@/api/rateLimit';
+import { profileUpdatesTotal } from '@/metrics/prometheus';
+import { validateProfileData } from '@/api/validation';
 
 const UpdateProfileSchema = z.object({
     profilePublicKey: z.string(),
@@ -18,7 +21,11 @@ const UpdateProfileSchema = z.object({
  */
 export async function profileRoutes(app: Fastify) {
     // Get own profile
-    app.get('/v1/profile/me', async (request, reply) => {
+    app.get('/v1/profile/me', {
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
+    }, async (request, reply) => {
         const userId = getAuthUserId(request);
 
         const user = await db.user.findUnique({
@@ -54,6 +61,9 @@ export async function profileRoutes(app: Fastify) {
                 identityPublicKey: z.string(),
             }),
         },
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
     }, async (request, reply) => {
         const { identityPublicKey } = request.params;
 
@@ -86,6 +96,9 @@ export async function profileRoutes(app: Fastify) {
         schema: {
             body: UpdateProfileSchema,
         },
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
         const {
@@ -96,14 +109,24 @@ export async function profileRoutes(app: Fastify) {
             signature,
         } = request.body;
 
+        // Validate size limits
+        try {
+            validateProfileData({ profilePublicKey, profileKeySignature, encryptedProfile });
+        } catch (error: any) {
+            profileUpdatesTotal.inc({ status: 'size_limit_exceeded' });
+            return reply.status(400).send({ error: error.message });
+        }
+
         // Validate profile public key format
         if (!isValidPublicKey(profilePublicKey)) {
+            profileUpdatesTotal.inc({ status: 'invalid_key' });
             return reply.status(400).send({ error: 'Invalid profile public key format' });
         }
 
         // Verify timestamp is recent (within 5 minutes)
         const now = Date.now();
         if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            profileUpdatesTotal.inc({ status: 'timestamp_expired' });
             return reply.status(400).send({ error: 'Request timestamp too old' });
         }
 
@@ -116,11 +139,13 @@ export async function profileRoutes(app: Fastify) {
         });
 
         if (!verifySignature(message, signature, userId)) {
+            profileUpdatesTotal.inc({ status: 'invalid_signature' });
             return reply.status(400).send({ error: 'Invalid request signature' });
         }
 
         // Verify profile key signature (profile key signed by identity key)
         if (!verifySignature(profilePublicKey, profileKeySignature, userId)) {
+            profileUpdatesTotal.inc({ status: 'invalid_profile_signature' });
             return reply.status(400).send({ error: 'Invalid profile key signature' });
         }
 
@@ -138,6 +163,8 @@ export async function profileRoutes(app: Fastify) {
                 profileUpdatedAt: new Date(),
             },
         });
+
+        profileUpdatesTotal.inc({ status: 'success' });
 
         // Publish profile update event
         await events.publishUser(userId, {

@@ -3,6 +3,9 @@ import type { Fastify } from '@/types';
 import { db } from '@/db';
 import { getAuthUserId } from '@/api/auth';
 import { verifySignature } from '@/utils/crypto';
+import { rateLimitConfigs } from '@/api/rateLimit';
+import { preKeysUploadedTotal, preKeysAllocatedTotal } from '@/metrics/prometheus';
+import { validatePreKeyData } from '@/api/validation';
 
 const UploadPreKeysSchema = z.object({
     preKeys: z.array(z.object({
@@ -28,13 +31,27 @@ export async function preKeyRoutes(app: Fastify) {
         schema: {
             body: UploadPreKeysSchema,
         },
+        config: {
+            rateLimit: rateLimitConfigs.preKey,
+        },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
         const { preKeys, timestamp, signature } = request.body;
 
+        // Validate size limits for each prekey
+        try {
+            for (const preKey of preKeys) {
+                validatePreKeyData(preKey);
+            }
+        } catch (error: any) {
+            preKeysUploadedTotal.inc({ status: 'size_limit_exceeded' });
+            return reply.status(400).send({ error: error.message });
+        }
+
         // Verify timestamp is recent (within 5 minutes)
         const now = Date.now();
         if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            preKeysUploadedTotal.inc({ status: 'timestamp_expired' });
             return reply.status(400).send({ error: 'Request timestamp too old' });
         }
 
@@ -45,12 +62,14 @@ export async function preKeyRoutes(app: Fastify) {
         });
 
         if (!verifySignature(message, signature, userId)) {
+            preKeysUploadedTotal.inc({ status: 'invalid_signature' });
             return reply.status(400).send({ error: 'Invalid request signature' });
         }
 
         // Verify each prekey signature
         for (const preKey of preKeys) {
             if (!verifySignature(preKey.publicKey, preKey.signature, userId)) {
+                preKeysUploadedTotal.inc({ status: 'invalid_prekey_signature' });
                 return reply.status(400).send({
                     error: `Invalid signature for prekey ${preKey.publicKey.substring(0, 8)}...`
                 });
@@ -67,6 +86,8 @@ export async function preKeyRoutes(app: Fastify) {
             })),
         });
 
+        preKeysUploadedTotal.inc({ status: 'success' }, created.count);
+
         return reply.send({
             success: true,
             uploaded: created.count,
@@ -79,6 +100,9 @@ export async function preKeyRoutes(app: Fastify) {
             params: z.object({
                 identityPublicKey: z.string(),
             }),
+        },
+        config: {
+            rateLimit: rateLimitConfigs.preKey,
         },
     }, async (request, reply) => {
         const requesterId = getAuthUserId(request);
@@ -110,6 +134,7 @@ export async function preKeyRoutes(app: Fastify) {
                     allocatedAt: new Date(),
                 },
             });
+            preKeysAllocatedTotal.inc({ type: 'signed' });
         }
 
         // Get one-time prekey (not yet allocated)
@@ -131,6 +156,7 @@ export async function preKeyRoutes(app: Fastify) {
                     allocatedAt: new Date(),
                 },
             });
+            preKeysAllocatedTotal.inc({ type: 'onetime' });
         }
 
         return reply.send({
@@ -148,7 +174,11 @@ export async function preKeyRoutes(app: Fastify) {
     });
 
     // Get count of remaining unallocated one-time prekeys
-    app.get('/v1/prekeys/onetime/count', async (request, reply) => {
+    app.get('/v1/prekeys/onetime/count', {
+        config: {
+            rateLimit: rateLimitConfigs.preKey,
+        },
+    }, async (request, reply) => {
         const userId = getAuthUserId(request);
 
         const count = await db.preKey.count({

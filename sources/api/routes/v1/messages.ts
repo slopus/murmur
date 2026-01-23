@@ -5,6 +5,9 @@ import { getAuthUserId } from '@/api/auth';
 import { verifySignature } from '@/utils/crypto';
 import { events } from '@/events';
 import { sseManager, SSEConnection } from '@/api/sse';
+import { rateLimitConfigs } from '@/api/rateLimit';
+import { messagesSentTotal, messagesDeliveredTotal, messagesAcknowledgedTotal, messageSize, sseActiveConnections } from '@/metrics/prometheus';
+import { validateMessageData } from '@/api/validation';
 
 // Dynamic import for cuid2
 async function validateCuid(id: string): Promise<boolean> {
@@ -32,13 +35,25 @@ export async function messageRoutes(app: Fastify) {
         schema: {
             body: SendMessageSchema,
         },
+        config: {
+            rateLimit: rateLimitConfigs.messageSend,
+        },
     }, async (request, reply) => {
         const senderId = getAuthUserId(request);
         const { messageId, recipientId, blob, signature } = request.body;
 
+        // Validate size limits
+        try {
+            validateMessageData({ messageId, blob, signature, recipientId });
+        } catch (error: any) {
+            messagesSentTotal.inc({ status: 'size_limit_exceeded' });
+            return reply.status(400).send({ error: error.message });
+        }
+
         // Validate message ID is a valid cuid2
         const isValidCuid = await validateCuid(messageId);
         if (!isValidCuid) {
+            messagesSentTotal.inc({ status: 'invalid_message_id' });
             return reply.status(400).send({ error: 'Invalid message ID format (must be cuid2)' });
         }
 
@@ -48,6 +63,7 @@ export async function messageRoutes(app: Fastify) {
         });
 
         if (existingMessage) {
+            messagesSentTotal.inc({ status: 'duplicate_message_id' });
             return reply.status(409).send({ error: 'Message ID already exists (duplicate message)' });
         }
 
@@ -57,6 +73,7 @@ export async function messageRoutes(app: Fastify) {
         });
 
         if (!recipient) {
+            messagesSentTotal.inc({ status: 'recipient_not_found' });
             return reply.status(404).send({ error: 'Recipient not found' });
         }
 
@@ -67,6 +84,7 @@ export async function messageRoutes(app: Fastify) {
         // Verify signature (blob + messageId concatenated, signed by sender's identity key)
         const messageToSign = blob + messageId;
         if (!verifySignature(messageToSign, signature, senderId)) {
+            messagesSentTotal.inc({ status: 'invalid_signature' });
             return reply.status(400).send({ error: 'Invalid message signature' });
         }
 
@@ -85,6 +103,10 @@ export async function messageRoutes(app: Fastify) {
                 expiresAt,
             },
         });
+
+        // Track message size and count
+        messageSize.observe(blobBuffer.length);
+        messagesSentTotal.inc({ status: 'success' });
 
         // Publish message event to notify recipient
         await events.publishUser(recipientId, {
@@ -117,6 +139,9 @@ export async function messageRoutes(app: Fastify) {
                 }),
                 cursor: z.string().optional(),
             }),
+        },
+        config: {
+            rateLimit: rateLimitConfigs.messageFetch,
         },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
@@ -195,6 +220,9 @@ export async function messageRoutes(app: Fastify) {
                 messageId: z.string(),
             }),
         },
+        config: {
+            rateLimit: rateLimitConfigs.messageFetch,
+        },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
         const { messageId } = request.params;
@@ -228,6 +256,7 @@ export async function messageRoutes(app: Fastify) {
                 where: { id: messageId },
                 data: { deliveredAt: new Date() },
             });
+            messagesDeliveredTotal.inc();
         }
 
         return reply.send({
@@ -244,6 +273,9 @@ export async function messageRoutes(app: Fastify) {
     app.post('/v1/messages/ack', {
         schema: {
             body: AckMessagesSchema,
+        },
+        config: {
+            rateLimit: rateLimitConfigs.messageFetch,
         },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
@@ -275,6 +307,7 @@ export async function messageRoutes(app: Fastify) {
                 });
 
                 acknowledged++;
+                messagesAcknowledgedTotal.inc();
             } catch (error) {
                 failed.push({ messageId, error: 'Failed to acknowledge' });
             }
@@ -313,6 +346,7 @@ export async function messageRoutes(app: Fastify) {
 
         const connection = new SSEConnection(reply);
         sseManager.addConnection(userId, connection);
+        sseActiveConnections.inc();
 
         // Send initial connected event
         connection.send('connected', {
@@ -340,6 +374,7 @@ export async function messageRoutes(app: Fastify) {
         request.raw.on('close', () => {
             clearInterval(heartbeatInterval);
             connection.close();
+            sseActiveConnections.dec();
         });
     });
 }
