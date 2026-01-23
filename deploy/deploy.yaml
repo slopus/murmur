@@ -16,12 +16,17 @@ spec:
     metadata:
       labels:
         app: murmur-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
     spec:
       containers:
       - name: murmur-server
         image: docker.korshakov.com/murmur-server:{version}
         ports:
         - containerPort: 3000
+        - containerPort: 9090
         env:
         - name: NODE_ENV
           value: production
@@ -34,16 +39,16 @@ spec:
             name: murmur-server-secrets
         livenessProbe:
           httpGet:
-            path: /health
-            port: 3000
+            path: /liveness
+            port: 9090
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
         readinessProbe:
           httpGet:
-            path: /health
-            port: 3000
+            path: /readiness
+            port: 9090
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 3
