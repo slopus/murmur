@@ -55,6 +55,7 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": ">=20",
     "@types/react": "^19.2.9",
+    "ink-testing-library": "^4.0.0",
     "pkgroll": "^2.14.2",
     "shx": "^0.3.3",
     "tsx": "^4.20.6",
