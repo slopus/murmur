@@ -40,8 +40,8 @@ export async function profileRoutes(app: Fastify) {
         return reply.send({
             id: user.id,
             profilePublicKey: user.profilePublicKey,
-            profileKeySignature: user.profileKeySignature.toString('base64'),
-            encryptedProfile: user.encryptedProfile.toString('base64'),
+            profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
+            encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
             profileUpdatedAt: user.profileUpdatedAt.getTime(),
             createdAt: user.createdAt.getTime(),
         });
@@ -75,8 +75,8 @@ export async function profileRoutes(app: Fastify) {
         return reply.send({
             id: user.id,
             profilePublicKey: user.profilePublicKey,
-            profileKeySignature: user.profileKeySignature.toString('base64'),
-            encryptedProfile: user.encryptedProfile.toString('base64'),
+            profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
+            encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
             profileUpdatedAt: user.profileUpdatedAt.getTime(),
         });
     });

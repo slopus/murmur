@@ -180,8 +180,8 @@ export async function messageRoutes(app: Fastify) {
         const formattedMessages = returnMessages.map(m => ({
             id: m.id,
             senderId: m.senderId,
-            blob: m.blob.toString('base64'),
-            signature: m.signature.toString('base64'),
+            blob: Buffer.from(m.blob).toString('base64'),
+            signature: Buffer.from(m.signature).toString('base64'),
             createdAt: m.createdAt.getTime(),
             expiresAt: m.expiresAt.getTime(),
         }));

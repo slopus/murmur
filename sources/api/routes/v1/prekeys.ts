@@ -137,12 +137,12 @@ export async function preKeyRoutes(app: Fastify) {
             identityKey: identityPublicKey,
             signedPreKey: {
                 publicKey: signedPreKey.publicKey,
-                signature: signedPreKey.signature.toString('base64'),
+                signature: Buffer.from(signedPreKey.signature).toString('base64'),
                 createdAt: signedPreKey.createdAt.getTime(),
             },
             oneTimePreKey: oneTimePreKey ? {
                 publicKey: oneTimePreKey.publicKey,
-                signature: oneTimePreKey.signature.toString('base64'),
+                signature: Buffer.from(oneTimePreKey.signature).toString('base64'),
             } : null,
         });
     });

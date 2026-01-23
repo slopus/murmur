@@ -88,8 +88,8 @@ export async function authRoutes(app: Fastify) {
             // User exists - verify the profile matches (idempotent)
             if (
                 user.profilePublicKey === profilePublicKey &&
-                user.profileKeySignature.equals(profileKeySignatureBuffer) &&
-                user.encryptedProfile.equals(encryptedProfileBuffer)
+                Buffer.compare(user.profileKeySignature, profileKeySignatureBuffer) === 0 &&
+                Buffer.compare(user.encryptedProfile, encryptedProfileBuffer) === 0
             ) {
                 // Same profile - return success with tokens (idempotent)
                 const tokens = await generateToken(identityPublicKey);
