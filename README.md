@@ -95,7 +95,8 @@ All requests must be signed with Ed25519. See **[API.md](API.md)** for complete 
 **Messages:**
 - `POST /v1/messages/send` - Send encrypted blob
 - `GET /v1/messages/inbox` - Retrieve messages (cursor pagination, oldest first)
-- `GET /v1/messages/stream` - SSE stream for real-time delivery
+- `GET /v1/messages/:id` - Get specific message by ID
+- `GET /v1/messages/stream` - SSE stream (includes undelivered message IDs on connect)
 - `POST /v1/messages/ack` - Acknowledge (delete) messages
 
 **Profiles:**

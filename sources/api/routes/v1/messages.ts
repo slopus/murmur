@@ -193,7 +193,7 @@ export async function messageRoutes(app: Fastify) {
         });
     });
 
-    // Get a specific message
+    // Get a specific message by ID
     app.get('/v1/messages/:messageId', {
         schema: {
             params: z.object({
@@ -206,6 +206,16 @@ export async function messageRoutes(app: Fastify) {
 
         const message = await db.message.findUnique({
             where: { id: messageId },
+            select: {
+                id: true,
+                senderId: true,
+                recipientId: true,
+                blob: true,
+                signature: true,
+                createdAt: true,
+                expiresAt: true,
+                deliveredAt: true,
+            },
         });
 
         if (!message) {
@@ -225,7 +235,14 @@ export async function messageRoutes(app: Fastify) {
             });
         }
 
-        return reply.send({ message });
+        return reply.send({
+            id: message.id,
+            senderId: message.senderId,
+            blob: Buffer.from(message.blob).toString('base64'),
+            signature: Buffer.from(message.signature).toString('base64'),
+            createdAt: message.createdAt.getTime(),
+            expiresAt: message.expiresAt.getTime(),
+        });
     });
 
     // Acknowledge (delete) messages in batch
@@ -282,11 +299,32 @@ export async function messageRoutes(app: Fastify) {
     app.get('/v1/messages/stream', async (request, reply) => {
         const userId = getAuthUserId(request);
 
+        // Get all undelivered message IDs
+        const undeliveredMessages = await db.message.findMany({
+            where: {
+                recipientId: userId,
+                deliveredAt: null,
+                expiresAt: {
+                    gt: new Date(), // Only non-expired messages
+                },
+            },
+            select: {
+                id: true,
+            },
+            orderBy: {
+                createdAt: 'asc', // Oldest first
+            },
+        });
+
         const connection = new SSEConnection(reply);
         sseManager.addConnection(userId, connection);
 
-        // Send initial connected event
-        connection.send('connected', { userId, timestamp: Date.now() });
+        // Send initial connected event with undelivered message IDs
+        connection.send('connected', {
+            userId,
+            timestamp: Date.now(),
+            undeliveredMessageIds: undeliveredMessages.map(m => m.id),
+        });
 
         // Send heartbeat every 30 seconds
         const heartbeatInterval = setInterval(() => {

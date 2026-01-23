@@ -259,6 +259,13 @@ Authorization: Bearer <accessToken>
 
 **Event Types:**
 
+**Connected Event (sent immediately on connection):**
+```
+event: connected
+data: {"userId":"user-public-key","timestamp":1737500000000,"undeliveredMessageIds":["msg-id-1","msg-id-2","msg-id-3"]}
+
+```
+
 **Message Event:**
 ```
 event: message
@@ -274,16 +281,56 @@ data: {"timestamp":1737500000000}
 ```
 
 **Connection Behavior:**
+- Initial `connected` event includes all undelivered message IDs
+- New messages delivered in real-time as `message` events
 - Ping sent every 30 seconds to keep connection alive
 - Connection closes after 5 minutes of inactivity
 - Client should reconnect on disconnect
-- Messages delivered in real-time as they arrive
 
 **Notes:**
+- Use `undeliveredMessageIds` to fetch messages via `GET /v1/messages/:messageId`
 - Messages are NOT acknowledged when streamed
 - Messages remain in database until acknowledged with `/v1/messages/ack`
 - Use for live notifications, poll `/inbox` for reliability
 - All timestamps in millisecond precision
+
+---
+
+### Get Message by ID
+
+Retrieve a specific message by its ID.
+
+**Endpoint:** `GET /v1/messages/:messageId`
+
+**Headers:**
+```
+Authorization: Bearer <accessToken>
+```
+
+**URL Parameters:**
+- `messageId` - The cuid2 ID of the message
+
+**Response (200):**
+```json
+{
+  "id": "cuid2-message-id",
+  "senderId": "sender-identity-public-key",
+  "blob": "base64-encrypted-content",
+  "signature": "base64-message-signature",
+  "createdAt": 1737500000000,
+  "expiresAt": 1740092000000
+}
+```
+
+**Error Responses:**
+- `404` - Message not found
+- `403` - Not authorized (you can only read your own received messages)
+
+**Notes:**
+- Automatically marks message as delivered on first fetch
+- Use this endpoint to fetch messages from `undeliveredMessageIds` in SSE `connected` event
+- Returns message with base64-encoded blob and signature
+- Only recipients can fetch their messages
 
 ---
 
