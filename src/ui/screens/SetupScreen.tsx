@@ -7,6 +7,7 @@
 import React, { useState, useCallback } from 'react'
 import { Box, Text, useInput } from 'ink'
 import { TextInput } from '../components/TextInput.js'
+import { Spinner } from '../components/Spinner.js'
 import { useInput as useTextInput } from '../hooks/useInput.js'
 
 export interface SetupScreenProps {
@@ -68,8 +69,11 @@ export function SetupScreen({ step, error, onSubmit }: SetupScreenProps) {
                 height="100%"
             >
                 <Text bold color="cyan">Setting up your account...</Text>
+                <Box marginTop={2}>
+                    <Spinner label="Generating encryption keys" />
+                </Box>
                 <Box marginTop={1}>
-                    <Text color="gray">Generating encryption keys</Text>
+                    <Text color="gray">Creating secure identity</Text>
                 </Box>
                 <Box marginTop={1}>
                     <Text color="gray">Registering with server</Text>

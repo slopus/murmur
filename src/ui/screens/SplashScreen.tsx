@@ -4,6 +4,7 @@
 
 import React from 'react'
 import { Box, Text } from 'ink'
+import { Spinner } from '../components/Spinner.js'
 
 const LOGO = `
 ╔══════════════════════════════════════╗
@@ -36,7 +37,7 @@ export function SplashScreen() {
                 {LOGO}
             </Text>
             <Box marginTop={2}>
-                <Text color="gray">Loading...</Text>
+                <Spinner label="Loading..." />
             </Box>
         </Box>
     )
