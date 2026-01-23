@@ -91,6 +91,12 @@ export function ChatScreen({
             return
         }
 
+        // Ctrl+P for profile
+        if (key.ctrl && input === 'p') {
+            onNavigate({ type: 'profile' })
+            return
+        }
+
         // Handle panel-specific input
         switch (focusPanel) {
             case 'contacts':
@@ -152,7 +158,7 @@ export function ChatScreen({
                     {account.lastName ? ` ${account.lastName}` : ''}
                 </Text>
                 <Text color="gray">
-                    Tab: switch | Esc: back | Ctrl+N: add contact | Ctrl+C: quit
+                    Tab: switch | Esc: back | Ctrl+N: add | Ctrl+P: profile | Ctrl+C: quit
                 </Text>
             </Box>
 

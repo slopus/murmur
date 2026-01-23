@@ -20,6 +20,7 @@ export type Screen =
     | { type: 'chat_list' }
     | { type: 'conversation'; contactId: string }
     | { type: 'add_contact' }
+    | { type: 'profile' }
 
 /**
  * Application state.

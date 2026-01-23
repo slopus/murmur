@@ -12,6 +12,7 @@ import { SplashScreen } from './screens/SplashScreen.js'
 import { SetupScreen } from './screens/SetupScreen.js'
 import { ChatScreen } from './screens/ChatScreen.js'
 import { AddContactScreen } from './screens/AddContactScreen.js'
+import { ProfileScreen } from './screens/ProfileScreen.js'
 
 export interface AppProps {
     engine: MurmurEngine
@@ -88,6 +89,19 @@ export function App({ engine }: AppProps) {
                     onNavigate={navigate}
                 />
             )
+            break
+
+        case 'profile':
+            if (!state.account) {
+                screen = <SplashScreen />
+            } else {
+                screen = (
+                    <ProfileScreen
+                        account={state.account}
+                        onNavigate={navigate}
+                    />
+                )
+            }
             break
 
         default:

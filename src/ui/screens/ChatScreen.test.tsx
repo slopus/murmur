@@ -235,6 +235,7 @@ describe('ChatScreen', () => {
         expect(output).toContain('Tab')
         expect(output).toContain('Esc')
         expect(output).toContain('Ctrl+N')
+        expect(output).toContain('Ctrl+P')
         expect(output).toContain('Ctrl+C')
     })
 })
