@@ -56,6 +56,18 @@ export interface ServerProfile {
 }
 
 /**
+ * Prekey bundle from the server.
+ */
+export interface ServerPreKeyBundle {
+    identityKey: string
+    signedPreKey: string
+    signedPreKeyId: number
+    signedPreKeySignature: string
+    oneTimePreKey?: string
+    oneTimePreKeyId?: number
+}
+
+/**
  * Murmur API client.
  * Handles all communication with the server including authentication.
  */
@@ -342,5 +354,43 @@ export class MurmurApi {
             ...requestBody,
             signature
         })
+    }
+
+    /**
+     * Upload prekey bundle.
+     */
+    async uploadPreKeyBundle(
+        identityKey: string,
+        signedPreKey: string,
+        signedPreKeyId: number,
+        signedPreKeySignature: string,
+        oneTimePreKeys: Array<{ id: number; key: string }>
+    ): Promise<void> {
+        const timestamp = Date.now()
+
+        const requestBody = {
+            identityKey,
+            signedPreKey,
+            signedPreKeyId,
+            signedPreKeySignature,
+            oneTimePreKeys,
+            timestamp
+        }
+        const signature = this.sign(JSON.stringify(requestBody))
+
+        await this.request<{ success: boolean }>('POST', '/v1/keys/upload', {
+            ...requestBody,
+            signature
+        })
+    }
+
+    /**
+     * Get prekey bundle for another user.
+     */
+    async getPreKeyBundle(identityPublicKey: string): Promise<ServerPreKeyBundle> {
+        return this.request<ServerPreKeyBundle>(
+            'GET',
+            `/v1/keys/${encodeURIComponent(identityPublicKey)}`
+        )
     }
 }

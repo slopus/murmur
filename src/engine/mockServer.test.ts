@@ -244,6 +244,78 @@ describe('MockServer', () => {
             expect(profile.encryptedProfile).toBe('new-encrypted-profile')
         })
     })
+
+    describe('Prekey Bundles', () => {
+        let aliceToken: string
+        let bobToken: string
+
+        beforeEach(() => {
+            const aliceResult = server.register('alice-id', 'ppk', 'sig', 'ep')
+            aliceToken = aliceResult.tokens.accessToken
+
+            const bobResult = server.register('bob-id', 'ppk', 'sig', 'ep')
+            bobToken = bobResult.tokens.accessToken
+        })
+
+        it('should upload prekey bundle', () => {
+            server.uploadPreKeyBundle(
+                aliceToken,
+                'alice-identity-key',
+                'signed-prekey',
+                1,
+                'spk-signature',
+                [
+                    { id: 1, key: 'otpk-1' },
+                    { id: 2, key: 'otpk-2' }
+                ]
+            )
+
+            // Should be able to fetch the bundle
+            const bundle = server.getPreKeyBundle(bobToken, 'alice-id')
+            expect(bundle.identityKey).toBe('alice-identity-key')
+            expect(bundle.signedPreKey).toBe('signed-prekey')
+            expect(bundle.signedPreKeyId).toBe(1)
+            expect(bundle.signedPreKeySignature).toBe('spk-signature')
+        })
+
+        it('should consume one-time prekeys on fetch', () => {
+            server.uploadPreKeyBundle(
+                aliceToken,
+                'alice-identity-key',
+                'signed-prekey',
+                1,
+                'spk-signature',
+                [
+                    { id: 1, key: 'otpk-1' },
+                    { id: 2, key: 'otpk-2' }
+                ]
+            )
+
+            // First fetch gets first one-time prekey
+            const bundle1 = server.getPreKeyBundle(bobToken, 'alice-id')
+            expect(bundle1.oneTimePreKey).toBe('otpk-1')
+            expect(bundle1.oneTimePreKeyId).toBe(1)
+
+            // Second fetch gets second one-time prekey
+            const bundle2 = server.getPreKeyBundle(bobToken, 'alice-id')
+            expect(bundle2.oneTimePreKey).toBe('otpk-2')
+            expect(bundle2.oneTimePreKeyId).toBe(2)
+
+            // Third fetch has no one-time prekeys left
+            const bundle3 = server.getPreKeyBundle(bobToken, 'alice-id')
+            expect(bundle3.oneTimePreKey).toBeUndefined()
+            expect(bundle3.oneTimePreKeyId).toBeUndefined()
+            expect(bundle3.signedPreKey).toBe('signed-prekey')
+        })
+
+        it('should fail to get bundle for user without bundle', () => {
+            expect(() => server.getPreKeyBundle(aliceToken, 'bob-id')).toThrow('No prekey bundle available')
+        })
+
+        it('should fail to get bundle for non-existent user', () => {
+            expect(() => server.getPreKeyBundle(aliceToken, 'nonexistent')).toThrow('User not found')
+        })
+    })
 })
 
 describe('createMockApi', () => {
@@ -293,5 +365,31 @@ describe('createMockApi', () => {
 
         const inbox2 = await bobApi.getInbox()
         expect(inbox2.messages).toHaveLength(0)
+    })
+
+    it('should upload and fetch prekey bundle via mock API', async () => {
+        await api.register('alice-id', new Uint8Array(32), 'ppk', 'sig', 'ep')
+
+        const bobApi = createMockApi(server)
+        await bobApi.register('bob-id', new Uint8Array(32), 'ppk', 'sig', 'ep')
+
+        // Alice uploads her prekey bundle
+        await api.uploadPreKeyBundle(
+            'alice-identity-key',
+            'signed-prekey',
+            1,
+            'spk-sig',
+            [
+                { id: 1, key: 'otpk-1' },
+                { id: 2, key: 'otpk-2' }
+            ]
+        )
+
+        // Bob fetches Alice's prekey bundle
+        const bundle = await bobApi.getPreKeyBundle('alice-id')
+        expect(bundle.identityKey).toBe('alice-identity-key')
+        expect(bundle.signedPreKey).toBe('signed-prekey')
+        expect(bundle.oneTimePreKey).toBe('otpk-1')
+        expect(bundle.oneTimePreKeyId).toBe(1)
     })
 })

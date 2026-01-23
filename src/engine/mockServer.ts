@@ -8,6 +8,17 @@ import { createId } from '@paralleldrive/cuid2'
 import type { InboxMessage, ServerProfile, AuthTokens } from './api.js'
 
 /**
+ * Prekey bundle stored in mock server.
+ */
+interface MockPreKeyBundle {
+    identityKey: string
+    signedPreKey: string
+    signedPreKeyId: number
+    signedPreKeySignature: string
+    oneTimePreKeys: Array<{ id: number; key: string }>
+}
+
+/**
  * User stored in mock server.
  */
 interface MockUser {
@@ -17,6 +28,7 @@ interface MockUser {
     encryptedProfile: string
     createdAt: number
     refreshToken: string
+    preKeyBundle?: MockPreKeyBundle
 }
 
 /**
@@ -330,6 +342,76 @@ export class MockServer {
     }
 
     /**
+     * Upload prekey bundle.
+     */
+    uploadPreKeyBundle(
+        accessToken: string,
+        identityKey: string,
+        signedPreKey: string,
+        signedPreKeyId: number,
+        signedPreKeySignature: string,
+        oneTimePreKeys: Array<{ id: number; key: string }>
+    ): void {
+        const userId = this.verifyToken(accessToken)
+        const user = this.users.get(userId)!
+
+        user.preKeyBundle = {
+            identityKey,
+            signedPreKey,
+            signedPreKeyId,
+            signedPreKeySignature,
+            oneTimePreKeys: [...oneTimePreKeys]
+        }
+    }
+
+    /**
+     * Get prekey bundle for a user.
+     * Consumes one one-time prekey if available.
+     */
+    getPreKeyBundle(
+        accessToken: string,
+        identityPublicKey: string
+    ): {
+        identityKey: string
+        signedPreKey: string
+        signedPreKeyId: number
+        signedPreKeySignature: string
+        oneTimePreKey?: string
+        oneTimePreKeyId?: number
+    } {
+        this.verifyToken(accessToken)
+
+        const user = this.users.get(identityPublicKey)
+        if (!user) {
+            throw new Error('User not found')
+        }
+
+        if (!user.preKeyBundle) {
+            throw new Error('No prekey bundle available')
+        }
+
+        const bundle = user.preKeyBundle
+        let oneTimePreKey: string | undefined
+        let oneTimePreKeyId: number | undefined
+
+        // Consume one one-time prekey if available
+        if (bundle.oneTimePreKeys.length > 0) {
+            const otpk = bundle.oneTimePreKeys.shift()!
+            oneTimePreKey = otpk.key
+            oneTimePreKeyId = otpk.id
+        }
+
+        return {
+            identityKey: bundle.identityKey,
+            signedPreKey: bundle.signedPreKey,
+            signedPreKeyId: bundle.signedPreKeyId,
+            signedPreKeySignature: bundle.signedPreKeySignature,
+            oneTimePreKey,
+            oneTimePreKeyId
+        }
+    }
+
+    /**
      * Clear all data.
      */
     reset(): void {
@@ -427,6 +509,29 @@ export function createMockApi(server: MockServer) {
         ) {
             if (!accessToken) throw new Error('Not authenticated')
             server.updateProfile(accessToken, profilePublicKey, profileKeySignature, encryptedProfile)
+        },
+
+        async uploadPreKeyBundle(
+            identityKey: string,
+            signedPreKey: string,
+            signedPreKeyId: number,
+            signedPreKeySignature: string,
+            oneTimePreKeys: Array<{ id: number; key: string }>
+        ) {
+            if (!accessToken) throw new Error('Not authenticated')
+            server.uploadPreKeyBundle(
+                accessToken,
+                identityKey,
+                signedPreKey,
+                signedPreKeyId,
+                signedPreKeySignature,
+                oneTimePreKeys
+            )
+        },
+
+        async getPreKeyBundle(identityPublicKey: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.getPreKeyBundle(accessToken, identityPublicKey)
         },
 
         getTokens() {

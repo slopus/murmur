@@ -24,9 +24,11 @@ import {
     serializeAgent,
     deserializeAgent,
     prepareOutgoingMessage,
-    processIncomingMessage
+    processIncomingMessage,
+    getOneTimePreKeyCount
 } from '../encryption/session/session.js'
 import type { AgentState, SessionInitMessage, ProtocolMessage } from '../encryption/session/types.js'
+import type { PreKeyBundle } from '../encryption/x3dh/types.js'
 import {
     encodeBase64,
     decodeBase64,
@@ -168,6 +170,9 @@ export class MurmurEngine {
             encryptedProfile
         )
 
+        // Upload prekey bundle to server
+        await this.uploadPreKeyBundle()
+
         // Create account object
         this.account = {
             identityKey,
@@ -184,6 +189,34 @@ export class MurmurEngine {
         this.db.saveAgentState(serializeAgent(this.agent))
 
         return this.account
+    }
+
+    /**
+     * Upload prekey bundle to server.
+     */
+    private async uploadPreKeyBundle(): Promise<void> {
+        if (!this.agent) {
+            throw new Error('Not initialized')
+        }
+
+        const bundle = getPreKeyBundle(this.agent, false)
+
+        // Convert one-time prekeys to array for upload
+        const oneTimePreKeys: Array<{ id: number; key: string }> = []
+        for (const [id, otpk] of this.agent.keyStore.oneTimePreKeys) {
+            oneTimePreKeys.push({
+                id,
+                key: encodeBase64(otpk.keyPair.publicKey)
+            })
+        }
+
+        await this.api.uploadPreKeyBundle(
+            encodeBase64(bundle.identityKey),
+            encodeBase64(bundle.signedPreKey),
+            bundle.signedPreKeyId,
+            encodeBase64(bundle.signedPreKeySignature),
+            oneTimePreKeys
+        )
     }
 
     /**
@@ -224,11 +257,19 @@ export class MurmurEngine {
 
     /**
      * Add a contact by their identity key.
-     * This fetches their profile from the server.
+     * This fetches their profile and prekey bundle from the server,
+     * and establishes an X3DH session for messaging.
      */
     async addContact(identityKey: string): Promise<Contact> {
+        if (!this.agent) {
+            throw new Error('Not initialized')
+        }
+
         // Fetch profile from server
         const serverProfile = await this.api.getProfile(identityKey)
+
+        // Fetch prekey bundle and establish session
+        await this.establishSession(identityKey)
 
         // For simplicity, we'll store a placeholder profile
         // In a real app, we'd need a key exchange to decrypt their profile
@@ -245,6 +286,9 @@ export class MurmurEngine {
 
         this.db.saveContact(storedContact)
 
+        // Save agent state after session establishment
+        this.db.saveAgentState(serializeAgent(this.agent))
+
         const contact: Contact = {
             ...profile,
             identityKey,
@@ -255,6 +299,37 @@ export class MurmurEngine {
 
         this.emit({ type: 'contact_added', contact })
         return contact
+    }
+
+    /**
+     * Establish a session with a peer by fetching their prekey bundle.
+     */
+    private async establishSession(peerIdentityKey: string): Promise<void> {
+        if (!this.agent) {
+            throw new Error('Not initialized')
+        }
+
+        // Skip if session already exists
+        if (hasSession(this.agent, peerIdentityKey)) {
+            return
+        }
+
+        // Fetch prekey bundle from server
+        const serverBundle = await this.api.getPreKeyBundle(peerIdentityKey)
+
+        // Convert to protocol PreKeyBundle
+        const bundle: PreKeyBundle = {
+            identityKey: decodeBase64(serverBundle.identityKey),
+            signedPreKey: decodeBase64(serverBundle.signedPreKey),
+            signedPreKeyId: serverBundle.signedPreKeyId,
+            signedPreKeySignature: decodeBase64(serverBundle.signedPreKeySignature),
+            oneTimePreKey: serverBundle.oneTimePreKey ? decodeBase64(serverBundle.oneTimePreKey) : undefined,
+            oneTimePreKeyId: serverBundle.oneTimePreKeyId
+        }
+
+        // Initiate session with a placeholder message (we'll send real message later)
+        // The first actual message will use the established session
+        initiateSession(this.agent, bundle, stringToBytes('session_init'))
     }
 
     /**
@@ -348,9 +423,8 @@ export class MurmurEngine {
 
         // Ensure we have a session with the recipient
         if (!hasSession(this.agent, recipientIdentityKey)) {
-            // Fetch their prekey bundle and initiate session
-            // For now, we'll throw - in real app, we'd fetch from server
-            throw new Error('No session with recipient. Session must be established first.')
+            // Establish session first
+            await this.establishSession(recipientIdentityKey)
         }
 
         // Encrypt the message

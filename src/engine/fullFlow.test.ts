@@ -6,7 +6,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
-import { MockServer } from './mockServer.js'
+import { MockServer, createMockApi } from './mockServer.js'
 import {
     createAgent,
     getIdentityKey,
@@ -20,11 +20,13 @@ import {
 } from '../encryption/session/session.js'
 import {
     encodeBase64,
+    decodeBase64,
     stringToBytes,
     bytesToString
 } from '../encryption/crypto/utils.js'
 import { sign } from '../encryption/crypto/signing.js'
 import { createProfileForRegistration, type Profile } from './profile.js'
+import type { PreKeyBundle } from '../encryption/x3dh/types.js'
 
 describe('Full end-to-end encrypted messaging flow', () => {
     let server: MockServer
@@ -344,5 +346,134 @@ describe('Full end-to-end encrypted messaging flow', () => {
             bobInbox2.messages[0].signature
         )
         expect(bytesToString(dec.plaintext)).toBe('Message after restart')
+    })
+
+    it('should establish session via server prekey bundle fetch', async () => {
+        // This tests the full flow including prekey bundle upload and fetch via server
+        // Uses direct server calls (not mock API) to verify signatures properly
+
+        // === BOB SETUP (recipient) ===
+        const bobAgent = createAgent(10)
+        const bobIdentity = getIdentityKey(bobAgent)
+        const bobBundle = getPreKeyBundle(bobAgent, false)
+
+        const bobProfile = createProfileForRegistration(
+            { firstName: 'Bob' },
+            bobAgent.keyStore.identityKeyPair.privateKey
+        )
+
+        const bobAuth = server.register(
+            bobIdentity,
+            bobProfile.profilePublicKey,
+            bobProfile.profileKeySignature,
+            bobProfile.encryptedProfile
+        )
+        const bobToken = bobAuth.tokens.accessToken
+
+        // Bob uploads his prekey bundle
+        const oneTimePreKeys: Array<{ id: number; key: string }> = []
+        for (const [id, otpk] of bobAgent.keyStore.oneTimePreKeys) {
+            oneTimePreKeys.push({
+                id,
+                key: encodeBase64(otpk.keyPair.publicKey)
+            })
+        }
+
+        server.uploadPreKeyBundle(
+            bobToken,
+            encodeBase64(bobBundle.identityKey),
+            encodeBase64(bobBundle.signedPreKey),
+            bobBundle.signedPreKeyId,
+            encodeBase64(bobBundle.signedPreKeySignature),
+            oneTimePreKeys
+        )
+
+        // === ALICE SETUP (initiator) ===
+        const aliceAgent = createAgent(10)
+        const aliceIdentity = getIdentityKey(aliceAgent)
+
+        const aliceProfile = createProfileForRegistration(
+            { firstName: 'Alice' },
+            aliceAgent.keyStore.identityKeyPair.privateKey
+        )
+
+        const aliceAuth = server.register(
+            aliceIdentity,
+            aliceProfile.profilePublicKey,
+            aliceProfile.profileKeySignature,
+            aliceProfile.encryptedProfile
+        )
+        const aliceToken = aliceAuth.tokens.accessToken
+
+        // Alice fetches Bob's prekey bundle from server
+        const serverBundle = server.getPreKeyBundle(aliceToken, bobIdentity)
+
+        // Convert server bundle to protocol bundle
+        const fetchedBundle: PreKeyBundle = {
+            identityKey: decodeBase64(serverBundle.identityKey),
+            signedPreKey: decodeBase64(serverBundle.signedPreKey),
+            signedPreKeyId: serverBundle.signedPreKeyId,
+            signedPreKeySignature: decodeBase64(serverBundle.signedPreKeySignature),
+            oneTimePreKey: serverBundle.oneTimePreKey ? decodeBase64(serverBundle.oneTimePreKey) : undefined,
+            oneTimePreKeyId: serverBundle.oneTimePreKeyId
+        }
+
+        // Verify we got a one-time prekey
+        expect(fetchedBundle.oneTimePreKey).toBeDefined()
+        expect(fetchedBundle.oneTimePreKeyId).toBeDefined()
+
+        // Alice initiates session using fetched bundle
+        const { sessionInitMessage } = initiateSession(
+            aliceAgent,
+            fetchedBundle,
+            stringToBytes('Hello via server bundle!')
+        )
+
+        // Send through server with proper signature
+        const initBlob = encodeBase64(stringToBytes(JSON.stringify(sessionInitMessage)))
+        const initMsgId = 'server-init'
+        const initSig = encodeBase64(sign(
+            stringToBytes(initBlob + initMsgId),
+            aliceAgent.keyStore.identityKeyPair.privateKey
+        ))
+        server.sendMessage(aliceToken, initMsgId, bobIdentity, initBlob, initSig)
+
+        // Bob receives and decrypts
+        const bobInbox = server.getInbox(bobToken)
+        expect(bobInbox.messages).toHaveLength(1)
+
+        const msg = bobInbox.messages[0]
+        const decrypted = processIncomingMessage(
+            bobAgent,
+            msg.senderId,
+            msg.blob,
+            msg.id,
+            msg.signature
+        )
+
+        expect(bytesToString(decrypted.plaintext)).toBe('Hello via server bundle!')
+        expect(decrypted.isSessionInit).toBe(true)
+        server.acknowledgeMessages(bobToken, [msg.id])
+
+        // Continue with regular messaging
+        const msg2 = prepareOutgoingMessage(
+            aliceAgent,
+            bobIdentity,
+            stringToBytes('Second message!'),
+            'msg-2'
+        )
+        server.sendMessage(aliceToken, 'msg-2', bobIdentity, msg2.outgoing.blob, msg2.outgoing.signature)
+
+        const bobInbox2 = server.getInbox(bobToken)
+        expect(bobInbox2.messages).toHaveLength(1)
+
+        const dec2 = processIncomingMessage(
+            bobAgent,
+            bobInbox2.messages[0].senderId,
+            bobInbox2.messages[0].blob,
+            bobInbox2.messages[0].id,
+            bobInbox2.messages[0].signature
+        )
+        expect(bytesToString(dec2.plaintext)).toBe('Second message!')
     })
 })
