@@ -1,5 +1,7 @@
 import Redis from 'ioredis';
 import { log } from '@/log';
+import { forever } from '@/utils/timing';
+import { getShutdownSignal } from '@/shutdown';
 import {
     EventEnvelope,
     EventEnvelopeSchema,
@@ -38,7 +40,7 @@ export class EventBus {
     private client: Redis;
     private readonly STREAM_KEY = 'murmur:events';
     private readonly CONSUMER_GROUP = 'murmur-consumers';
-    private readonly CONSUMER_NAME: string;
+    private CONSUMER_NAME: string = '';
 
     private globalEventHandlers: Set<GlobalEventHandler> = new Set();
     private messageEventHandlers: Set<MessageEventHandler> = new Set();
@@ -57,9 +59,6 @@ export class EventBus {
             },
         });
 
-        // Unique consumer name per instance
-        this.CONSUMER_NAME = `consumer-${process.pid}-${Date.now()}`;
-
         this.client.on('error', (err) => {
             log(`EventBus Redis error: ${err.message}`);
         });
@@ -74,6 +73,10 @@ export class EventBus {
             return;
         }
 
+        // Generate unique consumer name using cuid2
+        const { createId } = await import('@paralleldrive/cuid2');
+        this.CONSUMER_NAME = `consumer-${createId()}`;
+
         // Create consumer group if it doesn't exist
         try {
             await this.client.xgroup('CREATE', this.STREAM_KEY, this.CONSUMER_GROUP, '$', 'MKSTREAM');
@@ -86,7 +89,9 @@ export class EventBus {
         }
 
         this.isRunning = true;
-        this.readLoopPromise = this.readLoop();
+
+        const shutdownSignal = getShutdownSignal();
+        this.readLoopPromise = this.readLoop(shutdownSignal);
 
         log('EventBus started with Redis Streams');
     }
@@ -209,9 +214,10 @@ export class EventBus {
     /**
      * Read loop that consumes messages from Redis Streams.
      * Uses XREADGROUP for consumer group coordination.
+     * Uses forever helper to loop until shutdown.
      */
-    private async readLoop(): Promise<void> {
-        while (this.isRunning) {
+    private async readLoop(signal: AbortSignal): Promise<void> {
+        await forever(async () => {
             try {
                 // XREADGROUP GROUP group consumer BLOCK ms COUNT n STREAMS stream >
                 // '>' means only read new messages not yet delivered to this group
@@ -229,7 +235,7 @@ export class EventBus {
                 ) as any; // Type assertion needed due to ioredis typing limitations
 
                 if (!results || results.length === 0) {
-                    continue;
+                    return;
                 }
 
                 // Process messages
@@ -239,13 +245,19 @@ export class EventBus {
                     }
                 }
             } catch (error: any) {
+                // Check if consumer group was deleted
+                if (error.message && error.message.includes('NOGROUP')) {
+                    log(`FATAL: Consumer group ${this.CONSUMER_GROUP} was deleted!`);
+                    console.error(`FATAL: Consumer group ${this.CONSUMER_GROUP} was deleted!`);
+                    process.exit(1); // Hard crash as requested
+                }
+
                 if (this.isRunning) {
                     log(`Error in read loop: ${error.message}`);
-                    // Wait a bit before retrying
-                    await new Promise(resolve => setTimeout(resolve, 1000));
+                    throw error; // Re-throw to let forever handle it
                 }
             }
-        }
+        }, 0, signal); // No delay between iterations since XREADGROUP has its own blocking
     }
 
     /**

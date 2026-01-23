@@ -1,31 +1,43 @@
 import * as privacyKit from 'privacy-kit';
 
 const JWT_SEED = process.env.JWT_SEED || 'dev-seed-change-in-production';
-const JWT_PUBLIC_KEY_BASE64 = process.env.JWT_PUBLIC_KEY;
+const ACCESS_TOKEN_TTL = 60 * 60; // 1 hour in seconds
+const REFRESH_TOKEN_SERVICE = 'murmur-refresh';
+const ACCESS_TOKEN_SERVICE = 'murmur-access';
 
-let tokenGenerator: Awaited<ReturnType<typeof privacyKit.createPersistentTokenGenerator>> | null = null;
-let tokenVerifier: Awaited<ReturnType<typeof privacyKit.createPersistentTokenVerifier>> | null = null;
+let refreshTokenGenerator: Awaited<ReturnType<typeof privacyKit.createPersistentTokenGenerator>> | null = null;
+let refreshTokenVerifier: Awaited<ReturnType<typeof privacyKit.createPersistentTokenVerifier>> | null = null;
+let accessTokenGenerator: Awaited<ReturnType<typeof privacyKit.createEphemeralTokenGenerator>> | null = null;
+let accessTokenVerifier: Awaited<ReturnType<typeof privacyKit.createEphemeralTokenVerifier>> | null = null;
 
 /**
- * Initialize the token generator and verifier
+ * Initialize the token generators and verifiers
  * This should be called once at startup
  */
 export async function initializeJWT(): Promise<void> {
-    // Initialize generator with seed
-    tokenGenerator = await privacyKit.createPersistentTokenGenerator({
-        service: 'murmur-auth',
+    // Initialize refresh token generator (persistent, long-lived)
+    refreshTokenGenerator = await privacyKit.createPersistentTokenGenerator({
+        service: REFRESH_TOKEN_SERVICE,
         seed: JWT_SEED,
     });
 
-    // Get public key from generator or environment
-    const publicKeyBytes = JWT_PUBLIC_KEY_BASE64
-        ? privacyKit.decodeBase64(JWT_PUBLIC_KEY_BASE64)
-        : tokenGenerator.publicKey;
+    // Initialize refresh token verifier using public key from generator
+    refreshTokenVerifier = await privacyKit.createPersistentTokenVerifier({
+        service: REFRESH_TOKEN_SERVICE,
+        publicKey: refreshTokenGenerator.publicKey,
+    });
 
-    // Initialize verifier with public key
-    tokenVerifier = await privacyKit.createPersistentTokenVerifier({
-        service: 'murmur-auth',
-        publicKey: publicKeyBytes,
+    // Initialize access token generator (ephemeral, short-lived)
+    accessTokenGenerator = await privacyKit.createEphemeralTokenGenerator({
+        service: ACCESS_TOKEN_SERVICE,
+        seed: JWT_SEED,
+        ttl: ACCESS_TOKEN_TTL,
+    });
+
+    // Initialize access token verifier using public key from generator
+    accessTokenVerifier = await privacyKit.createEphemeralTokenVerifier({
+        service: ACCESS_TOKEN_SERVICE,
+        publicKey: accessTokenGenerator.publicKey,
     });
 }
 
@@ -35,35 +47,43 @@ export interface JWTPayload {
     uuid?: string | null;
 }
 
-/**
- * Generate a JWT token for a user
- * privacy-kit tokens include both access tokens (24h expiration) and refresh tokens
- * The tokens returned are already in the format "access.refresh" which is a single string
- */
-export async function generateToken(userId: string): Promise<string> {
-    if (!tokenGenerator) {
-        throw new Error('JWT not initialized. Call initializeJWT() first.');
-    }
-
-    // privacy-kit automatically handles refresh tokens and 24h expiration
-    const token = await tokenGenerator.new({
-        user: userId,
-    });
-
-    return token;
+export interface TokenPair {
+    accessToken: string;
+    refreshToken: string;
 }
 
 /**
- * Verify and decode a JWT token
- * @returns The payload if valid, null if invalid
+ * Generate a token pair (access + refresh) for a user
+ * @param userId - The user ID to generate tokens for
+ * @returns Object with accessToken (1h expiry) and refreshToken (long-lived)
  */
-export async function verifyToken(token: string): Promise<JWTPayload | null> {
-    if (!tokenVerifier) {
+export async function generateToken(userId: string): Promise<TokenPair> {
+    if (!accessTokenGenerator || !refreshTokenGenerator) {
+        throw new Error('JWT not initialized. Call initializeJWT() first.');
+    }
+
+    const [accessToken, refreshToken] = await Promise.all([
+        accessTokenGenerator.new({ user: userId }),
+        refreshTokenGenerator.new({ user: userId }),
+    ]);
+
+    return {
+        accessToken,
+        refreshToken,
+    };
+}
+
+/**
+ * Verify and decode an access token
+ * @returns The payload if valid, null if invalid or expired
+ */
+export async function verifyAccessToken(token: string): Promise<JWTPayload | null> {
+    if (!accessTokenVerifier) {
         throw new Error('JWT not initialized. Call initializeJWT() first.');
     }
 
     try {
-        const result = await tokenVerifier.verify(token);
+        const result = await accessTokenVerifier.verify(token);
 
         if (!result || !result.user) {
             return null;
@@ -77,4 +97,62 @@ export async function verifyToken(token: string): Promise<JWTPayload | null> {
     } catch {
         return null;
     }
+}
+
+/**
+ * Verify and decode a refresh token
+ * @returns The payload if valid, null if invalid
+ */
+export async function verifyRefreshToken(token: string): Promise<JWTPayload | null> {
+    if (!refreshTokenVerifier) {
+        throw new Error('JWT not initialized. Call initializeJWT() first.');
+    }
+
+    try {
+        const result = await refreshTokenVerifier.verify(token);
+
+        if (!result || !result.user) {
+            return null;
+        }
+
+        return {
+            userId: result.user,
+            user: result.user,
+            uuid: result.uuid,
+        };
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Refresh an access token using a valid refresh token
+ * @param refreshToken - The refresh token
+ * @returns New access token if refresh token is valid, null otherwise
+ */
+export async function refreshAccessToken(refreshToken: string): Promise<string | null> {
+    const payload = await verifyRefreshToken(refreshToken);
+
+    if (!payload || !payload.userId) {
+        return null;
+    }
+
+    if (!accessTokenGenerator) {
+        throw new Error('JWT not initialized. Call initializeJWT() first.');
+    }
+
+    // Generate new access token with same user ID
+    const accessToken = await accessTokenGenerator.new({
+        user: payload.userId,
+    });
+
+    return accessToken;
+}
+
+/**
+ * Legacy function for backward compatibility
+ * @deprecated Use verifyAccessToken instead
+ */
+export async function verifyToken(token: string): Promise<JWTPayload | null> {
+    return verifyAccessToken(token);
 }

@@ -1,5 +1,5 @@
 import type { FastifyRequest, FastifyReply } from 'fastify';
-import { verifyToken } from '@/utils/jwt';
+import { verifyAccessToken } from '@/utils/jwt';
 
 /**
  * Authentication hook for Fastify routes
@@ -16,7 +16,7 @@ export async function authenticationHook(
     }
 
     const token = authHeader.slice(7); // Remove 'Bearer ' prefix
-    const payload = await verifyToken(token);
+    const payload = await verifyAccessToken(token);
 
     if (!payload || !payload.userId) {
         return reply.status(401).send({ error: 'Invalid or expired token' });

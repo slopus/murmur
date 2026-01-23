@@ -3,7 +3,7 @@ import { db } from './db';
 import { events } from './events';
 import { log } from './log';
 import { awaitShutdown, onShutdown } from './shutdown';
-import { createCleanupWorker } from './workers/cleanupWorker';
+import { startCleanupWorker } from './workers/cleanupWorker';
 import { initializeJWT } from './utils/jwt';
 
 export async function main() {
@@ -25,10 +25,9 @@ export async function main() {
     });
 
     log('Starting cleanup worker...');
-    const cleanupWorker = createCleanupWorker();
-    await cleanupWorker.start();
-    onShutdown('cleanup', async () => {
-        await cleanupWorker.stop();
+    // Start cleanup worker in background (runs until shutdown)
+    startCleanupWorker().catch(err => {
+        log(`Cleanup worker error: ${err}`);
     });
 
     log('Starting API...');

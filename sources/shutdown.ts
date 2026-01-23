@@ -5,11 +5,21 @@ type ShutdownHandler = () => Promise<void>;
 const shutdownHandlers = new Map<string, ShutdownHandler>();
 let isShuttingDown = false;
 
+// Global AbortController for shutdown signaling
+const shutdownController = new AbortController();
+
 export function onShutdown(name: string, handler: ShutdownHandler) {
     if (shutdownHandlers.has(name)) {
         throw new Error(`Shutdown handler "${name}" already registered`);
     }
     shutdownHandlers.set(name, handler);
+}
+
+/**
+ * Get the global shutdown AbortSignal
+ */
+export function getShutdownSignal(): AbortSignal {
+    return shutdownController.signal;
 }
 
 async function performShutdown() {
@@ -19,6 +29,9 @@ async function performShutdown() {
     }
     isShuttingDown = true;
     log('Shutdown initiated...');
+
+    // Signal shutdown via AbortController
+    shutdownController.abort();
 
     // Execute shutdown handlers in reverse order (LIFO)
     const handlers = Array.from(shutdownHandlers.entries()).reverse();
