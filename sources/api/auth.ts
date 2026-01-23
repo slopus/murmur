@@ -16,9 +16,9 @@ export async function authenticationHook(
     }
 
     const token = authHeader.slice(7); // Remove 'Bearer ' prefix
-    const payload = verifyToken(token);
+    const payload = await verifyToken(token);
 
-    if (!payload) {
+    if (!payload || !payload.userId) {
         return reply.status(401).send({ error: 'Invalid or expired token' });
     }
 

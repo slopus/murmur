@@ -37,18 +37,6 @@ model User {
     // Relations
     sentMessages      Message[] @relation("MessageSender")
     receivedMessages  Message[] @relation("MessageRecipient")
-    sequence          UserSequence?
-}
-
-//
-// UserSequence (for EventBus sequence numbers)
-//
-
-model UserSequence {
-    userId    String   @id
-    user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
-    seqno     Int      @default(1)
-    updatedAt DateTime @updatedAt
 }
 
 //
@@ -56,7 +44,7 @@ model UserSequence {
 //
 
 model Message {
-    id          String   @id @default(cuid(2))
+    id          String   @id // cuid2 provided by sender (guarantees uniqueness in distributed system)
     createdAt   DateTime @default(now())
     expiresAt   DateTime // Auto-delete after 30 days (createdAt + 30 days)
     deliveredAt DateTime? // When the message was first read by recipient
@@ -72,7 +60,7 @@ model Message {
     blob        Json   // The encrypted message blob (arbitrary structure)
 
     /// [MessageSignature]
-    signature   Json   // NaCl signature of the blob by sender's identity key
+    signature   String // NaCl signature of (blob + messageId) by sender's identity key
 
     @@index([recipientId, createdAt])
     @@index([expiresAt]) // For cleanup worker

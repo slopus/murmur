@@ -126,6 +126,7 @@ export async function profileRoutes(app: Fastify) {
         // Publish profile update event
         await events.publishUser(userId, {
             type: 'profile:updated',
+            userId,
         });
 
         return reply.send({

@@ -108,9 +108,10 @@ All message endpoints require `Authorization: Bearer <JWT>` header.
 ```
 POST /v1/messages/send
 {
+  "messageId": "cuid2-generated-id", // Must be valid cuid2
   "recipientId": "recipient-public-key",
   "blob": { ... }, // Encrypted message
-  "signature": "signature-of-blob"
+  "signature": "signature-of-blob-and-messageId"
 }
 ```
 
@@ -122,6 +123,11 @@ GET /v1/messages/inbox?limit=50&offset=0
 **Stream Messages (SSE)**
 ```
 GET /v1/messages/stream
+```
+
+**Acknowledge Message** (removes from Redis Stream queue)
+```
+POST /v1/messages/:messageId/ack
 ```
 
 **Delete Message**
@@ -169,9 +175,12 @@ yarn build
 ## Security
 
 - All messages must be signed by the sender's identity key
+- Message signatures include both blob and message ID to prevent tampering
+- Message IDs must be valid cuid2 format
+- Repeat protection: duplicate message IDs are rejected
 - Profile keys must be signed by the identity key
 - Timestamps are checked to prevent replay attacks (5-minute window)
-- JWTs expire after 30 days
+- JWTs use privacy-kit with 24h access token expiration + refresh tokens
 - Messages auto-delete after 30 days
 
 ## Development
@@ -184,13 +193,12 @@ sources/
 │   ├── routes/v1/   # API endpoints
 │   ├── auth.ts      # Authentication middleware
 │   └── sse.ts       # Server-Sent Events
-├── eventbus/        # Redis-based event distribution
-│   ├── eventBus.ts
-│   ├── sequenceCounter.ts
-│   └── types.ts
+├── eventbus/        # Redis Streams event distribution
+│   ├── eventBus.ts  # Redis Streams consumer/publisher
+│   └── types.ts     # Event type definitions
 ├── utils/           # Utilities and helpers
 │   ├── crypto.ts    # NaCl signature verification
-│   ├── jwt.ts       # JWT generation/verification
+│   ├── jwt.ts       # privacy-kit JWT with refresh tokens
 │   └── sync.ts      # InvalidateSync helper
 ├── workers/         # Background workers
 │   └── cleanupWorker.ts
@@ -198,6 +206,8 @@ sources/
 ├── events.ts        # EventBus instance
 ├── log.ts           # Logging
 └── main.ts          # Entry point
+scripts/
+└── generateKeys.ts  # Generate JWT keys for privacy-kit
 ```
 
 ## License

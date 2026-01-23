@@ -11,7 +11,9 @@ Murmur is a secure message relay server using NaCl (TweetNaCl) public key crypto
 - Users are identified by their Ed25519 public keys (NaCl signing keys)
 - No passwords or traditional accounts
 - Authentication uses cryptographic signatures
-- JWT tokens are issued after signature verification
+- JWT tokens are issued after signature verification using privacy-kit
+- Tokens include both access tokens (24h expiration) and refresh tokens
+- Automatic token refresh without re-authentication
 
 ### Signed Blobs
 
@@ -38,47 +40,33 @@ This separation allows profile key rotation without changing identity.
 
 ## Components
 
-### 1. EventBus (Redis + PostgreSQL)
+### 1. EventBus (Redis Streams)
 
-The EventBus enables reliable event distribution across multiple server instances:
+The EventBus provides reliable event distribution using Redis Streams:
 
 **Architecture:**
-- Redis pub/sub for fast real-time event delivery
-- PostgreSQL for durable sequence number checkpoints
-- Atomic operations to prevent race conditions
+- Redis Streams for reliable message delivery (not pub/sub)
+- Consumer groups for distributed message processing
+- Messages persist until explicitly acknowledged
+- Channel-based routing for future sharding capabilities
 
-**Sequence Numbers:**
-- Each user has a monotonic counter (seqno)
-- Stored in Redis (fast, volatile)
-- Checkpointed to DB every 10 seconds (durable)
-- Gaps are acceptable (uniqueness guaranteed)
+**Message Identification:**
+- Messages identified by cuid2 IDs provided by sender
+- No sequence numbers needed (distributed ID generation)
+- Repeat protection via unique message IDs
+- Format validation ensures only valid cuid2 IDs accepted
 
-**Redis Recovery:**
-When Redis restarts or connection is lost:
-1. Process atomically increments DB checkpoint by 1000
-2. Sets Redis to max(current, checkpoint) using Lua script
-3. Resumes counting from new checkpoint
+**Reliable Delivery:**
+- Messages remain in stream until acknowledged
+- Consumer groups track which messages each server has seen
+- Multiple servers can process messages concurrently
+- Messages can be acknowledged and deleted by clients
 
-This creates sequence gaps but guarantees:
-- No duplicate sequence numbers
-- No race conditions between processes
-- Survives Redis restarts
-
-**Race Condition Prevention:**
-
-Three critical race conditions are handled:
-
-1. **DB Checkpoint Recovery**: Multiple processes incrementing checkpoint
-   - Solution: Atomic `UPDATE...RETURNING` with row-level lock
-   - Each process gets unique checkpoint (1000, 2000, 3000...)
-
-2. **Redis Write-Back**: Later process overwrites with smaller value
-   - Solution: Lua script `SET MAX(current, new)`
-   - Ensures Redis always has highest value
-
-3. **Periodic Checkpoints**: Old checkpoint overwrites new
-   - Solution: SQL `GREATEST(current, new)`
-   - Only updates if new value is higher
+**Channel-Based Routing:**
+- Events published to channels (e.g., "user:userId", "global")
+- Allows future sharding: route specific channels to specific servers
+- Currently all channels processed globally
+- Easy migration path to horizontal scaling
 
 ### 2. API Layer (Fastify)
 
@@ -132,21 +120,14 @@ profileUpdatedAt: DateTime
 
 ### Message
 ```
-id: string (CUID)
+id: string (cuid2 provided by sender)
 createdAt: DateTime
 expiresAt: DateTime (createdAt + 30 days)
 deliveredAt: DateTime | null
 senderId: string (User.id)
 recipientId: string (User.id)
 blob: JSON (encrypted message)
-signature: JSON (NaCl signature of blob)
-```
-
-### UserSequence
-```
-userId: string (User.id)
-seqno: int (monotonic counter)
-updatedAt: DateTime
+signature: string (NaCl signature of blob + messageId)
 ```
 
 ## Security Considerations
@@ -157,8 +138,17 @@ All critical operations require signature verification:
 - Registration: Request signed by identity key
 - Login: Timestamp signed by identity key
 - Profile update: Request signed by identity key
-- Message send: Blob signed by sender's identity key
+- Message send: Blob + messageId signed by sender's identity key
 - Profile key: Signed by identity key
+
+### Message ID Security
+
+Message IDs must be cuid2 format:
+- Provided by sender (not auto-generated)
+- Validated with isCuid() check
+- Included in signature to prevent tampering
+- Repeat protection via unique constraint
+- Distributed ID generation prevents conflicts
 
 ### Timestamp Validation
 
@@ -190,10 +180,11 @@ Server only:
 ### Horizontal Scaling
 
 Multiple server instances can run simultaneously:
-- EventBus coordinates via Redis
+- EventBus coordinates via Redis Streams consumer groups
 - Each instance has own DB connection pool
 - SSE connections distributed across instances
-- Sequence numbers remain unique via atomic DB operations
+- Message IDs remain unique via cuid2 distributed generation
+- Channel-based routing enables future sharding
 
 ### Database
 
@@ -206,14 +197,14 @@ PostgreSQL chosen for:
 ### Redis
 
 Used for:
-- Pub/sub event distribution
-- Volatile sequence number counters
-- Fast reads (no DB hit for increments)
+- Redis Streams for reliable event distribution
+- Consumer groups for message processing
+- Message persistence until acknowledged
 
 Configured with:
 - AOF persistence (append-only file)
-- Ensures sequence data survives restarts
-- Acceptable to lose few seconds on crash
+- Ensures messages survive restarts
+- Messages persist until explicitly deleted
 
 ## Deployment
 
@@ -234,8 +225,11 @@ Each service:
 Required:
 - `DATABASE_URL`: PostgreSQL connection
 - `REDIS_URL`: Redis connection
-- `JWT_SECRET`: Secret for JWT signing
+- `JWT_SEED`: Seed for privacy-kit JWT token generation
+- `JWT_PUBLIC_KEY`: Public key for JWT verification
 - `PORT`: HTTP port (default 3000)
+
+Generate JWT keys with: `yarn tsx scripts/generateKeys.ts`
 
 ## Future Enhancements
 

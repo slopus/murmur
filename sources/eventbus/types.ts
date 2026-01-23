@@ -2,22 +2,29 @@ import { z } from 'zod';
 
 /**
  * Event types for the Murmur server
+ * Now using Redis Streams with message IDs instead of sequence numbers
  */
 
-// User-scoped events (with sequence numbers)
+// Message events (identified by cuid2 message ID)
+export const MessageEventSchema = z.object({
+    type: z.literal('message:new'),
+    messageId: z.string(), // cuid2 provided by sender
+});
+
+export type MessageEvent = z.infer<typeof MessageEventSchema>;
+
+// User events (profile updates, etc.)
 export const UserEventSchema = z.discriminatedUnion('type', [
-    z.object({
-        type: z.literal('message:new'),
-        messageId: z.string(),
-    }),
+    MessageEventSchema,
     z.object({
         type: z.literal('profile:updated'),
+        userId: z.string(),
     }),
 ]);
 
 export type UserEvent = z.infer<typeof UserEventSchema>;
 
-// Global events (no sequence numbers)
+// Global events
 export const GlobalEventSchema = z.discriminatedUnion('type', [
     z.object({
         type: z.literal('system:health'),
@@ -28,29 +35,30 @@ export const GlobalEventSchema = z.discriminatedUnion('type', [
 export type GlobalEvent = z.infer<typeof GlobalEventSchema>;
 
 /**
- * Event envelopes for transport
+ * Event envelopes for Redis Streams transport
+ * No sequence numbers - messages are identified by their cuid2 message ID
  */
 
-export const UserEnvelopeSchema = z.object({
-    type: z.literal('user'),
+export const MessageEnvelopeSchema = z.object({
+    type: z.literal('message'),
     timestamp: z.number(),
-    userId: z.string(),
-    seqno: z.number(),
+    channel: z.string(), // e.g., "user:userId" for future sharding
     event: UserEventSchema,
 });
 
-export type UserEnvelope = z.infer<typeof UserEnvelopeSchema>;
+export type MessageEnvelope = z.infer<typeof MessageEnvelopeSchema>;
 
 export const GlobalEnvelopeSchema = z.object({
     type: z.literal('global'),
     timestamp: z.number(),
+    channel: z.string(), // e.g., "global" or "system"
     event: GlobalEventSchema,
 });
 
 export type GlobalEnvelope = z.infer<typeof GlobalEnvelopeSchema>;
 
 export const EventEnvelopeSchema = z.union([
-    UserEnvelopeSchema,
+    MessageEnvelopeSchema,
     GlobalEnvelopeSchema,
 ]);
 
@@ -60,8 +68,8 @@ export type EventEnvelope = z.infer<typeof EventEnvelopeSchema>;
  * Type guards
  */
 
-export function isUserEnvelope(envelope: EventEnvelope): envelope is UserEnvelope {
-    return envelope.type === 'user';
+export function isMessageEnvelope(envelope: EventEnvelope): envelope is MessageEnvelope {
+    return envelope.type === 'message';
 }
 
 export function isGlobalEnvelope(envelope: EventEnvelope): envelope is GlobalEnvelope {

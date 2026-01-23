@@ -91,8 +91,8 @@ export async function authRoutes(app: Fastify) {
             },
         });
 
-        // Generate JWT
-        const token = generateToken(identityPublicKey);
+        // Generate JWT (privacy-kit handles refresh tokens automatically)
+        const token = await generateToken(identityPublicKey);
 
         return reply.send({
             success: true,
@@ -138,8 +138,8 @@ export async function authRoutes(app: Fastify) {
             return reply.status(404).send({ error: 'User not found' });
         }
 
-        // Generate JWT
-        const token = generateToken(identityPublicKey);
+        // Generate JWT (privacy-kit handles refresh tokens automatically)
+        const token = await generateToken(identityPublicKey);
 
         return reply.send({
             success: true,

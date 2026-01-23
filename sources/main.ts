@@ -4,9 +4,13 @@ import { events } from './events';
 import { log } from './log';
 import { awaitShutdown, onShutdown } from './shutdown';
 import { createCleanupWorker } from './workers/cleanupWorker';
+import { initializeJWT } from './utils/jwt';
 
 export async function main() {
     log('Starting Murmur Server...');
+
+    log('Initializing JWT...');
+    await initializeJWT();
 
     log('Connecting to database...');
     await db.$connect();

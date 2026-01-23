@@ -17,7 +17,6 @@
   },
   "devDependencies": {
     "@fastify/cors": "^11.1.0",
-    "@types/jsonwebtoken": "^9.0.7",
     "@types/node": "^24.8.1",
     "fastify": "^5.6.1",
     "fastify-type-provider-zod": "^6.0.0",
@@ -30,13 +29,13 @@
     "@paralleldrive/cuid2": "^3.1.0",
     "@prisma/client": "^6.17.1",
     "ioredis": "^5.8.2",
-    "jsonwebtoken": "^9.0.2",
     "pino": "^10.1.0",
     "pino-pretty": "^13.1.2",
     "prisma": "^6.17.1",
     "prisma-json-types-generator": "^3.6.2",
+    "privacy-kit": "^0.0.23",
+    "tsx": "^4.20.6",
     "tweetnacl": "^1.0.3",
-    "tweetnacl-util": "^0.15.1",
-    "tsx": "^4.20.6"
+    "tweetnacl-util": "^0.15.1"
   }
 }

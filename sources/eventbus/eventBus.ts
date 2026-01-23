@@ -1,53 +1,55 @@
 import Redis from 'ioredis';
 import { log } from '@/log';
-import { SequenceCounter } from './sequenceCounter';
 import {
     EventEnvelope,
     EventEnvelopeSchema,
     GlobalEvent,
     GlobalEnvelope,
     UserEvent,
-    UserEnvelope,
+    MessageEnvelope,
     isGlobalEnvelope,
-    isUserEnvelope,
+    isMessageEnvelope,
 } from './types';
 
 /**
  * Event handler type definitions
  */
 export type GlobalEventHandler = (event: GlobalEvent) => void | Promise<void>;
-export type UserEventHandler = (envelope: UserEnvelope) => void | Promise<void>;
+export type MessageEventHandler = (envelope: MessageEnvelope) => void | Promise<void>;
 
 /**
- * EventBus provides a high-performance, scalable event distribution system
- * using Redis pub/sub with at-most-once delivery guarantee.
+ * EventBus provides a reliable event distribution system using Redis Streams.
+ *
+ * Key differences from pub/sub:
+ * - Redis Streams provide reliable delivery with persistence
+ * - Messages can be acknowledged and deleted after processing
+ * - Consumer groups allow multiple servers to process messages
+ * - No sequence numbers needed - messages identified by cuid2 message IDs
+ * - Supports channel-based subscriptions for future sharding
  *
  * Features:
- * - Single Redis connection per process for pub/sub
- * - Strict type checking with Zod validation
- * - Automatic sequence number management for user events
- * - Atomic DB operations for Redis recovery (prevents race conditions)
- * - Support for both global and user-scoped events
- * - At-most-once delivery guarantee
- * - Survives Redis restarts without losing event ordering
+ * - Reliable message delivery (not fire-and-forget like pub/sub)
+ * - Message acknowledgment and deletion
+ * - Channel-based subscriptions (e.g., "user:userId")
+ * - Repeat protection via cuid2 message IDs
+ * - Type-safe with Zod validation
  */
 export class EventBus {
-    private publisher: Redis;
-    private subscriber: Redis;
-    private sequenceCounter: SequenceCounter;
-    private readonly CHANNEL = 'eventbus:events';
+    private client: Redis;
+    private readonly STREAM_KEY = 'murmur:events';
+    private readonly CONSUMER_GROUP = 'murmur-consumers';
+    private readonly CONSUMER_NAME: string;
 
     private globalEventHandlers: Set<GlobalEventHandler> = new Set();
-    private userEventHandlers: Set<UserEventHandler> = new Set();
+    private messageEventHandlers: Set<MessageEventHandler> = new Set();
 
-    private isSubscribed = false;
+    private isRunning = false;
+    private readLoopPromise: Promise<void> | null = null;
 
     constructor(redisUrl?: string) {
         const url = redisUrl || process.env.REDIS_URL || 'redis://localhost:6379';
 
-        // Create separate connections for pub and sub
-        // Redis requires separate connections for pub/sub operations
-        this.publisher = new Redis(url, {
+        this.client = new Redis(url, {
             maxRetriesPerRequest: 3,
             retryStrategy: (times) => {
                 const delay = Math.min(times * 50, 2000);
@@ -55,23 +57,11 @@ export class EventBus {
             },
         });
 
-        this.subscriber = new Redis(url, {
-            maxRetriesPerRequest: 3,
-            retryStrategy: (times) => {
-                const delay = Math.min(times * 50, 2000);
-                return delay;
-            },
-        });
+        // Unique consumer name per instance
+        this.CONSUMER_NAME = `consumer-${process.pid}-${Date.now()}`;
 
-        this.sequenceCounter = new SequenceCounter(this.publisher);
-
-        // Set up error handlers
-        this.publisher.on('error', (err) => {
-            log(`EventBus publisher error: ${err.message}`);
-        });
-
-        this.subscriber.on('error', (err) => {
-            log(`EventBus subscriber error: ${err.message}`);
+        this.client.on('error', (err) => {
+            log(`EventBus Redis error: ${err.message}`);
         });
     }
 
@@ -79,66 +69,68 @@ export class EventBus {
      * Initialize the EventBus and start listening for events.
      */
     async start(): Promise<void> {
-        if (this.isSubscribed) {
+        if (this.isRunning) {
             log('EventBus already started');
             return;
         }
 
-        // Subscribe to the events channel
-        await this.subscriber.subscribe(this.CHANNEL);
-        this.isSubscribed = true;
-
-        // Set up message handler
-        this.subscriber.on('message', (channel, message) => {
-            if (channel === this.CHANNEL) {
-                this.handleIncomingMessage(message);
+        // Create consumer group if it doesn't exist
+        try {
+            await this.client.xgroup('CREATE', this.STREAM_KEY, this.CONSUMER_GROUP, '$', 'MKSTREAM');
+            log(`Created consumer group ${this.CONSUMER_GROUP}`);
+        } catch (err: any) {
+            // Ignore if group already exists
+            if (!err.message.includes('BUSYGROUP')) {
+                log(`Consumer group creation error: ${err.message}`);
             }
-        });
+        }
 
-        // Start periodic sequence number flushing
-        this.sequenceCounter.start();
+        this.isRunning = true;
+        this.readLoopPromise = this.readLoop();
 
-        log('EventBus started and listening for events');
+        log('EventBus started with Redis Streams');
     }
 
     /**
-     * Publish a global event (no user scope, no sequence number).
+     * Publish a global event to the global channel.
      */
-    async publishGlobal(event: GlobalEvent): Promise<void> {
+    async publishGlobal(event: GlobalEvent): Promise<string> {
         const envelope: GlobalEnvelope = {
             type: 'global',
             timestamp: Date.now(),
+            channel: 'global',
             event,
         };
 
-        await this.publishEnvelope(envelope);
+        return this.publishEnvelope(envelope);
     }
 
     /**
-     * Publish a user-scoped event (automatically assigns sequence number).
-     *
-     * The sequence counter handles:
-     * 1. Atomic seqno increment in Redis
-     * 2. Automatic DB checkpoint writes every BATCH_SIZE events
-     * 3. Redis recovery via atomic DB checkpoint increment
+     * Publish a user-scoped event to a user channel.
+     * The channel allows future sharding (e.g., route "user:alice" to server A).
      */
-    async publishUser(userId: string, event: UserEvent): Promise<number> {
-        // Get next sequence number (handles checkpointing internally)
-        const seqno = await this.sequenceCounter.getNextSeqno(userId);
-
-        // Create envelope with the assigned seqno
-        const envelope: UserEnvelope = {
-            type: 'user',
+    async publishUser(userId: string, event: UserEvent): Promise<string> {
+        const envelope: MessageEnvelope = {
+            type: 'message',
             timestamp: Date.now(),
-            userId,
-            seqno,
+            channel: `user:${userId}`,
             event,
         };
 
-        // Publish to all subscribers
-        await this.publishEnvelope(envelope);
+        return this.publishEnvelope(envelope);
+    }
 
-        return seqno;
+    /**
+     * Acknowledge a message (mark as processed and delete from stream).
+     * This is called after the message has been successfully delivered to the client.
+     */
+    async acknowledgeMessage(messageId: string): Promise<void> {
+        try {
+            await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, messageId);
+            await this.client.xdel(this.STREAM_KEY, messageId);
+        } catch (error) {
+            log(`Error acknowledging message ${messageId}: ${error}`);
+        }
     }
 
     /**
@@ -149,11 +141,10 @@ export class EventBus {
     }
 
     /**
-     * Register a handler for user-scoped events.
-     * Handler receives the full envelope (userId, seqno, event).
+     * Register a handler for message events.
      */
-    onUserEvent(handler: UserEventHandler): void {
-        this.userEventHandlers.add(handler);
+    onMessageEvent(handler: MessageEventHandler): void {
+        this.messageEventHandlers.add(handler);
     }
 
     /**
@@ -164,10 +155,10 @@ export class EventBus {
     }
 
     /**
-     * Unregister a user event handler.
+     * Unregister a message event handler.
      */
-    offUserEvent(handler: UserEventHandler): void {
-        this.userEventHandlers.delete(handler);
+    offMessageEvent(handler: MessageEventHandler): void {
+        this.messageEventHandlers.delete(handler);
     }
 
     /**
@@ -176,33 +167,39 @@ export class EventBus {
     async shutdown(): Promise<void> {
         log('Shutting down EventBus...');
 
-        // Stop periodic flushing and flush any pending data
-        await this.sequenceCounter.stop();
+        this.isRunning = false;
 
-        // Unsubscribe from channels
-        if (this.isSubscribed) {
-            await this.subscriber.unsubscribe(this.CHANNEL);
-            this.isSubscribed = false;
+        // Wait for read loop to finish
+        if (this.readLoopPromise) {
+            await this.readLoopPromise;
         }
 
-        // Close Redis connections
-        await this.subscriber.quit();
-        await this.publisher.quit();
+        // Close Redis connection
+        await this.client.quit();
 
         // Clear handlers
         this.globalEventHandlers.clear();
-        this.userEventHandlers.clear();
+        this.messageEventHandlers.clear();
 
         log('EventBus shutdown complete');
     }
 
     /**
-     * Publish an event envelope to Redis.
+     * Publish an event envelope to Redis Streams.
+     * @returns The Redis Stream message ID
      */
-    private async publishEnvelope(envelope: EventEnvelope): Promise<void> {
+    private async publishEnvelope(envelope: EventEnvelope): Promise<string> {
         try {
-            const message = JSON.stringify(envelope);
-            await this.publisher.publish(this.CHANNEL, message);
+            const messageData = JSON.stringify(envelope);
+            // XADD stream-key * field value
+            // The '*' means auto-generate stream ID (different from our message IDs)
+            const streamId = await this.client.xadd(
+                this.STREAM_KEY,
+                '*',
+                'data',
+                messageData
+            );
+            return streamId as string;
         } catch (error) {
             log(`Error publishing event: ${error}`);
             throw error;
@@ -210,36 +207,88 @@ export class EventBus {
     }
 
     /**
-     * Handle incoming message from Redis pub/sub.
-     * Validates the message and routes to appropriate handlers.
+     * Read loop that consumes messages from Redis Streams.
+     * Uses XREADGROUP for consumer group coordination.
      */
-    private handleIncomingMessage(message: string): void {
+    private async readLoop(): Promise<void> {
+        while (this.isRunning) {
+            try {
+                // XREADGROUP GROUP group consumer BLOCK ms COUNT n STREAMS stream >
+                // '>' means only read new messages not yet delivered to this group
+                const results = await this.client.xreadgroup(
+                    'GROUP',
+                    this.CONSUMER_GROUP,
+                    this.CONSUMER_NAME,
+                    'COUNT',
+                    10, // Read up to 10 messages at a time
+                    'BLOCK',
+                    5000, // Block for 5 seconds
+                    'STREAMS',
+                    this.STREAM_KEY,
+                    '>'
+                ) as any; // Type assertion needed due to ioredis typing limitations
+
+                if (!results || results.length === 0) {
+                    continue;
+                }
+
+                // Process messages
+                for (const [_streamKey, messages] of results) {
+                    for (const [streamId, fields] of messages) {
+                        await this.handleStreamMessage(streamId, fields as string[]);
+                    }
+                }
+            } catch (error: any) {
+                if (this.isRunning) {
+                    log(`Error in read loop: ${error.message}`);
+                    // Wait a bit before retrying
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+        }
+    }
+
+    /**
+     * Handle a message from Redis Streams.
+     */
+    private async handleStreamMessage(streamId: string, fields: string[]): Promise<void> {
         try {
-            // Parse JSON
-            const parsed = JSON.parse(message);
+            // Fields are [key1, value1, key2, value2, ...]
+            const dataIndex = fields.indexOf('data');
+            if (dataIndex === -1 || dataIndex + 1 >= fields.length) {
+                log(`Invalid message format in stream ${streamId}`);
+                await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
+                return;
+            }
+
+            const messageData = fields[dataIndex + 1];
+            const parsed = JSON.parse(messageData);
 
             // Validate with Zod
             const result = EventEnvelopeSchema.safeParse(parsed);
 
             if (!result.success) {
-                log(`Invalid event envelope received: ${result.error.message}`);
-                // Discard incompatible updates as per requirements
+                log(`Invalid event envelope in stream ${streamId}: ${result.error.message}`);
+                await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
                 return;
             }
 
             const envelope = result.data;
 
-            // Route to appropriate handlers based on envelope type
+            // Route to appropriate handlers
             if (isGlobalEnvelope(envelope)) {
                 this.dispatchGlobalEvent(envelope.event);
-            } else if (isUserEnvelope(envelope)) {
-                this.dispatchUserEvent(envelope);
-            } else {
-                log(`Unknown envelope type received: ${JSON.stringify(envelope)}`);
+            } else if (isMessageEnvelope(envelope)) {
+                this.dispatchMessageEvent(envelope);
             }
+
+            // Auto-acknowledge after dispatching
+            // Messages will be deleted when clients explicitly ack them via acknowledgeMessage()
+            await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
         } catch (error) {
-            log(`Error handling incoming message: ${error}`);
-            // At-most-once guarantee - we don't retry, just log and move on
+            log(`Error handling stream message ${streamId}: ${error}`);
+            // Acknowledge anyway to avoid getting stuck
+            await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
         }
     }
 
@@ -250,7 +299,6 @@ export class EventBus {
         for (const handler of this.globalEventHandlers) {
             try {
                 const result = handler(event);
-                // Handle async handlers
                 if (result instanceof Promise) {
                     result.catch((err) => {
                         log(`Global event handler error: ${err.message}`);
@@ -263,29 +311,20 @@ export class EventBus {
     }
 
     /**
-     * Dispatch a user event to all registered handlers.
-     * Passes the full envelope (userId, seqno, event) to handlers.
+     * Dispatch a message event to all registered handlers.
      */
-    private dispatchUserEvent(envelope: UserEnvelope): void {
-        for (const handler of this.userEventHandlers) {
+    private dispatchMessageEvent(envelope: MessageEnvelope): void {
+        for (const handler of this.messageEventHandlers) {
             try {
                 const result = handler(envelope);
-                // Handle async handlers
                 if (result instanceof Promise) {
                     result.catch((err) => {
-                        log(`User event handler error: ${err.message}`);
+                        log(`Message event handler error: ${err.message}`);
                     });
                 }
             } catch (error) {
-                log(`User event handler error: ${error}`);
+                log(`Message event handler error: ${error}`);
             }
         }
-    }
-
-    /**
-     * Get the sequence counter (useful for testing and utilities).
-     */
-    getSequenceCounter(): SequenceCounter {
-        return this.sequenceCounter;
     }
 }
