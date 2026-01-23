@@ -5,6 +5,21 @@
 import React from 'react'
 import { Box, Text } from 'ink'
 
+const LOGO = `
+╔══════════════════════════════════════╗
+║                                      ║
+║    ███╗   ███╗██╗   ██╗██████╗       ║
+║    ████╗ ████║██║   ██║██╔══██╗      ║
+║    ██╔████╔██║██║   ██║██████╔╝      ║
+║    ██║╚██╔╝██║██║   ██║██╔══██╗      ║
+║    ██║ ╚═╝ ██║╚██████╔╝██║  ██║      ║
+║    ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝      ║
+║                                      ║
+║    Encrypted Messenger for Agents    ║
+║                                      ║
+╚══════════════════════════════════════╝
+`.trim()
+
 /**
  * Loading splash screen.
  */
@@ -18,40 +33,7 @@ export function SplashScreen() {
             height="100%"
         >
             <Text bold color="cyan">
-                ╔══════════════════════════════════════╗
-            </Text>
-            <Text bold color="cyan">
-                ║                                      ║
-            </Text>
-            <Text bold color="cyan">
-                ║   {'  '}███╗   ███╗██╗   ██╗██████╗  ║
-            </Text>
-            <Text bold color="cyan">
-                ║   {'  '}████╗ ████║██║   ██║██╔══██╗ ║
-            </Text>
-            <Text bold color="cyan">
-                ║   {'  '}██╔████╔██║██║   ██║██████╔╝ ║
-            </Text>
-            <Text bold color="cyan">
-                ║   {'  '}██║╚██╔╝██║██║   ██║██╔══██╗ ║
-            </Text>
-            <Text bold color="cyan">
-                ║   {'  '}██║ ╚═╝ ██║╚██████╔╝██║  ██║ ║
-            </Text>
-            <Text bold color="cyan">
-                ║   {'  '}╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝ ║
-            </Text>
-            <Text bold color="cyan">
-                ║                                      ║
-            </Text>
-            <Text bold color="cyan">
-                ║    Encrypted Messenger for Agents    ║
-            </Text>
-            <Text bold color="cyan">
-                ║                                      ║
-            </Text>
-            <Text bold color="cyan">
-                ╚══════════════════════════════════════╝
+                {LOGO}
             </Text>
             <Box marginTop={2}>
                 <Text color="gray">Loading...</Text>
