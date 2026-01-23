@@ -10,6 +10,7 @@ import { authenticationHook } from './auth';
 import { authRoutes } from './routes/v1/auth';
 import { profileRoutes } from './routes/v1/profile';
 import { messageRoutes } from './routes/v1/messages';
+import { preKeyRoutes } from './routes/v1/prekeys';
 import { Fastify } from '@/types';
 
 export async function startApi() {
@@ -49,6 +50,7 @@ export async function startApi() {
         // Register authenticated routes
         await profileRoutes(authenticatedApp);
         await messageRoutes(authenticatedApp);
+        await preKeyRoutes(authenticatedApp);
     });
 
     // Start HTTP

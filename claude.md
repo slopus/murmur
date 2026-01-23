@@ -185,6 +185,15 @@ if (!verifySignature(message, signature, publicKey)) {
 - Profile encryption keys signed by identity key
 - Prevents unauthorized profile key changes
 
+**PreKey System** (Signal Protocol):
+- Signed prekeys and one-time prekeys stored in unified `PreKey` table
+- `oneTime` flag distinguishes between signed (false) and one-time (true) prekeys
+- PreKeys permanently allocated to users who claim them (not deleted)
+- Allocation tracking: `allocatedTo` and `allocatedAt` fields
+- Signed prekeys can be reused for same requester
+- One-time prekeys allocated once, subsequent fetches return null
+- All prekeys signed by owner's identity key
+
 ### 8. Testing Philosophy
 
 **Comprehensive Unit Tests**:

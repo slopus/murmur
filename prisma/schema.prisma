@@ -29,6 +29,8 @@ model User {
     // Relations
     sentMessages      Message[] @relation("MessageSender")
     receivedMessages  Message[] @relation("MessageRecipient")
+    ownedPreKeys      PreKey[]  @relation("PreKeyOwner")
+    allocatedPreKeys  PreKey[]  @relation("PreKeyAllocatedTo")
 }
 
 //
@@ -54,4 +56,30 @@ model Message {
     @@index([recipientId, createdAt])
     @@index([expiresAt]) // For cleanup worker
     @@index([senderId])
+}
+
+//
+// PreKey (Signed prekeys and one-time prekeys for session establishment)
+//
+
+model PreKey {
+    id            String   @id @default(cuid())
+    createdAt     DateTime @default(now())
+
+    // Owner of this prekey
+    ownerId       String
+    owner         User     @relation("PreKeyOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+    // Prekey data
+    publicKey     String   // NaCl public key (base64)
+    signature     Bytes    // Binary signature of publicKey by identity key
+    oneTime       Boolean  // true = one-time prekey, false = signed prekey
+
+    // Allocation tracking (null if not yet allocated)
+    allocatedTo   String?  // User who claimed this prekey
+    allocatedUser User?    @relation("PreKeyAllocatedTo", fields: [allocatedTo], references: [id], onDelete: SetNull)
+    allocatedAt   DateTime? // When the prekey was allocated
+
+    @@index([ownerId, oneTime, allocatedTo])
+    @@index([ownerId, oneTime])
 }

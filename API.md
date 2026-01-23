@@ -462,6 +462,146 @@ Authorization: Bearer <accessToken>
 
 ---
 
+## PreKey Endpoints
+
+Signal-style prekey management for secure session establishment. All endpoints require `Authorization: Bearer <accessToken>` header.
+
+### Upload PreKeys
+
+Upload signed prekeys or one-time prekeys for session establishment.
+
+**Endpoint:** `POST /v1/prekeys/upload`
+
+**Headers:**
+```
+Authorization: Bearer <accessToken>
+```
+
+**Request Body:**
+```json
+{
+  "preKeys": [
+    {
+      "publicKey": "base64-nacl-public-key-1",
+      "signature": "base64-signature-by-identity-key-1",
+      "oneTime": false
+    },
+    {
+      "publicKey": "base64-nacl-public-key-2",
+      "signature": "base64-signature-by-identity-key-2",
+      "oneTime": true
+    }
+  ],
+  "timestamp": 1737500000000,
+  "signature": "base64-signature-of-entire-request"
+}
+```
+
+**Response (200):**
+```json
+{
+  "success": true,
+  "uploaded": 2
+}
+```
+
+**Validation Rules:**
+- Array can contain 1-100 prekeys
+- Each prekey signature must be valid (signed by identity key)
+- `oneTime`: `false` for signed prekeys, `true` for one-time prekeys
+- `timestamp` must be within 5 minutes of server time
+- `signature` must be valid signature of entire request
+
+**Notes:**
+- **Signed prekeys** (`oneTime: false`): Medium-term keys, rotated periodically
+- **One-time prekeys** (`oneTime: true`): Ephemeral keys for forward secrecy
+- Upload more one-time prekeys when count runs low
+- Prekeys are permanently assigned to users who claim them (not deleted)
+
+---
+
+### Get PreKey Bundle
+
+Retrieve a user's prekey bundle for initiating an encrypted session. PreKeys are permanently allocated to the requester.
+
+**Endpoint:** `GET /v1/prekeys/:identityPublicKey`
+
+**Headers:**
+```
+Authorization: Bearer <accessToken>
+```
+
+**URL Parameters:**
+- `identityPublicKey` - The identity public key of the target user
+
+**Response (200):**
+```json
+{
+  "identityKey": "identity-public-key",
+  "signedPreKey": {
+    "publicKey": "base64-signed-prekey",
+    "signature": "base64-signature",
+    "createdAt": 1737500000000
+  },
+  "oneTimePreKey": {
+    "publicKey": "base64-onetime-prekey",
+    "signature": "base64-signature"
+  }
+}
+```
+
+**Response (200 - no one-time prekeys available):**
+```json
+{
+  "identityKey": "identity-public-key",
+  "signedPreKey": {
+    "publicKey": "base64-signed-prekey",
+    "signature": "base64-signature",
+    "createdAt": 1737500000000
+  },
+  "oneTimePreKey": null
+}
+```
+
+**Error Responses:**
+- `404` - User not found or has not uploaded signed prekeys
+
+**Notes:**
+- PreKeys are **permanently allocated** to the requester (not deleted)
+- Fetching the same user's bundle again returns the same signed prekey
+- One-time prekey is allocated on first fetch, `null` if none available
+- Use for X3DH or similar key agreement protocol
+- All signatures can be verified against identity key
+- Allocation tracking enables session management and key rotation
+
+---
+
+### Get Unallocated One-Time PreKey Count
+
+Check how many unallocated one-time prekeys you have remaining.
+
+**Endpoint:** `GET /v1/prekeys/onetime/count`
+
+**Headers:**
+```
+Authorization: Bearer <accessToken>
+```
+
+**Response (200):**
+```json
+{
+  "count": 42
+}
+```
+
+**Notes:**
+- Returns count of **unallocated** one-time prekeys only
+- Monitor this to know when to upload more prekeys
+- Recommended to maintain at least 10-20 unallocated prekeys
+- Upload more when count drops below threshold
+
+---
+
 ## Signature Verification
 
 All signed requests follow this pattern:
