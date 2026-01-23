@@ -39,6 +39,6 @@ if (!hasNoWarnings || !hasNoDeprecation) {
         process.exit(1)
     }
 } else {
-    // We have the flags, run the main module
-    import('../dist/index.mjs')
+    // We have the flags, run the CLI module
+    import('../dist/cli.mjs')
 }

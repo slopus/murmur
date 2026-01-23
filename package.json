@@ -33,18 +33,25 @@
     "build": "shx rm -rf dist && npx tsc --noEmit && pkgroll",
     "test": "vitest run",
     "test:watch": "vitest",
-    "dev": "tsx src/index.ts",
+    "dev": "tsx src/cli.tsx",
+    "start": "tsx src/cli.tsx",
     "prepublishOnly": "$npm_execpath run build && $npm_execpath test"
   },
   "dependencies": {
     "@noble/ciphers": "^1.2.1",
     "@noble/curves": "^1.8.1",
     "@noble/hashes": "^1.7.1",
+    "@paralleldrive/cuid2": "^3.0.6",
+    "better-sqlite3": "^12.6.2",
     "chalk": "^5.6.2",
+    "ink": "^6.6.0",
+    "react": "^19.2.3",
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": ">=20",
+    "@types/react": "^19.2.9",
     "pkgroll": "^2.14.2",
     "shx": "^0.3.3",
     "tsx": "^4.20.6",

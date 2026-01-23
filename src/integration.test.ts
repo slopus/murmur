@@ -19,7 +19,7 @@ import {
     serializeKeyStore,
     deserializeKeyStore,
     type X3DHReceiverKeys
-} from './x3dh/index.js'
+} from './encryption/x3dh/index.js'
 import {
     // Double Ratchet
     initializeAlice,
@@ -29,13 +29,13 @@ import {
     serializeState,
     deserializeState,
     type RatchetState
-} from './ratchet/index.js'
+} from './encryption/ratchet/index.js'
 import {
     stringToBytes,
     bytesToString,
     constantTimeEqual
-} from './crypto/utils.js'
-import type { DHKeyPair } from './crypto/dh.js'
+} from './encryption/crypto/utils.js'
+import type { DHKeyPair } from './encryption/crypto/dh.js'
 
 /**
  * Complete session state combining X3DH keys and ratchet state.

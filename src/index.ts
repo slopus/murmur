@@ -17,14 +17,5 @@
  * - @noble/ciphers: ChaCha20-Poly1305 for AEAD
  */
 
-// Export cryptographic primitives
-export * from './crypto/index.js'
-
-// Export Double Ratchet protocol
-export * from './ratchet/index.js'
-
-// Export X3DH key agreement
-export * from './x3dh/index.js'
-
-// Export Session management
-export * from './session/index.js'
+// Re-export all encryption modules
+export * from './encryption/index.js'
