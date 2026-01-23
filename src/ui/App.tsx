@@ -31,21 +31,6 @@ export function App({ engine }: AppProps) {
         clearError
     } = useApp(engine)
 
-    // Render error overlay if present
-    const errorOverlay = state.error && (
-        <Box
-            position="absolute"
-            marginTop={1}
-            marginLeft={1}
-            borderStyle="round"
-            borderColor="red"
-            paddingX={2}
-            paddingY={1}
-        >
-            <Text color="red">{state.error}</Text>
-        </Box>
-    )
-
     // Render appropriate screen
     let screen: React.ReactNode
 
@@ -111,7 +96,6 @@ export function App({ engine }: AppProps) {
     return (
         <Box flexDirection="column" width="100%" height="100%">
             {screen}
-            {errorOverlay}
         </Box>
     )
 }

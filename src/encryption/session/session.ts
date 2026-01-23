@@ -63,17 +63,17 @@ import type {
 /**
  * Create a new agent with fresh keys.
  *
- * @param oneTimePreKeyCount - Number of one-time prekeys to generate
+ * @param oneTimePreKeyCount - Number of one-time prekeys to generate (default: 99, server limit is 100 total including signed prekey)
  * @returns New agent state
  *
  * @example
  * ```typescript
- * const agent = createAgent(100)
+ * const agent = createAgent()
  * const bundle = getPreKeyBundle(agent)
  * // Publish bundle to server
  * ```
  */
-export function createAgent(oneTimePreKeyCount: number = 100): AgentState {
+export function createAgent(oneTimePreKeyCount: number = 99): AgentState {
     return {
         keyStore: initializeKeyStore(oneTimePreKeyCount),
         sessions: new Map()

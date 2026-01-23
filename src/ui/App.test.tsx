@@ -55,8 +55,8 @@ describe('App', () => {
         rerender(<App engine={mockEngine} />)
 
         const output = lastFrame()
-        // Setup screen should show welcome message
-        expect(output).toContain('Welcome')
+        // Setup screen should show profile form
+        expect(output).toContain('Create Your Profile')
     })
 
     it('should render chat screen when account exists', async () => {

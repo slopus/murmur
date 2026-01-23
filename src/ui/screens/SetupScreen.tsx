@@ -4,11 +4,31 @@
  * Shown when no account exists. Collects name and creates keys.
  */
 
-import React, { useState, useCallback } from 'react'
+import React, { useState } from 'react'
 import { Box, Text, useInput } from 'ink'
 import { TextInput } from '../components/TextInput.js'
 import { Spinner } from '../components/Spinner.js'
 import { useInput as useTextInput } from '../hooks/useInput.js'
+
+const LOGO = `
+╔══════════════════════════════════════╗
+║                                      ║
+║    ███╗   ███╗██╗   ██╗██████╗       ║
+║    ████╗ ████║██║   ██║██╔══██╗      ║
+║    ██╔████╔██║██║   ██║██████╔╝      ║
+║    ██║╚██╔╝██║██║   ██║██╔══██╗      ║
+║    ██║ ╚═╝ ██║╚██████╔╝██║  ██║      ║
+║    ╚═╝     ╚═╝ ╚═════╝ ╚═╝  ╚═╝      ║
+║                                      ║
+║    Encrypted Messenger for Agents    ║
+║                                      ║
+╚══════════════════════════════════════╝
+`.trim()
+
+// Fixed width for form to prevent layout shifts
+const FORM_WIDTH = 42
+// Fixed width for text inputs (form width minus label and padding)
+const INPUT_WIDTH = 24
 
 export interface SetupScreenProps {
     step: 'name' | 'creating' | 'error'
@@ -68,15 +88,11 @@ export function SetupScreen({ step, error, onSubmit }: SetupScreenProps) {
                 width="100%"
                 height="100%"
             >
-                <Text bold color="cyan">Setting up your account...</Text>
+                <Text bold color="cyan">
+                    {LOGO}
+                </Text>
                 <Box marginTop={2}>
-                    <Spinner label="Generating encryption keys" />
-                </Box>
-                <Box marginTop={1}>
-                    <Text color="gray">Creating secure identity</Text>
-                </Box>
-                <Box marginTop={1}>
-                    <Text color="gray">Registering with server</Text>
+                    <Spinner label="Setting up your account..." />
                 </Box>
             </Box>
         )
@@ -91,9 +107,23 @@ export function SetupScreen({ step, error, onSubmit }: SetupScreenProps) {
                 width="100%"
                 height="100%"
             >
-                <Text bold color="red">Setup Failed</Text>
-                <Box marginTop={1}>
-                    <Text color="red">{error || 'Unknown error'}</Text>
+                <Text bold color="cyan">
+                    {LOGO}
+                </Text>
+                <Box
+                    marginTop={2}
+                    borderStyle="round"
+                    borderColor="red"
+                    paddingX={2}
+                    paddingY={1}
+                    width={FORM_WIDTH}
+                    flexDirection="column"
+                    alignItems="center"
+                >
+                    <Text bold color="red">Setup Failed</Text>
+                    <Box marginTop={1}>
+                        <Text color="red">{error || 'Unknown error'}</Text>
+                    </Box>
                 </Box>
                 <Box marginTop={2}>
                     <Text color="gray">Press Ctrl+C to exit</Text>
@@ -110,12 +140,9 @@ export function SetupScreen({ step, error, onSubmit }: SetupScreenProps) {
             width="100%"
             height="100%"
         >
-            <Text bold color="cyan">Welcome to Murmur</Text>
-            <Text color="gray">Encrypted messaging for AI agents</Text>
-
-            <Box marginTop={2} flexDirection="column">
-                <Text>Let's set up your profile</Text>
-            </Box>
+            <Text bold color="cyan">
+                {LOGO}
+            </Text>
 
             <Box
                 marginTop={2}
@@ -124,36 +151,42 @@ export function SetupScreen({ step, error, onSubmit }: SetupScreenProps) {
                 borderColor="gray"
                 paddingX={2}
                 paddingY={1}
+                width={FORM_WIDTH}
             >
-                <Box>
+                <Box flexDirection="column" alignItems="center" marginBottom={1}>
+                    <Text>Create Your Profile</Text>
+                </Box>
+
+                <Box height={1}>
                     <Text color={field === 'first' ? 'cyan' : 'gray'}>
                         First Name:{' '}
                     </Text>
                     <TextInput
                         value={firstNameInput.value}
                         cursor={firstNameInput.cursor}
-                        placeholder="Enter your first name"
+                        placeholder="required"
                         focused={field === 'first'}
+                        width={INPUT_WIDTH}
                     />
                 </Box>
 
-                <Box marginTop={1}>
+                <Box height={1} marginTop={1}>
                     <Text color={field === 'last' ? 'cyan' : 'gray'}>
                         Last Name:{' '}
                     </Text>
                     <TextInput
                         value={lastNameInput.value}
                         cursor={lastNameInput.cursor}
-                        placeholder="(optional)"
+                        placeholder="optional"
                         focused={field === 'last'}
+                        width={INPUT_WIDTH}
                     />
                 </Box>
             </Box>
 
-            <Box marginTop={2}>
+            <Box marginTop={1}>
                 <Text color="gray">
-                    Press <Text color="white">Tab</Text> to switch fields,{' '}
-                    <Text color="white">Enter</Text> to continue
+                    <Text color="white">Tab</Text> switch fields · <Text color="white">Enter</Text> continue
                 </Text>
             </Box>
         </Box>

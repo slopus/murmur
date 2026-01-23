@@ -39,13 +39,18 @@ export interface AppState {
  * Application state hook.
  */
 export function useApp(engine: MurmurEngine) {
+    // Determine initial screen synchronously to avoid blink
+    const initialScreen: Screen = engine.hasAccount()
+        ? { type: 'splash' }
+        : { type: 'setup', step: 'name' }
+
     const [state, setState] = useState<AppState>({
-        screen: { type: 'splash' },
+        screen: initialScreen,
         account: null,
         conversations: [],
         selectedConversation: null,
         messages: [],
-        isLoading: true,
+        isLoading: engine.hasAccount(),
         error: null
     })
 
@@ -53,30 +58,32 @@ export function useApp(engine: MurmurEngine) {
      * Initialize the application.
      */
     const initialize = useCallback(async () => {
-        try {
-            if (engine.hasAccount()) {
-                const initialized = await engine.initialize()
-                if (initialized) {
-                    const account = engine.getAccount()
-                    const conversations = engine.getConversations()
-                    setState(prev => ({
-                        ...prev,
-                        screen: { type: 'chat_list' },
-                        account,
-                        conversations,
-                        isLoading: false
-                    }))
-                    engine.startSync()
-                    return
-                }
-            }
+        // If no account, we already set screen to setup in initial state
+        if (!engine.hasAccount()) {
+            return
+        }
 
-            // No account, show setup
-            setState(prev => ({
-                ...prev,
-                screen: { type: 'setup', step: 'name' },
-                isLoading: false
-            }))
+        try {
+            const initialized = await engine.initialize()
+            if (initialized) {
+                const account = engine.getAccount()
+                const conversations = engine.getConversations()
+                setState(prev => ({
+                    ...prev,
+                    screen: { type: 'chat_list' },
+                    account,
+                    conversations,
+                    isLoading: false
+                }))
+                engine.startSync()
+            } else {
+                // Account exists but initialization failed, show setup
+                setState(prev => ({
+                    ...prev,
+                    screen: { type: 'setup', step: 'name' },
+                    isLoading: false
+                }))
+            }
         } catch (error) {
             setState(prev => ({
                 ...prev,

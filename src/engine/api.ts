@@ -56,15 +56,28 @@ export interface ServerProfile {
 }
 
 /**
+ * Prekey from server upload.
+ */
+export interface PreKeyUpload {
+    publicKey: string
+    signature: string
+    oneTime: boolean
+}
+
+/**
  * Prekey bundle from the server.
  */
 export interface ServerPreKeyBundle {
     identityKey: string
-    signedPreKey: string
-    signedPreKeyId: number
-    signedPreKeySignature: string
-    oneTimePreKey?: string
-    oneTimePreKeyId?: number
+    signedPreKey: {
+        publicKey: string
+        signature: string
+        createdAt: number
+    }
+    oneTimePreKey: {
+        publicKey: string
+        signature: string
+    } | null
 }
 
 /**
@@ -105,13 +118,24 @@ export class MurmurApi {
     }
 
     /**
-     * Sign data with the identity key.
+     * Sign string data with the identity key.
      */
     private sign(data: string): string {
         if (!this.identityPrivateKey) {
             throw new Error('Identity private key not set')
         }
         const signature = sign(stringToBytes(data), this.identityPrivateKey)
+        return encodeBase64(signature)
+    }
+
+    /**
+     * Sign raw bytes with the identity key.
+     */
+    private signBytes(data: Uint8Array): string {
+        if (!this.identityPrivateKey) {
+            throw new Error('Identity private key not set')
+        }
+        const signature = sign(data, this.identityPrivateKey)
         return encodeBase64(signature)
     }
 
@@ -257,8 +281,13 @@ export class MurmurApi {
         blob: string
     ): Promise<{ id: string; createdAt: number; expiresAt: number }> {
         const messageId = createId()
-        const signatureData = blob + messageId
-        const signature = this.sign(signatureData)
+        // Server verifies signature of: blobBytes + messageIdBytes (concatenated raw bytes)
+        const blobBytes = decodeBase64(blob)
+        const messageIdBytes = stringToBytes(messageId)
+        const messageToSign = new Uint8Array(blobBytes.length + messageIdBytes.length)
+        messageToSign.set(blobBytes, 0)
+        messageToSign.set(messageIdBytes, blobBytes.length)
+        const signature = this.signBytes(messageToSign)
 
         const response = await this.request<{
             success: boolean
@@ -294,6 +323,16 @@ export class MurmurApi {
             nextCursor: string | null
             hasMore: boolean
         }>('GET', path)
+    }
+
+    /**
+     * Get a specific message by ID.
+     */
+    async getMessage(messageId: string): Promise<InboxMessage> {
+        return this.request<InboxMessage>(
+            'GET',
+            `/v1/messages/${encodeURIComponent(messageId)}`
+        )
     }
 
     /**
@@ -357,28 +396,18 @@ export class MurmurApi {
     }
 
     /**
-     * Upload prekey bundle.
+     * Upload prekeys.
      */
-    async uploadPreKeyBundle(
-        identityKey: string,
-        signedPreKey: string,
-        signedPreKeyId: number,
-        signedPreKeySignature: string,
-        oneTimePreKeys: Array<{ id: number; key: string }>
-    ): Promise<void> {
+    async uploadPreKeys(preKeys: PreKeyUpload[]): Promise<void> {
         const timestamp = Date.now()
 
         const requestBody = {
-            identityKey,
-            signedPreKey,
-            signedPreKeyId,
-            signedPreKeySignature,
-            oneTimePreKeys,
+            preKeys,
             timestamp
         }
         const signature = this.sign(JSON.stringify(requestBody))
 
-        await this.request<{ success: boolean }>('POST', '/v1/keys/upload', {
+        await this.request<{ success: boolean }>('POST', '/v1/prekeys/upload', {
             ...requestBody,
             signature
         })
@@ -390,7 +419,15 @@ export class MurmurApi {
     async getPreKeyBundle(identityPublicKey: string): Promise<ServerPreKeyBundle> {
         return this.request<ServerPreKeyBundle>(
             'GET',
-            `/v1/keys/${encodeURIComponent(identityPublicKey)}`
+            `/v1/prekeys/${encodeURIComponent(identityPublicKey)}`
         )
+    }
+
+    /**
+     * Get count of unallocated one-time prekeys.
+     */
+    async getOneTimePreKeyCount(): Promise<number> {
+        const result = await this.request<{ count: number }>('GET', '/v1/prekeys/onetime/count')
+        return result.count
     }
 }

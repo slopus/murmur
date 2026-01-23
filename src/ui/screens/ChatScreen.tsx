@@ -190,7 +190,7 @@ export function ChatScreen({
                     </BorderBox>
                 }
                 main={
-                    <Box flexDirection="column" height="100%">
+                    <Box flexDirection="column" width="100%" height="100%">
                         {/* Messages panel */}
                         <BorderBox
                             title={selectedConversation
@@ -201,6 +201,7 @@ export function ChatScreen({
                                 }`
                                 : 'Messages'
                             }
+                            width="100%"
                             focused={focusPanel === 'messages'}
                         >
                             {selectedConversation ? (
@@ -230,6 +231,7 @@ export function ChatScreen({
                         {selectedConversation && (
                             <BorderBox
                                 title="Message"
+                                width="100%"
                                 focused={focusPanel === 'input'}
                             >
                                 <Box paddingX={1}>

@@ -148,8 +148,8 @@ export class MurmurEngine {
      * Create a new account.
      */
     async createAccount(firstName: string, lastName?: string): Promise<Account> {
-        // Create agent with encryption keys
-        this.agent = createAgent(100)
+        // Create agent with encryption keys (99 one-time + 1 signed = 100 total, server limit)
+        this.agent = createAgent()
         const identityKey = getIdentityKey(this.agent)
 
         // Create profile
@@ -170,8 +170,8 @@ export class MurmurEngine {
             encryptedProfile
         )
 
-        // Upload prekey bundle to server
-        await this.uploadPreKeyBundle()
+        // Upload prekeys to server
+        await this.uploadPreKeys()
 
         // Create account object
         this.account = {
@@ -192,31 +192,35 @@ export class MurmurEngine {
     }
 
     /**
-     * Upload prekey bundle to server.
+     * Upload prekeys to server.
      */
-    private async uploadPreKeyBundle(): Promise<void> {
+    private async uploadPreKeys(): Promise<void> {
         if (!this.agent) {
             throw new Error('Not initialized')
         }
 
         const bundle = getPreKeyBundle(this.agent, false)
+        const preKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }> = []
 
-        // Convert one-time prekeys to array for upload
-        const oneTimePreKeys: Array<{ id: number; key: string }> = []
-        for (const [id, otpk] of this.agent.keyStore.oneTimePreKeys) {
-            oneTimePreKeys.push({
-                id,
-                key: encodeBase64(otpk.keyPair.publicKey)
+        // Add signed prekey
+        preKeys.push({
+            publicKey: encodeBase64(bundle.signedPreKey),
+            signature: encodeBase64(bundle.signedPreKeySignature),
+            oneTime: false
+        })
+
+        // Add one-time prekeys
+        for (const [_id, otpk] of this.agent.keyStore.oneTimePreKeys) {
+            // Sign each one-time prekey with identity key
+            const signature = sign(otpk.keyPair.publicKey, this.agent.keyStore.identityKeyPair.privateKey)
+            preKeys.push({
+                publicKey: encodeBase64(otpk.keyPair.publicKey),
+                signature: encodeBase64(signature),
+                oneTime: true
             })
         }
 
-        await this.api.uploadPreKeyBundle(
-            encodeBase64(bundle.identityKey),
-            encodeBase64(bundle.signedPreKey),
-            bundle.signedPreKeyId,
-            encodeBase64(bundle.signedPreKeySignature),
-            oneTimePreKeys
-        )
+        await this.api.uploadPreKeys(preKeys)
     }
 
     /**
@@ -318,13 +322,16 @@ export class MurmurEngine {
         const serverBundle = await this.api.getPreKeyBundle(peerIdentityKey)
 
         // Convert to protocol PreKeyBundle
+        // Server doesn't use numeric IDs, so we use placeholders
         const bundle: PreKeyBundle = {
             identityKey: decodeBase64(serverBundle.identityKey),
-            signedPreKey: decodeBase64(serverBundle.signedPreKey),
-            signedPreKeyId: serverBundle.signedPreKeyId,
-            signedPreKeySignature: decodeBase64(serverBundle.signedPreKeySignature),
-            oneTimePreKey: serverBundle.oneTimePreKey ? decodeBase64(serverBundle.oneTimePreKey) : undefined,
-            oneTimePreKeyId: serverBundle.oneTimePreKeyId
+            signedPreKey: decodeBase64(serverBundle.signedPreKey.publicKey),
+            signedPreKeyId: 0, // Server doesn't use IDs
+            signedPreKeySignature: decodeBase64(serverBundle.signedPreKey.signature),
+            oneTimePreKey: serverBundle.oneTimePreKey
+                ? decodeBase64(serverBundle.oneTimePreKey.publicKey)
+                : undefined,
+            oneTimePreKeyId: serverBundle.oneTimePreKey ? 0 : undefined
         }
 
         // Initiate session with a placeholder message (we'll send real message later)

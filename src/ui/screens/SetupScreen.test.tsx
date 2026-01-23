@@ -15,7 +15,8 @@ describe('SetupScreen', () => {
         )
         const output = lastFrame()
 
-        expect(output).toContain('Welcome to Murmur')
+        expect(output).toContain('Encrypted Messenger for Agents')
+        expect(output).toContain('Create Your Profile')
         expect(output).toContain('First Name')
         expect(output).toContain('Last Name')
     })
@@ -28,7 +29,6 @@ describe('SetupScreen', () => {
         const output = lastFrame()
 
         expect(output).toContain('Setting up your account')
-        expect(output).toContain('Generating encryption keys')
     })
 
     it('should render error step', () => {

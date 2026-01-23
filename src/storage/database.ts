@@ -15,9 +15,11 @@ import type { SerializedAgentState } from '../encryption/session/types.js'
 /**
  * Get the Murmur data directory path.
  * Creates the directory if it doesn't exist.
+ *
+ * @param local - If true, use .murmur in current directory instead of home
  */
-export function getDataDir(): string {
-    const dir = join(homedir(), '.murmur')
+export function getDataDir(local: boolean = false): string {
+    const dir = local ? join(process.cwd(), '.murmur') : join(homedir(), '.murmur')
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true })
     }
@@ -26,9 +28,11 @@ export function getDataDir(): string {
 
 /**
  * Get the database file path.
+ *
+ * @param local - If true, use .murmur in current directory instead of home
  */
-export function getDbPath(): string {
-    return join(getDataDir(), 'murmur.db')
+export function getDbPath(local: boolean = false): string {
+    return join(getDataDir(local), 'murmur.db')
 }
 
 /**

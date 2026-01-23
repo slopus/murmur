@@ -257,55 +257,59 @@ describe('MockServer', () => {
             bobToken = bobResult.tokens.accessToken
         })
 
-        it('should upload prekey bundle', () => {
-            server.uploadPreKeyBundle(
-                aliceToken,
-                'alice-identity-key',
-                'signed-prekey',
-                1,
-                'spk-signature',
-                [
-                    { id: 1, key: 'otpk-1' },
-                    { id: 2, key: 'otpk-2' }
-                ]
-            )
+        it('should upload prekeys', () => {
+            server.uploadPreKeys(aliceToken, [
+                { publicKey: 'signed-prekey', signature: 'spk-signature', oneTime: false },
+                { publicKey: 'otpk-1', signature: 'otpk-sig-1', oneTime: true },
+                { publicKey: 'otpk-2', signature: 'otpk-sig-2', oneTime: true }
+            ])
 
             // Should be able to fetch the bundle
             const bundle = server.getPreKeyBundle(bobToken, 'alice-id')
-            expect(bundle.identityKey).toBe('alice-identity-key')
-            expect(bundle.signedPreKey).toBe('signed-prekey')
-            expect(bundle.signedPreKeyId).toBe(1)
-            expect(bundle.signedPreKeySignature).toBe('spk-signature')
+            expect(bundle.identityKey).toBe('alice-id')
+            expect(bundle.signedPreKey.publicKey).toBe('signed-prekey')
+            expect(bundle.signedPreKey.signature).toBe('spk-signature')
         })
 
-        it('should consume one-time prekeys on fetch', () => {
-            server.uploadPreKeyBundle(
-                aliceToken,
-                'alice-identity-key',
-                'signed-prekey',
-                1,
-                'spk-signature',
-                [
-                    { id: 1, key: 'otpk-1' },
-                    { id: 2, key: 'otpk-2' }
-                ]
-            )
+        it('should allocate one-time prekeys on fetch', () => {
+            server.uploadPreKeys(aliceToken, [
+                { publicKey: 'signed-prekey', signature: 'spk-signature', oneTime: false },
+                { publicKey: 'otpk-1', signature: 'otpk-sig-1', oneTime: true },
+                { publicKey: 'otpk-2', signature: 'otpk-sig-2', oneTime: true }
+            ])
 
             // First fetch gets first one-time prekey
             const bundle1 = server.getPreKeyBundle(bobToken, 'alice-id')
-            expect(bundle1.oneTimePreKey).toBe('otpk-1')
-            expect(bundle1.oneTimePreKeyId).toBe(1)
+            expect(bundle1.oneTimePreKey?.publicKey).toBe('otpk-1')
+            expect(bundle1.oneTimePreKey?.signature).toBe('otpk-sig-1')
 
             // Second fetch gets second one-time prekey
             const bundle2 = server.getPreKeyBundle(bobToken, 'alice-id')
-            expect(bundle2.oneTimePreKey).toBe('otpk-2')
-            expect(bundle2.oneTimePreKeyId).toBe(2)
+            expect(bundle2.oneTimePreKey?.publicKey).toBe('otpk-2')
+            expect(bundle2.oneTimePreKey?.signature).toBe('otpk-sig-2')
 
             // Third fetch has no one-time prekeys left
             const bundle3 = server.getPreKeyBundle(bobToken, 'alice-id')
-            expect(bundle3.oneTimePreKey).toBeUndefined()
-            expect(bundle3.oneTimePreKeyId).toBeUndefined()
-            expect(bundle3.signedPreKey).toBe('signed-prekey')
+            expect(bundle3.oneTimePreKey).toBeNull()
+            expect(bundle3.signedPreKey.publicKey).toBe('signed-prekey')
+        })
+
+        it('should get one-time prekey count', () => {
+            server.uploadPreKeys(aliceToken, [
+                { publicKey: 'signed-prekey', signature: 'spk-signature', oneTime: false },
+                { publicKey: 'otpk-1', signature: 'otpk-sig-1', oneTime: true },
+                { publicKey: 'otpk-2', signature: 'otpk-sig-2', oneTime: true }
+            ])
+
+            expect(server.getOneTimePreKeyCount(aliceToken)).toBe(2)
+
+            // Allocate one
+            server.getPreKeyBundle(bobToken, 'alice-id')
+            expect(server.getOneTimePreKeyCount(aliceToken)).toBe(1)
+
+            // Allocate another
+            server.getPreKeyBundle(bobToken, 'alice-id')
+            expect(server.getOneTimePreKeyCount(aliceToken)).toBe(0)
         })
 
         it('should fail to get bundle for user without bundle', () => {
@@ -373,23 +377,17 @@ describe('createMockApi', () => {
         const bobApi = createMockApi(server)
         await bobApi.register('bob-id', new Uint8Array(32), 'ppk', 'sig', 'ep')
 
-        // Alice uploads her prekey bundle
-        await api.uploadPreKeyBundle(
-            'alice-identity-key',
-            'signed-prekey',
-            1,
-            'spk-sig',
-            [
-                { id: 1, key: 'otpk-1' },
-                { id: 2, key: 'otpk-2' }
-            ]
-        )
+        // Alice uploads her prekeys
+        await api.uploadPreKeys([
+            { publicKey: 'signed-prekey', signature: 'spk-sig', oneTime: false },
+            { publicKey: 'otpk-1', signature: 'otpk-sig-1', oneTime: true },
+            { publicKey: 'otpk-2', signature: 'otpk-sig-2', oneTime: true }
+        ])
 
         // Bob fetches Alice's prekey bundle
         const bundle = await bobApi.getPreKeyBundle('alice-id')
-        expect(bundle.identityKey).toBe('alice-identity-key')
-        expect(bundle.signedPreKey).toBe('signed-prekey')
-        expect(bundle.oneTimePreKey).toBe('otpk-1')
-        expect(bundle.oneTimePreKeyId).toBe(1)
+        expect(bundle.identityKey).toBe('alice-id')
+        expect(bundle.signedPreKey.publicKey).toBe('signed-prekey')
+        expect(bundle.oneTimePreKey?.publicKey).toBe('otpk-1')
     })
 })

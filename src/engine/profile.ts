@@ -79,30 +79,28 @@ export function decryptProfile(encryptedProfile: string, profileSecretKey: Uint8
 /**
  * Sign the profile public key with the identity key.
  * This proves the profile belongs to this identity.
- * Signs the base64-encoded public key string for server compatibility.
+ * Signs the raw public key bytes.
  */
 export function signProfileKey(
     profilePublicKey: Uint8Array,
     identityPrivateKey: Uint8Array
 ): string {
-    // Sign the base64-encoded string, not raw bytes
-    const profilePublicKeyBase64 = encodeBase64(profilePublicKey)
-    const signature = sign(stringToBytes(profilePublicKeyBase64), identityPrivateKey)
+    // Sign the raw bytes of the profile public key
+    const signature = sign(profilePublicKey, identityPrivateKey)
     return encodeBase64(signature)
 }
 
 /**
  * Verify a profile key signature.
- * Verifies against the base64-encoded public key string.
+ * Verifies against the raw public key bytes.
  */
 export function verifyProfileKeySignature(
     profilePublicKey: Uint8Array,
     signature: string,
     identityPublicKey: Uint8Array
 ): boolean {
-    // Verify against base64-encoded string, matching signProfileKey
-    const profilePublicKeyBase64 = encodeBase64(profilePublicKey)
-    return verify(stringToBytes(profilePublicKeyBase64), decodeBase64(signature), identityPublicKey)
+    // Verify against raw bytes, matching signProfileKey
+    return verify(profilePublicKey, decodeBase64(signature), identityPublicKey)
 }
 
 /**

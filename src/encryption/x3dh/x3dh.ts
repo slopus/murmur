@@ -297,10 +297,10 @@ export function x3dhReceiver(
  * - Initial signed prekey
  * - Initial batch of one-time prekeys
  *
- * @param oneTimePreKeyCount - Number of one-time prekeys to generate (default: 100)
+ * @param oneTimePreKeyCount - Number of one-time prekeys to generate (default: 99)
  * @returns Initialized key store
  */
-export function initializeKeyStore(oneTimePreKeyCount: number = 100): X3DHKeyStore {
+export function initializeKeyStore(oneTimePreKeyCount: number = 99): X3DHKeyStore {
     const identityKeyPair = generateIdentityKeyPair()
     const signedPreKey = generateSignedPreKey(identityKeyPair, 0)
     const oneTimePreKeys = new Map<number, OneTimePreKey>()

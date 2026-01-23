@@ -38,7 +38,7 @@ describe('Full end-to-end encrypted messaging flow', () => {
     it('should complete full registration and messaging flow', async () => {
         // === ALICE SETUP ===
         // Create agent with encryption keys
-        const aliceAgent = createAgent(100)
+        const aliceAgent = createAgent(10)
         const aliceIdentity = getIdentityKey(aliceAgent)
 
         // Create profile
@@ -58,7 +58,7 @@ describe('Full end-to-end encrypted messaging flow', () => {
         const aliceToken = aliceAuth.tokens.accessToken
 
         // === BOB SETUP ===
-        const bobAgent = createAgent(100)
+        const bobAgent = createAgent(10)
         const bobIdentity = getIdentityKey(bobAgent)
 
         const bobProfile: Profile = { firstName: 'Bob' }
@@ -370,23 +370,27 @@ describe('Full end-to-end encrypted messaging flow', () => {
         )
         const bobToken = bobAuth.tokens.accessToken
 
-        // Bob uploads his prekey bundle
-        const oneTimePreKeys: Array<{ id: number; key: string }> = []
-        for (const [id, otpk] of bobAgent.keyStore.oneTimePreKeys) {
-            oneTimePreKeys.push({
-                id,
-                key: encodeBase64(otpk.keyPair.publicKey)
+        // Bob uploads his prekeys using new format
+        const preKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }> = []
+
+        // Add signed prekey
+        preKeys.push({
+            publicKey: encodeBase64(bobBundle.signedPreKey),
+            signature: encodeBase64(bobBundle.signedPreKeySignature),
+            oneTime: false
+        })
+
+        // Add one-time prekeys
+        for (const [_id, otpk] of bobAgent.keyStore.oneTimePreKeys) {
+            const sig = sign(otpk.keyPair.publicKey, bobAgent.keyStore.identityKeyPair.privateKey)
+            preKeys.push({
+                publicKey: encodeBase64(otpk.keyPair.publicKey),
+                signature: encodeBase64(sig),
+                oneTime: true
             })
         }
 
-        server.uploadPreKeyBundle(
-            bobToken,
-            encodeBase64(bobBundle.identityKey),
-            encodeBase64(bobBundle.signedPreKey),
-            bobBundle.signedPreKeyId,
-            encodeBase64(bobBundle.signedPreKeySignature),
-            oneTimePreKeys
-        )
+        server.uploadPreKeys(bobToken, preKeys)
 
         // === ALICE SETUP (initiator) ===
         const aliceAgent = createAgent(10)
@@ -408,19 +412,34 @@ describe('Full end-to-end encrypted messaging flow', () => {
         // Alice fetches Bob's prekey bundle from server
         const serverBundle = server.getPreKeyBundle(aliceToken, bobIdentity)
 
+        // Server doesn't use IDs, so we need to find the matching ID from Bob's key store
+        // This is necessary because the X3DH protocol expects to match prekeys by ID
+        let matchingOneTimePreKeyId: number | undefined
+        if (serverBundle.oneTimePreKey) {
+            const serverOtpkBytes = decodeBase64(serverBundle.oneTimePreKey.publicKey)
+            for (const [id, otpk] of bobAgent.keyStore.oneTimePreKeys) {
+                if (encodeBase64(otpk.keyPair.publicKey) === encodeBase64(serverOtpkBytes)) {
+                    matchingOneTimePreKeyId = id
+                    break
+                }
+            }
+        }
+
         // Convert server bundle to protocol bundle
         const fetchedBundle: PreKeyBundle = {
             identityKey: decodeBase64(serverBundle.identityKey),
-            signedPreKey: decodeBase64(serverBundle.signedPreKey),
-            signedPreKeyId: serverBundle.signedPreKeyId,
-            signedPreKeySignature: decodeBase64(serverBundle.signedPreKeySignature),
-            oneTimePreKey: serverBundle.oneTimePreKey ? decodeBase64(serverBundle.oneTimePreKey) : undefined,
-            oneTimePreKeyId: serverBundle.oneTimePreKeyId
+            signedPreKey: decodeBase64(serverBundle.signedPreKey.publicKey),
+            signedPreKeyId: bobAgent.keyStore.signedPreKey.id, // Use Bob's actual signed prekey ID
+            signedPreKeySignature: decodeBase64(serverBundle.signedPreKey.signature),
+            oneTimePreKey: serverBundle.oneTimePreKey
+                ? decodeBase64(serverBundle.oneTimePreKey.publicKey)
+                : undefined,
+            oneTimePreKeyId: matchingOneTimePreKeyId
         }
 
         // Verify we got a one-time prekey
         expect(fetchedBundle.oneTimePreKey).toBeDefined()
-        expect(fetchedBundle.oneTimePreKeyId).toBeDefined()
+        expect(matchingOneTimePreKeyId).toBeDefined()
 
         // Alice initiates session using fetched bundle
         const { sessionInitMessage } = initiateSession(
