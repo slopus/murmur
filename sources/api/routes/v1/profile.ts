@@ -8,7 +8,7 @@ import { events } from '@/events';
 const UpdateProfileSchema = z.object({
     profilePublicKey: z.string(),
     profileKeySignature: z.string(),
-    encryptedProfile: z.any(),
+    encryptedProfile: z.string(), // Base64-encoded encrypted profile blob
     timestamp: z.number(),
     signature: z.string(),
 });
@@ -37,7 +37,14 @@ export async function profileRoutes(app: Fastify) {
             return reply.status(404).send({ error: 'User not found' });
         }
 
-        return reply.send({ user });
+        return reply.send({
+            id: user.id,
+            profilePublicKey: user.profilePublicKey,
+            profileKeySignature: user.profileKeySignature.toString('base64'),
+            encryptedProfile: user.encryptedProfile.toString('base64'),
+            profileUpdatedAt: user.profileUpdatedAt.getTime(),
+            createdAt: user.createdAt.getTime(),
+        });
     });
 
     // Get another user's profile (requires profile public key)
@@ -54,7 +61,6 @@ export async function profileRoutes(app: Fastify) {
             where: { id: identityPublicKey },
             select: {
                 id: true,
-                createdAt: true,
                 profilePublicKey: true,
                 profileKeySignature: true,
                 encryptedProfile: true,
@@ -66,7 +72,13 @@ export async function profileRoutes(app: Fastify) {
             return reply.status(404).send({ error: 'User not found' });
         }
 
-        return reply.send({ user });
+        return reply.send({
+            id: user.id,
+            profilePublicKey: user.profilePublicKey,
+            profileKeySignature: user.profileKeySignature.toString('base64'),
+            encryptedProfile: user.encryptedProfile.toString('base64'),
+            profileUpdatedAt: user.profileUpdatedAt.getTime(),
+        });
     });
 
     // Update own profile
@@ -112,13 +124,17 @@ export async function profileRoutes(app: Fastify) {
             return reply.status(400).send({ error: 'Invalid profile key signature' });
         }
 
+        // Parse base64 to binary
+        const profileKeySignatureBuffer = Buffer.from(profileKeySignature, 'base64');
+        const encryptedProfileBuffer = Buffer.from(encryptedProfile, 'base64');
+
         // Update user profile
         const user = await db.user.update({
             where: { id: userId },
             data: {
                 profilePublicKey,
-                profileKeySignature,
-                encryptedProfile,
+                profileKeySignature: profileKeySignatureBuffer,
+                encryptedProfile: encryptedProfileBuffer,
                 profileUpdatedAt: new Date(),
             },
         });
@@ -131,10 +147,9 @@ export async function profileRoutes(app: Fastify) {
 
         return reply.send({
             success: true,
-            user: {
-                id: user.id,
+            profile: {
                 profilePublicKey: user.profilePublicKey,
-                profileUpdatedAt: user.profileUpdatedAt,
+                profileUpdatedAt: user.profileUpdatedAt.getTime(),
             },
         });
     });

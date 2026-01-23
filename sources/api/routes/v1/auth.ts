@@ -2,13 +2,13 @@ import { z } from 'zod';
 import type { Fastify } from '@/types';
 import { db } from '@/db';
 import { isValidPublicKey, verifySignature } from '@/utils/crypto';
-import { generateToken } from '@/utils/jwt';
+import { generateToken, refreshAccessToken } from '@/utils/jwt';
 
 const RegisterSchema = z.object({
     identityPublicKey: z.string(),
     profilePublicKey: z.string(),
     profileKeySignature: z.string(),
-    encryptedProfile: z.any(),
+    encryptedProfile: z.string(), // Base64-encoded encrypted profile blob
     timestamp: z.number(),
     signature: z.string(), // Signature of the entire request by identity key
 });
@@ -17,6 +17,10 @@ const LoginSchema = z.object({
     identityPublicKey: z.string(),
     timestamp: z.number(),
     signature: z.string(), // Signature of timestamp by identity key
+});
+
+const RefreshSchema = z.object({
+    refreshToken: z.string(),
 });
 
 /**
@@ -71,35 +75,60 @@ export async function authRoutes(app: Fastify) {
             return reply.status(400).send({ error: 'Invalid profile key signature' });
         }
 
-        // Check if user already exists
-        const existingUser = await db.user.findUnique({
+        // Parse base64 to binary
+        const profileKeySignatureBuffer = Buffer.from(profileKeySignature, 'base64');
+        const encryptedProfileBuffer = Buffer.from(encryptedProfile, 'base64');
+
+        // Check if user already exists (idempotent registration)
+        let user = await db.user.findUnique({
             where: { id: identityPublicKey },
         });
 
-        if (existingUser) {
-            return reply.status(409).send({ error: 'User already registered' });
+        if (user) {
+            // User exists - verify the profile matches (idempotent)
+            if (
+                user.profilePublicKey === profilePublicKey &&
+                user.profileKeySignature.equals(profileKeySignatureBuffer) &&
+                user.encryptedProfile.equals(encryptedProfileBuffer)
+            ) {
+                // Same profile - return success with tokens (idempotent)
+                const tokens = await generateToken(identityPublicKey);
+                return reply.send({
+                    success: true,
+                    accessToken: tokens.accessToken,
+                    refreshToken: tokens.refreshToken,
+                    user: {
+                        id: user.id,
+                        createdAt: user.createdAt.getTime(),
+                    },
+                });
+            } else {
+                // Different profile - this is an update, not a registration
+                return reply.status(400).send({ error: 'User exists with different profile. Use /v1/profile/update to update profile.' });
+            }
         }
 
-        // Create user
-        const user = await db.user.create({
+        // Create new user
+        user = await db.user.create({
             data: {
                 id: identityPublicKey,
                 profilePublicKey,
-                profileKeySignature,
-                encryptedProfile,
+                profileKeySignature: profileKeySignatureBuffer,
+                encryptedProfile: encryptedProfileBuffer,
                 profileUpdatedAt: new Date(),
             },
         });
 
-        // Generate JWT (privacy-kit handles refresh tokens automatically)
-        const token = await generateToken(identityPublicKey);
+        // Generate token pair (access + refresh)
+        const tokens = await generateToken(identityPublicKey);
 
         return reply.send({
             success: true,
-            token,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
             user: {
                 id: user.id,
-                createdAt: user.createdAt,
+                createdAt: user.createdAt.getTime(),
             },
         });
     });
@@ -138,16 +167,38 @@ export async function authRoutes(app: Fastify) {
             return reply.status(404).send({ error: 'User not found' });
         }
 
-        // Generate JWT (privacy-kit handles refresh tokens automatically)
-        const token = await generateToken(identityPublicKey);
+        // Generate token pair (access + refresh)
+        const tokens = await generateToken(identityPublicKey);
 
         return reply.send({
             success: true,
-            token,
+            accessToken: tokens.accessToken,
+            refreshToken: tokens.refreshToken,
             user: {
                 id: user.id,
-                createdAt: user.createdAt,
+                createdAt: user.createdAt.getTime(),
             },
+        });
+    });
+
+    // Refresh access token using refresh token
+    app.post('/v1/auth/refresh', {
+        schema: {
+            body: RefreshSchema,
+        },
+    }, async (request, reply) => {
+        const { refreshToken } = request.body;
+
+        // Attempt to refresh the access token
+        const newAccessToken = await refreshAccessToken(refreshToken);
+
+        if (!newAccessToken) {
+            return reply.status(401).send({ error: 'Invalid or expired refresh token' });
+        }
+
+        return reply.send({
+            success: true,
+            accessToken: newAccessToken,
         });
     });
 }

@@ -15,8 +15,12 @@ async function validateCuid(id: string): Promise<boolean> {
 const SendMessageSchema = z.object({
     messageId: z.string(), // cuid2 provided by sender
     recipientId: z.string(),
-    blob: z.any(), // Encrypted message blob
+    blob: z.string(), // Base64-encoded encrypted message blob
     signature: z.string(), // Signature of (blob + messageId) by sender's identity key
+});
+
+const AckMessagesSchema = z.object({
+    messageIds: z.array(z.string()).min(1).max(100),
 });
 
 /**
@@ -56,8 +60,12 @@ export async function messageRoutes(app: Fastify) {
             return reply.status(404).send({ error: 'Recipient not found' });
         }
 
-        // Verify signature (blob + messageId signed by sender's identity key)
-        const messageToSign = JSON.stringify({ blob, messageId });
+        // Parse base64 to binary
+        const blobBuffer = Buffer.from(blob, 'base64');
+        const signatureBuffer = Buffer.from(signature, 'base64');
+
+        // Verify signature (blob + messageId concatenated, signed by sender's identity key)
+        const messageToSign = blob + messageId;
         if (!verifySignature(messageToSign, signature, senderId)) {
             return reply.status(400).send({ error: 'Invalid message signature' });
         }
@@ -72,8 +80,8 @@ export async function messageRoutes(app: Fastify) {
                 id: messageId,
                 senderId,
                 recipientId,
-                blob,
-                signature,
+                blob: blobBuffer,
+                signature: signatureBuffer,
                 expiresAt,
             },
         });
@@ -84,47 +92,69 @@ export async function messageRoutes(app: Fastify) {
             messageId: message.id,
         });
 
-        // Notify via SSE if recipient is connected
+        // Notify via SSE if recipient is connected (send full message)
         sseManager.sendToUser(recipientId, 'message', {
-            messageId: message.id,
+            id: message.id,
             senderId,
-            createdAt: message.createdAt,
+            blob: blobBuffer.toString('base64'),
+            signature: signatureBuffer.toString('base64'),
+            createdAt: message.createdAt.getTime(),
+            expiresAt: message.expiresAt.getTime(),
         });
 
         return reply.send({
             success: true,
             message: {
                 id: message.id,
-                createdAt: message.createdAt,
-                expiresAt: message.expiresAt,
+                createdAt: message.createdAt.getTime(),
+                expiresAt: message.expiresAt.getTime(),
             },
         });
     });
 
-    // Get pending messages
+    // Get pending messages with cursor-based pagination
     app.get('/v1/messages/inbox', {
         schema: {
             querystring: z.object({
-                limit: z.string().optional().transform(val => val ? parseInt(val) : 50),
-                offset: z.string().optional().transform(val => val ? parseInt(val) : 0),
+                limit: z.string().optional().transform(val => {
+                    const parsed = val ? parseInt(val) : 50;
+                    return Math.min(parsed, 100); // Cap at 100
+                }),
+                cursor: z.string().optional(),
             }),
         },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
-        const { limit, offset } = request.query;
+        const { limit, cursor } = request.query;
 
+        // Decode cursor (base64-encoded timestamp)
+        let cursorDate: Date | undefined;
+        if (cursor) {
+            try {
+                const decodedTimestamp = parseInt(Buffer.from(cursor, 'base64').toString('utf-8'));
+                cursorDate = new Date(decodedTimestamp);
+            } catch (error) {
+                return reply.status(400).send({ error: 'Invalid cursor' });
+            }
+        }
+
+        // Fetch messages (oldest first)
         const messages = await db.message.findMany({
             where: {
                 recipientId: userId,
                 expiresAt: {
                     gt: new Date(), // Only non-expired messages
                 },
+                ...(cursorDate ? {
+                    createdAt: {
+                        gt: cursorDate, // Messages after cursor
+                    },
+                } : {}),
             },
             orderBy: {
-                createdAt: 'desc',
+                createdAt: 'asc', // Oldest first
             },
-            take: limit,
-            skip: offset,
+            take: limit + 1, // Fetch one extra to check if there are more
             select: {
                 id: true,
                 senderId: true,
@@ -132,31 +162,34 @@ export async function messageRoutes(app: Fastify) {
                 signature: true,
                 createdAt: true,
                 expiresAt: true,
-                deliveredAt: true,
             },
         });
 
-        // Mark undelivered messages as delivered
-        const undeliveredIds = messages
-            .filter(m => !m.deliveredAt)
-            .map(m => m.id);
+        // Check if there are more messages
+        const hasMore = messages.length > limit;
+        const returnMessages = hasMore ? messages.slice(0, limit) : messages;
 
-        if (undeliveredIds.length > 0) {
-            await db.message.updateMany({
-                where: {
-                    id: { in: undeliveredIds },
-                },
-                data: {
-                    deliveredAt: new Date(),
-                },
-            });
+        // Generate next cursor from last message
+        let nextCursor: string | null = null;
+        if (hasMore && returnMessages.length > 0) {
+            const lastMessage = returnMessages[returnMessages.length - 1];
+            nextCursor = Buffer.from(lastMessage.createdAt.getTime().toString()).toString('base64');
         }
 
+        // Convert to Unix timestamps and encode binary to base64
+        const formattedMessages = returnMessages.map(m => ({
+            id: m.id,
+            senderId: m.senderId,
+            blob: m.blob.toString('base64'),
+            signature: m.signature.toString('base64'),
+            createdAt: m.createdAt.getTime(),
+            expiresAt: m.expiresAt.getTime(),
+        }));
+
         return reply.send({
-            messages,
-            total: messages.length,
-            limit,
-            offset,
+            messages: formattedMessages,
+            nextCursor,
+            hasMore,
         });
     });
 
@@ -195,73 +228,54 @@ export async function messageRoutes(app: Fastify) {
         return reply.send({ message });
     });
 
-    // Delete a message (recipient only)
-    app.delete('/v1/messages/:messageId', {
+    // Acknowledge (delete) messages in batch
+    app.post('/v1/messages/ack', {
         schema: {
-            params: z.object({
-                messageId: z.string(),
-            }),
+            body: AckMessagesSchema,
         },
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
-        const { messageId } = request.params;
+        const { messageIds } = request.body;
 
-        const message = await db.message.findUnique({
-            where: { id: messageId },
+        const failed: Array<{ messageId: string; error: string }> = [];
+        let acknowledged = 0;
+
+        // Process each message
+        for (const messageId of messageIds) {
+            try {
+                const message = await db.message.findUnique({
+                    where: { id: messageId },
+                });
+
+                if (!message) {
+                    failed.push({ messageId, error: 'Message not found' });
+                    continue;
+                }
+
+                if (message.recipientId !== userId) {
+                    failed.push({ messageId, error: 'Not authorized' });
+                    continue;
+                }
+
+                // Delete the message
+                await db.message.delete({
+                    where: { id: messageId },
+                });
+
+                acknowledged++;
+            } catch (error) {
+                failed.push({ messageId, error: 'Failed to acknowledge' });
+            }
+        }
+
+        // Return 207 Multi-Status if there are failures, otherwise 200
+        const statusCode = failed.length > 0 ? 207 : 200;
+
+        return reply.status(statusCode).send({
+            success: true,
+            acknowledged,
+            failed,
         });
-
-        if (!message) {
-            return reply.status(404).send({ error: 'Message not found' });
-        }
-
-        // Ensure user is the recipient
-        if (message.recipientId !== userId) {
-            return reply.status(403).send({ error: 'Not authorized to delete this message' });
-        }
-
-        await db.message.delete({
-            where: { id: messageId },
-        });
-
-        return reply.send({ success: true });
-    });
-
-    // Acknowledge a message (mark as delivered and delete from Redis Stream)
-    app.post('/v1/messages/:messageId/ack', {
-        schema: {
-            params: z.object({
-                messageId: z.string(),
-            }),
-        },
-    }, async (request, reply) => {
-        const userId = getAuthUserId(request);
-        const { messageId } = request.params;
-
-        // Verify the message exists and user is the recipient
-        const message = await db.message.findUnique({
-            where: { id: messageId },
-        });
-
-        if (!message) {
-            return reply.status(404).send({ error: 'Message not found' });
-        }
-
-        if (message.recipientId !== userId) {
-            return reply.status(403).send({ error: 'Not authorized to acknowledge this message' });
-        }
-
-        // Mark as delivered in database if not already
-        if (!message.deliveredAt) {
-            await db.message.update({
-                where: { id: messageId },
-                data: { deliveredAt: new Date() },
-            });
-        }
-
-        // Acknowledge in Redis Stream (this removes it from the stream)
-        await events.acknowledgeMessage(messageId);
-
-        return reply.send({ success: true });
     });
 
     // SSE stream for new messages

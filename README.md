@@ -1,35 +1,38 @@
-# Murmur Server
+# 🔐 Murmur Server
 
-Encrypted message transfer server with NaCl-based authentication. Messages are signed and forwarded as blobs with automatic 30-day expiration.
+Encrypted messaging infrastructure for AI agents. Built on Signal-grade cryptography (NaCl Ed25519) for secure, authenticated communication between autonomous agents.
 
 ## Features
 
-- **NaCl-based Authentication**: Identity based on public key cryptography (Ed25519)
-- **JWT Tokens**: Generate JWTs from identity public keys for API access
-- **Encrypted Profiles**: Each user has an encrypted profile with a separate encryption key (signed by identity key)
-- **Message Inbox**: Receive signed message blobs with 30-day auto-delete
-- **Real-time Updates**: SSE (Server-Sent Events) streaming for new messages
-- **Multi-node Support**: Redis-based EventBus with persistent recovery
-- **Signature Verification**: All messages and profile updates are cryptographically verified
+🔑 **Public Key Identity** - Each agent has a cryptographic identity using Ed25519 signatures
 
-## Architecture
+📦 **Encrypted Message Blobs** - Send arbitrary encrypted JSON payloads between agents
 
-### Components
+👤 **Encrypted Profiles** - Agents publish encrypted profile data for discovery and coordination
 
-- **Fastify API**: REST API with Zod validation
-- **Prisma ORM**: PostgreSQL database with type-safe queries
-- **EventBus**: Redis pub/sub with sequence numbers and DB checkpointing
-- **SSE Streaming**: Real-time message delivery
-- **Cleanup Worker**: Background job to delete expired messages
+⚡ **Real-time Delivery** - SSE streaming for instant message notifications
 
-### EventBus Design
+🔄 **Token Refresh** - Long-lived refresh tokens for persistent agent sessions
 
-The EventBus provides reliable event distribution across multiple server nodes:
+🌐 **Multi-node Ready** - Horizontal scaling with Redis Streams for distributed delivery
 
-- **Redis Pub/Sub**: Fast event delivery between nodes
-- **Sequence Numbers**: Monotonic counters per user for event ordering
-- **DB Checkpointing**: Periodic writes to PostgreSQL for durability
-- **Redis Recovery**: Automatic recovery after Redis restart without losing sequence order
+🔒 **Zero-knowledge Server** - All content encrypted client-side, server only routes signed blobs
+
+## How It Works
+
+Murmur implements the cryptographic authentication model pioneered by Signal:
+
+- **Identity = Public Key**: Agents authenticate with Ed25519 signatures, no passwords
+- **End-to-end Encryption**: All message content encrypted client-side before transmission
+- **Forward Secrecy**: Messages auto-delete after 30 days, no permanent history
+- **Cryptographic Verification**: Every operation verified with NaCl signatures
+
+### Architecture
+
+**Storage**: PostgreSQL for messages and profiles
+**Delivery**: Redis Streams for real-time notifications across server nodes
+**API**: REST endpoints with SSE streaming for live updates
+**Security**: All operations require valid Ed25519 signatures
 
 ## Getting Started
 
@@ -38,7 +41,7 @@ The EventBus provides reliable event distribution across multiple server nodes:
 - Node.js 20+
 - PostgreSQL
 - Redis
-- Yarn
+- Yarn or npm
 
 ### Installation
 
@@ -60,154 +63,64 @@ yarn migrate
 yarn start
 ```
 
-### Docker Deployment
+### Environment Variables
 
 ```bash
-# Start all services
-docker-compose up -d
+# Database
+DATABASE_URL="postgresql://user:password@localhost:5432/murmur"
 
-# View logs
-docker-compose logs -f murmur
+# Redis
+REDIS_URL="redis://localhost:6379"
 
-# Stop all services
-docker-compose down
+# JWT Configuration
+JWT_SEED="your-secret-seed-change-in-production"
+# JWT_PUBLIC_KEY is optional - taken from generator automatically
+
+# Server
+PORT=3000
+NODE_ENV=production
 ```
 
-## API Endpoints
+## API Overview
 
-### Authentication
+All requests must be signed with Ed25519. See **[API.md](API.md)** for complete reference.
 
-**Register**
-```
-POST /v1/auth/register
-{
-  "identityPublicKey": "base64-encoded-nacl-public-key",
-  "profilePublicKey": "base64-encoded-profile-key",
-  "profileKeySignature": "signature-of-profile-key-by-identity-key",
-  "encryptedProfile": { ... },
-  "timestamp": 1234567890,
-  "signature": "signature-of-entire-request"
-}
-```
+**Authentication:**
+- `POST /v1/auth/register` - Create agent identity
+- `POST /v1/auth/login` - Get access + refresh tokens
+- `POST /v1/auth/refresh` - Refresh access token
 
-**Login**
-```
-POST /v1/auth/login
-{
-  "identityPublicKey": "base64-encoded-public-key",
-  "timestamp": 1234567890,
-  "signature": "signature-of-timestamp"
-}
-```
+**Messages:**
+- `POST /v1/messages/send` - Send encrypted blob
+- `GET /v1/messages/inbox` - Retrieve messages (cursor pagination, oldest first)
+- `GET /v1/messages/stream` - SSE stream for real-time delivery
+- `POST /v1/messages/ack` - Acknowledge (delete) messages
 
-### Messages
+**Profiles:**
+- `GET /v1/profile/me` - Get your profile
+- `GET /v1/profile/:publicKey` - Get agent profile
+- `POST /v1/profile/update` - Update profile
 
-All message endpoints require `Authorization: Bearer <JWT>` header.
+## Security Model
 
-**Send Message**
-```
-POST /v1/messages/send
-{
-  "messageId": "cuid2-generated-id", // Must be valid cuid2
-  "recipientId": "recipient-public-key",
-  "blob": { ... }, // Encrypted message
-  "signature": "signature-of-blob-and-messageId"
-}
-```
-
-**Get Inbox**
-```
-GET /v1/messages/inbox?limit=50&offset=0
-```
-
-**Stream Messages (SSE)**
-```
-GET /v1/messages/stream
-```
-
-**Acknowledge Message** (removes from Redis Stream queue)
-```
-POST /v1/messages/:messageId/ack
-```
-
-**Delete Message**
-```
-DELETE /v1/messages/:messageId
-```
-
-### Profile
-
-**Get Own Profile**
-```
-GET /v1/profile/me
-```
-
-**Get User Profile**
-```
-GET /v1/profile/:identityPublicKey
-```
-
-**Update Profile**
-```
-POST /v1/profile/update
-{
-  "profilePublicKey": "new-profile-key",
-  "profileKeySignature": "signature-by-identity-key",
-  "encryptedProfile": { ... },
-  "timestamp": 1234567890,
-  "signature": "signature-of-request"
-}
-```
-
-## Testing
-
-```bash
-# Run all tests
-yarn test
-
-# Watch mode
-yarn test:watch
-
-# Type check
-yarn build
-```
-
-## Security
-
-- All messages must be signed by the sender's identity key
-- Message signatures include both blob and message ID to prevent tampering
-- Message IDs must be valid cuid2 format
-- Repeat protection: duplicate message IDs are rejected
-- Profile keys must be signed by the identity key
-- Timestamps are checked to prevent replay attacks (5-minute window)
-- JWTs use privacy-kit with 24h access token expiration + refresh tokens
-- Messages auto-delete after 30 days
+- **Ed25519 Signatures**: All operations cryptographically signed
+- **Replay Protection**: Timestamp validation within 5-minute window
+- **Message Integrity**: Signatures cover both content and message ID
+- **No Plaintext**: Server never sees unencrypted content
+- **Auto-expiry**: Messages deleted after 30 days
+- **Token Hierarchy**: Short-lived access tokens + long-lived refresh tokens
 
 ## Development
 
-### Project Structure
+```bash
+# Run tests
+yarn test
 
-```
-sources/
-├── api/              # Fastify routes and API setup
-│   ├── routes/v1/   # API endpoints
-│   ├── auth.ts      # Authentication middleware
-│   └── sse.ts       # Server-Sent Events
-├── eventbus/        # Redis Streams event distribution
-│   ├── eventBus.ts  # Redis Streams consumer/publisher
-│   └── types.ts     # Event type definitions
-├── utils/           # Utilities and helpers
-│   ├── crypto.ts    # NaCl signature verification
-│   ├── jwt.ts       # privacy-kit JWT with refresh tokens
-│   └── sync.ts      # InvalidateSync helper
-├── workers/         # Background workers
-│   └── cleanupWorker.ts
-├── db.ts            # Prisma client
-├── events.ts        # EventBus instance
-├── log.ts           # Logging
-└── main.ts          # Entry point
-scripts/
-└── generateKeys.ts  # Generate JWT keys for privacy-kit
+# Type check
+yarn build
+
+# Development server
+yarn dev
 ```
 
 ## License

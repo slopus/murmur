@@ -6,10 +6,6 @@ generator client {
     previewFeatures = ["metrics", "relationJoins"]
 }
 
-generator json {
-    provider = "prisma-json-types-generator"
-}
-
 datasource db {
     provider = "postgresql"
     url      = env("DATABASE_URL")
@@ -25,14 +21,10 @@ model User {
     updatedAt         DateTime @updatedAt
 
     // Current profile encryption key (signed by identity key)
-    profilePublicKey  String? // Separate NaCl public key for profile encryption
-
-    /// [ProfileSignature]
-    profileKeySignature Json? // Signature of profilePublicKey by identity key
-
-    /// [EncryptedProfile]
-    encryptedProfile  Json? // Encrypted profile data
-    profileUpdatedAt  DateTime?
+    profilePublicKey  String // Separate NaCl public key for profile encryption
+    profileKeySignature Bytes // Binary signature of profilePublicKey by identity key
+    encryptedProfile  Bytes // Binary encrypted profile blob
+    profileUpdatedAt  DateTime @default(now())
 
     // Relations
     sentMessages      Message[] @relation("MessageSender")
@@ -56,11 +48,8 @@ model Message {
     recipientId String
     recipient   User   @relation("MessageRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
 
-    /// [MessageBlob]
-    blob        Json   // The encrypted message blob (arbitrary structure)
-
-    /// [MessageSignature]
-    signature   String // NaCl signature of (blob + messageId) by sender's identity key
+    blob        Bytes // Binary encrypted message blob (stored as bytea in PostgreSQL)
+    signature   Bytes // Binary NaCl signature of (blob + messageId) by sender's identity key
 
     @@index([recipientId, createdAt])
     @@index([expiresAt]) // For cleanup worker
