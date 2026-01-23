@@ -92,14 +92,9 @@ export async function messageRoutes(app: Fastify) {
             messageId: message.id,
         });
 
-        // Notify via SSE if recipient is connected (send full message)
+        // Notify via SSE if recipient is connected (send only message ID)
         sseManager.sendToUser(recipientId, 'message', {
-            id: message.id,
-            senderId,
-            blob: blobBuffer.toString('base64'),
-            signature: signatureBuffer.toString('base64'),
-            createdAt: message.createdAt.getTime(),
-            expiresAt: message.expiresAt.getTime(),
+            messageId: message.id,
         });
 
         return reply.send({
@@ -319,12 +314,18 @@ export async function messageRoutes(app: Fastify) {
         const connection = new SSEConnection(reply);
         sseManager.addConnection(userId, connection);
 
-        // Send initial connected event with undelivered message IDs
+        // Send initial connected event
         connection.send('connected', {
             userId,
             timestamp: Date.now(),
-            undeliveredMessageIds: undeliveredMessages.map(m => m.id),
         });
+
+        // Send all undelivered messages as message events
+        for (const message of undeliveredMessages) {
+            connection.send('message', {
+                messageId: message.id,
+            });
+        }
 
         // Send heartbeat every 30 seconds
         const heartbeatInterval = setInterval(() => {

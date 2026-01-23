@@ -262,37 +262,39 @@ Authorization: Bearer <accessToken>
 **Connected Event (sent immediately on connection):**
 ```
 event: connected
-data: {"userId":"user-public-key","timestamp":1737500000000,"undeliveredMessageIds":["msg-id-1","msg-id-2","msg-id-3"]}
+data: {"userId":"user-public-key","timestamp":1737500000000}
 
 ```
 
-**Message Event:**
+**Message Event (notification only, contains message ID):**
 ```
 event: message
-data: {"id":"cuid2-id","senderId":"sender-key","blob":"base64-blob","signature":"base64-sig","createdAt":1737500000000,"expiresAt":1740092000000}
+data: {"messageId":"cuid2-message-id"}
 
 ```
 
-**Ping Event:**
+**Ping Event (keepalive):**
 ```
 event: ping
 data: {"timestamp":1737500000000}
 
 ```
 
-**Connection Behavior:**
-- Initial `connected` event includes all undelivered message IDs
-- New messages delivered in real-time as `message` events
-- Ping sent every 30 seconds to keep connection alive
-- Connection closes after 5 minutes of inactivity
-- Client should reconnect on disconnect
+**Connection Flow:**
+1. Client connects to SSE stream
+2. Server sends `connected` event
+3. Server immediately sends `message` events for all undelivered messages (oldest first)
+4. Server sends `message` events for new messages as they arrive
+5. Server sends `ping` every 30 seconds
+6. Connection closes after 5 minutes of inactivity
 
 **Notes:**
-- Use `undeliveredMessageIds` to fetch messages via `GET /v1/messages/:messageId`
+- SSE only sends message IDs, not message content
+- Client fetches full message via `GET /v1/messages/:messageId` using the ID
+- All undelivered messages sent as individual `message` events on connection
 - Messages are NOT acknowledged when streamed
 - Messages remain in database until acknowledged with `/v1/messages/ack`
-- Use for live notifications, poll `/inbox` for reliability
-- All timestamps in millisecond precision
+- Efficient: SSE used only for notifications, not data transfer
 
 ---
 
