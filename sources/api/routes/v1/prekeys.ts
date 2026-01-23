@@ -68,7 +68,9 @@ export async function preKeyRoutes(app: Fastify) {
 
         // Verify each prekey signature
         for (const preKey of preKeys) {
-            if (!verifySignature(preKey.publicKey, preKey.signature, userId)) {
+            // Decode public key to bytes for signature verification
+            const preKeyPublicKeyBuffer = Buffer.from(preKey.publicKey, 'base64');
+            if (!verifySignature(preKeyPublicKeyBuffer, preKey.signature, userId)) {
                 preKeysUploadedTotal.inc({ status: 'invalid_prekey_signature' });
                 return reply.status(400).send({
                     error: `Invalid signature for prekey ${preKey.publicKey.substring(0, 8)}...`

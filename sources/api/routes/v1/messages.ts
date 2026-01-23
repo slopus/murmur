@@ -81,8 +81,12 @@ export async function messageRoutes(app: Fastify) {
         const blobBuffer = Buffer.from(blob, 'base64');
         const signatureBuffer = Buffer.from(signature, 'base64');
 
-        // Verify signature (blob + messageId concatenated, signed by sender's identity key)
-        const messageToSign = blob + messageId;
+        // Verify signature (blob bytes + messageId bytes concatenated, signed by sender's identity key)
+        const messageIdBytes = new TextEncoder().encode(messageId);
+        const messageToSign = new Uint8Array(blobBuffer.length + messageIdBytes.length);
+        messageToSign.set(blobBuffer, 0);
+        messageToSign.set(messageIdBytes, blobBuffer.length);
+
         if (!verifySignature(messageToSign, signature, senderId)) {
             messagesSentTotal.inc({ status: 'invalid_signature' });
             return reply.status(400).send({ error: 'Invalid message signature' });

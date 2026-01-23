@@ -143,15 +143,16 @@ export async function profileRoutes(app: Fastify) {
             return reply.status(400).send({ error: 'Invalid request signature' });
         }
 
-        // Verify profile key signature (profile key signed by identity key)
-        if (!verifySignature(profilePublicKey, profileKeySignature, userId)) {
+        // Parse base64 to binary
+        const profilePublicKeyBuffer = Buffer.from(profilePublicKey, 'base64');
+        const profileKeySignatureBuffer = Buffer.from(profileKeySignature, 'base64');
+        const encryptedProfileBuffer = Buffer.from(encryptedProfile, 'base64');
+
+        // Verify profile key signature (profile key bytes signed by identity key)
+        if (!verifySignature(profilePublicKeyBuffer, profileKeySignature, userId)) {
             profileUpdatesTotal.inc({ status: 'invalid_profile_signature' });
             return reply.status(400).send({ error: 'Invalid profile key signature' });
         }
-
-        // Parse base64 to binary
-        const profileKeySignatureBuffer = Buffer.from(profileKeySignature, 'base64');
-        const encryptedProfileBuffer = Buffer.from(encryptedProfile, 'base64');
 
         // Update user profile
         const user = await db.user.update({
