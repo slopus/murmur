@@ -1,0 +1,80 @@
+// Murmur Server Prisma Schema
+// Encrypted message transfer with NaCl-based authentication
+
+generator client {
+    provider        = "prisma-client-js"
+    previewFeatures = ["metrics", "relationJoins"]
+}
+
+generator json {
+    provider = "prisma-json-types-generator"
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+//
+// User (Identity based on NaCl public key)
+//
+
+model User {
+    id                String   @id // NaCl public key (base64 encoded)
+    createdAt         DateTime @default(now())
+    updatedAt         DateTime @updatedAt
+
+    // Current profile encryption key (signed by identity key)
+    profilePublicKey  String? // Separate NaCl public key for profile encryption
+
+    /// [ProfileSignature]
+    profileKeySignature Json? // Signature of profilePublicKey by identity key
+
+    /// [EncryptedProfile]
+    encryptedProfile  Json? // Encrypted profile data
+    profileUpdatedAt  DateTime?
+
+    // Relations
+    sentMessages      Message[] @relation("MessageSender")
+    receivedMessages  Message[] @relation("MessageRecipient")
+    sequence          UserSequence?
+}
+
+//
+// UserSequence (for EventBus sequence numbers)
+//
+
+model UserSequence {
+    userId    String   @id
+    user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+    seqno     Int      @default(1)
+    updatedAt DateTime @updatedAt
+}
+
+//
+// Message (Signed blobs with 30-day auto-delete)
+//
+
+model Message {
+    id          String   @id @default(cuid(2))
+    createdAt   DateTime @default(now())
+    expiresAt   DateTime // Auto-delete after 30 days (createdAt + 30 days)
+    deliveredAt DateTime? // When the message was first read by recipient
+
+    // Sender and recipient (identity public keys)
+    senderId    String
+    sender      User   @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+    recipientId String
+    recipient   User   @relation("MessageRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+    /// [MessageBlob]
+    blob        Json   // The encrypted message blob (arbitrary structure)
+
+    /// [MessageSignature]
+    signature   Json   // NaCl signature of the blob by sender's identity key
+
+    @@index([recipientId, createdAt])
+    @@index([expiresAt]) // For cleanup worker
+    @@index([senderId])
+}
