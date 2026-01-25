@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Fastify } from '@/types';
 import { db } from '@/db';
 import { getAuthUserId } from '@/api/auth';
-import { verifySignature } from '@/utils/crypto';
+import { normalizePublicKey, publicKeyToExternal, verifySignature } from '@/utils/crypto';
 import { events } from '@/events';
 import { sseManager, SSEConnection } from '@/api/sse';
 import { rateLimitConfigs } from '@/api/rateLimit';
@@ -41,6 +41,7 @@ export async function messageRoutes(app: Fastify) {
     }, async (request, reply) => {
         const senderId = getAuthUserId(request);
         const { messageId, recipientId, blob, signature } = request.body;
+        let normalizedRecipientId: string;
 
         // Validate size limits
         try {
@@ -48,6 +49,14 @@ export async function messageRoutes(app: Fastify) {
         } catch (error: any) {
             messagesSentTotal.inc({ status: 'size_limit_exceeded' });
             return reply.status(400).send({ error: error.message });
+        }
+
+        // Normalize recipient public key
+        try {
+            normalizedRecipientId = normalizePublicKey(recipientId);
+        } catch (error: any) {
+            messagesSentTotal.inc({ status: 'invalid_recipient_key' });
+            return reply.status(400).send({ error: 'Invalid recipient public key format' });
         }
 
         // Validate message ID is a valid cuid2
@@ -69,7 +78,7 @@ export async function messageRoutes(app: Fastify) {
 
         // Check if recipient exists
         const recipient = await db.user.findUnique({
-            where: { id: recipientId },
+            where: { id: normalizedRecipientId },
         });
 
         if (!recipient) {
@@ -101,7 +110,7 @@ export async function messageRoutes(app: Fastify) {
             data: {
                 id: messageId,
                 senderId,
-                recipientId,
+                recipientId: normalizedRecipientId,
                 blob: blobBuffer,
                 signature: signatureBuffer,
                 expiresAt,
@@ -113,13 +122,13 @@ export async function messageRoutes(app: Fastify) {
         messagesSentTotal.inc({ status: 'success' });
 
         // Publish message event to notify recipient
-        await events.publishUser(recipientId, {
+        await events.publishUser(normalizedRecipientId, {
             type: 'message:new',
             messageId: message.id,
         });
 
         // Notify via SSE if recipient is connected (send only message ID)
-        sseManager.sendToUser(recipientId, 'message', {
+        sseManager.sendToUser(normalizedRecipientId, 'message', {
             messageId: message.id,
         });
 
@@ -203,7 +212,7 @@ export async function messageRoutes(app: Fastify) {
         // Convert to Unix timestamps and encode binary to base64
         const formattedMessages = returnMessages.map(m => ({
             id: m.id,
-            senderId: m.senderId,
+            senderId: publicKeyToExternal(m.senderId),
             blob: Buffer.from(m.blob).toString('base64'),
             signature: Buffer.from(m.signature).toString('base64'),
             createdAt: m.createdAt.getTime(),
@@ -265,7 +274,7 @@ export async function messageRoutes(app: Fastify) {
 
         return reply.send({
             id: message.id,
-            senderId: message.senderId,
+            senderId: publicKeyToExternal(message.senderId),
             blob: Buffer.from(message.blob).toString('base64'),
             signature: Buffer.from(message.signature).toString('base64'),
             createdAt: message.createdAt.getTime(),
@@ -354,7 +363,7 @@ export async function messageRoutes(app: Fastify) {
 
         // Send initial connected event
         connection.send('connected', {
-            userId,
+            userId: publicKeyToExternal(userId),
             timestamp: Date.now(),
         });
 

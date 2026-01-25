@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Fastify } from '@/types';
 import { db } from '@/db';
 import { getAuthUserId } from '@/api/auth';
-import { isValidPublicKey, verifySignature } from '@/utils/crypto';
+import { isValidPublicKey, normalizePublicKey, publicKeyToExternal, verifySignature } from '@/utils/crypto';
 import { events } from '@/events';
 import { rateLimitConfigs } from '@/api/rateLimit';
 import { profileUpdatesTotal } from '@/metrics/prometheus';
@@ -45,8 +45,8 @@ export async function profileRoutes(app: Fastify) {
         }
 
         return reply.send({
-            id: user.id,
-            profilePublicKey: user.profilePublicKey,
+            id: publicKeyToExternal(user.id),
+            profilePublicKey: publicKeyToExternal(user.profilePublicKey),
             profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
             encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
             profileUpdatedAt: user.profileUpdatedAt.getTime(),
@@ -80,8 +80,15 @@ export async function profileRoutes(app: Fastify) {
             return reply.status(400).send({ error: error.message });
         }
 
+        let normalizedProfilePublicKey: string;
         // Validate profile public key format
         if (!isValidPublicKey(profilePublicKey)) {
+            profileUpdatesTotal.inc({ status: 'invalid_key' });
+            return reply.status(400).send({ error: 'Invalid profile public key format' });
+        }
+        try {
+            normalizedProfilePublicKey = normalizePublicKey(profilePublicKey);
+        } catch (error: any) {
             profileUpdatesTotal.inc({ status: 'invalid_key' });
             return reply.status(400).send({ error: 'Invalid profile public key format' });
         }
@@ -107,7 +114,7 @@ export async function profileRoutes(app: Fastify) {
         }
 
         // Parse base64 to binary
-        const profilePublicKeyBuffer = Buffer.from(profilePublicKey, 'base64');
+        const profilePublicKeyBuffer = Buffer.from(normalizedProfilePublicKey, 'base64');
         const profileKeySignatureBuffer = Buffer.from(profileKeySignature, 'base64');
         const encryptedProfileBuffer = Buffer.from(encryptedProfile, 'base64');
 
@@ -121,7 +128,7 @@ export async function profileRoutes(app: Fastify) {
         const user = await db.user.update({
             where: { id: userId },
             data: {
-                profilePublicKey,
+                profilePublicKey: normalizedProfilePublicKey,
                 profileKeySignature: profileKeySignatureBuffer,
                 encryptedProfile: encryptedProfileBuffer,
                 profileUpdatedAt: new Date(),
@@ -139,7 +146,7 @@ export async function profileRoutes(app: Fastify) {
         return reply.send({
             success: true,
             profile: {
-                profilePublicKey: user.profilePublicKey,
+                profilePublicKey: publicKeyToExternal(user.profilePublicKey),
                 profileUpdatedAt: user.profileUpdatedAt.getTime(),
             },
         });
@@ -162,9 +169,15 @@ export async function publicProfileRoutes(app: Fastify) {
         },
     }, async (request, reply) => {
         const { profilePublicKey } = request.params;
+        let normalizedProfilePublicKey: string;
+        try {
+            normalizedProfilePublicKey = normalizePublicKey(profilePublicKey);
+        } catch (error: any) {
+            return reply.status(400).send({ error: 'Invalid profile public key format' });
+        }
 
         const user = await db.user.findUnique({
-            where: { profilePublicKey },
+            where: { profilePublicKey: normalizedProfilePublicKey },
             select: {
                 id: true,
                 profilePublicKey: true,
@@ -179,8 +192,8 @@ export async function publicProfileRoutes(app: Fastify) {
         }
 
         return reply.send({
-            id: user.id,
-            profilePublicKey: user.profilePublicKey,
+            id: publicKeyToExternal(user.id),
+            profilePublicKey: publicKeyToExternal(user.profilePublicKey),
             profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
             encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
             profileUpdatedAt: user.profileUpdatedAt.getTime(),

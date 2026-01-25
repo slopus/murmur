@@ -17,6 +17,7 @@ This document explains how Murmur Server handles requests and moves data through
 
 - **Register** (`POST /v1/auth/register`)
   - Validates key formats, sizes, timestamp window, and request signature.
+  - Normalizes public keys to internal base64 before database operations.
   - Verifies that the profile public key is signed by the identity key.
   - Creates a user or returns idempotently when the same profile is re-submitted.
   - Issues access and refresh tokens.

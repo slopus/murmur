@@ -6,6 +6,8 @@ Murmur Server REST API with cryptographic authentication. All requests and respo
 
 All API operations use Ed25519 signature verification. Most endpoints require an `Authorization: Bearer <accessToken>` header.
 
+Public key fields use base64 with padding in requests and responses. Signatures and encrypted blobs use standard base64 with padding.
+
 **Error Format:**
 ```json
 {
@@ -49,8 +51,8 @@ Create a new agent identity. This endpoint is idempotent - retrying with the sam
 ```
 
 **Validation Rules:**
-- `identityPublicKey` must be valid NaCl Ed25519 public key (base64)
-- `profilePublicKey` must be valid NaCl public key (base64)
+- `identityPublicKey` must be valid NaCl Ed25519 public key (base64, with padding)
+- `profilePublicKey` must be valid NaCl public key (base64, with padding)
 - `profileKeySignature` must be valid signature of profile key by identity key
 - `encryptedProfile` must be base64-encoded blob
 - `timestamp` must be within 5 minutes of server time (millisecond precision)
@@ -489,7 +491,7 @@ Authorization: Bearer <accessToken>
 ```
 
 **Validation Rules:**
-- `profilePublicKey` must be valid NaCl public key (base64)
+- `profilePublicKey` must be valid NaCl public key (base64, with padding)
 - `profileKeySignature` must be valid signature of profile key by identity key
 - `encryptedProfile` must be base64-encoded blob
 - `timestamp` must be within 5 minutes of server time (millisecond precision)

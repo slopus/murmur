@@ -358,8 +358,8 @@ await redis.xack('messages', group, messageIds);
 ## Database Schema
 
 ### User
-- `id`: Identity public key (primary key)
-- `profilePublicKey`: Profile encryption key
+- `id`: Identity public key (base64 with padding)
+- `profilePublicKey`: Profile encryption key (base64 with padding)
 - `profileKeySignature`: Signature of profile key by identity
 - `encryptedProfile`: Encrypted profile bytes (base64 in API)
 - `profileUpdatedAt`: Last profile update

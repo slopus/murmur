@@ -66,7 +66,7 @@ export function generateKeyPair(): { publicKey: string; privateKey: string } {
 }
 
 /**
- * Validate that a string is a valid base64-encoded public key
+ * Validate that a string is a valid public key encoding.
  */
 export function isValidPublicKey(publicKey: string): boolean {
     try {
@@ -75,4 +75,27 @@ export function isValidPublicKey(publicKey: string): boolean {
     } catch {
         return false;
     }
+}
+
+/**
+ * Normalize a public key to internal base64.
+ * Throws if the key is invalid or the decoded length is not 32 bytes.
+ */
+export function normalizePublicKey(publicKey: string): string {
+    const bytes = decodeBase64(publicKey);
+    if (bytes.length !== 32) {
+        throw new Error('Invalid public key format');
+    }
+    return encodeBase64(bytes);
+}
+
+/**
+ * Convert an internal base64 public key to the external base64 format.
+ */
+export function publicKeyToExternal(publicKey: string): string {
+    const bytes = decodeBase64(publicKey);
+    if (bytes.length !== 32) {
+        throw new Error('Invalid public key format');
+    }
+    return encodeBase64(bytes);
 }

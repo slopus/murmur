@@ -108,6 +108,8 @@ Background job that:
 
 ## Data Models
 
+Public keys are stored internally as standard base64 with padding, and API inputs/outputs use the same base64 encoding.
+
 ### User
 ```
 id: string (Ed25519 public key, base64)

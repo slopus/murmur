@@ -2,7 +2,7 @@ import { z } from 'zod';
 import type { Fastify } from '@/types';
 import { db } from '@/db';
 import { getAuthUserId } from '@/api/auth';
-import { verifySignature } from '@/utils/crypto';
+import { normalizePublicKey, publicKeyToExternal, verifySignature } from '@/utils/crypto';
 import { rateLimitConfigs } from '@/api/rateLimit';
 import { preKeysUploadedTotal, preKeysAllocatedTotal } from '@/metrics/prometheus';
 import { validatePreKeyData } from '@/api/validation';
@@ -37,6 +37,7 @@ export async function preKeyRoutes(app: Fastify) {
     }, async (request, reply) => {
         const userId = getAuthUserId(request);
         const { preKeys, timestamp, signature } = request.body;
+        let normalizedPreKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }> = [];
 
         // Validate size limits for each prekey
         try {
@@ -46,6 +47,16 @@ export async function preKeyRoutes(app: Fastify) {
         } catch (error: any) {
             preKeysUploadedTotal.inc({ status: 'size_limit_exceeded' });
             return reply.status(400).send({ error: error.message });
+        }
+
+        try {
+            normalizedPreKeys = preKeys.map(preKey => ({
+                ...preKey,
+                publicKey: normalizePublicKey(preKey.publicKey),
+            }));
+        } catch (error: any) {
+            preKeysUploadedTotal.inc({ status: 'invalid_key' });
+            return reply.status(400).send({ error: 'Invalid prekey public key format' });
         }
 
         // Verify timestamp is recent (within 5 minutes)
@@ -67,7 +78,7 @@ export async function preKeyRoutes(app: Fastify) {
         }
 
         // Verify each prekey signature
-        for (const preKey of preKeys) {
+        for (const preKey of normalizedPreKeys) {
             // Decode public key to bytes for signature verification
             const preKeyPublicKeyBuffer = Buffer.from(preKey.publicKey, 'base64');
             if (!verifySignature(preKeyPublicKeyBuffer, preKey.signature, userId)) {
@@ -80,7 +91,7 @@ export async function preKeyRoutes(app: Fastify) {
 
         // Insert all prekeys
         const created = await db.preKey.createMany({
-            data: preKeys.map(pk => ({
+            data: normalizedPreKeys.map(pk => ({
                 ownerId: userId,
                 publicKey: pk.publicKey,
                 signature: Buffer.from(pk.signature, 'base64'),
@@ -109,11 +120,17 @@ export async function preKeyRoutes(app: Fastify) {
     }, async (request, reply) => {
         const requesterId = getAuthUserId(request);
         const { identityPublicKey } = request.params;
+        let normalizedIdentityPublicKey: string;
+        try {
+            normalizedIdentityPublicKey = normalizePublicKey(identityPublicKey);
+        } catch (error: any) {
+            return reply.status(400).send({ error: 'Invalid identity public key format' });
+        }
 
         // Get user's signed prekey (not allocated yet, or already allocated to requester)
         const signedPreKey = await db.preKey.findFirst({
             where: {
-                ownerId: identityPublicKey,
+                ownerId: normalizedIdentityPublicKey,
                 oneTime: false,
                 OR: [
                     { allocatedTo: null }, // Not yet allocated
@@ -142,7 +159,7 @@ export async function preKeyRoutes(app: Fastify) {
         // Get one-time prekey (not yet allocated)
         const oneTimePreKey = await db.preKey.findFirst({
             where: {
-                ownerId: identityPublicKey,
+                ownerId: normalizedIdentityPublicKey,
                 oneTime: true,
                 allocatedTo: null, // Only unallocated one-time prekeys
             },
@@ -162,14 +179,14 @@ export async function preKeyRoutes(app: Fastify) {
         }
 
         return reply.send({
-            identityKey: identityPublicKey,
+            identityKey: publicKeyToExternal(normalizedIdentityPublicKey),
             signedPreKey: {
-                publicKey: signedPreKey.publicKey,
+                publicKey: publicKeyToExternal(signedPreKey.publicKey),
                 signature: Buffer.from(signedPreKey.signature).toString('base64'),
                 createdAt: signedPreKey.createdAt.getTime(),
             },
             oneTimePreKey: oneTimePreKey ? {
-                publicKey: oneTimePreKey.publicKey,
+                publicKey: publicKeyToExternal(oneTimePreKey.publicKey),
                 signature: Buffer.from(oneTimePreKey.signature).toString('base64'),
             } : null,
         });

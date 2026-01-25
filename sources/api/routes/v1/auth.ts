@@ -1,7 +1,7 @@
 import { z } from 'zod';
 import type { Fastify } from '@/types';
 import { db } from '@/db';
-import { isValidPublicKey, verifySignature } from '@/utils/crypto';
+import { isValidPublicKey, normalizePublicKey, publicKeyToExternal, verifySignature } from '@/utils/crypto';
 import { generateToken, refreshAccessToken } from '@/utils/jwt';
 import { rateLimitConfigs } from '@/api/rateLimit';
 import { registrationsTotal, loginsTotal, tokenRefreshesTotal } from '@/metrics/prometheus';
@@ -48,6 +48,8 @@ export async function authRoutes(app: Fastify) {
             signature,
         } = request.body;
 
+        let normalizedIdentityPublicKey: string;
+        let normalizedProfilePublicKey: string;
         try {
             // Validate public keys format
             if (!isValidPublicKey(identityPublicKey)) {
@@ -59,6 +61,9 @@ export async function authRoutes(app: Fastify) {
                 registrationsTotal.inc({ status: 'invalid_key' });
                 return reply.status(400).send({ error: 'Invalid profile public key format' });
             }
+
+            normalizedIdentityPublicKey = normalizePublicKey(identityPublicKey);
+            normalizedProfilePublicKey = normalizePublicKey(profilePublicKey);
 
             // Validate size limits
             validateProfileData({ profilePublicKey, profileKeySignature, encryptedProfile });
@@ -89,7 +94,7 @@ export async function authRoutes(app: Fastify) {
         }
 
         // Parse base64 to binary
-        const profilePublicKeyBuffer = Buffer.from(profilePublicKey, 'base64');
+        const profilePublicKeyBuffer = Buffer.from(normalizedProfilePublicKey, 'base64');
         const profileKeySignatureBuffer = Buffer.from(profileKeySignature, 'base64');
         const encryptedProfileBuffer = Buffer.from(encryptedProfile, 'base64');
 
@@ -101,25 +106,25 @@ export async function authRoutes(app: Fastify) {
 
         // Check if user already exists (idempotent registration)
         let user = await db.user.findUnique({
-            where: { id: identityPublicKey },
+            where: { id: normalizedIdentityPublicKey },
         });
 
         if (user) {
             // User exists - verify the profile matches (idempotent)
             if (
-                user.profilePublicKey === profilePublicKey &&
+                user.profilePublicKey === normalizedProfilePublicKey &&
                 Buffer.compare(user.profileKeySignature, profileKeySignatureBuffer) === 0 &&
                 Buffer.compare(user.encryptedProfile, encryptedProfileBuffer) === 0
             ) {
                 // Same profile - return success with tokens (idempotent)
                 registrationsTotal.inc({ status: 'idempotent' });
-                const tokens = await generateToken(identityPublicKey);
+                const tokens = await generateToken(normalizedIdentityPublicKey);
                 return reply.send({
                     success: true,
                     accessToken: tokens.accessToken,
                     refreshToken: tokens.refreshToken,
                     user: {
-                        id: user.id,
+                        id: publicKeyToExternal(user.id),
                         createdAt: user.createdAt.getTime(),
                     },
                 });
@@ -133,8 +138,8 @@ export async function authRoutes(app: Fastify) {
         // Create new user
         user = await db.user.create({
             data: {
-                id: identityPublicKey,
-                profilePublicKey,
+                id: normalizedIdentityPublicKey,
+                profilePublicKey: normalizedProfilePublicKey,
                 profileKeySignature: profileKeySignatureBuffer,
                 encryptedProfile: encryptedProfileBuffer,
                 profileUpdatedAt: new Date(),
@@ -142,7 +147,7 @@ export async function authRoutes(app: Fastify) {
         });
 
         // Generate token pair (access + refresh)
-        const tokens = await generateToken(identityPublicKey);
+        const tokens = await generateToken(normalizedIdentityPublicKey);
 
         registrationsTotal.inc({ status: 'success' });
         return reply.send({
@@ -150,7 +155,7 @@ export async function authRoutes(app: Fastify) {
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken,
             user: {
-                id: user.id,
+                id: publicKeyToExternal(user.id),
                 createdAt: user.createdAt.getTime(),
             },
         });
@@ -167,8 +172,15 @@ export async function authRoutes(app: Fastify) {
     }, async (request, reply) => {
         const { identityPublicKey, timestamp, signature } = request.body;
 
+        let normalizedIdentityPublicKey: string;
         // Validate public key format
         if (!isValidPublicKey(identityPublicKey)) {
+            loginsTotal.inc({ status: 'invalid_key' });
+            return reply.status(400).send({ error: 'Invalid identity public key format' });
+        }
+        try {
+            normalizedIdentityPublicKey = normalizePublicKey(identityPublicKey);
+        } catch (error: any) {
             loginsTotal.inc({ status: 'invalid_key' });
             return reply.status(400).send({ error: 'Invalid identity public key format' });
         }
@@ -189,7 +201,7 @@ export async function authRoutes(app: Fastify) {
 
         // Check if user exists
         const user = await db.user.findUnique({
-            where: { id: identityPublicKey },
+            where: { id: normalizedIdentityPublicKey },
         });
 
         if (!user) {
@@ -198,7 +210,7 @@ export async function authRoutes(app: Fastify) {
         }
 
         // Generate token pair (access + refresh)
-        const tokens = await generateToken(identityPublicKey);
+        const tokens = await generateToken(normalizedIdentityPublicKey);
 
         loginsTotal.inc({ status: 'success' });
         return reply.send({
@@ -206,7 +218,7 @@ export async function authRoutes(app: Fastify) {
             accessToken: tokens.accessToken,
             refreshToken: tokens.refreshToken,
             user: {
-                id: user.id,
+                id: publicKeyToExternal(user.id),
                 createdAt: user.createdAt.getTime(),
             },
         });
