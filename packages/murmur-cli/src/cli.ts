@@ -812,7 +812,7 @@ async function run(): Promise<void> {
                                     logger.debug('Realtime stream ping.')
                                     return
                                 }
-                                if (event.event !== 'message' && event.event !== 'message:new') {
+                                if (event.event !== 'message:new') {
                                     logger.debug(`Realtime stream event: ${event.event}`)
                                     return
                                 }
