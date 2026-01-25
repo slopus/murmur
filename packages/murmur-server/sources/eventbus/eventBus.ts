@@ -20,27 +20,18 @@ export type GlobalEventHandler = (event: GlobalEvent) => void | Promise<void>;
 export type MessageEventHandler = (envelope: MessageEnvelope) => void | Promise<void>;
 
 /**
- * EventBus provides a reliable event distribution system using Redis Streams.
+ * EventBus provides a broadcast event distribution system using Redis Streams.
  *
  * Key differences from pub/sub:
- * - Redis Streams provide reliable delivery with persistence
- * - Messages can be acknowledged and deleted after processing
- * - Consumer groups allow multiple servers to process messages
- * - No sequence numbers needed - messages identified by cuid2 message IDs
+ * - Redis Streams provide persistence with replay ability
+ * - Each node independently reads the stream (fan-out)
+ * - No consumer groups; all nodes see all events
  * - Supports channel-based subscriptions for future sharding
- *
- * Features:
- * - Reliable message delivery (not fire-and-forget like pub/sub)
- * - Message acknowledgment and deletion
- * - Channel-based subscriptions (e.g., "user:userId")
- * - Repeat protection via cuid2 message IDs
- * - Type-safe with Zod validation
  */
 export class EventBus {
     private client: Redis;
     private readonly STREAM_KEY = 'murmur:events';
-    private readonly CONSUMER_GROUP = 'murmur-consumers';
-    private CONSUMER_NAME: string = '';
+    private lastStreamId: string = '$';
 
     private globalEventHandlers: Set<GlobalEventHandler> = new Set();
     private messageEventHandlers: Set<MessageEventHandler> = new Set();
@@ -73,27 +64,12 @@ export class EventBus {
             return;
         }
 
-        // Generate unique consumer name using cuid2
-        const { createId } = await import('@paralleldrive/cuid2');
-        this.CONSUMER_NAME = `consumer-${createId()}`;
-
-        // Create consumer group if it doesn't exist
-        try {
-            await this.client.xgroup('CREATE', this.STREAM_KEY, this.CONSUMER_GROUP, '$', 'MKSTREAM');
-            log(`Created consumer group ${this.CONSUMER_GROUP}`);
-        } catch (err: any) {
-            // Ignore if group already exists
-            if (!err.message.includes('BUSYGROUP')) {
-                log(`Consumer group creation error: ${err.message}`);
-            }
-        }
-
         this.isRunning = true;
 
         const shutdownSignal = getShutdownSignal();
         this.readLoopPromise = this.readLoop(shutdownSignal);
 
-        log('EventBus started with Redis Streams');
+        log('EventBus started with Redis Streams (broadcast)');
     }
 
     /**
@@ -130,12 +106,8 @@ export class EventBus {
      * This is called after the message has been successfully delivered to the client.
      */
     async acknowledgeMessage(messageId: string): Promise<void> {
-        try {
-            await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, messageId);
-            await this.client.xdel(this.STREAM_KEY, messageId);
-        } catch (error) {
-            log(`Error acknowledging message ${messageId}: ${error}`);
-        }
+        // No-op in broadcast mode (each node reads independently).
+        log(`Ignoring acknowledgeMessage(${messageId}) in broadcast mode`);
     }
 
     /**
@@ -219,19 +191,15 @@ export class EventBus {
     private async readLoop(signal: AbortSignal): Promise<void> {
         await forever(async () => {
             try {
-                // XREADGROUP GROUP group consumer BLOCK ms COUNT n STREAMS stream >
-                // '>' means only read new messages not yet delivered to this group
-                const results = await this.client.xreadgroup(
-                    'GROUP',
-                    this.CONSUMER_GROUP,
-                    this.CONSUMER_NAME,
+                // XREAD BLOCK ms COUNT n STREAMS stream last-id
+                const results = await this.client.xread(
                     'COUNT',
                     10, // Read up to 10 messages at a time
                     'BLOCK',
                     5000, // Block for 5 seconds
                     'STREAMS',
                     this.STREAM_KEY,
-                    '>'
+                    this.lastStreamId
                 ) as any; // Type assertion needed due to ioredis typing limitations
 
                 if (!results || results.length === 0) {
@@ -241,23 +209,17 @@ export class EventBus {
                 // Process messages
                 for (const [_streamKey, messages] of results) {
                     for (const [streamId, fields] of messages) {
+                        this.lastStreamId = streamId;
                         await this.handleStreamMessage(streamId, fields as string[]);
                     }
                 }
             } catch (error: any) {
-                // Check if consumer group was deleted
-                if (error.message && error.message.includes('NOGROUP')) {
-                    log(`FATAL: Consumer group ${this.CONSUMER_GROUP} was deleted!`);
-                    console.error(`FATAL: Consumer group ${this.CONSUMER_GROUP} was deleted!`);
-                    process.exit(1); // Hard crash as requested
-                }
-
                 if (this.isRunning) {
                     log(`Error in read loop: ${error.message}`);
                     throw error; // Re-throw to let forever handle it
                 }
             }
-        }, 0, signal); // No delay between iterations since XREADGROUP has its own blocking
+        }, 0, signal); // No delay between iterations since XREAD has its own blocking
     }
 
     /**
@@ -269,7 +231,6 @@ export class EventBus {
             const dataIndex = fields.indexOf('data');
             if (dataIndex === -1 || dataIndex + 1 >= fields.length) {
                 log(`Invalid message format in stream ${streamId}`);
-                await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
                 return;
             }
 
@@ -281,7 +242,6 @@ export class EventBus {
 
             if (!result.success) {
                 log(`Invalid event envelope in stream ${streamId}: ${result.error.message}`);
-                await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
                 return;
             }
 
@@ -294,13 +254,9 @@ export class EventBus {
                 this.dispatchMessageEvent(envelope);
             }
 
-            // Auto-acknowledge after dispatching
-            // Messages will be deleted when clients explicitly ack them via acknowledgeMessage()
-            await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
+            // No acknowledgments in broadcast mode.
         } catch (error) {
             log(`Error handling stream message ${streamId}: ${error}`);
-            // Acknowledge anyway to avoid getting stuck
-            await this.client.xack(this.STREAM_KEY, this.CONSUMER_GROUP, streamId);
         }
     }
 
