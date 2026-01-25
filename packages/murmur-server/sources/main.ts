@@ -6,6 +6,7 @@ import { awaitShutdown, onShutdown } from './shutdown';
 import { startCleanupWorker } from './workers/cleanupWorker';
 import { initializeJWT } from './utils/jwt';
 import { startMetricsServer } from './metrics/startMetricsServer';
+import { sseManager } from './api/sse';
 
 export async function main() {
     log('Starting Murmur Server...');
@@ -23,6 +24,19 @@ export async function main() {
     await events.start();
     onShutdown('events', async () => {
         await events.shutdown();
+    });
+
+    events.onMessageEvent((envelope) => {
+        if (envelope.event.type !== 'message:new') {
+            return;
+        }
+        if (!envelope.channel.startsWith('user:')) {
+            return;
+        }
+        const userId = envelope.channel.slice('user:'.length);
+        sseManager.sendToUser(userId, 'message', {
+            messageId: envelope.event.messageId,
+        });
     });
 
     log('Starting cleanup worker...');

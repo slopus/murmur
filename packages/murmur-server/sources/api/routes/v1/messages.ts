@@ -127,11 +127,6 @@ export async function messageRoutes(app: Fastify) {
             messageId: message.id,
         });
 
-        // Notify via SSE if recipient is connected (send only message ID)
-        sseManager.sendToUser(normalizedRecipientId, 'message', {
-            messageId: message.id,
-        });
-
         return reply.send({
             success: true,
             message: {
