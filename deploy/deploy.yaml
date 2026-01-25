@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: murmur-server
+spec:
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  replicas: 3
+  selector:
+    matchLabels:
+      app: murmur-server
+  template:
+    metadata:
+      labels:
+        app: murmur-server
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+      - name: murmur-server
+        image: docker.korshakov.com/murmur-server:{version}
+        ports:
+        - containerPort: 3000
+        - containerPort: 9090
+        env:
+        - name: NODE_ENV
+          value: production
+        - name: PORT
+          value: "3000"
+        - name: REDIS_URL
+          value: redis://murmur-redis:6379
+        envFrom:
+        - secretRef:
+            name: murmur-server-secrets
+        livenessProbe:
+          httpGet:
+            path: /liveness
+            port: 9090
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /readiness
+            port: 9090
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 512Mi
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: murmur-server-pdb
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: murmur-server
+---
+apiVersion: external-secrets.io/v1beta1
+kind: ExternalSecret
+metadata:
+  name: murmur-server-secrets
+spec:
+  refreshInterval: 1h
+  secretStoreRef:
+    name: vault-backend
+    kind: SecretStore
+  target:
+    name: murmur-server-secrets
+    creationPolicy: Owner
+  dataFrom:
+    - extract:
+        key: /murmur-database
+    - extract:
+        key: /murmur-jwt        
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: murmur-server
+spec:
+  selector:
+    app: murmur-server
+  ports:
+  - port: 3000
+    targetPort: 3000
+  type: ClusterIP

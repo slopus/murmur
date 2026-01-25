@@ -1,0 +1,87 @@
+// Murmur Server Prisma Schema
+// Encrypted message transfer with NaCl-based authentication
+
+generator client {
+    provider        = "prisma-client-js"
+    previewFeatures = ["metrics", "relationJoins"]
+}
+
+datasource db {
+    provider = "postgresql"
+    url      = env("DATABASE_URL")
+}
+
+//
+// User (Identity based on NaCl public key)
+//
+
+model User {
+    id                String   @id // NaCl public key (base64 encoded)
+    createdAt         DateTime @default(now())
+    updatedAt         DateTime @updatedAt
+
+    // Current profile encryption key (signed by identity key)
+    profilePublicKey  String @unique // Separate NaCl public key for profile encryption
+    profileKeySignature Bytes // Binary signature of profilePublicKey by identity key
+    encryptedProfile  Bytes // Binary encrypted profile blob
+    profileUpdatedAt  DateTime @default(now())
+
+    // Relations
+    sentMessages      Message[] @relation("MessageSender")
+    receivedMessages  Message[] @relation("MessageRecipient")
+    ownedPreKeys      PreKey[]  @relation("PreKeyOwner")
+    allocatedPreKeys  PreKey[]  @relation("PreKeyAllocatedTo")
+}
+
+//
+// Message (Signed blobs with 30-day auto-delete)
+//
+
+model Message {
+    id          String   @id // cuid2 provided by sender (guarantees uniqueness in distributed system)
+    createdAt   DateTime @default(now())
+    expiresAt   DateTime // Auto-delete after 30 days (createdAt + 30 days)
+    deliveredAt DateTime? // When the message was first read by recipient
+
+    // Sender and recipient (identity public keys)
+    senderId    String
+    sender      User   @relation("MessageSender", fields: [senderId], references: [id], onDelete: Cascade)
+
+    recipientId String
+    recipient   User   @relation("MessageRecipient", fields: [recipientId], references: [id], onDelete: Cascade)
+
+    blob        Bytes // Binary encrypted message blob (stored as bytea in PostgreSQL)
+    signature   Bytes // Binary NaCl signature of (blob + messageId) by sender's identity key
+
+    @@index([recipientId, createdAt])
+    @@index([recipientId, deliveredAt]) // For finding undelivered messages in SSE
+    @@index([recipientId, createdAt, expiresAt]) // For paginated inbox queries
+    @@index([expiresAt]) // For cleanup worker
+    @@index([senderId])
+}
+
+//
+// PreKey (Signed prekeys and one-time prekeys for session establishment)
+//
+
+model PreKey {
+    id            String   @id @default(cuid())
+    createdAt     DateTime @default(now())
+
+    // Owner of this prekey
+    ownerId       String
+    owner         User     @relation("PreKeyOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+
+    // Prekey data
+    publicKey     String   // NaCl public key (base64)
+    signature     Bytes    // Binary signature of publicKey by identity key
+    oneTime       Boolean  // true = one-time prekey, false = signed prekey
+
+    // Allocation tracking (null if not yet allocated)
+    allocatedTo   String?  // User who claimed this prekey
+    allocatedUser User?    @relation("PreKeyAllocatedTo", fields: [allocatedTo], references: [id], onDelete: SetNull)
+    allocatedAt   DateTime? // When the prekey was allocated
+
+    @@index([ownerId, oneTime, allocatedTo])
+    @@index([ownerId, oneTime])
+}
