@@ -10,24 +10,20 @@
  */
 
 import { createId } from '@paralleldrive/cuid2'
-import { MurmurApi, type InboxMessage } from './api.js'
+import { MurmurApi, type InboxMessage, type ServerProfile } from './api.js'
 import { MurmurDatabase } from '../storage/database.js'
 import type { Account, StoredContact, StoredMessage, Contact } from '../storage/types.js'
 import {
     createAgent,
     getIdentityKey,
     getPreKeyBundle,
-    initiateSession,
     hasSession,
-    encryptMessage,
-    decryptMessage,
     serializeAgent,
     deserializeAgent,
     prepareOutgoingMessage,
-    processIncomingMessage,
-    getOneTimePreKeyCount
+    processIncomingMessage
 } from '../encryption/session/session.js'
-import type { AgentState, SessionInitMessage, ProtocolMessage } from '../encryption/session/types.js'
+import type { AgentState } from '../encryption/session/types.js'
 import type { PreKeyBundle } from '../encryption/x3dh/types.js'
 import {
     encodeBase64,
@@ -40,8 +36,10 @@ import {
     encryptProfile,
     decryptProfile,
     createProfileForRegistration,
+    verifyProfileKeySignature,
     type Profile
 } from './profile.js'
+import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
 
 /**
  * Conversation with a contact including messages.
@@ -192,6 +190,21 @@ export class MurmurEngine {
     }
 
     /**
+     * Delete the current account and local data.
+     */
+    async deleteAccount(): Promise<void> {
+        if (!this.agent || !this.account) {
+            throw new Error('Not initialized')
+        }
+
+        await this.api.deleteAccount()
+        this.stopSync()
+        this.db.clearAll()
+        this.agent = null
+        this.account = null
+    }
+
+    /**
      * Upload prekeys to server.
      */
     private async uploadPreKeys(): Promise<void> {
@@ -235,11 +248,25 @@ export class MurmurEngine {
      * Decrypt a stored contact's profile.
      */
     private decryptContact(stored: StoredContact): Contact {
+        if (stored.profileSecretKey) {
+            try {
+                const profileSecretKey = decodeBase64(stored.profileSecretKey, 'base64url')
+                const profile = decryptProfile(stored.encryptedProfile, profileSecretKey)
+                return {
+                    identityKey: stored.identityKey,
+                    profilePublicKey: stored.profilePublicKey,
+                    firstName: profile.firstName || 'Unknown',
+                    lastName: profile.lastName,
+                    addedAt: stored.addedAt,
+                    updatedAt: stored.updatedAt
+                }
+            } catch {
+                // Fall through to legacy decoding.
+            }
+        }
+
         try {
-            // Try to decrypt with our profile key (for contacts who shared their key)
-            // In a real implementation, we'd need the contact's profile secret
-            // For now, we store the decrypted name when adding the contact
-            const profile = JSON.parse(bytesToString(decodeBase64(stored.encryptedProfile)))
+            const profile = JSON.parse(bytesToString(decodeBase64(stored.encryptedProfile))) as Profile
             return {
                 identityKey: stored.identityKey,
                 profilePublicKey: stored.profilePublicKey,
@@ -249,73 +276,38 @@ export class MurmurEngine {
                 updatedAt: stored.updatedAt
             }
         } catch {
-            return {
-                identityKey: stored.identityKey,
-                profilePublicKey: stored.profilePublicKey,
-                firstName: 'Unknown',
-                addedAt: stored.addedAt,
-                updatedAt: stored.updatedAt
-            }
+            return this.buildPlaceholderContact(stored.identityKey, stored.profilePublicKey, stored.addedAt, stored.updatedAt)
         }
     }
 
     /**
-     * Add a contact by their identity key.
-     * This fetches their profile and prekey bundle from the server,
-     * and establishes an X3DH session for messaging.
+     * Add a contact by their profile secret key.
      */
-    async addContact(identityKey: string): Promise<Contact> {
-        if (!this.agent) {
-            throw new Error('Not initialized')
-        }
-
-        // Fetch profile from server
-        const serverProfile = await this.api.getProfile(identityKey)
-
-        // Fetch prekey bundle and establish session
-        await this.establishSession(identityKey)
-
-        // For simplicity, we'll store a placeholder profile
-        // In a real app, we'd need a key exchange to decrypt their profile
-        const profile: Profile = { firstName: identityKey.slice(0, 8) }
-
-        const now = Date.now()
-        const storedContact: StoredContact = {
-            identityKey,
-            profilePublicKey: serverProfile.profilePublicKey,
-            encryptedProfile: encodeBase64(stringToBytes(JSON.stringify(profile))),
-            addedAt: now,
-            updatedAt: now
-        }
-
-        this.db.saveContact(storedContact)
-
-        // Save agent state after session establishment
-        this.db.saveAgentState(serializeAgent(this.agent))
-
-        const contact: Contact = {
-            ...profile,
-            identityKey,
-            profilePublicKey: serverProfile.profilePublicKey,
-            addedAt: now,
-            updatedAt: now
-        }
-
-        this.emit({ type: 'contact_added', contact })
-        return contact
+    async addContact(profileSecretKey: string): Promise<Contact> {
+        return this.addContactByProfileSecret(profileSecretKey)
     }
 
     /**
-     * Establish a session with a peer by fetching their prekey bundle.
+     * Add a contact by their profile secret key.
      */
-    private async establishSession(peerIdentityKey: string): Promise<void> {
+    async addContactByProfileSecret(profileSecretKey: string): Promise<Contact> {
         if (!this.agent) {
             throw new Error('Not initialized')
         }
 
-        // Skip if session already exists
-        if (hasSession(this.agent, peerIdentityKey)) {
-            return
+        const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+        const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+        const serverProfile = await this.api.getProfile(profilePublicKey)
+
+        return this.addContactFromProfile(serverProfile, profileSecretKey)
+    }
+
+    /**
+     * Fetch and parse a peer's prekey bundle.
+     */
+    private async fetchPreKeyBundle(peerIdentityKey: string): Promise<PreKeyBundle> {
+        if (!this.agent) {
+            throw new Error('Not initialized')
         }
 
         // Fetch prekey bundle from server
@@ -331,43 +323,56 @@ export class MurmurEngine {
             oneTimePreKey: serverBundle.oneTimePreKey
                 ? decodeBase64(serverBundle.oneTimePreKey.publicKey)
                 : undefined,
-            oneTimePreKeyId: serverBundle.oneTimePreKey ? 0 : undefined
+            oneTimePreKeyId: undefined
         }
-
-        // Initiate session with a placeholder message (we'll send real message later)
-        // The first actual message will use the established session
-        initiateSession(this.agent, bundle, stringToBytes('session_init'))
+        return bundle
     }
 
     /**
-     * Add a contact with known profile info.
-     * Used when receiving a message from a new sender.
+     * Add a contact using a server profile and shared secret key.
      */
-    addContactWithProfile(
-        identityKey: string,
-        profilePublicKey: string,
-        firstName: string,
-        lastName?: string
+    private addContactFromProfile(
+        serverProfile: ServerProfile,
+        profileSecretKey: string,
+        expectedIdentityKey?: string
     ): Contact {
-        const now = Date.now()
-        const profile: Profile = { firstName, lastName }
+        if (expectedIdentityKey && serverProfile.id !== expectedIdentityKey) {
+            throw new Error('Profile does not match expected identity key')
+        }
 
+        const profilePublicKeyBytes = decodeBase64(serverProfile.profilePublicKey)
+        const identityKeyBytes = decodeBase64(serverProfile.id)
+        const isValid = verifyProfileKeySignature(
+            profilePublicKeyBytes,
+            serverProfile.profileKeySignature,
+            identityKeyBytes
+        )
+
+        if (!isValid) {
+            throw new Error('Invalid profile key signature')
+        }
+
+        const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+        const profile = decryptProfile(serverProfile.encryptedProfile, profileSecretKeyBytes)
+
+        const now = Date.now()
         const storedContact: StoredContact = {
-            identityKey,
-            profilePublicKey,
-            encryptedProfile: encodeBase64(stringToBytes(JSON.stringify(profile))),
+            identityKey: serverProfile.id,
+            profilePublicKey: serverProfile.profilePublicKey,
+            profileSecretKey,
+            encryptedProfile: serverProfile.encryptedProfile,
             addedAt: now,
-            updatedAt: now
+            updatedAt: serverProfile.profileUpdatedAt ?? now
         }
 
         this.db.saveContact(storedContact)
 
         const contact: Contact = {
             ...profile,
-            identityKey,
-            profilePublicKey,
-            addedAt: now,
-            updatedAt: now
+            identityKey: serverProfile.id,
+            profilePublicKey: serverProfile.profilePublicKey,
+            addedAt: storedContact.addedAt,
+            updatedAt: storedContact.updatedAt
         }
 
         this.emit({ type: 'contact_added', contact })
@@ -377,14 +382,42 @@ export class MurmurEngine {
     /**
      * Get or create a contact.
      */
-    private getOrCreateContact(identityKey: string): Contact {
+    private async getOrCreateContact(identityKey: string, profileSecretKey?: string): Promise<Contact> {
         const stored = this.db.getContact(identityKey)
+        if (stored && stored.profileSecretKey) {
+            return this.decryptContact(stored)
+        }
+
+        if (profileSecretKey) {
+            const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+            const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+            const serverProfile = await this.api.getProfile(profilePublicKey)
+            return this.addContactFromProfile(serverProfile, profileSecretKey, identityKey)
+        }
+
         if (stored) {
             return this.decryptContact(stored)
         }
 
-        // Create a placeholder contact
-        return this.addContactWithProfile(identityKey, '', identityKey.slice(0, 8))
+        throw new Error('Contact not found for incoming message')
+    }
+
+    /**
+     * Build a placeholder contact when profile data is unavailable.
+     */
+    private buildPlaceholderContact(
+        identityKey: string,
+        profilePublicKey: string = '',
+        addedAt: number = Date.now(),
+        updatedAt: number = Date.now()
+    ): Contact {
+        return {
+            identityKey,
+            profilePublicKey,
+            firstName: identityKey.slice(0, 8),
+            addedAt,
+            updatedAt
+        }
     }
 
     /**
@@ -428,20 +461,29 @@ export class MurmurEngine {
             throw new Error('Message cannot be empty')
         }
 
-        // Ensure we have a session with the recipient
+        const storedContact = this.db.getContact(recipientIdentityKey)
+        if (!storedContact || !storedContact.profileSecretKey) {
+            throw new Error('Contact not found. Add contact with a profile secret key first.')
+        }
+
+        let preKeyBundle: PreKeyBundle | undefined
         if (!hasSession(this.agent, recipientIdentityKey)) {
-            // Establish session first
-            await this.establishSession(recipientIdentityKey)
+            preKeyBundle = await this.fetchPreKeyBundle(recipientIdentityKey)
         }
 
         // Encrypt the message
         const messageId = createId()
-        const plaintext = stringToBytes(trimmedText)
+        const payload = {
+            text: trimmedText,
+            profileSecretKey: this.account.profileSecretKey
+        }
+        const plaintext = stringToBytes(JSON.stringify(payload))
         const { outgoing } = prepareOutgoingMessage(
             this.agent,
             recipientIdentityKey,
             plaintext,
-            messageId
+            messageId,
+            preKeyBundle
         )
 
         // Send to server
@@ -471,7 +513,7 @@ export class MurmurEngine {
     /**
      * Process an incoming message from the server.
      */
-    private processIncomingServerMessage(inboxMessage: InboxMessage): StoredMessage | null {
+    private async processIncomingServerMessage(inboxMessage: InboxMessage): Promise<StoredMessage | null> {
         if (!this.agent) {
             throw new Error('Not initialized')
         }
@@ -489,8 +531,31 @@ export class MurmurEngine {
             // Save agent state after decryption (ratchet may have advanced)
             this.db.saveAgentState(serializeAgent(this.agent))
 
-            // Extract text from plaintext
-            const text = bytesToString(decrypted.plaintext).trim()
+            const rawPayload = bytesToString(decrypted.plaintext).trim()
+            let text = rawPayload
+            let profileSecretKey: string | undefined
+
+            try {
+                const parsed = JSON.parse(rawPayload) as { text?: unknown; profileSecretKey?: unknown }
+                if (parsed && typeof parsed === 'object') {
+                    if (typeof parsed.text === 'string') {
+                        text = parsed.text.trim()
+                    }
+                    if (typeof parsed.profileSecretKey === 'string' && parsed.profileSecretKey.trim().length > 0) {
+                        profileSecretKey = parsed.profileSecretKey
+                    }
+                }
+            } catch {
+                // Treat as legacy plaintext.
+            }
+
+            const existingContact = this.db.getContact(inboxMessage.senderId)
+            if (!profileSecretKey && (!existingContact || !existingContact.profileSecretKey)) {
+                throw new Error('Missing profile secret key for incoming contact')
+            }
+
+            // Ensure contact exists before saving message (foreign key constraint).
+            const contact = await this.getOrCreateContact(inboxMessage.senderId, profileSecretKey)
 
             // Save message
             const storedMessage: StoredMessage = {
@@ -503,9 +568,6 @@ export class MurmurEngine {
             }
 
             this.db.saveMessage(storedMessage)
-
-            // Ensure contact exists
-            const contact = this.getOrCreateContact(inboxMessage.senderId)
 
             // Emit event
             this.emit({ type: 'message', message: storedMessage, contact })
@@ -535,7 +597,7 @@ export class MurmurEngine {
                 const result = await this.api.getInbox(50, cursor)
 
                 for (const msg of result.messages) {
-                    const stored = this.processIncomingServerMessage(msg)
+                    const stored = await this.processIncomingServerMessage(msg)
                     if (stored) {
                         processedIds.push(msg.id)
                     }

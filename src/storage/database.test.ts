@@ -8,6 +8,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MurmurDatabase } from './database.js'
 import type { Account, StoredContact, StoredMessage } from './types.js'
+import type { SerializedAgentState } from '../encryption/session/types.js'
 
 describe('MurmurDatabase', () => {
     let db: MurmurDatabase
@@ -91,6 +92,63 @@ describe('MurmurDatabase', () => {
             expect(retrieved?.identityKey).toBe('key2')
             expect(retrieved?.firstName).toBe('Alice Updated')
         })
+
+        it('should clear all data', () => {
+            const account: Account = {
+                identityKey: 'key1',
+                profilePublicKey: 'ppk1',
+                profileSecretKey: 'psk1',
+                encryptedProfile: 'ep1',
+                firstName: 'Alice',
+                createdAt: 1000
+            }
+            const state: SerializedAgentState = {
+                keyStore: {
+                    identityPrivateKey: 'id-private',
+                    identityPublicKey: 'id-public',
+                    identityDHPrivateKey: 'idh-private',
+                    identityDHPublicKey: 'idh-public',
+                    signedPreKey: {
+                        id: 1,
+                        privateKey: 'spk-private',
+                        publicKey: 'spk-public',
+                        signature: 'spk-signature',
+                        createdAt: 1234
+                    },
+                    oneTimePreKeys: [],
+                    nextPreKeyId: 2
+                },
+                sessions: []
+            }
+            const contact: StoredContact = {
+                identityKey: 'contact-id',
+                profilePublicKey: 'contact-ppk',
+                profileSecretKey: 'contact-psk',
+                encryptedProfile: 'contact-ep',
+                addedAt: 1000,
+                updatedAt: 1000
+            }
+            const message: StoredMessage = {
+                id: 'msg-1',
+                conversationId: 'contact-id',
+                isOutgoing: true,
+                text: 'Hello',
+                createdAt: 1000,
+                read: true
+            }
+
+            db.saveAccount(account)
+            db.saveAgentState(state)
+            db.saveContact(contact)
+            db.saveMessage(message)
+
+            db.clearAll()
+
+            expect(db.getAccount()).toBeNull()
+            expect(db.getAgentState()).toBeNull()
+            expect(db.getContacts()).toEqual([])
+            expect(db.getMessages('contact-id')).toEqual([])
+        })
     })
 
     describe('Agent State', () => {
@@ -99,12 +157,26 @@ describe('MurmurDatabase', () => {
         })
 
         it('should save and retrieve agent state', () => {
-            const state = {
-                keyStore: { test: 'data' },
+            const state: SerializedAgentState = {
+                keyStore: {
+                    identityPrivateKey: 'id-private',
+                    identityPublicKey: 'id-public',
+                    identityDHPrivateKey: 'idh-private',
+                    identityDHPublicKey: 'idh-public',
+                    signedPreKey: {
+                        id: 1,
+                        privateKey: 'spk-private',
+                        publicKey: 'spk-public',
+                        signature: 'spk-signature',
+                        createdAt: 1234
+                    },
+                    oneTimePreKeys: [],
+                    nextPreKeyId: 2
+                },
                 sessions: []
             }
 
-            db.saveAgentState(state as any)
+            db.saveAgentState(state)
 
             const retrieved = db.getAgentState()
             expect(retrieved).toEqual(state)
@@ -120,6 +192,7 @@ describe('MurmurDatabase', () => {
             const contact: StoredContact = {
                 identityKey: 'contact-id-key',
                 profilePublicKey: 'contact-profile-key',
+                profileSecretKey: 'contact-profile-secret',
                 encryptedProfile: 'encrypted-data',
                 addedAt: 1000,
                 updatedAt: 2000
@@ -136,6 +209,7 @@ describe('MurmurDatabase', () => {
             const contact: StoredContact = {
                 identityKey: 'specific-key',
                 profilePublicKey: 'ppk',
+                profileSecretKey: 'psk',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
                 updatedAt: 1000
@@ -151,6 +225,7 @@ describe('MurmurDatabase', () => {
             const contact1: StoredContact = {
                 identityKey: 'contact-key',
                 profilePublicKey: 'ppk1',
+                profileSecretKey: 'psk1',
                 encryptedProfile: 'ep1',
                 addedAt: 1000,
                 updatedAt: 1000
@@ -159,6 +234,7 @@ describe('MurmurDatabase', () => {
             const contact2: StoredContact = {
                 identityKey: 'contact-key',
                 profilePublicKey: 'ppk2',
+                profileSecretKey: 'psk2',
                 encryptedProfile: 'ep2',
                 addedAt: 1000,
                 updatedAt: 2000
@@ -176,6 +252,7 @@ describe('MurmurDatabase', () => {
             const contact: StoredContact = {
                 identityKey: 'delete-me',
                 profilePublicKey: 'ppk',
+                profileSecretKey: 'psk',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
                 updatedAt: 1000
@@ -208,6 +285,7 @@ describe('MurmurDatabase', () => {
             db.saveContact({
                 identityKey: 'peer-1',
                 profilePublicKey: 'ppk',
+                profileSecretKey: 'psk',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
                 updatedAt: 1000
@@ -274,6 +352,7 @@ describe('MurmurDatabase', () => {
             db.saveContact({
                 identityKey: 'peer-2',
                 profilePublicKey: 'ppk',
+                profileSecretKey: 'psk2',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
                 updatedAt: 1000
@@ -297,6 +376,7 @@ describe('MurmurDatabase', () => {
             db.saveContact({
                 identityKey: 'peer-2',
                 profilePublicKey: 'ppk',
+                profileSecretKey: 'psk2',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
                 updatedAt: 1000

@@ -7,8 +7,8 @@ import {
     createAgent,
     getIdentityKey,
     getPreKeyBundle,
-    initiateSession,
-    receiveSessionInit,
+    createPreKeyMessage,
+    receivePreKeyMessage,
     encryptMessage,
     decryptMessage,
     hasSession,
@@ -23,8 +23,7 @@ import {
     replenishPreKeys,
     getOneTimePreKeyCount
 } from './session.js'
-import { stringToBytes, bytesToString, constantTimeEqual } from '../crypto/utils.js'
-import type { ProtocolMessage } from './types.js'
+import { stringToBytes, bytesToString } from '../crypto/utils.js'
 
 describe('Agent creation', () => {
     it('should create agent with keys', () => {
@@ -72,50 +71,48 @@ describe('Prekey bundle', () => {
 })
 
 describe('Session establishment', () => {
-    it('should establish session via initiateSession', () => {
+    it('should establish session via createPreKeyMessage', () => {
         const alice = createAgent(10)
         const bob = createAgent(10)
 
         const bobBundle = getPreKeyBundle(bob, true)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('Hello Bob!'))
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Hello Bob!'))
 
-        expect(sessionInitMessage.type).toBe('session_init')
-        expect(sessionInitMessage.identityDHKey).toBeDefined()
-        expect(sessionInitMessage.ephemeralKey).toBeDefined()
-        expect(sessionInitMessage.header).toBeDefined()
-        expect(sessionInitMessage.ciphertext).toBeDefined()
+        expect(message.type).toBe('message')
+        expect(message.identityDHKey).toBeDefined()
+        expect(message.ephemeralKey).toBeDefined()
+        expect(message.header).toBeDefined()
+        expect(message.ciphertext).toBeDefined()
 
         // Alice should have session
         expect(hasSession(alice, getIdentityKey(bob))).toBe(true)
     })
 
-    it('should establish session via receiveSessionInit', () => {
+    it('should establish session via receivePreKeyMessage', () => {
         const alice = createAgent(10)
         const bob = createAgent(10)
 
         const bobBundle = getPreKeyBundle(bob, true)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('Hello Bob!'))
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Hello Bob!'))
 
         // Bob receives and processes
-        const result = receiveSessionInit(bob, getIdentityKey(alice), sessionInitMessage)
+        const result = receivePreKeyMessage(bob, getIdentityKey(alice), message)
 
         expect(bytesToString(result.plaintext)).toBe('Hello Bob!')
-        expect(result.isSessionInit).toBe(true)
         expect(hasSession(bob, getIdentityKey(alice))).toBe(true)
     })
 
-    it('should consume one-time prekey on session init', () => {
+    it('should retain one-time prekeys after pre-key message', () => {
         const alice = createAgent(10)
         const bob = createAgent(10)
 
         const initialCount = getOneTimePreKeyCount(bob)
         const bobBundle = getPreKeyBundle(bob, true)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('Hello'))
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Hello'))
 
-        receiveSessionInit(bob, getIdentityKey(alice), sessionInitMessage)
+        receivePreKeyMessage(bob, getIdentityKey(alice), message)
 
-        // One-time prekey should be consumed
-        expect(getOneTimePreKeyCount(bob)).toBe(initialCount - 1)
+        expect(getOneTimePreKeyCount(bob)).toBe(initialCount)
     })
 })
 
@@ -125,8 +122,8 @@ describe('Message exchange', () => {
         const bob = createAgent(10)
 
         const bobBundle = getPreKeyBundle(bob, true)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('Hello'))
-        receiveSessionInit(bob, getIdentityKey(alice), sessionInitMessage)
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Hello'))
+        receivePreKeyMessage(bob, getIdentityKey(alice), message)
 
         return { alice, bob }
     }
@@ -141,7 +138,6 @@ describe('Message exchange', () => {
         // Bob decrypts
         const dec1 = decryptMessage(bob, getIdentityKey(alice), msg1)
         expect(bytesToString(dec1.plaintext)).toBe('Message 1')
-        expect(dec1.isSessionInit).toBe(false)
     })
 
     it('should support bidirectional messaging', () => {
@@ -191,7 +187,7 @@ describe('Session management', () => {
         expect(hasSession(alice, getIdentityKey(bob))).toBe(false)
 
         const bobBundle = getPreKeyBundle(bob)
-        initiateSession(alice, bobBundle, stringToBytes('Hi'))
+        createPreKeyMessage(alice, bobBundle, stringToBytes('Hi'))
 
         expect(hasSession(alice, getIdentityKey(bob))).toBe(true)
     })
@@ -203,7 +199,7 @@ describe('Session management', () => {
         expect(getSession(alice, getIdentityKey(bob))).toBeUndefined()
 
         const bobBundle = getPreKeyBundle(bob)
-        initiateSession(alice, bobBundle, stringToBytes('Hi'))
+        createPreKeyMessage(alice, bobBundle, stringToBytes('Hi'))
 
         const session = getSession(alice, getIdentityKey(bob))
         expect(session).toBeDefined()
@@ -215,7 +211,7 @@ describe('Session management', () => {
         const bob = createAgent()
 
         const bobBundle = getPreKeyBundle(bob)
-        initiateSession(alice, bobBundle, stringToBytes('Hi'))
+        createPreKeyMessage(alice, bobBundle, stringToBytes('Hi'))
 
         expect(hasSession(alice, getIdentityKey(bob))).toBe(true)
         expect(deleteSession(alice, getIdentityKey(bob))).toBe(true)
@@ -230,7 +226,7 @@ describe('State persistence', () => {
 
         // Establish session
         const bobBundle = getPreKeyBundle(bob)
-        initiateSession(alice, bobBundle, stringToBytes('Hi'))
+        createPreKeyMessage(alice, bobBundle, stringToBytes('Hi'))
 
         // Serialize
         const serialized = serializeAgent(alice)
@@ -249,8 +245,8 @@ describe('State persistence', () => {
 
         // Setup session
         const bobBundle = getPreKeyBundle(bob)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('First'))
-        receiveSessionInit(bob, getIdentityKey(alice), sessionInitMessage)
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('First'))
+        receivePreKeyMessage(bob, getIdentityKey(alice), message)
 
         // Exchange a message
         const msg1 = encryptMessage(alice, getIdentityKey(bob), stringToBytes('Before restore'))
@@ -324,8 +320,8 @@ describe('Full server message flow', () => {
 
         // Setup session
         const bobBundle = getPreKeyBundle(bob)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('Init'))
-        receiveSessionInit(bob, getIdentityKey(alice), sessionInitMessage)
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Init'))
+        receivePreKeyMessage(bob, getIdentityKey(alice), message)
 
         // Alice prepares message for server
         const messageId = 'test-msg-1'
@@ -358,8 +354,8 @@ describe('Full server message flow', () => {
 
         // Setup session
         const bobBundle = getPreKeyBundle(bob)
-        const { sessionInitMessage } = initiateSession(alice, bobBundle, stringToBytes('Init'))
-        receiveSessionInit(bob, getIdentityKey(alice), sessionInitMessage)
+        const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Init'))
+        receivePreKeyMessage(bob, getIdentityKey(alice), message)
 
         // Alice prepares message
         const messageId = 'test-msg-1'

@@ -130,7 +130,7 @@ describe('createProfileForRegistration', () => {
 
         // Public key should be base64 encoded
         expect(() => decodeBase64(result.profilePublicKey)).not.toThrow()
-        expect(() => decodeBase64(result.profileSecretKey)).not.toThrow()
+        expect(() => decodeBase64(result.profileSecretKey, 'base64url')).not.toThrow()
 
         // Should be able to decrypt profile
         const decrypted = decryptProfile(

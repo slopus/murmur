@@ -1,14 +1,14 @@
 /**
  * SQLite database storage for Murmur.
  *
- * Uses better-sqlite3 for synchronous, fast SQLite access.
+ * Uses node:sqlite for synchronous, fast SQLite access.
  * Data is stored in ~/.murmur/murmur.db
  */
 
-import Database from 'better-sqlite3'
+import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { join, resolve } from 'node:path'
 import type { StoredContact, StoredMessage, Account } from './types.js'
 import type { SerializedAgentState } from '../encryption/session/types.js'
 
@@ -16,10 +16,10 @@ import type { SerializedAgentState } from '../encryption/session/types.js'
  * Get the Murmur data directory path.
  * Creates the directory if it doesn't exist.
  *
- * @param local - If true, use .murmur in current directory instead of home
+ * @param rootDir - If provided, use this directory instead of home
  */
-export function getDataDir(local: boolean = false): string {
-    const dir = local ? join(process.cwd(), '.murmur') : join(homedir(), '.murmur')
+export function getDataDir(rootDir?: string): string {
+    const dir = rootDir ? resolve(rootDir) : join(homedir(), '.murmur')
     if (!existsSync(dir)) {
         mkdirSync(dir, { recursive: true })
     }
@@ -29,21 +29,22 @@ export function getDataDir(local: boolean = false): string {
 /**
  * Get the database file path.
  *
- * @param local - If true, use .murmur in current directory instead of home
+ * @param rootDir - If provided, use this directory instead of home
  */
-export function getDbPath(local: boolean = false): string {
-    return join(getDataDir(local), 'murmur.db')
+export function getDbPath(rootDir?: string): string {
+    return join(getDataDir(rootDir), 'murmur.db')
 }
 
 /**
  * Database manager for Murmur storage.
  */
 export class MurmurDatabase {
-    private db: Database.Database
+    private db: DatabaseSync
 
     constructor(dbPath?: string) {
-        this.db = new Database(dbPath ?? getDbPath())
-        this.db.pragma('journal_mode = WAL')
+        this.db = new DatabaseSync(dbPath ?? getDbPath())
+        this.db.exec('PRAGMA foreign_keys = ON')
+        this.db.exec('PRAGMA journal_mode = WAL')
         this.initSchema()
     }
 
@@ -75,6 +76,7 @@ export class MurmurDatabase {
             CREATE TABLE IF NOT EXISTS contacts (
                 identity_key TEXT PRIMARY KEY,
                 profile_public_key TEXT NOT NULL,
+                profile_secret_key TEXT,
                 encrypted_profile TEXT NOT NULL,
                 added_at INTEGER NOT NULL,
                 updated_at INTEGER NOT NULL
@@ -99,6 +101,19 @@ export class MurmurDatabase {
             CREATE INDEX IF NOT EXISTS idx_messages_unread
             ON messages(conversation_id, read) WHERE read = 0;
         `)
+
+        this.ensureContactSchema()
+    }
+
+    /**
+     * Ensure optional contact columns exist for older databases.
+     */
+    private ensureContactSchema(): void {
+        const columns = this.db.prepare('PRAGMA table_info(contacts)').all() as Array<{ name: string }>
+        const hasProfileSecretKey = columns.some(column => column.name === 'profile_secret_key')
+        if (!hasProfileSecretKey) {
+            this.db.exec('ALTER TABLE contacts ADD COLUMN profile_secret_key TEXT')
+        }
     }
 
     /**
@@ -183,16 +198,34 @@ export class MurmurDatabase {
     }
 
     /**
+     * Clear all stored data.
+     */
+    clearAll(): void {
+        this.db.exec('BEGIN')
+        try {
+            this.db.exec('DELETE FROM messages')
+            this.db.exec('DELETE FROM contacts')
+            this.db.exec('DELETE FROM agent_state')
+            this.db.exec('DELETE FROM account')
+            this.db.exec('COMMIT')
+        } catch (error) {
+            this.db.exec('ROLLBACK')
+            throw error
+        }
+    }
+
+    /**
      * Get all contacts.
      */
     getContacts(): StoredContact[] {
         const rows = this.db.prepare(`
-            SELECT identity_key, profile_public_key, encrypted_profile,
+            SELECT identity_key, profile_public_key, profile_secret_key, encrypted_profile,
                    added_at, updated_at
             FROM contacts ORDER BY added_at DESC
         `).all() as Array<{
             identity_key: string
             profile_public_key: string
+            profile_secret_key: string | null
             encrypted_profile: string
             added_at: number
             updated_at: number
@@ -201,6 +234,7 @@ export class MurmurDatabase {
         return rows.map(row => ({
             identityKey: row.identity_key,
             profilePublicKey: row.profile_public_key,
+            profileSecretKey: row.profile_secret_key ?? undefined,
             encryptedProfile: row.encrypted_profile,
             addedAt: row.added_at,
             updatedAt: row.updated_at
@@ -212,12 +246,13 @@ export class MurmurDatabase {
      */
     getContact(identityKey: string): StoredContact | null {
         const row = this.db.prepare(`
-            SELECT identity_key, profile_public_key, encrypted_profile,
+            SELECT identity_key, profile_public_key, profile_secret_key, encrypted_profile,
                    added_at, updated_at
             FROM contacts WHERE identity_key = ?
         `).get(identityKey) as {
             identity_key: string
             profile_public_key: string
+            profile_secret_key: string | null
             encrypted_profile: string
             added_at: number
             updated_at: number
@@ -228,6 +263,7 @@ export class MurmurDatabase {
         return {
             identityKey: row.identity_key,
             profilePublicKey: row.profile_public_key,
+            profileSecretKey: row.profile_secret_key ?? undefined,
             encryptedProfile: row.encrypted_profile,
             addedAt: row.added_at,
             updatedAt: row.updated_at
@@ -240,11 +276,12 @@ export class MurmurDatabase {
     saveContact(contact: StoredContact): void {
         this.db.prepare(`
             INSERT OR REPLACE INTO contacts
-            (identity_key, profile_public_key, encrypted_profile, added_at, updated_at)
-            VALUES (?, ?, ?, ?, ?)
+            (identity_key, profile_public_key, profile_secret_key, encrypted_profile, added_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
         `).run(
             contact.identityKey,
             contact.profilePublicKey,
+            contact.profileSecretKey ?? null,
             contact.encryptedProfile,
             contact.addedAt,
             contact.updatedAt
@@ -262,10 +299,15 @@ export class MurmurDatabase {
             'DELETE FROM contacts WHERE identity_key = ?'
         )
 
-        this.db.transaction(() => {
+        this.db.exec('BEGIN')
+        try {
             deleteMessages.run(identityKey)
             deleteContact.run(identityKey)
-        })()
+            this.db.exec('COMMIT')
+        } catch (error) {
+            this.db.exec('ROLLBACK')
+            throw error
+        }
     }
 
     /**

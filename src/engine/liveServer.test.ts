@@ -235,7 +235,7 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
             )
 
             // Fetch their profile
-            const profile = await api.getProfile(identity2.publicKey)
+            const profile = await api.getProfile(profileData2.profilePublicKey)
 
             expect(profile.id).toBe(identity2.publicKey)
             expect(profile.profilePublicKey).toBe(profileData2.profilePublicKey)
@@ -243,9 +243,10 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
 
         it('should fail to get non-existent user profile', async () => {
             const fakeIdentity = createTestIdentity()
+            const fakeProfile = createTestProfile(fakeIdentity)
 
             await expect(
-                api.getProfile(fakeIdentity.publicKey)
+                api.getProfile(fakeProfile.profilePublicKey)
             ).rejects.toThrow()
         })
 

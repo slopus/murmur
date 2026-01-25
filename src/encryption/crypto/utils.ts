@@ -6,6 +6,7 @@
  */
 
 import { randomBytes as cryptoRandomBytes } from 'node:crypto'
+import { base58 } from '@scure/base'
 
 /**
  * Encode a Uint8Array to base64 string
@@ -32,6 +33,24 @@ export function encodeBase64Url(buffer: Uint8Array): string {
         .replaceAll('+', '-')
         .replaceAll('/', '_')
         .replaceAll('=', '')
+}
+
+/**
+ * Encode a Uint8Array to base58 string.
+ * @param buffer - The buffer to encode
+ * @returns Base58 encoded string
+ */
+export function encodeBase58(buffer: Uint8Array): string {
+    return base58.encode(buffer)
+}
+
+/**
+ * Decode a base58 string to a Uint8Array.
+ * @param value - The base58 string to decode
+ * @returns The decoded Uint8Array
+ */
+export function decodeBase58(value: string): Uint8Array {
+    return base58.decode(value)
 }
 
 /**

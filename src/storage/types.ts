@@ -37,6 +37,8 @@ export interface StoredContact {
     identityKey: string
     /** Contact's profile public key (base64) */
     profilePublicKey: string
+    /** Contact's profile secret key (base64) */
+    profileSecretKey?: string
     /** Encrypted profile blob (base64) */
     encryptedProfile: string
     /** When the contact was added */

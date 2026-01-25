@@ -11,12 +11,12 @@ import {
     createAgent,
     getIdentityKey,
     getPreKeyBundle,
-    initiateSession,
-    receiveSessionInit,
+    createPreKeyMessage,
     serializeAgent,
     deserializeAgent,
     prepareOutgoingMessage,
-    processIncomingMessage
+    processIncomingMessage,
+    signMessageForServer
 } from '../encryption/session/session.js'
 import {
     encodeBase64,
@@ -79,20 +79,17 @@ describe('Full end-to-end encrypted messaging flow', () => {
         // Alice gets Bob's prekey bundle (normally from server, we use agent directly)
         const bobBundle = getPreKeyBundle(bobAgent, true)
 
-        // Alice initiates session with initial message
-        const { sessionInitMessage } = initiateSession(
+        // Alice sends a pre-key message with the initial payload
+        const { message: preKeyMessage } = createPreKeyMessage(
             aliceAgent,
             bobBundle,
             stringToBytes('Hello Bob! This is our first secure message.')
         )
 
-        // Alice sends session init message through server
-        const sessionMsgBlob = encodeBase64(stringToBytes(JSON.stringify(sessionInitMessage)))
+        // Alice sends message through server
+        const sessionMsgBlob = encodeBase64(stringToBytes(JSON.stringify(preKeyMessage)))
         const sessionMsgId = 'session-init-1'
-        const sessionMsgSig = encodeBase64(sign(
-            stringToBytes(sessionMsgBlob + sessionMsgId),
-            aliceAgent.keyStore.identityKeyPair.privateKey
-        ))
+        const sessionMsgSig = signMessageForServer(aliceAgent, sessionMsgBlob, sessionMsgId)
 
         server.sendMessage(aliceToken, sessionMsgId, bobIdentity, sessionMsgBlob, sessionMsgSig)
 
@@ -110,8 +107,6 @@ describe('Full end-to-end encrypted messaging flow', () => {
         )
 
         expect(bytesToString(decrypted.plaintext)).toBe('Hello Bob! This is our first secure message.')
-        expect(decrypted.isSessionInit).toBe(true)
-
         // Acknowledge
         server.acknowledgeMessages(bobToken, [inboxMsg.id])
 
@@ -195,19 +190,17 @@ describe('Full end-to-end encrypted messaging flow', () => {
 
         // Establish session
         const bobBundle = getPreKeyBundle(bobAgent, true)
-        const { sessionInitMessage } = initiateSession(
+        const { message: preKeyMessage } = createPreKeyMessage(
             aliceAgent,
             bobBundle,
             stringToBytes('Init')
         )
 
-        // Send session init through server
-        const initBlob = encodeBase64(stringToBytes(JSON.stringify(sessionInitMessage)))
-        const initSig = encodeBase64(sign(
-            stringToBytes(initBlob + 'init-msg'),
-            aliceAgent.keyStore.identityKeyPair.privateKey
-        ))
-        server.sendMessage(aliceToken, 'init-msg', bobIdentity, initBlob, initSig)
+        // Send pre-key message through server
+        const initBlob = encodeBase64(stringToBytes(JSON.stringify(preKeyMessage)))
+        const initMsgId = 'init-msg'
+        const initSig = signMessageForServer(aliceAgent, initBlob, initMsgId)
+        server.sendMessage(aliceToken, initMsgId, bobIdentity, initBlob, initSig)
 
         // Bob processes init
         const inbox = server.getInbox(bobToken)
@@ -297,18 +290,16 @@ describe('Full end-to-end encrypted messaging flow', () => {
 
         // Establish session and exchange a message
         const bobBundle = getPreKeyBundle(bobAgent, true)
-        const { sessionInitMessage } = initiateSession(
+        const { message: preKeyMessage } = createPreKeyMessage(
             aliceAgent,
             bobBundle,
             stringToBytes('Hello')
         )
 
-        const initBlob = encodeBase64(stringToBytes(JSON.stringify(sessionInitMessage)))
-        const initSig = encodeBase64(sign(
-            stringToBytes(initBlob + 'init'),
-            aliceAgent.keyStore.identityKeyPair.privateKey
-        ))
-        server.sendMessage(aliceToken, 'init', bobIdentity, initBlob, initSig)
+        const initBlob = encodeBase64(stringToBytes(JSON.stringify(preKeyMessage)))
+        const initMsgId = 'init'
+        const initSig = signMessageForServer(aliceAgent, initBlob, initMsgId)
+        server.sendMessage(aliceToken, initMsgId, bobIdentity, initBlob, initSig)
 
         const bobInbox = server.getInbox(bobToken)
         processIncomingMessage(
@@ -442,19 +433,16 @@ describe('Full end-to-end encrypted messaging flow', () => {
         expect(matchingOneTimePreKeyId).toBeDefined()
 
         // Alice initiates session using fetched bundle
-        const { sessionInitMessage } = initiateSession(
+        const { message: preKeyMessage } = createPreKeyMessage(
             aliceAgent,
             fetchedBundle,
             stringToBytes('Hello via server bundle!')
         )
 
         // Send through server with proper signature
-        const initBlob = encodeBase64(stringToBytes(JSON.stringify(sessionInitMessage)))
+        const initBlob = encodeBase64(stringToBytes(JSON.stringify(preKeyMessage)))
         const initMsgId = 'server-init'
-        const initSig = encodeBase64(sign(
-            stringToBytes(initBlob + initMsgId),
-            aliceAgent.keyStore.identityKeyPair.privateKey
-        ))
+        const initSig = signMessageForServer(aliceAgent, initBlob, initMsgId)
         server.sendMessage(aliceToken, initMsgId, bobIdentity, initBlob, initSig)
 
         // Bob receives and decrypts
@@ -471,7 +459,6 @@ describe('Full end-to-end encrypted messaging flow', () => {
         )
 
         expect(bytesToString(decrypted.plaintext)).toBe('Hello via server bundle!')
-        expect(decrypted.isSessionInit).toBe(true)
         server.acknowledgeMessages(bobToken, [msg.id])
 
         // Continue with regular messaging

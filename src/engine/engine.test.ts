@@ -178,7 +178,7 @@ describe('MockServer integration with Engine concepts', () => {
         await bobApi.register('bob', new Uint8Array(32), 'bob-ppk', 'sig', 'bob-profile')
 
         // Alice fetches Bob's profile
-        const bobProfile = await aliceApi.getProfile('bob')
+        const bobProfile = await aliceApi.getProfile('bob-ppk')
         expect(bobProfile.id).toBe('bob')
         expect(bobProfile.profilePublicKey).toBe('bob-ppk')
         expect(bobProfile.encryptedProfile).toBe('bob-profile')

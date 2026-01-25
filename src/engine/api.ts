@@ -140,13 +140,14 @@ export class MurmurApi {
     }
 
     /**
-     * Make an authenticated request.
+     * Make an authenticated request with timeout.
      */
     private async request<T>(
         method: string,
         path: string,
         body?: unknown,
-        requireAuth: boolean = true
+        requireAuth: boolean = true,
+        timeoutMs: number = 30000
     ): Promise<T> {
         const headers: Record<string, string> = {
             'Content-Type': 'application/json'
@@ -159,18 +160,31 @@ export class MurmurApi {
             headers['Authorization'] = `Bearer ${this.accessToken}`
         }
 
-        const response = await fetch(`${this.baseUrl}${path}`, {
-            method,
-            headers,
-            body: body ? JSON.stringify(body) : undefined
-        })
+        const controller = new AbortController()
+        const timeout = setTimeout(() => controller.abort(), timeoutMs)
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => ({ error: 'Unknown error' })) as { error?: string }
-            throw new Error(errorData.error || `HTTP ${response.status}`)
+        try {
+            const response = await fetch(`${this.baseUrl}${path}`, {
+                method,
+                headers,
+                body: body ? JSON.stringify(body) : undefined,
+                signal: controller.signal
+            })
+
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => ({ error: 'Unknown error' })) as { error?: string }
+                throw new Error(errorData.error || `HTTP ${response.status}`)
+            }
+
+            return response.json() as Promise<T>
+        } catch (error) {
+            if (error instanceof Error && error.name === 'AbortError') {
+                throw new Error('Request timed out')
+            }
+            throw error
+        } finally {
+            clearTimeout(timeout)
         }
-
-        return response.json() as Promise<T>
     }
 
     /**
@@ -362,12 +376,38 @@ export class MurmurApi {
     }
 
     /**
-     * Get another user's profile.
+     * Delete the current account.
      */
-    async getProfile(identityPublicKey: string): Promise<ServerProfile> {
+    async deleteAccount(): Promise<void> {
+        const timestamp = Date.now()
+        const requestBody = { timestamp }
+        const signature = this.sign(JSON.stringify(requestBody))
+
+        await this.request<{ success: boolean }>('POST', '/v1/account/delete', {
+            ...requestBody,
+            signature
+        })
+    }
+
+    /**
+     * Get another user's profile by profile public key.
+     */
+    async getProfile(profilePublicKey: string): Promise<ServerProfile> {
         return this.request<ServerProfile>(
             'GET',
-            `/v1/profile/${encodeURIComponent(identityPublicKey)}`
+            `/v1/profile/${encodeURIComponent(profilePublicKey)}`
+        )
+    }
+
+    /**
+     * Get another user's profile by profile public key without auth.
+     */
+    async getPublicProfile(profilePublicKey: string): Promise<ServerProfile> {
+        return this.request<ServerProfile>(
+            'GET',
+            `/v1/profile/${encodeURIComponent(profilePublicKey)}`,
+            undefined,
+            false
         )
     }
 

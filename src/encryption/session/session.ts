@@ -10,7 +10,7 @@
  * Usage:
  * 1. Create agent: createAgent()
  * 2. Publish prekey bundle to server
- * 3. Initiate session: initiateSession(agent, peerBundle)
+ * 3. Send first message: createPreKeyMessage(agent, peerBundle, plaintext)
  * 4. Send messages: encryptMessage(agent, peerId, plaintext)
  * 5. Receive messages: decryptMessage(agent, senderId, message)
  */
@@ -20,7 +20,6 @@ import {
     createPreKeyBundle,
     x3dhSender,
     x3dhReceiver,
-    consumeOneTimePreKey,
     serializeKeyStore,
     deserializeKeyStore,
     replenishOneTimePreKeys,
@@ -45,7 +44,8 @@ import {
     decodeBase64,
     stringToBytes,
     bytesToString,
-    concatBytes
+    concatBytes,
+    constantTimeEqual
 } from '../crypto/utils.js'
 import { sign, verify } from '../crypto/signing.js'
 import type {
@@ -53,8 +53,6 @@ import type {
     SerializedSession,
     AgentState,
     SerializedAgentState,
-    SessionInitMessage,
-    RegularMessage,
     ProtocolMessage,
     DecryptedMessage,
     OutgoingMessage
@@ -114,25 +112,25 @@ export function getPreKeyBundle(agent: AgentState, includeOneTimePreKey: boolean
 }
 
 /**
- * Initiate a session with a peer using their prekey bundle.
+ * Create a pre-key message to establish a new session.
  *
  * @param agent - Our agent state
  * @param peerBundle - Peer's prekey bundle (from server)
  * @param initialMessage - First message to send
- * @returns Session init message to send to peer
+ * @returns Message to send along with the created session
  *
  * @example
  * ```typescript
  * const peerBundle = await fetchPreKeyBundle(peerId)
- * const { message } = initiateSession(agent, peerBundle, 'Hello!')
+ * const { message } = createPreKeyMessage(agent, peerBundle, stringToBytes('Hello!'))
  * await sendMessage(peerId, message)
  * ```
  */
-export function initiateSession(
+export function createPreKeyMessage(
     agent: AgentState,
     peerBundle: PreKeyBundle,
     initialMessage: Uint8Array
-): { sessionInitMessage: SessionInitMessage; session: Session } {
+): { message: ProtocolMessage; session: Session } {
     // Perform X3DH
     const x3dhResult = x3dhSender(agent.keyStore.identityKeyPair, peerBundle)
 
@@ -154,44 +152,69 @@ export function initiateSession(
     // Encrypt first message with Double Ratchet
     const encrypted = ratchetEncrypt(ratchetState, initialMessage)
 
-    // Create session init message
-    const sessionInitMessage: SessionInitMessage = {
-        type: 'session_init',
+    const message: ProtocolMessage = {
+        type: 'message',
         identityDHKey: encodeBase64(x3dhResult.aliceIdentityDHKey),
         ephemeralKey: encodeBase64(x3dhResult.ephemeralPublicKey),
-        signedPreKeyId: x3dhResult.signedPreKeyId,
-        oneTimePreKeyId: x3dhResult.oneTimePreKeyId,
+        signedPreKey: encodeBase64(peerBundle.signedPreKey),
+        oneTimePreKey: peerBundle.oneTimePreKey ? encodeBase64(peerBundle.oneTimePreKey) : undefined,
         header: encodeBase64(encodeHeader(encrypted.header)),
         ciphertext: encodeBase64(encrypted.ciphertext)
     }
 
-    return { sessionInitMessage, session }
+    return { message, session }
 }
 
 /**
- * Process a session init message from a peer.
+ * Find a one-time prekey by public key.
+ */
+function findOneTimePreKey(store: X3DHKeyStore, publicKey: Uint8Array): X3DHReceiverKeys['oneTimePreKey'] {
+    for (const otpk of store.oneTimePreKeys.values()) {
+        if (constantTimeEqual(otpk.keyPair.publicKey, publicKey)) {
+            return otpk
+        }
+    }
+    return undefined
+}
+
+/**
+ * Process a pre-key message from a peer.
  *
  * @param agent - Our agent state
  * @param senderId - Sender's identity key (base64)
- * @param message - Session init message
- * @returns Decrypted first message
+ * @param message - Pre-key protocol message
+ * @returns Decrypted message
  */
-export function receiveSessionInit(
+export function receivePreKeyMessage(
     agent: AgentState,
     senderId: string,
-    message: SessionInitMessage
+    message: ProtocolMessage
 ): DecryptedMessage {
+    if (!message.identityDHKey || !message.ephemeralKey) {
+        throw new Error('Missing pre-key fields in message')
+    }
+
     const senderIdentityKey = decodeBase64(senderId)
+    const identityDHKey = decodeBase64(message.identityDHKey)
+    const ephemeralKey = decodeBase64(message.ephemeralKey)
+
+    if (!message.signedPreKey) {
+        throw new Error('Missing signed prekey in message')
+    }
+    const expectedSignedPreKey = decodeBase64(message.signedPreKey)
+    if (!constantTimeEqual(expectedSignedPreKey, agent.keyStore.signedPreKey.keyPair.publicKey)) {
+        throw new Error('Signed prekey does not match current key')
+    }
 
     // Get the one-time prekey if used
     let oneTimePreKey
-    if (message.oneTimePreKeyId !== undefined) {
-        oneTimePreKey = consumeOneTimePreKey(agent.keyStore, message.oneTimePreKeyId)
-    }
-
-    // Verify we have the signed prekey
-    if (agent.keyStore.signedPreKey.id !== message.signedPreKeyId) {
-        throw new Error(`Unknown signed prekey ID: ${message.signedPreKeyId}`)
+    if (message.oneTimePreKey) {
+        const expectedOneTimePreKey = decodeBase64(message.oneTimePreKey)
+        const resolvedOneTimePreKey = findOneTimePreKey(agent.keyStore, expectedOneTimePreKey)
+        if (!resolvedOneTimePreKey) {
+            throw new Error('Unknown one-time prekey')
+        }
+        oneTimePreKey = resolvedOneTimePreKey
     }
 
     // Perform X3DH
@@ -204,8 +227,8 @@ export function receiveSessionInit(
     const x3dhResult = x3dhReceiver(
         receiverKeys,
         senderIdentityKey,
-        decodeBase64(message.identityDHKey),
-        decodeBase64(message.ephemeralKey)
+        identityDHKey,
+        ephemeralKey
     )
 
     // Initialize Double Ratchet as Bob
@@ -227,8 +250,7 @@ export function receiveSessionInit(
 
     return {
         plaintext,
-        senderIdentityKey,
-        isSessionInit: true
+        senderIdentityKey
     }
 }
 
@@ -245,7 +267,7 @@ export function encryptMessage(
     agent: AgentState,
     peerId: string,
     plaintext: Uint8Array
-): RegularMessage {
+): ProtocolMessage {
     const session = agent.sessions.get(peerId)
     if (!session) {
         throw new Error(`No session with peer: ${peerId}`)
@@ -274,9 +296,16 @@ export function decryptMessage(
     senderId: string,
     message: ProtocolMessage
 ): DecryptedMessage {
-    // Handle session init
-    if (message.type === 'session_init') {
-        return receiveSessionInit(agent, senderId, message)
+    if (message.type !== 'message') {
+        throw new Error(`Invalid message type: ${message.type}`)
+    }
+
+    const hasPreKeyFields = message.identityDHKey !== undefined
+        || message.ephemeralKey !== undefined
+        || message.signedPreKey !== undefined
+        || message.oneTimePreKey !== undefined
+    if (hasPreKeyFields) {
+        return receivePreKeyMessage(agent, senderId, message)
     }
 
     // Handle regular message
@@ -292,8 +321,7 @@ export function decryptMessage(
 
     return {
         plaintext,
-        senderIdentityKey: session.peerIdentityKey,
-        isSessionInit: false
+        senderIdentityKey: session.peerIdentityKey
     }
 }
 
@@ -394,7 +422,11 @@ export function signMessageForServer(
     blob: string,
     messageId: string
 ): string {
-    const message = stringToBytes(blob + messageId)
+    const blobBytes = decodeBase64(blob)
+    const messageIdBytes = stringToBytes(messageId)
+    const message = new Uint8Array(blobBytes.length + messageIdBytes.length)
+    message.set(blobBytes, 0)
+    message.set(messageIdBytes, blobBytes.length)
     const signature = sign(message, agent.keyStore.identityKeyPair.privateKey)
     return encodeBase64(signature)
 }
@@ -415,7 +447,11 @@ export function verifyMessageSignature(
     signature: string
 ): boolean {
     const senderKey = decodeBase64(senderId)
-    const message = stringToBytes(blob + messageId)
+    const blobBytes = decodeBase64(blob)
+    const messageIdBytes = stringToBytes(messageId)
+    const message = new Uint8Array(blobBytes.length + messageIdBytes.length)
+    message.set(blobBytes, 0)
+    message.set(messageIdBytes, blobBytes.length)
     const signatureBytes = decodeBase64(signature)
     return verify(message, signatureBytes, senderKey)
 }
@@ -427,21 +463,25 @@ export function verifyMessageSignature(
  * @param peerId - Recipient's identity key (base64)
  * @param plaintext - Message plaintext
  * @param messageId - Unique message ID
+ * @param preKeyBundle - Optional prekey bundle for new sessions
  * @returns Outgoing message ready for server API
  */
 export function prepareOutgoingMessage(
     agent: AgentState,
     peerId: string,
     plaintext: Uint8Array,
-    messageId: string
+    messageId: string,
+    preKeyBundle?: PreKeyBundle
 ): { outgoing: OutgoingMessage; protocolMessage: ProtocolMessage } {
     let protocolMessage: ProtocolMessage
 
-    if (!hasSession(agent, peerId)) {
-        throw new Error(`No session with peer: ${peerId}. Call initiateSession first.`)
+    if (hasSession(agent, peerId)) {
+        protocolMessage = encryptMessage(agent, peerId, plaintext)
+    } else if (preKeyBundle) {
+        protocolMessage = createPreKeyMessage(agent, preKeyBundle, plaintext).message
+    } else {
+        throw new Error(`No session with peer: ${peerId}. Provide a prekey bundle.`)
     }
-
-    protocolMessage = encryptMessage(agent, peerId, plaintext)
 
     const blob = encodeBase64(stringToBytes(JSON.stringify(protocolMessage)))
     const signature = signMessageForServer(agent, blob, messageId)

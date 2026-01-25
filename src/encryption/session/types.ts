@@ -79,42 +79,27 @@ export interface IncomingMessage {
 }
 
 /**
- * Initial session message sent from Alice to Bob.
- * Contains X3DH parameters needed for Bob to establish the session.
+ * Protocol message.
+ *
+ * Messages are always type "message". Pre-key fields are included when
+ * establishing a new session.
  */
-export interface SessionInitMessage {
-    /** Message type identifier */
-    type: 'session_init'
-    /** Alice's identity DH public key (for X3DH) */
-    identityDHKey: string
-    /** Alice's ephemeral public key (for X3DH) */
-    ephemeralKey: string
-    /** ID of Bob's signed prekey used */
-    signedPreKeyId: number
-    /** ID of Bob's one-time prekey used (if any) */
-    oneTimePreKeyId?: number
-    /** First encrypted message (Double Ratchet) */
-    header: string
-    /** Ciphertext of first message */
-    ciphertext: string
-}
-
-/**
- * Regular message after session is established.
- */
-export interface RegularMessage {
+export interface ProtocolMessage {
     /** Message type identifier */
     type: 'message'
     /** Encoded Double Ratchet header */
     header: string
     /** Encrypted ciphertext */
     ciphertext: string
+    /** Alice's identity DH public key (for X3DH) */
+    identityDHKey?: string
+    /** Alice's ephemeral public key (for X3DH) */
+    ephemeralKey?: string
+    /** Bob's signed prekey public key used */
+    signedPreKey?: string
+    /** Bob's one-time prekey public key used (if any) */
+    oneTimePreKey?: string
 }
-
-/**
- * Union of all message types in the protocol.
- */
-export type ProtocolMessage = SessionInitMessage | RegularMessage
 
 /**
  * Result of decrypting a message.
@@ -124,6 +109,4 @@ export interface DecryptedMessage {
     plaintext: Uint8Array
     /** Sender's identity key */
     senderIdentityKey: Uint8Array
-    /** Whether this was a session-initiating message */
-    isSessionInit: boolean
 }

@@ -83,6 +83,22 @@ describe('MockServer', () => {
         it('should fail refresh with invalid token', () => {
             expect(() => server.refresh('invalid-token')).toThrow('Invalid refresh token')
         })
+
+        it('should delete an account', () => {
+            const result = server.register(
+                'identity-key-1',
+                'profile-public-key-1',
+                'profile-signature-1',
+                'encrypted-profile-1'
+            )
+
+            expect(server.getUserCount()).toBe(1)
+
+            server.deleteAccount(result.tokens.accessToken)
+
+            expect(server.getUserCount()).toBe(0)
+            expect(() => server.login('identity-key-1')).toThrow('User not found')
+        })
     })
 
     describe('Messages', () => {
@@ -221,7 +237,7 @@ describe('MockServer', () => {
         })
 
         it('should get other user profile', () => {
-            const profile = server.getProfile(aliceToken, 'bob-id')
+            const profile = server.getProfile(aliceToken, 'bob-profile-key')
 
             expect(profile.id).toBe('bob-id')
             expect(profile.profilePublicKey).toBe('bob-profile-key')

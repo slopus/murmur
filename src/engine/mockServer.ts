@@ -165,6 +165,26 @@ export class MockServer {
     }
 
     /**
+     * Delete a user account.
+     */
+    deleteAccount(accessToken: string): void {
+        const userId = this.verifyToken(accessToken)
+        this.users.delete(userId)
+
+        for (const [token, ownerId] of Array.from(this.accessTokens.entries())) {
+            if (ownerId === userId) {
+                this.accessTokens.delete(token)
+            }
+        }
+
+        for (const [messageId, message] of Array.from(this.messages.entries())) {
+            if (message.senderId === userId || message.recipientId === userId) {
+                this.messages.delete(messageId)
+            }
+        }
+    }
+
+    /**
      * Verify access token and get user ID.
      */
     private verifyToken(accessToken: string): string {
@@ -296,22 +316,29 @@ export class MockServer {
     }
 
     /**
-     * Get profile.
+     * Get profile by profile public key.
      */
-    getProfile(accessToken: string, identityPublicKey: string): ServerProfile {
+    getProfile(accessToken: string, profilePublicKey: string): ServerProfile {
         this.verifyToken(accessToken)
 
-        const user = this.users.get(identityPublicKey)
-        if (!user) {
+        let matched: MockUser | undefined
+        for (const user of this.users.values()) {
+            if (user.profilePublicKey === profilePublicKey) {
+                matched = user
+                break
+            }
+        }
+
+        if (!matched) {
             throw new Error('User not found')
         }
 
         return {
-            id: identityPublicKey,
-            profilePublicKey: user.profilePublicKey,
-            profileKeySignature: user.profileKeySignature,
-            encryptedProfile: user.encryptedProfile,
-            profileUpdatedAt: user.createdAt
+            id: matched.identityPublicKey,
+            profilePublicKey: matched.profilePublicKey,
+            profileKeySignature: matched.profileKeySignature,
+            encryptedProfile: matched.encryptedProfile,
+            profileUpdatedAt: matched.createdAt
         }
     }
 
@@ -519,6 +546,13 @@ export function createMockApi(server: MockServer) {
             return accessToken
         },
 
+        async deleteAccount() {
+            if (!accessToken) throw new Error('Not authenticated')
+            server.deleteAccount(accessToken)
+            accessToken = null
+            refreshToken = null
+        },
+
         async sendMessage(recipientId: string, blob: string) {
             if (!accessToken) throw new Error('Not authenticated')
             const messageId = createId()
@@ -535,9 +569,9 @@ export function createMockApi(server: MockServer) {
             return server.acknowledgeMessages(accessToken, messageIds)
         },
 
-        async getProfile(identityPublicKey: string) {
+        async getProfile(profilePublicKey: string) {
             if (!accessToken) throw new Error('Not authenticated')
-            return server.getProfile(accessToken, identityPublicKey)
+            return server.getProfile(accessToken, profilePublicKey)
         },
 
         async getMyProfile() {

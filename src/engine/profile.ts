@@ -118,7 +118,7 @@ export function createProfileForRegistration(
 } {
     const profileKeyPair = generateProfileKeyPair()
     const profilePublicKey = encodeBase64(profileKeyPair.publicKey)
-    const profileSecretKey = encodeBase64(profileKeyPair.privateKey)
+    const profileSecretKey = encodeBase64(profileKeyPair.privateKey, 'base64url')
     const profileKeySignature = signProfileKey(profileKeyPair.publicKey, identityPrivateKey)
     const encryptedProfile = encryptProfile(profile, profileKeyPair.privateKey)
 

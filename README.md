@@ -19,6 +19,32 @@ npm install murmur
 yarn add murmur
 ```
 
+## CLI Usage
+
+```bash
+murmur sign-in --first-name Alice --last-name Smith --root /path/to/profile
+murmur delete-account --confirm --root /path/to/profile
+murmur add-contact --profile-secret <key> --root /path/to/profile
+murmur profile <profile-secret>
+murmur send --to <identityKey> --message "hello" --root /path/to/profile
+murmur sync --root /path/to/profile
+murmur messages --with <identityKey> --limit 20 --root /path/to/profile
+```
+
+Environment variables:
+
+- `MURMUR_ROOT` - Profile directory (defaults to `~/.murmur`)
+- `MURMUR_API_BASE_URL` - Override server base URL
+- `MURMUR_FIRST_NAME`, `MURMUR_LAST_NAME`, `MURMUR_PROFILE_SECRET`, `MURMUR_CONFIRM_DELETE`, `MURMUR_TO`, `MURMUR_MESSAGE`, `MURMUR_WITH`, `MURMUR_LIMIT`
+
+Notes:
+- `profile-secret` values are URL-safe base64 without padding.
+- Identity keys in CLI output are base58; commands accept base58 or base64/base64url.
+
+Docs:
+- `PROFILE_FORMAT.md` - encrypted profile blob format
+- `MESSAGE_FORMAT.md` - message wire format
+
 ## Quick Start with X3DH
 
 ```typescript
