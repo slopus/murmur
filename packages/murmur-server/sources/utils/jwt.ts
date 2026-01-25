@@ -1,7 +1,8 @@
 import * as privacyKit from 'privacy-kit';
 
 const JWT_SEED = process.env.JWT_SEED || 'dev-seed-change-in-production';
-const ACCESS_TOKEN_TTL = 60 * 60; // 1 hour in seconds
+const ACCESS_TOKEN_TTL =
+    Number.parseInt(process.env.ACCESS_TOKEN_TTL_SECONDS ?? '', 10) || 60 * 60 * 24; // 24 hours in seconds
 const REFRESH_TOKEN_SERVICE = 'murmur-refresh';
 const ACCESS_TOKEN_SERVICE = 'murmur-access';
 
@@ -55,7 +56,7 @@ export interface TokenPair {
 /**
  * Generate a token pair (access + refresh) for a user
  * @param userId - The user ID to generate tokens for
- * @returns Object with accessToken (1h expiry) and refreshToken (long-lived)
+ * @returns Object with accessToken (configurable expiry) and refreshToken (long-lived)
  */
 export async function generateToken(userId: string): Promise<TokenPair> {
     if (!accessTokenGenerator || !refreshTokenGenerator) {
