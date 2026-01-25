@@ -461,6 +461,33 @@ function printUnreadMessages(
     return printed
 }
 
+async function waitWithAbort(delayMs: number, signal: AbortSignal): Promise<void> {
+    if (delayMs <= 0) {
+        return
+    }
+    if (signal.aborted) {
+        throw new Error('Aborted')
+    }
+    await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => {
+            cleanup()
+            resolve()
+        }, delayMs)
+
+        const onAbort = () => {
+            cleanup()
+            reject(new Error('Aborted'))
+        }
+
+        const cleanup = () => {
+            clearTimeout(timer)
+            signal.removeEventListener('abort', onAbort)
+        }
+
+        signal.addEventListener('abort', onAbort)
+    })
+}
+
 /**
  * Run the CLI command.
  */
@@ -628,23 +655,50 @@ async function run(): Promise<void> {
                 process.on('SIGINT', onSigint)
 
                 try {
-                    await getEngine().streamMessages(async event => {
-                        if (event.event !== 'message') {
-                            return
+                    let backoffMs = 1000
+                    const maxBackoffMs = 30000
+
+                    while (!controller.signal.aborted) {
+                        try {
+                            await getEngine().streamMessages(async event => {
+                                if (event.event !== 'message') {
+                                    return
+                                }
+                                const data = event.data
+                                if (!data || typeof data !== 'object') {
+                                    return
+                                }
+                                const messageId = (data as { messageId?: unknown }).messageId
+                                if (typeof messageId !== 'string' || messageId.length === 0) {
+                                    return
+                                }
+                                if (getEngine().hasMessage(messageId)) {
+                                    return
+                                }
+                                await triggerSync()
+                            }, { signal: controller.signal })
+
+                            backoffMs = 1000
+                            if (!controller.signal.aborted) {
+                                await triggerSync()
+                            }
+                        } catch (error) {
+                            if (controller.signal.aborted) {
+                                break
+                            }
+                            const message = error instanceof Error ? error.message : String(error)
+                            console.error(`Realtime sync disconnected: ${message}`)
                         }
-                        const data = event.data
-                        if (!data || typeof data !== 'object') {
-                            return
+
+                        if (!controller.signal.aborted) {
+                            try {
+                                await waitWithAbort(backoffMs, controller.signal)
+                            } catch {
+                                break
+                            }
+                            backoffMs = Math.min(backoffMs * 2, maxBackoffMs)
                         }
-                        const messageId = (data as { messageId?: unknown }).messageId
-                        if (typeof messageId !== 'string' || messageId.length === 0) {
-                            return
-                        }
-                        if (getEngine().hasMessage(messageId)) {
-                            return
-                        }
-                        await triggerSync()
-                    }, { signal: controller.signal })
+                    }
                 } catch (error) {
                     if (!controller.signal.aborted) {
                         throw error
