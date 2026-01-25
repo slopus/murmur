@@ -315,6 +315,35 @@ describe('MurmurDatabase', () => {
             expect(db.hasMessage('msg-1')).toBe(true)
         })
 
+        it('should save and retrieve attachments', () => {
+            const message: StoredMessage = {
+                id: 'msg-attach',
+                conversationId: 'peer-1',
+                isOutgoing: false,
+                text: 'With attachments',
+                createdAt: 2000,
+                read: false,
+                attachments: [
+                    {
+                        fileName: 'test.txt',
+                        hash: 'deadbeef',
+                        iv: 'iv-base64',
+                        key: 'key-base64',
+                        ciphertext: 'cipher-base64'
+                    }
+                ]
+            }
+
+            db.saveMessage(message)
+
+            const messages = db.getMessages('peer-1')
+            expect(messages).toHaveLength(1)
+            expect(messages[0].attachments).toEqual(message.attachments)
+
+            const attachment = db.getAttachment('msg-attach', 'test.txt')
+            expect(attachment).toEqual(message.attachments?.[0])
+        })
+
         it('should return messages in chronological order', () => {
             for (let i = 1; i <= 5; i++) {
                 db.saveMessage({

@@ -18,7 +18,7 @@ import { publicKeyFromPrivate } from './encryption/crypto/dh.js'
  */
 interface ParsedArgs {
     command: string | null
-    options: Record<string, string | boolean>
+    options: Record<string, string | boolean | string[]>
     positionals: string[]
 }
 
@@ -27,8 +27,25 @@ interface ParsedArgs {
  */
 function parseArgs(args: string[]): ParsedArgs {
     let command: string | null = null
-    const options: Record<string, string | boolean> = {}
+    const options: Record<string, string | boolean | string[]> = {}
     const positionals: string[] = []
+
+    const pushOption = (key: string, value: string): void => {
+        const existing = options[key]
+        if (existing === undefined) {
+            options[key] = value
+            return
+        }
+        if (Array.isArray(existing)) {
+            existing.push(value)
+            return
+        }
+        if (typeof existing === 'string') {
+            options[key] = [existing, value]
+            return
+        }
+        options[key] = value
+    }
 
     for (let i = 0; i < args.length; i += 1) {
         const arg = args[i]
@@ -53,11 +70,11 @@ function parseArgs(args: string[]): ParsedArgs {
             if (eqIndex >= 0) {
                 const key = trimmed.slice(0, eqIndex)
                 const value = trimmed.slice(eqIndex + 1)
-                options[key] = value
+                pushOption(key, value)
             } else {
                 const next = args[i + 1]
                 if (next && !next.startsWith('-')) {
-                    options[trimmed] = next
+                    pushOption(trimmed, next)
                     i += 1
                 } else {
                     options[trimmed] = true
@@ -80,13 +97,16 @@ function parseArgs(args: string[]): ParsedArgs {
  * Read a string option from args or environment.
  */
 function readStringOption(
-    options: Record<string, string | boolean>,
+    options: Record<string, string | boolean | string[]>,
     name: string,
     envName?: string
 ): string | undefined {
     const value = options[name]
     if (typeof value === 'string' && value.trim().length > 0) {
         return value
+    }
+    if (Array.isArray(value) && value.length > 0 && value[0].trim().length > 0) {
+        return value[0]
     }
 
     if (envName) {
@@ -103,7 +123,7 @@ function readStringOption(
  * Read a required string option or throw.
  */
 function requireStringOption(
-    options: Record<string, string | boolean>,
+    options: Record<string, string | boolean | string[]>,
     name: string,
     envName?: string
 ): string {
@@ -119,7 +139,7 @@ function requireStringOption(
  * Read a numeric option from args or environment.
  */
 function readNumberOption(
-    options: Record<string, string | boolean>,
+    options: Record<string, string | boolean | string[]>,
     name: string,
     envName?: string
 ): number | undefined {
@@ -137,7 +157,7 @@ function readNumberOption(
  * Read a boolean option from args or environment.
  */
 function readBooleanOption(
-    options: Record<string, string | boolean>,
+    options: Record<string, string | boolean | string[]>,
     name: string,
     envName?: string
 ): boolean {
@@ -168,6 +188,23 @@ function readBooleanOption(
     }
 
     return false
+}
+
+/**
+ * Read a string array option from args.
+ */
+function readStringArrayOption(
+    options: Record<string, string | boolean | string[]>,
+    name: string
+): string[] {
+    const value = options[name]
+    if (typeof value === 'string') {
+        return value.trim().length > 0 ? [value] : []
+    }
+    if (Array.isArray(value)) {
+        return value.map(item => item.trim()).filter(item => item.length > 0)
+    }
+    return []
 }
 
 /**
@@ -320,10 +357,11 @@ function printUsage(): void {
         '  murmur delete-account --confirm',
         '  murmur add-contact <id>',
         '  murmur profile <profile-secret>',
-        '  murmur send --to <id> --message <text>',
+        '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>]',
         '  murmur messages --with <id> [--limit <n>]',
-        '  murmur ack <messageId...>'
+        '  murmur ack <messageId...>',
+        '  murmur attachment --message <id> --name <file> --out <path>'
     ]
 
     console.log(lines.join('\n'))
@@ -365,11 +403,16 @@ function formatSenderId(contact: Contact | undefined, fallbackIdentityKey: strin
 }
 
 function printMessageBlock(message: StoredMessage, senderId: string, senderName: string): void {
+    const attachments = message.attachments
+    const attachmentNames = attachments?.map(attachment => attachment.fileName) ?? []
     console.log('----')
     console.log(`Message ID: ${message.id}`)
     console.log(`Sender ID: ${senderId}`)
     console.log(`Sender Name: ${senderName}`)
     console.log(`Date: ${formatTimestamp(message.createdAt)}`)
+    if (attachmentNames.length > 0) {
+        console.log(`Attachments: ${attachmentNames.join(', ')}`)
+    }
     console.log(message.text)
     console.log('----')
 }
@@ -449,8 +492,9 @@ async function run(): Promise<void> {
                 await requireInitialized(getEngine())
                 const recipientId = requireStringOption(parsed.options, 'to', 'MURMUR_TO')
                 const message = requireStringOption(parsed.options, 'message', 'MURMUR_MESSAGE')
+                const attachments = readStringArrayOption(parsed.options, 'attach')
                 const contact = resolveContactByProfileSecret(getEngine(), recipientId)
-                const stored = await getEngine().sendMessage(contact.identityKey, message)
+                const stored = await getEngine().sendMessage(contact.identityKey, message, attachments)
                 console.log(`Sent ${stored.id} to ${formatContact(contact)} at ${formatTimestamp(stored.createdAt)}`)
                 return
             }
@@ -558,6 +602,15 @@ async function run(): Promise<void> {
                 }
                 await getEngine().acknowledgeMessages(ids)
                 console.log(`Acknowledged ${ids.length} message${ids.length === 1 ? '' : 's'}.`)
+                return
+            }
+            case 'attachment': {
+                await requireInitialized(getEngine())
+                const messageId = requireStringOption(parsed.options, 'message')
+                const fileName = requireStringOption(parsed.options, 'name')
+                const outputPath = requireStringOption(parsed.options, 'out')
+                getEngine().saveAttachmentToPath(messageId, fileName, outputPath)
+                console.log(`Saved attachment to ${outputPath}`)
                 return
             }
             default:

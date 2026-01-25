@@ -17,7 +17,14 @@ Current payload JSON:
 ```json
 {
   "text": "Hello there",
-  "profileSecretKey": "base64url-no-padding"
+  "profileSecretKey": "base64url-no-padding",
+  "attachments": {
+    "report.pdf": {
+      "hash": "sha256-hex-of-encrypted-bytes",
+      "iv": "base64",
+      "key": "base64"
+    }
+  }
 }
 ```
 
@@ -26,6 +33,11 @@ Notes:
 - `text` is required.
 - `profileSecretKey` is the sender's profile secret key (base64url, no padding),
   included so a recipient can resolve the sender profile if not already known.
+- `attachments` is optional. Each entry maps a filename (no path) to the
+  AES-GCM parameters for the encrypted attachment bytes:
+  - `hash`: SHA-256 of the encrypted bytes (hex).
+  - `iv`: AES-GCM IV (base64).
+  - `key`: AES-GCM key (base64).
 - Legacy payloads may be a raw UTF-8 string; if JSON parsing fails, the client
   treats the plaintext as text.
 
@@ -47,6 +59,9 @@ Protocol messages always use `type: "message"`. Pre-key fields live under
     "preKey": "base64",
     "oneTimePreKey": "base64"
   },
+  "attachments": {
+    "sha256-hex": "base64(encrypted-bytes)"
+  },
   "ratchetKey": "base64",
   "previousChainLength": 0,
   "messageNumber": 0,
@@ -59,6 +74,9 @@ Protocol messages always use `type: "message"`. Pre-key fields live under
 ```json
 {
   "type": "message",
+  "attachments": {
+    "sha256-hex": "base64(encrypted-bytes)"
+  },
   "ratchetKey": "base64",
   "previousChainLength": 0,
   "messageNumber": 0,
@@ -76,6 +94,9 @@ Field details:
 - `ratchetKey`: current Double Ratchet public key (X25519, base64).
 - `previousChainLength`, `messageNumber`: chain counters for the Double Ratchet.
 - `ciphertext`: base64-encoded ChaCha20-Poly1305 ciphertext + auth tag.
+- `attachments`: optional map of `sha256(encrypted_bytes)` (hex) to the
+  AES-GCM encrypted bytes (base64). Filenames are only present inside the
+  encrypted payload.
 
 ## Algorithms
 
@@ -94,6 +115,7 @@ Field details:
 6. Build protocol message JSON with:
    - `type: "message"`
    - `init` containing `ephemeralKey`, `preKey`, and optional `oneTimePreKey` (from bundle)
+   - `attachments` map (if any)
    - `ratchetKey`, `previousChainLength`, `messageNumber`
    - `ciphertext` (base64)
 7. Base64-encode the JSON to create the server `blob`.
@@ -122,6 +144,7 @@ Field details:
    - Ciphertext bytes
 3. Build protocol message JSON with:
    - `type: "message"`
+   - `attachments` map (if any)
    - `ratchetKey`, `previousChainLength`, `messageNumber`
    - `ciphertext` (base64)
 4. Base64-encode the JSON to create the server `blob`.

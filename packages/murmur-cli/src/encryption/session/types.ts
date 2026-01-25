@@ -87,6 +87,8 @@ export interface IncomingMessage {
 export interface ProtocolMessage {
     /** Message type identifier */
     type: 'message'
+    /** Optional attachment payloads keyed by sha256 hash */
+    attachments?: Record<string, string>
     /** Optional session init fields for pre-key messages */
     init?: {
         /** Alice's ephemeral public key (for X3DH) */
@@ -114,4 +116,6 @@ export interface DecryptedMessage {
     plaintext: Uint8Array
     /** Sender's identity key */
     senderIdentityKey: Uint8Array
+    /** Optional attachment payloads keyed by sha256 hash */
+    attachments?: Record<string, string>
 }

@@ -487,7 +487,8 @@ export function prepareOutgoingMessage(
     peerId: string,
     plaintext: Uint8Array,
     messageId: string,
-    preKeyBundle?: PreKeyBundle
+    preKeyBundle?: PreKeyBundle,
+    attachments?: Record<string, string>
 ): { outgoing: OutgoingMessage; protocolMessage: ProtocolMessage } {
     let protocolMessage: ProtocolMessage
 
@@ -497,6 +498,10 @@ export function prepareOutgoingMessage(
         protocolMessage = createPreKeyMessage(agent, preKeyBundle, plaintext).message
     } else {
         throw new Error(`No session with peer: ${peerId}. Provide a prekey bundle.`)
+    }
+
+    if (attachments && Object.keys(attachments).length > 0) {
+        protocolMessage.attachments = attachments
     }
 
     const blob = encodeBase64(stringToBytes(JSON.stringify(protocolMessage)))
@@ -539,7 +544,15 @@ export function processIncomingMessage(
     const protocolMessage = JSON.parse(protocolMessageJson) as ProtocolMessage
 
     // Decrypt
-    return decryptMessage(agent, senderId, protocolMessage)
+    const decrypted = decryptMessage(agent, senderId, protocolMessage)
+    if (protocolMessage.attachments) {
+        return {
+            ...decrypted,
+            attachments: protocolMessage.attachments
+        }
+    }
+
+    return decrypted
 }
 
 /**

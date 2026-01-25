@@ -9,7 +9,7 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { StoredContact, StoredMessage, Account } from './types.js'
+import type { StoredAttachment, StoredContact, StoredMessage, Account } from './types.js'
 import type { SerializedAgentState } from '../encryption/session/types.js'
 
 /**
@@ -100,9 +100,64 @@ export class MurmurDatabase {
             -- Index for unread messages
             CREATE INDEX IF NOT EXISTS idx_messages_unread
             ON messages(conversation_id, read) WHERE read = 0;
+
+            -- Migration tracker
+            CREATE TABLE IF NOT EXISTS migrations (
+                id TEXT PRIMARY KEY,
+                applied_at INTEGER NOT NULL
+            );
         `)
 
+        this.runMigrations()
         this.ensureContactSchema()
+    }
+
+    /**
+     * Run pending database migrations.
+     */
+    private runMigrations(): void {
+        const appliedRows = this.db.prepare('SELECT id FROM migrations').all() as Array<{ id: string }>
+        const applied = new Set(appliedRows.map(row => row.id))
+
+        const migrations: Array<{ id: string; up: string }> = [
+            {
+                id: '202602010001_add_attachments',
+                up: `
+                    CREATE TABLE IF NOT EXISTS attachments (
+                        message_id TEXT NOT NULL,
+                        file_name TEXT NOT NULL,
+                        hash TEXT NOT NULL,
+                        iv TEXT NOT NULL,
+                        key TEXT NOT NULL,
+                        ciphertext TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        FOREIGN KEY (message_id) REFERENCES messages(id) ON DELETE CASCADE,
+                        UNIQUE (message_id, file_name)
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_attachments_message
+                    ON attachments(message_id);
+                `
+            }
+        ]
+
+        for (const migration of migrations) {
+            if (applied.has(migration.id)) {
+                continue
+            }
+
+            this.db.exec('BEGIN')
+            try {
+                this.db.exec(migration.up)
+                this.db.prepare(
+                    'INSERT INTO migrations (id, applied_at) VALUES (?, ?)'
+                ).run(migration.id, Date.now())
+                this.db.exec('COMMIT')
+            } catch (error) {
+                this.db.exec('ROLLBACK')
+                throw error
+            }
+        }
     }
 
     /**
@@ -203,6 +258,7 @@ export class MurmurDatabase {
     clearAll(): void {
         this.db.exec('BEGIN')
         try {
+            this.db.exec('DELETE FROM attachments')
             this.db.exec('DELETE FROM messages')
             this.db.exec('DELETE FROM contacts')
             this.db.exec('DELETE FROM agent_state')
@@ -329,14 +385,26 @@ export class MurmurDatabase {
             read: number
         }>
 
-        return rows.map(row => ({
-            id: row.id,
-            conversationId: row.conversation_id,
-            isOutgoing: row.is_outgoing === 1,
-            text: row.text,
-            createdAt: row.created_at,
-            read: row.read === 1
-        })).reverse() // Return in chronological order
+        const messageIds = rows.map(row => row.id)
+        const attachments = this.getAttachmentsForMessages(messageIds)
+
+        const messages = rows.map(row => {
+            const message: StoredMessage = {
+                id: row.id,
+                conversationId: row.conversation_id,
+                isOutgoing: row.is_outgoing === 1,
+                text: row.text,
+                createdAt: row.created_at,
+                read: row.read === 1
+            }
+            const messageAttachments = attachments.get(row.id)
+            if (messageAttachments && messageAttachments.length > 0) {
+                message.attachments = messageAttachments
+            }
+            return message
+        })
+
+        return messages.reverse() // Return in chronological order
     }
 
     /**
@@ -357,39 +425,83 @@ export class MurmurDatabase {
                 ORDER BY created_at ASC
             `).all()
 
-        return (rows as Array<{
+        const typedRows = rows as Array<{
             id: string
             conversation_id: string
             is_outgoing: number
             text: string
             created_at: number
             read: number
-        }>).map(row => ({
-            id: row.id,
-            conversationId: row.conversation_id,
-            isOutgoing: row.is_outgoing === 1,
-            text: row.text,
-            createdAt: row.created_at,
-            read: row.read === 1
-        }))
+        }>
+
+        const messageIds = typedRows.map(row => row.id)
+        const attachments = this.getAttachmentsForMessages(messageIds)
+
+        return typedRows.map(row => {
+            const message: StoredMessage = {
+                id: row.id,
+                conversationId: row.conversation_id,
+                isOutgoing: row.is_outgoing === 1,
+                text: row.text,
+                createdAt: row.created_at,
+                read: row.read === 1
+            }
+            const messageAttachments = attachments.get(row.id)
+            if (messageAttachments && messageAttachments.length > 0) {
+                message.attachments = messageAttachments
+            }
+            return message
+        })
     }
 
     /**
      * Save a message.
      */
     saveMessage(message: StoredMessage): void {
-        this.db.prepare(`
-            INSERT OR REPLACE INTO messages
-            (id, conversation_id, is_outgoing, text, created_at, read)
-            VALUES (?, ?, ?, ?, ?, ?)
-        `).run(
-            message.id,
-            message.conversationId,
-            message.isOutgoing ? 1 : 0,
-            message.text,
-            message.createdAt,
-            message.read ? 1 : 0
-        )
+        const attachments = message.attachments ?? []
+
+        this.db.exec('BEGIN')
+        try {
+            this.db.prepare(`
+                INSERT OR REPLACE INTO messages
+                (id, conversation_id, is_outgoing, text, created_at, read)
+                VALUES (?, ?, ?, ?, ?, ?)
+            `).run(
+                message.id,
+                message.conversationId,
+                message.isOutgoing ? 1 : 0,
+                message.text,
+                message.createdAt,
+                message.read ? 1 : 0
+            )
+
+            this.db.prepare('DELETE FROM attachments WHERE message_id = ?').run(message.id)
+
+            if (attachments.length > 0) {
+                const insertAttachment = this.db.prepare(`
+                    INSERT INTO attachments
+                    (message_id, file_name, hash, iv, key, ciphertext, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                `)
+
+                for (const attachment of attachments) {
+                    insertAttachment.run(
+                        message.id,
+                        attachment.fileName,
+                        attachment.hash,
+                        attachment.iv,
+                        attachment.key,
+                        attachment.ciphertext,
+                        message.createdAt
+                    )
+                }
+            }
+
+            this.db.exec('COMMIT')
+        } catch (error) {
+            this.db.exec('ROLLBACK')
+            throw error
+        }
     }
 
     /**
@@ -466,18 +578,99 @@ export class MurmurDatabase {
             read: number
         }>
 
+        const messageIds = rows.map(row => row.id)
+        const attachments = this.getAttachmentsForMessages(messageIds)
+
         const messages = new Map<string, StoredMessage>()
         for (const row of rows) {
-            messages.set(row.conversation_id, {
+            const message: StoredMessage = {
                 id: row.id,
                 conversationId: row.conversation_id,
                 isOutgoing: row.is_outgoing === 1,
                 text: row.text,
                 createdAt: row.created_at,
                 read: row.read === 1
-            })
+            }
+            const messageAttachments = attachments.get(row.id)
+            if (messageAttachments && messageAttachments.length > 0) {
+                message.attachments = messageAttachments
+            }
+            messages.set(row.conversation_id, message)
         }
         return messages
+    }
+
+    /**
+     * Get a specific attachment for a message.
+     */
+    getAttachment(messageId: string, fileName: string): StoredAttachment | null {
+        const row = this.db.prepare(`
+            SELECT file_name, hash, iv, key, ciphertext
+            FROM attachments
+            WHERE message_id = ? AND file_name = ?
+            LIMIT 1
+        `).get(messageId, fileName) as {
+            file_name: string
+            hash: string
+            iv: string
+            key: string
+            ciphertext: string
+        } | undefined
+
+        if (!row) {
+            return null
+        }
+
+        return {
+            fileName: row.file_name,
+            hash: row.hash,
+            iv: row.iv,
+            key: row.key,
+            ciphertext: row.ciphertext
+        }
+    }
+
+    /**
+     * Fetch attachments for a set of message IDs.
+     */
+    private getAttachmentsForMessages(messageIds: string[]): Map<string, StoredAttachment[]> {
+        const attachments = new Map<string, StoredAttachment[]>()
+        if (messageIds.length === 0) {
+            return attachments
+        }
+
+        const placeholders = messageIds.map(() => '?').join(', ')
+        const rows = this.db.prepare(`
+            SELECT message_id, file_name, hash, iv, key, ciphertext
+            FROM attachments
+            WHERE message_id IN (${placeholders})
+            ORDER BY file_name ASC
+        `).all(...messageIds) as Array<{
+            message_id: string
+            file_name: string
+            hash: string
+            iv: string
+            key: string
+            ciphertext: string
+        }>
+
+        for (const row of rows) {
+            const entry: StoredAttachment = {
+                fileName: row.file_name,
+                hash: row.hash,
+                iv: row.iv,
+                key: row.key,
+                ciphertext: row.ciphertext
+            }
+            const bucket = attachments.get(row.message_id)
+            if (bucket) {
+                bucket.push(entry)
+            } else {
+                attachments.set(row.message_id, [entry])
+            }
+        }
+
+        return attachments
     }
 
     /**

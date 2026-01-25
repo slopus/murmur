@@ -30,7 +30,14 @@ murmur me  # Display your ID to share with others
 ```bash
 murmur add-contact <their-id>
 murmur send --to <their-id> --message "Hello!"
+murmur send --to <their-id> --message "See attached." --attach ./report.pdf
 murmur sync  # Fetch replies
+```
+
+### Save an attachment
+
+```bash
+murmur attachment --message <message-id> --name report.pdf --out /tmp/report.pdf
 ```
 
 ## Project Components

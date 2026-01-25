@@ -9,10 +9,14 @@
  * Provides a high-level API for the UI to use.
  */
 
+import { readFileSync, writeFileSync } from 'node:fs'
+import { basename } from 'node:path'
 import { createId } from '@paralleldrive/cuid2'
+import { gcm } from '@noble/ciphers/aes'
+import { sha256 } from '@noble/hashes/sha256'
 import { MurmurApi, type InboxMessage, type ServerProfile } from './api.js'
 import { MurmurDatabase } from '../storage/database.js'
-import type { Account, StoredContact, StoredMessage, Contact } from '../storage/types.js'
+import type { Account, StoredAttachment, StoredContact, StoredMessage, Contact } from '../storage/types.js'
 import {
     createAgent,
     getIdentityKey,
@@ -29,7 +33,9 @@ import {
     encodeBase64,
     decodeBase64,
     stringToBytes,
-    bytesToString
+    bytesToString,
+    getRandomBytes,
+    zeroBytes
 } from '../encryption/crypto/utils.js'
 import { sign } from '../encryption/crypto/signing.js'
 import {
@@ -40,6 +46,160 @@ import {
     type Profile
 } from './profile.js'
 import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
+
+const MAX_MESSAGE_LENGTH = 20000
+const ATTACHMENT_KEY_LENGTH = 32
+const ATTACHMENT_IV_LENGTH = 12
+
+type AttachmentPayloadEntry = {
+    hash: string
+    iv: string
+    key: string
+}
+
+type AttachmentPayload = Record<string, AttachmentPayloadEntry>
+type AttachmentMap = Record<string, string>
+
+function truncateMessageText(text: string): string {
+    if (text.length <= MAX_MESSAGE_LENGTH) {
+        return text
+    }
+    return text.slice(0, MAX_MESSAGE_LENGTH)
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+    return Buffer.from(bytes).toString('hex')
+}
+
+function normalizeAttachmentName(path: string): string {
+    const fileName = basename(path)
+    if (!fileName || fileName === '.' || fileName === '..') {
+        throw new Error(`Invalid attachment path: ${path}`)
+    }
+    return fileName
+}
+
+function createOutgoingAttachments(paths: string[]): {
+    attachmentMap: AttachmentMap
+    payload: AttachmentPayload
+    stored: StoredAttachment[]
+} {
+    const attachmentMap: AttachmentMap = {}
+    const payload: AttachmentPayload = {}
+    const stored: StoredAttachment[] = []
+    const seenNames = new Set<string>()
+
+    for (const path of paths) {
+        const fileName = normalizeAttachmentName(path)
+        if (seenNames.has(fileName)) {
+            throw new Error(`Attachment filenames must be unique: ${fileName}`)
+        }
+        seenNames.add(fileName)
+
+        const fileBytes = readFileSync(path)
+        const key = getRandomBytes(ATTACHMENT_KEY_LENGTH)
+        const iv = getRandomBytes(ATTACHMENT_IV_LENGTH)
+        const cipher = gcm(key, iv)
+        const ciphertextBytes = cipher.encrypt(fileBytes)
+        const hash = bytesToHex(sha256(ciphertextBytes))
+        if (attachmentMap[hash]) {
+            throw new Error(`Duplicate attachment hash detected for ${fileName}`)
+        }
+
+        const ciphertext = encodeBase64(ciphertextBytes)
+        const ivBase64 = encodeBase64(iv)
+        const keyBase64 = encodeBase64(key)
+
+        attachmentMap[hash] = ciphertext
+        payload[fileName] = { hash, iv: ivBase64, key: keyBase64 }
+        stored.push({
+            fileName,
+            hash,
+            iv: ivBase64,
+            key: keyBase64,
+            ciphertext
+        })
+
+        zeroBytes(key)
+        zeroBytes(iv)
+    }
+
+    return { attachmentMap, payload, stored }
+}
+
+function parseAttachmentPayload(value: unknown): AttachmentPayload | undefined {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        return undefined
+    }
+
+    const rawEntries = value as Record<string, unknown>
+    const parsed: AttachmentPayload = {}
+
+    for (const [fileName, entry] of Object.entries(rawEntries)) {
+        if (!fileName || typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
+            continue
+        }
+        const record = entry as Record<string, unknown>
+        const hash = record.hash
+        const iv = record.iv
+        const key = record.key
+
+        if (typeof hash !== 'string' || typeof iv !== 'string' || typeof key !== 'string') {
+            continue
+        }
+
+        parsed[fileName] = { hash, iv, key }
+    }
+
+    return Object.keys(parsed).length > 0 ? parsed : undefined
+}
+
+function buildStoredAttachments(
+    payload: AttachmentPayload | undefined,
+    attachmentMap: AttachmentMap | undefined
+): { stored: StoredAttachment[]; invalid: boolean } {
+    if (!payload && attachmentMap) {
+        return { stored: [], invalid: true }
+    }
+    if (!payload) {
+        return { stored: [], invalid: false }
+    }
+    if (!attachmentMap) {
+        return { stored: [], invalid: true }
+    }
+
+    const stored: StoredAttachment[] = []
+    for (const [fileName, meta] of Object.entries(payload)) {
+        const ciphertext = attachmentMap[meta.hash]
+        if (!ciphertext) {
+            return { stored: [], invalid: true }
+        }
+        const ciphertextBytes = decodeBase64(ciphertext)
+        const computedHash = bytesToHex(sha256(ciphertextBytes))
+        if (computedHash !== meta.hash) {
+            return { stored: [], invalid: true }
+        }
+
+        const keyBytes = decodeBase64(meta.key)
+        const ivBytes = decodeBase64(meta.iv)
+        try {
+            const cipher = gcm(keyBytes, ivBytes)
+            cipher.decrypt(ciphertextBytes)
+        } catch {
+            return { stored: [], invalid: true }
+        }
+
+        stored.push({
+            fileName,
+            hash: meta.hash,
+            iv: meta.iv,
+            key: meta.key,
+            ciphertext
+        })
+    }
+
+    return { stored, invalid: false }
+}
 
 /**
  * Conversation with a contact including messages.
@@ -467,7 +627,7 @@ export class MurmurEngine {
     /**
      * Send a message to a contact.
      */
-    async sendMessage(recipientIdentityKey: string, text: string): Promise<StoredMessage> {
+    async sendMessage(recipientIdentityKey: string, text: string, attachments: string[] = []): Promise<StoredMessage> {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
@@ -476,11 +636,14 @@ export class MurmurEngine {
         if (!trimmedText) {
             throw new Error('Message cannot be empty')
         }
+        const finalText = truncateMessageText(trimmedText)
 
         const storedContact = this.db.getContact(recipientIdentityKey)
         if (!storedContact || !storedContact.profileSecretKey) {
             throw new Error('Contact not found. Add contact with a profile secret key first.')
         }
+
+        const attachmentData = attachments.length > 0 ? createOutgoingAttachments(attachments) : undefined
 
         let preKeyBundle: PreKeyBundle | undefined
         if (!hasSession(this.agent, recipientIdentityKey)) {
@@ -489,9 +652,12 @@ export class MurmurEngine {
 
         // Encrypt the message
         const messageId = createId()
-        const payload = {
-            text: trimmedText,
+        const payload: { text: string; profileSecretKey: string; attachments?: AttachmentPayload } = {
+            text: finalText,
             profileSecretKey: this.account.profileSecretKey
+        }
+        if (attachmentData) {
+            payload.attachments = attachmentData.payload
         }
         const plaintext = stringToBytes(JSON.stringify(payload))
         const { outgoing } = prepareOutgoingMessage(
@@ -499,7 +665,8 @@ export class MurmurEngine {
             recipientIdentityKey,
             plaintext,
             messageId,
-            preKeyBundle
+            preKeyBundle,
+            attachmentData?.attachmentMap
         )
 
         // Send to server
@@ -516,9 +683,12 @@ export class MurmurEngine {
             id: messageId,
             conversationId: recipientIdentityKey,
             isOutgoing: true,
-            text: trimmedText,
+            text: finalText,
             createdAt: serverResult.createdAt,
             read: true
+        }
+        if (attachmentData && attachmentData.stored.length > 0) {
+            storedMessage.attachments = attachmentData.stored
         }
 
         this.db.saveMessage(storedMessage)
@@ -550,23 +720,36 @@ export class MurmurEngine {
             const rawPayload = bytesToString(decrypted.plaintext).trim()
             let text = rawPayload
             let profileSecretKey: string | undefined
+            let payloadAttachments: AttachmentPayload | undefined
 
             try {
-                const parsed = JSON.parse(rawPayload) as { text?: unknown; profileSecretKey?: unknown }
+                const parsed = JSON.parse(rawPayload) as {
+                    text?: unknown
+                    profileSecretKey?: unknown
+                    attachments?: unknown
+                }
                 if (parsed && typeof parsed === 'object') {
                     if (typeof parsed.text === 'string') {
                         text = parsed.text.trim()
                     }
                     if (typeof parsed.profileSecretKey === 'string' && parsed.profileSecretKey.trim().length > 0) {
-                        profileSecretKey = parsed.profileSecretKey
+                        profileSecretKey = parsed.profileSecretKey.trim()
                     }
+                    payloadAttachments = parseAttachmentPayload(parsed.attachments)
                 }
             } catch {
                 // Treat as legacy plaintext.
             }
+            text = truncateMessageText(text)
 
             if (!profileSecretKey) {
                 this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
+                return null
+            }
+
+            const attachmentResult = buildStoredAttachments(payloadAttachments, decrypted.attachments)
+            if (attachmentResult.invalid) {
+                this.emit({ type: 'error', error: 'Incoming attachments failed validation or decryption' })
                 return null
             }
 
@@ -592,6 +775,10 @@ export class MurmurEngine {
                 text,
                 createdAt: inboxMessage.createdAt,
                 read: false
+            }
+
+            if (attachmentResult.stored.length > 0) {
+                storedMessage.attachments = attachmentResult.stored
             }
 
             this.db.saveMessage(storedMessage)
@@ -701,6 +888,29 @@ export class MurmurEngine {
         }
 
         this.db.markMessagesReadById(messageIds)
+    }
+
+    /**
+     * Save a stored attachment to disk.
+     */
+    saveAttachmentToPath(messageId: string, fileName: string, outputPath: string): void {
+        const attachment = this.db.getAttachment(messageId, fileName)
+        if (!attachment) {
+            throw new Error('Attachment not found in local storage.')
+        }
+
+        const ciphertextBytes = decodeBase64(attachment.ciphertext)
+        const computedHash = bytesToHex(sha256(ciphertextBytes))
+        if (computedHash !== attachment.hash) {
+            throw new Error('Attachment hash mismatch. Data may be corrupted.')
+        }
+
+        const key = decodeBase64(attachment.key)
+        const iv = decodeBase64(attachment.iv)
+        const cipher = gcm(key, iv)
+        const plaintext = cipher.decrypt(ciphertextBytes)
+
+        writeFileSync(outputPath, plaintext)
     }
 
     /**

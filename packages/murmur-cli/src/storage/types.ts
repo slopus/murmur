@@ -50,6 +50,22 @@ export interface StoredContact {
 }
 
 /**
+ * Attachment stored alongside a message.
+ */
+export interface StoredAttachment {
+    /** Attachment filename (no path) */
+    fileName: string
+    /** SHA-256 hash of encrypted bytes (hex) */
+    hash: string
+    /** AES-GCM IV (base64) */
+    iv: string
+    /** AES-GCM key (base64) */
+    key: string
+    /** AES-GCM encrypted payload (base64) */
+    ciphertext: string
+}
+
+/**
  * Message stored in the database.
  */
 export interface StoredMessage {
@@ -65,6 +81,8 @@ export interface StoredMessage {
     createdAt: number
     /** Whether the message has been read */
     read: boolean
+    /** Optional attachments stored with the message */
+    attachments?: StoredAttachment[]
 }
 
 /**
