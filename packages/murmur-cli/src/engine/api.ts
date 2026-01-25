@@ -12,6 +12,7 @@ import {
     stringToBytes
 } from '../encryption/crypto/utils.js'
 import { sign } from '../encryption/crypto/signing.js'
+import { logger } from '../logger.js'
 
 /** Base URL for the Murmur server */
 const API_BASE = 'https://murmur.cluster-fluster.com'
@@ -173,9 +174,12 @@ export class MurmurApi {
             })
 
             if (response.status === 401 && requireAuth && allowRetry && this.refreshToken) {
+                logger.warn('Access token expired. Attempting refresh...')
                 try {
                     await this.refresh()
+                    logger.info('Access token refreshed.')
                 } catch {
+                    logger.error('Access token refresh failed.')
                     // Fall through to normal error handling.
                 }
                 return this.request(method, path, body, requireAuth, timeoutMs, false)
@@ -220,7 +224,9 @@ export class MurmurApi {
             })
 
             if (response.status === 401 && this.refreshToken && !refreshed) {
+                logger.warn('Realtime stream unauthorized. Refreshing token...')
                 await this.refresh()
+                logger.info('Realtime stream token refreshed.')
                 refreshed = true
                 continue
             }

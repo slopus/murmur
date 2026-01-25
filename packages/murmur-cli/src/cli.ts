@@ -801,27 +801,42 @@ async function run(): Promise<void> {
                     const maxBackoffMs = 30000
 
                     while (!controller.signal.aborted) {
+                        logger.info('Connecting realtime stream...')
                         try {
                             await getEngine().streamMessages(async event => {
+                                if (event.event === 'connected') {
+                                    logger.info('Realtime stream connected.')
+                                    return
+                                }
+                                if (event.event === 'ping') {
+                                    logger.debug('Realtime stream ping.')
+                                    return
+                                }
                                 if (event.event !== 'message') {
+                                    logger.debug(`Realtime stream event: ${event.event}`)
                                     return
                                 }
                                 const data = event.data
                                 if (!data || typeof data !== 'object') {
+                                    logger.debug('Realtime message event missing payload.')
                                     return
                                 }
                                 const messageId = (data as { messageId?: unknown }).messageId
                                 if (typeof messageId !== 'string' || messageId.length === 0) {
+                                    logger.debug('Realtime message event missing messageId.')
                                     return
                                 }
                                 if (getEngine().hasMessage(messageId)) {
+                                    logger.debug(`Realtime message already stored: ${messageId}`)
                                     return
                                 }
+                                logger.info(`Realtime message received: ${messageId}`)
                                 await triggerSync()
                             }, { signal: controller.signal })
 
                             backoffMs = 1000
                             if (!controller.signal.aborted) {
+                                logger.warn('Realtime stream closed. Reconnecting...')
                                 await triggerSync()
                             }
                         } catch (error) {
@@ -837,6 +852,7 @@ async function run(): Promise<void> {
                         }
 
                         if (!controller.signal.aborted) {
+                            logger.warn(`Retrying realtime stream in ${Math.round(backoffMs / 1000)}s...`)
                             try {
                                 await waitWithAbort(backoffMs, controller.signal)
                             } catch {
