@@ -88,6 +88,16 @@ murmur send --to <their-id> --message "See attached." --attach ./report.pdf
 murmur sync  # Fetch replies
 ```
 
+### Verify hooks
+
+```bash
+murmur hooks add verify-message /path/to/script --arg foo
+murmur hooks remove <hook-id>
+```
+
+`verify-message` hooks run before messages are stored. The hook receives a temp folder
+containing `message.txt` and any decrypted attachments.
+
 ### Webhook notifications
 
 ```bash
