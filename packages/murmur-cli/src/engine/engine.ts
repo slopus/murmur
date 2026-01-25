@@ -9,14 +9,16 @@
  * Provides a high-level API for the UI to use.
  */
 
-import { readFileSync, writeFileSync } from 'node:fs'
-import { basename } from 'node:path'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { basename, join } from 'node:path'
+import { spawn } from 'node:child_process'
 import { createId } from '@paralleldrive/cuid2'
 import { gcm } from '@noble/ciphers/aes'
 import { sha256 } from '@noble/hashes/sha256'
 import { MurmurApi, type InboxMessage, type ServerProfile } from './api.js'
 import { MurmurDatabase } from '../storage/database.js'
-import type { Account, StoredAttachment, StoredContact, StoredMessage, Contact } from '../storage/types.js'
+import type { Account, StoredAttachment, StoredContact, StoredMessage, Contact, HookType, StoredHook } from '../storage/types.js'
 import { logger } from '../logger.js'
 import {
     createAgent,
@@ -51,6 +53,8 @@ import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
 const MAX_MESSAGE_LENGTH = 20000
 const ATTACHMENT_KEY_LENGTH = 32
 const ATTACHMENT_IV_LENGTH = 12
+const VERIFY_HOOK_TYPE: HookType = 'verify-message'
+const VERIFY_REPLY_MESSAGE = 'Message rejected by verify-message hook.'
 
 type AttachmentPayloadEntry = {
     hash: string
@@ -283,6 +287,27 @@ export class MurmurEngine {
      */
     getAuthError(): string | null {
         return this.authError
+    }
+
+    /**
+     * Get configured hooks.
+     */
+    getHooks(type?: HookType): StoredHook[] {
+        return this.db.getHooks(type)
+    }
+
+    /**
+     * Add a new hook.
+     */
+    addHook(type: HookType, path: string, args: string[]): StoredHook {
+        return this.db.addHook(type, path, args)
+    }
+
+    /**
+     * Remove a hook by ID.
+     */
+    removeHook(id: string): number {
+        return this.db.removeHook(id)
     }
 
     /**
@@ -591,6 +616,164 @@ export class MurmurEngine {
     }
 
     /**
+     * Run verify-message hooks for an incoming message.
+     */
+    private async runVerifyHooks(
+        text: string,
+        attachments: StoredAttachment[]
+    ): Promise<{ success: boolean; error?: string }> {
+        const hooks = this.db.getHooks(VERIFY_HOOK_TYPE)
+        if (hooks.length === 0) {
+            return { success: true }
+        }
+
+        const workspace = mkdtempSync(join(tmpdir(), 'murmur-verify-'))
+        try {
+            writeFileSync(join(workspace, 'message.txt'), text)
+            this.writeVerifyAttachments(workspace, attachments)
+
+            for (const hook of hooks) {
+                await this.executeHook(hook, workspace)
+            }
+
+            return { success: true }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            return { success: false, error: message }
+        } finally {
+            rmSync(workspace, { recursive: true, force: true })
+        }
+    }
+
+    /**
+     * Write decrypted attachments into a workspace folder.
+     */
+    private writeVerifyAttachments(workspace: string, attachments: StoredAttachment[]): void {
+        if (attachments.length === 0) {
+            return
+        }
+
+        const seenNames = new Set<string>()
+        for (const attachment of attachments) {
+            const fileName = basename(attachment.fileName)
+            if (!fileName || fileName === '.' || fileName === '..') {
+                throw new Error(`Invalid attachment name: ${attachment.fileName}`)
+            }
+            if (seenNames.has(fileName)) {
+                throw new Error(`Duplicate attachment name: ${fileName}`)
+            }
+            seenNames.add(fileName)
+
+            const ciphertextBytes = decodeBase64(attachment.ciphertext)
+            const keyBytes = decodeBase64(attachment.key)
+            const ivBytes = decodeBase64(attachment.iv)
+            try {
+                const cipher = gcm(keyBytes, ivBytes)
+                const plaintext = cipher.decrypt(ciphertextBytes)
+                writeFileSync(join(workspace, fileName), plaintext)
+            } finally {
+                zeroBytes(keyBytes)
+                zeroBytes(ivBytes)
+            }
+        }
+    }
+
+    /**
+     * Execute a hook command.
+     */
+    private async executeHook(hook: StoredHook, workspace: string): Promise<void> {
+        await new Promise<void>((resolve, reject) => {
+            const child = spawn(hook.path, [...hook.args, workspace], {
+                stdio: ['ignore', 'pipe', 'pipe']
+            })
+
+            let stdout = ''
+            let stderr = ''
+
+            child.stdout.on('data', chunk => {
+                stdout += chunk.toString()
+            })
+            child.stderr.on('data', chunk => {
+                stderr += chunk.toString()
+            })
+
+            child.on('error', error => {
+                reject(error)
+            })
+
+            child.on('close', (code, signal) => {
+                if (code === 0) {
+                    resolve()
+                    return
+                }
+                const output = stderr.trim() || stdout.trim()
+                const suffix = output ? `: ${output}` : ''
+                const detail = signal ? `signal ${signal}` : `code ${code ?? 'unknown'}`
+                reject(new Error(`Hook ${hook.id} failed (${detail})${suffix}`))
+            })
+        })
+    }
+
+    /**
+     * Send a verification failure notice and acknowledge the message.
+     */
+    private async handleVerifyFailure(inboxMessage: InboxMessage, reason?: string): Promise<void> {
+        if (!this.agent || !this.account) {
+            return
+        }
+
+        if (reason) {
+            logger.warn(`verify-message hook rejected ${inboxMessage.id}: ${reason}`)
+        } else {
+            logger.warn(`verify-message hook rejected ${inboxMessage.id}`)
+        }
+
+        try {
+            await this.sendVerificationFailureNotice(inboxMessage.senderId)
+        } catch (error) {
+            logger.warn(`Failed to send verification failure notice: ${error instanceof Error ? error.message : String(error)}`)
+        }
+
+        try {
+            await this.api.acknowledgeMessages([inboxMessage.id])
+        } catch (error) {
+            logger.warn(`Failed to acknowledge rejected message: ${error instanceof Error ? error.message : String(error)}`)
+        } finally {
+            this.db.saveAgentState(serializeAgent(this.agent))
+        }
+    }
+
+    /**
+     * Send a verification failure notice without persisting a message.
+     */
+    private async sendVerificationFailureNotice(recipientIdentityKey: string): Promise<void> {
+        if (!this.agent || !this.account) {
+            throw new Error('Not initialized')
+        }
+
+        let preKeyBundle: PreKeyBundle | undefined
+        if (!hasSession(this.agent, recipientIdentityKey)) {
+            preKeyBundle = await this.fetchPreKeyBundle(recipientIdentityKey)
+        }
+
+        const payload = {
+            text: VERIFY_REPLY_MESSAGE,
+            profileSecretKey: this.account.profileSecretKey
+        }
+        const plaintext = stringToBytes(JSON.stringify(payload))
+        const messageId = createId()
+        const { outgoing } = prepareOutgoingMessage(
+            this.agent,
+            recipientIdentityKey,
+            plaintext,
+            messageId,
+            preKeyBundle
+        )
+
+        await this.api.sendMessage(outgoing.recipientId, outgoing.blob)
+    }
+
+    /**
      * Get all conversations with unread counts and last messages.
      */
     getConversations(): Conversation[] {
@@ -722,9 +905,6 @@ export class MurmurEngine {
                 inboxMessage.signature
             )
 
-            // Save agent state after decryption (ratchet may have advanced)
-            this.db.saveAgentState(serializeAgent(this.agent))
-
             const rawPayload = bytesToString(decrypted.plaintext).trim()
             let text = rawPayload
             let profileSecretKey: string | undefined
@@ -748,16 +928,27 @@ export class MurmurEngine {
             } catch {
                 // Treat as legacy plaintext.
             }
-            text = truncateMessageText(text)
-
-            if (!profileSecretKey) {
-                this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
-                return null
-            }
+            const verifyText = text
+            const storedText = truncateMessageText(verifyText)
 
             const attachmentResult = buildStoredAttachments(payloadAttachments, decrypted.attachments)
             if (attachmentResult.invalid) {
                 this.emit({ type: 'error', error: 'Incoming attachments failed validation or decryption' })
+                this.db.saveAgentState(serializeAgent(this.agent))
+                return null
+            }
+
+            const verifyResult = await this.runVerifyHooks(verifyText, attachmentResult.stored)
+            if (!verifyResult.success) {
+                await this.handleVerifyFailure(inboxMessage, verifyResult.error)
+                return null
+            }
+
+            // Save agent state after verification (ratchet may have advanced)
+            this.db.saveAgentState(serializeAgent(this.agent))
+
+            if (!profileSecretKey) {
+                this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
                 return null
             }
 
@@ -780,7 +971,7 @@ export class MurmurEngine {
                 id: inboxMessage.id,
                 conversationId: inboxMessage.senderId,
                 isOutgoing: false,
-                text,
+                text: storedText,
                 createdAt: inboxMessage.createdAt,
                 read: false
             }

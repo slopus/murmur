@@ -8,7 +8,7 @@
 import { MurmurEngine } from './engine/engine.js'
 import { MurmurApi } from './engine/api.js'
 import { decryptProfile } from './engine/profile.js'
-import type { Contact, StoredMessage } from './storage/types.js'
+import type { Contact, StoredMessage, HookType } from './storage/types.js'
 import { getDbPath } from './storage/database.js'
 import { decodeBase64, encodeBase64, decodeBase58, encodeBase58 } from './encryption/crypto/utils.js'
 import { publicKeyFromPrivate } from './encryption/crypto/dh.js'
@@ -348,6 +348,16 @@ function formatIdentityKey(identityKey: string): string {
 }
 
 /**
+ * Parse a hook type.
+ */
+function parseHookType(value: string): HookType {
+    if (value === 'verify-message') {
+        return value
+    }
+    throw new Error(`Unsupported hook type: ${value}`)
+}
+
+/**
  * Print CLI usage help.
  */
 function printUsage(): void {
@@ -362,7 +372,9 @@ function printUsage(): void {
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
         '  murmur messages --with <id> [--limit <n>]',
         '  murmur ack <messageId...>',
-        '  murmur attachment --message <id> --name <file> --out <path>'
+        '  murmur attachment --message <id> --name <file> --out <path>',
+        '  murmur hooks add <type> <path> [--arg <value> ...]',
+        '  murmur hooks remove <id>'
     ]
 
     console.log(lines.join('\n'))
@@ -925,6 +937,42 @@ async function run(): Promise<void> {
                 getEngine().saveAttachmentToPath(messageId, fileName, outputPath)
                 logger.info(`Saved attachment to ${outputPath}`)
                 return
+            }
+            case 'hooks': {
+                await requireInitialized(getEngine())
+                const action = parsed.positionals[0]
+                if (!action) {
+                    throw new Error('Missing hooks action. Usage: murmur hooks add|remove ...')
+                }
+
+                if (action === 'add') {
+                    const typeRaw = parsed.positionals[1]
+                    const hookPath = parsed.positionals[2]
+                    if (!typeRaw || !hookPath) {
+                        throw new Error('Missing hook info. Usage: murmur hooks add <type> <path> [--arg <value> ...]')
+                    }
+                    const type = parseHookType(typeRaw)
+                    const args = readStringArrayOption(parsed.options, 'arg')
+                    const hook = getEngine().addHook(type, hookPath, args)
+                    logger.info(`Added hook ${hook.id} (${hook.type})`)
+                    return
+                }
+
+                if (action === 'remove') {
+                    const hookId = parsed.positionals[1]
+                    if (!hookId) {
+                        throw new Error('Missing hook ID. Usage: murmur hooks remove <id>')
+                    }
+                    const removed = getEngine().removeHook(hookId)
+                    if (removed === 0) {
+                        logger.warn(`Hook not found: ${hookId}`)
+                    } else {
+                        logger.info(`Removed hook ${hookId}`)
+                    }
+                    return
+                }
+
+                throw new Error(`Unknown hooks action: ${action}`)
             }
             default:
                 throw new Error(`Unknown command: ${parsed.command}`)

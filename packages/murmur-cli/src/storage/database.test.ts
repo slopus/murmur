@@ -141,6 +141,7 @@ describe('MurmurDatabase', () => {
             db.saveAgentState(state)
             db.saveContact(contact)
             db.saveMessage(message)
+            db.addHook('verify-message', '/usr/bin/env', ['echo'])
 
             db.clearAll()
 
@@ -148,6 +149,7 @@ describe('MurmurDatabase', () => {
             expect(db.getAgentState()).toBeNull()
             expect(db.getContacts()).toEqual([])
             expect(db.getMessages('contact-id')).toEqual([])
+            expect(db.getHooks()).toEqual([])
         })
     })
 
@@ -474,6 +476,20 @@ describe('MurmurDatabase', () => {
             const lastMessages = db.getLastMessages()
             expect(lastMessages.get('peer-1')?.text).toBe('Last peer-1')
             expect(lastMessages.get('peer-2')?.text).toBe('Last peer-2')
+        })
+    })
+
+    describe('Hooks', () => {
+        it('should add and remove hooks', () => {
+            const hook = db.addHook('verify-message', '/usr/bin/env', ['node'])
+
+            const hooks = db.getHooks('verify-message')
+            expect(hooks).toHaveLength(1)
+            expect(hooks[0]).toEqual(hook)
+
+            const removed = db.removeHook(hook.id)
+            expect(removed).toBe(1)
+            expect(db.getHooks()).toEqual([])
         })
     })
 })

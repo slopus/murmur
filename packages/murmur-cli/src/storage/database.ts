@@ -9,7 +9,8 @@ import { DatabaseSync } from 'node:sqlite'
 import { mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
-import type { StoredAttachment, StoredContact, StoredMessage, Account } from './types.js'
+import { createId } from '@paralleldrive/cuid2'
+import type { StoredAttachment, StoredContact, StoredMessage, Account, StoredHook, HookType } from './types.js'
 import type { SerializedAgentState } from '../encryption/session/types.js'
 
 /**
@@ -138,6 +139,21 @@ export class MurmurDatabase {
                     CREATE INDEX IF NOT EXISTS idx_attachments_message
                     ON attachments(message_id);
                 `
+            },
+            {
+                id: '202602150001_add_hooks',
+                up: `
+                    CREATE TABLE IF NOT EXISTS hooks (
+                        id TEXT PRIMARY KEY,
+                        type TEXT NOT NULL,
+                        path TEXT NOT NULL,
+                        args_json TEXT NOT NULL,
+                        created_at INTEGER NOT NULL
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_hooks_type
+                    ON hooks(type);
+                `
             }
         ]
 
@@ -258,6 +274,7 @@ export class MurmurDatabase {
     clearAll(): void {
         this.db.exec('BEGIN')
         try {
+            this.db.exec('DELETE FROM hooks')
             this.db.exec('DELETE FROM attachments')
             this.db.exec('DELETE FROM messages')
             this.db.exec('DELETE FROM contacts')
@@ -268,6 +285,83 @@ export class MurmurDatabase {
             this.db.exec('ROLLBACK')
             throw error
         }
+    }
+
+    /**
+     * Get registered hooks.
+     */
+    getHooks(type?: HookType): StoredHook[] {
+        const query = `
+            SELECT id, type, path, args_json, created_at
+            FROM hooks
+            ${type ? 'WHERE type = ?' : ''}
+            ORDER BY created_at ASC
+        `
+        const rows = type
+            ? (this.db.prepare(query).all(type) as Array<{
+                id: string
+                type: HookType
+                path: string
+                args_json: string
+                created_at: number
+            }>)
+            : (this.db.prepare(query).all() as Array<{
+                id: string
+                type: HookType
+                path: string
+                args_json: string
+                created_at: number
+            }>)
+
+        return rows.map(row => {
+            let args: string[] = []
+            try {
+                const parsed = JSON.parse(row.args_json) as unknown
+                if (Array.isArray(parsed)) {
+                    args = parsed.filter((item): item is string => typeof item === 'string')
+                }
+            } catch {
+                args = []
+            }
+            return {
+                id: row.id,
+                type: row.type,
+                path: row.path,
+                args,
+                createdAt: row.created_at
+            }
+        })
+    }
+
+    /**
+     * Add a new hook.
+     */
+    addHook(type: HookType, path: string, args: string[]): StoredHook {
+        const id = createId()
+        const createdAt = Date.now()
+        const argsJson = JSON.stringify(args)
+        this.db.prepare(`
+            INSERT INTO hooks (id, type, path, args_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+        `).run(id, type, path, argsJson, createdAt)
+
+        return {
+            id,
+            type,
+            path,
+            args,
+            createdAt
+        }
+    }
+
+    /**
+     * Remove a hook by ID.
+     */
+    removeHook(id: string): number {
+        const result = this.db.prepare(`
+            DELETE FROM hooks WHERE id = ?
+        `).run(id) as { changes?: number }
+        return result.changes ?? 0
     }
 
     /**

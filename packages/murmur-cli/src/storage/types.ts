@@ -114,3 +114,24 @@ export interface AppState {
     /** Serialized agent state (encryption keys and sessions) */
     agentState: SerializedAgentState | null
 }
+
+/**
+ * Supported hook types.
+ */
+export type HookType = 'verify-message'
+
+/**
+ * Hook definition stored locally.
+ */
+export interface StoredHook {
+    /** Hook ID */
+    id: string
+    /** Hook type */
+    type: HookType
+    /** Path to the hook command */
+    path: string
+    /** Arguments passed to the hook command */
+    args: string[]
+    /** When the hook was added */
+    createdAt: number
+}
