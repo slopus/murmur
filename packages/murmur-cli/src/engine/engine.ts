@@ -625,6 +625,13 @@ export class MurmurEngine {
     }
 
     /**
+     * Check if a message exists locally.
+     */
+    hasMessage(messageId: string): boolean {
+        return this.db.hasMessage(messageId)
+    }
+
+    /**
      * Send a message to a contact.
      */
     async sendMessage(recipientIdentityKey: string, text: string, attachments: string[] = []): Promise<StoredMessage> {
@@ -888,6 +895,23 @@ export class MurmurEngine {
         }
 
         this.db.markMessagesReadById(messageIds)
+    }
+
+    /**
+     * Listen for server-sent message notifications.
+     */
+    async streamMessages(
+        onEvent: (event: { event: string; data: unknown }) => void | Promise<void>,
+        options?: { signal?: AbortSignal }
+    ): Promise<void> {
+        if (!this.agent || !this.account) {
+            throw new Error('Not initialized')
+        }
+        if (!this.api.getTokens()) {
+            const reason = this.authError ? `Not authenticated: ${this.authError}` : 'Not authenticated'
+            throw new Error(reason)
+        }
+        await this.api.streamMessages(onEvent, options)
     }
 
     /**

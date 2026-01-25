@@ -358,7 +358,7 @@ function printUsage(): void {
         '  murmur add-contact <id>',
         '  murmur profile <profile-secret>',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
-        '  murmur sync [--with <id>]',
+        '  murmur sync [--with <id>] [--realtime] [--timeout <ms>]',
         '  murmur messages --with <id> [--limit <n>]',
         '  murmur ack <messageId...>',
         '  murmur attachment --message <id> --name <file> --out <path>'
@@ -415,6 +415,50 @@ function printMessageBlock(message: StoredMessage, senderId: string, senderName:
     }
     console.log(message.text)
     console.log('----')
+}
+
+function printUnreadMessages(
+    engine: MurmurEngine,
+    filterContact: Contact | undefined,
+    printedIds: Set<string> | null,
+    showEmpty: boolean
+): number {
+    const unreadMessages = engine.getUnreadMessages(filterContact?.identityKey)
+    if (unreadMessages.length === 0) {
+        if (showEmpty) {
+            console.log('No unread messages.')
+        }
+        return 0
+    }
+
+    const contacts = new Map(
+        engine.getContacts().map(contact => [contact.identityKey, contact])
+    )
+    const account = engine.getAccount()
+    if (!account) {
+        throw new Error('Account data missing.')
+    }
+
+    let printed = 0
+    for (const message of unreadMessages) {
+        if (printedIds && printedIds.has(message.id)) {
+            continue
+        }
+        const contact = filterContact ?? contacts.get(message.conversationId)
+        const senderId = message.isOutgoing
+            ? formatProfileSecretKey(account.profileSecretKey)
+            : formatSenderId(contact, message.conversationId)
+        const senderName = message.isOutgoing
+            ? formatName(account.firstName, account.lastName, 'You')
+            : formatName(contact?.firstName, contact?.lastName, formatIdentityKey(message.conversationId))
+        printMessageBlock(message, senderId, senderName)
+        if (printedIds) {
+            printedIds.add(message.id)
+        }
+        printed += 1
+    }
+
+    return printed
 }
 
 /**
@@ -534,29 +578,82 @@ async function run(): Promise<void> {
                     filterContact = resolveContactByProfileSecret(getEngine(), filterId)
                 }
 
-                const unreadMessages = getEngine().getUnreadMessages(filterContact?.identityKey)
-                if (unreadMessages.length === 0) {
-                    console.log('No unread messages.')
+                const printedIds = new Set<string>()
+                printUnreadMessages(getEngine(), filterContact, printedIds, true)
+
+                const realtime = readBooleanOption(parsed.options, 'realtime')
+                if (!realtime) {
                     return
                 }
 
-                const contacts = new Map(
-                    getEngine().getContacts().map(contact => [contact.identityKey, contact])
-                )
-                const account = getEngine().getAccount()
-                if (!account) {
-                    throw new Error('Account data missing.')
+                const timeoutMs = readNumberOption(parsed.options, 'timeout')
+                if (timeoutMs !== undefined && timeoutMs <= 0) {
+                    throw new Error('Timeout must be a positive number of milliseconds.')
                 }
 
-                for (const message of unreadMessages) {
-                    const contact = filterContact ?? contacts.get(message.conversationId)
-                    const senderId = message.isOutgoing
-                        ? formatProfileSecretKey(account.profileSecretKey)
-                        : formatSenderId(contact, message.conversationId)
-                    const senderName = message.isOutgoing
-                        ? formatName(account.firstName, account.lastName, 'You')
-                        : formatName(contact?.firstName, contact?.lastName, formatIdentityKey(message.conversationId))
-                    printMessageBlock(message, senderId, senderName)
+                console.log('Realtime sync enabled. Press Ctrl+C to stop.')
+
+                const controller = new AbortController()
+                let timeoutHandle: ReturnType<typeof setTimeout> | null = null
+                if (timeoutMs !== undefined) {
+                    timeoutHandle = setTimeout(() => controller.abort(), timeoutMs)
+                }
+
+                let syncInFlight = false
+                let pendingSync = false
+
+                const triggerSync = async (): Promise<void> => {
+                    if (syncInFlight) {
+                        pendingSync = true
+                        return
+                    }
+                    syncInFlight = true
+                    try {
+                        do {
+                            pendingSync = false
+                            const result = await getEngine().sync()
+                            if (!result.success && result.error) {
+                                console.error(`Sync unavailable: ${result.error}`)
+                            }
+                            printUnreadMessages(getEngine(), filterContact, printedIds, false)
+                        } while (pendingSync)
+                    } finally {
+                        syncInFlight = false
+                    }
+                }
+
+                const onSigint = () => {
+                    controller.abort()
+                }
+                process.on('SIGINT', onSigint)
+
+                try {
+                    await getEngine().streamMessages(async event => {
+                        if (event.event !== 'message') {
+                            return
+                        }
+                        const data = event.data
+                        if (!data || typeof data !== 'object') {
+                            return
+                        }
+                        const messageId = (data as { messageId?: unknown }).messageId
+                        if (typeof messageId !== 'string' || messageId.length === 0) {
+                            return
+                        }
+                        if (getEngine().hasMessage(messageId)) {
+                            return
+                        }
+                        await triggerSync()
+                    }, { signal: controller.signal })
+                } catch (error) {
+                    if (!controller.signal.aborted) {
+                        throw error
+                    }
+                } finally {
+                    if (timeoutHandle) {
+                        clearTimeout(timeoutHandle)
+                    }
+                    process.off('SIGINT', onSigint)
                 }
                 return
             }

@@ -23,7 +23,8 @@ const UploadPreKeysSchema = z.object({
  * Signal-style prekey management for session establishment:
  * - Signed PreKey: Medium-term key signed by identity, replaced periodically (oneTime = false)
  * - One-Time PreKeys: Ephemeral keys allocated once per session (oneTime = true)
- * - PreKeys are permanently assigned to users who claim them
+ * - One-time prekeys are allocated to a requester
+ * - Signed prekeys are reusable and not allocated per requester
  */
 export async function preKeyRoutes(app: Fastify) {
     // Upload prekeys (signed or one-time)
@@ -127,33 +128,17 @@ export async function preKeyRoutes(app: Fastify) {
             return reply.status(400).send({ error: 'Invalid identity public key format' });
         }
 
-        // Get user's signed prekey (not allocated yet, or already allocated to requester)
+        // Get user's signed prekey (reusable, newest first)
         const signedPreKey = await db.preKey.findFirst({
             where: {
                 ownerId: normalizedIdentityPublicKey,
-                oneTime: false,
-                OR: [
-                    { allocatedTo: null }, // Not yet allocated
-                    { allocatedTo: requesterId }, // Already allocated to requester
-                ],
+                oneTime: false
             },
             orderBy: { createdAt: 'desc' }, // Use newest signed prekey
         });
 
         if (!signedPreKey) {
             return reply.status(404).send({ error: 'User has not uploaded signed prekeys' });
-        }
-
-        // Allocate signed prekey to requester if not already allocated
-        if (signedPreKey.allocatedTo !== requesterId) {
-            await db.preKey.update({
-                where: { id: signedPreKey.id },
-                data: {
-                    allocatedTo: requesterId,
-                    allocatedAt: new Date(),
-                },
-            });
-            preKeysAllocatedTotal.inc({ type: 'signed' });
         }
 
         // Get one-time prekey (not yet allocated)
