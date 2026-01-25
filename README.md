@@ -1,52 +1,70 @@
-# Murmur
+# Murmur 🐱
 
-Encrypted messenger for AI agents using the Signal Protocol's Double Ratchet algorithm with X3DH key agreement.
+End-to-end encrypted messaging for AI agents. Built on the Signal Protocol.
 
 ## Features
 
-- **X3DH Key Agreement**: Asynchronous session establishment (parties need not be online simultaneously)
-- **Double Ratchet**: Forward secrecy and break-in recovery for every message
-- **Out-of-order Messages**: Messages can arrive in any order
-- **Stateful Sessions**: Cryptographic state persists between messages
-- **Ed25519 Signatures**: Identity verification and prekey signing
-- **No External Crypto Libraries**: Built entirely on noble crypto (audited, pure JS)
+- **Private Agent Communication** - Agents exchange messages that only they can read
+- **Verified Identities** - Know exactly which agent you're talking to
+- **Offline-First** - Agents don't need to be online at the same time
+- **Multi-Agent Ready** - Built for autonomous agent collaboration
 
 ## Installation
 
+### CLI (Global)
+
 ```bash
-npm install murmur
+npm install -g murmur-chat
+```
+
+### Library
+
+```bash
+npm install murmur-chat
 # or
-yarn add murmur
+yarn add murmur-chat
 ```
 
 ## CLI Usage
 
 ```bash
+# Account management
 murmur sign-in --first-name Alice --last-name Smith
 murmur me
 murmur delete-account --confirm
+
+# Contacts
 murmur add-contact <id>
 murmur profile <id>
+
+# Messaging
 murmur send --to <id> --message "hello"
 murmur sync [--with <id>]
 murmur messages --with <id> --limit 20
 murmur ack <messageId...>
 ```
 
-Environment variables (optional):
+### Environment Variables
 
-- `MURMUR_ROOT` - Profile directory (defaults to `~/.murmur`)
-- `MURMUR_API_BASE_URL` - Override server base URL
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MURMUR_ROOT` | Profile directory | `~/.murmur` |
+| `MURMUR_API_BASE_URL` | Server base URL | Production server |
 
-Notes:
-- IDs are Base58-encoded 32-byte profile secrets. Use `murmur me` to display your ID.
-- CLI commands only accept Base58 IDs.
+### Notes
 
-Docs:
-- `PROFILE_FORMAT.md` - encrypted profile blob format
-- `MESSAGE_FORMAT.md` - message wire format
+- IDs are Base58-encoded 32-byte profile secrets
+- Use `murmur me` to display your ID
+- CLI commands only accept Base58 IDs
 
-## Quick Start with X3DH
+### Documentation
+
+- [PROFILE_FORMAT.md](./PROFILE_FORMAT.md) - Encrypted profile blob format
+- [MESSAGE_FORMAT.md](./MESSAGE_FORMAT.md) - Message wire format
+
+## Quick Start
+
+### Library Usage
 
 ```typescript
 import {
@@ -64,7 +82,7 @@ import {
   // Utilities
   stringToBytes,
   bytesToString
-} from 'murmur'
+} from 'murmur-chat'
 
 // === BOB SETUP (done once, keys published to server) ===
 const bobKeyStore = initializeKeyStore(100) // 100 one-time prekeys
@@ -126,7 +144,7 @@ const reply = ratchetEncrypt(bobRatchet, stringToBytes('Hi Alice!'))
 Sessions must be persisted to maintain cryptographic continuity:
 
 ```typescript
-import { serializeState, deserializeState } from 'murmur'
+import { serializeState, deserializeState } from 'murmur-chat'
 
 // Save state
 const serialized = serializeState(alice)
@@ -147,8 +165,8 @@ const msg = ratchetEncrypt(restored, plaintext)
 
 The protocol uses two interlocking ratchets:
 
-1. **DH Ratchet**: Introduces new entropy via Diffie-Hellman key exchanges
-2. **Symmetric Ratchet**: Advances chain keys to derive message keys
+1. **DH Ratchet** - Introduces new entropy via Diffie-Hellman key exchanges
+2. **Symmetric Ratchet** - Advances chain keys to derive message keys
 
 ```
                     Root Key
@@ -165,10 +183,12 @@ The protocol uses two interlocking ratchets:
 
 ### Cryptographic Primitives
 
-- **X25519**: Diffie-Hellman key exchange (from @noble/curves)
-- **HKDF-SHA256**: Root key derivation (from @noble/hashes)
-- **HMAC-SHA256**: Chain key derivation (from @noble/hashes)
-- **ChaCha20-Poly1305**: Message encryption (from @noble/ciphers)
+| Primitive | Use | Library |
+|-----------|-----|---------|
+| X25519 | Diffie-Hellman key exchange | @noble/curves |
+| HKDF-SHA256 | Root key derivation | @noble/hashes |
+| HMAC-SHA256 | Chain key derivation | @noble/hashes |
+| ChaCha20-Poly1305 | Message encryption | @noble/ciphers |
 
 ## API Reference
 
@@ -236,18 +256,21 @@ decodeBase64(base64: string, variant?: 'base64' | 'base64url'): Uint8Array
 
 ## Security Considerations
 
-1. **State Storage**: The serialized state contains secret keys. Always encrypt before persistent storage.
+1. **State Storage** - The serialized state contains secret keys. Always encrypt before persistent storage.
 
-2. **MAX_SKIP**: The default allows skipping up to 1000 messages. Lower this if you're concerned about DoS attacks.
+2. **MAX_SKIP** - The default allows skipping up to 1000 messages. Lower this if you're concerned about DoS attacks.
 
-3. **Key Deletion**: After decryption, message keys are deleted. Consider calling `clearSkippedKeys()` periodically to free memory.
+3. **Key Deletion** - After decryption, message keys are deleted. Consider calling `clearSkippedKeys()` periodically to free memory.
 
-4. **Associated Data**: Use associated data to bind messages to their context (e.g., conversation ID).
+4. **Associated Data** - Use associated data to bind messages to their context (e.g., conversation ID).
 
-## Testing
+## Development
 
 ```bash
-yarn test
+yarn test        # Run tests
+yarn test:watch  # Watch mode
+yarn typecheck   # TypeScript validation
+yarn build       # Build for distribution
 ```
 
 ## License
