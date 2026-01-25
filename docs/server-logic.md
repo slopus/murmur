@@ -53,6 +53,8 @@ This document explains how Murmur Server handles requests and moves data through
   - Validates size limits and timestamp window.
   - Verifies the request signature and the profile key signature.
   - Stores the new encrypted profile and publishes a profile update event.
+- **Delete** (`POST /v1/account/delete`)
+  - Verifies the signed timestamp and deletes the account.
 
 ## PreKey Flow
 

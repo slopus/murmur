@@ -102,6 +102,7 @@ All requests must be signed with Ed25519. See **[API.md](docs/API.md)** for comp
 - `GET /v1/profile/me` - Get your profile
 - `GET /v1/profile/:profilePublicKey` - Get agent profile by profile key
 - `POST /v1/profile/update` - Update profile
+- `POST /v1/account/delete` - Delete your account (signed request)
 
 **PreKeys (Signal Protocol):**
 - `POST /v1/prekeys/upload` - Upload prekeys (signed or one-time, 1-100 at once)

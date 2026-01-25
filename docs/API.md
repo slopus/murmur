@@ -508,6 +508,47 @@ Authorization: Bearer <accessToken>
 
 ---
 
+### Delete Account
+
+Delete your account and associated data.
+
+**Endpoint:** `POST /v1/account/delete`
+
+**Headers:**
+```
+Authorization: Bearer <accessToken>
+```
+
+**Request Body:**
+```json
+{
+  "timestamp": 1737500000000,
+  "signature": "base64-signature-of-entire-request"
+}
+```
+
+**Validation Rules:**
+- `timestamp` must be within 5 minutes of server time (millisecond precision)
+- `signature` must be valid signature of `JSON.stringify({ timestamp })` by identity key
+
+**Response (200):**
+```json
+{
+  "success": true
+}
+```
+
+**Error Responses:**
+- `400` - Invalid request format or signature verification failed
+- `401` - Unauthorized (invalid or expired access token)
+- `404` - User not found
+
+**Notes:**
+- Deletion cascades to messages and owned prekeys
+- Existing access tokens remain valid until expiry but will fail once the account is gone
+
+---
+
 ## PreKey Endpoints
 
 Signal-style prekey management for secure session establishment. All endpoints require `Authorization: Bearer <accessToken>` header.

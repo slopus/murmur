@@ -16,6 +16,11 @@ const UpdateProfileSchema = z.object({
     signature: z.string(),
 });
 
+const DeleteAccountSchema = z.object({
+    timestamp: z.number(),
+    signature: z.string(),
+});
+
 /**
  * Profile routes (authenticated)
  */
@@ -52,6 +57,44 @@ export async function profileRoutes(app: Fastify) {
             profileUpdatedAt: user.profileUpdatedAt.getTime(),
             createdAt: user.createdAt.getTime(),
         });
+    });
+
+    // Delete own account
+    app.post('/v1/account/delete', {
+        schema: {
+            body: DeleteAccountSchema,
+        },
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
+    }, async (request, reply) => {
+        const userId = getAuthUserId(request);
+        const { timestamp, signature } = request.body;
+
+        // Verify timestamp is recent (within 5 minutes)
+        const now = Date.now();
+        if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            return reply.status(400).send({ error: 'Request timestamp too old' });
+        }
+
+        // Verify signature of the request
+        const message = JSON.stringify({
+            timestamp,
+        });
+
+        if (!verifySignature(message, signature, userId)) {
+            return reply.status(400).send({ error: 'Invalid request signature' });
+        }
+
+        try {
+            await db.user.delete({
+                where: { id: userId },
+            });
+        } catch (error: any) {
+            return reply.status(404).send({ error: 'User not found' });
+        }
+
+        return reply.send({ success: true });
     });
 
     // Update own profile
