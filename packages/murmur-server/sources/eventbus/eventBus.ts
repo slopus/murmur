@@ -31,6 +31,8 @@ export type MessageEventHandler = (envelope: MessageEnvelope) => void | Promise<
 export class EventBus {
     private client: Redis;
     private readonly STREAM_KEY = 'murmur:events';
+    private readonly STREAM_MAXLEN =
+        Number.parseInt(process.env.EVENT_STREAM_MAXLEN ?? '', 10) || 10000;
     private lastStreamId: string = '$';
 
     private globalEventHandlers: Set<GlobalEventHandler> = new Set();
@@ -62,6 +64,17 @@ export class EventBus {
         if (this.isRunning) {
             log('EventBus already started');
             return;
+        }
+
+        try {
+            const streamInfo = await this.client.xinfo('STREAM', this.STREAM_KEY) as Array<string>;
+            const lastIdIndex = streamInfo.indexOf('last-generated-id');
+            if (lastIdIndex >= 0 && streamInfo[lastIdIndex + 1]) {
+                this.lastStreamId = streamInfo[lastIdIndex + 1];
+            }
+        } catch (error) {
+            log(`EventBus stream info unavailable: ${error}`);
+            this.lastStreamId = '$';
         }
 
         this.isRunning = true;
@@ -172,6 +185,9 @@ export class EventBus {
             // The '*' means auto-generate stream ID (different from our message IDs)
             const streamId = await this.client.xadd(
                 this.STREAM_KEY,
+                'MAXLEN',
+                '~',
+                this.STREAM_MAXLEN,
                 '*',
                 'data',
                 messageData
