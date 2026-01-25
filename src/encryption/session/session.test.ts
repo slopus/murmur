@@ -79,9 +79,12 @@ describe('Session establishment', () => {
         const { message } = createPreKeyMessage(alice, bobBundle, stringToBytes('Hello Bob!'))
 
         expect(message.type).toBe('message')
-        expect(message.identityDHKey).toBeDefined()
-        expect(message.ephemeralKey).toBeDefined()
-        expect(message.header).toBeDefined()
+        expect(message.init).toBeDefined()
+        expect(message.init?.ephemeralKey).toBeDefined()
+        expect(message.init?.preKey).toBeDefined()
+        expect(message.ratchetKey).toBeDefined()
+        expect(message.messageNumber).toBeDefined()
+        expect(message.previousChainLength).toBeDefined()
         expect(message.ciphertext).toBeDefined()
 
         // Alice should have session
@@ -173,7 +176,13 @@ describe('Message exchange', () => {
 
     it('should throw when decrypting without session', () => {
         const alice = createAgent()
-        const fakeMessage = { type: 'message' as const, header: 'x', ciphertext: 'y' }
+        const fakeMessage = {
+            type: 'message' as const,
+            ratchetKey: 'x',
+            messageNumber: 0,
+            previousChainLength: 0,
+            ciphertext: 'y'
+        }
 
         expect(() => decryptMessage(alice, 'nonexistent', fakeMessage)).toThrow()
     })

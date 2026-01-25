@@ -15,7 +15,7 @@
  * Based on: https://signal.org/docs/specifications/x3dh/
  */
 
-import { generateDH, dh, publicKeyFromPrivate, type DHKeyPair } from '../crypto/dh.js'
+import { generateDH, dh, publicKeyFromPrivate, deriveDhKeyPairFromSigningKey, type DHKeyPair } from '../crypto/dh.js'
 import {
     generateSigningKeyPair,
     sign,
@@ -60,8 +60,8 @@ const ZERO_BYTES = new Uint8Array(32)
  */
 export function generateIdentityKeyPair(): IdentityKeyPair {
     const signingKeyPair = generateSigningKeyPair()
-    // Generate a separate DH key pair for X25519 operations
-    const dhKeyPair = generateDH()
+    // Derive DH key pair from signing private key
+    const dhKeyPair = deriveDhKeyPairFromSigningKey(signingKeyPair.privateKey)
 
     return {
         ...signingKeyPair,
@@ -147,10 +147,8 @@ export function createPreKeyBundle(
     return {
         identityKey: identityKeyPair.publicKey,
         signedPreKey: signedPreKey.keyPair.publicKey,
-        signedPreKeyId: signedPreKey.id,
         signedPreKeySignature: signedPreKey.signature,
-        oneTimePreKey: oneTimePreKey?.keyPair.publicKey,
-        oneTimePreKeyId: oneTimePreKey?.id
+        oneTimePreKey: oneTimePreKey?.keyPair.publicKey
     }
 }
 
@@ -226,8 +224,6 @@ export function x3dhSender(
     return {
         sharedSecret,
         ephemeralPublicKey: ephemeralKeyPair.publicKey,
-        signedPreKeyId: bobBundle.signedPreKeyId,
-        oneTimePreKeyId: bobBundle.oneTimePreKeyId,
         bobSignedPreKey: bobBundle.signedPreKey,
         // Also include Alice's identity DH public key for Bob to compute DH1
         aliceIdentityDHKey: aliceIdentity.dhKeyPair.publicKey
@@ -249,8 +245,8 @@ export function x3dhSender(
  * ```typescript
  * const bobKeys = {
  *   identityKeyPair: bobIdentity,
- *   signedPreKey: signedPreKeys.get(message.signedPreKeyId),
- *   oneTimePreKey: oneTimePreKeys.get(message.oneTimePreKeyId)
+ *   signedPreKey: bobSignedPreKey,
+ *   oneTimePreKey: bobOneTimePreKey
  * }
  * const result = x3dhReceiver(bobKeys, message.identityKey, message.identityDHKey, message.ephemeralKey)
  * // Use result.sharedSecret for Double Ratchet

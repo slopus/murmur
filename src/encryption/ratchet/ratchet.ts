@@ -16,11 +16,10 @@
  * Based on: https://signal.org/docs/specifications/doubleratchet/
  */
 
-import { generateDH, dh, type DHKeyPair } from '../crypto/dh.js'
+import { generateDH, dh, type DHKeyPair, DH_PUBLIC_KEY_LENGTH } from '../crypto/dh.js'
 import { kdfRK, kdfCK } from '../crypto/kdf.js'
 import { encrypt, decrypt } from '../crypto/aead.js'
-import { constantTimeEqual, concatBytes } from '../crypto/utils.js'
-import { encodeHeader, createHeader, type HEADER_SIZE } from './header.js'
+import { constantTimeEqual, concatBytes, numberToBytes } from '../crypto/utils.js'
 import { makeSkippedKeyIndex } from './state.js'
 import type {
     RatchetState,
@@ -159,11 +158,11 @@ export function ratchetEncrypt(
     state.sendingChainKey = newChainKey
 
     // Create header with current ratchet key and message number
-    const header = createHeader(
-        state.dhSelf.publicKey,
-        state.previousSendingChainLength,
-        state.sendingMessageNumber
-    )
+    const header: MessageHeader = {
+        publicKey: state.dhSelf.publicKey,
+        previousChainLength: state.previousSendingChainLength,
+        messageNumber: state.sendingMessageNumber
+    }
 
     // Increment message counter
     state.sendingMessageNumber++
@@ -356,6 +355,27 @@ function dhRatchet(state: RatchetState, header: MessageHeader): void {
     const [rootKey2, sendingChainKey] = kdfRK(state.rootKey, dhOutputSend)
     state.rootKey = rootKey2
     state.sendingChainKey = sendingChainKey
+}
+
+function encodeHeader(header: MessageHeader): Uint8Array {
+    if (!header.publicKey) {
+        throw new Error('Header public key must not be null')
+    }
+    if (header.publicKey.length !== DH_PUBLIC_KEY_LENGTH) {
+        throw new Error(`Invalid public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${header.publicKey.length}`)
+    }
+    if (header.messageNumber < 0 || !Number.isInteger(header.messageNumber)) {
+        throw new Error(`Invalid message number: ${header.messageNumber}`)
+    }
+    if (header.previousChainLength < 0 || !Number.isInteger(header.previousChainLength)) {
+        throw new Error(`Invalid previous chain length: ${header.previousChainLength}`)
+    }
+
+    const pnBytes = numberToBytes(header.previousChainLength)
+    const nBytes = numberToBytes(header.messageNumber)
+    const reserved = new Uint8Array(4)
+
+    return concatBytes(header.publicKey, pnBytes, nBytes, reserved)
 }
 
 /**

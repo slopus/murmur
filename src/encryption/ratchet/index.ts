@@ -26,6 +26,5 @@
  */
 
 export * from './types.js'
-export * from './header.js'
 export * from './state.js'
 export * from './ratchet.js'

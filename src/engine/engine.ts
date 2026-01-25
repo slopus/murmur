@@ -75,6 +75,7 @@ export class MurmurEngine {
     private account: Account | null = null
     private listeners: Set<EngineEventListener> = new Set()
     private syncInterval: ReturnType<typeof setInterval> | null = null
+    private authError: string | null = null
 
     constructor(dbPath?: string, apiBaseUrl?: string) {
         this.db = new MurmurDatabase(dbPath)
@@ -117,6 +118,13 @@ export class MurmurEngine {
     }
 
     /**
+     * Get the last authentication error, if any.
+     */
+    getAuthError(): string | null {
+        return this.authError
+    }
+
+    /**
      * Initialize the engine with existing account.
      */
     async initialize(): Promise<boolean> {
@@ -134,9 +142,9 @@ export class MurmurEngine {
                 this.account.identityKey,
                 this.agent.keyStore.identityKeyPair.privateKey
             )
+            this.authError = null
         } catch (error) {
-            // Server might be unavailable, continue in offline mode
-            console.error('Failed to login:', error)
+            this.authError = error instanceof Error ? error.message : String(error)
         }
 
         return true
@@ -255,6 +263,7 @@ export class MurmurEngine {
                 return {
                     identityKey: stored.identityKey,
                     profilePublicKey: stored.profilePublicKey,
+                    profileSecretKey: stored.profileSecretKey,
                     firstName: profile.firstName || 'Unknown',
                     lastName: profile.lastName,
                     addedAt: stored.addedAt,
@@ -270,6 +279,7 @@ export class MurmurEngine {
             return {
                 identityKey: stored.identityKey,
                 profilePublicKey: stored.profilePublicKey,
+                profileSecretKey: stored.profileSecretKey,
                 firstName: profile.firstName || 'Unknown',
                 lastName: profile.lastName,
                 addedAt: stored.addedAt,
@@ -318,12 +328,10 @@ export class MurmurEngine {
         const bundle: PreKeyBundle = {
             identityKey: decodeBase64(serverBundle.identityKey),
             signedPreKey: decodeBase64(serverBundle.signedPreKey.publicKey),
-            signedPreKeyId: 0, // Server doesn't use IDs
             signedPreKeySignature: decodeBase64(serverBundle.signedPreKey.signature),
             oneTimePreKey: serverBundle.oneTimePreKey
                 ? decodeBase64(serverBundle.oneTimePreKey.publicKey)
-                : undefined,
-            oneTimePreKeyId: undefined
+                : undefined
         }
         return bundle
     }
@@ -371,6 +379,7 @@ export class MurmurEngine {
             ...profile,
             identityKey: serverProfile.id,
             profilePublicKey: serverProfile.profilePublicKey,
+            profileSecretKey,
             addedAt: storedContact.addedAt,
             updatedAt: storedContact.updatedAt
         }
@@ -446,6 +455,13 @@ export class MurmurEngine {
      */
     getMessages(contactIdentityKey: string, limit: number = 100): StoredMessage[] {
         return this.db.getMessages(contactIdentityKey, limit)
+    }
+
+    /**
+     * Get unread incoming messages.
+     */
+    getUnreadMessages(contactIdentityKey?: string): StoredMessage[] {
+        return this.db.getUnreadMessages(contactIdentityKey)
     }
 
     /**
@@ -549,13 +565,24 @@ export class MurmurEngine {
                 // Treat as legacy plaintext.
             }
 
-            const existingContact = this.db.getContact(inboxMessage.senderId)
-            if (!profileSecretKey && (!existingContact || !existingContact.profileSecretKey)) {
-                throw new Error('Missing profile secret key for incoming contact')
+            if (!profileSecretKey) {
+                this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
+                return null
             }
 
-            // Ensure contact exists before saving message (foreign key constraint).
-            const contact = await this.getOrCreateContact(inboxMessage.senderId, profileSecretKey)
+            let contact: Contact
+            try {
+                const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+                const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+                const serverProfile = await this.api.getProfile(profilePublicKey)
+                contact = this.addContactFromProfile(serverProfile, profileSecretKey, inboxMessage.senderId)
+            } catch (error) {
+                this.emit({
+                    type: 'error',
+                    error: `Failed to fetch profile for incoming message: ${error instanceof Error ? error.message : String(error)}`
+                })
+                return null
+            }
 
             // Save message
             const storedMessage: StoredMessage = {
@@ -583,9 +610,13 @@ export class MurmurEngine {
     /**
      * Sync messages from the server.
      */
-    async sync(): Promise<void> {
+    async sync(): Promise<{ success: boolean; error?: string }> {
         if (!this.agent || !this.account) {
-            return
+            return { success: false, error: 'Not initialized' }
+        }
+        if (!this.api.getTokens()) {
+            const reason = this.authError ? `Not authenticated: ${this.authError}` : 'Not authenticated'
+            return { success: false, error: reason }
         }
 
         try {
@@ -597,6 +628,10 @@ export class MurmurEngine {
                 const result = await this.api.getInbox(50, cursor)
 
                 for (const msg of result.messages) {
+                    if (this.db.hasMessage(msg.id)) {
+                        processedIds.push(msg.id)
+                        continue
+                    }
                     const stored = await this.processIncomingServerMessage(msg)
                     if (stored) {
                         processedIds.push(msg.id)
@@ -607,15 +642,16 @@ export class MurmurEngine {
                 hasMore = result.hasMore
             }
 
-            // Acknowledge processed messages
             if (processedIds.length > 0) {
                 await this.api.acknowledgeMessages(processedIds)
             }
 
             this.emit({ type: 'sync_complete' })
+            return { success: true }
         } catch (error) {
-            console.error('Sync failed:', error)
-            this.emit({ type: 'error', error: `Sync failed: ${error}` })
+            const message = error instanceof Error ? error.message : String(error)
+            this.emit({ type: 'error', error: `Sync failed: ${message}` })
+            return { success: false, error: message }
         }
     }
 
@@ -651,6 +687,20 @@ export class MurmurEngine {
      */
     markAsRead(contactIdentityKey: string): void {
         this.db.markMessagesRead(contactIdentityKey)
+    }
+
+    /**
+     * Mark messages as read locally.
+     */
+    async acknowledgeMessages(messageIds: string[]): Promise<void> {
+        if (!this.agent || !this.account) {
+            throw new Error('Not initialized')
+        }
+        if (messageIds.length === 0) {
+            return
+        }
+
+        this.db.markMessagesReadById(messageIds)
     }
 
     /**

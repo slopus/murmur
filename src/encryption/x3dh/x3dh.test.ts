@@ -21,6 +21,19 @@ import {
 import { constantTimeEqual } from '../crypto/utils.js'
 import type { X3DHReceiverKeys } from './types.js'
 
+function findOneTimePreKeyId(
+    store: ReturnType<typeof initializeKeyStore>,
+    publicKey?: Uint8Array
+): number | undefined {
+    if (!publicKey) return undefined
+    for (const [id, otpk] of store.oneTimePreKeys) {
+        if (constantTimeEqual(otpk.keyPair.publicKey, publicKey)) {
+            return id
+        }
+    }
+    return undefined
+}
+
 describe('Identity key generation', () => {
     it('should generate identity key pair', () => {
         const identity = generateIdentityKeyPair()
@@ -84,7 +97,6 @@ describe('Prekey bundle', () => {
 
         expect(bundle.identityKey).toEqual(identity.publicKey)
         expect(bundle.signedPreKey).toEqual(signedPreKey.keyPair.publicKey)
-        expect(bundle.signedPreKeyId).toBe(1)
         expect(bundle.oneTimePreKey).toBeUndefined()
     })
 
@@ -95,7 +107,6 @@ describe('Prekey bundle', () => {
         const bundle = createPreKeyBundle(identity, signedPreKey, oneTimePreKey)
 
         expect(bundle.oneTimePreKey).toEqual(oneTimePreKey.keyPair.publicKey)
-        expect(bundle.oneTimePreKeyId).toBe(100)
     })
 
     it('should verify valid bundle', () => {
@@ -167,8 +178,6 @@ describe('X3DH key agreement', () => {
         // Alice performs X3DH
         const aliceIdentity = generateIdentityKeyPair()
         const senderResult = x3dhSender(aliceIdentity, bobBundle)
-
-        expect(senderResult.oneTimePreKeyId).toBe(100)
 
         // Bob computes shared secret
         const bobKeys: X3DHReceiverKeys = {
@@ -311,7 +320,8 @@ describe('Full session establishment', () => {
         const senderResult = x3dhSender(aliceStore.identityKeyPair, bobBundle)
 
         // Bob processes the session initiation
-        const usedOTPK = consumeOneTimePreKey(bobStore, senderResult.oneTimePreKeyId!)
+        const usedOTPKId = findOneTimePreKeyId(bobStore, bobBundle.oneTimePreKey)
+        const usedOTPK = usedOTPKId ? consumeOneTimePreKey(bobStore, usedOTPKId) : undefined
         expect(usedOTPK).toBeDefined()
 
         const bobKeys: X3DHReceiverKeys = {

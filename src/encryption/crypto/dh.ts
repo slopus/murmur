@@ -10,7 +10,7 @@
  * - Shared secrets: 32 bytes
  */
 
-import { x25519 } from '@noble/curves/ed25519'
+import { ed25519, x25519 } from '@noble/curves/ed25519'
 import { getRandomBytes } from './utils.js'
 
 /** Length of X25519 private key in bytes */
@@ -51,6 +51,37 @@ export function generateDH(): DHKeyPair {
     const privateKey = getRandomBytes(DH_PRIVATE_KEY_LENGTH)
     const publicKey = x25519.getPublicKey(privateKey)
     return { privateKey, publicKey }
+}
+
+/**
+ * Derive an X25519 key pair from an Ed25519 private key seed.
+ *
+ * Uses the standard Ed25519 -> X25519 conversion.
+ *
+ * @param signingPrivateKey - 32-byte Ed25519 private key seed
+ * @returns Deterministic X25519 key pair
+ */
+export function deriveDhKeyPairFromSigningKey(signingPrivateKey: Uint8Array): DHKeyPair {
+    if (signingPrivateKey.length !== DH_PRIVATE_KEY_LENGTH) {
+        throw new Error(`Invalid signing key length: expected ${DH_PRIVATE_KEY_LENGTH}, got ${signingPrivateKey.length}`)
+    }
+
+    const privateKey = ed25519.utils.toMontgomerySecret(signingPrivateKey)
+    const publicKey = x25519.getPublicKey(privateKey)
+    return { privateKey, publicKey }
+}
+
+/**
+ * Derive an X25519 public key from an Ed25519 public key.
+ *
+ * @param signingPublicKey - 32-byte Ed25519 public key
+ * @returns 32-byte X25519 public key
+ */
+export function deriveDhPublicKeyFromSigningPublicKey(signingPublicKey: Uint8Array): Uint8Array {
+    if (signingPublicKey.length !== DH_PUBLIC_KEY_LENGTH) {
+        throw new Error(`Invalid signing public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${signingPublicKey.length}`)
+    }
+    return ed25519.utils.toMontgomery(signingPublicKey)
 }
 
 /**

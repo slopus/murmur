@@ -5,6 +5,8 @@
 import { describe, it, expect } from 'vitest'
 import {
     generateDH,
+    deriveDhKeyPairFromSigningKey,
+    deriveDhPublicKeyFromSigningPublicKey,
     dh,
     publicKeyFromPrivate,
     isValidPublicKey,
@@ -13,6 +15,7 @@ import {
     DH_SHARED_SECRET_LENGTH
 } from './dh.js'
 import { constantTimeEqual } from './utils.js'
+import { generateSigningKeyPair } from './signing.js'
 
 describe('DH key generation', () => {
     it('should generate key pair with correct lengths', () => {
@@ -32,6 +35,23 @@ describe('DH key generation', () => {
         const keyPair = generateDH()
         const derivedPublic = publicKeyFromPrivate(keyPair.privateKey)
         expect(constantTimeEqual(derivedPublic, keyPair.publicKey)).toBe(true)
+    })
+
+    it('should derive deterministic DH keys from signing key', () => {
+        const signing = generateSigningKeyPair()
+        const dh1 = deriveDhKeyPairFromSigningKey(signing.privateKey)
+        const dh2 = deriveDhKeyPairFromSigningKey(signing.privateKey)
+
+        expect(constantTimeEqual(dh1.privateKey, dh2.privateKey)).toBe(true)
+        expect(constantTimeEqual(dh1.publicKey, dh2.publicKey)).toBe(true)
+    })
+
+    it('should derive DH public key from signing public key', () => {
+        const signing = generateSigningKeyPair()
+        const derived = deriveDhPublicKeyFromSigningPublicKey(signing.publicKey)
+        const expected = deriveDhKeyPairFromSigningKey(signing.privateKey).publicKey
+
+        expect(constantTimeEqual(derived, expected)).toBe(true)
     })
 })
 

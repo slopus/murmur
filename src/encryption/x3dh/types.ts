@@ -53,14 +53,10 @@ export interface PreKeyBundle {
     identityKey: Uint8Array
     /** Bob's signed prekey public key */
     signedPreKey: Uint8Array
-    /** ID of the signed prekey */
-    signedPreKeyId: number
     /** Signature of signedPreKey by identityKey */
     signedPreKeySignature: Uint8Array
     /** Optional one-time prekey public key (may be exhausted) */
     oneTimePreKey?: Uint8Array
-    /** ID of the one-time prekey (if present) */
-    oneTimePreKeyId?: number
 }
 
 /**
@@ -73,10 +69,6 @@ export interface X3DHSenderResult {
     ephemeralPublicKey: Uint8Array
     /** Alice's identity DH public key (to send to Bob for DH computation) */
     aliceIdentityDHKey: Uint8Array
-    /** ID of the signed prekey used (to send to Bob) */
-    signedPreKeyId: number
-    /** ID of the one-time prekey used, if any (to send to Bob) */
-    oneTimePreKeyId?: number
     /** Bob's signed prekey public key (for Double Ratchet init) */
     bobSignedPreKey: Uint8Array
 }
@@ -89,10 +81,10 @@ export interface X3DHInitialMessage {
     identityKey: Uint8Array
     /** Alice's ephemeral public key */
     ephemeralKey: Uint8Array
-    /** ID of Bob's signed prekey that was used */
-    signedPreKeyId: number
-    /** ID of Bob's one-time prekey that was used (if any) */
-    oneTimePreKeyId?: number
+    /** Bob's signed prekey public key that was used */
+    signedPreKey: Uint8Array
+    /** Bob's one-time prekey public key that was used (if any) */
+    oneTimePreKey?: Uint8Array
     /** The first Double Ratchet encrypted message */
     initialCiphertext: Uint8Array
     /** Header of the first message */

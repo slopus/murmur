@@ -34,19 +34,22 @@ Notes:
 The application payload is encrypted via Double Ratchet. The resulting protocol
 message is JSON-encoded and then base64-encoded for transport.
 
-Protocol messages always use `type: "message"`. Pre-key fields are included
-when establishing a new session.
+Protocol messages always use `type: "message"`. Pre-key fields live under
+`init` when establishing a new session.
 
 ### Pre-key Message
 
 ```json
 {
   "type": "message",
-  "identityDHKey": "base64",
-  "ephemeralKey": "base64",
-  "signedPreKey": "base64",
-  "oneTimePreKey": "base64",
-  "header": "base64",
+  "init": {
+    "ephemeralKey": "base64",
+    "preKey": "base64",
+    "oneTimePreKey": "base64"
+  },
+  "ratchetKey": "base64",
+  "previousChainLength": 0,
+  "messageNumber": 0,
   "ciphertext": "base64"
 }
 ```
@@ -56,22 +59,83 @@ when establishing a new session.
 ```json
 {
   "type": "message",
-  "header": "base64",
+  "ratchetKey": "base64",
+  "previousChainLength": 0,
+  "messageNumber": 0,
   "ciphertext": "base64"
 }
 ```
 
 Field details:
 
-- `identityDHKey`, `ephemeralKey`: X25519 public keys (base64).
-- `signedPreKey`: recipient signed prekey public key used for X3DH (required for pre-key messages).
-- `oneTimePreKey`: recipient one-time prekey public key used for X3DH (optional).
-- The presence of `identityDHKey` + `ephemeralKey` indicates a pre-key message.
-- Regular messages identify the derived ratchet key via the encoded header's public key.
-- `header`: base64-encoded 44-byte Double Ratchet header.
+- `init.ephemeralKey`: X25519 public key (base64).
+- The sender identity DH public key is derived by the receiver from the sender identity signing key (`ed25519.utils.toMontgomery`).
+- `init.preKey`: recipient prekey public key used for X3DH (required for pre-key messages).
+- `init.oneTimePreKey`: recipient one-time prekey public key used for X3DH (optional).
+- The presence of `init` indicates a pre-key message.
+- `ratchetKey`: current Double Ratchet public key (X25519, base64).
+- `previousChainLength`, `messageNumber`: chain counters for the Double Ratchet.
 - `ciphertext`: base64-encoded ChaCha20-Poly1305 ciphertext + auth tag.
 
-### Double Ratchet Header (encoded)
+## Algorithms
+
+### Pre-key Message Encryption (sender)
+
+1. Fetch recipient prekey bundle from server and verify the bundle signature.
+2. The receiver will derive the sender identity DH key from the sender Ed25519 public key.
+3. Run X3DH (sender side) using:
+   - Alice identity DH keypair (derived from her Ed25519 identity key)
+   - Bob prekey (from bundle)
+   - Optional Bob one-time prekey (from bundle)
+4. Initialize Double Ratchet (Alice) with the X3DH shared secret and Bob's prekey public key.
+5. Ratchet encrypt the plaintext to get:
+   - Header fields: `ratchetKey`, `previousChainLength`, `messageNumber`
+   - Ciphertext bytes
+6. Build protocol message JSON with:
+   - `type: "message"`
+   - `init` containing `ephemeralKey`, `preKey`, and optional `oneTimePreKey` (from bundle)
+   - `ratchetKey`, `previousChainLength`, `messageNumber`
+   - `ciphertext` (base64)
+7. Base64-encode the JSON to create the server `blob`.
+8. Sign `blobBytes || messageIdBytes` with Alice's Ed25519 identity key.
+
+### Pre-key Message Decryption (receiver)
+
+1. Verify the server signature over `blobBytes || messageIdBytes` using the sender identity key.
+2. Decode and parse the protocol message JSON from the `blob`.
+3. Look up `init.preKey` (and optional `init.oneTimePreKey`) in the local key store to find the matching private keys.
+4. Derive Alice identity DH public key from her Ed25519 public key.
+5. Run X3DH (receiver side) using:
+   - Bob identity DH keypair
+   - Bob prekey private key
+   - Optional Bob one-time prekey private key
+   - Alice derived identity DH key and `init.ephemeralKey`
+6. Initialize Double Ratchet (Bob) with the X3DH shared secret and Bob's prekey keypair.
+7. Build the internal header from `ratchetKey`, `previousChainLength`, `messageNumber`.
+8. Ratchet decrypt the ciphertext to recover plaintext.
+
+### Regular Message Encryption (sender)
+
+1. Use the existing Double Ratchet session for the recipient.
+2. Ratchet encrypt the plaintext to get:
+   - `ratchetKey`, `previousChainLength`, `messageNumber`
+   - Ciphertext bytes
+3. Build protocol message JSON with:
+   - `type: "message"`
+   - `ratchetKey`, `previousChainLength`, `messageNumber`
+   - `ciphertext` (base64)
+4. Base64-encode the JSON to create the server `blob`.
+5. Sign `blobBytes || messageIdBytes` with the sender identity key.
+
+### Regular Message Decryption (receiver)
+
+1. Verify the server signature over `blobBytes || messageIdBytes` using the sender identity key.
+2. Decode and parse the protocol message JSON from the `blob`.
+3. Use the existing Double Ratchet session for the sender.
+4. Build the internal header from `ratchetKey`, `previousChainLength`, `messageNumber`.
+5. Ratchet decrypt the ciphertext to recover plaintext.
+
+### Double Ratchet Header (internal)
 
 The header is 44 bytes:
 
@@ -80,7 +144,8 @@ The header is 44 bytes:
 - 4 bytes: message number (uint32, big-endian)
 - 4 bytes: reserved (zero)
 
-The encoded header bytes are authenticated as associated data for the ciphertext.
+The header bytes are derived from the ratchet fields and authenticated as
+associated data for the ciphertext.
 
 ### Ciphertext
 

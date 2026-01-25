@@ -34,8 +34,6 @@ import {
     ratchetDecrypt,
     serializeState,
     deserializeState,
-    encodeHeader,
-    decodeHeader,
     type RatchetState,
     type EncryptedMessage
 } from '../ratchet/index.js'
@@ -47,6 +45,7 @@ import {
     concatBytes,
     constantTimeEqual
 } from '../crypto/utils.js'
+import { deriveDhPublicKeyFromSigningPublicKey } from '../crypto/dh.js'
 import { sign, verify } from '../crypto/signing.js'
 import type {
     Session,
@@ -154,11 +153,14 @@ export function createPreKeyMessage(
 
     const message: ProtocolMessage = {
         type: 'message',
-        identityDHKey: encodeBase64(x3dhResult.aliceIdentityDHKey),
-        ephemeralKey: encodeBase64(x3dhResult.ephemeralPublicKey),
-        signedPreKey: encodeBase64(peerBundle.signedPreKey),
-        oneTimePreKey: peerBundle.oneTimePreKey ? encodeBase64(peerBundle.oneTimePreKey) : undefined,
-        header: encodeBase64(encodeHeader(encrypted.header)),
+        init: {
+            ephemeralKey: encodeBase64(x3dhResult.ephemeralPublicKey),
+            preKey: encodeBase64(peerBundle.signedPreKey),
+            oneTimePreKey: peerBundle.oneTimePreKey ? encodeBase64(peerBundle.oneTimePreKey) : undefined
+        },
+        ratchetKey: encodeBase64(encrypted.header.publicKey),
+        previousChainLength: encrypted.header.previousChainLength,
+        messageNumber: encrypted.header.messageNumber,
         ciphertext: encodeBase64(encrypted.ciphertext)
     }
 
@@ -190,26 +192,26 @@ export function receivePreKeyMessage(
     senderId: string,
     message: ProtocolMessage
 ): DecryptedMessage {
-    if (!message.identityDHKey || !message.ephemeralKey) {
+    if (!message.init) {
         throw new Error('Missing pre-key fields in message')
     }
 
     const senderIdentityKey = decodeBase64(senderId)
-    const identityDHKey = decodeBase64(message.identityDHKey)
-    const ephemeralKey = decodeBase64(message.ephemeralKey)
+    const identityDHKey = deriveDhPublicKeyFromSigningPublicKey(senderIdentityKey)
+    const ephemeralKey = decodeBase64(message.init.ephemeralKey)
 
-    if (!message.signedPreKey) {
-        throw new Error('Missing signed prekey in message')
+    if (!message.init.preKey) {
+        throw new Error('Missing prekey in message')
     }
-    const expectedSignedPreKey = decodeBase64(message.signedPreKey)
+    const expectedSignedPreKey = decodeBase64(message.init.preKey)
     if (!constantTimeEqual(expectedSignedPreKey, agent.keyStore.signedPreKey.keyPair.publicKey)) {
-        throw new Error('Signed prekey does not match current key')
+        throw new Error('Prekey does not match current key')
     }
 
     // Get the one-time prekey if used
     let oneTimePreKey
-    if (message.oneTimePreKey) {
-        const expectedOneTimePreKey = decodeBase64(message.oneTimePreKey)
+    if (message.init.oneTimePreKey) {
+        const expectedOneTimePreKey = decodeBase64(message.init.oneTimePreKey)
         const resolvedOneTimePreKey = findOneTimePreKey(agent.keyStore, expectedOneTimePreKey)
         if (!resolvedOneTimePreKey) {
             throw new Error('Unknown one-time prekey')
@@ -244,9 +246,8 @@ export function receivePreKeyMessage(
     agent.sessions.set(senderId, session)
 
     // Decrypt the first message
-    const header = decodeHeader(decodeBase64(message.header))
-    const ciphertext = decodeBase64(message.ciphertext)
-    const plaintext = ratchetDecrypt(ratchetState, { header, ciphertext })
+    const encryptedMessage = parseEncryptedMessage(message)
+    const plaintext = ratchetDecrypt(ratchetState, encryptedMessage)
 
     return {
         plaintext,
@@ -278,7 +279,9 @@ export function encryptMessage(
 
     return {
         type: 'message',
-        header: encodeBase64(encodeHeader(encrypted.header)),
+        ratchetKey: encodeBase64(encrypted.header.publicKey),
+        previousChainLength: encrypted.header.previousChainLength,
+        messageNumber: encrypted.header.messageNumber,
         ciphertext: encodeBase64(encrypted.ciphertext)
     }
 }
@@ -300,11 +303,7 @@ export function decryptMessage(
         throw new Error(`Invalid message type: ${message.type}`)
     }
 
-    const hasPreKeyFields = message.identityDHKey !== undefined
-        || message.ephemeralKey !== undefined
-        || message.signedPreKey !== undefined
-        || message.oneTimePreKey !== undefined
-    if (hasPreKeyFields) {
+    if (message.init) {
         return receivePreKeyMessage(agent, senderId, message)
     }
 
@@ -314,15 +313,32 @@ export function decryptMessage(
         throw new Error(`No session with peer: ${senderId}`)
     }
 
-    const header = decodeHeader(decodeBase64(message.header))
-    const ciphertext = decodeBase64(message.ciphertext)
-    const plaintext = ratchetDecrypt(session.ratchetState, { header, ciphertext })
+    const encryptedMessage = parseEncryptedMessage(message)
+    const plaintext = ratchetDecrypt(session.ratchetState, encryptedMessage)
     session.lastActivityAt = Date.now()
 
     return {
         plaintext,
         senderIdentityKey: session.peerIdentityKey
     }
+}
+
+/**
+ * Build an encrypted message from protocol fields.
+ */
+function parseEncryptedMessage(message: ProtocolMessage): EncryptedMessage {
+    if (!message.ratchetKey) {
+        throw new Error('Missing ratchet key in message')
+    }
+
+    const header = {
+        publicKey: decodeBase64(message.ratchetKey),
+        previousChainLength: message.previousChainLength,
+        messageNumber: message.messageNumber
+    }
+    const ciphertext = decodeBase64(message.ciphertext)
+
+    return { header, ciphertext }
 }
 
 /**

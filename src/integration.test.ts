@@ -37,6 +37,19 @@ import {
 } from './encryption/crypto/utils.js'
 import type { DHKeyPair } from './encryption/crypto/dh.js'
 
+function findOneTimePreKeyId(
+    store: ReturnType<typeof initializeKeyStore>,
+    publicKey?: Uint8Array
+): number | undefined {
+    if (!publicKey) return undefined
+    for (const [id, otpk] of store.oneTimePreKeys) {
+        if (constantTimeEqual(otpk.keyPair.publicKey, publicKey)) {
+            return id
+        }
+    }
+    return undefined
+}
+
 /**
  * Complete session state combining X3DH keys and ratchet state.
  */
@@ -64,7 +77,8 @@ describe('Full Protocol Integration', () => {
         const aliceX3DHResult = x3dhSender(aliceKeyStore.identityKeyPair, bobBundle)
 
         // Bob receives Alice's initiation
-        const usedOTPK = consumeOneTimePreKey(bobKeyStore, aliceX3DHResult.oneTimePreKeyId!)
+        const usedOTPKId = findOneTimePreKeyId(bobKeyStore, bobBundle.oneTimePreKey)
+        const usedOTPK = usedOTPKId ? consumeOneTimePreKey(bobKeyStore, usedOTPKId) : undefined
         const bobReceiverKeys: X3DHReceiverKeys = {
             identityKeyPair: bobKeyStore.identityKeyPair,
             signedPreKey: bobKeyStore.signedPreKey,
@@ -138,7 +152,10 @@ describe('Full Protocol Integration', () => {
             {
                 identityKeyPair: bobKeyStore.identityKeyPair,
                 signedPreKey: bobKeyStore.signedPreKey,
-                oneTimePreKey: consumeOneTimePreKey(bobKeyStore, aliceX3DH.oneTimePreKeyId!)
+                oneTimePreKey: (() => {
+                    const otpkId = findOneTimePreKeyId(bobKeyStore, bobBundle.oneTimePreKey)
+                    return otpkId ? consumeOneTimePreKey(bobKeyStore, otpkId) : undefined
+                })()
             },
             aliceKeyStore.identityKeyPair.publicKey,
             aliceX3DH.aliceIdentityDHKey,

@@ -87,18 +87,23 @@ export interface IncomingMessage {
 export interface ProtocolMessage {
     /** Message type identifier */
     type: 'message'
-    /** Encoded Double Ratchet header */
-    header: string
+    /** Optional session init fields for pre-key messages */
+    init?: {
+        /** Alice's ephemeral public key (for X3DH) */
+        ephemeralKey: string
+        /** Bob's prekey public key used */
+        preKey: string
+        /** Bob's one-time prekey public key used (if any) */
+        oneTimePreKey?: string
+    }
+    /** Ratchet public key (X25519) */
+    ratchetKey: string
+    /** Number of messages in previous sending chain */
+    previousChainLength: number
+    /** Message number in current chain */
+    messageNumber: number
     /** Encrypted ciphertext */
     ciphertext: string
-    /** Alice's identity DH public key (for X3DH) */
-    identityDHKey?: string
-    /** Alice's ephemeral public key (for X3DH) */
-    ephemeralKey?: string
-    /** Bob's signed prekey public key used */
-    signedPreKey?: string
-    /** Bob's one-time prekey public key used (if any) */
-    oneTimePreKey?: string
 }
 
 /**

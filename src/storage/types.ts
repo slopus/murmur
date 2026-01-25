@@ -18,6 +18,8 @@ export interface Contact {
     identityKey: string
     /** Contact's profile public key for fetching profile */
     profilePublicKey: string
+    /** Contact's profile secret key (base64url, optional) */
+    profileSecretKey?: string
     /** Decrypted first name */
     firstName: string
     /** Decrypted last name (optional) */

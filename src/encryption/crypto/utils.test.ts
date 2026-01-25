@@ -7,6 +7,8 @@ import {
     encodeBase64,
     decodeBase64,
     encodeBase64Url,
+    encodeBase58,
+    decodeBase58,
     getRandomBytes,
     constantTimeEqual,
     concatBytes,
@@ -57,6 +59,30 @@ describe('Base64 encoding', () => {
         const encoded = encodeBase64(random)
         const decoded = decodeBase64(encoded)
         expect(decoded).toEqual(random)
+    })
+})
+
+describe('Base58 encoding', () => {
+    it('should roundtrip 32-byte keys', () => {
+        for (let i = 0; i < 10; i++) {
+            const key = getRandomBytes(32)
+            const encoded = encodeBase58(key)
+            const decoded = decodeBase58(encoded)
+            expect(decoded).toEqual(key)
+            expect(decoded.length).toBe(32)
+        }
+    })
+
+    it('should preserve leading zeros', () => {
+        const key = new Uint8Array(32)
+        key[31] = 0x01
+        const encoded = encodeBase58(key)
+        const decoded = decodeBase58(encoded)
+        expect(decoded).toEqual(key)
+    })
+
+    it('should reject invalid base58 strings', () => {
+        expect(() => decodeBase58('0OIl-')).toThrow()
     })
 })
 

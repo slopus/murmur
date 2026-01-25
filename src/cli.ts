@@ -244,6 +244,58 @@ function decodeIdentityKey(value: string): Uint8Array {
 }
 
 /**
+ * Decode a profile secret key (base64url, no padding).
+ */
+function decodeProfileSecretKey(value: string): Uint8Array {
+    const trimmed = value.trim()
+    if (!trimmed) {
+        throw new Error('Profile ID cannot be empty')
+    }
+
+    if (!isBase58(trimmed)) {
+        throw new Error('Profile ID must be base58')
+    }
+
+    const bytes = decodeBase58(trimmed)
+    if (bytes.length !== 32) {
+        throw new Error('Invalid profile ID length')
+    }
+
+    return bytes
+}
+
+/**
+ * Format a profile secret key (base64url) for display.
+ */
+function formatProfileSecretKey(profileSecretKey: string): string {
+    return encodeBase58(decodeBase64(profileSecretKey, 'base64url'))
+}
+
+/**
+ * Decode the locally stored profile secret key (base64url).
+ */
+function decodeStoredProfileSecretKey(profileSecretKey: string): Uint8Array {
+    const bytes = decodeBase64(profileSecretKey, 'base64url')
+    if (bytes.length !== 32) {
+        throw new Error('Invalid stored profile secret key')
+    }
+    return bytes
+}
+
+/**
+ * Resolve a contact by profile secret key.
+ */
+function resolveContactByProfileSecret(engine: MurmurEngine, profileSecretKey: string): Contact {
+    const profileSecretKeyBytes = decodeProfileSecretKey(profileSecretKey)
+    const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+    const contact = engine.getContacts().find(item => item.profilePublicKey === profilePublicKey)
+    if (!contact) {
+        throw new Error('Contact not found. Add contact with `murmur add-contact <id>` first.')
+    }
+    return contact
+}
+
+/**
  * Normalize an identity key string to base64.
  */
 function normalizeIdentityKey(value: string): string {
@@ -263,22 +315,15 @@ function formatIdentityKey(identityKey: string): string {
 function printUsage(): void {
     const lines = [
         'Usage:',
-        '  murmur sign-in [--first-name <name>] [--last-name <name>] [--root <dir>] [--api <url>]',
-        '  murmur delete-account --confirm [--root <dir>] [--api <url>]',
-        '  murmur add-contact --profile-secret <key> [--root <dir>] [--api <url>]',
-        '  murmur profile <profile-secret> [--api <url>]',
-        '  murmur send --to <identityKey> --message <text> [--root <dir>] [--api <url>]',
-        '  murmur sync [--root <dir>] [--api <url>]',
-        '  murmur messages --with <identityKey> [--limit <n>] [--root <dir>] [--api <url>]',
-        '',
-        'Environment:',
-        '  MURMUR_FIRST_NAME, MURMUR_LAST_NAME',
-        '  MURMUR_CONFIRM_DELETE',
-        '  MURMUR_PROFILE_SECRET',
-        '  MURMUR_TO, MURMUR_MESSAGE',
-        '  MURMUR_WITH, MURMUR_LIMIT',
-        '  MURMUR_ROOT',
-        '  MURMUR_API_BASE_URL'
+        '  murmur sign-in [--first-name <name>] [--last-name <name>]',
+        '  murmur me',
+        '  murmur delete-account --confirm',
+        '  murmur add-contact <id>',
+        '  murmur profile <profile-secret>',
+        '  murmur send --to <id> --message <text>',
+        '  murmur sync [--with <id>]',
+        '  murmur messages --with <id> [--limit <n>]',
+        '  murmur ack <messageId...>'
     ]
 
     console.log(lines.join('\n'))
@@ -297,21 +342,36 @@ async function requireInitialized(engine: MurmurEngine): Promise<void> {
 /**
  * Print account information.
  */
-function printAccountSummary(prefix: string, account: { identityKey: string; firstName: string; lastName?: string; profilePublicKey: string }): void {
+function printAccountSummary(prefix: string, account: { profileSecretKey: string; firstName: string; lastName?: string }): void {
     const name = [account.firstName, account.lastName].filter(Boolean).join(' ')
     console.log(prefix)
+    console.log(`ID: ${formatProfileSecretKey(account.profileSecretKey)}`)
     console.log(`Name: ${name}`)
-    console.log(`Identity key: ${formatIdentityKey(account.identityKey)}`)
-    console.log(`Profile public key: ${encodeBase58(decodeBase64(account.profilePublicKey))}`)
 }
 
 /**
  * Print a message line.
  */
-function printMessageLine(contactLabel: string, message: StoredMessage): void {
-    const direction = message.isOutgoing ? '->' : '<-'
-    const timestamp = formatTimestamp(message.createdAt)
-    console.log(`${timestamp} ${direction} ${contactLabel}: ${message.text}`)
+function formatName(firstName?: string, lastName?: string, fallback: string = 'Unknown'): string {
+    const name = [firstName, lastName].filter(Boolean).join(' ')
+    return name.length > 0 ? name : fallback
+}
+
+function formatSenderId(contact: Contact | undefined, fallbackIdentityKey: string): string {
+    if (contact?.profileSecretKey) {
+        return formatProfileSecretKey(contact.profileSecretKey)
+    }
+    return `Unknown (${formatIdentityKey(fallbackIdentityKey)})`
+}
+
+function printMessageBlock(message: StoredMessage, senderId: string, senderName: string): void {
+    console.log('----')
+    console.log(`Message ID: ${message.id}`)
+    console.log(`Sender ID: ${senderId}`)
+    console.log(`Sender Name: ${senderName}`)
+    console.log(`Date: ${formatTimestamp(message.createdAt)}`)
+    console.log(message.text)
+    console.log('----')
 }
 
 /**
@@ -324,6 +384,8 @@ async function run(): Promise<void> {
         printUsage()
         return
     }
+
+    console.log('Welcome to Murmur! End-To-End encrypted messenger for AI Agents.')
 
     const rootDir = readStringOption(parsed.options, 'root', 'MURMUR_ROOT')
     const apiBaseUrl =
@@ -348,6 +410,10 @@ async function run(): Promise<void> {
                         throw new Error('Account data missing.')
                     }
                     printAccountSummary('Signed in with existing account.', account)
+                    const authError = getEngine().getAuthError()
+                    if (authError) {
+                        console.log(`Note: server login failed (${authError}). Run \`murmur delete-account --confirm\` then \`murmur sign-in\` to re-register.`)
+                    }
                     return
                 }
 
@@ -355,6 +421,18 @@ async function run(): Promise<void> {
                 const lastName = readStringOption(parsed.options, 'last-name', 'MURMUR_LAST_NAME')
                 const account = await getEngine().createAccount(firstName, lastName)
                 printAccountSummary('Account created and signed in.', account)
+                return
+            }
+            case 'me': {
+                await requireInitialized(getEngine())
+                const account = getEngine().getAccount()
+                if (!account) {
+                    throw new Error('Account data missing.')
+                }
+                const profileSecretKeyBytes = decodeStoredProfileSecretKey(account.profileSecretKey)
+                const profile = decryptProfile(account.encryptedProfile, profileSecretKeyBytes)
+                console.log(`ID: ${formatProfileSecretKey(account.profileSecretKey)}`)
+                console.log(JSON.stringify(profile, null, 2))
                 return
             }
             case 'delete-account': {
@@ -369,95 +447,125 @@ async function run(): Promise<void> {
             }
             case 'send': {
                 await requireInitialized(getEngine())
-                const recipient = normalizeIdentityKey(requireStringOption(parsed.options, 'to', 'MURMUR_TO'))
+                const recipientId = requireStringOption(parsed.options, 'to', 'MURMUR_TO')
                 const message = requireStringOption(parsed.options, 'message', 'MURMUR_MESSAGE')
-                const stored = await getEngine().sendMessage(recipient, message)
-                console.log(`Sent ${stored.id} to ${formatIdentityKey(recipient)} at ${formatTimestamp(stored.createdAt)}`)
+                const contact = resolveContactByProfileSecret(getEngine(), recipientId)
+                const stored = await getEngine().sendMessage(contact.identityKey, message)
+                console.log(`Sent ${stored.id} to ${formatContact(contact)} at ${formatTimestamp(stored.createdAt)}`)
                 return
             }
             case 'add-contact': {
                 await requireInitialized(getEngine())
-                const profileSecret = requireStringOption(parsed.options, 'profile-secret', 'MURMUR_PROFILE_SECRET')
-                const contact = await getEngine().addContactByProfileSecret(profileSecret)
+                const profileSecret = parsed.positionals[0]
+                if (!profileSecret) {
+                    throw new Error('Missing contact ID. Usage: murmur add-contact <id>')
+                }
+                const profileSecretBytes = decodeProfileSecretKey(profileSecret)
+                const profileSecretBase64 = encodeBase64(profileSecretBytes, 'base64url')
+                const contact = await getEngine().addContactByProfileSecret(profileSecretBase64)
                 console.log(`Added contact: ${formatContact(contact)}`)
                 return
             }
             case 'profile': {
                 const positionalSecret = parsed.positionals[0]
                 const profileSecret = positionalSecret ?? requireStringOption(parsed.options, 'profile-secret', 'MURMUR_PROFILE_SECRET')
-                const profileSecretBytes = decodeBase64(profileSecret, 'base64url')
+                const profileSecretBytes = decodeProfileSecretKey(profileSecret)
                 const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretBytes))
                 const api = new MurmurApi(apiBaseUrl)
                 const serverProfile = await api.getPublicProfile(profilePublicKey)
                 const profile = decryptProfile(serverProfile.encryptedProfile, profileSecretBytes)
-                console.log(`Identity key: ${formatIdentityKey(serverProfile.id)}`)
                 console.log(JSON.stringify(profile, null, 2))
                 return
             }
             case 'sync': {
                 await requireInitialized(getEngine())
-                const received: Array<{ contact: Contact; message: StoredMessage }> = []
-                const markRead = new Set<string>()
-                const unsubscribe = getEngine().on(event => {
-                    if (event.type === 'message') {
-                        received.push({ contact: event.contact, message: event.message })
-                        markRead.add(event.contact.identityKey)
-                    }
-                    if (event.type === 'error') {
-                        console.error(event.error)
-                    }
-                })
+                const syncResult = await getEngine().sync()
+                if (!syncResult.success && syncResult.error) {
+                    console.error(`Sync unavailable: ${syncResult.error}`)
+                }
 
-                await getEngine().sync()
-                unsubscribe()
+                const filterId = readStringOption(parsed.options, 'with', 'MURMUR_WITH')
+                let filterContact: Contact | undefined
+                if (filterId) {
+                    filterContact = resolveContactByProfileSecret(getEngine(), filterId)
+                }
 
-                if (received.length === 0) {
-                    console.log('No new messages.')
+                const unreadMessages = getEngine().getUnreadMessages(filterContact?.identityKey)
+                if (unreadMessages.length === 0) {
+                    console.log('No unread messages.')
                     return
                 }
 
-                for (const { contact, message } of received) {
-                    printMessageLine(formatContact(contact), message)
+                const contacts = new Map(
+                    getEngine().getContacts().map(contact => [contact.identityKey, contact])
+                )
+                const account = getEngine().getAccount()
+                if (!account) {
+                    throw new Error('Account data missing.')
                 }
 
-                for (const identityKey of markRead) {
-                    getEngine().markAsRead(identityKey)
+                for (const message of unreadMessages) {
+                    const contact = filterContact ?? contacts.get(message.conversationId)
+                    const senderId = message.isOutgoing
+                        ? formatProfileSecretKey(account.profileSecretKey)
+                        : formatSenderId(contact, message.conversationId)
+                    const senderName = message.isOutgoing
+                        ? formatName(account.firstName, account.lastName, 'You')
+                        : formatName(contact?.firstName, contact?.lastName, formatIdentityKey(message.conversationId))
+                    printMessageBlock(message, senderId, senderName)
                 }
                 return
             }
             case 'messages': {
                 await requireInitialized(getEngine())
-                const peer = normalizeIdentityKey(requireStringOption(parsed.options, 'with', 'MURMUR_WITH'))
+                const peerId = requireStringOption(parsed.options, 'with', 'MURMUR_WITH')
+                const contact = resolveContactByProfileSecret(getEngine(), peerId)
                 const limit = readNumberOption(parsed.options, 'limit', 'MURMUR_LIMIT') ?? 20
                 if (limit <= 0) {
                     throw new Error('Limit must be a positive number.')
                 }
 
-                const contacts = getEngine().getContacts()
-                const contact = contacts.find(item => item.identityKey === peer)
-                const label = contact ? formatContact(contact) : formatIdentityKey(peer)
-                const messages = getEngine().getMessages(peer, limit)
+                const label = formatContact(contact)
+                const messages = getEngine().getMessages(contact.identityKey, limit)
 
                 if (messages.length === 0) {
                     console.log(`No messages for ${label}.`)
                     return
                 }
 
-                const resolvedLabel = contact ? formatContact(contact) : formatIdentityKey(peer)
-                console.log(`Last ${messages.length} messages for ${resolvedLabel}:`)
+                console.log(`Last ${messages.length} messages for ${label}:`)
+                const account = getEngine().getAccount()
+                if (!account) {
+                    throw new Error('Account data missing.')
+                }
                 for (const message of messages) {
-                    printMessageLine(resolvedLabel, message)
+                    const senderId = message.isOutgoing
+                        ? formatProfileSecretKey(account.profileSecretKey)
+                        : formatSenderId(contact, message.conversationId)
+                    const senderName = message.isOutgoing
+                        ? formatName(account.firstName, account.lastName, 'You')
+                        : formatName(contact.firstName, contact.lastName)
+                    printMessageBlock(message, senderId, senderName)
                 }
 
-                getEngine().markAsRead(peer)
+                return
+            }
+            case 'ack': {
+                await requireInitialized(getEngine())
+                const ids = parsed.positionals.filter(value => value.trim().length > 0)
+                if (ids.length === 0) {
+                    throw new Error('Missing message IDs. Usage: murmur ack <messageId...>')
+                }
+                await getEngine().acknowledgeMessages(ids)
+                console.log(`Acknowledged ${ids.length} message${ids.length === 1 ? '' : 's'}.`)
                 return
             }
             default:
                 throw new Error(`Unknown command: ${parsed.command}`)
         }
     } finally {
-        if (engine) {
-            engine.close()
+        if (engine !== null) {
+            (engine as MurmurEngine).close()
         }
     }
 }

@@ -340,6 +340,41 @@ export class MurmurDatabase {
     }
 
     /**
+     * Get unread incoming messages.
+     */
+    getUnreadMessages(conversationId?: string): StoredMessage[] {
+        const rows = conversationId
+            ? this.db.prepare(`
+                SELECT id, conversation_id, is_outgoing, text, created_at, read
+                FROM messages
+                WHERE conversation_id = ? AND read = 0 AND is_outgoing = 0
+                ORDER BY created_at ASC
+            `).all(conversationId)
+            : this.db.prepare(`
+                SELECT id, conversation_id, is_outgoing, text, created_at, read
+                FROM messages
+                WHERE read = 0 AND is_outgoing = 0
+                ORDER BY created_at ASC
+            `).all()
+
+        return (rows as Array<{
+            id: string
+            conversation_id: string
+            is_outgoing: number
+            text: string
+            created_at: number
+            read: number
+        }>).map(row => ({
+            id: row.id,
+            conversationId: row.conversation_id,
+            isOutgoing: row.is_outgoing === 1,
+            text: row.text,
+            createdAt: row.created_at,
+            read: row.read === 1
+        }))
+    }
+
+    /**
      * Save a message.
      */
     saveMessage(message: StoredMessage): void {
@@ -358,6 +393,16 @@ export class MurmurDatabase {
     }
 
     /**
+     * Check whether a message ID exists.
+     */
+    hasMessage(id: string): boolean {
+        const row = this.db.prepare(`
+            SELECT 1 FROM messages WHERE id = ? LIMIT 1
+        `).get(id) as { 1: number } | undefined
+        return row !== undefined
+    }
+
+    /**
      * Mark messages as read.
      */
     markMessagesRead(conversationId: string): void {
@@ -365,6 +410,20 @@ export class MurmurDatabase {
             UPDATE messages SET read = 1
             WHERE conversation_id = ? AND read = 0
         `).run(conversationId)
+    }
+
+    /**
+     * Mark messages as read by ID.
+     */
+    markMessagesReadById(ids: string[]): void {
+        if (ids.length === 0) {
+            return
+        }
+        const placeholders = ids.map(() => '?').join(', ')
+        this.db.prepare(`
+            UPDATE messages SET read = 1
+            WHERE id IN (${placeholders})
+        `).run(...ids)
     }
 
     /**

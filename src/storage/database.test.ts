@@ -294,6 +294,7 @@ describe('MurmurDatabase', () => {
 
         it('should return empty array initially', () => {
             expect(db.getMessages('peer-1')).toEqual([])
+            expect(db.hasMessage('missing')).toBe(false)
         })
 
         it('should save and retrieve message', () => {
@@ -311,6 +312,7 @@ describe('MurmurDatabase', () => {
             const messages = db.getMessages('peer-1')
             expect(messages).toHaveLength(1)
             expect(messages[0]).toEqual(message)
+            expect(db.hasMessage('msg-1')).toBe(true)
         })
 
         it('should return messages in chronological order', () => {
@@ -346,6 +348,60 @@ describe('MurmurDatabase', () => {
             db.markMessagesRead('peer-1')
 
             expect(db.getMessages('peer-1')[0].read).toBe(true)
+        })
+
+        it('should mark messages as read by id', () => {
+            db.saveMessage({
+                id: 'msg-1',
+                conversationId: 'peer-1',
+                isOutgoing: false,
+                text: 'Unread message 1',
+                createdAt: 1000,
+                read: false
+            })
+            db.saveMessage({
+                id: 'msg-2',
+                conversationId: 'peer-1',
+                isOutgoing: false,
+                text: 'Unread message 2',
+                createdAt: 2000,
+                read: false
+            })
+
+            db.markMessagesReadById(['msg-2'])
+
+            const messages = db.getMessages('peer-1')
+            const msg1 = messages.find(message => message.id === 'msg-1')
+            const msg2 = messages.find(message => message.id === 'msg-2')
+            expect(msg1?.read).toBe(false)
+            expect(msg2?.read).toBe(true)
+        })
+
+        it('should return unread incoming messages', () => {
+            db.saveMessage({ id: 'm1', conversationId: 'peer-1', isOutgoing: false, text: 'first', createdAt: 1, read: false })
+            db.saveMessage({ id: 'm2', conversationId: 'peer-1', isOutgoing: true, text: 'outgoing', createdAt: 2, read: false })
+            db.saveMessage({ id: 'm3', conversationId: 'peer-1', isOutgoing: false, text: 'second', createdAt: 3, read: false })
+            db.saveMessage({ id: 'm4', conversationId: 'peer-1', isOutgoing: false, text: 'read', createdAt: 4, read: true })
+
+            const unread = db.getUnreadMessages()
+            expect(unread.map(msg => msg.id)).toEqual(['m1', 'm3'])
+        })
+
+        it('should filter unread messages by conversation', () => {
+            db.saveContact({
+                identityKey: 'peer-2',
+                profilePublicKey: 'ppk',
+                profileSecretKey: 'psk2',
+                encryptedProfile: 'ep',
+                addedAt: 1000,
+                updatedAt: 1000
+            })
+
+            db.saveMessage({ id: 'm1', conversationId: 'peer-1', isOutgoing: false, text: 'peer-1', createdAt: 1, read: false })
+            db.saveMessage({ id: 'm2', conversationId: 'peer-2', isOutgoing: false, text: 'peer-2', createdAt: 2, read: false })
+
+            const unread = db.getUnreadMessages('peer-2')
+            expect(unread.map(msg => msg.id)).toEqual(['m2'])
         })
 
         it('should get unread counts', () => {

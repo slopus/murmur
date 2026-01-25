@@ -403,34 +403,18 @@ describe('Full end-to-end encrypted messaging flow', () => {
         // Alice fetches Bob's prekey bundle from server
         const serverBundle = server.getPreKeyBundle(aliceToken, bobIdentity)
 
-        // Server doesn't use IDs, so we need to find the matching ID from Bob's key store
-        // This is necessary because the X3DH protocol expects to match prekeys by ID
-        let matchingOneTimePreKeyId: number | undefined
-        if (serverBundle.oneTimePreKey) {
-            const serverOtpkBytes = decodeBase64(serverBundle.oneTimePreKey.publicKey)
-            for (const [id, otpk] of bobAgent.keyStore.oneTimePreKeys) {
-                if (encodeBase64(otpk.keyPair.publicKey) === encodeBase64(serverOtpkBytes)) {
-                    matchingOneTimePreKeyId = id
-                    break
-                }
-            }
-        }
-
         // Convert server bundle to protocol bundle
         const fetchedBundle: PreKeyBundle = {
             identityKey: decodeBase64(serverBundle.identityKey),
             signedPreKey: decodeBase64(serverBundle.signedPreKey.publicKey),
-            signedPreKeyId: bobAgent.keyStore.signedPreKey.id, // Use Bob's actual signed prekey ID
             signedPreKeySignature: decodeBase64(serverBundle.signedPreKey.signature),
             oneTimePreKey: serverBundle.oneTimePreKey
                 ? decodeBase64(serverBundle.oneTimePreKey.publicKey)
-                : undefined,
-            oneTimePreKeyId: matchingOneTimePreKeyId
+                : undefined
         }
 
         // Verify we got a one-time prekey
         expect(fetchedBundle.oneTimePreKey).toBeDefined()
-        expect(matchingOneTimePreKeyId).toBeDefined()
 
         // Alice initiates session using fetched bundle
         const { message: preKeyMessage } = createPreKeyMessage(
