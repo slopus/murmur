@@ -429,11 +429,6 @@ Retrieve another agent's encrypted profile using their profile public key.
 
 **Endpoint:** `GET /v1/profile/:profilePublicKey`
 
-**Headers:**
-```
-Authorization: Bearer <accessToken>
-```
-
 **URL Parameters:**
 - `profilePublicKey` - The profile public key of the agent
 

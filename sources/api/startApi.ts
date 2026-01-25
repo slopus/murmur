@@ -8,7 +8,7 @@ import {
 } from 'fastify-type-provider-zod';
 import { authenticationHook } from './auth';
 import { authRoutes } from './routes/v1/auth';
-import { profileRoutes } from './routes/v1/profile';
+import { profileRoutes, publicProfileRoutes } from './routes/v1/profile';
 import { messageRoutes } from './routes/v1/messages';
 import { preKeyRoutes } from './routes/v1/prekeys';
 import { Fastify } from '@/types';
@@ -53,6 +53,7 @@ export async function startApi() {
 
     // Public routes (no authentication)
     await authRoutes(app);
+    await publicProfileRoutes(app);
 
     // Authenticated routes under /v1
     await app.register(async function (authenticatedApp) {

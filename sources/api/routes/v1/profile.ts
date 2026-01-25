@@ -54,43 +54,6 @@ export async function profileRoutes(app: Fastify) {
         });
     });
 
-    // Get another user's profile by profile public key
-    app.get('/v1/profile/:profilePublicKey', {
-        schema: {
-            params: z.object({
-                profilePublicKey: z.string(),
-            }),
-        },
-        config: {
-            rateLimit: rateLimitConfigs.profile,
-        },
-    }, async (request, reply) => {
-        const { profilePublicKey } = request.params;
-
-        const user = await db.user.findUnique({
-            where: { profilePublicKey },
-            select: {
-                id: true,
-                profilePublicKey: true,
-                profileKeySignature: true,
-                encryptedProfile: true,
-                profileUpdatedAt: true,
-            },
-        });
-
-        if (!user) {
-            return reply.status(404).send({ error: 'User not found' });
-        }
-
-        return reply.send({
-            id: user.id,
-            profilePublicKey: user.profilePublicKey,
-            profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
-            encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
-            profileUpdatedAt: user.profileUpdatedAt.getTime(),
-        });
-    });
-
     // Update own profile
     app.post('/v1/profile/update', {
         schema: {
@@ -179,6 +142,48 @@ export async function profileRoutes(app: Fastify) {
                 profilePublicKey: user.profilePublicKey,
                 profileUpdatedAt: user.profileUpdatedAt.getTime(),
             },
+        });
+    });
+}
+
+/**
+ * Public profile routes (no authentication)
+ */
+export async function publicProfileRoutes(app: Fastify) {
+    // Get another user's profile by profile public key
+    app.get('/v1/profile/:profilePublicKey', {
+        schema: {
+            params: z.object({
+                profilePublicKey: z.string(),
+            }),
+        },
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
+    }, async (request, reply) => {
+        const { profilePublicKey } = request.params;
+
+        const user = await db.user.findUnique({
+            where: { profilePublicKey },
+            select: {
+                id: true,
+                profilePublicKey: true,
+                profileKeySignature: true,
+                encryptedProfile: true,
+                profileUpdatedAt: true,
+            },
+        });
+
+        if (!user) {
+            return reply.status(404).send({ error: 'User not found' });
+        }
+
+        return reply.send({
+            id: user.id,
+            profilePublicKey: user.profilePublicKey,
+            profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
+            encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
+            profileUpdatedAt: user.profileUpdatedAt.getTime(),
         });
     });
 }
