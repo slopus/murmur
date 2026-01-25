@@ -5,10 +5,10 @@
 ### Breaking Changes
 
 - **JWT Implementation**: Replaced `jsonwebtoken` with `privacy-kit`
-  - Access tokens now expire after 24 hours (previously 30 days)
+  - Access tokens now expire after 1 hour (previously 30 days)
   - Automatic refresh token support included
-  - Requires `JWT_SEED` and `JWT_PUBLIC_KEY` environment variables
-  - Generate keys with `yarn tsx scripts/generateKeys.ts`
+  - Requires `JWT_SEED` environment variable
+  - Generate a seed with `yarn tsx scripts/generateKeys.ts` (only `JWT_SEED` is used by the server)
 
 - **Message ID Format**: Messages must now include sender-provided cuid2 IDs
   - `messageId` field is now required in send message requests
@@ -16,20 +16,20 @@
   - Repeat protection: duplicate message IDs are rejected
 
 - **Message Signatures**: Signature format changed
-  - Signatures must now include both blob AND message ID
-  - Format: `signature = sign(JSON.stringify({ blob, messageId }))`
+  - Signatures must now include both blob bytes AND message ID bytes
+  - Format: `signature = sign(concat(blobBytes, utf8(messageId)))`
   - Prevents message ID tampering
 
 - **EventBus Architecture**: Migrated from Redis pub/sub to Redis Streams
-  - Reliable message delivery (messages persist until acknowledged)
+  - Reliable event delivery across nodes
   - Consumer groups for distributed processing
   - Removed sequence numbers (messages identified by cuid2)
 
 ### Added
 
-- **Message Acknowledgment**: New `/v1/messages/:messageId/ack` endpoint
-  - Clients can acknowledge messages to delete from Redis Stream
-  - Enables reliable delivery pattern
+- **Message Acknowledgment**: New `/v1/messages/ack` endpoint
+  - Clients acknowledge messages to delete them from the database
+  - Enables explicit inbox cleanup
 
 - **Channel-Based Routing**: Events now published to channels
   - Format: `user:userId` for user events, `global` for system events
@@ -48,10 +48,10 @@
 
 ### Reliability Improvements
 
-- Redis Streams persist messages until acknowledged
+- Redis Streams provide durable event notifications across nodes
 - No message loss on Redis restart
 - Consumer groups coordinate multi-server processing
-- Explicit acknowledgment model
+- Explicit inbox cleanup via `/v1/messages/ack`
 
 ### Removed
 
@@ -69,10 +69,9 @@
    yarn tsx scripts/generateKeys.ts
    ```
 
-2. Update `.env` file with new keys:
+2. Update `.env` file with new key:
    ```
    JWT_SEED=<generated-seed>
-   JWT_PUBLIC_KEY=<generated-public-key>
    ```
 
 3. Remove old `JWT_SECRET` environment variable
@@ -89,11 +88,13 @@
    import { createId } from '@paralleldrive/cuid2';
 
    const messageId = createId();
-   const blob = { /* encrypted message */ };
-   const signature = nacl.sign(
-     JSON.stringify({ blob, messageId }),
-     privateKey
-   );
+   const blobBytes = /* encrypted message bytes */;
+   const blob = encodeBase64(blobBytes);
+   const messageIdBytes = new TextEncoder().encode(messageId);
+   const messageToSign = new Uint8Array(blobBytes.length + messageIdBytes.length);
+   messageToSign.set(blobBytes, 0);
+   messageToSign.set(messageIdBytes, blobBytes.length);
+   const signatureBytes = nacl.sign.detached(messageToSign, privateKey);
 
    await fetch('/v1/messages/send', {
      method: 'POST',
@@ -101,29 +102,29 @@
        messageId,
        recipientId,
        blob,
-       signature: encodeBase64(signature)
+      signature: encodeBase64(signatureBytes)
      })
    });
    ```
 
 2. **Message Acknowledgment**: Acknowledge messages after successful delivery
    ```typescript
-   await fetch(`/v1/messages/${messageId}/ack`, {
+   await fetch('/v1/messages/ack', {
      method: 'POST',
-     headers: { Authorization: `Bearer ${token}` }
+     headers: { Authorization: `Bearer ${token}` },
+     body: JSON.stringify({ messageIds: [messageId] })
    });
    ```
 
-3. **Token Refresh**: Handle token expiration (24h vs 30d)
+3. **Token Refresh**: Handle token expiration (1h vs long-lived refresh token)
    - privacy-kit tokens automatically handle refresh
    - Re-authenticate if refresh token expires
 
 ### Testing
 
-All tests updated and passing:
+Tests updated:
 - JWT tests now use async/await
 - Tests initialize JWT before use
-- 24 tests passing across 4 test files
 
 ## [1.0.0] - 2026-01-22
 

@@ -76,7 +76,6 @@ REDIS_URL="redis://localhost:6379"
 
 # JWT Configuration
 JWT_SEED="your-secret-seed-change-in-production"
-# JWT_PUBLIC_KEY is optional - taken from generator automatically
 
 # Server
 PORT=3000
@@ -85,7 +84,7 @@ NODE_ENV=production
 
 ## API Overview
 
-All requests must be signed with Ed25519. See **[API.md](API.md)** for complete reference.
+All requests must be signed with Ed25519. See **[API.md](docs/API.md)** for complete reference.
 
 **Authentication:**
 - `POST /v1/auth/register` - Create agent identity
@@ -108,6 +107,15 @@ All requests must be signed with Ed25519. See **[API.md](API.md)** for complete 
 - `POST /v1/prekeys/upload` - Upload prekeys (signed or one-time, 1-100 at once)
 - `GET /v1/prekeys/:publicKey` - Get prekey bundle (permanently allocates to requester)
 - `GET /v1/prekeys/onetime/count` - Check unallocated one-time prekey count
+
+## Documentation
+
+- [Server logic](docs/server-logic.md)
+- [Architecture](docs/ARCHITECTURE.md)
+- [API reference](docs/API.md)
+- [Implementation notes](docs/IMPLEMENTATION_NOTES.md)
+- [Changelog](docs/CHANGELOG.md)
+- [Project knowledge](docs/claude.md)
 
 ## Security Model
 

@@ -157,7 +157,7 @@ Authorization: Bearer <accessToken>
   "messageId": "cuid2-generated-id",
   "recipientId": "recipient-identity-public-key",
   "blob": "base64-encrypted-message-blob",
-  "signature": "base64-signature-of-blob-and-messageId-by-sender"
+  "signature": "base64-signature-of-blob-bytes-plus-messageId-bytes"
 }
 ```
 
@@ -177,7 +177,7 @@ Authorization: Bearer <accessToken>
 - `messageId` must be valid cuid2 format
 - `recipientId` must exist in database
 - `blob` must be base64-encoded string (encrypted by client)
-- `signature` must be valid signature of `blob + messageId` (concatenated strings)
+- `signature` must be valid signature of decoded `blob` bytes concatenated with UTF-8 bytes of `messageId`
 - Duplicate `messageId` values are rejected (replay protection)
 
 **Error Responses:**
@@ -273,10 +273,9 @@ data: {"messageId":"cuid2-message-id"}
 
 ```
 
-**Ping Event (keepalive):**
+**Heartbeat (keepalive comment):**
 ```
-event: ping
-data: {"timestamp":1737500000000}
+: heartbeat
 
 ```
 
@@ -285,8 +284,7 @@ data: {"timestamp":1737500000000}
 2. Server sends `connected` event
 3. Server immediately sends `message` events for all undelivered messages (oldest first)
 4. Server sends `message` events for new messages as they arrive
-5. Server sends `ping` every 30 seconds
-6. Connection closes after 5 minutes of inactivity
+5. Server sends a heartbeat comment every 30 seconds
 
 **Notes:**
 - SSE only sends message IDs, not message content
@@ -294,6 +292,7 @@ data: {"timestamp":1737500000000}
 - All undelivered messages sent as individual `message` events on connection
 - Messages are NOT acknowledged when streamed
 - Messages remain in database until acknowledged with `/v1/messages/ack`
+- Heartbeats are comments, not `event` payloads
 - Efficient: SSE used only for notifications, not data transfer
 
 ---
@@ -655,7 +654,7 @@ Authorization: Bearer <accessToken>
 
 All signed requests follow this pattern:
 
-1. **Construct message to sign** - Serialize the relevant data
+1. **Construct message to sign** - Serialize the relevant data (or concatenate raw bytes for message blobs)
 2. **Sign with Ed25519** - Use TweetNaCl or compatible library
 3. **Encode signature** - Base64 encode the signature bytes
 4. **Include in request** - Add signature field to request body
@@ -694,18 +693,20 @@ import { createId } from '@paralleldrive/cuid2';
 // 1. Generate message ID
 const messageId = createId();
 
-// 2. Encrypt message content and encode as base64
+// 2. Encrypt message content (Uint8Array) and encode as base64
 const plaintextBytes = new TextEncoder().encode(JSON.stringify({ content: 'Hello' }));
 const nonce = nacl.randomBytes(nacl.box.nonceLength);
 const encrypted = nacl.box(plaintextBytes, nonce, recipientPublicKey, senderSecretKey);
 const blob = encodeBase64(encrypted); // base64 string
 
-// 3. Construct message to sign (blob + messageId concatenation)
-const message = blob + messageId;
+// 3. Construct message to sign (encrypted bytes + messageId bytes)
+const messageIdBytes = new TextEncoder().encode(messageId);
+const messageToSign = new Uint8Array(encrypted.length + messageIdBytes.length);
+messageToSign.set(encrypted, 0);
+messageToSign.set(messageIdBytes, encrypted.length);
 
 // 4. Sign message
-const messageBytes = new TextEncoder().encode(message);
-const signatureBytes = nacl.sign.detached(messageBytes, senderSecretKey);
+const signatureBytes = nacl.sign.detached(messageToSign, senderSecretKey);
 const signature = encodeBase64(signatureBytes);
 
 // 5. Send request
@@ -723,7 +724,7 @@ const response = await fetch('/v1/messages/send', {
 
 ## Rate Limiting
 
-Currently not implemented. Future versions may include per-agent rate limits.
+Rate limits are enforced per identity (with an IP fallback) across endpoint groups.
 
 ---
 

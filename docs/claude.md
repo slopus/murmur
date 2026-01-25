@@ -166,15 +166,9 @@ private async readLoop(signal: AbortSignal): Promise<void> {
 
 **NaCl Ed25519 Signatures**:
 
-All operations verified cryptographically using TweetNaCl:
-
-```typescript
-// Signature verification pattern
-const message = JSON.stringify(data);
-if (!verifySignature(message, signature, publicKey)) {
-    throw new Error('Invalid signature');
-}
-```
+All operations are verified using Ed25519 signatures (via `@noble/curves`).
+Most requests sign `JSON.stringify(payload)`, while message sends sign raw blob bytes
+concatenated with UTF-8 bytes of `messageId`.
 
 **Message Integrity**:
 - Message signatures include BOTH blob and messageId
@@ -197,8 +191,8 @@ if (!verifySignature(message, signature, publicKey)) {
 ### 8. Testing Philosophy
 
 **Comprehensive Unit Tests**:
-- 49 tests across 5 test suites
-- All new features must have tests
+- Tests cover crypto, JWT, timing, and sync helpers
+- All new features should include tests
 - Focus on edge cases and error scenarios
 
 **Test Organization**:
@@ -367,7 +361,7 @@ await redis.xack('messages', group, messageIds);
 - `id`: Identity public key (primary key)
 - `profilePublicKey`: Profile encryption key
 - `profileKeySignature`: Signature of profile key by identity
-- `encryptedProfile`: JSON blob
+- `encryptedProfile`: Encrypted profile bytes (base64 in API)
 - `profileUpdatedAt`: Last profile update
 - `createdAt`: Account creation
 
@@ -375,7 +369,7 @@ await redis.xack('messages', group, messageIds);
 - `id`: cuid2 message ID (primary key)
 - `senderId`: Sender's identity public key
 - `recipientId`: Recipient's identity public key
-- `blob`: JSON encrypted message
+- `blob`: Encrypted message bytes (base64 in API)
 - `signature`: Message signature
 - `createdAt`: Message creation
 - `expiresAt`: Expiration date (createdAt + 30 days)
@@ -396,7 +390,7 @@ await redis.xack('messages', group, messageIds);
 ### Multi-Node Deployment
 - Each node runs independent EventBus consumer
 - Consumer groups ensure messages processed only once across all nodes
-- Redis Streams provides exactly-once delivery semantics
+- Redis Streams provide at-least-once delivery semantics with consumer group acknowledgments
 - Nodes can be added/removed without coordination
 
 ### Database
@@ -418,9 +412,7 @@ await redis.xack('messages', group, messageIds);
 
 Potential areas for improvement:
 
-1. **Message Pagination**: Cursor-based pagination for large inboxes
-2. **Read Receipts**: Track message read status
-3. **Message Encryption**: End-to-end encryption helpers
-4. **Rate Limiting**: Per-user rate limits on message sending
-5. **Metrics**: Prometheus metrics export
-6. **Health Checks**: /health endpoint for load balancers
+1. **Read Receipts**: Track message read status
+2. **Message Encryption**: End-to-end encryption helpers
+3. **Group Messaging**: Multi-recipient message support
+4. **WebSocket Support**: Optional alternative to SSE

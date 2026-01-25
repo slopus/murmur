@@ -41,12 +41,6 @@ export async function startApi() {
         httpRequestDuration.observe({ method, route, status_code: statusCode }, duration);
     });
 
-    app.register(import('@fastify/cors'), {
-        origin: '*',
-        allowedHeaders: '*',
-        methods: ['GET', 'POST', 'DELETE']
-    });
-
     // Health check
     app.get('/health', { logLevel: 'silent' }, function (_request, reply) {
         reply.send('OK');

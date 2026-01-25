@@ -2,7 +2,7 @@
 
 ## Overview
 
-Murmur is a secure message relay server using NaCl (TweetNaCl) public key cryptography for authentication and message signing. It acts as a message broker, forwarding signed encrypted blobs between users without ever decrypting them.
+Murmur is a secure message relay server using Ed25519 public key cryptography for authentication and message signing. It acts as a message broker, forwarding signed encrypted blobs between users without ever decrypting them.
 
 ## Key Concepts
 
@@ -12,7 +12,7 @@ Murmur is a secure message relay server using NaCl (TweetNaCl) public key crypto
 - No passwords or traditional accounts
 - Authentication uses cryptographic signatures
 - JWT tokens are issued after signature verification using privacy-kit
-- Tokens include both access tokens (24h expiration) and refresh tokens
+- Tokens include both access tokens (1h expiration) and refresh tokens
 - Automatic token refresh without re-authentication
 
 ### Signed Blobs
@@ -47,7 +47,7 @@ The EventBus provides reliable event distribution using Redis Streams:
 **Architecture:**
 - Redis Streams for reliable message delivery (not pub/sub)
 - Consumer groups for distributed message processing
-- Messages persist until explicitly acknowledged
+- Stream entries are acknowledged by consumers after dispatch
 - Channel-based routing for future sharding capabilities
 
 **Message Identification:**
@@ -57,10 +57,10 @@ The EventBus provides reliable event distribution using Redis Streams:
 - Format validation ensures only valid cuid2 IDs accepted
 
 **Reliable Delivery:**
-- Messages remain in stream until acknowledged
+- Stream entries are acknowledged after dispatch by consumers
 - Consumer groups track which messages each server has seen
 - Multiple servers can process messages concurrently
-- Messages can be acknowledged and deleted by clients
+- Inbox messages are deleted via `/v1/messages/ack` (database)
 
 **Channel-Based Routing:**
 - Events published to channels (e.g., "user:userId", "global")
@@ -113,8 +113,8 @@ Background job that:
 id: string (Ed25519 public key, base64)
 createdAt: DateTime
 profilePublicKey: string (NaCl public key for profile)
-profileKeySignature: JSON (signature of profilePublicKey by id)
-encryptedProfile: JSON (encrypted profile data)
+profileKeySignature: Bytes (signature of profilePublicKey by id)
+encryptedProfile: Bytes (encrypted profile data)
 profileUpdatedAt: DateTime
 ```
 
@@ -126,8 +126,8 @@ expiresAt: DateTime (createdAt + 30 days)
 deliveredAt: DateTime | null
 senderId: string (User.id)
 recipientId: string (User.id)
-blob: JSON (encrypted message)
-signature: string (NaCl signature of blob + messageId)
+blob: Bytes (encrypted message)
+signature: Bytes (NaCl signature of blob bytes + messageId bytes)
 ```
 
 ## Security Considerations
@@ -189,22 +189,21 @@ Multiple server instances can run simultaneously:
 ### Database
 
 PostgreSQL chosen for:
-- ACID guarantees for sequence numbers
-- Atomic `UPDATE...RETURNING` for checkpoints
+- ACID guarantees for message and profile writes
 - Efficient indexing for message queries
-- JSON support for flexible blob storage
+- Reliable retention for encrypted blobs
 
 ### Redis
 
 Used for:
 - Redis Streams for reliable event distribution
-- Consumer groups for message processing
-- Message persistence until acknowledged
+- Consumer groups for event processing
+- Cross-node notification delivery
 
 Configured with:
 - AOF persistence (append-only file)
 - Ensures messages survive restarts
-- Messages persist until explicitly deleted
+- Stream entries persist until explicitly deleted
 
 ## Deployment
 
@@ -226,19 +225,15 @@ Required:
 - `DATABASE_URL`: PostgreSQL connection
 - `REDIS_URL`: Redis connection
 - `JWT_SEED`: Seed for privacy-kit JWT token generation
-- `JWT_PUBLIC_KEY`: Public key for JWT verification
 - `PORT`: HTTP port (default 3000)
 
-Generate JWT keys with: `yarn tsx scripts/generateKeys.ts`
+Generate a JWT seed with: `yarn tsx scripts/generateKeys.ts` (only `JWT_SEED` is used by the server)
 
 ## Future Enhancements
 
 Potential improvements:
-1. Rate limiting per user
-2. Message size limits
-3. WebSocket support alongside SSE
-4. Message read receipts
-5. Multi-recipient messages (groups)
-6. Message forwarding/routing
-7. Metrics and monitoring
-8. Admin API for user management
+1. WebSocket support alongside SSE
+2. Message read receipts
+3. Multi-recipient messages (groups)
+4. Message forwarding/routing
+5. Admin API for user management

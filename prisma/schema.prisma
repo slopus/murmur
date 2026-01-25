@@ -21,7 +21,7 @@ model User {
     updatedAt         DateTime @updatedAt
 
     // Current profile encryption key (signed by identity key)
-    profilePublicKey  String // Separate NaCl public key for profile encryption
+    profilePublicKey  String @unique // Separate NaCl public key for profile encryption
     profileKeySignature Bytes // Binary signature of profilePublicKey by identity key
     encryptedProfile  Bytes // Binary encrypted profile blob
     profileUpdatedAt  DateTime @default(now())

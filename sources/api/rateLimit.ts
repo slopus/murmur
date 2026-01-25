@@ -2,6 +2,14 @@ import rateLimit from '@fastify/rate-limit';
 import type { FastifyInstance } from 'fastify';
 import { rateLimitHitsTotal } from '@/metrics/prometheus';
 
+function getAuthenticatedRateLimitKey(req: any): string {
+    return req.userId || req.user?.id || req.ip;
+}
+
+function getAuthRateLimitKey(req: any): string {
+    return req.body?.identityPublicKey || req.body?.refreshToken || req.ip;
+}
+
 /**
  * Rate limiting configuration for Murmur Server
  *
@@ -32,6 +40,7 @@ export const rateLimitConfigs = {
     auth: {
         max: 10, // 10 requests
         timeWindow: '1 minute',
+        keyGenerator: getAuthRateLimitKey,
         errorResponseBuilder: () => ({
             error: 'Too many authentication attempts. Please try again later.',
             retryAfter: 60,
@@ -42,10 +51,7 @@ export const rateLimitConfigs = {
     messageSend: {
         max: 100, // 100 messages
         timeWindow: '1 hour',
-        keyGenerator: (req: any) => {
-            // Rate limit per user
-            return req.user?.id || req.ip;
-        },
+        keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
             error: 'Message sending rate limit exceeded. Max 100 messages per hour.',
             retryAfter: 3600,
@@ -56,9 +62,7 @@ export const rateLimitConfigs = {
     messageFetch: {
         max: 1000, // 1000 requests
         timeWindow: '1 hour',
-        keyGenerator: (req: any) => {
-            return req.user?.id || req.ip;
-        },
+        keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
             error: 'Message fetching rate limit exceeded. Max 1000 requests per hour.',
             retryAfter: 3600,
@@ -69,9 +73,7 @@ export const rateLimitConfigs = {
     preKey: {
         max: 50, // 50 requests
         timeWindow: '1 hour',
-        keyGenerator: (req: any) => {
-            return req.user?.id || req.ip;
-        },
+        keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
             error: 'PreKey operation rate limit exceeded. Max 50 requests per hour.',
             retryAfter: 3600,
@@ -82,9 +84,7 @@ export const rateLimitConfigs = {
     profile: {
         max: 200, // 200 requests
         timeWindow: '1 hour',
-        keyGenerator: (req: any) => {
-            return req.user?.id || req.ip;
-        },
+        keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
             error: 'Profile operation rate limit exceeded. Max 200 requests per hour.',
             retryAfter: 3600,

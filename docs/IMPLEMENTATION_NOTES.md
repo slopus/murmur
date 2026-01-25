@@ -19,7 +19,6 @@ murmur-server/
 │   │   └── startApi.ts        # API initialization
 │   ├── eventbus/              # Redis-based event distribution
 │   │   ├── eventBus.ts        # Main EventBus class
-│   │   ├── sequenceCounter.ts # Atomic sequence numbers
 │   │   ├── types.ts           # Event type definitions
 │   │   └── index.ts           # Exports
 │   ├── utils/                 # Utilities
@@ -37,13 +36,19 @@ murmur-server/
 │   └── types.ts               # Type definitions
 ├── prisma/
 │   └── schema.prisma          # Database schema
+├── docs/
+│   ├── API.md                 # API reference
+│   ├── ARCHITECTURE.md        # Technical architecture
+│   ├── CHANGELOG.md           # Release notes
+│   ├── claude.md              # Project knowledge
+│   ├── IMPLEMENTATION_NOTES.md # Build details
+│   └── server-logic.md        # Request/flow overview
 ├── package.json               # Dependencies
 ├── tsconfig.json              # TypeScript config
 ├── vitest.config.ts           # Test config
 ├── Dockerfile                 # Docker build
 ├── docker-compose.yml         # Multi-service deployment
-├── README.md                  # User documentation
-└── ARCHITECTURE.md            # Technical architecture
+└── README.md                  # User documentation
 
 37 files created, 4375+ lines of code
 ```
@@ -55,7 +60,7 @@ murmur-server/
 - Registration with signature verification
 - Login with signature verification
 - JWT tokens issued after authentication using privacy-kit
-- Access tokens with 24h expiration + automatic refresh tokens
+- Access tokens with 1h expiration + automatic refresh tokens
 - All requests verify signatures
 
 ### 2. Profile System ✅
@@ -74,7 +79,7 @@ murmur-server/
 - Auto-delete after 30 days
 - Mark as delivered on first read
 - Delete messages manually
-- Acknowledge messages to remove from Redis Stream
+- Acknowledge messages to delete from the database
 - Signature verification on send
 
 ### 4. Real-time Updates ✅
@@ -87,10 +92,10 @@ murmur-server/
 ### 5. EventBus with Redis Streams ✅
 - Redis Streams for reliable event distribution
 - Consumer groups for distributed processing
-- Messages persist until acknowledged
+- Stream entries are acknowledged by consumers after dispatch
 - Channel-based routing (e.g., "user:userId")
 - No sequence numbers - messages identified by cuid2 IDs
-- Acknowledgment endpoint to delete messages from stream
+- Acknowledgment endpoint deletes messages from the database
 - Supports future sharding via channel routing
 
 ### 6. Multi-Node Support ✅
@@ -105,7 +110,6 @@ murmur-server/
 - Unit tests for JWT utilities
 - Unit tests for InvalidateSync
 - Unit tests for trimIndent
-- All tests passing (24/24)
 
 ### 8. Docker Deployment ✅
 - Multi-stage Dockerfile
@@ -124,8 +128,8 @@ murmur-server/
 - **Prisma**: Type-safe ORM
 - **PostgreSQL**: Relational database
 - **Redis**: Redis Streams for reliable messaging
-- **TweetNaCl**: Ed25519 signatures
-- **privacy-kit**: JWT with refresh tokens (24h access token expiration)
+- **@noble/curves**: Ed25519 signatures
+- **privacy-kit**: JWT with refresh tokens (1h access token expiration)
 - **cuid2**: Distributed unique ID generation
 - **Zod**: Schema validation
 - **Vitest**: Testing framework
@@ -135,10 +139,10 @@ murmur-server/
 ## What Makes This Implementation Robust
 
 ### 1. Reliable Message Delivery
-- Redis Streams provide persistent message storage
-- Messages remain until explicitly acknowledged
+- Message data is stored in PostgreSQL with 30-day retention
+- Redis Streams provide durable event notifications across nodes
+- Stream entries are acknowledged by consumers after dispatch
 - Consumer groups coordinate multiple servers
-- No message loss on Redis restart
 
 ### 2. Distributed Message IDs
 - cuid2 provides collision-resistant IDs
@@ -156,7 +160,7 @@ Every critical operation verifies signatures:
 
 ### 4. JWT with Refresh Tokens
 - privacy-kit provides secure token management
-- 24h access token expiration
+- 1h access token expiration
 - Automatic refresh token handling
 - No need for re-authentication during refresh
 
@@ -186,11 +190,11 @@ All components shut down cleanly:
 - [x] Graceful shutdown
 - [x] Redis persistence (AOF)
 - [x] Multi-node support
+- [x] Rate limiting
+- [x] Message size limits
+- [x] Metrics/monitoring (Prometheus)
 
 ### 🔄 Consider Adding
-- [ ] Rate limiting
-- [ ] Message size limits
-- [ ] Metrics/monitoring (Prometheus)
 - [ ] Health check improvements
 - [ ] Admin API
 - [ ] Read receipts
@@ -221,7 +225,7 @@ curl -X POST http://localhost:3000/v1/auth/register \
     "identityPublicKey": "...",
     "profilePublicKey": "...",
     "profileKeySignature": "...",
-    "encryptedProfile": {},
+    "encryptedProfile": "base64-encrypted-profile-blob",
     "timestamp": 1234567890,
     "signature": "..."
   }'
