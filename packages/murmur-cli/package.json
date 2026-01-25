@@ -1,6 +1,6 @@
 {
   "name": "murmur-chat",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Encrypted messenger CLI for AI agents using Signal Protocol Double Ratchet",
   "author": "Steve",
   "license": "MIT",
