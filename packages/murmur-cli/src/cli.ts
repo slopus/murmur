@@ -358,7 +358,7 @@ function printUsage(): void {
         '  murmur add-contact <id>',
         '  murmur profile <profile-secret>',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
-        '  murmur sync [--with <id>] [--realtime] [--timeout <ms>]',
+        '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
         '  murmur messages --with <id> [--limit <n>]',
         '  murmur ack <messageId...>',
         '  murmur attachment --message <id> --name <file> --out <path>'
@@ -400,6 +400,21 @@ function formatSenderId(contact: Contact | undefined, fallbackIdentityKey: strin
         return formatProfileSecretKey(contact.profileSecretKey)
     }
     return `Unknown (${formatIdentityKey(fallbackIdentityKey)})`
+}
+
+function isAuthErrorMessage(message: string | undefined): boolean {
+    if (!message) {
+        return false
+    }
+    const normalized = message.toLowerCase()
+    return normalized.includes('not authenticated') || normalized.includes('token')
+}
+
+function formatWebhookSenderId(contact: Contact | undefined, fallbackIdentityKey: string): string {
+    if (contact?.profileSecretKey) {
+        return formatProfileSecretKey(contact.profileSecretKey)
+    }
+    return formatIdentityKey(fallbackIdentityKey)
 }
 
 function printMessageBlock(message: StoredMessage, senderId: string, senderName: string): void {
@@ -459,6 +474,101 @@ function printUnreadMessages(
     }
 
     return printed
+}
+
+type WebhookContext = {
+    event: string
+    messageId: string
+    senderId: string
+    senderIdentityKey: string
+    senderName: string
+    receivedAt: number
+    hasAttachments: boolean
+}
+
+function resolveWebhookTemplate(value: unknown, context: WebhookContext): unknown {
+    if (typeof value === 'string') {
+        const exactMatch = value.match(/^{{\s*([a-zA-Z0-9_]+)\s*}}$/)
+        if (exactMatch) {
+            const key = exactMatch[1] as keyof WebhookContext
+            return context[key] ?? value
+        }
+        return value.replace(/{{\s*([a-zA-Z0-9_]+)\s*}}/g, (_match, key) => {
+            const typedKey = key as keyof WebhookContext
+            const replacement = context[typedKey]
+            return replacement === undefined ? '' : String(replacement)
+        })
+    }
+    if (Array.isArray(value)) {
+        return value.map(item => resolveWebhookTemplate(item, context))
+    }
+    if (value && typeof value === 'object') {
+        const result: Record<string, unknown> = {}
+        for (const [entryKey, entryValue] of Object.entries(value)) {
+            result[entryKey] = resolveWebhookTemplate(entryValue, context)
+        }
+        return result
+    }
+    return value
+}
+
+async function postWebhook(url: string, payload: unknown): Promise<void> {
+    const response = await fetch(url, {
+        method: 'POST',
+        headers: {
+            'Content-Type': 'application/json'
+        },
+        body: JSON.stringify(payload)
+    })
+
+    if (!response.ok) {
+        const errorText = await response.text().catch(() => '')
+        throw new Error(errorText || `HTTP ${response.status}`)
+    }
+}
+
+async function emitWebhook(
+    webhookUrl: string | undefined,
+    webhookTemplate: unknown,
+    engine: MurmurEngine,
+    messages: StoredMessage[],
+    filterContact: Contact | undefined
+): Promise<void> {
+    if (!webhookUrl || messages.length === 0) {
+        return
+    }
+
+    const contacts = new Map(
+        engine.getContacts().map(contact => [contact.identityKey, contact])
+    )
+
+    for (const message of messages) {
+        if (message.isOutgoing) {
+            continue
+        }
+        if (filterContact && message.conversationId !== filterContact.identityKey) {
+            continue
+        }
+
+        const contact = contacts.get(message.conversationId)
+        const context: WebhookContext = {
+            event: 'message',
+            messageId: message.id,
+            senderId: formatWebhookSenderId(contact, message.conversationId),
+            senderIdentityKey: message.conversationId,
+            senderName: formatName(contact?.firstName, contact?.lastName, 'Unknown'),
+            receivedAt: message.createdAt,
+            hasAttachments: Boolean(message.attachments && message.attachments.length > 0)
+        }
+        const payload = resolveWebhookTemplate(webhookTemplate, context)
+
+        try {
+            await postWebhook(webhookUrl, payload)
+        } catch (error) {
+            const messageText = error instanceof Error ? error.message : String(error)
+            console.error(`Webhook failed for ${message.id}: ${messageText}`)
+        }
+    }
 }
 
 async function waitWithAbort(delayMs: number, signal: AbortSignal): Promise<void> {
@@ -594,8 +704,34 @@ async function run(): Promise<void> {
             }
             case 'sync': {
                 await requireInitialized(getEngine())
+                const webhookUrl = readStringOption(parsed.options, 'webhook')
+                const webhookBodyRaw = readStringOption(parsed.options, 'webhook-body')
+                if (!webhookUrl && webhookBodyRaw) {
+                    throw new Error('Missing --webhook URL')
+                }
+                if (webhookUrl) {
+                    try {
+                        new URL(webhookUrl)
+                    } catch {
+                        throw new Error('Invalid --webhook URL')
+                    }
+                    if (!webhookBodyRaw) {
+                        throw new Error('Missing --webhook-body JSON')
+                    }
+                }
+                let webhookTemplate: unknown = null
+                if (webhookBodyRaw) {
+                    try {
+                        webhookTemplate = JSON.parse(webhookBodyRaw)
+                    } catch {
+                        throw new Error('Invalid JSON for --webhook-body')
+                    }
+                }
                 const syncResult = await getEngine().sync()
                 if (!syncResult.success && syncResult.error) {
+                    if (isAuthErrorMessage(syncResult.error)) {
+                        throw new Error(`Sync unavailable: ${syncResult.error}`)
+                    }
                     console.error(`Sync unavailable: ${syncResult.error}`)
                 }
 
@@ -606,6 +742,7 @@ async function run(): Promise<void> {
                 }
 
                 const printedIds = new Set<string>()
+                await emitWebhook(webhookUrl, webhookTemplate, getEngine(), syncResult.newMessages, filterContact)
                 printUnreadMessages(getEngine(), filterContact, printedIds, true)
 
                 const realtime = readBooleanOption(parsed.options, 'realtime')
@@ -640,8 +777,12 @@ async function run(): Promise<void> {
                             pendingSync = false
                             const result = await getEngine().sync()
                             if (!result.success && result.error) {
+                                if (isAuthErrorMessage(result.error)) {
+                                    throw new Error(`Sync unavailable: ${result.error}`)
+                                }
                                 console.error(`Sync unavailable: ${result.error}`)
                             }
+                            await emitWebhook(webhookUrl, webhookTemplate, getEngine(), result.newMessages, filterContact)
                             printUnreadMessages(getEngine(), filterContact, printedIds, false)
                         } while (pendingSync)
                     } finally {
@@ -687,6 +828,10 @@ async function run(): Promise<void> {
                                 break
                             }
                             const message = error instanceof Error ? error.message : String(error)
+                            if (isAuthErrorMessage(message)) {
+                                console.error(`Realtime sync stopped: ${message}`)
+                                break
+                            }
                             console.error(`Realtime sync disconnected: ${message}`)
                         }
 

@@ -34,6 +34,13 @@ murmur send --to <their-id> --message "See attached." --attach ./report.pdf
 murmur sync  # Fetch replies
 ```
 
+### Webhook notifications
+
+```bash
+murmur sync --webhook https://example.com/hook/agent/XYZ \
+  --webhook-body '{"event":"{{event}}","messageId":"{{messageId}}","senderId":"{{senderId}}","senderName":"{{senderName}}","receivedAt":{{receivedAt}},"hasAttachments":{{hasAttachments}}}'
+```
+
 ### Save an attachment
 
 ```bash

@@ -804,19 +804,20 @@ export class MurmurEngine {
     /**
      * Sync messages from the server.
      */
-    async sync(): Promise<{ success: boolean; error?: string }> {
+    async sync(): Promise<{ success: boolean; error?: string; newMessages: StoredMessage[] }> {
         if (!this.agent || !this.account) {
-            return { success: false, error: 'Not initialized' }
+            return { success: false, error: 'Not initialized', newMessages: [] }
         }
         if (!this.api.getTokens()) {
             const reason = this.authError ? `Not authenticated: ${this.authError}` : 'Not authenticated'
-            return { success: false, error: reason }
+            return { success: false, error: reason, newMessages: [] }
         }
 
         try {
             let cursor: string | undefined
             let hasMore = true
             const processedIds: string[] = []
+            const newMessages: StoredMessage[] = []
 
             while (hasMore) {
                 const result = await this.api.getInbox(50, cursor)
@@ -829,6 +830,7 @@ export class MurmurEngine {
                     const stored = await this.processIncomingServerMessage(msg)
                     if (stored) {
                         processedIds.push(msg.id)
+                        newMessages.push(stored)
                     }
                 }
 
@@ -841,11 +843,11 @@ export class MurmurEngine {
             }
 
             this.emit({ type: 'sync_complete' })
-            return { success: true }
+            return { success: true, newMessages }
         } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             this.emit({ type: 'error', error: `Sync failed: ${message}` })
-            return { success: false, error: message }
+            return { success: false, error: message, newMessages: [] }
         }
     }
 

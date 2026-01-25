@@ -45,6 +45,12 @@ murmur/
 - **Comprehensive JSDoc**: Document all public functions
 - **Co-located tests**: `*.test.ts` next to implementation
 
+## Workflow
+
+- Run tests and typechecks before finishing work.
+- Always commit and push changes when done.
+- Use Angular-style commit messages (e.g., `feat(cli): add webhook sync`).
+
 ## Key Conventions
 
 1. **All cryptographic keys are Uint8Array** - never strings internally
