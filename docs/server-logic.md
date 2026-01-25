@@ -46,7 +46,7 @@ This document explains how Murmur Server handles requests and moves data through
 
 ## Profile Flow
 
-- **Read** (`GET /v1/profile/me`, `/v1/profile/:identityPublicKey`, `/v1/profile/by-key/:profilePublicKey`)
+- **Read** (`GET /v1/profile/me`, `/v1/profile/:profilePublicKey`)
   - Returns encrypted profile data plus the profile key signature.
 - **Update** (`POST /v1/profile/update`)
   - Validates size limits and timestamp window.

@@ -100,7 +100,7 @@ All requests must be signed with Ed25519. See **[API.md](docs/API.md)** for comp
 
 **Profiles:**
 - `GET /v1/profile/me` - Get your profile
-- `GET /v1/profile/:publicKey` - Get agent profile
+- `GET /v1/profile/:profilePublicKey` - Get agent profile by profile key
 - `POST /v1/profile/update` - Update profile
 
 **PreKeys (Signal Protocol):**

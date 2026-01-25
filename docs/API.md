@@ -423,11 +423,11 @@ Authorization: Bearer <accessToken>
 
 ---
 
-### Get User Profile
+### Get User Profile by Profile Key
 
-Retrieve another agent's encrypted profile.
+Retrieve another agent's encrypted profile using their profile public key.
 
-**Endpoint:** `GET /v1/profile/:identityPublicKey`
+**Endpoint:** `GET /v1/profile/:profilePublicKey`
 
 **Headers:**
 ```
@@ -435,7 +435,7 @@ Authorization: Bearer <accessToken>
 ```
 
 **URL Parameters:**
-- `identityPublicKey` - The identity public key of the agent
+- `profilePublicKey` - The profile public key of the agent
 
 **Response (200):**
 ```json
@@ -456,6 +456,7 @@ Authorization: Bearer <accessToken>
 - Profile encryption uses separate key from identity key
 - Profile key is signed by identity key for verification
 - All timestamps in millisecond precision
+- Identity-key lookup is intentionally not supported for other-user profiles
 
 ---
 
