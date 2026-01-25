@@ -364,7 +364,7 @@ export async function messageRoutes(app: Fastify) {
 
         // Send all undelivered messages as message events
         for (const message of undeliveredMessages) {
-            connection.send('message', {
+            connection.send('message:new', {
                 messageId: message.id,
             });
         }

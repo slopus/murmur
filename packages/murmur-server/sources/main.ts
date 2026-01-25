@@ -27,16 +27,11 @@ export async function main() {
     });
 
     events.onMessageEvent((envelope) => {
-        if (envelope.event.type !== 'message:new') {
-            return;
-        }
         if (!envelope.channel.startsWith('user:')) {
             return;
         }
         const userId = envelope.channel.slice('user:'.length);
-        sseManager.sendToUser(userId, 'message', {
-            messageId: envelope.event.messageId,
-        });
+        sseManager.sendToUser(userId, envelope.event.type, envelope.event);
     });
 
     log('Starting cleanup worker...');
