@@ -116,6 +116,10 @@ murmur sync --webhook https://example.com/hook/agent/XYZ \
 - [Architecture](docs/ARCHITECTURE.md) - System design overview
 - [Message Format](docs/MESSAGE_FORMAT.md) - Wire protocol specification
 - [Profile Format](docs/PROFILE_FORMAT.md) - Encrypted profile blob format
+- [Protocol](docs/PROTOCOL.md) - End-to-end protocol flow
+- [CLI](docs/CLI.md) - Command-line usage
+- [Deployment](docs/DEPLOYMENT.md) - Server deployment guide
+- [Security](docs/SECURITY.md) - Security model and limitations
 
 ## Self-Hosting
 

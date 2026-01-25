@@ -12,7 +12,7 @@ Murmur is a secure message relay server using Ed25519 public key cryptography fo
 - No passwords or traditional accounts
 - Authentication uses cryptographic signatures
 - JWT tokens are issued after signature verification using privacy-kit
-- Tokens include both access tokens (1h expiration) and refresh tokens
+- Tokens include access tokens (configurable TTL, default 24h) and refresh tokens
 - Automatic token refresh without re-authentication
 
 ### Signed Blobs
@@ -42,12 +42,12 @@ This separation allows profile key rotation without changing identity.
 
 ### 1. EventBus (Redis Streams)
 
-The EventBus provides reliable event distribution using Redis Streams:
+The EventBus provides broadcast event distribution using Redis Streams:
 
 **Architecture:**
-- Redis Streams for reliable message delivery (not pub/sub)
-- Consumer groups for distributed message processing
-- Stream entries are acknowledged by consumers after dispatch
+- Redis Streams for durable event delivery (not pub/sub)
+- Broadcast reads: each node reads the stream independently
+- No consumer groups or acknowledgments required
 - Channel-based routing for future sharding capabilities
 
 **Message Identification:**
@@ -56,10 +56,9 @@ The EventBus provides reliable event distribution using Redis Streams:
 - Repeat protection via unique message IDs
 - Format validation ensures only valid cuid2 IDs accepted
 
-**Reliable Delivery:**
-- Stream entries are acknowledged after dispatch by consumers
-- Consumer groups track which messages each server has seen
-- Multiple servers can process messages concurrently
+**Delivery Model:**
+- Each node receives all events and filters by channel
+- Messages are stored in PostgreSQL; events are realtime hints
 - Inbox messages are deleted via `/v1/messages/ack` (database)
 
 **Channel-Based Routing:**
@@ -182,7 +181,7 @@ Server only:
 ### Horizontal Scaling
 
 Multiple server instances can run simultaneously:
-- EventBus coordinates via Redis Streams consumer groups
+- EventBus coordinates via Redis Streams broadcast reads
 - Each instance has own DB connection pool
 - SSE connections distributed across instances
 - Message IDs remain unique via cuid2 distributed generation
@@ -198,14 +197,13 @@ PostgreSQL chosen for:
 ### Redis
 
 Used for:
-- Redis Streams for reliable event distribution
-- Consumer groups for event processing
-- Cross-node notification delivery
+-- Redis Streams for event distribution
+-- Cross-node realtime notification delivery
 
 Configured with:
 - AOF persistence (append-only file)
 - Ensures messages survive restarts
-- Stream entries persist until explicitly deleted
+- Stream entries are trimmed by `EVENT_STREAM_MAXLEN`
 
 ## Deployment
 
@@ -228,6 +226,11 @@ Required:
 - `REDIS_URL`: Redis connection
 - `JWT_SEED`: Seed for privacy-kit JWT token generation
 - `PORT`: HTTP port (default 3000)
+Optional:
+- `ACCESS_TOKEN_TTL_MS`: Access token TTL in milliseconds
+- `EVENT_STREAM_MAXLEN`: Redis stream trim length
+- `METRICS_PORT`: Metrics server port
+- `LOG_LEVEL`: Logging level
 
 Generate a JWT seed with: `yarn tsx scripts/generateKeys.ts` (only `JWT_SEED` is used by the server)
 

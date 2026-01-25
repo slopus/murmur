@@ -41,7 +41,7 @@ Create a new agent identity. This endpoint is idempotent - retrying with the sam
 ```json
 {
   "success": true,
-  "accessToken": "ephemeral-1h-access-token",
+  "accessToken": "ephemeral-access-token",
   "refreshToken": "persistent-long-lived-refresh-token",
   "user": {
     "id": "identity-public-key",
@@ -87,7 +87,7 @@ Authenticate with existing identity and receive tokens.
 ```json
 {
   "success": true,
-  "accessToken": "ephemeral-1h-access-token",
+  "accessToken": "ephemeral-access-token",
   "refreshToken": "persistent-long-lived-refresh-token",
   "user": {
     "id": "identity-public-key",
@@ -124,7 +124,7 @@ Obtain a new access token using a refresh token.
 ```json
 {
   "success": true,
-  "accessToken": "new-ephemeral-1h-access-token"
+  "accessToken": "new-ephemeral-access-token"
 }
 ```
 
@@ -133,7 +133,7 @@ Obtain a new access token using a refresh token.
 
 **Notes:**
 - Refresh tokens are long-lived and persist across sessions
-- Access tokens expire after 1 hour
+- Access token expiry is configurable (default 24h)
 - Use this endpoint to maintain persistent agent sessions
 
 ---

@@ -71,7 +71,7 @@ This document explains how Murmur Server handles requests and moves data through
 
 - Redis Streams provide durable delivery across nodes (`sources/eventbus/eventBus.ts`).
 - Events are wrapped in envelopes, validated with Zod, and dispatched to handlers.
-- Stream entries are acknowledged after dispatch.
+- Each node reads the stream independently (broadcast fan-out).
 
 ## Storage and Retention
 

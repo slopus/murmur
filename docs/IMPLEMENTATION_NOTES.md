@@ -60,7 +60,7 @@ murmur-server/
 - Registration with signature verification
 - Login with signature verification
 - JWT tokens issued after authentication using privacy-kit
-- Access tokens with 1h expiration + automatic refresh tokens
+- Access tokens with configurable TTL (default 24h) + automatic refresh tokens
 - All requests verify signatures
 
 ### 2. Profile System ✅
@@ -90,9 +90,9 @@ murmur-server/
 - Events pushed on new messages
 
 ### 5. EventBus with Redis Streams ✅
-- Redis Streams for reliable event distribution
-- Consumer groups for distributed processing
-- Stream entries are acknowledged by consumers after dispatch
+- Redis Streams for durable event distribution
+- Broadcast reads: each node independently reads the stream
+- No consumer groups or acknowledgments required
 - Channel-based routing (e.g., "user:userId")
 - No sequence numbers - messages identified by cuid2 IDs
 - Acknowledgment endpoint deletes messages from the database
@@ -100,7 +100,7 @@ murmur-server/
 
 ### 6. Multi-Node Support ✅
 - Multiple server instances can run
-- EventBus coordinates via Redis Streams consumer groups
+- EventBus coordinates via Redis Streams broadcast reads
 - Message IDs remain unique via cuid2
 - SSE connections distributed
 - Channel routing enables future sharding
@@ -129,7 +129,7 @@ murmur-server/
 - **PostgreSQL**: Relational database
 - **Redis**: Redis Streams for reliable messaging
 - **@noble/curves**: Ed25519 signatures
-- **privacy-kit**: JWT with refresh tokens (1h access token expiration)
+- **privacy-kit**: JWT with refresh tokens (configurable access token TTL)
 - **cuid2**: Distributed unique ID generation
 - **Zod**: Schema validation
 - **Vitest**: Testing framework
@@ -141,8 +141,7 @@ murmur-server/
 ### 1. Reliable Message Delivery
 - Message data is stored in PostgreSQL with 30-day retention
 - Redis Streams provide durable event notifications across nodes
-- Stream entries are acknowledged by consumers after dispatch
-- Consumer groups coordinate multiple servers
+- Each node reads the stream independently (fan-out)
 
 ### 2. Distributed Message IDs
 - cuid2 provides collision-resistant IDs
@@ -160,7 +159,7 @@ Every critical operation verifies signatures:
 
 ### 4. JWT with Refresh Tokens
 - privacy-kit provides secure token management
-- 1h access token expiration
+- Configurable access token expiration (default 24h)
 - Automatic refresh token handling
 - No need for re-authentication during refresh
 

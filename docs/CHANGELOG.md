@@ -5,7 +5,7 @@
 ### Breaking Changes
 
 - **JWT Implementation**: Replaced `jsonwebtoken` with `privacy-kit`
-  - Access tokens now expire after 1 hour (previously 30 days)
+  - Access tokens now use a configurable TTL (default 24h)
   - Automatic refresh token support included
   - Requires `JWT_SEED` environment variable
   - Generate a seed with `yarn tsx scripts/generateKeys.ts` (only `JWT_SEED` is used by the server)
@@ -116,7 +116,7 @@
    });
    ```
 
-3. **Token Refresh**: Handle token expiration (1h vs long-lived refresh token)
+3. **Token Refresh**: Handle access token expiration with refresh tokens
    - privacy-kit tokens automatically handle refresh
    - Re-authenticate if refresh token expires
 
