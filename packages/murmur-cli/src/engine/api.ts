@@ -147,7 +147,8 @@ export class MurmurApi {
         path: string,
         body?: unknown,
         requireAuth: boolean = true,
-        timeoutMs: number = 30000
+        timeoutMs: number = 30000,
+        allowRetry: boolean = true
     ): Promise<T> {
         const headers: Record<string, string> = {
             'Content-Type': 'application/json'
@@ -170,6 +171,15 @@ export class MurmurApi {
                 body: body ? JSON.stringify(body) : undefined,
                 signal: controller.signal
             })
+
+            if (response.status === 401 && requireAuth && allowRetry && this.refreshToken) {
+                try {
+                    await this.refresh()
+                } catch {
+                    // Fall through to normal error handling.
+                }
+                return this.request(method, path, body, requireAuth, timeoutMs, false)
+            }
 
             if (!response.ok) {
                 const errorData = await response.json().catch(() => ({ error: 'Unknown error' })) as { error?: string }
@@ -197,78 +207,89 @@ export class MurmurApi {
         if (!this.accessToken) {
             throw new Error('Not authenticated')
         }
+        let refreshed = false
 
-        const response = await fetch(`${this.baseUrl}/v1/messages/stream`, {
-            method: 'GET',
-            headers: {
-                'Accept': 'text/event-stream',
-                'Authorization': `Bearer ${this.accessToken}`
-            },
-            signal: options?.signal
-        })
+        while (true) {
+            const response = await fetch(`${this.baseUrl}/v1/messages/stream`, {
+                method: 'GET',
+                headers: {
+                    'Accept': 'text/event-stream',
+                    'Authorization': `Bearer ${this.accessToken}`
+                },
+                signal: options?.signal
+            })
 
-        if (!response.ok) {
-            const errorText = await response.text().catch(() => '')
-            throw new Error(errorText || `HTTP ${response.status}`)
-        }
+            if (response.status === 401 && this.refreshToken && !refreshed) {
+                await this.refresh()
+                refreshed = true
+                continue
+            }
 
-        if (!response.body) {
-            throw new Error('SSE response missing body')
-        }
+            if (!response.ok) {
+                const errorText = await response.text().catch(() => '')
+                throw new Error(errorText || `HTTP ${response.status}`)
+            }
 
-        const reader = response.body.getReader()
-        const decoder = new TextDecoder()
-        let buffer = ''
-        let eventName = 'message'
-        let dataLines: string[] = []
+            if (!response.body) {
+                throw new Error('SSE response missing body')
+            }
 
-        const dispatchEvent = async (): Promise<void> => {
-            if (dataLines.length === 0) {
+            const reader = response.body.getReader()
+            const decoder = new TextDecoder()
+            let buffer = ''
+            let eventName = 'message'
+            let dataLines: string[] = []
+
+            const dispatchEvent = async (): Promise<void> => {
+                if (dataLines.length === 0) {
+                    eventName = 'message'
+                    return
+                }
+                const dataText = dataLines.join('\n')
+                let data: unknown = dataText
+                try {
+                    data = JSON.parse(dataText)
+                } catch {
+                    // Leave as raw string.
+                }
+                await onEvent({ event: eventName, data })
                 eventName = 'message'
-                return
+                dataLines = []
             }
-            const dataText = dataLines.join('\n')
-            let data: unknown = dataText
+
             try {
-                data = JSON.parse(dataText)
-            } catch {
-                // Leave as raw string.
-            }
-            await onEvent({ event: eventName, data })
-            eventName = 'message'
-            dataLines = []
-        }
-
-        try {
-            while (true) {
-                const { value, done } = await reader.read()
-                if (done) {
-                    break
-                }
-                buffer += decoder.decode(value, { stream: true })
-
-                let newlineIndex = buffer.indexOf('\n')
-                while (newlineIndex >= 0) {
-                    let line = buffer.slice(0, newlineIndex)
-                    if (line.endsWith('\r')) {
-                        line = line.slice(0, -1)
+                while (true) {
+                    const { value, done } = await reader.read()
+                    if (done) {
+                        break
                     }
-                    buffer = buffer.slice(newlineIndex + 1)
+                    buffer += decoder.decode(value, { stream: true })
 
-                    if (line === '') {
-                        await dispatchEvent()
-                    } else if (line.startsWith('event:')) {
-                        eventName = line.slice(6).trim() || 'message'
-                    } else if (line.startsWith('data:')) {
-                        dataLines.push(line.slice(5).trimStart())
+                    let newlineIndex = buffer.indexOf('\n')
+                    while (newlineIndex >= 0) {
+                        let line = buffer.slice(0, newlineIndex)
+                        if (line.endsWith('\r')) {
+                            line = line.slice(0, -1)
+                        }
+                        buffer = buffer.slice(newlineIndex + 1)
+
+                        if (line === '') {
+                            await dispatchEvent()
+                        } else if (line.startsWith('event:')) {
+                            eventName = line.slice(6).trim() || 'message'
+                        } else if (line.startsWith('data:')) {
+                            dataLines.push(line.slice(5).trimStart())
+                        }
+
+                        newlineIndex = buffer.indexOf('\n')
                     }
-
-                    newlineIndex = buffer.indexOf('\n')
                 }
+                await dispatchEvent()
+            } finally {
+                reader.releaseLock()
             }
-            await dispatchEvent()
-        } finally {
-            reader.releaseLock()
+
+            return
         }
     }
 
@@ -366,7 +387,7 @@ export class MurmurApi {
             accessToken: string
         }>('POST', '/v1/auth/refresh', {
             refreshToken: this.refreshToken
-        }, false)
+        }, false, 30000, false)
 
         this.accessToken = response.accessToken
         return response.accessToken
