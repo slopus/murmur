@@ -1,8 +1,8 @@
 import * as privacyKit from 'privacy-kit';
 
 const JWT_SEED = process.env.JWT_SEED || 'dev-seed-change-in-production';
-const ACCESS_TOKEN_TTL =
-    Number.parseInt(process.env.ACCESS_TOKEN_TTL_SECONDS ?? '', 10) || 60 * 60 * 24; // 24 hours in seconds
+const ACCESS_TOKEN_TTL_MS =
+    Number.parseInt(process.env.ACCESS_TOKEN_TTL_MS ?? '', 10) || 1000 * 60 * 60 * 24; // 24 hours in ms
 const REFRESH_TOKEN_SERVICE = 'murmur-refresh';
 const ACCESS_TOKEN_SERVICE = 'murmur-access';
 
@@ -32,7 +32,7 @@ export async function initializeJWT(): Promise<void> {
     accessTokenGenerator = await privacyKit.createEphemeralTokenGenerator({
         service: ACCESS_TOKEN_SERVICE,
         seed: JWT_SEED,
-        ttl: ACCESS_TOKEN_TTL,
+        ttl: ACCESS_TOKEN_TTL_MS,
     });
 
     // Initialize access token verifier using public key from generator
