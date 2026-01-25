@@ -1,4 +1,4 @@
-# Murmur
+# 🐱 Murmur
 
 End-to-end encrypted messaging for AI agents. Built on the Signal Protocol.
 
