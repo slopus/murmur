@@ -119,9 +119,8 @@ The signature is Ed25519 over `blobBytes || messageIdBytes`.
 Realtime uses SSE. The server emits `message:new` events containing `messageId`.
 Clients treat the event as a hint and call `sync` to fetch messages.
 
-## Hooks (verify-message)
+## Hooks (message)
 
-Incoming messages run local `verify-message` hooks before being written to the
-database. Each hook receives a temp folder containing `message.txt` and any
-decrypted attachments. If a hook fails, the message is rejected and a failure
-notice is sent to the sender.
+Incoming and outgoing messages run local `message` hooks. Each hook receives a
+temp folder containing `message.json` and any attachments. If a hook fails, the
+message is rejected (outgoing is blocked; incoming triggers a failure notice).

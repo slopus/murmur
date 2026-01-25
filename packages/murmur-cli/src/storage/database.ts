@@ -154,6 +154,12 @@ export class MurmurDatabase {
                     CREATE INDEX IF NOT EXISTS idx_hooks_type
                     ON hooks(type);
                 `
+            },
+            {
+                id: '202602150002_message_hooks',
+                up: `
+                    UPDATE hooks SET type = 'message' WHERE type = 'verify-message';
+                `
             }
         ]
 

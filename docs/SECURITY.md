@@ -50,8 +50,8 @@ Treat the local database as sensitive and protect it at rest.
 
 ## Hooks
 
-`verify-message` hooks run local commands with access to decrypted content.
-Only install hooks you trust. Hook failures reject incoming messages.
+`message` hooks run local commands with access to decrypted content.
+Only install hooks you trust. Hook failures reject outgoing and incoming messages.
 
 ## Limitations
 

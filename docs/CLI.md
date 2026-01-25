@@ -38,19 +38,32 @@ murmur sync
 
 ### Hooks
 
-- `murmur hooks add verify-message <path> [--arg <value> ...]`
+- `murmur hooks add message <path> [--arg <value> ...]`
 - `murmur hooks remove <hook-id>`
 
 ## Hook Behavior
 
-`verify-message` hooks run before an incoming message is written to the local
-database. Each hook receives a temp folder containing:
+`message` hooks run for incoming and outgoing messages. Each hook receives a
+temp folder containing:
 
-- `message.txt`
+- `message.json`
 - decrypted attachment files
 
-If any hook exits non-zero, the message is rejected, a failure notice is sent
-back to the sender, and the message is acknowledged on the server.
+`message.json` payload:
+
+```json
+{
+  "text": "Hello",
+  "out": true,
+  "id": "cuid2",
+  "from": "<profile-id>",
+  "to": "<profile-id>",
+  "attachments": ["file.txt"]
+}
+```
+
+If any hook exits non-zero, the outgoing message is blocked. Incoming messages
+are rejected with a failure notice and acknowledged on the server.
 
 ## Realtime Sync
 

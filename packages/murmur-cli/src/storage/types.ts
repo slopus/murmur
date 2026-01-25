@@ -118,7 +118,7 @@ export interface AppState {
 /**
  * Supported hook types.
  */
-export type HookType = 'verify-message'
+export type HookType = 'message'
 
 /**
  * Hook definition stored locally.

@@ -9,7 +9,7 @@
  * Provides a high-level API for the UI to use.
  */
 
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -35,6 +35,7 @@ import type { PreKeyBundle } from '../encryption/x3dh/types.js'
 import {
     encodeBase64,
     decodeBase64,
+    encodeBase58,
     stringToBytes,
     bytesToString,
     getRandomBytes,
@@ -53,8 +54,8 @@ import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
 const MAX_MESSAGE_LENGTH = 20000
 const ATTACHMENT_KEY_LENGTH = 32
 const ATTACHMENT_IV_LENGTH = 12
-const VERIFY_HOOK_TYPE: HookType = 'verify-message'
-const VERIFY_REPLY_MESSAGE = 'Message rejected by verify-message hook.'
+const MESSAGE_HOOK_TYPE: HookType = 'message'
+const MESSAGE_HOOK_REPLY = 'Message rejected by message hook.'
 
 type AttachmentPayloadEntry = {
     hash: string
@@ -64,6 +65,19 @@ type AttachmentPayloadEntry = {
 
 type AttachmentPayload = Record<string, AttachmentPayloadEntry>
 type AttachmentMap = Record<string, string>
+type AttachmentSource = {
+    path: string
+    fileName: string
+}
+
+type HookMessagePayload = {
+    id: string
+    out: boolean
+    from: string
+    to: string
+    text: string
+    attachments: string[]
+}
 
 function truncateMessageText(text: string): string {
     if (text.length <= MAX_MESSAGE_LENGTH) {
@@ -76,6 +90,11 @@ function bytesToHex(bytes: Uint8Array): string {
     return Buffer.from(bytes).toString('hex')
 }
 
+function formatProfileSecretKeyForHook(profileSecretKey: string): string {
+    const bytes = decodeBase64(profileSecretKey, 'base64url')
+    return encodeBase58(bytes)
+}
+
 function normalizeAttachmentName(path: string): string {
     const fileName = basename(path)
     if (!fileName || fileName === '.' || fileName === '..') {
@@ -84,14 +103,8 @@ function normalizeAttachmentName(path: string): string {
     return fileName
 }
 
-function createOutgoingAttachments(paths: string[]): {
-    attachmentMap: AttachmentMap
-    payload: AttachmentPayload
-    stored: StoredAttachment[]
-} {
-    const attachmentMap: AttachmentMap = {}
-    const payload: AttachmentPayload = {}
-    const stored: StoredAttachment[] = []
+function collectAttachmentSources(paths: string[]): AttachmentSource[] {
+    const sources: AttachmentSource[] = []
     const seenNames = new Set<string>()
 
     for (const path of paths) {
@@ -100,15 +113,30 @@ function createOutgoingAttachments(paths: string[]): {
             throw new Error(`Attachment filenames must be unique: ${fileName}`)
         }
         seenNames.add(fileName)
+        sources.push({ path, fileName })
+    }
 
-        const fileBytes = readFileSync(path)
+    return sources
+}
+
+function createOutgoingAttachments(sources: AttachmentSource[]): {
+    attachmentMap: AttachmentMap
+    payload: AttachmentPayload
+    stored: StoredAttachment[]
+} {
+    const attachmentMap: AttachmentMap = {}
+    const payload: AttachmentPayload = {}
+    const stored: StoredAttachment[] = []
+
+    for (const source of sources) {
+        const fileBytes = readFileSync(source.path)
         const key = getRandomBytes(ATTACHMENT_KEY_LENGTH)
         const iv = getRandomBytes(ATTACHMENT_IV_LENGTH)
         const cipher = gcm(key, iv)
         const ciphertextBytes = cipher.encrypt(fileBytes)
         const hash = bytesToHex(sha256(ciphertextBytes))
         if (attachmentMap[hash]) {
-            throw new Error(`Duplicate attachment hash detected for ${fileName}`)
+            throw new Error(`Duplicate attachment hash detected for ${source.fileName}`)
         }
 
         const ciphertext = encodeBase64(ciphertextBytes)
@@ -116,9 +144,9 @@ function createOutgoingAttachments(paths: string[]): {
         const keyBase64 = encodeBase64(key)
 
         attachmentMap[hash] = ciphertext
-        payload[fileName] = { hash, iv: ivBase64, key: keyBase64 }
+        payload[source.fileName] = { hash, iv: ivBase64, key: keyBase64 }
         stored.push({
-            fileName,
+            fileName: source.fileName,
             hash,
             iv: ivBase64,
             key: keyBase64,
@@ -390,6 +418,7 @@ export class MurmurEngine {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
+        const account = this.account
 
         await this.api.deleteAccount()
         this.stopSync()
@@ -402,7 +431,7 @@ export class MurmurEngine {
      * Upload prekeys to server.
      */
     private async uploadPreKeys(): Promise<void> {
-        if (!this.agent) {
+        if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
 
@@ -616,21 +645,22 @@ export class MurmurEngine {
     }
 
     /**
-     * Run verify-message hooks for an incoming message.
+     * Run message hooks for an incoming or outgoing message.
      */
-    private async runVerifyHooks(
-        text: string,
-        attachments: StoredAttachment[]
+    private async runMessageHooks(
+        payload: HookMessagePayload,
+        writeAttachments: (workspace: string) => void
     ): Promise<{ success: boolean; error?: string }> {
-        const hooks = this.db.getHooks(VERIFY_HOOK_TYPE)
+        const hooks = this.db.getHooks(MESSAGE_HOOK_TYPE)
         if (hooks.length === 0) {
             return { success: true }
         }
 
-        const workspace = mkdtempSync(join(tmpdir(), 'murmur-verify-'))
+        const workspace = mkdtempSync(join(tmpdir(), 'murmur-message-hook-'))
         try {
-            writeFileSync(join(workspace, 'message.txt'), text)
-            this.writeVerifyAttachments(workspace, attachments)
+            const messagePath = join(workspace, 'message.json')
+            writeFileSync(messagePath, JSON.stringify(payload, null, 2))
+            writeAttachments(workspace)
 
             for (const hook of hooks) {
                 await this.executeHook(hook, workspace)
@@ -648,7 +678,7 @@ export class MurmurEngine {
     /**
      * Write decrypted attachments into a workspace folder.
      */
-    private writeVerifyAttachments(workspace: string, attachments: StoredAttachment[]): void {
+    private writeIncomingAttachments(workspace: string, attachments: StoredAttachment[]): void {
         if (attachments.length === 0) {
             return
         }
@@ -675,6 +705,15 @@ export class MurmurEngine {
                 zeroBytes(keyBytes)
                 zeroBytes(ivBytes)
             }
+        }
+    }
+
+    /**
+     * Copy outgoing attachments into the workspace folder.
+     */
+    private copyOutgoingAttachments(workspace: string, attachments: AttachmentSource[]): void {
+        for (const attachment of attachments) {
+            copyFileSync(attachment.path, join(workspace, attachment.fileName))
         }
     }
 
@@ -717,21 +756,21 @@ export class MurmurEngine {
     /**
      * Send a verification failure notice and acknowledge the message.
      */
-    private async handleVerifyFailure(inboxMessage: InboxMessage, reason?: string): Promise<void> {
+    private async handleMessageHookFailure(inboxMessage: InboxMessage, reason?: string): Promise<void> {
         if (!this.agent || !this.account) {
             return
         }
 
         if (reason) {
-            logger.warn(`verify-message hook rejected ${inboxMessage.id}: ${reason}`)
+            logger.warn(`message hook rejected ${inboxMessage.id}: ${reason}`)
         } else {
-            logger.warn(`verify-message hook rejected ${inboxMessage.id}`)
+            logger.warn(`message hook rejected ${inboxMessage.id}`)
         }
 
         try {
-            await this.sendVerificationFailureNotice(inboxMessage.senderId)
+            await this.sendMessageHookFailureNotice(inboxMessage.senderId)
         } catch (error) {
-            logger.warn(`Failed to send verification failure notice: ${error instanceof Error ? error.message : String(error)}`)
+            logger.warn(`Failed to send message hook failure notice: ${error instanceof Error ? error.message : String(error)}`)
         }
 
         try {
@@ -746,7 +785,7 @@ export class MurmurEngine {
     /**
      * Send a verification failure notice without persisting a message.
      */
-    private async sendVerificationFailureNotice(recipientIdentityKey: string): Promise<void> {
+    private async sendMessageHookFailureNotice(recipientIdentityKey: string): Promise<void> {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
@@ -757,7 +796,7 @@ export class MurmurEngine {
         }
 
         const payload = {
-            text: VERIFY_REPLY_MESSAGE,
+            text: MESSAGE_HOOK_REPLY,
             profileSecretKey: this.account.profileSecretKey
         }
         const plaintext = stringToBytes(JSON.stringify(payload))
@@ -834,7 +873,26 @@ export class MurmurEngine {
             throw new Error('Contact not found. Add contact with a profile secret key first.')
         }
 
-        const attachmentData = attachments.length > 0 ? createOutgoingAttachments(attachments) : undefined
+        const messageId = createId()
+        const attachmentSources = attachments.length > 0 ? collectAttachmentSources(attachments) : []
+
+        const hookPayload: HookMessagePayload = {
+            id: messageId,
+            out: true,
+            from: formatProfileSecretKeyForHook(this.account.profileSecretKey),
+            to: formatProfileSecretKeyForHook(storedContact.profileSecretKey),
+            text: finalText,
+            attachments: attachmentSources.map(entry => entry.fileName)
+        }
+        const hookResult = await this.runMessageHooks(hookPayload, workspace => {
+            this.copyOutgoingAttachments(workspace, attachmentSources)
+        })
+        if (!hookResult.success) {
+            const reason = hookResult.error ? `: ${hookResult.error}` : ''
+            throw new Error(`Message hook rejected outgoing message${reason}`)
+        }
+
+        const attachmentData = attachmentSources.length > 0 ? createOutgoingAttachments(attachmentSources) : undefined
 
         let preKeyBundle: PreKeyBundle | undefined
         if (!hasSession(this.agent, recipientIdentityKey)) {
@@ -842,7 +900,6 @@ export class MurmurEngine {
         }
 
         // Encrypt the message
-        const messageId = createId()
         const payload: { text: string; profileSecretKey: string; attachments?: AttachmentPayload } = {
             text: finalText,
             profileSecretKey: this.account.profileSecretKey
@@ -891,9 +948,10 @@ export class MurmurEngine {
      * Process an incoming message from the server.
      */
     private async processIncomingServerMessage(inboxMessage: InboxMessage): Promise<StoredMessage | null> {
-        if (!this.agent) {
+        if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
+        const account = this.account
 
         try {
             // Decrypt the message
@@ -904,6 +962,9 @@ export class MurmurEngine {
                 inboxMessage.id,
                 inboxMessage.signature
             )
+
+            // Save agent state after decryption (ratchet may have advanced)
+            this.db.saveAgentState(serializeAgent(this.agent))
 
             const rawPayload = bytesToString(decrypted.plaintext).trim()
             let text = rawPayload
@@ -928,27 +989,33 @@ export class MurmurEngine {
             } catch {
                 // Treat as legacy plaintext.
             }
-            const verifyText = text
-            const storedText = truncateMessageText(verifyText)
+            const hookText = text
+            const storedText = truncateMessageText(hookText)
+
+            if (!profileSecretKey) {
+                this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
+                return null
+            }
 
             const attachmentResult = buildStoredAttachments(payloadAttachments, decrypted.attachments)
             if (attachmentResult.invalid) {
                 this.emit({ type: 'error', error: 'Incoming attachments failed validation or decryption' })
-                this.db.saveAgentState(serializeAgent(this.agent))
                 return null
             }
 
-            const verifyResult = await this.runVerifyHooks(verifyText, attachmentResult.stored)
-            if (!verifyResult.success) {
-                await this.handleVerifyFailure(inboxMessage, verifyResult.error)
-                return null
+            const hookPayload: HookMessagePayload = {
+                id: inboxMessage.id,
+                out: false,
+                from: formatProfileSecretKeyForHook(profileSecretKey),
+                to: formatProfileSecretKeyForHook(account.profileSecretKey),
+                text: hookText,
+                attachments: attachmentResult.stored.map(entry => entry.fileName)
             }
-
-            // Save agent state after verification (ratchet may have advanced)
-            this.db.saveAgentState(serializeAgent(this.agent))
-
-            if (!profileSecretKey) {
-                this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
+            const hookResult = await this.runMessageHooks(hookPayload, workspace => {
+                this.writeIncomingAttachments(workspace, attachmentResult.stored)
+            })
+            if (!hookResult.success) {
+                await this.handleMessageHookFailure(inboxMessage, hookResult.error)
                 return null
             }
 

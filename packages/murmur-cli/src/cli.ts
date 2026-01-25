@@ -351,7 +351,7 @@ function formatIdentityKey(identityKey: string): string {
  * Parse a hook type.
  */
 function parseHookType(value: string): HookType {
-    if (value === 'verify-message') {
+    if (value === 'message') {
         return value
     }
     throw new Error(`Unsupported hook type: ${value}`)
@@ -373,7 +373,7 @@ function printUsage(): void {
         '  murmur messages --with <id> [--limit <n>]',
         '  murmur ack <messageId...>',
         '  murmur attachment --message <id> --name <file> --out <path>',
-        '  murmur hooks add <type> <path> [--arg <value> ...]',
+        '  murmur hooks add message <path> [--arg <value> ...]',
         '  murmur hooks remove <id>'
     ]
 
@@ -949,7 +949,7 @@ async function run(): Promise<void> {
                     const typeRaw = parsed.positionals[1]
                     const hookPath = parsed.positionals[2]
                     if (!typeRaw || !hookPath) {
-                        throw new Error('Missing hook info. Usage: murmur hooks add <type> <path> [--arg <value> ...]')
+                        throw new Error('Missing hook info. Usage: murmur hooks add message <path> [--arg <value> ...]')
                     }
                     const type = parseHookType(typeRaw)
                     const args = readStringArrayOption(parsed.options, 'arg')
