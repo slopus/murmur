@@ -17,6 +17,7 @@ import { sha256 } from '@noble/hashes/sha256'
 import { MurmurApi, type InboxMessage, type ServerProfile } from './api.js'
 import { MurmurDatabase } from '../storage/database.js'
 import type { Account, StoredAttachment, StoredContact, StoredMessage, Contact } from '../storage/types.js'
+import { logger } from '../logger.js'
 import {
     createAgent,
     getIdentityKey,
@@ -258,7 +259,7 @@ export class MurmurEngine {
             try {
                 listener(event)
             } catch (error) {
-                console.error('Event listener error:', error)
+                logger.error({ error }, 'Event listener error')
             }
         }
     }
@@ -795,8 +796,9 @@ export class MurmurEngine {
 
             return storedMessage
         } catch (error) {
-            console.error('Failed to process message:', error)
-            this.emit({ type: 'error', error: `Failed to process message: ${error}` })
+            const message = error instanceof Error ? error.message : String(error)
+            logger.error({ error }, 'Failed to process message')
+            this.emit({ type: 'error', error: `Failed to process message: ${message}` })
             return null
         }
     }

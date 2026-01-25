@@ -12,6 +12,7 @@ import type { Contact, StoredMessage } from './storage/types.js'
 import { getDbPath } from './storage/database.js'
 import { decodeBase64, encodeBase64, decodeBase58, encodeBase58 } from './encryption/crypto/utils.js'
 import { publicKeyFromPrivate } from './encryption/crypto/dh.js'
+import { logger } from './logger.js'
 
 /**
  * Parsed CLI arguments.
@@ -441,7 +442,7 @@ function printUnreadMessages(
     const unreadMessages = engine.getUnreadMessages(filterContact?.identityKey)
     if (unreadMessages.length === 0) {
         if (showEmpty) {
-            console.log('No unread messages.')
+            logger.info('No unread messages.')
         }
         return 0
     }
@@ -566,7 +567,7 @@ async function emitWebhook(
             await postWebhook(webhookUrl, payload)
         } catch (error) {
             const messageText = error instanceof Error ? error.message : String(error)
-            console.error(`Webhook failed for ${message.id}: ${messageText}`)
+            logger.error(`Webhook failed for ${message.id}: ${messageText}`)
         }
     }
 }
@@ -609,7 +610,7 @@ async function run(): Promise<void> {
         return
     }
 
-    console.log('Welcome to Murmur! End-To-End encrypted messenger for AI Agents.')
+    logger.info('Welcome to Murmur! End-To-End encrypted messenger for AI Agents.')
 
     const rootDir = readStringOption(parsed.options, 'root', 'MURMUR_ROOT')
     const apiBaseUrl =
@@ -636,7 +637,7 @@ async function run(): Promise<void> {
                     printAccountSummary('Signed in with existing account.', account)
                     const authError = getEngine().getAuthError()
                     if (authError) {
-                        console.log(`Note: server login failed (${authError}). Run \`murmur delete-account --confirm\` then \`murmur sign-in\` to re-register.`)
+                        logger.warn(`Note: server login failed (${authError}). Run \`murmur delete-account --confirm\` then \`murmur sign-in\` to re-register.`)
                     }
                     return
                 }
@@ -666,7 +667,7 @@ async function run(): Promise<void> {
                     throw new Error('Account deletion requires --confirm or MURMUR_CONFIRM_DELETE=true')
                 }
                 await getEngine().deleteAccount()
-                console.log('Account deleted.')
+                logger.info('Account deleted.')
                 return
             }
             case 'send': {
@@ -676,7 +677,7 @@ async function run(): Promise<void> {
                 const attachments = readStringArrayOption(parsed.options, 'attach')
                 const contact = resolveContactByProfileSecret(getEngine(), recipientId)
                 const stored = await getEngine().sendMessage(contact.identityKey, message, attachments)
-                console.log(`Sent ${stored.id} to ${formatContact(contact)} at ${formatTimestamp(stored.createdAt)}`)
+                logger.info(`Sent ${stored.id} to ${formatContact(contact)} at ${formatTimestamp(stored.createdAt)}`)
                 return
             }
             case 'add-contact': {
@@ -688,7 +689,7 @@ async function run(): Promise<void> {
                 const profileSecretBytes = decodeProfileSecretKey(profileSecret)
                 const profileSecretBase64 = encodeBase64(profileSecretBytes, 'base64url')
                 const contact = await getEngine().addContactByProfileSecret(profileSecretBase64)
-                console.log(`Added contact: ${formatContact(contact)}`)
+                logger.info(`Added contact: ${formatContact(contact)}`)
                 return
             }
             case 'profile': {
@@ -732,7 +733,7 @@ async function run(): Promise<void> {
                     if (isAuthErrorMessage(syncResult.error)) {
                         throw new Error(`Sync unavailable: ${syncResult.error}`)
                     }
-                    console.error(`Sync unavailable: ${syncResult.error}`)
+                    logger.error(`Sync unavailable: ${syncResult.error}`)
                 }
 
                 const filterId = readStringOption(parsed.options, 'with', 'MURMUR_WITH')
@@ -755,7 +756,7 @@ async function run(): Promise<void> {
                     throw new Error('Timeout must be a positive number of milliseconds.')
                 }
 
-                console.log('Realtime sync enabled. Press Ctrl+C to stop.')
+                logger.info('Realtime sync enabled. Press Ctrl+C to stop.')
 
                 const controller = new AbortController()
                 let timeoutHandle: ReturnType<typeof setTimeout> | null = null
@@ -780,7 +781,7 @@ async function run(): Promise<void> {
                                 if (isAuthErrorMessage(result.error)) {
                                     throw new Error(`Sync unavailable: ${result.error}`)
                                 }
-                                console.error(`Sync unavailable: ${result.error}`)
+                                logger.error(`Sync unavailable: ${result.error}`)
                             }
                             await emitWebhook(webhookUrl, webhookTemplate, getEngine(), result.newMessages, filterContact)
                             printUnreadMessages(getEngine(), filterContact, printedIds, false)
@@ -829,10 +830,10 @@ async function run(): Promise<void> {
                             }
                             const message = error instanceof Error ? error.message : String(error)
                             if (isAuthErrorMessage(message)) {
-                                console.error(`Realtime sync stopped: ${message}`)
+                                logger.error(`Realtime sync stopped: ${message}`)
                                 break
                             }
-                            console.error(`Realtime sync disconnected: ${message}`)
+                            logger.warn(`Realtime sync disconnected: ${message}`)
                         }
 
                         if (!controller.signal.aborted) {
@@ -869,11 +870,11 @@ async function run(): Promise<void> {
                 const messages = getEngine().getMessages(contact.identityKey, limit)
 
                 if (messages.length === 0) {
-                    console.log(`No messages for ${label}.`)
+                    logger.info(`No messages for ${label}.`)
                     return
                 }
 
-                console.log(`Last ${messages.length} messages for ${label}:`)
+                logger.info(`Last ${messages.length} messages for ${label}:`)
                 const account = getEngine().getAccount()
                 if (!account) {
                     throw new Error('Account data missing.')
@@ -897,7 +898,7 @@ async function run(): Promise<void> {
                     throw new Error('Missing message IDs. Usage: murmur ack <messageId...>')
                 }
                 await getEngine().acknowledgeMessages(ids)
-                console.log(`Acknowledged ${ids.length} message${ids.length === 1 ? '' : 's'}.`)
+                logger.info(`Acknowledged ${ids.length} message${ids.length === 1 ? '' : 's'}.`)
                 return
             }
             case 'attachment': {
@@ -906,7 +907,7 @@ async function run(): Promise<void> {
                 const fileName = requireStringOption(parsed.options, 'name')
                 const outputPath = requireStringOption(parsed.options, 'out')
                 getEngine().saveAttachmentToPath(messageId, fileName, outputPath)
-                console.log(`Saved attachment to ${outputPath}`)
+                logger.info(`Saved attachment to ${outputPath}`)
                 return
             }
             default:
@@ -921,6 +922,6 @@ async function run(): Promise<void> {
 
 run().catch(error => {
     const message = error instanceof Error ? error.message : String(error)
-    console.error(message)
+    logger.error(message)
     process.exit(1)
 })
