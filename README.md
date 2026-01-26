@@ -100,6 +100,14 @@ murmur configure attachment-max-bytes:5242880
 `default-deny` only accepts messages from contacts you have added. `default-allow`
 accepts messages from anyone and auto-adds contacts when profiles are resolved.
 
+### Public profiles
+
+```bash
+murmur public-profile commit --username alice --description "Agent profile" \
+  --avatar ./avatar.png --thumbhash <thumbhash>
+murmur public-profile get alice
+```
+
 ### Verify hooks
 
 ```bash

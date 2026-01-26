@@ -5,10 +5,11 @@
  * Provides non-interactive commands for account setup and messaging.
  */
 
+import { readFileSync } from 'node:fs'
 import { createId } from '@paralleldrive/cuid2'
 import { MurmurEngine } from './engine/engine.js'
 import { startMcpServer } from './mcp/server.js'
-import { MurmurApi } from './engine/api.js'
+import { MurmurApi, type PublicProfile } from './engine/api.js'
 import { decryptProfile } from './engine/profile.js'
 import type { Contact, StoredMessage, HookType } from './storage/types.js'
 import { getDbPath } from './storage/database.js'
@@ -375,6 +376,8 @@ function printUsage(): void {
         '  murmur contacts unblock <id>',
         '  murmur configure [permissions:default-allow|permissions:default-deny|message-max-chars:<number>|attachment-max-bytes:<number>]',
         '  murmur profile <profile-secret>',
+        '  murmur public-profile get <username>',
+        '  murmur public-profile commit --username <name> --description <text> [--avatar <path> --thumbhash <hash>]',
         '  murmur mcp',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
@@ -406,6 +409,19 @@ function printAccountSummary(prefix: string, account: { profileSecretKey: string
     console.log(prefix)
     console.log(`ID: ${formatProfileSecretKey(account.profileSecretKey)}`)
     console.log(`Name: ${name}`)
+}
+
+/**
+ * Print a public profile payload.
+ */
+function printPublicProfile(profile: PublicProfile): void {
+    const output = {
+        username: profile.username,
+        identityKey: formatIdentityKey(profile.identityKey),
+        description: profile.description,
+        avatar: profile.avatar
+    }
+    console.log(JSON.stringify(output, null, 2))
 }
 
 /**
@@ -811,6 +827,47 @@ async function run(): Promise<void> {
                 const profile = decryptProfile(serverProfile.encryptedProfile, profileSecretBytes)
                 console.log(JSON.stringify(profile, null, 2))
                 return
+            }
+            case 'public-profile': {
+                const action = parsed.positionals[0]
+                if (!action) {
+                    throw new Error('Missing action. Usage: murmur public-profile get <username> | murmur public-profile commit --username <name> --description <text> [--avatar <path> --thumbhash <hash>]')
+                }
+                if (action === 'get') {
+                    const username = parsed.positionals[1]
+                    if (!username) {
+                        throw new Error('Missing username. Usage: murmur public-profile get <username>')
+                    }
+                    const api = new MurmurApi(apiBaseUrl)
+                    const publicProfile = await api.getPublicProfileByUsername(username)
+                    printPublicProfile(publicProfile)
+                    return
+                }
+                if (action === 'commit') {
+                    await requireInitialized(getEngine())
+                    const username = requireStringOption(parsed.options, 'username', 'MURMUR_PUBLIC_USERNAME')
+                    const description = requireStringOption(parsed.options, 'description', 'MURMUR_PUBLIC_DESCRIPTION')
+                    const avatarPath = readStringOption(parsed.options, 'avatar', 'MURMUR_PUBLIC_AVATAR')
+                    const thumbhash = readStringOption(parsed.options, 'thumbhash', 'MURMUR_PUBLIC_THUMBHASH')
+                    if (avatarPath && !thumbhash) {
+                        throw new Error('Missing --thumbhash for avatar')
+                    }
+                    if (thumbhash && !avatarPath) {
+                        throw new Error('Missing --avatar for thumbhash')
+                    }
+                    let avatar: { image: string; thumbhash: string } | undefined
+                    if (avatarPath) {
+                        const avatarBytes = readFileSync(avatarPath)
+                        avatar = {
+                            image: avatarBytes.toString('base64'),
+                            thumbhash: thumbhash ?? ''
+                        }
+                    }
+                    const publicProfile = await getEngine().commitPublicProfile(username, description, avatar)
+                    printPublicProfile(publicProfile)
+                    return
+                }
+                throw new Error(`Unknown public-profile action: ${action}`)
             }
             case 'mcp': {
                 await startMcpServer()

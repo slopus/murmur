@@ -6,7 +6,7 @@ import { isValidPublicKey, normalizePublicKey, publicKeyToExternal, verifySignat
 import { events } from '@/events';
 import { rateLimitConfigs } from '@/api/rateLimit';
 import { profileUpdatesTotal } from '@/metrics/prometheus';
-import { validateProfileData } from '@/api/validation';
+import { validateProfileData, validatePublicProfileData, validatePublicProfileUsername } from '@/api/validation';
 
 const UpdateProfileSchema = z.object({
     profilePublicKey: z.string(),
@@ -20,6 +20,25 @@ const DeleteAccountSchema = z.object({
     timestamp: z.number(),
     signature: z.string(),
 });
+
+const PublicProfileCommitSchema = z.object({
+    username: z.string(),
+    description: z.string(),
+    avatar: z.object({
+        image: z.string(),
+        thumbhash: z.string(),
+    }).optional(),
+    timestamp: z.number(),
+    signature: z.string(),
+});
+
+const PublicProfileParamsSchema = z.object({
+    username: z.string(),
+});
+
+function normalizeUsername(value: string): string {
+    return value.trim().toLowerCase();
+}
 
 /**
  * Profile routes (authenticated)
@@ -194,6 +213,121 @@ export async function profileRoutes(app: Fastify) {
             },
         });
     });
+
+    // Commit public profile
+    app.post('/v1/public-profile/commit', {
+        schema: {
+            body: PublicProfileCommitSchema,
+        },
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
+    }, async (request, reply) => {
+        const userId = getAuthUserId(request);
+        const {
+            username,
+            description,
+            avatar,
+            timestamp,
+            signature,
+        } = request.body;
+
+        const normalizedUsername = normalizeUsername(username);
+        const normalizedDescription = description.trim();
+
+        try {
+            validatePublicProfileData({
+                username: normalizedUsername,
+                description: normalizedDescription,
+                avatarImage: avatar?.image,
+                avatarThumbhash: avatar?.thumbhash,
+            });
+        } catch (error: any) {
+            return reply.status(400).send({ error: error.message });
+        }
+
+        // Verify timestamp is recent (within 5 minutes)
+        const now = Date.now();
+        if (Math.abs(now - timestamp) > 5 * 60 * 1000) {
+            return reply.status(400).send({ error: 'Request timestamp too old' });
+        }
+
+        // Verify signature of the entire request
+        const message = JSON.stringify({
+            username: normalizedUsername,
+            description: normalizedDescription,
+            ...(avatar ? { avatar } : {}),
+            timestamp,
+        });
+
+        if (!verifySignature(message, signature, userId)) {
+            return reply.status(400).send({ error: 'Invalid request signature' });
+        }
+
+        const existingByUsername = await db.publicProfile.findUnique({
+            where: { username: normalizedUsername },
+            select: { username: true, userId: true },
+        });
+
+        if (existingByUsername && existingByUsername.userId !== userId) {
+            return reply.status(409).send({ error: 'Username already taken' });
+        }
+
+        const existingByUser = await db.publicProfile.findUnique({
+            where: { userId },
+        });
+
+        const avatarImage = avatar ? Buffer.from(avatar.image, 'base64') : undefined;
+        const avatarThumbhash = avatar?.thumbhash;
+
+        let profile;
+        if (existingByUser && existingByUser.username !== normalizedUsername) {
+            await db.publicProfile.delete({ where: { username: existingByUser.username } });
+            profile = await db.publicProfile.create({
+                data: {
+                    username: normalizedUsername,
+                    userId,
+                    description: normalizedDescription,
+                    avatarImage,
+                    avatarThumbhash,
+                },
+            });
+        } else if (existingByUser) {
+            profile = await db.publicProfile.update({
+                where: { username: existingByUser.username },
+                data: {
+                    description: normalizedDescription,
+                    ...(avatar
+                        ? { avatarImage, avatarThumbhash }
+                        : {}),
+                },
+            });
+        } else {
+            profile = await db.publicProfile.create({
+                data: {
+                    username: normalizedUsername,
+                    userId,
+                    description: normalizedDescription,
+                    avatarImage,
+                    avatarThumbhash,
+                },
+            });
+        }
+
+        return reply.send({
+            username: profile.username,
+            identityKey: publicKeyToExternal(profile.userId),
+            description: profile.description,
+            avatar: profile.avatarImage
+                ? {
+                    image: Buffer.from(profile.avatarImage).toString('base64'),
+                    thumbhash: profile.avatarThumbhash,
+                }
+                : null,
+            createdAt: profile.createdAt.getTime(),
+            updatedAt: profile.updatedAt.getTime(),
+        });
+    });
 }
 
 /**
@@ -240,6 +374,47 @@ export async function publicProfileRoutes(app: Fastify) {
             profileKeySignature: Buffer.from(user.profileKeySignature).toString('base64'),
             encryptedProfile: Buffer.from(user.encryptedProfile).toString('base64'),
             profileUpdatedAt: user.profileUpdatedAt.getTime(),
+        });
+    });
+
+    // Get public profile by username
+    app.get('/v1/public-profile/:username', {
+        schema: {
+            params: PublicProfileParamsSchema,
+        },
+        config: {
+            rateLimit: rateLimitConfigs.profile,
+        },
+    }, async (request, reply) => {
+        const { username } = request.params;
+        const normalizedUsername = normalizeUsername(username);
+
+        try {
+            validatePublicProfileUsername(normalizedUsername);
+        } catch (error: any) {
+            return reply.status(400).send({ error: error.message });
+        }
+
+        const profile = await db.publicProfile.findUnique({
+            where: { username: normalizedUsername },
+        });
+
+        if (!profile) {
+            return reply.status(404).send({ error: 'Public profile not found' });
+        }
+
+        return reply.send({
+            username: profile.username,
+            identityKey: publicKeyToExternal(profile.userId),
+            description: profile.description,
+            avatar: profile.avatarImage
+                ? {
+                    image: Buffer.from(profile.avatarImage).toString('base64'),
+                    thumbhash: profile.avatarThumbhash,
+                }
+                : null,
+            createdAt: profile.createdAt.getTime(),
+            updatedAt: profile.updatedAt.getTime(),
         });
     });
 }

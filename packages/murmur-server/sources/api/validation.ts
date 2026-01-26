@@ -15,6 +15,10 @@ export const SIZE_LIMITS = {
     SIGNATURE: 1024, // 1KB
     MESSAGE_ID: 256, // 256 bytes (cuid2 is ~24 chars)
     PUBLIC_KEY: 1024, // 1KB
+    PUBLIC_PROFILE_USERNAME: 32, // 3-32 chars
+    PUBLIC_PROFILE_DESCRIPTION: 1000, // 1KB of text
+    PUBLIC_PROFILE_AVATAR: 1 * 1024 * 1024, // 1MB
+    PUBLIC_PROFILE_THUMBHASH: 1024, // 1KB
 } as const;
 
 /**
@@ -102,4 +106,56 @@ export function validatePreKeyData(data: {
 }): void {
     validateStringLength(data.publicKey, SIZE_LIMITS.PREKEY_PUBLIC, 'publicKey');
     validateBlobSize(data.signature, SIZE_LIMITS.SIGNATURE, 'signature');
+}
+
+const USERNAME_REGEX = /^[a-z0-9][a-z0-9_-]{2,31}$/;
+
+/**
+ * Validate public profile username.
+ */
+export function validatePublicProfileUsername(value: string): void {
+    const username = value.trim();
+    if (username.length === 0) {
+        throw new Error('username is required');
+    }
+    validateStringLength(username, SIZE_LIMITS.PUBLIC_PROFILE_USERNAME, 'username');
+    if (!USERNAME_REGEX.test(username)) {
+        throw new Error('username must be 3-32 chars (lowercase letters, numbers, _ or -)');
+    }
+}
+
+/**
+ * Validate public profile description.
+ */
+export function validatePublicProfileDescription(value: string): void {
+    const description = value.trim();
+    if (description.length === 0) {
+        throw new Error('description is required');
+    }
+    validateStringLength(description, SIZE_LIMITS.PUBLIC_PROFILE_DESCRIPTION, 'description');
+}
+
+/**
+ * Validate public profile data before processing.
+ */
+export function validatePublicProfileData(data: {
+    username: string;
+    description: string;
+    avatarImage?: string;
+    avatarThumbhash?: string;
+}): void {
+    validatePublicProfileUsername(data.username);
+    validatePublicProfileDescription(data.description);
+    if (data.avatarImage) {
+        if (data.avatarImage.trim().length === 0) {
+            throw new Error('avatar image is required');
+        }
+        validateBlobSize(data.avatarImage, SIZE_LIMITS.PUBLIC_PROFILE_AVATAR, 'avatar');
+    }
+    if (data.avatarThumbhash) {
+        if (data.avatarThumbhash.trim().length === 0) {
+            throw new Error('thumbhash is required');
+        }
+        validateStringLength(data.avatarThumbhash, SIZE_LIMITS.PUBLIC_PROFILE_THUMBHASH, 'thumbhash');
+    }
 }

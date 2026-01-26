@@ -28,6 +28,8 @@ murmur sync
 - `murmur contacts block <profile-secret>`
 - `murmur contacts unblock <profile-secret>`
 - `murmur profile <profile-secret>`
+- `murmur public-profile get <username>`
+- `murmur public-profile commit --username <name> --description <text> [--avatar <path> --thumbhash <hash>]`
 
 ### Settings
 

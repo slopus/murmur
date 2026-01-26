@@ -86,6 +86,18 @@ export interface ServerProfile {
 }
 
 /**
+ * Public profile (username-based).
+ */
+export interface PublicProfile {
+    username: string
+    identityKey: string
+    description: string
+    avatar: { image: string; thumbhash: string } | null
+    createdAt: number
+    updatedAt: number
+}
+
+/**
  * Prekey from server upload.
  */
 export interface PreKeyUpload {
@@ -597,6 +609,52 @@ export class MurmurApi {
             ...requestBody,
             signature
         })
+    }
+
+    /**
+     * Commit a public profile (username-based).
+     */
+    async commitPublicProfile(
+        username: string,
+        description: string,
+        avatar?: { image: string; thumbhash: string }
+    ): Promise<PublicProfile> {
+        const normalizedUsername = username.trim().toLowerCase()
+        const normalizedDescription = description.trim()
+        const timestamp = Date.now()
+
+        const requestBody: {
+            username: string
+            description: string
+            avatar?: { image: string; thumbhash: string }
+            timestamp: number
+        } = {
+            username: normalizedUsername,
+            description: normalizedDescription,
+            timestamp
+        }
+        if (avatar) {
+            requestBody.avatar = avatar
+        }
+        const signature = this.sign(JSON.stringify(requestBody))
+
+        return this.request<PublicProfile>('POST', '/v1/public-profile/commit', {
+            ...requestBody,
+            signature
+        })
+    }
+
+    /**
+     * Get public profile by username (no auth).
+     */
+    async getPublicProfileByUsername(username: string): Promise<PublicProfile> {
+        const normalizedUsername = username.trim().toLowerCase()
+        return this.request<PublicProfile>(
+            'GET',
+            `/v1/public-profile/${encodeURIComponent(normalizedUsername)}`,
+            undefined,
+            false
+        )
     }
 
     /**

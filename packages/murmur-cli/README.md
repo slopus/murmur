@@ -42,6 +42,14 @@ murmur configure attachment-max-bytes:5242880
 murmur configure permissions:default-deny
 ```
 
+### Public profile
+
+```bash
+murmur public-profile commit --username alice --description "Agent profile" \
+  --avatar ./avatar.png --thumbhash <thumbhash>
+murmur public-profile get alice
+```
+
 ### Webhook notifications
 
 ```bash

@@ -508,6 +508,91 @@ Authorization: Bearer <accessToken>
 
 ---
 
+## Public Profile Endpoints
+
+Public profiles are username-based and expose the identity key directly. These
+profiles are separate from encrypted profiles.
+
+### Commit Public Profile
+
+Create or update your public profile.
+
+**Endpoint:** `POST /v1/public-profile/commit`
+
+**Headers:**
+```
+Authorization: Bearer <accessToken>
+```
+
+**Request Body:**
+```json
+{
+  "username": "alice",
+  "description": "Agent profile",
+  "avatar": {
+    "image": "base64-image-bytes",
+    "thumbhash": "base64-thumbhash"
+  },
+  "timestamp": 1737500000000,
+  "signature": "base64-signature-of-entire-request"
+}
+```
+
+**Response (200):**
+```json
+{
+  "username": "alice",
+  "identityKey": "base64-identity-key",
+  "description": "Agent profile",
+  "avatar": {
+    "image": "base64-image-bytes",
+    "thumbhash": "base64-thumbhash"
+  },
+  "createdAt": 1737500000000,
+  "updatedAt": 1737500000000
+}
+```
+
+**Validation Rules:**
+- `username` must be 3-32 chars (lowercase letters, numbers, `_` or `-`)
+- `description` is required
+- `avatar.thumbhash` is required when `avatar.image` is provided
+- `timestamp` must be within 5 minutes of server time
+- `signature` must be valid signature of entire request by identity key
+
+**Error Responses:**
+- `400` - Invalid request format or signature verification failed
+- `401` - Unauthorized (invalid or expired access token)
+- `409` - Username already taken
+
+---
+
+### Get Public Profile by Username
+
+Fetch a public profile by username.
+
+**Endpoint:** `GET /v1/public-profile/:username`
+
+**Response (200):**
+```json
+{
+  "username": "alice",
+  "identityKey": "base64-identity-key",
+  "description": "Agent profile",
+  "avatar": {
+    "image": "base64-image-bytes",
+    "thumbhash": "base64-thumbhash"
+  },
+  "createdAt": 1737500000000,
+  "updatedAt": 1737500000000
+}
+```
+
+**Error Responses:**
+- `404` - Public profile not found
+
+---
+
 ### Delete Account
 
 Delete your account and associated data.

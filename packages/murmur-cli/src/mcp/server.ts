@@ -7,6 +7,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
 import { MurmurEngine } from '../engine/engine.js'
+import { MurmurApi } from '../engine/api.js'
 import { getDbPath } from '../storage/database.js'
 import type { Contact, StoredMessage } from '../storage/types.js'
 import { decodeBase58, decodeBase64, encodeBase58, encodeBase64 } from '../encryption/crypto/utils.js'
@@ -220,6 +221,33 @@ export async function startMcpServer(): Promise<void> {
                 inputSchema: { type: 'object', properties: {}, additionalProperties: false }
             },
             {
+                name: 'publicProfile.commit',
+                description: 'Commit a public profile (username-based).',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        username: { type: 'string' },
+                        description: { type: 'string' },
+                        avatarImage: { type: 'string' },
+                        avatarThumbhash: { type: 'string' }
+                    },
+                    required: ['username', 'description'],
+                    additionalProperties: false
+                }
+            },
+            {
+                name: 'publicProfile.get',
+                description: 'Fetch a public profile by username.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        username: { type: 'string' }
+                    },
+                    required: ['username'],
+                    additionalProperties: false
+                }
+            },
+            {
                 name: 'settings.configure',
                 description: 'Update settings. permissions = default-allow or default-deny.',
                 inputSchema: {
@@ -352,6 +380,41 @@ export async function startMcpServer(): Promise<void> {
                 return textResult({
                     id: profileId,
                     profile
+                })
+            }
+            case 'publicProfile.commit': {
+                const username = args.username
+                const description = args.description
+                const avatarImage = args.avatarImage
+                const avatarThumbhash = args.avatarThumbhash
+                if (typeof username !== 'string' || typeof description !== 'string') {
+                    throw new Error('Missing username/description')
+                }
+                if (typeof avatarImage === 'string' && typeof avatarThumbhash !== 'string') {
+                    throw new Error('avatarThumbhash is required when avatarImage is provided')
+                }
+                if (typeof avatarThumbhash === 'string' && typeof avatarImage !== 'string') {
+                    throw new Error('avatarImage is required when avatarThumbhash is provided')
+                }
+                const avatar = typeof avatarImage === 'string' && typeof avatarThumbhash === 'string'
+                    ? { image: avatarImage, thumbhash: avatarThumbhash }
+                    : undefined
+                const profile = await engine.commitPublicProfile(username, description, avatar)
+                return textResult({
+                    ...profile,
+                    identityKey: formatIdentityKey(profile.identityKey)
+                })
+            }
+            case 'publicProfile.get': {
+                const username = args.username
+                if (typeof username !== 'string') {
+                    throw new Error('Missing username')
+                }
+                const api = new MurmurApi(apiBaseUrl)
+                const profile = await api.getPublicProfileByUsername(username)
+                return textResult({
+                    ...profile,
+                    identityKey: formatIdentityKey(profile.identityKey)
                 })
             }
             case 'settings.configure': {

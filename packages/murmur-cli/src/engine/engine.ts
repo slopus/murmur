@@ -16,7 +16,7 @@ import { spawn } from 'node:child_process'
 import { createId } from '@paralleldrive/cuid2'
 import { gcm } from '@noble/ciphers/aes'
 import { sha256 } from '@noble/hashes/sha256'
-import { MurmurApi, type InboxMessage, type ServerProfile } from './api.js'
+import { MurmurApi, type InboxMessage, type ServerProfile, type PublicProfile } from './api.js'
 import { MurmurDatabase } from '../storage/database.js'
 import type { Account, StoredAttachment, StoredContact, StoredMessage, Contact, HookType, StoredHook } from '../storage/types.js'
 import { logger } from '../logger.js'
@@ -361,6 +361,20 @@ export class MurmurEngine {
             'message-max-chars': this.getMessageMaxChars(),
             'attachment-max-bytes': this.getAttachmentMaxBytes()
         }
+    }
+
+    /**
+     * Commit a public profile for the current account.
+     */
+    async commitPublicProfile(
+        username: string,
+        description: string,
+        avatar?: { image: string; thumbhash: string }
+    ): Promise<PublicProfile> {
+        if (!this.agent || !this.account) {
+            throw new Error('Not initialized')
+        }
+        return this.api.commitPublicProfile(username, description, avatar)
     }
 
     /**
