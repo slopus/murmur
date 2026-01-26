@@ -31,8 +31,8 @@ murmur sync
 
 ### Settings
 
-- `murmur configure default-allow`
-- `murmur configure default-deny`
+- `murmur configure permissions:default-allow`
+- `murmur configure permissions:default-deny`
 
 `default-allow` accepts messages from unknown contacts and auto-adds them when
 profiles can be resolved. `default-deny` only accepts messages from contacts

@@ -339,9 +339,9 @@ export class MurmurEngine {
     /**
      * Get current settings.
      */
-    getSettings(): Record<string, boolean> {
+    getSettings(): Record<string, string> {
         return {
-            'default-allow': this.getDefaultAllow()
+            permissions: this.getDefaultAllow() ? 'default-allow' : 'default-deny'
         }
     }
 

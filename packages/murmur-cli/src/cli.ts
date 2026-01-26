@@ -371,7 +371,7 @@ function printUsage(): void {
         '  murmur contacts remove <id>',
         '  murmur contacts block <id>',
         '  murmur contacts unblock <id>',
-        '  murmur configure [default-allow|default-deny]',
+        '  murmur configure [permissions:default-allow|permissions:default-deny]',
         '  murmur profile <profile-secret>',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
@@ -760,14 +760,23 @@ async function run(): Promise<void> {
             }
             case 'configure': {
                 await requireInitialized(getEngine())
-                const key = parsed.positionals[0]
-                if (key) {
-                    if (key === 'default-allow') {
+                const setting = parsed.positionals[0]
+                if (setting) {
+                    const [rawKey, rawValue] = setting.split(':')
+                    const key = rawKey?.trim()
+                    const value = rawValue?.trim()
+                    if (!key || !value) {
+                        throw new Error('Invalid setting. Usage: murmur configure permissions:default-allow|permissions:default-deny')
+                    }
+                    if (key !== 'permissions') {
+                        throw new Error(`Unknown setting: ${key}`)
+                    }
+                    if (value === 'default-allow') {
                         getEngine().setDefaultAllow(true)
-                    } else if (key === 'default-deny') {
+                    } else if (value === 'default-deny') {
                         getEngine().setDefaultAllow(false)
                     } else {
-                        throw new Error(`Unknown setting: ${key}`)
+                        throw new Error(`Unknown permissions value: ${value}`)
                     }
                 }
                 console.log(JSON.stringify(getEngine().getSettings(), null, 2))
