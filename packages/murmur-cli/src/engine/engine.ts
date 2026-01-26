@@ -47,6 +47,7 @@ import {
     decryptProfile,
     createProfileForRegistration,
     verifyProfileKeySignature,
+    signProfileKey,
     type Profile
 } from './profile.js'
 import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
@@ -517,6 +518,45 @@ export class MurmurEngine {
         // Save to database
         this.db.saveAccount(this.account)
         this.db.saveAgentState(serializeAgent(this.agent))
+
+        return this.account
+    }
+
+    /**
+     * Update the current account's profile (firstName, lastName).
+     */
+    async updateProfile(firstName: string, lastName?: string): Promise<Account> {
+        if (!this.agent || !this.account) {
+            throw new Error('Not initialized')
+        }
+
+        // Create new encrypted profile
+        const profile: Profile = { firstName, lastName }
+        const profileSecretKeyBytes = decodeBase64(this.account.profileSecretKey, 'base64url')
+        const profilePublicKeyBytes = decodeBase64(this.account.profilePublicKey)
+        const encryptedProfile = encryptProfile(profile, profileSecretKeyBytes)
+        const profileKeySignature = signProfileKey(
+            profilePublicKeyBytes,
+            this.agent.keyStore.identityKeyPair.privateKey
+        )
+
+        // Upload to server
+        await this.api.updateProfile(
+            this.account.profilePublicKey,
+            profileKeySignature,
+            encryptedProfile
+        )
+
+        // Update local account
+        this.account = {
+            ...this.account,
+            firstName,
+            lastName,
+            encryptedProfile
+        }
+
+        // Save to database
+        this.db.saveAccount(this.account)
 
         return this.account
     }

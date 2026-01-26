@@ -367,6 +367,7 @@ function printUsage(): void {
     const lines = [
         'Usage:',
         '  murmur sign-in [--first-name <name>] [--last-name <name>]',
+        '  murmur update-profile --first-name <name> [--last-name <name>]',
         '  murmur me',
         '  murmur delete-account --confirm',
         '  murmur contacts',
@@ -696,6 +697,14 @@ async function run(): Promise<void> {
                 const profile = decryptProfile(account.encryptedProfile, profileSecretKeyBytes)
                 console.log(`ID: ${formatProfileSecretKey(account.profileSecretKey)}`)
                 console.log(JSON.stringify(profile, null, 2))
+                return
+            }
+            case 'update-profile': {
+                await requireInitialized(getEngine())
+                const firstName = requireStringOption(parsed.options, 'first-name', 'MURMUR_FIRST_NAME')
+                const lastName = readStringOption(parsed.options, 'last-name', 'MURMUR_LAST_NAME')
+                const account = await getEngine().updateProfile(firstName, lastName)
+                printAccountSummary('Profile updated.', account)
                 return
             }
             case 'delete-account': {
