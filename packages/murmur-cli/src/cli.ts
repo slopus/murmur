@@ -6,6 +6,7 @@
  */
 
 import { MurmurEngine } from './engine/engine.js'
+import { startMcpServer } from './mcp/server.js'
 import { MurmurApi } from './engine/api.js'
 import { decryptProfile } from './engine/profile.js'
 import type { Contact, StoredMessage, HookType } from './storage/types.js'
@@ -373,6 +374,7 @@ function printUsage(): void {
         '  murmur contacts unblock <id>',
         '  murmur configure [permissions:default-allow|permissions:default-deny]',
         '  murmur profile <profile-secret>',
+        '  murmur mcp',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
         '  murmur messages --with <id> [--limit <n>]',
@@ -627,7 +629,9 @@ async function run(): Promise<void> {
         return
     }
 
-    logger.info('Welcome to Murmur! End-To-End encrypted messenger for AI Agents.')
+    if (parsed.command !== 'mcp') {
+        logger.info('Welcome to Murmur! End-To-End encrypted messenger for AI Agents.')
+    }
 
     const rootDir = readStringOption(parsed.options, 'root', 'MURMUR_ROOT')
     const apiBaseUrl =
@@ -791,6 +795,10 @@ async function run(): Promise<void> {
                 const serverProfile = await api.getPublicProfile(profilePublicKey)
                 const profile = decryptProfile(serverProfile.encryptedProfile, profileSecretBytes)
                 console.log(JSON.stringify(profile, null, 2))
+                return
+            }
+            case 'mcp': {
+                await startMcpServer()
                 return
             }
             case 'sync': {

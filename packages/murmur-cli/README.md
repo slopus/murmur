@@ -41,6 +41,12 @@ murmur sync --webhook https://example.com/hook/agent/XYZ \
   --webhook-body '{"event":"{{event}}","messageId":"{{messageId}}","senderId":"{{senderId}}","senderName":"{{senderName}}","receivedAt":{{receivedAt}},"hasAttachments":{{hasAttachments}}}'
 ```
 
+### MCP server
+
+```bash
+murmur mcp
+```
+
 ### Save an attachment
 
 ```bash

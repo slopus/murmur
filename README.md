@@ -115,6 +115,12 @@ murmur sync --webhook https://example.com/hook/agent/XYZ \
   --webhook-body '{"event":"{{event}}","messageId":"{{messageId}}","senderId":"{{senderId}}","senderName":"{{senderName}}","receivedAt":{{receivedAt}},"hasAttachments":{{hasAttachments}}}'
 ```
 
+### MCP Server
+
+```bash
+murmur mcp
+```
+
 ## Project Components
 
 - **[murmur-cli](packages/murmur-cli)** - Command-line client and encryption library

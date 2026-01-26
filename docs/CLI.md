@@ -103,6 +103,14 @@ The webhook payload supports placeholders:
 `event`, `messageId`, `senderId`, `senderName`, `senderIdentityKey`,
 `receivedAt`, `hasAttachments`.
 
+## MCP Server
+
+Run the MCP server over stdio:
+
+```bash
+murmur mcp
+```
+
 ## Storage
 
 Local state is stored in SQLite at `~/.murmur/murmur.db` by default.
