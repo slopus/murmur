@@ -225,7 +225,9 @@ export async function startMcpServer(): Promise<void> {
                 inputSchema: {
                     type: 'object',
                     properties: {
-                        permissions: { type: 'string' }
+                        permissions: { type: 'string' },
+                        'message-max-chars': { type: 'number' },
+                        'attachment-max-bytes': { type: 'number' }
                     },
                     additionalProperties: false
                 }
@@ -361,6 +363,14 @@ export async function startMcpServer(): Promise<void> {
                     } else {
                         throw new Error(`Unknown permissions value: ${args.permissions}`)
                     }
+                }
+                const messageMaxChars = args['message-max-chars']
+                if (typeof messageMaxChars === 'number') {
+                    engine.setMessageMaxChars(messageMaxChars)
+                }
+                const attachmentMaxBytes = args['attachment-max-bytes']
+                if (typeof attachmentMaxBytes === 'number') {
+                    engine.setAttachmentMaxBytes(attachmentMaxBytes)
                 }
                 return textResult(engine.getSettings())
             }

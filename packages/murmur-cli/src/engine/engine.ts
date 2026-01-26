@@ -9,7 +9,7 @@
  * Provides a high-level API for the UI to use.
  */
 
-import { copyFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { basename, join } from 'node:path'
 import { spawn } from 'node:child_process'
@@ -51,12 +51,15 @@ import {
 } from './profile.js'
 import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
 
-const MAX_MESSAGE_LENGTH = 20000
+const DEFAULT_MESSAGE_MAX_CHARS = 20000
+const DEFAULT_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
 const ATTACHMENT_KEY_LENGTH = 32
 const ATTACHMENT_IV_LENGTH = 12
 const MESSAGE_HOOK_TYPE: HookType = 'message'
 const MESSAGE_HOOK_REPLY = 'Message rejected by message hook.'
 const DEFAULT_ALLOW_KEY = 'default-allow'
+const MESSAGE_MAX_CHARS_KEY = 'message-max-chars'
+const ATTACHMENT_MAX_BYTES_KEY = 'attachment-max-bytes'
 
 type AttachmentPayloadEntry = {
     hash: string
@@ -80,11 +83,11 @@ type HookMessagePayload = {
     attachments: string[]
 }
 
-function truncateMessageText(text: string): string {
-    if (text.length <= MAX_MESSAGE_LENGTH) {
+function truncateMessageText(text: string, maxChars: number): string {
+    if (text.length <= maxChars) {
         return text
     }
-    return text.slice(0, MAX_MESSAGE_LENGTH)
+    return text.slice(0, maxChars)
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -118,6 +121,15 @@ function collectAttachmentSources(paths: string[]): AttachmentSource[] {
     }
 
     return sources
+}
+
+function validateAttachmentSizes(sources: AttachmentSource[], maxBytes: number): void {
+    for (const source of sources) {
+        const size = statSync(source.path).size
+        if (size > maxBytes) {
+            throw new Error(`Attachment ${source.fileName} exceeds ${maxBytes} bytes`)
+        }
+    }
 }
 
 function createOutgoingAttachments(sources: AttachmentSource[]): {
@@ -190,7 +202,8 @@ function parseAttachmentPayload(value: unknown): AttachmentPayload | undefined {
 
 function buildStoredAttachments(
     payload: AttachmentPayload | undefined,
-    attachmentMap: AttachmentMap | undefined
+    attachmentMap: AttachmentMap | undefined,
+    maxBytes: number
 ): { stored: StoredAttachment[]; invalid: boolean } {
     if (!payload && attachmentMap) {
         return { stored: [], invalid: true }
@@ -209,6 +222,9 @@ function buildStoredAttachments(
             return { stored: [], invalid: true }
         }
         const ciphertextBytes = decodeBase64(ciphertext)
+        if (ciphertextBytes.length > maxBytes) {
+            return { stored: [], invalid: true }
+        }
         const computedHash = bytesToHex(sha256(ciphertextBytes))
         if (computedHash !== meta.hash) {
             return { stored: [], invalid: true }
@@ -339,10 +355,62 @@ export class MurmurEngine {
     /**
      * Get current settings.
      */
-    getSettings(): Record<string, string> {
+    getSettings(): Record<string, string | number> {
         return {
-            permissions: this.getDefaultAllow() ? 'default-allow' : 'default-deny'
+            permissions: this.getDefaultAllow() ? 'default-allow' : 'default-deny',
+            'message-max-chars': this.getMessageMaxChars(),
+            'attachment-max-bytes': this.getAttachmentMaxBytes()
         }
+    }
+
+    /**
+     * Get the max message length (characters).
+     */
+    getMessageMaxChars(): number {
+        const value = this.db.getSetting(MESSAGE_MAX_CHARS_KEY)
+        if (value === null) {
+            return DEFAULT_MESSAGE_MAX_CHARS
+        }
+        const parsed = Number.parseInt(value, 10)
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            return DEFAULT_MESSAGE_MAX_CHARS
+        }
+        return parsed
+    }
+
+    /**
+     * Set the max message length (characters).
+     */
+    setMessageMaxChars(value: number): void {
+        if (!Number.isFinite(value) || value <= 0) {
+            throw new Error('Message max chars must be a positive number')
+        }
+        this.db.setSetting(MESSAGE_MAX_CHARS_KEY, String(Math.floor(value)))
+    }
+
+    /**
+     * Get the max attachment size (bytes).
+     */
+    getAttachmentMaxBytes(): number {
+        const value = this.db.getSetting(ATTACHMENT_MAX_BYTES_KEY)
+        if (value === null) {
+            return DEFAULT_ATTACHMENT_MAX_BYTES
+        }
+        const parsed = Number.parseInt(value, 10)
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            return DEFAULT_ATTACHMENT_MAX_BYTES
+        }
+        return parsed
+    }
+
+    /**
+     * Set the max attachment size (bytes).
+     */
+    setAttachmentMaxBytes(value: number): void {
+        if (!Number.isFinite(value) || value <= 0) {
+            throw new Error('Attachment max bytes must be a positive number')
+        }
+        this.db.setSetting(ATTACHMENT_MAX_BYTES_KEY, String(Math.floor(value)))
     }
 
     /**
@@ -941,7 +1009,7 @@ export class MurmurEngine {
         if (!trimmedText) {
             throw new Error('Message cannot be empty')
         }
-        const finalText = truncateMessageText(trimmedText)
+        const finalText = truncateMessageText(trimmedText, this.getMessageMaxChars())
 
         const storedContact = this.db.getContact(recipientIdentityKey)
         if (!storedContact || !storedContact.profileSecretKey) {
@@ -952,6 +1020,9 @@ export class MurmurEngine {
         }
 
         const attachmentSources = attachments.length > 0 ? collectAttachmentSources(attachments) : []
+        if (attachmentSources.length > 0) {
+            validateAttachmentSizes(attachmentSources, this.getAttachmentMaxBytes())
+        }
 
         const hookPayload: HookMessagePayload = {
             id: messageId,
@@ -1068,7 +1139,7 @@ export class MurmurEngine {
                 // Treat as legacy plaintext.
             }
             const hookText = text
-            const storedText = truncateMessageText(hookText)
+            const storedText = truncateMessageText(hookText, this.getMessageMaxChars())
 
             if (!profileSecretKey) {
                 this.emit({ type: 'error', error: 'Missing profile secret key for incoming contact' })
@@ -1089,7 +1160,11 @@ export class MurmurEngine {
                 return null
             }
 
-            const attachmentResult = buildStoredAttachments(payloadAttachments, decrypted.attachments)
+            const attachmentResult = buildStoredAttachments(
+                payloadAttachments,
+                decrypted.attachments,
+                this.getAttachmentMaxBytes()
+            )
             if (attachmentResult.invalid) {
                 this.emit({ type: 'error', error: 'Incoming attachments failed validation or decryption' })
                 return null

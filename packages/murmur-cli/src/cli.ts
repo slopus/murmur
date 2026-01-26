@@ -373,7 +373,7 @@ function printUsage(): void {
         '  murmur contacts remove <id>',
         '  murmur contacts block <id>',
         '  murmur contacts unblock <id>',
-        '  murmur configure [permissions:default-allow|permissions:default-deny]',
+        '  murmur configure [permissions:default-allow|permissions:default-deny|message-max-chars:<number>|attachment-max-bytes:<number>]',
         '  murmur profile <profile-secret>',
         '  murmur mcp',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
@@ -772,17 +772,30 @@ async function run(): Promise<void> {
                     const key = rawKey?.trim()
                     const value = rawValue?.trim()
                     if (!key || !value) {
-                        throw new Error('Invalid setting. Usage: murmur configure permissions:default-allow|permissions:default-deny')
+                        throw new Error('Invalid setting. Usage: murmur configure permissions:default-allow|permissions:default-deny|message-max-chars:<number>|attachment-max-bytes:<number>')
                     }
-                    if (key !== 'permissions') {
-                        throw new Error(`Unknown setting: ${key}`)
-                    }
-                    if (value === 'default-allow') {
-                        getEngine().setDefaultAllow(true)
-                    } else if (value === 'default-deny') {
-                        getEngine().setDefaultAllow(false)
+                    if (key === 'permissions') {
+                        if (value === 'default-allow') {
+                            getEngine().setDefaultAllow(true)
+                        } else if (value === 'default-deny') {
+                            getEngine().setDefaultAllow(false)
+                        } else {
+                            throw new Error(`Unknown permissions value: ${value}`)
+                        }
+                    } else if (key === 'message-max-chars') {
+                        const parsed = Number.parseInt(value, 10)
+                        if (!Number.isFinite(parsed) || parsed <= 0) {
+                            throw new Error('message-max-chars must be a positive number')
+                        }
+                        getEngine().setMessageMaxChars(parsed)
+                    } else if (key === 'attachment-max-bytes') {
+                        const parsed = Number.parseInt(value, 10)
+                        if (!Number.isFinite(parsed) || parsed <= 0) {
+                            throw new Error('attachment-max-bytes must be a positive number')
+                        }
+                        getEngine().setAttachmentMaxBytes(parsed)
                     } else {
-                        throw new Error(`Unknown permissions value: ${value}`)
+                        throw new Error(`Unknown setting: ${key}`)
                     }
                 }
                 console.log(JSON.stringify(getEngine().getSettings(), null, 2))

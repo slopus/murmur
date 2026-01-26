@@ -93,6 +93,8 @@ murmur sync  # Fetch replies
 ```bash
 murmur configure permissions:default-allow
 murmur configure permissions:default-deny
+murmur configure message-max-chars:20000
+murmur configure attachment-max-bytes:5242880
 ```
 
 `default-deny` only accepts messages from contacts you have added. `default-allow`

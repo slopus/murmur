@@ -33,6 +33,8 @@ murmur sync
 
 - `murmur configure permissions:default-allow`
 - `murmur configure permissions:default-deny`
+- `murmur configure message-max-chars:20000`
+- `murmur configure attachment-max-bytes:5242880`
 
 `default-allow` accepts messages from unknown contacts and auto-adds them when
 profiles can be resolved. `default-deny` only accepts messages from contacts
