@@ -88,6 +88,16 @@ murmur send --to <their-id> --message "See attached." --attach ./report.pdf
 murmur sync  # Fetch replies
 ```
 
+### Contact Policy
+
+```bash
+murmur set default-allow
+murmur set default-deny
+```
+
+`default-deny` only accepts messages from contacts you have added. `default-allow`
+accepts messages from anyone and auto-adds contacts when profiles are resolved.
+
 ### Verify hooks
 
 ```bash

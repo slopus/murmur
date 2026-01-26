@@ -186,6 +186,14 @@ describe('MurmurDatabase', () => {
         })
     })
 
+    describe('Settings', () => {
+        it('should store and retrieve settings', () => {
+            expect(db.getSetting('default-allow')).toBeNull()
+            db.setSetting('default-allow', 'true')
+            expect(db.getSetting('default-allow')).toBe('true')
+        })
+    })
+
     describe('Contacts', () => {
         it('should return empty array initially', () => {
             expect(db.getContacts()).toEqual([])

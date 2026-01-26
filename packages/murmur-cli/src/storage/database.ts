@@ -161,6 +161,15 @@ export class MurmurDatabase {
                 up: `
                     UPDATE hooks SET type = 'message' WHERE type = 'verify-message';
                 `
+            },
+            {
+                id: '202602160001_add_settings',
+                up: `
+                    CREATE TABLE IF NOT EXISTS settings (
+                        key TEXT PRIMARY KEY,
+                        value TEXT NOT NULL
+                    );
+                `
             }
         ]
 
@@ -285,6 +294,7 @@ export class MurmurDatabase {
     clearAll(): void {
         this.db.exec('BEGIN')
         try {
+            this.db.exec('DELETE FROM settings')
             this.db.exec('DELETE FROM hooks')
             this.db.exec('DELETE FROM attachments')
             this.db.exec('DELETE FROM messages')
@@ -296,6 +306,24 @@ export class MurmurDatabase {
             this.db.exec('ROLLBACK')
             throw error
         }
+    }
+
+    /**
+     * Get a setting value by key.
+     */
+    getSetting(key: string): string | null {
+        const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined
+        return row?.value ?? null
+    }
+
+    /**
+     * Set a setting value by key.
+     */
+    setSetting(key: string, value: string): void {
+        this.db.prepare(`
+            INSERT OR REPLACE INTO settings (key, value)
+            VALUES (?, ?)
+        `).run(key, value)
     }
 
     /**

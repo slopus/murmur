@@ -371,6 +371,8 @@ function printUsage(): void {
         '  murmur contacts remove <id>',
         '  murmur contacts block <id>',
         '  murmur contacts unblock <id>',
+        '  murmur set default-allow',
+        '  murmur set default-deny',
         '  murmur profile <profile-secret>',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
@@ -756,6 +758,24 @@ async function run(): Promise<void> {
                 }
 
                 throw new Error(`Unknown contacts action: ${action}`)
+            }
+            case 'set': {
+                await requireInitialized(getEngine())
+                const key = parsed.positionals[0]
+                if (!key) {
+                    throw new Error('Missing setting. Usage: murmur set default-allow|default-deny')
+                }
+                if (key === 'default-allow') {
+                    getEngine().setDefaultAllow(true)
+                    logger.info('Default contact policy set to allow.')
+                    return
+                }
+                if (key === 'default-deny') {
+                    getEngine().setDefaultAllow(false)
+                    logger.info('Default contact policy set to deny.')
+                    return
+                }
+                throw new Error(`Unknown setting: ${key}`)
             }
             case 'profile': {
                 const positionalSecret = parsed.positionals[0]

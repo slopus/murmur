@@ -56,6 +56,7 @@ const ATTACHMENT_KEY_LENGTH = 32
 const ATTACHMENT_IV_LENGTH = 12
 const MESSAGE_HOOK_TYPE: HookType = 'message'
 const MESSAGE_HOOK_REPLY = 'Message rejected by message hook.'
+const DEFAULT_ALLOW_KEY = 'default-allow'
 
 type AttachmentPayloadEntry = {
     hash: string
@@ -315,6 +316,24 @@ export class MurmurEngine {
      */
     getAuthError(): string | null {
         return this.authError
+    }
+
+    /**
+     * Get whether to allow messages from unknown contacts.
+     */
+    getDefaultAllow(): boolean {
+        const value = this.db.getSetting(DEFAULT_ALLOW_KEY)
+        if (value === null) {
+            return true
+        }
+        return value === 'true'
+    }
+
+    /**
+     * Set whether to allow messages from unknown contacts.
+     */
+    setDefaultAllow(allow: boolean): void {
+        this.db.setSetting(DEFAULT_ALLOW_KEY, allow ? 'true' : 'false')
     }
 
     /**
@@ -1043,6 +1062,11 @@ export class MurmurEngine {
             const existingContact = this.db.getContactByProfilePublicKey(profilePublicKey)
             if (existingContact?.blocked) {
                 logger.info(`Ignored message from blocked contact: ${inboxMessage.id}`)
+                await this.api.acknowledgeMessages([inboxMessage.id])
+                return null
+            }
+            if (!this.getDefaultAllow() && !existingContact) {
+                logger.info(`Ignored message from unknown contact: ${inboxMessage.id}`)
                 await this.api.acknowledgeMessages([inboxMessage.id])
                 return null
             }
