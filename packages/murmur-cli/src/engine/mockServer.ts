@@ -4,7 +4,6 @@
  * Simulates the server API for local testing of all chat mechanisms.
  */
 
-import { createId } from '@paralleldrive/cuid2'
 import type { InboxMessage, ServerProfile, AuthTokens } from './api.js'
 
 /**
@@ -553,10 +552,9 @@ export function createMockApi(server: MockServer) {
             refreshToken = null
         },
 
-        async sendMessage(recipientId: string, blob: string, messageId?: string) {
+        async sendMessage(recipientId: string, blob: string, messageId: string) {
             if (!accessToken) throw new Error('Not authenticated')
-            const resolvedMessageId = messageId ?? createId()
-            return server.sendMessage(accessToken, resolvedMessageId, recipientId, blob, 'mock-signature')
+            return server.sendMessage(accessToken, messageId, recipientId, blob, 'mock-signature')
         },
 
         async getInbox(limit?: number, cursor?: string) {

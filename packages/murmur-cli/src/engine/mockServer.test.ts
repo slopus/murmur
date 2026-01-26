@@ -376,7 +376,7 @@ describe('createMockApi', () => {
         const bobApi = createMockApi(server)
         await bobApi.register('bob-id', new Uint8Array(32), 'ppk', 'sig', 'ep')
 
-        await api.sendMessage('bob-id', 'hello-blob')
+        await api.sendMessage('bob-id', 'hello-blob', createId())
 
         const inbox = await bobApi.getInbox()
         expect(inbox.messages).toHaveLength(1)

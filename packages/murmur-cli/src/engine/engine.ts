@@ -923,9 +923,18 @@ export class MurmurEngine {
     /**
      * Send a message to a contact.
      */
-    async sendMessage(recipientIdentityKey: string, text: string, attachments: string[] = []): Promise<StoredMessage> {
+    async sendMessage(
+        recipientIdentityKey: string,
+        text: string,
+        messageId: string,
+        attachments: string[] = []
+    ): Promise<StoredMessage> {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
+        }
+
+        if (!messageId || messageId.trim().length === 0) {
+            throw new Error('Message ID is required')
         }
 
         const trimmedText = text.trim()
@@ -942,7 +951,6 @@ export class MurmurEngine {
             throw new Error('Contact is blocked.')
         }
 
-        const messageId = createId()
         const attachmentSources = attachments.length > 0 ? collectAttachmentSources(attachments) : []
 
         const hookPayload: HookMessagePayload = {

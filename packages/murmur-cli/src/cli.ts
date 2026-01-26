@@ -5,6 +5,7 @@
  * Provides non-interactive commands for account setup and messaging.
  */
 
+import { createId } from '@paralleldrive/cuid2'
 import { MurmurEngine } from './engine/engine.js'
 import { startMcpServer } from './mcp/server.js'
 import { MurmurApi } from './engine/api.js'
@@ -697,7 +698,8 @@ async function run(): Promise<void> {
                 const message = requireStringOption(parsed.options, 'message', 'MURMUR_MESSAGE')
                 const attachments = readStringArrayOption(parsed.options, 'attach')
                 const contact = resolveContactByProfileSecret(getEngine(), recipientId)
-                const stored = await getEngine().sendMessage(contact.identityKey, message, attachments)
+                const messageId = createId()
+                const stored = await getEngine().sendMessage(contact.identityKey, message, messageId, attachments)
                 logger.info(`Sent ${stored.id} to ${formatContact(contact)} at ${formatTimestamp(stored.createdAt)}`)
                 return
             }

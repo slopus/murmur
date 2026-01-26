@@ -423,7 +423,7 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
         it('should send a message', async () => {
             const blob = encodeBase64(stringToBytes('encrypted-test-message'))
 
-            const result = await alice.api.sendMessage(bob.identity.publicKey, blob)
+            const result = await alice.api.sendMessage(bob.identity.publicKey, blob, createId())
 
             expect(result.id).toBeDefined()
             expect(result.createdAt).toBeGreaterThan(0)
@@ -434,7 +434,7 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
             const messageContent = 'test-message-' + Date.now()
             const blob = encodeBase64(stringToBytes(messageContent))
 
-            await alice.api.sendMessage(bob.identity.publicKey, blob)
+            await alice.api.sendMessage(bob.identity.publicKey, blob, createId())
 
             const inbox = await bob.api.getInbox()
 
@@ -448,7 +448,7 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
             // Send multiple messages
             for (let i = 0; i < 5; i++) {
                 const blob = encodeBase64(stringToBytes(`message-${i}`))
-                await alice.api.sendMessage(bob.identity.publicKey, blob)
+                await alice.api.sendMessage(bob.identity.publicKey, blob, createId())
             }
 
             // Fetch with limit
@@ -474,7 +474,7 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
 
         it('should acknowledge messages', async () => {
             const blob = encodeBase64(stringToBytes('ack-test-message'))
-            await alice.api.sendMessage(bob.identity.publicKey, blob)
+            await alice.api.sendMessage(bob.identity.publicKey, blob, createId())
 
             const inbox1 = await bob.api.getInbox()
             const msg = inbox1.messages.find(m => m.blob === blob)
@@ -505,19 +505,19 @@ describe.skipIf(!LIVE_TEST_ENABLED)('Live Server Integration Tests', () => {
             const blob = encodeBase64(stringToBytes('test'))
 
             await expect(
-                alice.api.sendMessage(fakeIdentity.publicKey, blob)
+                alice.api.sendMessage(fakeIdentity.publicKey, blob, createId())
             ).rejects.toThrow()
         })
 
         it('should reject duplicate message ID', async () => {
             const blob1 = encodeBase64(stringToBytes('message1'))
-            await alice.api.sendMessage(bob.identity.publicKey, blob1)
+            await alice.api.sendMessage(bob.identity.publicKey, blob1, createId())
 
             // The API generates its own message ID, so this test verifies
             // that separate sends work (not testing duplicate ID rejection directly
             // since the client always generates new IDs)
             const blob2 = encodeBase64(stringToBytes('message2'))
-            const result = await alice.api.sendMessage(bob.identity.publicKey, blob2)
+            const result = await alice.api.sendMessage(bob.identity.publicKey, blob2, createId())
             expect(result.id).toBeDefined()
         })
     })

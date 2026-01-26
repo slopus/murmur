@@ -2,6 +2,7 @@
  * Murmur MCP Server (stdio).
  */
 
+import { createId } from '@paralleldrive/cuid2'
 import { Server } from '@modelcontextprotocol/sdk/server/index.js'
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { CallToolRequestSchema, ListToolsRequestSchema } from '@modelcontextprotocol/sdk/types.js'
@@ -307,7 +308,8 @@ export async function startMcpServer(): Promise<void> {
                     throw new Error('Missing to/message')
                 }
                 const contact = resolveContactByProfileId(engine, to)
-                const stored = await engine.sendMessage(contact.identityKey, message, attachments)
+                const messageId = createId()
+                const stored = await engine.sendMessage(contact.identityKey, message, messageId, attachments)
                 return textResult(formatMessage(stored, contacts, profileId))
             }
             case 'messages.sync': {

@@ -5,7 +5,6 @@
  * https://murmur.cluster-fluster.com
  */
 
-import { createId } from '@paralleldrive/cuid2'
 import {
     encodeBase64,
     decodeBase64,
@@ -435,13 +434,12 @@ export class MurmurApi {
     async sendMessage(
         recipientId: string,
         blob: string,
-        messageId?: string,
+        messageId: string,
         retries: number = 3
     ): Promise<{ id: string; createdAt: number; expiresAt: number }> {
-        const resolvedMessageId = messageId ?? createId()
         // Server verifies signature of: blobBytes + messageIdBytes (concatenated raw bytes)
         const blobBytes = decodeBase64(blob)
-        const messageIdBytes = stringToBytes(resolvedMessageId)
+        const messageIdBytes = stringToBytes(messageId)
         const messageToSign = new Uint8Array(blobBytes.length + messageIdBytes.length)
         messageToSign.set(blobBytes, 0)
         messageToSign.set(messageIdBytes, blobBytes.length)
@@ -459,7 +457,7 @@ export class MurmurApi {
                         expiresAt: number
                     }
                 }>('POST', '/v1/messages/send', {
-                    messageId: resolvedMessageId,
+                    messageId,
                     recipientId,
                     blob,
                     signature
@@ -469,7 +467,7 @@ export class MurmurApi {
                 if (isDuplicateMessageIdError(error)) {
                     const now = Date.now()
                     return {
-                        id: resolvedMessageId,
+                        id: messageId,
                         createdAt: now,
                         expiresAt: now + MESSAGE_TTL_MS
                     }

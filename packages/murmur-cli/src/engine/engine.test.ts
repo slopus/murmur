@@ -4,6 +4,7 @@
  * Uses mock server to test full chat flow without network.
  */
 
+import { createId } from '@paralleldrive/cuid2'
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
@@ -114,10 +115,10 @@ describe('MockServer integration with Engine concepts', () => {
         await bobApi.register('bob', new Uint8Array(32), 'ppk', 'sig', 'ep')
 
         // Alice -> Bob
-        await aliceApi.sendMessage('bob', 'hello-bob')
+        await aliceApi.sendMessage('bob', 'hello-bob', createId())
 
         // Bob -> Alice
-        await bobApi.sendMessage('alice', 'hi-alice')
+        await bobApi.sendMessage('alice', 'hi-alice', createId())
 
         // Check Alice's inbox
         const aliceInbox = await aliceApi.getInbox()
@@ -139,7 +140,7 @@ describe('MockServer integration with Engine concepts', () => {
 
         // Send 10 messages
         for (let i = 0; i < 10; i++) {
-            await aliceApi.sendMessage('bob', `message-${i}`)
+            await aliceApi.sendMessage('bob', `message-${i}`, createId())
         }
 
         // Bob receives all 10
