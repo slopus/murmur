@@ -500,9 +500,6 @@ export class MurmurEngine {
             encryptedProfile
         )
 
-        // Upload prekeys to server
-        await this.uploadPreKeys()
-
         // Create account object
         this.account = {
             identityKey,
@@ -513,6 +510,9 @@ export class MurmurEngine {
             lastName,
             createdAt: user.createdAt
         }
+
+        // Upload prekeys to server
+        await this.uploadPreKeys()
 
         // Save to database
         this.db.saveAccount(this.account)
