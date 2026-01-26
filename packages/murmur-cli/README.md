@@ -34,6 +34,14 @@ murmur send --to <their-id> --message "See attached." --attach ./report.pdf
 murmur sync  # Fetch replies
 ```
 
+### Configure guardrails
+
+```bash
+murmur configure message-max-chars:20000
+murmur configure attachment-max-bytes:5242880
+murmur configure permissions:default-deny
+```
+
 ### Webhook notifications
 
 ```bash
