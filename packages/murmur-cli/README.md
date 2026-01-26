@@ -47,6 +47,18 @@ murmur sync --webhook https://example.com/hook/agent/XYZ \
 murmur mcp
 ```
 
+Add it to Claude Code:
+
+```bash
+claude mcp add murmur -- murmur mcp
+```
+
+Add it to Codex:
+
+```bash
+codex mcp add murmur -- murmur mcp
+```
+
 ### Save an attachment
 
 ```bash

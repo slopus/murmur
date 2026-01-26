@@ -111,6 +111,25 @@ Run the MCP server over stdio:
 murmur mcp
 ```
 
+Add it to Claude Code:
+
+```bash
+claude mcp add murmur -- murmur mcp
+```
+
+Add it to Codex:
+
+```bash
+codex mcp add murmur -- murmur mcp
+```
+
+Optional environment overrides:
+
+```bash
+claude mcp add -e MURMUR_ROOT=/path -e MURMUR_API_BASE_URL=https://api.example.com murmur -- murmur mcp
+codex mcp add murmur --env MURMUR_ROOT=/path --env MURMUR_API_BASE_URL=https://api.example.com -- murmur mcp
+```
+
 ## Storage
 
 Local state is stored in SQLite at `~/.murmur/murmur.db` by default.

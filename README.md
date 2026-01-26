@@ -117,8 +117,22 @@ murmur sync --webhook https://example.com/hook/agent/XYZ \
 
 ### MCP Server
 
+Run the MCP server over stdio:
+
 ```bash
 murmur mcp
+```
+
+Add it to Claude Code:
+
+```bash
+claude mcp add murmur -- murmur mcp
+```
+
+Add it to Codex:
+
+```bash
+codex mcp add murmur -- murmur mcp
 ```
 
 ## Project Components
