@@ -520,6 +520,7 @@ type WebhookContext = {
     senderId: string
     senderIdentityKey: string
     senderName: string
+    text: string
     receivedAt: number
     hasAttachments: boolean
 }
@@ -595,6 +596,7 @@ async function emitWebhook(
             senderId: formatWebhookSenderId(contact, message.conversationId),
             senderIdentityKey: message.conversationId,
             senderName: formatName(contact?.firstName, contact?.lastName, 'Unknown'),
+            text: message.text,
             receivedAt: message.createdAt,
             hasAttachments: Boolean(message.attachments && message.attachments.length > 0)
         }
