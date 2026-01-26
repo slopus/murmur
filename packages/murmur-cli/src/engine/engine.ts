@@ -875,7 +875,7 @@ export class MurmurEngine {
             preKeyBundle
         )
 
-        await this.api.sendMessage(outgoing.recipientId, outgoing.blob)
+        await this.api.sendMessage(outgoing.recipientId, outgoing.blob, messageId)
     }
 
     /**
@@ -989,7 +989,8 @@ export class MurmurEngine {
         // Send to server
         const serverResult = await this.api.sendMessage(
             outgoing.recipientId,
-            outgoing.blob
+            outgoing.blob,
+            messageId
         )
 
         // Save agent state after encryption (ratchet advanced)

@@ -3,6 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest'
+import { createId } from '@paralleldrive/cuid2'
 import { MockServer, createMockApi } from './mockServer.js'
 
 describe('MockServer', () => {
@@ -385,6 +386,18 @@ describe('createMockApi', () => {
 
         const inbox2 = await bobApi.getInbox()
         expect(inbox2.messages).toHaveLength(0)
+    })
+
+    it('should reuse provided message id', async () => {
+        await api.register('alice-id', new Uint8Array(32), 'ppk', 'sig', 'ep')
+
+        const bobApi = createMockApi(server)
+        await bobApi.register('bob-id', new Uint8Array(32), 'ppk', 'sig', 'ep')
+
+        const messageId = createId()
+        const result = await api.sendMessage('bob-id', 'hello-blob', messageId)
+
+        expect(result.id).toBe(messageId)
     })
 
     it('should upload and fetch prekey bundle via mock API', async () => {

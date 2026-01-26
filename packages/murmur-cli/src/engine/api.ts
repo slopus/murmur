@@ -16,6 +16,36 @@ import { logger } from '../logger.js'
 
 /** Base URL for the Murmur server */
 const API_BASE = 'https://murmur.cluster-fluster.com'
+const MESSAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+function isDuplicateMessageIdError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+        return false
+    }
+    const message = error.message.toLowerCase()
+    return message.includes('message id already exists') || message.includes('duplicate message')
+}
+
+function shouldRetrySend(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+        return true
+    }
+    const message = error.message.toLowerCase()
+    if (message.startsWith('http 4') && !message.startsWith('http 429')) {
+        return false
+    }
+    if (message.includes('recipient not found')) {
+        return false
+    }
+    if (message.includes('invalid message id')) {
+        return false
+    }
+    return true
+}
+
+function sleep(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 /**
  * Authentication tokens from the server.
@@ -404,32 +434,56 @@ export class MurmurApi {
      */
     async sendMessage(
         recipientId: string,
-        blob: string
+        blob: string,
+        messageId?: string,
+        retries: number = 3
     ): Promise<{ id: string; createdAt: number; expiresAt: number }> {
-        const messageId = createId()
+        const resolvedMessageId = messageId ?? createId()
         // Server verifies signature of: blobBytes + messageIdBytes (concatenated raw bytes)
         const blobBytes = decodeBase64(blob)
-        const messageIdBytes = stringToBytes(messageId)
+        const messageIdBytes = stringToBytes(resolvedMessageId)
         const messageToSign = new Uint8Array(blobBytes.length + messageIdBytes.length)
         messageToSign.set(blobBytes, 0)
         messageToSign.set(messageIdBytes, blobBytes.length)
         const signature = this.signBytes(messageToSign)
 
-        const response = await this.request<{
-            success: boolean
-            message: {
-                id: string
-                createdAt: number
-                expiresAt: number
+        const attempts = Math.max(1, Math.floor(retries))
+        let lastError: unknown
+        for (let attempt = 1; attempt <= attempts; attempt += 1) {
+            try {
+                const response = await this.request<{
+                    success: boolean
+                    message: {
+                        id: string
+                        createdAt: number
+                        expiresAt: number
+                    }
+                }>('POST', '/v1/messages/send', {
+                    messageId: resolvedMessageId,
+                    recipientId,
+                    blob,
+                    signature
+                })
+                return response.message
+            } catch (error) {
+                if (isDuplicateMessageIdError(error)) {
+                    const now = Date.now()
+                    return {
+                        id: resolvedMessageId,
+                        createdAt: now,
+                        expiresAt: now + MESSAGE_TTL_MS
+                    }
+                }
+                lastError = error
+                if (!shouldRetrySend(error) || attempt === attempts) {
+                    throw error
+                }
+                const delayMs = 250 * attempt
+                logger.warn(`Send failed (attempt ${attempt} of ${attempts}). Retrying...`)
+                await sleep(delayMs)
             }
-        }>('POST', '/v1/messages/send', {
-            messageId,
-            recipientId,
-            blob,
-            signature
-        })
-
-        return response.message
+        }
+        throw lastError ?? new Error('Failed to send message')
     }
 
     /**

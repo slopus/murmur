@@ -553,10 +553,10 @@ export function createMockApi(server: MockServer) {
             refreshToken = null
         },
 
-        async sendMessage(recipientId: string, blob: string) {
+        async sendMessage(recipientId: string, blob: string, messageId?: string) {
             if (!accessToken) throw new Error('Not authenticated')
-            const messageId = createId()
-            return server.sendMessage(accessToken, messageId, recipientId, blob, 'mock-signature')
+            const resolvedMessageId = messageId ?? createId()
+            return server.sendMessage(accessToken, resolvedMessageId, recipientId, blob, 'mock-signature')
         },
 
         async getInbox(limit?: number, cursor?: string) {
