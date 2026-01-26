@@ -337,6 +337,15 @@ export class MurmurEngine {
     }
 
     /**
+     * Get current settings.
+     */
+    getSettings(): Record<string, boolean> {
+        return {
+            'default-allow': this.getDefaultAllow()
+        }
+    }
+
+    /**
      * Get configured hooks.
      */
     getHooks(type?: HookType): StoredHook[] {

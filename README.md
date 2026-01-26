@@ -91,8 +91,8 @@ murmur sync  # Fetch replies
 ### Contact Policy
 
 ```bash
-murmur set default-allow
-murmur set default-deny
+murmur configure default-allow
+murmur configure default-deny
 ```
 
 `default-deny` only accepts messages from contacts you have added. `default-allow`

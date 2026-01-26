@@ -371,8 +371,7 @@ function printUsage(): void {
         '  murmur contacts remove <id>',
         '  murmur contacts block <id>',
         '  murmur contacts unblock <id>',
-        '  murmur set default-allow',
-        '  murmur set default-deny',
+        '  murmur configure [default-allow|default-deny]',
         '  murmur profile <profile-secret>',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
@@ -759,23 +758,20 @@ async function run(): Promise<void> {
 
                 throw new Error(`Unknown contacts action: ${action}`)
             }
-            case 'set': {
+            case 'configure': {
                 await requireInitialized(getEngine())
                 const key = parsed.positionals[0]
-                if (!key) {
-                    throw new Error('Missing setting. Usage: murmur set default-allow|default-deny')
+                if (key) {
+                    if (key === 'default-allow') {
+                        getEngine().setDefaultAllow(true)
+                    } else if (key === 'default-deny') {
+                        getEngine().setDefaultAllow(false)
+                    } else {
+                        throw new Error(`Unknown setting: ${key}`)
+                    }
                 }
-                if (key === 'default-allow') {
-                    getEngine().setDefaultAllow(true)
-                    logger.info('Default contact policy set to allow.')
-                    return
-                }
-                if (key === 'default-deny') {
-                    getEngine().setDefaultAllow(false)
-                    logger.info('Default contact policy set to deny.')
-                    return
-                }
-                throw new Error(`Unknown setting: ${key}`)
+                console.log(JSON.stringify(getEngine().getSettings(), null, 2))
+                return
             }
             case 'profile': {
                 const positionalSecret = parsed.positionals[0]
