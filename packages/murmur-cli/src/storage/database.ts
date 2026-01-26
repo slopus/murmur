@@ -80,7 +80,8 @@ export class MurmurDatabase {
                 profile_secret_key TEXT,
                 encrypted_profile TEXT NOT NULL,
                 added_at INTEGER NOT NULL,
-                updated_at INTEGER NOT NULL
+                updated_at INTEGER NOT NULL,
+                blocked INTEGER NOT NULL DEFAULT 0
             );
 
             -- Messages table
@@ -190,6 +191,10 @@ export class MurmurDatabase {
         const hasProfileSecretKey = columns.some(column => column.name === 'profile_secret_key')
         if (!hasProfileSecretKey) {
             this.db.exec('ALTER TABLE contacts ADD COLUMN profile_secret_key TEXT')
+        }
+        const hasBlocked = columns.some(column => column.name === 'blocked')
+        if (!hasBlocked) {
+            this.db.exec('ALTER TABLE contacts ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0')
         }
     }
 
@@ -376,7 +381,7 @@ export class MurmurDatabase {
     getContacts(): StoredContact[] {
         const rows = this.db.prepare(`
             SELECT identity_key, profile_public_key, profile_secret_key, encrypted_profile,
-                   added_at, updated_at
+                   added_at, updated_at, blocked
             FROM contacts ORDER BY added_at DESC
         `).all() as Array<{
             identity_key: string
@@ -385,6 +390,7 @@ export class MurmurDatabase {
             encrypted_profile: string
             added_at: number
             updated_at: number
+            blocked: number
         }>
 
         return rows.map(row => ({
@@ -393,7 +399,8 @@ export class MurmurDatabase {
             profileSecretKey: row.profile_secret_key ?? undefined,
             encryptedProfile: row.encrypted_profile,
             addedAt: row.added_at,
-            updatedAt: row.updated_at
+            updatedAt: row.updated_at,
+            blocked: row.blocked === 1
         }))
     }
 
@@ -403,7 +410,7 @@ export class MurmurDatabase {
     getContact(identityKey: string): StoredContact | null {
         const row = this.db.prepare(`
             SELECT identity_key, profile_public_key, profile_secret_key, encrypted_profile,
-                   added_at, updated_at
+                   added_at, updated_at, blocked
             FROM contacts WHERE identity_key = ?
         `).get(identityKey) as {
             identity_key: string
@@ -412,6 +419,7 @@ export class MurmurDatabase {
             encrypted_profile: string
             added_at: number
             updated_at: number
+            blocked: number
         } | undefined
 
         if (!row) return null
@@ -422,7 +430,8 @@ export class MurmurDatabase {
             profileSecretKey: row.profile_secret_key ?? undefined,
             encryptedProfile: row.encrypted_profile,
             addedAt: row.added_at,
-            updatedAt: row.updated_at
+            updatedAt: row.updated_at,
+            blocked: row.blocked === 1
         }
     }
 
@@ -432,16 +441,58 @@ export class MurmurDatabase {
     saveContact(contact: StoredContact): void {
         this.db.prepare(`
             INSERT OR REPLACE INTO contacts
-            (identity_key, profile_public_key, profile_secret_key, encrypted_profile, added_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            (identity_key, profile_public_key, profile_secret_key, encrypted_profile, added_at, updated_at, blocked)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
         `).run(
             contact.identityKey,
             contact.profilePublicKey,
             contact.profileSecretKey ?? null,
             contact.encryptedProfile,
             contact.addedAt,
-            contact.updatedAt
+            contact.updatedAt,
+            contact.blocked ? 1 : 0
         )
+    }
+
+    /**
+     * Get a contact by profile public key.
+     */
+    getContactByProfilePublicKey(profilePublicKey: string): StoredContact | null {
+        const row = this.db.prepare(`
+            SELECT identity_key, profile_public_key, profile_secret_key, encrypted_profile,
+                   added_at, updated_at, blocked
+            FROM contacts WHERE profile_public_key = ?
+        `).get(profilePublicKey) as {
+            identity_key: string
+            profile_public_key: string
+            profile_secret_key: string | null
+            encrypted_profile: string
+            added_at: number
+            updated_at: number
+            blocked: number
+        } | undefined
+
+        if (!row) return null
+
+        return {
+            identityKey: row.identity_key,
+            profilePublicKey: row.profile_public_key,
+            profileSecretKey: row.profile_secret_key ?? undefined,
+            encryptedProfile: row.encrypted_profile,
+            addedAt: row.added_at,
+            updatedAt: row.updated_at,
+            blocked: row.blocked === 1
+        }
+    }
+
+    /**
+     * Update block status for a contact.
+     */
+    setContactBlocked(identityKey: string, blocked: boolean): number {
+        const result = this.db.prepare(`
+            UPDATE contacts SET blocked = ?, updated_at = ? WHERE identity_key = ?
+        `).run(blocked ? 1 : 0, Date.now(), identityKey) as { changes?: number }
+        return result.changes ?? 0
     }
 
     /**

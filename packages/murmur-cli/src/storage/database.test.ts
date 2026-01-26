@@ -126,7 +126,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'contact-psk',
                 encryptedProfile: 'contact-ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             }
             const message: StoredMessage = {
                 id: 'msg-1',
@@ -197,7 +198,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'contact-profile-secret',
                 encryptedProfile: 'encrypted-data',
                 addedAt: 1000,
-                updatedAt: 2000
+                updatedAt: 2000,
+                blocked: false
             }
 
             db.saveContact(contact)
@@ -214,7 +216,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             }
 
             db.saveContact(contact)
@@ -230,7 +233,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk1',
                 encryptedProfile: 'ep1',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             }
 
             const contact2: StoredContact = {
@@ -239,7 +243,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk2',
                 encryptedProfile: 'ep2',
                 addedAt: 1000,
-                updatedAt: 2000
+                updatedAt: 2000,
+                blocked: false
             }
 
             db.saveContact(contact1)
@@ -257,7 +262,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             }
 
             const message: StoredMessage = {
@@ -290,7 +296,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             })
         })
 
@@ -425,7 +432,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk2',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             })
 
             db.saveMessage({ id: 'm1', conversationId: 'peer-1', isOutgoing: false, text: 'peer-1', createdAt: 1, read: false })
@@ -442,7 +450,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk2',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             })
 
             // Peer-1: 2 unread incoming
@@ -466,7 +475,8 @@ describe('MurmurDatabase', () => {
                 profileSecretKey: 'psk2',
                 encryptedProfile: 'ep',
                 addedAt: 1000,
-                updatedAt: 1000
+                updatedAt: 1000,
+                blocked: false
             })
 
             db.saveMessage({ id: 'm1', conversationId: 'peer-1', isOutgoing: false, text: 'First', createdAt: 1000, read: true })

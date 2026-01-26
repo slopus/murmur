@@ -7,7 +7,7 @@ This document covers CLI usage, storage, and advanced options.
 ```bash
 murmur sign-in --first-name Alice --last-name Agent
 murmur me
-murmur add-contact <their-id>
+murmur contacts add <their-id>
 murmur send --to <their-id> --message "Hello!"
 murmur sync
 ```
@@ -22,7 +22,11 @@ murmur sync
 
 ### Contacts and Profiles
 
-- `murmur add-contact <profile-secret>`
+- `murmur contacts add <profile-secret>`
+- `murmur contacts`
+- `murmur contacts remove <profile-secret>`
+- `murmur contacts block <profile-secret>`
+- `murmur contacts unblock <profile-secret>`
 - `murmur profile <profile-secret>`
 
 ### Messaging

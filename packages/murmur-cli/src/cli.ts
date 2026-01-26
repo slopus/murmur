@@ -328,7 +328,7 @@ function resolveContactByProfileSecret(engine: MurmurEngine, profileSecretKey: s
     const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
     const contact = engine.getContacts().find(item => item.profilePublicKey === profilePublicKey)
     if (!contact) {
-        throw new Error('Contact not found. Add contact with `murmur add-contact <id>` first.')
+        throw new Error('Contact not found. Add contact with `murmur contacts add <id>` first.')
     }
     return contact
 }
@@ -366,7 +366,11 @@ function printUsage(): void {
         '  murmur sign-in [--first-name <name>] [--last-name <name>]',
         '  murmur me',
         '  murmur delete-account --confirm',
-        '  murmur add-contact <id>',
+        '  murmur contacts',
+        '  murmur contacts add <id>',
+        '  murmur contacts remove <id>',
+        '  murmur contacts block <id>',
+        '  murmur contacts unblock <id>',
         '  murmur profile <profile-secret>',
         '  murmur send --to <id> --message <text> [--attach <path> ...]',
         '  murmur sync [--with <id>] [--realtime] [--timeout <ms>] [--webhook <url>] [--webhook-body <json>]',
@@ -692,17 +696,66 @@ async function run(): Promise<void> {
                 logger.info(`Sent ${stored.id} to ${formatContact(contact)} at ${formatTimestamp(stored.createdAt)}`)
                 return
             }
-            case 'add-contact': {
+            case 'contacts': {
                 await requireInitialized(getEngine())
-                const profileSecret = parsed.positionals[0]
-                if (!profileSecret) {
-                    throw new Error('Missing contact ID. Usage: murmur add-contact <id>')
+                const action = parsed.positionals[0] ?? 'list'
+
+                if (action === 'list') {
+                    const contacts = getEngine().getContacts()
+                    if (contacts.length === 0) {
+                        logger.info('No contacts.')
+                        return
+                    }
+                    logger.info('Contacts:')
+                    for (const contact of contacts) {
+                        const name = formatName(contact.firstName, contact.lastName, 'Unknown')
+                        const id = contact.profileSecretKey
+                            ? formatProfileSecretKey(contact.profileSecretKey)
+                            : formatIdentityKey(contact.identityKey)
+                        const suffix = contact.blocked ? ' [blocked]' : ''
+                        console.log(`${name} (${id})${suffix}`)
+                    }
+                    return
                 }
-                const profileSecretBytes = decodeProfileSecretKey(profileSecret)
-                const profileSecretBase64 = encodeBase64(profileSecretBytes, 'base64url')
-                const contact = await getEngine().addContactByProfileSecret(profileSecretBase64)
-                logger.info(`Added contact: ${formatContact(contact)}`)
-                return
+
+                if (action === 'add') {
+                    const profileSecret = parsed.positionals[1]
+                    if (!profileSecret) {
+                        throw new Error('Missing contact ID. Usage: murmur contacts add <id>')
+                    }
+                    const profileSecretBytes = decodeProfileSecretKey(profileSecret)
+                    const profileSecretBase64 = encodeBase64(profileSecretBytes, 'base64url')
+                    const contact = await getEngine().addContactByProfileSecret(profileSecretBase64)
+                    logger.info(`Added contact: ${formatContact(contact)}`)
+                    return
+                }
+
+                if (action === 'remove') {
+                    const profileSecret = parsed.positionals[1]
+                    if (!profileSecret) {
+                        throw new Error('Missing contact ID. Usage: murmur contacts remove <id>')
+                    }
+                    const profileSecretBytes = decodeProfileSecretKey(profileSecret)
+                    const profileSecretBase64 = encodeBase64(profileSecretBytes, 'base64url')
+                    getEngine().removeContactByProfileSecret(profileSecretBase64)
+                    logger.info('Contact removed.')
+                    return
+                }
+
+                if (action === 'block' || action === 'unblock') {
+                    const profileSecret = parsed.positionals[1]
+                    if (!profileSecret) {
+                        throw new Error(`Missing contact ID. Usage: murmur contacts ${action} <id>`)
+                    }
+                    const profileSecretBytes = decodeProfileSecretKey(profileSecret)
+                    const profileSecretBase64 = encodeBase64(profileSecretBytes, 'base64url')
+                    const blocked = action === 'block'
+                    const contact = getEngine().updateContactBlocked(profileSecretBase64, blocked)
+                    logger.info(`${blocked ? 'Blocked' : 'Unblocked'} ${formatContact(contact)}`)
+                    return
+                }
+
+                throw new Error(`Unknown contacts action: ${action}`)
             }
             case 'profile': {
                 const positionalSecret = parsed.positionals[0]

@@ -39,8 +39,8 @@ if [[ -z "${alice_id}" || -z "${bob_id}" ]]; then
 fi
 
 echo "Adding contacts..."
-murmur "${ALICE_DIR}" add-contact "${bob_id}" >/dev/null
-murmur "${BOB_DIR}" add-contact "${alice_id}" >/dev/null
+murmur "${ALICE_DIR}" contacts add "${bob_id}" >/dev/null
+murmur "${BOB_DIR}" contacts add "${alice_id}" >/dev/null
 
 echo "Starting realtime sync for Bob..."
 murmur "${BOB_DIR}" sync --realtime --timeout 15000 >"${LOG_FILE}" 2>&1 &

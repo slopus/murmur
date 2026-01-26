@@ -51,8 +51,8 @@ if [[ -z "${alice_id}" || -z "${bob_id}" ]]; then
 fi
 
 echo "Adding contacts..."
-murmur "${ALICE_DIR}" add-contact "${bob_id}" >/dev/null
-murmur "${BOB_DIR}" add-contact "${alice_id}" >/dev/null
+murmur "${ALICE_DIR}" contacts add "${bob_id}" >/dev/null
+murmur "${BOB_DIR}" contacts add "${alice_id}" >/dev/null
 
 printf 'Hello from Alice attachment.\n' > "${ALICE_FILE}"
 printf 'Hello from Bob attachment.\n' > "${BOB_FILE}"

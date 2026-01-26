@@ -482,7 +482,8 @@ export class MurmurEngine {
                     firstName: profile.firstName || 'Unknown',
                     lastName: profile.lastName,
                     addedAt: stored.addedAt,
-                    updatedAt: stored.updatedAt
+                    updatedAt: stored.updatedAt,
+                    blocked: stored.blocked
                 }
             } catch {
                 // Fall through to legacy decoding.
@@ -498,10 +499,11 @@ export class MurmurEngine {
                 firstName: profile.firstName || 'Unknown',
                 lastName: profile.lastName,
                 addedAt: stored.addedAt,
-                updatedAt: stored.updatedAt
+                updatedAt: stored.updatedAt,
+                blocked: stored.blocked
             }
         } catch {
-            return this.buildPlaceholderContact(stored.identityKey, stored.profilePublicKey, stored.addedAt, stored.updatedAt)
+            return this.buildPlaceholderContact(stored.identityKey, stored.profilePublicKey, stored.addedAt, stored.updatedAt, stored.blocked)
         }
     }
 
@@ -525,6 +527,37 @@ export class MurmurEngine {
         const serverProfile = await this.api.getProfile(profilePublicKey)
 
         return this.addContactFromProfile(serverProfile, profileSecretKey)
+    }
+
+    /**
+     * Remove a contact by their profile secret key.
+     */
+    removeContactByProfileSecret(profileSecretKey: string): void {
+        const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+        const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+        const stored = this.db.getContactByProfilePublicKey(profilePublicKey)
+        if (!stored) {
+            throw new Error('Contact not found.')
+        }
+        this.db.deleteContact(stored.identityKey)
+    }
+
+    /**
+     * Update a contact's blocked status by profile secret key.
+     */
+    updateContactBlocked(profileSecretKey: string, blocked: boolean): Contact {
+        const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+        const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+        const stored = this.db.getContactByProfilePublicKey(profilePublicKey)
+        if (!stored) {
+            throw new Error('Contact not found.')
+        }
+        this.db.setContactBlocked(stored.identityKey, blocked)
+        const updated = this.db.getContact(stored.identityKey)
+        if (!updated) {
+            throw new Error('Contact not found after update.')
+        }
+        return this.decryptContact(updated)
     }
 
     /**
@@ -579,13 +612,15 @@ export class MurmurEngine {
         const profile = decryptProfile(serverProfile.encryptedProfile, profileSecretKeyBytes)
 
         const now = Date.now()
+        const existing = this.db.getContact(serverProfile.id)
         const storedContact: StoredContact = {
             identityKey: serverProfile.id,
             profilePublicKey: serverProfile.profilePublicKey,
             profileSecretKey,
             encryptedProfile: serverProfile.encryptedProfile,
             addedAt: now,
-            updatedAt: serverProfile.profileUpdatedAt ?? now
+            updatedAt: serverProfile.profileUpdatedAt ?? now,
+            blocked: existing?.blocked ?? false
         }
 
         this.db.saveContact(storedContact)
@@ -596,7 +631,8 @@ export class MurmurEngine {
             profilePublicKey: serverProfile.profilePublicKey,
             profileSecretKey,
             addedAt: storedContact.addedAt,
-            updatedAt: storedContact.updatedAt
+            updatedAt: storedContact.updatedAt,
+            blocked: storedContact.blocked
         }
 
         this.emit({ type: 'contact_added', contact })
@@ -633,14 +669,16 @@ export class MurmurEngine {
         identityKey: string,
         profilePublicKey: string = '',
         addedAt: number = Date.now(),
-        updatedAt: number = Date.now()
+        updatedAt: number = Date.now(),
+        blocked: boolean = false
     ): Contact {
         return {
             identityKey,
             profilePublicKey,
             firstName: identityKey.slice(0, 8),
             addedAt,
-            updatedAt
+            updatedAt,
+            blocked
         }
     }
 
@@ -870,7 +908,10 @@ export class MurmurEngine {
 
         const storedContact = this.db.getContact(recipientIdentityKey)
         if (!storedContact || !storedContact.profileSecretKey) {
-            throw new Error('Contact not found. Add contact with a profile secret key first.')
+            throw new Error('Contact not found. Add contact with `murmur contacts add <id>` first.')
+        }
+        if (storedContact.blocked) {
+            throw new Error('Contact is blocked.')
         }
 
         const messageId = createId()
@@ -997,6 +1038,15 @@ export class MurmurEngine {
                 return null
             }
 
+            const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
+            const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
+            const existingContact = this.db.getContactByProfilePublicKey(profilePublicKey)
+            if (existingContact?.blocked) {
+                logger.info(`Ignored message from blocked contact: ${inboxMessage.id}`)
+                await this.api.acknowledgeMessages([inboxMessage.id])
+                return null
+            }
+
             const attachmentResult = buildStoredAttachments(payloadAttachments, decrypted.attachments)
             if (attachmentResult.invalid) {
                 this.emit({ type: 'error', error: 'Incoming attachments failed validation or decryption' })
@@ -1021,8 +1071,6 @@ export class MurmurEngine {
 
             let contact: Contact
             try {
-                const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
-                const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
                 const serverProfile = await this.api.getProfile(profilePublicKey)
                 contact = this.addContactFromProfile(serverProfile, profileSecretKey, inboxMessage.senderId)
             } catch (error) {

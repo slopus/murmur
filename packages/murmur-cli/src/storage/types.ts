@@ -28,6 +28,8 @@ export interface Contact {
     addedAt: number
     /** When the contact was last updated */
     updatedAt: number
+    /** Whether the contact is blocked */
+    blocked: boolean
 }
 
 /**
@@ -47,6 +49,8 @@ export interface StoredContact {
     addedAt: number
     /** When the contact was last updated */
     updatedAt: number
+    /** Whether the contact is blocked */
+    blocked: boolean
 }
 
 /**
