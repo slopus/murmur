@@ -46,6 +46,17 @@ function sleep(ms: number): Promise<void> {
     return new Promise(resolve => setTimeout(resolve, ms))
 }
 
+function buildApiErrorMessage(
+    status: number,
+    errorData: { error?: string; retryAfter?: number }
+): string {
+    const message = errorData.error || `HTTP ${status}`
+    if (typeof errorData.retryAfter === 'number' && Number.isFinite(errorData.retryAfter) && errorData.retryAfter > 0) {
+        return `${message} Rate limit resets in ${errorData.retryAfter}s.`
+    }
+    return message
+}
+
 /**
  * Authentication tokens from the server.
  */
@@ -227,8 +238,11 @@ export class MurmurApi {
             }
 
             if (!response.ok) {
-                const errorData = await response.json().catch(() => ({ error: 'Unknown error' })) as { error?: string }
-                throw new Error(errorData.error || `HTTP ${response.status}`)
+                const errorData = await response.json().catch(() => ({ error: 'Unknown error' })) as {
+                    error?: string
+                    retryAfter?: number
+                }
+                throw new Error(buildApiErrorMessage(response.status, errorData))
             }
 
             return response.json() as Promise<T>
