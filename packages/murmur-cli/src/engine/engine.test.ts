@@ -43,6 +43,23 @@ describe('MurmurEngine', () => {
             engine = new MurmurEngine(join(tempDir, 'test.db'))
             expect(engine.getContacts()).toEqual([])
         })
+
+        it('should surface backend login failure when adding a contact', async () => {
+            engine = new MurmurEngine(join(tempDir, 'test.db'))
+            ;(engine as any).agent = {}
+            ;(engine as any).authError = 'Authentication rate limit exceeded. Max 1000 attempts per minute.'
+            ;(engine as any).api = {
+                getTokens: () => null
+            }
+
+            const profileSecretKey = Buffer.alloc(32).toString('base64url')
+
+            await expect(
+                engine.addContactByProfileSecret(profileSecretKey)
+            ).rejects.toThrow(
+                'Backend login failed: Authentication rate limit exceeded. Max 1000 attempts per minute.'
+            )
+        })
     })
 
     describe('Conversations', () => {

@@ -2,6 +2,9 @@ import rateLimit from '@fastify/rate-limit';
 import type { FastifyInstance } from 'fastify';
 import { rateLimitHitsTotal } from '@/metrics/prometheus';
 
+const AUTH_RATE_LIMIT_MAX =
+    Number.parseInt(process.env.AUTH_RATE_LIMIT_MAX ?? '', 10) || 1000;
+
 function getAuthenticatedRateLimitKey(req: any): string {
     return req.userId || req.user?.id || req.ip;
 }
@@ -14,7 +17,7 @@ function getAuthRateLimitKey(req: any): string {
  * Rate limiting configuration for Murmur Server
  *
  * Different limits for different endpoint categories:
- * - Public auth endpoints: 10 req/min
+ * - Public auth endpoints: 1000 req/min
  * - Message sending: 100 req/hour per user
  * - Message fetching: 1000 req/hour per user
  * - PreKey operations: 50 req/hour per user
@@ -38,11 +41,11 @@ export async function registerRateLimiting(app: FastifyInstance) {
 export const rateLimitConfigs = {
     // Public authentication endpoints (prevent brute force)
     auth: {
-        max: 10, // 10 requests
+        max: AUTH_RATE_LIMIT_MAX,
         timeWindow: '1 minute',
         keyGenerator: getAuthRateLimitKey,
         errorResponseBuilder: () => ({
-            error: 'Too many authentication attempts. Please try again later.',
+            error: `Authentication rate limit exceeded. Max ${AUTH_RATE_LIMIT_MAX} attempts per minute.`,
             retryAfter: 60,
         }),
     },

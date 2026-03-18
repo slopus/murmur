@@ -335,6 +335,26 @@ export class MurmurEngine {
     }
 
     /**
+     * Describe the current backend authentication failure.
+     */
+    private getAuthenticationErrorMessage(): string {
+        if (this.authError) {
+            return `Backend login failed: ${this.authError}`
+        }
+        return 'Backend login required. Run `murmur sign-in` again.'
+    }
+
+    /**
+     * Require an authenticated API client for backend operations.
+     */
+    private requireAuthenticatedApi(): MurmurApi {
+        if (!this.api.getTokens()) {
+            throw new Error(this.getAuthenticationErrorMessage())
+        }
+        return this.api
+    }
+
+    /**
      * Get whether to allow messages from unknown contacts.
      */
     getDefaultAllow(): boolean {
@@ -374,7 +394,7 @@ export class MurmurEngine {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
-        return this.api.commitPublicProfile(username, description, avatar)
+        return this.requireAuthenticatedApi().commitPublicProfile(username, description, avatar)
     }
 
     /**
@@ -530,7 +550,7 @@ export class MurmurEngine {
         }
         const account = this.account
 
-        await this.api.deleteAccount()
+        await this.requireAuthenticatedApi().deleteAccount()
         this.stopSync()
         this.db.clearAll()
         this.agent = null
@@ -566,7 +586,7 @@ export class MurmurEngine {
             })
         }
 
-        await this.api.uploadPreKeys(preKeys)
+        await this.requireAuthenticatedApi().uploadPreKeys(preKeys)
     }
 
     /**
@@ -634,7 +654,7 @@ export class MurmurEngine {
 
         const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
         const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
-        const serverProfile = await this.api.getProfile(profilePublicKey)
+        const serverProfile = await this.requireAuthenticatedApi().getProfile(profilePublicKey)
 
         return this.addContactFromProfile(serverProfile, profileSecretKey)
     }
@@ -679,7 +699,7 @@ export class MurmurEngine {
         }
 
         // Fetch prekey bundle from server
-        const serverBundle = await this.api.getPreKeyBundle(peerIdentityKey)
+        const serverBundle = await this.requireAuthenticatedApi().getPreKeyBundle(peerIdentityKey)
 
         // Convert to protocol PreKeyBundle
         // Server doesn't use numeric IDs, so we use placeholders
@@ -761,7 +781,7 @@ export class MurmurEngine {
         if (profileSecretKey) {
             const profileSecretKeyBytes = decodeBase64(profileSecretKey, 'base64url')
             const profilePublicKey = encodeBase64(publicKeyFromPrivate(profileSecretKeyBytes))
-            const serverProfile = await this.api.getProfile(profilePublicKey)
+            const serverProfile = await this.requireAuthenticatedApi().getProfile(profilePublicKey)
             return this.addContactFromProfile(serverProfile, profileSecretKey, identityKey)
         }
 
@@ -922,7 +942,7 @@ export class MurmurEngine {
         }
 
         try {
-            await this.api.acknowledgeMessages([inboxMessage.id])
+            await this.requireAuthenticatedApi().acknowledgeMessages([inboxMessage.id])
         } catch (error) {
             logger.warn(`Failed to acknowledge rejected message: ${error instanceof Error ? error.message : String(error)}`)
         } finally {
@@ -957,7 +977,7 @@ export class MurmurEngine {
             preKeyBundle
         )
 
-        await this.api.sendMessage(outgoing.recipientId, outgoing.blob, messageId)
+        await this.requireAuthenticatedApi().sendMessage(outgoing.recipientId, outgoing.blob, messageId)
     }
 
     /**
@@ -1014,6 +1034,7 @@ export class MurmurEngine {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
+        const api = this.requireAuthenticatedApi()
 
         if (!messageId || messageId.trim().length === 0) {
             throw new Error('Message ID is required')
@@ -1080,7 +1101,7 @@ export class MurmurEngine {
         )
 
         // Send to server
-        const serverResult = await this.api.sendMessage(
+        const serverResult = await api.sendMessage(
             outgoing.recipientId,
             outgoing.blob,
             messageId
@@ -1165,12 +1186,12 @@ export class MurmurEngine {
             const existingContact = this.db.getContactByProfilePublicKey(profilePublicKey)
             if (existingContact?.blocked) {
                 logger.info(`Ignored message from blocked contact: ${inboxMessage.id}`)
-                await this.api.acknowledgeMessages([inboxMessage.id])
+                await this.requireAuthenticatedApi().acknowledgeMessages([inboxMessage.id])
                 return null
             }
             if (!this.getDefaultAllow() && !existingContact) {
                 logger.info(`Ignored message from unknown contact: ${inboxMessage.id}`)
-                await this.api.acknowledgeMessages([inboxMessage.id])
+                await this.requireAuthenticatedApi().acknowledgeMessages([inboxMessage.id])
                 return null
             }
 
@@ -1202,7 +1223,7 @@ export class MurmurEngine {
 
             let contact: Contact
             try {
-                const serverProfile = await this.api.getProfile(profilePublicKey)
+                const serverProfile = await this.requireAuthenticatedApi().getProfile(profilePublicKey)
                 contact = this.addContactFromProfile(serverProfile, profileSecretKey, inboxMessage.senderId)
             } catch (error) {
                 this.emit({
@@ -1247,9 +1268,12 @@ export class MurmurEngine {
         if (!this.agent || !this.account) {
             return { success: false, error: 'Not initialized', newMessages: [] }
         }
-        if (!this.api.getTokens()) {
-            const reason = this.authError ? `Not authenticated: ${this.authError}` : 'Not authenticated'
-            return { success: false, error: reason, newMessages: [] }
+        let api: MurmurApi
+        try {
+            api = this.requireAuthenticatedApi()
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            return { success: false, error: message, newMessages: [] }
         }
 
         try {
@@ -1259,7 +1283,7 @@ export class MurmurEngine {
             const newMessages: StoredMessage[] = []
 
             while (hasMore) {
-                const result = await this.api.getInbox(50, cursor)
+                const result = await api.getInbox(50, cursor)
 
                 for (const msg of result.messages) {
                     if (this.db.hasMessage(msg.id)) {
@@ -1278,7 +1302,7 @@ export class MurmurEngine {
             }
 
             if (processedIds.length > 0) {
-                await this.api.acknowledgeMessages(processedIds)
+                await api.acknowledgeMessages(processedIds)
             }
 
             this.emit({ type: 'sync_complete' })
@@ -1348,11 +1372,7 @@ export class MurmurEngine {
         if (!this.agent || !this.account) {
             throw new Error('Not initialized')
         }
-        if (!this.api.getTokens()) {
-            const reason = this.authError ? `Not authenticated: ${this.authError}` : 'Not authenticated'
-            throw new Error(reason)
-        }
-        await this.api.streamMessages(onEvent, options)
+        await this.requireAuthenticatedApi().streamMessages(onEvent, options)
     }
 
     /**
