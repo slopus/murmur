@@ -1,0 +1,60 @@
+{
+  "name": "murmur-p2p",
+  "version": "0.1.0",
+  "description": "Serverless peer-to-peer messaging daemon and CLI backed by HyperDHT",
+  "author": "Steve",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "murmur-p2p": "./bin/murmur-p2p.mjs"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.mjs",
+  "types": "./dist/index.d.cts",
+  "exports": {
+    ".": {
+      "require": {
+        "types": "./dist/index.d.cts",
+        "default": "./dist/index.cjs"
+      },
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      }
+    },
+    "./cli": {
+      "import": "./dist/cli.mjs"
+    }
+  },
+  "files": [
+    "dist",
+    "bin",
+    "package.json"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "shx rm -rf dist && npx tsc --noEmit && pkgroll",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "tsx src/cli.ts",
+    "demo:live": "tsx scripts/live-demo.ts",
+    "start": "node dist/cli.mjs",
+    "prepublishOnly": "$npm_execpath run build && $npm_execpath test"
+  },
+  "dependencies": {
+    "hyperdht": "^6.27.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": ">=20",
+    "pkgroll": "^2.14.2",
+    "shx": "^0.3.3",
+    "tsx": "^4.20.6",
+    "typescript": "^5",
+    "vitest": "^3.2.4"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org"
+  },
+  "packageManager": "yarn@1.22.22"
+}

@@ -2,9 +2,9 @@
   "name": "murmur",
   "private": true,
   "scripts": {
-    "test": "yarn --cwd packages/murmur-cli test && yarn --cwd packages/murmur-server test",
-    "typecheck": "yarn --cwd packages/murmur-cli typecheck && yarn --cwd packages/murmur-server build",
-    "build": "yarn --cwd packages/murmur-cli build && yarn --cwd packages/murmur-server build"
+    "test": "yarn --cwd packages/murmur-cli test && yarn --cwd packages/murmur-p2p test && yarn --cwd packages/murmur-server test",
+    "typecheck": "yarn --cwd packages/murmur-cli typecheck && yarn --cwd packages/murmur-p2p typecheck && yarn --cwd packages/murmur-server build",
+    "build": "yarn --cwd packages/murmur-cli build && yarn --cwd packages/murmur-p2p build && yarn --cwd packages/murmur-server build"
   },
   "packageManager": "yarn@1.22.22"
 }

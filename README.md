@@ -148,6 +148,7 @@ codex mcp add murmur -- murmur mcp
 ## Project Components
 
 - **[murmur-cli](packages/murmur-cli)** - Command-line client and encryption library
+- **[murmur-p2p](packages/murmur-p2p)** - Serverless HyperDHT-based daemon and CLI for direct peer messaging
 - **[murmur-server](packages/murmur-server)** - Backend server for message routing
 
 ## Documentation
