@@ -4,6 +4,7 @@ import { once } from 'node:events'
 import process from 'node:process'
 import { MurmurP2pDaemon } from './daemon.js'
 import { sendControlRequest } from './control.js'
+import type { TransportPolicy } from './types.js'
 import { defaultControlSocketPath, defaultDataDir } from './utils.js'
 
 interface ParsedArgs {
@@ -52,7 +53,7 @@ function help(): string {
         'murmur-p2p',
         '',
         'Commands:',
-        '  server [--data-dir PATH] [--socket PATH] [--name NAME] [--bootstrap host:port,host:port]',
+        '  server [--data-dir PATH] [--socket PATH] [--name NAME] [--bootstrap host:port,host:port] [--transport-policy any|direct-only|private-only|public-only]',
         '  whoami [--data-dir PATH] [--socket PATH]',
         '  peers [--data-dir PATH] [--socket PATH]',
         '  messages [--data-dir PATH] [--socket PATH]',
@@ -89,6 +90,20 @@ function readBooleanOption(options: Record<string, string | boolean>, key: strin
     return options[key] === true || options[key] === 'true'
 }
 
+function readTransportPolicyOption(options: Record<string, string | boolean>): TransportPolicy {
+    const value = readStringOption(options, 'transport-policy') ?? 'any'
+    if (
+        value === 'any' ||
+        value === 'direct-only' ||
+        value === 'private-only' ||
+        value === 'public-only'
+    ) {
+        return value
+    }
+
+    throw new Error(`Invalid --transport-policy value: ${value}`)
+}
+
 async function main(): Promise<void> {
     const args = parseArgs(process.argv.slice(2))
     const dataDir = resolveDataDir(args.options)
@@ -106,6 +121,7 @@ async function main(): Promise<void> {
             bootstrap: parseBootstrap(args.options),
             name: readStringOption(args.options, 'name'),
             transportDebug: readBooleanOption(args.options, 'transport-debug'),
+            transportPolicy: readTransportPolicyOption(args.options),
         })
 
         await daemon.start()
@@ -141,6 +157,7 @@ async function main(): Promise<void> {
         console.log(`name: ${response.info.name}`)
         console.log(`socket: ${response.info.controlSocketPath}`)
         console.log(`topic: ${response.info.topic}`)
+        console.log(`transport policy: ${response.info.transportPolicy}`)
         return
     }
 

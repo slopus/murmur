@@ -47,12 +47,18 @@ export interface DaemonInfo {
     controlSocketPath: string
     topic: string
     bootstrap: string[]
+    transportPolicy: TransportPolicy
 }
 
 /**
  * Bootstrap peer accepted by HyperDHT.
  */
 export type BootstrapNode = string | RelayNode
+
+/**
+ * Enforced transport routing policy.
+ */
+export type TransportPolicy = 'any' | 'direct-only' | 'private-only' | 'public-only'
 
 /**
  * Options used to configure the daemon.
@@ -65,4 +71,5 @@ export interface MurmurP2pDaemonOptions {
     log?: (message: string) => void
     presenceRefreshMs?: number
     transportDebug?: boolean
+    transportPolicy?: TransportPolicy
 }

@@ -28,11 +28,13 @@ declare module 'hyperdht' {
     export interface ConnectOptions {
         nodes?: RelayAddress[]
         keyPair?: KeyPair
+        localConnection?: boolean
     }
 
     export interface ServerOptions {
         firewall?: (remotePublicKey: Buffer, remoteHandshakePayload?: unknown) => boolean
         holepunch?: boolean | (() => boolean)
+        shareLocalAddress?: boolean
     }
 
     export interface HyperDHTOptions {

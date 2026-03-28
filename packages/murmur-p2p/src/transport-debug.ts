@@ -1,5 +1,5 @@
 import type { DhtSocket } from 'hyperdht'
-import type { DiscoveredPeer, RelayNode } from './types.js'
+import type { DiscoveredPeer, RelayNode, TransportPolicy } from './types.js'
 
 interface RawStreamJson {
     connected?: boolean
@@ -84,6 +84,73 @@ export function inferTransportMode(
     }
 
     return 'direct'
+}
+
+/**
+ * Return true when the endpoint is local/private and therefore not public-routable.
+ */
+export function isPrivateEndpoint(host: string | null): boolean {
+    if (!host) {
+        return false
+    }
+
+    if (host === 'localhost') {
+        return true
+    }
+
+    if (host.startsWith('127.')) {
+        return true
+    }
+
+    if (host.startsWith('10.')) {
+        return true
+    }
+
+    if (host.startsWith('192.168.')) {
+        return true
+    }
+
+    const match172 = /^172\.(\d{1,3})\./.exec(host)
+    if (match172) {
+        const second = Number.parseInt(match172[1] ?? '', 10)
+        if (second >= 16 && second <= 31) {
+            return true
+        }
+    }
+
+    if (host === '::1' || host.startsWith('fc') || host.startsWith('fd')) {
+        return true
+    }
+
+    if (host.startsWith('fe80:')) {
+        return true
+    }
+
+    return false
+}
+
+/**
+ * Validate a transport snapshot against a requested policy.
+ */
+export function validateTransportPolicy(
+    snapshot: TransportSnapshot,
+    mode: TransportMode,
+    policy: TransportPolicy
+): string | null {
+    const isPrivate = isPrivateEndpoint(snapshot.remoteHost)
+
+    switch (policy) {
+        case 'any':
+            return null
+        case 'direct-only':
+            return mode === 'relay-assisted'
+                ? 'Connection used a relay-assisted path while direct-only was required'
+                : null
+        case 'private-only':
+            return isPrivate ? null : 'Connection endpoint was public while private-only was required'
+        case 'public-only':
+            return isPrivate ? 'Connection endpoint was private while public-only was required' : null
+    }
 }
 
 /**

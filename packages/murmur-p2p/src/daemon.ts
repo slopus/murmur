@@ -7,7 +7,7 @@ import { StateStore } from './store.js'
 import { keyPairFromIdentity } from './identity.js'
 import { messagesResponse, peersResponse, infoResponse, type ControlRequest, type ControlResponse, peerEnvelopeSchema, encodeFrame } from './protocol.js'
 import { sendControlRequest, startControlServer, stopControlServer } from './control.js'
-import { formatTransportSnapshot, inferTransportMode, snapshotTransport } from './transport-debug.js'
+import { formatTransportSnapshot, inferTransportMode, snapshotTransport, validateTransportPolicy } from './transport-debug.js'
 import type {
     BootstrapNode,
     DaemonInfo,
@@ -16,6 +16,7 @@ import type {
     MurmurP2pIdentity,
     RelayNode,
     StoredMessage,
+    TransportPolicy,
 } from './types.js'
 import {
     MURMUR_P2P_PROTOCOL,
@@ -42,6 +43,7 @@ export class MurmurP2pDaemon {
     private readonly desiredName: string
     private readonly presenceRefreshMs: number
     private readonly transportDebug: boolean
+    private readonly transportPolicy: TransportPolicy
     private readonly store: StateStore
     private readonly topic = deriveTopicBuffer()
 
@@ -59,6 +61,7 @@ export class MurmurP2pDaemon {
         this.desiredName = options.name?.trim() || 'murmur-p2p'
         this.presenceRefreshMs = options.presenceRefreshMs ?? DEFAULT_PRESENCE_REFRESH_MS
         this.transportDebug = options.transportDebug ?? false
+        this.transportPolicy = options.transportPolicy ?? 'any'
         this.log = options.log ?? ((message) => console.log(formatLogLine(message)))
         this.store = new StateStore(this.dataDir)
     }
@@ -76,9 +79,16 @@ export class MurmurP2pDaemon {
             bootstrap: this.bootstrap.length > 0 ? this.bootstrap : undefined,
         })
 
-        this.server = this.dht.createServer({}, (socket: DhtSocket) => {
-            void this.handlePeerConnection(socket)
-        })
+        this.server = this.dht.createServer(
+            {
+                shareLocalAddress: this.transportPolicy !== 'public-only',
+            },
+            (socket: DhtSocket) => {
+                void this.handlePeerConnection(socket).catch((error: Error) => {
+                    this.log(`peer connection closed: ${error.message}`)
+                })
+            }
+        )
 
         await this.server.listen(keyPair)
         await this.tryRefreshPresence()
@@ -94,6 +104,7 @@ export class MurmurP2pDaemon {
         this.log(`peer id ${this.identity.peerId}`)
         this.log(`control socket ${this.controlSocketPath}`)
         this.log(`announced topic ${MURMUR_P2P_TOPIC}`)
+        this.log(`transport policy ${this.transportPolicy}`)
         if (this.transportDebug) {
             const serverAddress = this.server.address()
             this.log(
@@ -141,6 +152,7 @@ export class MurmurP2pDaemon {
             controlSocketPath: this.controlSocketPath,
             topic: MURMUR_P2P_TOPIC,
             bootstrap: formatBootstrapNodes(this.bootstrap),
+            transportPolicy: this.transportPolicy,
         }
     }
 
@@ -189,17 +201,21 @@ export class MurmurP2pDaemon {
                 )}`
             )
         }
-        const socket = dht.connect(to, targetPeer ? { nodes: targetPeer.relayNodes } : undefined)
+        const socket = dht.connect(to, {
+            nodes: targetPeer?.relayNodes,
+            localConnection: this.transportPolicy !== 'public-only',
+        })
 
         await waitForSocketOpen(socket)
+        const openSnapshot = snapshotTransport(socket)
+        const openMode = inferTransportMode(openSnapshot, targetPeer, this.requireServer().relayAddresses)
+        this.enforceTransportPolicy(socket, openSnapshot, openMode, `outbound ${to}`)
         if (this.transportDebug) {
-            const snapshot = snapshotTransport(socket)
-            const mode = inferTransportMode(snapshot, targetPeer, this.requireServer().relayAddresses)
             this.log(
                 formatTransportSnapshot(
                     `transport open target=${to} latencyMs=${Date.now() - connectStartedAt}`,
-                    snapshot,
-                    mode,
+                    openSnapshot,
+                    openMode,
                     'mode is inferred from the final endpoint versus known relay nodes'
                 )
             )
@@ -219,14 +235,15 @@ export class MurmurP2pDaemon {
 
         const ackStartedAt = Date.now()
         await awaitAck(socket, id, envelope)
+        const ackSnapshot = snapshotTransport(socket)
+        const ackMode = inferTransportMode(ackSnapshot, targetPeer, this.requireServer().relayAddresses)
+        this.enforceTransportPolicy(socket, ackSnapshot, ackMode, `outbound-ack ${to}`)
         if (this.transportDebug) {
-            const snapshot = snapshotTransport(socket)
-            const mode = inferTransportMode(snapshot, targetPeer, this.requireServer().relayAddresses)
             this.log(
                 formatTransportSnapshot(
                     `transport ack id=${id} ackLatencyMs=${Date.now() - ackStartedAt}`,
-                    snapshot,
-                    mode
+                    ackSnapshot,
+                    ackMode
                 )
             )
         }
@@ -303,14 +320,20 @@ export class MurmurP2pDaemon {
 
     private async handlePeerConnection(socket: DhtSocket): Promise<void> {
         const lines = createInterface({ input: socket })
+        const inboundSnapshot = snapshotTransport(socket)
+        const inboundMode = inferTransportMode(inboundSnapshot, undefined, this.requireServer().relayAddresses)
+        this.enforceTransportPolicy(
+            socket,
+            inboundSnapshot,
+            inboundMode,
+            `inbound ${toHex(socket.remotePublicKey)}`
+        )
         if (this.transportDebug) {
-            const snapshot = snapshotTransport(socket)
-            const mode = inferTransportMode(snapshot, undefined, this.requireServer().relayAddresses)
             this.log(
                 formatTransportSnapshot(
                     `transport inbound remoteKey=${toHex(socket.remotePublicKey)}`,
-                    snapshot,
-                    mode,
+                    inboundSnapshot,
+                    inboundMode,
                     'mode is inferred; HyperDHT does not expose relay choice directly'
                 )
             )
@@ -381,6 +404,21 @@ export class MurmurP2pDaemon {
             throw new Error('Daemon server is not running')
         }
         return this.server
+    }
+
+    private enforceTransportPolicy(
+        socket: DhtSocket,
+        snapshot: ReturnType<typeof snapshotTransport>,
+        mode: ReturnType<typeof inferTransportMode>,
+        label: string
+    ): void {
+        const violation = validateTransportPolicy(snapshot, mode, this.transportPolicy)
+        if (!violation) {
+            return
+        }
+
+        socket.destroy(new Error(`${violation} (${label})`))
+        throw new Error(`${violation} (${label})`)
     }
 }
 

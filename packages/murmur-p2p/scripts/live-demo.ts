@@ -4,9 +4,11 @@ import { join } from 'node:path'
 import process from 'node:process'
 import { MurmurP2pDaemon } from '../src/daemon.js'
 import { sendControlRequest } from '../src/control.js'
+import type { TransportPolicy } from '../src/types.js'
 
 async function main(): Promise<void> {
     const transportDebug = process.argv.includes('--transport-debug')
+    const transportPolicy = readTransportPolicy(process.argv)
     const aliceDir = await mkdtemp(join(tmpdir(), 'murmur-p2p-live-alice-'))
     const bobDir = await mkdtemp(join(tmpdir(), 'murmur-p2p-live-bob-'))
 
@@ -15,12 +17,14 @@ async function main(): Promise<void> {
         controlSocketPath: join(aliceDir, 'control.sock'),
         name: 'alice-live',
         transportDebug,
+        transportPolicy,
     })
     const bob = new MurmurP2pDaemon({
         dataDir: bobDir,
         controlSocketPath: join(bobDir, 'control.sock'),
         name: 'bob-live',
         transportDebug,
+        transportPolicy,
     })
 
     try {
@@ -93,6 +97,25 @@ async function main(): Promise<void> {
         await rm(aliceDir, { recursive: true, force: true })
         await rm(bobDir, { recursive: true, force: true })
     }
+}
+
+function readTransportPolicy(argv: string[]): TransportPolicy {
+    const index = argv.indexOf('--transport-policy')
+    if (index === -1) {
+        return 'any'
+    }
+
+    const value = argv[index + 1]
+    if (
+        value === 'any' ||
+        value === 'direct-only' ||
+        value === 'private-only' ||
+        value === 'public-only'
+    ) {
+        return value
+    }
+
+    throw new Error(`Invalid --transport-policy value: ${value ?? '<missing>'}`)
 }
 
 async function waitFor<T>(

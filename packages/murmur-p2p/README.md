@@ -15,6 +15,7 @@
 ```bash
 yarn dev server --name alice
 yarn dev server --name alice --transport-debug
+yarn dev server --name alice --transport-policy public-only
 yarn dev whoami
 yarn dev peers
 yarn dev send --to <peer-id> --message "hello"
@@ -33,6 +34,17 @@ Each daemon does four things:
 4. Accepts local control commands over a Unix socket and dials peers on demand.
 
 Messages are newline-delimited JSON frames over the encrypted HyperDHT socket. The control socket is also newline-delimited JSON to keep the CLI and daemon loosely coupled.
+
+## Transport policy
+
+The daemon can enforce routing policy with `--transport-policy`:
+
+- `any`: accept any successful HyperDHT path
+- `direct-only`: reject relay-assisted paths
+- `private-only`: require a private/LAN endpoint
+- `public-only`: disable LAN shortcuts and reject private endpoints
+
+`public-only` is strict. If the network cannot establish a public-route path, the connection fails. HyperDHT does not provide guaranteed public relaying by default, so `public-only` can fail on same-NAT or hard-NAT topologies.
 
 ## Prior art
 

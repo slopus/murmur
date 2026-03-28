@@ -29,6 +29,12 @@ const daemonInfoSchema = z.object({
     controlSocketPath: z.string().min(1),
     topic: z.string().min(1),
     bootstrap: z.array(z.string()),
+    transportPolicy: z.union([
+        z.literal('any'),
+        z.literal('direct-only'),
+        z.literal('private-only'),
+        z.literal('public-only'),
+    ]),
 })
 
 /**
