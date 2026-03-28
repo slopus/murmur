@@ -1,10 +1,12 @@
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import process from 'node:process'
 import { MurmurP2pDaemon } from '../src/daemon.js'
 import { sendControlRequest } from '../src/control.js'
 
 async function main(): Promise<void> {
+    const transportDebug = process.argv.includes('--transport-debug')
     const aliceDir = await mkdtemp(join(tmpdir(), 'murmur-p2p-live-alice-'))
     const bobDir = await mkdtemp(join(tmpdir(), 'murmur-p2p-live-bob-'))
 
@@ -12,11 +14,13 @@ async function main(): Promise<void> {
         dataDir: aliceDir,
         controlSocketPath: join(aliceDir, 'control.sock'),
         name: 'alice-live',
+        transportDebug,
     })
     const bob = new MurmurP2pDaemon({
         dataDir: bobDir,
         controlSocketPath: join(bobDir, 'control.sock'),
         name: 'bob-live',
+        transportDebug,
     })
 
     try {

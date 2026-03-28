@@ -38,6 +38,7 @@
     "test:watch": "vitest",
     "dev": "tsx src/cli.ts",
     "demo:live": "tsx scripts/live-demo.ts",
+    "demo:live-debug": "tsx scripts/live-demo.ts --transport-debug",
     "start": "node dist/cli.mjs",
     "prepublishOnly": "$npm_execpath run build && $npm_execpath test"
   },

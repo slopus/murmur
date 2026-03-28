@@ -43,6 +43,7 @@ declare module 'hyperdht' {
     export interface DhtSocket extends Duplex {
         remotePublicKey: Buffer
         publicKey: Buffer
+        toJSON(): unknown
     }
 
     export class DhtServer extends EventEmitter {

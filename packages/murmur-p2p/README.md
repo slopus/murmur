@@ -14,6 +14,7 @@
 
 ```bash
 yarn dev server --name alice
+yarn dev server --name alice --transport-debug
 yarn dev whoami
 yarn dev peers
 yarn dev send --to <peer-id> --message "hello"
@@ -53,3 +54,5 @@ yarn demo:live
 ```
 
 `yarn demo:live` starts two temporary daemons on the public HyperDHT, waits for discovery, sends a message through the local control socket, and verifies delivery.
+
+`yarn demo:live-debug` runs the same flow with low-level transport logging: announced relay nodes, connect latency, final UDX endpoint, local socket endpoint, RTT, and an inferred `direct` vs `relay-assisted` mode.

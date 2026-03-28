@@ -7,6 +7,7 @@ import { StateStore } from './store.js'
 import { keyPairFromIdentity } from './identity.js'
 import { messagesResponse, peersResponse, infoResponse, type ControlRequest, type ControlResponse, peerEnvelopeSchema, encodeFrame } from './protocol.js'
 import { sendControlRequest, startControlServer, stopControlServer } from './control.js'
+import { formatTransportSnapshot, inferTransportMode, snapshotTransport } from './transport-debug.js'
 import type {
     BootstrapNode,
     DaemonInfo,
@@ -40,6 +41,7 @@ export class MurmurP2pDaemon {
     private readonly log: (message: string) => void
     private readonly desiredName: string
     private readonly presenceRefreshMs: number
+    private readonly transportDebug: boolean
     private readonly store: StateStore
     private readonly topic = deriveTopicBuffer()
 
@@ -56,6 +58,7 @@ export class MurmurP2pDaemon {
         this.bootstrap = options.bootstrap ?? []
         this.desiredName = options.name?.trim() || 'murmur-p2p'
         this.presenceRefreshMs = options.presenceRefreshMs ?? DEFAULT_PRESENCE_REFRESH_MS
+        this.transportDebug = options.transportDebug ?? false
         this.log = options.log ?? ((message) => console.log(formatLogLine(message)))
         this.store = new StateStore(this.dataDir)
     }
@@ -91,6 +94,14 @@ export class MurmurP2pDaemon {
         this.log(`peer id ${this.identity.peerId}`)
         this.log(`control socket ${this.controlSocketPath}`)
         this.log(`announced topic ${MURMUR_P2P_TOPIC}`)
+        if (this.transportDebug) {
+            const serverAddress = this.server.address()
+            this.log(
+                `transport listen public=${serverAddress?.host ?? 'unknown'}:${
+                    serverAddress?.port ?? 0
+                } relayNodes=${JSON.stringify(this.server.relayAddresses)}`
+            )
+        }
     }
 
     /**
@@ -170,9 +181,29 @@ export class MurmurP2pDaemon {
         const identity = this.requireIdentity()
         const peers = await this.listPeers()
         const targetPeer = peers.find((peer) => peer.peerId === to)
+        const connectStartedAt = Date.now()
+        if (this.transportDebug) {
+            this.log(
+                `transport send target=${to} discoveredRelayNodes=${JSON.stringify(
+                    targetPeer?.relayNodes ?? []
+                )}`
+            )
+        }
         const socket = dht.connect(to, targetPeer ? { nodes: targetPeer.relayNodes } : undefined)
 
         await waitForSocketOpen(socket)
+        if (this.transportDebug) {
+            const snapshot = snapshotTransport(socket)
+            const mode = inferTransportMode(snapshot, targetPeer, this.requireServer().relayAddresses)
+            this.log(
+                formatTransportSnapshot(
+                    `transport open target=${to} latencyMs=${Date.now() - connectStartedAt}`,
+                    snapshot,
+                    mode,
+                    'mode is inferred from the final endpoint versus known relay nodes'
+                )
+            )
+        }
 
         const id = randomUUID()
         const sentAt = new Date().toISOString()
@@ -186,7 +217,19 @@ export class MurmurP2pDaemon {
             sentAt,
         }
 
+        const ackStartedAt = Date.now()
         await awaitAck(socket, id, envelope)
+        if (this.transportDebug) {
+            const snapshot = snapshotTransport(socket)
+            const mode = inferTransportMode(snapshot, targetPeer, this.requireServer().relayAddresses)
+            this.log(
+                formatTransportSnapshot(
+                    `transport ack id=${id} ackLatencyMs=${Date.now() - ackStartedAt}`,
+                    snapshot,
+                    mode
+                )
+            )
+        }
 
         const message: StoredMessage = {
             id,
@@ -260,6 +303,18 @@ export class MurmurP2pDaemon {
 
     private async handlePeerConnection(socket: DhtSocket): Promise<void> {
         const lines = createInterface({ input: socket })
+        if (this.transportDebug) {
+            const snapshot = snapshotTransport(socket)
+            const mode = inferTransportMode(snapshot, undefined, this.requireServer().relayAddresses)
+            this.log(
+                formatTransportSnapshot(
+                    `transport inbound remoteKey=${toHex(socket.remotePublicKey)}`,
+                    snapshot,
+                    mode,
+                    'mode is inferred; HyperDHT does not expose relay choice directly'
+                )
+            )
+        }
 
         socket.once('error', (error) => {
             this.log(`peer stream error: ${error.message}`)

@@ -85,6 +85,10 @@ function responseError(): Error {
     return new Error('Unexpected response from daemon')
 }
 
+function readBooleanOption(options: Record<string, string | boolean>, key: string): boolean {
+    return options[key] === true || options[key] === 'true'
+}
+
 async function main(): Promise<void> {
     const args = parseArgs(process.argv.slice(2))
     const dataDir = resolveDataDir(args.options)
@@ -101,6 +105,7 @@ async function main(): Promise<void> {
             controlSocketPath: socketPath,
             bootstrap: parseBootstrap(args.options),
             name: readStringOption(args.options, 'name'),
+            transportDebug: readBooleanOption(args.options, 'transport-debug'),
         })
 
         await daemon.start()

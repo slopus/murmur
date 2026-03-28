@@ -64,4 +64,5 @@ export interface MurmurP2pDaemonOptions {
     name?: string
     log?: (message: string) => void
     presenceRefreshMs?: number
+    transportDebug?: boolean
 }
