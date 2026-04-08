@@ -7,7 +7,7 @@ import { mkdtempSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { MurmurDatabase } from './database.js'
-import type { Account, StoredContact, StoredMessage } from './types.js'
+import type { Account, StoredContact, StoredFeed, StoredFeedItem, StoredMessage } from './types.js'
 import type { SerializedAgentState } from '../encryption/session/types.js'
 
 describe('MurmurDatabase', () => {
@@ -191,6 +191,96 @@ describe('MurmurDatabase', () => {
             expect(db.getSetting('default-allow')).toBeNull()
             db.setSetting('default-allow', 'true')
             expect(db.getSetting('default-allow')).toBe('true')
+        })
+    })
+
+    describe('Feeds', () => {
+        it('stores feeds, members, keys, and cached items', () => {
+            const feed: StoredFeed = {
+                feedId: 'feed-1',
+                ownerId: 'owner-1',
+                encryptedMetadata: 'encrypted-meta',
+                currentEpoch: 2,
+                createdAt: 100,
+                updatedAt: 200,
+                owned: true
+            }
+
+            db.saveFeed(feed)
+            db.replaceFeedMembers(feed.feedId, ['member-1', 'member-2'])
+            db.saveFeedKey({
+                feedId: feed.feedId,
+                epoch: 1,
+                key: 'key-1',
+                addedAt: 101
+            })
+            db.saveFeedKey({
+                feedId: feed.feedId,
+                epoch: 2,
+                key: 'key-2',
+                addedAt: 201
+            })
+            const item: StoredFeedItem = {
+                itemId: 'item-1',
+                feedId: feed.feedId,
+                authorId: 'owner-1',
+                epoch: 2,
+                text: 'hello feed',
+                signature: 'sig',
+                createdAt: 300,
+                attachments: [
+                    {
+                        fileName: 'a.txt',
+                        hash: 'hash',
+                        iv: 'iv',
+                        key: 'key',
+                        ciphertext: 'ciphertext'
+                    }
+                ]
+            }
+            db.saveFeedItem(item)
+
+            expect(db.getFeed(feed.feedId)).toEqual(feed)
+            expect(db.getFeeds(true)).toEqual([feed])
+            expect(db.getFeedMembers(feed.feedId).map(member => member.memberId)).toEqual(['member-1', 'member-2'])
+            expect(db.getFeedKey(feed.feedId, 2)?.key).toBe('key-2')
+            expect(db.getFeedKeys(feed.feedId)).toHaveLength(2)
+            expect(db.getFeedItems(feed.feedId)).toEqual([item])
+            expect(db.getTimelineFeedItems()).toEqual([item])
+        })
+
+        it('deletes feeds and cascades cached data', () => {
+            db.saveFeed({
+                feedId: 'feed-1',
+                ownerId: 'owner-1',
+                currentEpoch: 0,
+                createdAt: 1,
+                updatedAt: 1,
+                owned: false
+            })
+            db.replaceFeedMembers('feed-1', ['member-1'])
+            db.saveFeedKey({
+                feedId: 'feed-1',
+                epoch: 0,
+                key: 'key-0',
+                addedAt: 1
+            })
+            db.saveFeedItem({
+                itemId: 'item-1',
+                feedId: 'feed-1',
+                authorId: 'owner-1',
+                epoch: 0,
+                text: 'bye',
+                signature: 'sig',
+                createdAt: 2
+            })
+
+            db.deleteFeed('feed-1')
+
+            expect(db.getFeed('feed-1')).toBeNull()
+            expect(db.getFeedMembers('feed-1')).toEqual([])
+            expect(db.getFeedKeys('feed-1')).toEqual([])
+            expect(db.getFeedItems('feed-1')).toEqual([])
         })
     })
 

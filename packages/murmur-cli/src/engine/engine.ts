@@ -16,9 +16,28 @@ import { spawn } from 'node:child_process'
 import { createId } from '@paralleldrive/cuid2'
 import { gcm } from '@noble/ciphers/aes'
 import { sha256 } from '@noble/hashes/sha256'
-import { MurmurApi, type InboxMessage, type ServerProfile, type PublicProfile } from './api.js'
+import {
+    MurmurApi,
+    type FeedKeyRecord,
+    type FeedTimelineItem,
+    type FollowedFeedRecord,
+    type InboxMessage,
+    type OwnedFeedRecord,
+    type ServerProfile,
+    type PublicProfile
+} from './api.js'
 import { MurmurDatabase } from '../storage/database.js'
-import type { Account, StoredAttachment, StoredContact, StoredMessage, Contact, HookType, StoredHook } from '../storage/types.js'
+import type {
+    Account,
+    StoredAttachment,
+    StoredContact,
+    StoredFeed,
+    StoredFeedItem,
+    StoredMessage,
+    Contact,
+    HookType,
+    StoredHook
+} from '../storage/types.js'
 import { logger } from '../logger.js'
 import {
     createAgent,
@@ -41,7 +60,7 @@ import {
     getRandomBytes,
     zeroBytes
 } from '../encryption/crypto/utils.js'
-import { sign } from '../encryption/crypto/signing.js'
+import { sign, verify } from '../encryption/crypto/signing.js'
 import {
     encryptProfile,
     decryptProfile,
@@ -49,7 +68,21 @@ import {
     verifyProfileKeySignature,
     type Profile
 } from './profile.js'
-import { publicKeyFromPrivate } from '../encryption/crypto/dh.js'
+import {
+    deriveDhPublicKeyFromSigningPublicKey,
+    publicKeyFromPrivate
+} from '../encryption/crypto/dh.js'
+import {
+    decryptFeedItem,
+    decryptFeedKey,
+    decryptFeedMetadata,
+    deriveFeedKey,
+    encryptFeedItem,
+    encryptFeedKey,
+    encryptFeedMetadata,
+    type FeedItemContent,
+    type FeedMetadata
+} from '../encryption/feed/index.js'
 
 const DEFAULT_MESSAGE_MAX_CHARS = 20000
 const DEFAULT_ATTACHMENT_MAX_BYTES = 5 * 1024 * 1024
@@ -65,6 +98,7 @@ type AttachmentPayloadEntry = {
     hash: string
     iv: string
     key: string
+    ciphertext?: string
 }
 
 type AttachmentPayload = Record<string, AttachmentPayloadEntry>
@@ -81,6 +115,17 @@ type HookMessagePayload = {
     to: string
     text: string
     attachments: string[]
+}
+
+export interface Feed {
+    feedId: string
+    ownerId: string
+    name?: string
+    description?: string
+    currentEpoch: number
+    createdAt: number
+    updatedAt: number
+    owned: boolean
 }
 
 function truncateMessageText(text: string, maxChars: number): string {
@@ -198,6 +243,41 @@ function parseAttachmentPayload(value: unknown): AttachmentPayload | undefined {
     }
 
     return Object.keys(parsed).length > 0 ? parsed : undefined
+}
+
+function toFeedAttachmentPayload(attachments: StoredAttachment[]): NonNullable<FeedItemContent['attachments']> {
+    const payload: NonNullable<FeedItemContent['attachments']> = {}
+    for (const attachment of attachments) {
+        payload[attachment.fileName] = {
+            hash: attachment.hash,
+            iv: attachment.iv,
+            key: attachment.key,
+            ciphertext: attachment.ciphertext
+        }
+    }
+    return payload
+}
+
+function fromFeedAttachmentPayload(payload: FeedItemContent['attachments']): StoredAttachment[] | undefined {
+    if (!payload) {
+        return undefined
+    }
+
+    const attachments: StoredAttachment[] = []
+    for (const [fileName, entry] of Object.entries(payload)) {
+        if (!entry.ciphertext) {
+            continue
+        }
+        attachments.push({
+            fileName,
+            hash: entry.hash,
+            iv: entry.iv,
+            key: entry.key,
+            ciphertext: entry.ciphertext
+        })
+    }
+
+    return attachments.length > 0 ? attachments : undefined
 }
 
 function buildStoredAttachments(
@@ -1006,6 +1086,430 @@ export class MurmurEngine {
      */
     getMessages(contactIdentityKey: string, limit: number = 100): StoredMessage[] {
         return this.db.getMessages(contactIdentityKey, limit)
+    }
+
+    private getIdentityPrivateKey(): Uint8Array {
+        if (!this.agent) {
+            throw new Error('Not initialized')
+        }
+        return this.agent.keyStore.identityKeyPair.privateKey
+    }
+
+    private decodeStoredFeed(stored: StoredFeed): Feed {
+        let metadata: FeedMetadata | undefined
+        if (stored.owned && stored.encryptedMetadata) {
+            try {
+                metadata = decryptFeedMetadata(
+                    decodeBase64(stored.encryptedMetadata),
+                    this.getIdentityPrivateKey(),
+                    stored.feedId
+                )
+            } catch {
+                metadata = undefined
+            }
+        }
+
+        return {
+            feedId: stored.feedId,
+            ownerId: stored.ownerId,
+            name: metadata?.name,
+            description: metadata?.description,
+            currentEpoch: stored.currentEpoch,
+            createdAt: stored.createdAt,
+            updatedAt: stored.updatedAt,
+            owned: stored.owned
+        }
+    }
+
+    private saveOwnedFeedRecord(record: OwnedFeedRecord): void {
+        if (!this.account) {
+            throw new Error('Not initialized')
+        }
+        const existing = this.db.getFeed(record.feedId)
+        this.db.saveFeed({
+            feedId: record.feedId,
+            ownerId: this.account.identityKey,
+            encryptedMetadata: record.metadata,
+            currentEpoch: record.epoch,
+            createdAt: existing?.createdAt ?? record.createdAt,
+            updatedAt: record.updatedAt,
+            owned: true
+        })
+    }
+
+    private saveFollowedFeedRecord(record: FollowedFeedRecord): void {
+        const existing = this.db.getFeed(record.feedId)
+        this.db.saveFeed({
+            feedId: record.feedId,
+            ownerId: record.ownerId,
+            encryptedMetadata: existing?.encryptedMetadata,
+            currentEpoch: record.epoch,
+            createdAt: existing?.createdAt ?? Date.now(),
+            updatedAt: Date.now(),
+            owned: existing?.owned ?? false
+        })
+    }
+
+    private requireOwnedFeed(feedId: string): StoredFeed {
+        const feed = this.db.getFeed(feedId)
+        if (!feed || !feed.owned) {
+            throw new Error('Feed not found or not owned by this account')
+        }
+        return feed
+    }
+
+    private resolveFeedKey(feedId: string, epoch: number): Uint8Array {
+        const feed = this.db.getFeed(feedId)
+        if (feed?.owned) {
+            return deriveFeedKey(this.getIdentityPrivateKey(), feedId, epoch)
+        }
+
+        const storedKey = this.db.getFeedKey(feedId, epoch)
+        if (!storedKey) {
+            throw new Error(`Missing feed key for ${feedId} epoch ${epoch}`)
+        }
+        return decodeBase64(storedKey.key)
+    }
+
+    private buildEncryptedFeedMember(feedKey: Uint8Array, memberId: string): { memberId: string; encryptedKey: string } {
+        const recipientDhPublicKey = deriveDhPublicKeyFromSigningPublicKey(decodeBase64(memberId))
+        return {
+            memberId,
+            encryptedKey: encodeBase64(encryptFeedKey(feedKey, recipientDhPublicKey))
+        }
+    }
+
+    private async processFeedTimelineItem(item: FeedTimelineItem): Promise<StoredFeedItem | null> {
+        const blobBytes = decodeBase64(item.blob)
+        const signatureBytes = decodeBase64(item.signature)
+        const itemIdBytes = stringToBytes(item.itemId)
+        const signedPayload = new Uint8Array(blobBytes.length + itemIdBytes.length)
+        signedPayload.set(blobBytes, 0)
+        signedPayload.set(itemIdBytes, blobBytes.length)
+
+        if (!verify(signedPayload, signatureBytes, decodeBase64(item.authorId))) {
+            this.emit({ type: 'error', error: `Invalid feed item signature: ${item.itemId}` })
+            return null
+        }
+
+        const existingFeed = this.db.getFeed(item.feedId)
+        if (!existingFeed) {
+            this.db.saveFeed({
+                feedId: item.feedId,
+                ownerId: item.authorId,
+                currentEpoch: item.epoch,
+                createdAt: item.createdAt,
+                updatedAt: item.createdAt,
+                owned: Boolean(this.account && this.account.identityKey === item.authorId)
+            })
+        }
+
+        let content: FeedItemContent
+        try {
+            content = decryptFeedItem(blobBytes, this.resolveFeedKey(item.feedId, item.epoch))
+        } catch (error) {
+            this.emit({
+                type: 'error',
+                error: `Failed to decrypt feed item ${item.itemId}: ${error instanceof Error ? error.message : String(error)}`
+            })
+            return null
+        }
+
+        const stored: StoredFeedItem = {
+            itemId: item.itemId,
+            feedId: item.feedId,
+            authorId: item.authorId,
+            epoch: item.epoch,
+            text: content.text,
+            signature: item.signature,
+            createdAt: item.createdAt
+        }
+        const attachments = fromFeedAttachmentPayload(content.attachments)
+        if (attachments) {
+            stored.attachments = attachments
+        }
+
+        this.db.saveFeedItem(stored)
+        return stored
+    }
+
+    async getOwnedFeeds(): Promise<Feed[]> {
+        if (this.account) {
+            try {
+                const records = await this.requireAuthenticatedApi().getOwnedFeeds()
+                for (const record of records) {
+                    this.saveOwnedFeedRecord(record)
+                }
+            } catch (error) {
+                logger.warn(`Failed to refresh owned feeds: ${error instanceof Error ? error.message : String(error)}`)
+            }
+        }
+
+        return this.db.getFeeds(true).map(feed => this.decodeStoredFeed(feed))
+    }
+
+    getFeed(feedId: string): Feed | null {
+        const stored = this.db.getFeed(feedId)
+        return stored ? this.decodeStoredFeed(stored) : null
+    }
+
+    getTimelineFeedItems(limit: number = 50): StoredFeedItem[] {
+        return this.db.getTimelineFeedItems(limit)
+    }
+
+    getFeedItems(feedId: string, limit: number = 50): StoredFeedItem[] {
+        return this.db.getFeedItems(feedId, limit)
+    }
+
+    async createFeed(name: string, description?: string): Promise<Feed> {
+        if (!this.account) {
+            throw new Error('Not initialized')
+        }
+        const normalizedName = name.trim()
+        if (!normalizedName) {
+            throw new Error('Feed name is required')
+        }
+
+        const feedId = createId()
+        const metadataBlob = encryptFeedMetadata(
+            { name: normalizedName, description: description?.trim() || undefined },
+            this.getIdentityPrivateKey(),
+            feedId
+        )
+        const response = await this.requireAuthenticatedApi().createFeed(feedId, encodeBase64(metadataBlob))
+        const stored: StoredFeed = {
+            feedId,
+            ownerId: this.account.identityKey,
+            encryptedMetadata: encodeBase64(metadataBlob),
+            currentEpoch: 0,
+            createdAt: response.createdAt,
+            updatedAt: response.createdAt,
+            owned: true
+        }
+        this.db.saveFeed(stored)
+        this.db.saveFeedKey({
+            feedId,
+            epoch: 0,
+            key: encodeBase64(deriveFeedKey(this.getIdentityPrivateKey(), feedId, 0)),
+            addedAt: response.createdAt
+        })
+        this.db.replaceFeedMembers(feedId, [])
+        return this.decodeStoredFeed(stored)
+    }
+
+    async updateFeed(feedId: string, name: string, description?: string): Promise<Feed> {
+        const feed = this.requireOwnedFeed(feedId)
+        const normalizedName = name.trim()
+        if (!normalizedName) {
+            throw new Error('Feed name is required')
+        }
+
+        const metadataBlob = encryptFeedMetadata(
+            { name: normalizedName, description: description?.trim() || undefined },
+            this.getIdentityPrivateKey(),
+            feedId
+        )
+        const response = await this.requireAuthenticatedApi().updateFeed(feedId, encodeBase64(metadataBlob))
+        const updated: StoredFeed = {
+            ...feed,
+            encryptedMetadata: encodeBase64(metadataBlob),
+            updatedAt: response.updatedAt
+        }
+        this.db.saveFeed(updated)
+        return this.decodeStoredFeed(updated)
+    }
+
+    async deleteFeed(feedId: string): Promise<void> {
+        this.requireOwnedFeed(feedId)
+        await this.requireAuthenticatedApi().deleteFeed(feedId)
+        this.db.deleteFeed(feedId)
+    }
+
+    async addFeedMembers(feedId: string, memberIdentityKeys: string[]): Promise<number> {
+        const feed = this.requireOwnedFeed(feedId)
+        const uniqueMemberIds = Array.from(new Set(memberIdentityKeys.map(memberId => memberId.trim()).filter(Boolean)))
+        if (uniqueMemberIds.length === 0) {
+            return 0
+        }
+
+        const feedKey = this.resolveFeedKey(feedId, feed.currentEpoch)
+        const members = uniqueMemberIds.map(memberId => this.buildEncryptedFeedMember(feedKey, memberId))
+        const added = await this.requireAuthenticatedApi().addFeedMembers(feedId, feed.currentEpoch, members)
+        const existingMembers = new Set(this.db.getFeedMembers(feedId).map(member => member.memberId))
+        for (const memberId of uniqueMemberIds) {
+            existingMembers.add(memberId)
+        }
+        this.db.replaceFeedMembers(feedId, [...existingMembers])
+        this.db.saveFeed({ ...feed, updatedAt: Date.now() })
+        return added
+    }
+
+    async removeFeedMembers(feedId: string, memberIdentityKeys: string[]): Promise<number> {
+        const feed = this.requireOwnedFeed(feedId)
+        const removals = new Set(memberIdentityKeys.map(memberId => memberId.trim()).filter(Boolean))
+        if (removals.size === 0) {
+            return 0
+        }
+
+        const removed = await this.requireAuthenticatedApi().removeFeedMembers(feedId, [...removals])
+        const remainingMembers = this.db.getFeedMembers(feedId)
+            .map(member => member.memberId)
+            .filter(memberId => !removals.has(memberId))
+
+        let nextEpoch = feed.currentEpoch
+        if (remainingMembers.length > 0) {
+            nextEpoch = feed.currentEpoch + 1
+            const nextKey = deriveFeedKey(this.getIdentityPrivateKey(), feedId, nextEpoch)
+            const rotatedMembers = remainingMembers.map(memberId => this.buildEncryptedFeedMember(nextKey, memberId))
+            await this.requireAuthenticatedApi().rotateFeedKeys(feedId, nextEpoch, rotatedMembers)
+            this.db.saveFeedKey({
+                feedId,
+                epoch: nextEpoch,
+                key: encodeBase64(nextKey),
+                addedAt: Date.now()
+            })
+        }
+
+        this.db.replaceFeedMembers(feedId, remainingMembers)
+        this.db.saveFeed({
+            ...feed,
+            currentEpoch: nextEpoch,
+            updatedAt: Date.now()
+        })
+        return removed
+    }
+
+    async syncFeedKeys(): Promise<number> {
+        if (!this.account) {
+            throw new Error('Not initialized')
+        }
+
+        const [followedFeeds, keys] = await Promise.all([
+            this.requireAuthenticatedApi().getFollowedFeeds(),
+            this.requireAuthenticatedApi().getFeedKeys()
+        ])
+
+        for (const feed of followedFeeds) {
+            this.saveFollowedFeedRecord(feed)
+        }
+
+        let synced = 0
+        for (const key of keys) {
+            if (this.db.getFeedKey(key.feedId, key.epoch)) {
+                continue
+            }
+            const decrypted = decryptFeedKey(decodeBase64(key.encryptedKey), this.getIdentityPrivateKey())
+            this.db.saveFeedKey({
+                feedId: key.feedId,
+                epoch: key.epoch,
+                key: encodeBase64(decrypted),
+                addedAt: Date.now()
+            })
+            synced += 1
+        }
+
+        return synced
+    }
+
+    async postFeedItem(feedId: string, text: string, itemId: string, attachments: string[] = []): Promise<StoredFeedItem> {
+        const feed = this.requireOwnedFeed(feedId)
+        if (!this.account) {
+            throw new Error('Not initialized')
+        }
+        if (!itemId || itemId.trim().length === 0) {
+            throw new Error('Item ID is required')
+        }
+
+        const trimmedText = text.trim()
+        if (!trimmedText) {
+            throw new Error('Feed post cannot be empty')
+        }
+
+        const attachmentSources = attachments.length > 0 ? collectAttachmentSources(attachments) : []
+        if (attachmentSources.length > 0) {
+            validateAttachmentSizes(attachmentSources, this.getAttachmentMaxBytes())
+        }
+        const attachmentData = attachmentSources.length > 0 ? createOutgoingAttachments(attachmentSources) : undefined
+
+        const content: FeedItemContent = {
+            text: truncateMessageText(trimmedText, this.getMessageMaxChars())
+        }
+        if (attachmentData) {
+            content.attachments = toFeedAttachmentPayload(attachmentData.stored)
+        }
+
+        const blobBytes = encryptFeedItem(content, this.resolveFeedKey(feedId, feed.currentEpoch))
+        const itemIdBytes = stringToBytes(itemId)
+        const signaturePayload = new Uint8Array(blobBytes.length + itemIdBytes.length)
+        signaturePayload.set(blobBytes, 0)
+        signaturePayload.set(itemIdBytes, blobBytes.length)
+        const signature = encodeBase64(sign(signaturePayload, this.getIdentityPrivateKey()))
+        const result = await this.requireAuthenticatedApi().postFeedItem(
+            feedId,
+            itemId,
+            feed.currentEpoch,
+            encodeBase64(blobBytes),
+            signature
+        )
+
+        const stored: StoredFeedItem = {
+            itemId,
+            feedId,
+            authorId: this.account.identityKey,
+            epoch: feed.currentEpoch,
+            text: content.text,
+            signature,
+            createdAt: result.createdAt
+        }
+        if (attachmentData?.stored.length) {
+            stored.attachments = attachmentData.stored
+        }
+        this.db.saveFeedItem(stored)
+        this.db.saveFeed({ ...feed, updatedAt: result.createdAt })
+        return stored
+    }
+
+    async fetchFeedTimeline(
+        limit: number = 50,
+        cursor?: string
+    ): Promise<{ items: StoredFeedItem[]; nextCursor: string | null; hasMore: boolean }> {
+        await this.getOwnedFeeds()
+        await this.syncFeedKeys()
+        const result = await this.requireAuthenticatedApi().getFeedTimeline(limit, cursor)
+        const items: StoredFeedItem[] = []
+        for (const item of result.items) {
+            const stored = await this.processFeedTimelineItem(item)
+            if (stored) {
+                items.push(stored)
+            }
+        }
+        return {
+            items,
+            nextCursor: result.nextCursor,
+            hasMore: result.hasMore
+        }
+    }
+
+    async fetchFeedItems(
+        feedId: string,
+        limit: number = 50,
+        cursor?: string
+    ): Promise<{ items: StoredFeedItem[]; nextCursor: string | null; hasMore: boolean }> {
+        await this.getOwnedFeeds()
+        await this.syncFeedKeys()
+        const result = await this.requireAuthenticatedApi().getFeedItems(feedId, limit, cursor)
+        const items: StoredFeedItem[] = []
+        for (const item of result.items) {
+            const stored = await this.processFeedTimelineItem(item)
+            if (stored) {
+                items.push(stored)
+            }
+        }
+        return {
+            items,
+            nextCursor: result.nextCursor,
+            hasMore: result.hasMore
+        }
     }
 
     /**

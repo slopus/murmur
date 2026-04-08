@@ -93,4 +93,24 @@ export const rateLimitConfigs = {
             retryAfter: 3600,
         }),
     },
+
+    feedWrite: {
+        max: 200,
+        timeWindow: '1 hour',
+        keyGenerator: getAuthenticatedRateLimitKey,
+        errorResponseBuilder: () => ({
+            error: 'Feed write rate limit exceeded. Max 200 requests per hour.',
+            retryAfter: 3600,
+        }),
+    },
+
+    feedRead: {
+        max: 1000,
+        timeWindow: '1 hour',
+        keyGenerator: getAuthenticatedRateLimitKey,
+        errorResponseBuilder: () => ({
+            error: 'Feed read rate limit exceeded. Max 1000 requests per hour.',
+            retryAfter: 3600,
+        }),
+    },
 };

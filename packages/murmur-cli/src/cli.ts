@@ -374,6 +374,13 @@ function printUsage(): void {
         '  murmur contacts remove <id>',
         '  murmur contacts block <id>',
         '  murmur contacts unblock <id>',
+        '  murmur feed create --name <name> [--description <text>]',
+        '  murmur feed list',
+        '  murmur feed members add --feed <id> --member <profile-id> [--member <profile-id> ...]',
+        '  murmur feed members remove --feed <id> --member <profile-id> [--member <profile-id> ...]',
+        '  murmur feed post --feed <id> --message <text> [--attach <path> ...]',
+        '  murmur feed timeline [--limit <n>]',
+        '  murmur feed items --feed <id> [--limit <n>]',
         '  murmur configure [permissions:default-allow|permissions:default-deny|message-max-chars:<number>|attachment-max-bytes:<number>]',
         '  murmur profile <profile-secret>',
         '  murmur public-profile get <username>',
@@ -452,6 +459,10 @@ function formatWebhookSenderId(contact: Contact | undefined, fallbackIdentityKey
         return formatProfileSecretKey(contact.profileSecretKey)
     }
     return formatIdentityKey(fallbackIdentityKey)
+}
+
+function formatFeedLabel(feed: { name?: string; feedId: string }): string {
+    return feed.name && feed.name.trim().length > 0 ? `${feed.name} (${feed.feedId})` : feed.feedId
 }
 
 function printMessageBlock(message: StoredMessage, senderId: string, senderName: string): void {
@@ -779,6 +790,122 @@ async function run(): Promise<void> {
                 }
 
                 throw new Error(`Unknown contacts action: ${action}`)
+            }
+            case 'feed': {
+                await requireInitialized(getEngine())
+                const action = parsed.positionals[0] ?? 'list'
+
+                if (action === 'create') {
+                    const name = requireStringOption(parsed.options, 'name')
+                    const description = readStringOption(parsed.options, 'description')
+                    const feed = await getEngine().createFeed(name, description)
+                    logger.info(`Created feed ${formatFeedLabel(feed)}`)
+                    return
+                }
+
+                if (action === 'list') {
+                    const feeds = await getEngine().getOwnedFeeds()
+                    if (feeds.length === 0) {
+                        logger.info('No owned feeds.')
+                        return
+                    }
+                    logger.info('Owned feeds:')
+                    for (const feed of feeds) {
+                        console.log(`${formatFeedLabel(feed)} [epoch ${feed.currentEpoch}]`)
+                    }
+                    return
+                }
+
+                if (action === 'members') {
+                    const memberAction = parsed.positionals[1]
+                    const feedId = requireStringOption(parsed.options, 'feed')
+                    const memberIds = readStringArrayOption(parsed.options, 'member')
+                    if (!memberAction || (memberAction !== 'add' && memberAction !== 'remove')) {
+                        throw new Error('Usage: murmur feed members add|remove --feed <id> --member <profile-id> [...]')
+                    }
+                    if (memberIds.length === 0) {
+                        throw new Error('At least one --member is required')
+                    }
+
+                    const resolvedMembers = memberIds.map(memberId => resolveContactByProfileSecret(getEngine(), memberId).identityKey)
+                    if (memberAction === 'add') {
+                        const added = await getEngine().addFeedMembers(feedId, resolvedMembers)
+                        logger.info(`Added ${added} member${added === 1 ? '' : 's'} to ${feedId}`)
+                    } else {
+                        const removed = await getEngine().removeFeedMembers(feedId, resolvedMembers)
+                        logger.info(`Removed ${removed} member${removed === 1 ? '' : 's'} from ${feedId}`)
+                    }
+                    return
+                }
+
+                if (action === 'post') {
+                    const feedId = requireStringOption(parsed.options, 'feed')
+                    const message = requireStringOption(parsed.options, 'message')
+                    const attachments = readStringArrayOption(parsed.options, 'attach')
+                    const item = await getEngine().postFeedItem(feedId, message, createId(), attachments)
+                    logger.info(`Posted ${item.itemId} to ${feedId} at ${formatTimestamp(item.createdAt)}`)
+                    return
+                }
+
+                if (action === 'timeline') {
+                    const limit = readNumberOption(parsed.options, 'limit', 'MURMUR_LIMIT') ?? 20
+                    if (limit <= 0) {
+                        throw new Error('Limit must be a positive number.')
+                    }
+
+                    const result = await getEngine().fetchFeedTimeline(limit)
+                    if (result.items.length === 0) {
+                        logger.info('No feed items.')
+                        return
+                    }
+
+                    logger.info(`Latest ${result.items.length} feed item${result.items.length === 1 ? '' : 's'}:`)
+                    for (const item of result.items) {
+                        const feed = getEngine().getFeed(item.feedId) ?? { feedId: item.feedId }
+                        console.log('----')
+                        console.log(`Feed: ${formatFeedLabel(feed)}`)
+                        console.log(`Item ID: ${item.itemId}`)
+                        console.log(`Author: ${formatIdentityKey(item.authorId)}`)
+                        console.log(`Date: ${formatTimestamp(item.createdAt)}`)
+                        if (item.attachments?.length) {
+                            console.log(`Attachments: ${item.attachments.map(attachment => attachment.fileName).join(', ')}`)
+                        }
+                        console.log(item.text)
+                        console.log('----')
+                    }
+                    return
+                }
+
+                if (action === 'items') {
+                    const feedId = requireStringOption(parsed.options, 'feed')
+                    const limit = readNumberOption(parsed.options, 'limit', 'MURMUR_LIMIT') ?? 20
+                    if (limit <= 0) {
+                        throw new Error('Limit must be a positive number.')
+                    }
+
+                    const result = await getEngine().fetchFeedItems(feedId, limit)
+                    if (result.items.length === 0) {
+                        logger.info(`No feed items for ${feedId}.`)
+                        return
+                    }
+
+                    const feed = getEngine().getFeed(feedId) ?? { feedId }
+                    logger.info(`Latest ${result.items.length} item${result.items.length === 1 ? '' : 's'} for ${formatFeedLabel(feed)}:`)
+                    for (const item of result.items) {
+                        console.log('----')
+                        console.log(`Item ID: ${item.itemId}`)
+                        console.log(`Author: ${formatIdentityKey(item.authorId)}`)
+                        console.log(`Date: ${formatTimestamp(item.createdAt)}`)
+                        if (item.attachments?.length) {
+                            console.log(`Attachments: ${item.attachments.map(attachment => attachment.fileName).join(', ')}`)
+                        }
+                        console.log(item.text)
+                        console.log('----')
+                    }
+                    return
+                }
+
+                throw new Error(`Unknown feed action: ${action}`)
             }
             case 'configure': {
                 await requireInitialized(getEngine())

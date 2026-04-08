@@ -17,5 +17,8 @@ export * from './ratchet/index.js'
 // Export X3DH key agreement
 export * from './x3dh/index.js'
 
+// Export feed encryption helpers
+export * from './feed/index.js'
+
 // Export Session management
 export * from './session/index.js'

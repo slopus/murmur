@@ -10,7 +10,18 @@ import { mkdirSync, existsSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { createId } from '@paralleldrive/cuid2'
-import type { StoredAttachment, StoredContact, StoredMessage, Account, StoredHook, HookType } from './types.js'
+import type {
+    StoredAttachment,
+    StoredContact,
+    StoredFeed,
+    StoredFeedItem,
+    StoredFeedKey,
+    StoredFeedMember,
+    StoredMessage,
+    Account,
+    StoredHook,
+    HookType
+} from './types.js'
 import type { SerializedAgentState } from '../encryption/session/types.js'
 
 /**
@@ -170,6 +181,55 @@ export class MurmurDatabase {
                         value TEXT NOT NULL
                     );
                 `
+            },
+            {
+                id: '202604070001_add_feeds',
+                up: `
+                    CREATE TABLE IF NOT EXISTS feeds (
+                        feed_id TEXT PRIMARY KEY,
+                        owner_id TEXT NOT NULL,
+                        encrypted_metadata TEXT,
+                        current_epoch INTEGER NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        owned INTEGER NOT NULL DEFAULT 0
+                    );
+
+                    CREATE TABLE IF NOT EXISTS feed_members (
+                        feed_id TEXT NOT NULL,
+                        member_id TEXT NOT NULL,
+                        added_at INTEGER NOT NULL,
+                        PRIMARY KEY (feed_id, member_id),
+                        FOREIGN KEY (feed_id) REFERENCES feeds(feed_id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS feed_keys (
+                        feed_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        key TEXT NOT NULL,
+                        added_at INTEGER NOT NULL,
+                        PRIMARY KEY (feed_id, epoch),
+                        FOREIGN KEY (feed_id) REFERENCES feeds(feed_id) ON DELETE CASCADE
+                    );
+
+                    CREATE TABLE IF NOT EXISTS feed_items (
+                        item_id TEXT PRIMARY KEY,
+                        feed_id TEXT NOT NULL,
+                        author_id TEXT NOT NULL,
+                        epoch INTEGER NOT NULL,
+                        text TEXT NOT NULL,
+                        attachments_json TEXT,
+                        signature TEXT NOT NULL,
+                        created_at INTEGER NOT NULL,
+                        FOREIGN KEY (feed_id) REFERENCES feeds(feed_id) ON DELETE CASCADE
+                    );
+
+                    CREATE INDEX IF NOT EXISTS idx_feed_items_created_at
+                    ON feed_items(created_at DESC, item_id DESC);
+
+                    CREATE INDEX IF NOT EXISTS idx_feed_items_feed
+                    ON feed_items(feed_id, created_at DESC, item_id DESC);
+                `
             }
         ]
 
@@ -296,6 +356,10 @@ export class MurmurDatabase {
         try {
             this.db.exec('DELETE FROM settings')
             this.db.exec('DELETE FROM hooks')
+            this.db.exec('DELETE FROM feed_items')
+            this.db.exec('DELETE FROM feed_keys')
+            this.db.exec('DELETE FROM feed_members')
+            this.db.exec('DELETE FROM feeds')
             this.db.exec('DELETE FROM attachments')
             this.db.exec('DELETE FROM messages')
             this.db.exec('DELETE FROM contacts')
@@ -850,6 +914,282 @@ export class MurmurDatabase {
         }
 
         return attachments
+    }
+
+    getFeeds(owned?: boolean): StoredFeed[] {
+        const rows = owned === undefined
+            ? this.db.prepare(`
+                SELECT feed_id, owner_id, encrypted_metadata, current_epoch, created_at, updated_at, owned
+                FROM feeds
+                ORDER BY updated_at DESC
+            `).all()
+            : this.db.prepare(`
+                SELECT feed_id, owner_id, encrypted_metadata, current_epoch, created_at, updated_at, owned
+                FROM feeds
+                WHERE owned = ?
+                ORDER BY updated_at DESC
+            `).all(owned ? 1 : 0)
+
+        return (rows as Array<{
+            feed_id: string
+            owner_id: string
+            encrypted_metadata: string | null
+            current_epoch: number
+            created_at: number
+            updated_at: number
+            owned: number
+        }>).map(row => ({
+            feedId: row.feed_id,
+            ownerId: row.owner_id,
+            encryptedMetadata: row.encrypted_metadata ?? undefined,
+            currentEpoch: row.current_epoch,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            owned: row.owned === 1
+        }))
+    }
+
+    getFeed(feedId: string): StoredFeed | null {
+        const row = this.db.prepare(`
+            SELECT feed_id, owner_id, encrypted_metadata, current_epoch, created_at, updated_at, owned
+            FROM feeds
+            WHERE feed_id = ?
+            LIMIT 1
+        `).get(feedId) as {
+            feed_id: string
+            owner_id: string
+            encrypted_metadata: string | null
+            current_epoch: number
+            created_at: number
+            updated_at: number
+            owned: number
+        } | undefined
+
+        if (!row) {
+            return null
+        }
+
+        return {
+            feedId: row.feed_id,
+            ownerId: row.owner_id,
+            encryptedMetadata: row.encrypted_metadata ?? undefined,
+            currentEpoch: row.current_epoch,
+            createdAt: row.created_at,
+            updatedAt: row.updated_at,
+            owned: row.owned === 1
+        }
+    }
+
+    saveFeed(feed: StoredFeed): void {
+        this.db.prepare(`
+            INSERT OR REPLACE INTO feeds
+            (feed_id, owner_id, encrypted_metadata, current_epoch, created_at, updated_at, owned)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            feed.feedId,
+            feed.ownerId,
+            feed.encryptedMetadata ?? null,
+            feed.currentEpoch,
+            feed.createdAt,
+            feed.updatedAt,
+            feed.owned ? 1 : 0
+        )
+    }
+
+    deleteFeed(feedId: string): void {
+        this.db.prepare('DELETE FROM feeds WHERE feed_id = ?').run(feedId)
+    }
+
+    getFeedMembers(feedId: string): StoredFeedMember[] {
+        const rows = this.db.prepare(`
+            SELECT feed_id, member_id, added_at
+            FROM feed_members
+            WHERE feed_id = ?
+            ORDER BY member_id ASC
+        `).all(feedId) as Array<{
+            feed_id: string
+            member_id: string
+            added_at: number
+        }>
+
+        return rows.map(row => ({
+            feedId: row.feed_id,
+            memberId: row.member_id,
+            addedAt: row.added_at
+        }))
+    }
+
+    replaceFeedMembers(feedId: string, memberIds: string[]): void {
+        const now = Date.now()
+        this.db.exec('BEGIN')
+        try {
+            this.db.prepare('DELETE FROM feed_members WHERE feed_id = ?').run(feedId)
+            const insert = this.db.prepare(`
+                INSERT INTO feed_members (feed_id, member_id, added_at)
+                VALUES (?, ?, ?)
+            `)
+            for (const memberId of memberIds) {
+                insert.run(feedId, memberId, now)
+            }
+            this.db.exec('COMMIT')
+        } catch (error) {
+            this.db.exec('ROLLBACK')
+            throw error
+        }
+    }
+
+    saveFeedKey(feedKey: StoredFeedKey): void {
+        this.db.prepare(`
+            INSERT OR REPLACE INTO feed_keys (feed_id, epoch, key, added_at)
+            VALUES (?, ?, ?, ?)
+        `).run(feedKey.feedId, feedKey.epoch, feedKey.key, feedKey.addedAt)
+    }
+
+    getFeedKey(feedId: string, epoch: number): StoredFeedKey | null {
+        const row = this.db.prepare(`
+            SELECT feed_id, epoch, key, added_at
+            FROM feed_keys
+            WHERE feed_id = ? AND epoch = ?
+            LIMIT 1
+        `).get(feedId, epoch) as {
+            feed_id: string
+            epoch: number
+            key: string
+            added_at: number
+        } | undefined
+
+        if (!row) {
+            return null
+        }
+
+        return {
+            feedId: row.feed_id,
+            epoch: row.epoch,
+            key: row.key,
+            addedAt: row.added_at
+        }
+    }
+
+    getFeedKeys(feedId: string): StoredFeedKey[] {
+        const rows = this.db.prepare(`
+            SELECT feed_id, epoch, key, added_at
+            FROM feed_keys
+            WHERE feed_id = ?
+            ORDER BY epoch ASC
+        `).all(feedId) as Array<{
+            feed_id: string
+            epoch: number
+            key: string
+            added_at: number
+        }>
+
+        return rows.map(row => ({
+            feedId: row.feed_id,
+            epoch: row.epoch,
+            key: row.key,
+            addedAt: row.added_at
+        }))
+    }
+
+    saveFeedItem(item: StoredFeedItem): void {
+        this.db.prepare(`
+            INSERT OR REPLACE INTO feed_items
+            (item_id, feed_id, author_id, epoch, text, attachments_json, signature, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `).run(
+            item.itemId,
+            item.feedId,
+            item.authorId,
+            item.epoch,
+            item.text,
+            JSON.stringify(item.attachments ?? []),
+            item.signature,
+            item.createdAt
+        )
+    }
+
+    getTimelineFeedItems(limit: number = 50): StoredFeedItem[] {
+        const rows = this.db.prepare(`
+            SELECT item_id, feed_id, author_id, epoch, text, attachments_json, signature, created_at
+            FROM feed_items
+            ORDER BY created_at DESC, item_id DESC
+            LIMIT ?
+        `).all(limit) as Array<{
+            item_id: string
+            feed_id: string
+            author_id: string
+            epoch: number
+            text: string
+            attachments_json: string | null
+            signature: string
+            created_at: number
+        }>
+
+        return rows.map(row => ({
+            itemId: row.item_id,
+            feedId: row.feed_id,
+            authorId: row.author_id,
+            epoch: row.epoch,
+            text: row.text,
+            attachments: this.parseStoredAttachments(row.attachments_json),
+            signature: row.signature,
+            createdAt: row.created_at
+        }))
+    }
+
+    getFeedItems(feedId: string, limit: number = 50): StoredFeedItem[] {
+        const rows = this.db.prepare(`
+            SELECT item_id, feed_id, author_id, epoch, text, attachments_json, signature, created_at
+            FROM feed_items
+            WHERE feed_id = ?
+            ORDER BY created_at DESC, item_id DESC
+            LIMIT ?
+        `).all(feedId, limit) as Array<{
+            item_id: string
+            feed_id: string
+            author_id: string
+            epoch: number
+            text: string
+            attachments_json: string | null
+            signature: string
+            created_at: number
+        }>
+
+        return rows.map(row => ({
+            itemId: row.item_id,
+            feedId: row.feed_id,
+            authorId: row.author_id,
+            epoch: row.epoch,
+            text: row.text,
+            attachments: this.parseStoredAttachments(row.attachments_json),
+            signature: row.signature,
+            createdAt: row.created_at
+        }))
+    }
+
+    private parseStoredAttachments(value: string | null): StoredAttachment[] | undefined {
+        if (!value) {
+            return undefined
+        }
+
+        try {
+            const parsed = JSON.parse(value) as unknown
+            if (!Array.isArray(parsed)) {
+                return undefined
+            }
+            const attachments = parsed.filter((entry): entry is StoredAttachment => (
+                typeof entry === 'object'
+                && entry !== null
+                && typeof (entry as StoredAttachment).fileName === 'string'
+                && typeof (entry as StoredAttachment).hash === 'string'
+                && typeof (entry as StoredAttachment).iv === 'string'
+                && typeof (entry as StoredAttachment).key === 'string'
+                && typeof (entry as StoredAttachment).ciphertext === 'string'
+            ))
+            return attachments.length > 0 ? attachments : undefined
+        } catch {
+            return undefined
+        }
     }
 
     /**

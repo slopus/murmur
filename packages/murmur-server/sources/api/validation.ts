@@ -19,6 +19,10 @@ export const SIZE_LIMITS = {
     PUBLIC_PROFILE_DESCRIPTION: 1000, // 1KB of text
     PUBLIC_PROFILE_AVATAR: 1 * 1024 * 1024, // 1MB
     PUBLIC_PROFILE_THUMBHASH: 1024, // 1KB
+    FEED_METADATA_BLOB: 16 * 1024,
+    FEED_ITEM_BLOB: 10 * 1024 * 1024,
+    FEED_ID: 256,
+    FEED_MEMBER_COUNT: 200,
 } as const;
 
 /**
@@ -158,4 +162,22 @@ export function validatePublicProfileData(data: {
         }
         validateStringLength(data.avatarThumbhash, SIZE_LIMITS.PUBLIC_PROFILE_THUMBHASH, 'thumbhash');
     }
+}
+
+export function validateFeedMetadata(metadata: string): void {
+    validateBlobSize(metadata, SIZE_LIMITS.FEED_METADATA_BLOB, 'metadata');
+}
+
+export function validateFeedItemData(data: {
+    itemId: string
+    blob: string
+    signature: string
+}): void {
+    validateStringLength(data.itemId, SIZE_LIMITS.MESSAGE_ID, 'itemId');
+    validateBlobSize(data.blob, SIZE_LIMITS.FEED_ITEM_BLOB, 'blob');
+    validateBlobSize(data.signature, SIZE_LIMITS.SIGNATURE, 'signature');
+}
+
+export function validateFeedKeyData(encryptedKey: string): void {
+    validateBlobSize(encryptedKey, SIZE_LIMITS.FEED_ITEM_BLOB, 'encryptedKey');
 }

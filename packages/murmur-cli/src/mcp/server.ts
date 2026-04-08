@@ -216,6 +216,88 @@ export async function startMcpServer(): Promise<void> {
                 }
             },
             {
+                name: 'feeds.list',
+                description: 'List feeds you own.',
+                inputSchema: { type: 'object', properties: {}, additionalProperties: false }
+            },
+            {
+                name: 'feeds.create',
+                description: 'Create a new feed.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        name: { type: 'string' },
+                        description: { type: 'string' }
+                    },
+                    required: ['name'],
+                    additionalProperties: false
+                }
+            },
+            {
+                name: 'feeds.members.add',
+                description: 'Add members to a feed.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        feedId: { type: 'string' },
+                        members: { type: 'array', items: { type: 'string' } }
+                    },
+                    required: ['feedId', 'members'],
+                    additionalProperties: false
+                }
+            },
+            {
+                name: 'feeds.members.remove',
+                description: 'Remove members from a feed and rotate the key.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        feedId: { type: 'string' },
+                        members: { type: 'array', items: { type: 'string' } }
+                    },
+                    required: ['feedId', 'members'],
+                    additionalProperties: false
+                }
+            },
+            {
+                name: 'feeds.post',
+                description: 'Post to a feed.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        feedId: { type: 'string' },
+                        message: { type: 'string' },
+                        attachments: { type: 'array', items: { type: 'string' } }
+                    },
+                    required: ['feedId', 'message'],
+                    additionalProperties: false
+                }
+            },
+            {
+                name: 'feeds.timeline',
+                description: 'Fetch the feed timeline.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        limit: { type: 'number' }
+                    },
+                    additionalProperties: false
+                }
+            },
+            {
+                name: 'feeds.items',
+                description: 'Fetch items for a specific feed.',
+                inputSchema: {
+                    type: 'object',
+                    properties: {
+                        feedId: { type: 'string' },
+                        limit: { type: 'number' }
+                    },
+                    required: ['feedId'],
+                    additionalProperties: false
+                }
+            },
+            {
                 name: 'profile.me',
                 description: 'Fetch the local profile.',
                 inputSchema: { type: 'object', properties: {}, additionalProperties: false }
@@ -373,6 +455,67 @@ export async function startMcpServer(): Promise<void> {
                 const messageIds = ids.filter((item): item is string => typeof item === 'string')
                 await engine.acknowledgeMessages(messageIds)
                 return textResult({ acknowledged: messageIds.length })
+            }
+            case 'feeds.list': {
+                const feeds = await engine.getOwnedFeeds()
+                return textResult({
+                    feeds: feeds.map(feed => ({
+                        feedId: feed.feedId,
+                        name: feed.name,
+                        description: feed.description,
+                        currentEpoch: feed.currentEpoch
+                    }))
+                })
+            }
+            case 'feeds.create': {
+                const name = args.name
+                const description = args.description
+                if (typeof name !== 'string') {
+                    throw new Error('Missing feed name')
+                }
+                const feed = await engine.createFeed(name, typeof description === 'string' ? description : undefined)
+                return textResult(feed)
+            }
+            case 'feeds.members.add':
+            case 'feeds.members.remove': {
+                const feedId = args.feedId
+                const members = Array.isArray(args.members)
+                    ? args.members.filter((item): item is string => typeof item === 'string')
+                    : []
+                if (typeof feedId !== 'string' || members.length === 0) {
+                    throw new Error('Missing feedId/members')
+                }
+                const memberIdentityKeys = members.map(member => resolveContactByProfileId(engine, member).identityKey)
+                const count = request.params.name === 'feeds.members.add'
+                    ? await engine.addFeedMembers(feedId, memberIdentityKeys)
+                    : await engine.removeFeedMembers(feedId, memberIdentityKeys)
+                return textResult({ count })
+            }
+            case 'feeds.post': {
+                const feedId = args.feedId
+                const message = args.message
+                const attachments = Array.isArray(args.attachments)
+                    ? args.attachments.filter((item): item is string => typeof item === 'string')
+                    : []
+                if (typeof feedId !== 'string' || typeof message !== 'string') {
+                    throw new Error('Missing feedId/message')
+                }
+                const item = await engine.postFeedItem(feedId, message, createId(), attachments)
+                return textResult(item)
+            }
+            case 'feeds.timeline': {
+                const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 20
+                const result = await engine.fetchFeedTimeline(limit)
+                return textResult({ items: result.items, nextCursor: result.nextCursor, hasMore: result.hasMore })
+            }
+            case 'feeds.items': {
+                const feedId = args.feedId
+                const limit = typeof args.limit === 'number' && Number.isFinite(args.limit) ? args.limit : 20
+                if (typeof feedId !== 'string') {
+                    throw new Error('Missing feedId')
+                }
+                const result = await engine.fetchFeedItems(feedId, limit)
+                return textResult({ items: result.items, nextCursor: result.nextCursor, hasMore: result.hasMore })
             }
             case 'profile.me': {
                 const profileSecretKeyBytes = decodeBase64(account.profileSecretKey, 'base64url')

@@ -4,7 +4,15 @@
  * Simulates the server API for local testing of all chat mechanisms.
  */
 
-import type { InboxMessage, ServerProfile, AuthTokens } from './api.js'
+import type {
+    FeedKeyRecord,
+    FeedTimelineItem,
+    FollowedFeedRecord,
+    InboxMessage,
+    OwnedFeedRecord,
+    ServerProfile,
+    AuthTokens
+} from './api.js'
 
 /**
  * Prekey stored in mock server.
@@ -52,12 +60,39 @@ interface MockMessage {
     acknowledged: boolean
 }
 
+interface MockFeedMemberKey {
+    epoch: number
+    encryptedKey: string
+}
+
+interface MockFeedItem {
+    itemId: string
+    feedId: string
+    authorId: string
+    epoch: number
+    blob: string
+    signature: string
+    createdAt: number
+}
+
+interface MockFeed {
+    id: string
+    ownerId: string
+    metadata: string
+    currentEpoch: number
+    createdAt: number
+    updatedAt: number
+    members: Map<string, MockFeedMemberKey[]>
+    items: Map<string, MockFeedItem>
+}
+
 /**
  * Mock server for testing.
  */
 export class MockServer {
     private users: Map<string, MockUser> = new Map()
     private messages: Map<string, MockMessage> = new Map()
+    private feeds: Map<string, MockFeed> = new Map()
     private accessTokens: Map<string, string> = new Map() // token -> userId
     private tokenCounter: number = 0
     private messageCounter: number = 0 // For unique timestamps in tests
@@ -179,6 +214,17 @@ export class MockServer {
         for (const [messageId, message] of Array.from(this.messages.entries())) {
             if (message.senderId === userId || message.recipientId === userId) {
                 this.messages.delete(messageId)
+            }
+        }
+
+        for (const [feedId, feed] of Array.from(this.feeds.entries())) {
+            if (feed.ownerId === userId) {
+                this.feeds.delete(feedId)
+                continue
+            }
+            feed.members.delete(userId)
+            if (feed.members.size === 0 && feed.items.size === 0) {
+                this.feeds.set(feedId, feed)
             }
         }
     }
@@ -480,12 +526,310 @@ export class MockServer {
         return user.preKeyData.oneTimePreKeys.filter(pk => !pk.allocated).length
     }
 
+    createFeed(accessToken: string, feedId: string, metadata: string): { feedId: string; createdAt: number } {
+        const ownerId = this.verifyToken(accessToken)
+        if (this.feeds.has(feedId)) {
+            throw new Error('Feed ID already exists')
+        }
+
+        const createdAt = Date.now() + this.messageCounter++
+        this.feeds.set(feedId, {
+            id: feedId,
+            ownerId,
+            metadata,
+            currentEpoch: 0,
+            createdAt,
+            updatedAt: createdAt,
+            members: new Map(),
+            items: new Map()
+        })
+
+        return { feedId, createdAt }
+    }
+
+    updateFeed(accessToken: string, feedId: string, metadata: string): { feedId: string; updatedAt: number } {
+        const ownerId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== ownerId) {
+            throw new Error('Not authorized for this feed')
+        }
+
+        feed.metadata = metadata
+        feed.updatedAt = Date.now() + this.messageCounter++
+        return { feedId, updatedAt: feed.updatedAt }
+    }
+
+    deleteFeed(accessToken: string, feedId: string): void {
+        const ownerId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== ownerId) {
+            throw new Error('Not authorized for this feed')
+        }
+        this.feeds.delete(feedId)
+    }
+
+    getOwnedFeeds(accessToken: string): OwnedFeedRecord[] {
+        const ownerId = this.verifyToken(accessToken)
+        return Array.from(this.feeds.values())
+            .filter(feed => feed.ownerId === ownerId)
+            .sort((a, b) => b.updatedAt - a.updatedAt)
+            .map(feed => ({
+                feedId: feed.id,
+                metadata: feed.metadata,
+                epoch: feed.currentEpoch,
+                createdAt: feed.createdAt,
+                updatedAt: feed.updatedAt
+            }))
+    }
+
+    addFeedMembers(
+        accessToken: string,
+        feedId: string,
+        epoch: number,
+        members: Array<{ memberId: string; encryptedKey: string }>
+    ): { added: number } {
+        const ownerId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== ownerId) {
+            throw new Error('Not authorized for this feed')
+        }
+        if (epoch !== feed.currentEpoch) {
+            throw new Error(`Epoch mismatch. Current epoch is ${feed.currentEpoch}`)
+        }
+
+        let added = 0
+        for (const member of members) {
+            if (!this.users.has(member.memberId)) {
+                throw new Error('One or more feed members were not found')
+            }
+            const keys = feed.members.get(member.memberId) ?? []
+            if (!keys.some(entry => entry.epoch === epoch)) {
+                keys.push({ epoch, encryptedKey: member.encryptedKey })
+                feed.members.set(member.memberId, keys)
+                added += 1
+            }
+        }
+        feed.updatedAt = Date.now() + this.messageCounter++
+        return { added }
+    }
+
+    removeFeedMembers(accessToken: string, feedId: string, memberIds: string[]): { removed: number } {
+        const ownerId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== ownerId) {
+            throw new Error('Not authorized for this feed')
+        }
+
+        let removed = 0
+        for (const memberId of memberIds) {
+            if (feed.members.delete(memberId)) {
+                removed += 1
+            }
+        }
+        feed.updatedAt = Date.now() + this.messageCounter++
+        return { removed }
+    }
+
+    rotateFeedKeys(
+        accessToken: string,
+        feedId: string,
+        epoch: number,
+        members: Array<{ memberId: string; encryptedKey: string }>
+    ): { epoch: number } {
+        const ownerId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== ownerId) {
+            throw new Error('Not authorized for this feed')
+        }
+        if (epoch !== feed.currentEpoch + 1) {
+            throw new Error(`Epoch must advance to ${feed.currentEpoch + 1}`)
+        }
+
+        const activeMembers = Array.from(feed.members.keys()).sort()
+        const providedMembers = Array.from(new Set(members.map(member => member.memberId))).sort()
+        if (activeMembers.length !== providedMembers.length || activeMembers.some((memberId, index) => memberId !== providedMembers[index])) {
+            throw new Error('Rotation members must match the current feed membership')
+        }
+
+        for (const member of members) {
+            const keys = feed.members.get(member.memberId) ?? []
+            keys.push({ epoch, encryptedKey: member.encryptedKey })
+            feed.members.set(member.memberId, keys)
+        }
+        feed.currentEpoch = epoch
+        feed.updatedAt = Date.now() + this.messageCounter++
+        return { epoch }
+    }
+
+    postFeedItem(
+        accessToken: string,
+        feedId: string,
+        itemId: string,
+        epoch: number,
+        blob: string,
+        signature: string
+    ): { itemId: string; createdAt: number } {
+        const authorId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== authorId) {
+            throw new Error('Not authorized for this feed')
+        }
+        if (epoch !== feed.currentEpoch) {
+            throw new Error(`Epoch mismatch. Current epoch is ${feed.currentEpoch}`)
+        }
+        if (feed.items.has(itemId)) {
+            throw new Error('Feed item ID already exists')
+        }
+
+        const createdAt = Date.now() + this.messageCounter++
+        feed.items.set(itemId, {
+            itemId,
+            feedId,
+            authorId,
+            epoch,
+            blob,
+            signature,
+            createdAt
+        })
+        feed.updatedAt = createdAt
+        return { itemId, createdAt }
+    }
+
+    deleteFeedItem(accessToken: string, feedId: string, itemId: string): void {
+        const ownerId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== ownerId) {
+            throw new Error('Not authorized for this feed')
+        }
+        if (!feed.items.delete(itemId)) {
+            throw new Error('Feed item not found')
+        }
+    }
+
+    getFollowedFeeds(accessToken: string): FollowedFeedRecord[] {
+        const memberId = this.verifyToken(accessToken)
+        return Array.from(this.feeds.values())
+            .filter(feed => feed.members.has(memberId))
+            .map(feed => ({
+                feedId: feed.id,
+                ownerId: feed.ownerId,
+                epoch: feed.currentEpoch
+            }))
+    }
+
+    getFeedKeys(accessToken: string): FeedKeyRecord[] {
+        const memberId = this.verifyToken(accessToken)
+        return Array.from(this.feeds.values())
+            .flatMap(feed => (feed.members.get(memberId) ?? []).map(entry => ({
+                feedId: feed.id,
+                epoch: entry.epoch,
+                encryptedKey: entry.encryptedKey
+            })))
+            .sort((a, b) => a.feedId.localeCompare(b.feedId) || a.epoch - b.epoch)
+    }
+
+    getFeedTimeline(
+        accessToken: string,
+        limit: number = 50,
+        cursor?: string
+    ): { items: FeedTimelineItem[]; nextCursor: string | null; hasMore: boolean } {
+        const userId = this.verifyToken(accessToken)
+        const cursorTime = cursor ? Number.parseInt(Buffer.from(cursor, 'base64').toString('utf-8'), 10) : undefined
+        const items = Array.from(this.feeds.values())
+            .filter(feed => feed.ownerId === userId || feed.members.has(userId))
+            .flatMap(feed => Array.from(feed.items.values()))
+            .filter(item => cursorTime === undefined || item.createdAt < cursorTime)
+            .sort((a, b) => b.createdAt - a.createdAt || b.itemId.localeCompare(a.itemId))
+
+        const page = items.slice(0, limit)
+        const hasMore = items.length > limit
+        const nextCursor = hasMore && page.length > 0
+            ? Buffer.from(String(page[page.length - 1].createdAt), 'utf-8').toString('base64')
+            : null
+
+        return {
+            items: page.map(item => ({
+                feedId: item.feedId,
+                itemId: item.itemId,
+                authorId: item.authorId,
+                epoch: item.epoch,
+                blob: item.blob,
+                signature: item.signature,
+                createdAt: item.createdAt
+            })),
+            nextCursor,
+            hasMore
+        }
+    }
+
+    getFeedItems(
+        accessToken: string,
+        feedId: string,
+        limit: number = 50,
+        cursor?: string
+    ): { items: FeedTimelineItem[]; nextCursor: string | null; hasMore: boolean } {
+        const userId = this.verifyToken(accessToken)
+        const feed = this.feeds.get(feedId)
+        if (!feed) {
+            throw new Error('Feed not found')
+        }
+        if (feed.ownerId !== userId && !feed.members.has(userId)) {
+            throw new Error('Not authorized for this feed')
+        }
+
+        const cursorTime = cursor ? Number.parseInt(Buffer.from(cursor, 'base64').toString('utf-8'), 10) : undefined
+        const items = Array.from(feed.items.values())
+            .filter(item => cursorTime === undefined || item.createdAt < cursorTime)
+            .sort((a, b) => b.createdAt - a.createdAt || b.itemId.localeCompare(a.itemId))
+        const page = items.slice(0, limit)
+        const hasMore = items.length > limit
+        const nextCursor = hasMore && page.length > 0
+            ? Buffer.from(String(page[page.length - 1].createdAt), 'utf-8').toString('base64')
+            : null
+
+        return {
+            items: page.map(item => ({
+                feedId: item.feedId,
+                itemId: item.itemId,
+                authorId: item.authorId,
+                epoch: item.epoch,
+                blob: item.blob,
+                signature: item.signature,
+                createdAt: item.createdAt
+            })),
+            nextCursor,
+            hasMore
+        }
+    }
+
     /**
      * Clear all data.
      */
     reset(): void {
         this.users.clear()
         this.messages.clear()
+        this.feeds.clear()
         this.accessTokens.clear()
         this.tokenCounter = 0
         this.messageCounter = 0
@@ -606,6 +950,71 @@ export function createMockApi(server: MockServer) {
         getTokens() {
             if (!accessToken || !refreshToken) return null
             return { accessToken, refreshToken }
+        },
+
+        async createFeed(feedId: string, metadata: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.createFeed(accessToken, feedId, metadata)
+        },
+
+        async updateFeed(feedId: string, metadata: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.updateFeed(accessToken, feedId, metadata)
+        },
+
+        async deleteFeed(feedId: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            server.deleteFeed(accessToken, feedId)
+        },
+
+        async getOwnedFeeds() {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.getOwnedFeeds(accessToken)
+        },
+
+        async addFeedMembers(feedId: string, epoch: number, members: Array<{ memberId: string; encryptedKey: string }>) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.addFeedMembers(accessToken, feedId, epoch, members).added
+        },
+
+        async removeFeedMembers(feedId: string, memberIds: string[]) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.removeFeedMembers(accessToken, feedId, memberIds).removed
+        },
+
+        async rotateFeedKeys(feedId: string, epoch: number, members: Array<{ memberId: string; encryptedKey: string }>) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.rotateFeedKeys(accessToken, feedId, epoch, members).epoch
+        },
+
+        async postFeedItem(feedId: string, itemId: string, epoch: number, blob: string, signature: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.postFeedItem(accessToken, feedId, itemId, epoch, blob, signature)
+        },
+
+        async deleteFeedItem(feedId: string, itemId: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            server.deleteFeedItem(accessToken, feedId, itemId)
+        },
+
+        async getFollowedFeeds() {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.getFollowedFeeds(accessToken)
+        },
+
+        async getFeedKeys() {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.getFeedKeys(accessToken)
+        },
+
+        async getFeedTimeline(limit?: number, cursor?: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.getFeedTimeline(accessToken, limit, cursor)
+        },
+
+        async getFeedItems(feedId: string, limit?: number, cursor?: string) {
+            if (!accessToken) throw new Error('Not authenticated')
+            return server.getFeedItems(accessToken, feedId, limit, cursor)
         },
 
         setCredentials(_key: Uint8Array, at: string, rt: string) {

@@ -49,6 +49,20 @@ already in your list.
 - `murmur messages --with <id> [--limit <n>]`
 - `murmur ack <messageId...>`
 
+### Feeds
+
+- `murmur feed create --name <name> [--description <text>]`
+- `murmur feed list`
+- `murmur feed members add --feed <feed-id> --member <profile-id> [--member <profile-id> ...]`
+- `murmur feed members remove --feed <feed-id> --member <profile-id> [--member <profile-id> ...]`
+- `murmur feed post --feed <feed-id> --message <text> [--attach <path> ...]`
+- `murmur feed timeline [--limit <n>]`
+- `murmur feed items --feed <feed-id> [--limit <n>]`
+
+Feed membership commands accept contact profile IDs (base58). The CLI resolves
+each profile ID to the contact's identity key before encrypting the current
+feed epoch key to that member.
+
 ### Attachments
 
 - `murmur attachment --message <id> --name <file> --out <path>`
@@ -148,3 +162,4 @@ Advanced overrides (optional):
 - The CLI displays IDs in base58.
 - The API uses base64.
 - Profile secret keys are the IDs you share with contacts.
+- Feed IDs are client-generated `cuid2` strings.

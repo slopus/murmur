@@ -114,10 +114,66 @@ The signature is Ed25519 over `blobBytes || messageIdBytes`.
 - Server acknowledgments delete messages from the server (`/v1/messages/ack`).
 - Client acknowledgments mark messages as read locally.
 
+## Feeds
+
+Feeds are persistent encrypted timelines owned by a single identity.
+
+### Feed Key Derivation
+
+For epoch `N`, the owner derives:
+
+- `feedKey = HKDF(identityPrivateKey, salt=feedId, info="murmur-feed-key:N")`
+
+The owner therefore never needs to upload or persist raw feed keys.
+
+### Metadata
+
+Feed metadata (`name`, optional `description`) is encrypted with a separate
+owner-only key derived from the identity private key and `feedId`.
+
+### Member Key Distribution
+
+Members receive epoch keys through a sealed-box style envelope:
+
+1. Generate an ephemeral X25519 keypair.
+2. Compute DH with the recipient's X25519 identity key (derived from Ed25519).
+3. HKDF the shared secret into an AES-256-GCM wrapping key.
+4. Encrypt the raw 32-byte feed key.
+5. Transmit `ephemeralPublic || iv || ciphertext`.
+
+### Feed Item Payload
+
+Feed items are encrypted JSON:
+
+```json
+{
+  "text": "Post body",
+  "attachments": {
+    "file.txt": {
+      "hash": "sha256-hex",
+      "iv": "base64",
+      "key": "base64",
+      "ciphertext": "base64"
+    }
+  }
+}
+```
+
+The server stores the encrypted blob and an Ed25519 signature over
+`blobBytes || itemIdBytes`.
+
+### Rotation
+
+Membership changes rotate the epoch. The owner removes members, derives the
+next epoch key locally, encrypts it to all remaining members, and the server
+updates `currentEpoch`.
+
 ## Realtime Notifications
 
 Realtime uses SSE. The server emits `message:new` events containing `messageId`.
 Clients treat the event as a hint and call `sync` to fetch messages.
+
+Feed timeline updates emit `feed:new_item` with `feedId` and `itemId`.
 
 ## Hooks (message)
 

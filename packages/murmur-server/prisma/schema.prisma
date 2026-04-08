@@ -31,6 +31,9 @@ model User {
     receivedMessages  Message[] @relation("MessageRecipient")
     ownedPreKeys      PreKey[]  @relation("PreKeyOwner")
     allocatedPreKeys  PreKey[]  @relation("PreKeyAllocatedTo")
+    ownedFeeds        Feed[]    @relation("FeedOwner")
+    feedMemberships   FeedMember[] @relation("FeedMembership")
+    authoredFeedItems FeedItem[] @relation("FeedItemAuthor")
 
     publicProfile     PublicProfile?
 }
@@ -104,4 +107,50 @@ model PublicProfile {
     user            User     @relation(fields: [userId], references: [id], onDelete: Cascade)
 
     @@index([userId])
+}
+
+model Feed {
+    id          String   @id
+    ownerId     String
+    owner       User     @relation("FeedOwner", fields: [ownerId], references: [id], onDelete: Cascade)
+    metadata    Bytes
+    currentEpoch Int     @default(0)
+    createdAt   DateTime @default(now())
+    updatedAt   DateTime @updatedAt
+
+    members     FeedMember[]
+    items       FeedItem[]
+
+    @@index([ownerId, updatedAt])
+}
+
+model FeedMember {
+    id           String   @id @default(cuid())
+    feedId       String
+    feed         Feed     @relation(fields: [feedId], references: [id], onDelete: Cascade)
+    memberId     String
+    member       User     @relation("FeedMembership", fields: [memberId], references: [id], onDelete: Cascade)
+    epoch        Int
+    encryptedKey Bytes
+    createdAt    DateTime @default(now())
+
+    @@unique([feedId, memberId, epoch])
+    @@index([memberId, feedId])
+    @@index([feedId, epoch])
+}
+
+model FeedItem {
+    id         String   @id
+    feedId      String
+    feed        Feed     @relation(fields: [feedId], references: [id], onDelete: Cascade)
+    authorId    String
+    author      User     @relation("FeedItemAuthor", fields: [authorId], references: [id], onDelete: Cascade)
+    epoch       Int
+    blob        Bytes
+    signature   Bytes
+    createdAt   DateTime @default(now())
+
+    @@index([feedId, createdAt])
+    @@index([createdAt])
+    @@index([authorId])
 }

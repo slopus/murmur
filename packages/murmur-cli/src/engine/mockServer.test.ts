@@ -262,6 +262,51 @@ describe('MockServer', () => {
         })
     })
 
+    describe('Feeds', () => {
+        let aliceToken: string
+        let bobToken: string
+        let carolToken: string
+
+        beforeEach(() => {
+            aliceToken = server.register('alice-id', 'alice-profile', 'sig', 'profile').tokens.accessToken
+            bobToken = server.register('bob-id', 'bob-profile', 'sig', 'profile').tokens.accessToken
+            carolToken = server.register('carol-id', 'carol-profile', 'sig', 'profile').tokens.accessToken
+        })
+
+        it('should manage feed membership, key rotation, and timeline pagination', () => {
+            const created = server.createFeed(aliceToken, 'feed-1', 'meta-1')
+            expect(created.feedId).toBe('feed-1')
+
+            expect(server.addFeedMembers(aliceToken, 'feed-1', 0, [
+                { memberId: 'bob-id', encryptedKey: 'bob-key-0' },
+                { memberId: 'carol-id', encryptedKey: 'carol-key-0' }
+            ]).added).toBe(2)
+
+            server.postFeedItem(aliceToken, 'feed-1', 'item-1', 0, 'blob-1', 'sig-1')
+
+            expect(server.getFollowedFeeds(bobToken)).toEqual([
+                { feedId: 'feed-1', ownerId: 'alice-id', epoch: 0 }
+            ])
+            expect(server.getFeedKeys(bobToken)).toEqual([
+                { feedId: 'feed-1', epoch: 0, encryptedKey: 'bob-key-0' }
+            ])
+
+            expect(server.removeFeedMembers(aliceToken, 'feed-1', ['carol-id']).removed).toBe(1)
+            expect(server.rotateFeedKeys(aliceToken, 'feed-1', 1, [
+                { memberId: 'bob-id', encryptedKey: 'bob-key-1' }
+            ]).epoch).toBe(1)
+            server.postFeedItem(aliceToken, 'feed-1', 'item-2', 1, 'blob-2', 'sig-2')
+
+            const timeline = server.getFeedTimeline(bobToken, 1)
+            expect(timeline.items.map(item => item.itemId)).toEqual(['item-2'])
+            expect(timeline.hasMore).toBe(true)
+
+            const nextPage = server.getFeedTimeline(bobToken, 2, timeline.nextCursor ?? undefined)
+            expect(nextPage.items.map(item => item.itemId)).toEqual(['item-1'])
+            expect(server.getFeedKeys(carolToken)).toEqual([])
+        })
+    })
+
     describe('Prekey Bundles', () => {
         let aliceToken: string
         let bobToken: string

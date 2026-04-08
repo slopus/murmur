@@ -11,6 +11,7 @@ import { authRoutes } from './routes/v1/auth';
 import { profileRoutes, publicProfileRoutes } from './routes/v1/profile';
 import { messageRoutes } from './routes/v1/messages';
 import { preKeyRoutes } from './routes/v1/prekeys';
+import { feedRoutes } from './routes/v1/feeds';
 import { Fastify } from '@/types';
 import { registerRateLimiting } from './rateLimit';
 import { httpRequestsTotal, httpRequestDuration } from '@/metrics/prometheus';
@@ -66,6 +67,7 @@ export async function startApi() {
         await profileRoutes(authenticatedApp);
         await messageRoutes(authenticatedApp);
         await preKeyRoutes(authenticatedApp);
+        await feedRoutes(authenticatedApp);
     });
 
     // Start HTTP

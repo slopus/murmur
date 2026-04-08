@@ -108,6 +108,36 @@ export interface PublicProfile {
     updatedAt: number
 }
 
+export interface OwnedFeedRecord {
+    feedId: string
+    metadata: string
+    epoch: number
+    createdAt: number
+    updatedAt: number
+}
+
+export interface FollowedFeedRecord {
+    feedId: string
+    ownerId: string
+    epoch: number
+}
+
+export interface FeedKeyRecord {
+    feedId: string
+    epoch: number
+    encryptedKey: string
+}
+
+export interface FeedTimelineItem {
+    feedId: string
+    itemId: string
+    authorId: string
+    epoch: number
+    blob: string
+    signature: string
+    createdAt: number
+}
+
 /**
  * Prekey from server upload.
  */
@@ -705,5 +735,118 @@ export class MurmurApi {
     async getOneTimePreKeyCount(): Promise<number> {
         const result = await this.request<{ count: number }>('GET', '/v1/prekeys/onetime/count')
         return result.count
+    }
+
+    async createFeed(feedId: string, metadata: string): Promise<{ feedId: string; createdAt: number }> {
+        return this.request<{ feedId: string; createdAt: number }>('POST', '/v1/feeds/create', {
+            feedId,
+            metadata
+        })
+    }
+
+    async updateFeed(feedId: string, metadata: string): Promise<{ feedId: string; updatedAt: number }> {
+        return this.request<{ feedId: string; updatedAt: number }>(
+            'POST',
+            `/v1/feeds/${encodeURIComponent(feedId)}/update`,
+            { metadata }
+        )
+    }
+
+    async deleteFeed(feedId: string): Promise<void> {
+        await this.request<{ success: boolean }>('DELETE', `/v1/feeds/${encodeURIComponent(feedId)}`)
+    }
+
+    async getOwnedFeeds(): Promise<OwnedFeedRecord[]> {
+        const result = await this.request<{ feeds: OwnedFeedRecord[] }>('GET', '/v1/feeds/owned')
+        return result.feeds
+    }
+
+    async addFeedMembers(
+        feedId: string,
+        epoch: number,
+        members: Array<{ memberId: string; encryptedKey: string }>
+    ): Promise<number> {
+        const result = await this.request<{ added: number }>(
+            'POST',
+            `/v1/feeds/${encodeURIComponent(feedId)}/members/add`,
+            { epoch, members }
+        )
+        return result.added
+    }
+
+    async removeFeedMembers(feedId: string, memberIds: string[]): Promise<number> {
+        const result = await this.request<{ removed: number }>(
+            'POST',
+            `/v1/feeds/${encodeURIComponent(feedId)}/members/remove`,
+            { memberIds }
+        )
+        return result.removed
+    }
+
+    async rotateFeedKeys(
+        feedId: string,
+        epoch: number,
+        members: Array<{ memberId: string; encryptedKey: string }>
+    ): Promise<number> {
+        const result = await this.request<{ epoch: number }>(
+            'POST',
+            `/v1/feeds/${encodeURIComponent(feedId)}/keys/rotate`,
+            { epoch, members }
+        )
+        return result.epoch
+    }
+
+    async postFeedItem(
+        feedId: string,
+        itemId: string,
+        epoch: number,
+        blob: string,
+        signature: string
+    ): Promise<{ itemId: string; createdAt: number }> {
+        return this.request<{ itemId: string; createdAt: number }>(
+            'POST',
+            `/v1/feeds/${encodeURIComponent(feedId)}/items/post`,
+            { itemId, epoch, blob, signature }
+        )
+    }
+
+    async deleteFeedItem(feedId: string, itemId: string): Promise<void> {
+        await this.request<{ success: boolean }>(
+            'DELETE',
+            `/v1/feeds/${encodeURIComponent(feedId)}/items/${encodeURIComponent(itemId)}`
+        )
+    }
+
+    async getFollowedFeeds(): Promise<FollowedFeedRecord[]> {
+        const result = await this.request<{ feeds: FollowedFeedRecord[] }>('GET', '/v1/feeds/following')
+        return result.feeds
+    }
+
+    async getFeedKeys(): Promise<FeedKeyRecord[]> {
+        const result = await this.request<{ keys: FeedKeyRecord[] }>('GET', '/v1/feeds/keys')
+        return result.keys
+    }
+
+    async getFeedTimeline(
+        limit: number = 50,
+        cursor?: string
+    ): Promise<{ items: FeedTimelineItem[]; nextCursor: string | null; hasMore: boolean }> {
+        let path = `/v1/feeds/timeline?limit=${limit}`
+        if (cursor) {
+            path += `&cursor=${encodeURIComponent(cursor)}`
+        }
+        return this.request<{ items: FeedTimelineItem[]; nextCursor: string | null; hasMore: boolean }>('GET', path)
+    }
+
+    async getFeedItems(
+        feedId: string,
+        limit: number = 50,
+        cursor?: string
+    ): Promise<{ items: FeedTimelineItem[]; nextCursor: string | null; hasMore: boolean }> {
+        let path = `/v1/feeds/${encodeURIComponent(feedId)}/items?limit=${limit}`
+        if (cursor) {
+            path += `&cursor=${encodeURIComponent(cursor)}`
+        }
+        return this.request<{ items: FeedTimelineItem[]; nextCursor: string | null; hasMore: boolean }>('GET', path)
     }
 }

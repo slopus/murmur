@@ -89,6 +89,40 @@ export interface StoredMessage {
     attachments?: StoredAttachment[]
 }
 
+export interface StoredFeed {
+    feedId: string
+    ownerId: string
+    encryptedMetadata?: string
+    currentEpoch: number
+    createdAt: number
+    updatedAt: number
+    owned: boolean
+}
+
+export interface StoredFeedMember {
+    feedId: string
+    memberId: string
+    addedAt: number
+}
+
+export interface StoredFeedKey {
+    feedId: string
+    epoch: number
+    key: string
+    addedAt: number
+}
+
+export interface StoredFeedItem {
+    itemId: string
+    feedId: string
+    authorId: string
+    epoch: number
+    text: string
+    createdAt: number
+    signature: string
+    attachments?: StoredAttachment[]
+}
+
 /**
  * Account information.
  */

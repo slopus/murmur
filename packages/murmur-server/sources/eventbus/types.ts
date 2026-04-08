@@ -13,9 +13,18 @@ export const MessageEventSchema = z.object({
 
 export type MessageEvent = z.infer<typeof MessageEventSchema>;
 
+export const FeedItemEventSchema = z.object({
+    type: z.literal('feed:new_item'),
+    feedId: z.string(),
+    itemId: z.string(),
+});
+
+export type FeedItemEvent = z.infer<typeof FeedItemEventSchema>;
+
 // User events (profile updates, etc.)
 export const UserEventSchema = z.discriminatedUnion('type', [
     MessageEventSchema,
+    FeedItemEventSchema,
     z.object({
         type: z.literal('profile:updated'),
         userId: z.string(),

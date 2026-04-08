@@ -876,6 +876,114 @@ if (hasMore) {
 
 ---
 
+## Feed Endpoints
+
+Feeds are persistent encrypted timelines. Feed metadata and items are encrypted
+client-side; the server stores only ciphertext plus signatures.
+
+Implementation notes:
+
+- `feedId` is client-generated (`cuid2`) so metadata encryption and feed-key
+  derivation can include the final feed ID before the create request.
+- `currentEpoch` is stored on the `Feed` row and returned by owned/following
+  list endpoints.
+- Feed item signatures cover `blobBytes || itemIdBytes`.
+
+### Create Feed
+
+`POST /v1/feeds/create`
+
+```json
+{
+  "feedId": "cuid2",
+  "metadata": "base64-encrypted-feed-metadata"
+}
+```
+
+Returns:
+
+```json
+{
+  "feedId": "cuid2",
+  "createdAt": 1737500000000
+}
+```
+
+### Feed Metadata
+
+- `POST /v1/feeds/:feedId/update` with `{ "metadata": "base64" }`
+- `DELETE /v1/feeds/:feedId`
+- `GET /v1/feeds/owned`
+
+`GET /v1/feeds/owned` returns:
+
+```json
+{
+  "feeds": [
+    {
+      "feedId": "cuid2",
+      "metadata": "base64",
+      "epoch": 0,
+      "createdAt": 1737500000000,
+      "updatedAt": 1737500000000
+    }
+  ]
+}
+```
+
+### Membership and Keys
+
+- `POST /v1/feeds/:feedId/members/add`
+- `POST /v1/feeds/:feedId/members/remove`
+- `POST /v1/feeds/:feedId/keys/rotate`
+- `GET /v1/feeds/following`
+- `GET /v1/feeds/keys`
+
+Member add/rotate payloads use:
+
+```json
+{
+  "epoch": 1,
+  "members": [
+    {
+      "memberId": "base64-identity-key",
+      "encryptedKey": "base64-sealed-feed-key"
+    }
+  ]
+}
+```
+
+### Feed Items and Timeline
+
+- `POST /v1/feeds/:feedId/items/post`
+- `DELETE /v1/feeds/:feedId/items/:itemId`
+- `GET /v1/feeds/timeline`
+- `GET /v1/feeds/:feedId/items`
+
+Timeline/items responses return encrypted blobs plus signatures:
+
+```json
+{
+  "items": [
+    {
+      "feedId": "cuid2",
+      "itemId": "cuid2",
+      "authorId": "base64-identity-key",
+      "epoch": 1,
+      "blob": "base64-encrypted-feed-item",
+      "signature": "base64-signature",
+      "createdAt": 1737500000000
+    }
+  ],
+  "nextCursor": "base64-timestamp-cursor",
+  "hasMore": false
+}
+```
+
+SSE now also emits `feed:new_item` events with `{ feedId, itemId }`.
+
+---
+
 ## Versioning
 
 API is versioned with URL prefix `/v1/`. Breaking changes will increment version number.
