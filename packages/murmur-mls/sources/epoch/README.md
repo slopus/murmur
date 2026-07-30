@@ -8,6 +8,9 @@ Ownership transfers only after successful construction: the state clones the
 secrets into private storage and zeros all caller-provided secret arrays.
 Construction failure leaves cleanup with the caller.
 
-Epoch transition is deliberately outside this module: the Commit/TreeKEM layer
-must first validate the next public tree, context, transcript, confirmation,
-and key schedule.
+Add-only transitions are staged here with explicit `commit()`/`cancel()`
+ownership. Sealing pauses while a transition is pending; commit adopts the
+validated external tree and destroys the old epoch, while cancel destroys the
+staged epoch and resumes the old one. TreeKEM validation and tree storage remain
+external, and Remove/Update transitions remain unavailable until UpdatePath is
+implemented.

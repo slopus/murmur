@@ -6,7 +6,7 @@ import {
     utf8Encode,
 } from "@murmur/core";
 import { describe, expect, it } from "vitest";
-import { MlsEpochState } from "../index.js";
+import { createMlsEpochFromWelcome, MlsEpochState, type MlsEpochTransition } from "../index.js";
 import { encodeMlsGroupContext, type MlsGroupContext } from "../../groupContext/index.js";
 import { createMlsKeyPackage } from "../../keyPackage/index.js";
 import {
@@ -99,5 +99,109 @@ describe("MLS epoch application state", () => {
                 }),
         ).toThrow("does not match");
         destroyMlsEpochSecrets(secrets);
+    });
+
+    it("prepares and applies an add-only epoch transition", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const charlie = generateIdentityKeyPair();
+        const charlieKeyPackage = createMlsKeyPackage(charlie);
+        const currentContext = context();
+        const currentJoiner = hashBytes(utf8Encode("current epoch"));
+        const interimTranscriptHash = hashBytes(utf8Encode("current interim"));
+        const nextTreeHash = hashBytes(utf8Encode("three-member tree"));
+        const currentMembers = [
+            { signatureKey: alice.signingKey, encryptionKey: alice.encryptionKey },
+            { signatureKey: bob.signingKey, encryptionKey: bob.encryptionKey },
+        ];
+        const createCurrentEpoch = (
+            localLeaf: number,
+            signingSecretKey: Uint8Array,
+        ): MlsEpochState =>
+            new MlsEpochState({
+                context: currentContext,
+                secrets: deriveMlsEpochSecretsFromJoiner(
+                    currentJoiner,
+                    encodeMlsGroupContext(currentContext),
+                ),
+                members: currentMembers,
+                localLeaf,
+                localSigningSecretKey: signingSecretKey,
+                interimTranscriptHash,
+            });
+        const aliceCurrent = createCurrentEpoch(0, alice.signingSecretKey);
+        const bobCurrent = createCurrentEpoch(1, bob.signingSecretKey);
+        const treeTransition = () => ({
+            treeHash: nextTreeHash,
+            commit: (): void => undefined,
+            cancel: (): void => undefined,
+        });
+
+        let preparedTransition: MlsEpochTransition | undefined;
+        let rejectedReentrantCommit = false;
+        const prepared = aliceCurrent.prepareAdd([charlieKeyPackage.keyPackage], (additions) => {
+            expect(() => aliceCurrent.prepareAdd(additions, treeTransition)).toThrow(
+                "pending transition",
+            );
+            return {
+                treeHash: nextTreeHash,
+                commit: (): void => {
+                    try {
+                        preparedTransition?.commit();
+                    } catch {
+                        rejectedReentrantCommit = true;
+                    }
+                },
+                cancel: (): void => undefined,
+            };
+        });
+        preparedTransition = prepared.transition;
+        expect(() => aliceCurrent.seal(utf8Encode("while staged"))).toThrow("pending transition");
+        const bobTransition = bobCurrent.applyAdd(prepared.commit, treeTransition);
+        const joined = openMlsWelcome({
+            welcome: prepared.welcome,
+            keyPackageBundle: charlieKeyPackage,
+            validateExternalTree: (groupInfo) =>
+                equalBytes(groupInfo.context.treeHash, nextTreeHash) ? alice.signingKey : undefined,
+        });
+        const nextMembers = [
+            ...currentMembers,
+            {
+                signatureKey: charlie.signingKey,
+                encryptionKey: charlieKeyPackage.keyPackage.leafNode.encryptionKey,
+            },
+        ];
+        expect(() =>
+            createMlsEpochFromWelcome({
+                opened: joined,
+                tree: {
+                    treeHash: hashBytes(utf8Encode("wrong tree")),
+                    members: nextMembers,
+                    localLeaf: 2,
+                },
+                localSigningSecretKey: charlie.signingSecretKey,
+            }),
+        ).toThrow("does not match");
+        const charlieNext = createMlsEpochFromWelcome({
+            opened: joined,
+            tree: { treeHash: nextTreeHash, members: nextMembers, localLeaf: 2 },
+            localSigningSecretKey: charlie.signingSecretKey,
+        });
+        const aliceNext = prepared.transition.commit();
+        expect(rejectedReentrantCommit).toBe(true);
+        const bobNext = bobTransition.commit();
+        expect(() => prepared.transition.commit()).toThrow("settled");
+
+        expect(
+            utf8Decode(bobNext.open(aliceNext.seal(utf8Encode("after add"))).applicationData),
+        ).toBe("after add");
+        expect(
+            utf8Decode(aliceNext.open(charlieNext.seal(utf8Encode("joined"))).applicationData),
+        ).toBe("joined");
+
+        expect(() => aliceCurrent.seal(utf8Encode("old epoch"))).toThrow("destroyed");
+        aliceNext.destroy();
+        bobNext.destroy();
+        charlieNext.destroy();
     });
 });
