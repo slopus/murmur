@@ -3,9 +3,12 @@ import {
     MemoryMurmurStore,
     createQueueAcknowledgeRequest,
     createQueueReadRequest,
+    createPrivateMessage,
     createRelayBlob,
     createRelayEvent,
     createTopicSubscription,
+    encodeEncryptedPrivateMessage,
+    encryptPrivateMessageForContact,
     generateIdentityKeyPair,
     utf8Decode,
     utf8Encode,
@@ -62,6 +65,31 @@ describe("RelayService", () => {
         expect(await pull(relay, bob)).toHaveLength(1);
         expect(await pull(relay, carol)).toHaveLength(1);
         expect(await pull(relay, alice)).toHaveLength(0);
+    });
+
+    it("accepts direct-message ciphertexts only within the shared relay limit", async () => {
+        const relay = new RelayService(new MemoryRelayStore());
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const encrypted = encryptPrivateMessageForContact(
+            alice,
+            bob,
+            createPrivateMessage("x".repeat(500_000), [], 42),
+        );
+        const payload = encodeEncryptedPrivateMessage(encrypted);
+
+        await relay.publish(createRelayEvent(alice, "direct", payload, [bob], 42));
+
+        const deliveries = await pull(relay, bob);
+        expect(deliveries).toHaveLength(1);
+        expect(deliveries[0]?.event.payload).toEqual(payload);
+        expect(() =>
+            encryptPrivateMessageForContact(
+                alice,
+                bob,
+                createPrivateMessage("x".repeat(650_000), [], 43),
+            ),
+        ).toThrow("too large");
     });
 
     it("wakes a long poll and preserves the event until ack", async () => {

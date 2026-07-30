@@ -14,6 +14,7 @@ import type {
     RelayEvent,
     TopicSubscription,
 } from "./types.js";
+import { MAX_RELAY_EVENT_PAYLOAD_BYTES } from "./types.js";
 
 export type {
     QueueAcknowledgeRequest,
@@ -24,6 +25,7 @@ export type {
     RelayTransport,
     TopicSubscription,
 } from "./types.js";
+export { MAX_RELAY_EVENT_PAYLOAD_BYTES } from "./types.js";
 export { HttpRelayTransport } from "./impl/httpTransport.js";
 export {
     decodeQueueRequestWire,
@@ -106,6 +108,9 @@ export function createRelayEvent(
     if (topic.length === 0 || topic.length > MAX_RELAY_TOPIC_CHARACTERS) {
         throw new Error(`Topic must contain 1 to ${MAX_RELAY_TOPIC_CHARACTERS} characters`);
     }
+    if (!(payload instanceof Uint8Array) || payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
+        throw new Error(`Event payload exceeds ${MAX_RELAY_EVENT_PAYLOAD_BYTES} bytes`);
+    }
     if (!Number.isSafeInteger(now) || now < 0) {
         throw new Error("Event time must be a non-negative safe integer");
     }
@@ -142,6 +147,7 @@ export function verifyRelayEvent(event: RelayEvent): boolean {
             decodeBase64Url(event.id).length !== 24 ||
             event.topic.length === 0 ||
             event.topic.length > MAX_RELAY_TOPIC_CHARACTERS ||
+            event.payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES ||
             !Array.isArray(event.recipients) ||
             event.recipients.length > MAX_RELAY_RECIPIENTS ||
             event.recipients.some((recipient) => !isIdentityId(recipient)) ||

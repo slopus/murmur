@@ -1,5 +1,6 @@
 import {
     MAX_RELAY_RECIPIENTS,
+    MAX_RELAY_EVENT_PAYLOAD_BYTES,
     identityId,
     verifyRelayBlob,
     verifyRelayEvent,
@@ -18,7 +19,7 @@ import type { PruneResult, RelayOptions } from "./types.js";
 export type { PruneResult, RelayOptions } from "./types.js";
 
 const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1_000;
-const DEFAULT_MAXIMUM_EVENT_BYTES = 1024 * 1024;
+const DEFAULT_MAXIMUM_EVENT_BYTES = MAX_RELAY_EVENT_PAYLOAD_BYTES;
 const DEFAULT_MAXIMUM_BLOB_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAXIMUM_ENVELOPE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAXIMUM_WAITERS = 10_000;

@@ -1,5 +1,8 @@
 import type { IdentityPublicKeys } from "../crypto/index.js";
 
+/** Maximum opaque event payload accepted by the default protocol profile. */
+export const MAX_RELAY_EVENT_PAYLOAD_BYTES = 1024 * 1024;
+
 /** An opaque, publisher-authenticated event. */
 export interface RelayEvent {
     readonly version: 1;

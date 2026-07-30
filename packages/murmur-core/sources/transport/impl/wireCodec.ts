@@ -11,6 +11,7 @@ import type {
     RelayEvent,
     TopicSubscription,
 } from "../types.js";
+import { MAX_RELAY_EVENT_PAYLOAD_BYTES } from "../types.js";
 
 interface WireRelayEvent {
     readonly version: 1;
@@ -47,7 +48,7 @@ const MAXIMUM_RELAY_RECIPIENTS = 1_024;
 const MAXIMUM_RELAY_TOPIC_CHARACTERS = 512;
 const MAXIMUM_DELIVERY_BATCH = 16;
 const MAXIMUM_DELIVERY_ID_CHARACTERS = 256;
-const MAXIMUM_EVENT_PAYLOAD_CHARACTERS = Math.ceil((1024 * 1024 * 4) / 3);
+const MAXIMUM_EVENT_PAYLOAD_CHARACTERS = Math.ceil((MAX_RELAY_EVENT_PAYLOAD_BYTES * 4) / 3);
 
 function object(value: unknown, name: string): Record<string, unknown> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
