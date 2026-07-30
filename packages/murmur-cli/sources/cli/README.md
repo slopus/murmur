@@ -7,7 +7,7 @@ Current identity, private-message, and group commands:
 
 ```text
 sign-in, me, contacts add/remove, send, sync, messages, attachment,
-groups create/invite/remove/send/messages
+groups create/invite/remove/send/messages, documents create/insert/delete
 ```
 
 Relay and database selection are bootstrap options handled by `main.ts`.

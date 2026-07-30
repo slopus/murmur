@@ -30,4 +30,6 @@ publication or acknowledgment. Removed clients retain only a topic tombstone
 so later ciphertext is drained without retaining or using group secrets.
 
 Shared-object state is layered over the same authenticated group application
-channel; the relay-facing client remains unchanged.
+channel. Shared text documents persist their deterministic operation log in the
+same transaction as the MLS ratchet checkpoint and exact outbox or inbound
+replay marker. The relay-facing client remains unchanged.

@@ -38,7 +38,7 @@ export interface CliGroupInvitation {
 
 /** Exact application outbox entry for group publication ordering. */
 export interface CliGroupOutbound {
-    readonly kind: "invitation" | "commit" | "application";
+    readonly kind: "invitation" | "commit" | "application" | "document";
     readonly groupId: string;
     readonly event: RelayEvent;
     readonly messageKey?: string;
@@ -383,7 +383,7 @@ export function decodeCliGroupOutbound(bytes: Uint8Array): CliGroupOutbound {
     );
     if (
         value.version !== 1 ||
-        !["invitation", "commit", "application"].includes(value.kind as string) ||
+        !["invitation", "commit", "application", "document"].includes(value.kind as string) ||
         !validGroupId(value.groupId) ||
         typeof value.event !== "string" ||
         (value.messageKey !== null &&

@@ -8,6 +8,9 @@ import {
     acceptPrivateMessageFromContact,
     createPrivateMessage,
     createRelayEvent,
+    createDocumentDelete,
+    createDocumentInsert,
+    createDocumentOperationId,
     decodeBase64Url,
     decodeEncryptedPrivateMessage,
     decryptContactProfile,
@@ -32,6 +35,8 @@ import {
     validateIdentityProfile,
     zeroBytes,
     type Contact,
+    type DocumentOperation,
+    type DocumentOperationId,
     type IdentityProfile,
     type IdentityPublicKeys,
     type MurmurStore,
@@ -63,6 +68,17 @@ import {
     type PreparedMlsGroupCommit,
 } from "@murmur/mls";
 import {
+    applyCliDocumentOperation,
+    decodeCliDocumentApplication,
+    decodeCliDocumentRecord,
+    encodeCliDocumentApplication,
+    encodeCliDocumentRecord,
+    nextCliDocumentOperationSequence,
+    openCliDocument,
+    type CliDocumentApplication,
+    type CliDocumentRecord,
+} from "./impl/documentCodec.js";
+import {
     decodeCliGroupInvitation,
     decodeCliGroupMessage,
     decodeCliGroupOutbound,
@@ -91,6 +107,7 @@ import {
 import type {
     CliAccount,
     CliAttachmentInput,
+    CliDocumentSummary,
     CliGroupMessage,
     CliGroupSummary,
     CliPublicIdentity,
@@ -103,6 +120,7 @@ export type {
     CliAccount,
     CliAttachmentInput,
     CliContact,
+    CliDocumentSummary,
     CliGroupMessage,
     CliGroupSummary,
     CliPublicIdentity,
@@ -124,8 +142,10 @@ const REMOVED_GROUP_PREFIX = "cli/removed-groups/v1";
 const GROUP_OUTBOUND_PREFIX = "cli/group-outbound/v1";
 const GROUP_MESSAGE_PREFIX = "cli/group-messages/v1";
 const GROUP_SEQUENCE_PREFIX = "cli/group-sequence/v1";
+const DOCUMENT_PREFIX = "cli/documents/v1";
 const MAXIMUM_QUARANTINE_RECORDS = 64;
 const MAXIMUM_LOCAL_KEY_PACKAGES = 64;
+const MAXIMUM_DEFERRED_GROUP_DELIVERIES = 10_000;
 const DIRECT_TOPIC_COMPONENT = utf8Encode("direct-private-message/v1");
 
 interface LoadedCliGroup {
@@ -133,12 +153,20 @@ interface LoadedCliGroup {
     readonly channel: MlsGroupChannel;
 }
 
+type CliGroupDeliveryResult = "message" | "document" | "commit" | "duplicate" | "deferred";
+
 type PendingCliGroupPublication =
     | {
           readonly kind: "commit";
           readonly groupId: string;
           readonly outboxKey: string;
           readonly prepared: PreparedMlsGroupCommit;
+      }
+    | {
+          readonly kind: "document";
+          readonly groupId: string;
+          readonly outboxKey: string;
+          readonly prepared: PreparedMlsGroupApplication;
       }
     | {
           readonly kind: "application";
@@ -289,6 +317,10 @@ function cliGroupMessageKey(
         .padStart(16, "0")}/${stored.groupId}/${stored.message.id}/${stored.direction}`;
 }
 
+function cliDocumentKey(ownerId: string, groupId: string, documentId: string): string {
+    return `${DOCUMENT_PREFIX}/${ownerId}/${groupId}/${documentId}`;
+}
+
 async function persistOutboundMessage(
     transaction: StoreTransaction,
     key: string,
@@ -334,6 +366,19 @@ async function persistCliStoredGroupMessage(
     stored: CliStoredGroupMessage,
 ): Promise<void> {
     const encoded = encodeCliStoredGroupMessage(stored);
+    try {
+        await transaction.set(key, encoded.slice());
+    } finally {
+        zeroBytes(encoded);
+    }
+}
+
+async function persistCliDocumentRecord(
+    transaction: Pick<StoreTransaction, "set">,
+    key: string,
+    document: CliDocumentRecord,
+): Promise<void> {
+    const encoded = encodeCliDocumentRecord(document);
     try {
         await transaction.set(key, encoded.slice());
     } finally {
@@ -441,6 +486,7 @@ export class MurmurCliRuntime {
     readonly #groups = new Map<string, LoadedCliGroup>();
     readonly #removedGroups = new Set<string>();
     readonly #pendingGroupPublications = new Map<string, PendingCliGroupPublication>();
+    readonly #deferredGroupDeliveries = new Map<string, ReceivedEvent>();
 
     private constructor(
         store: MurmurStore,
@@ -952,6 +998,95 @@ export class MurmurCliRuntime {
         return filtered.slice(Math.max(0, filtered.length - limit));
     }
 
+    /** Create and announce an empty shared document inside one MLS group. */
+    async createDocument(groupValue: string, name: string): Promise<string> {
+        const [groupId, group] = this.#resolveGroup(groupValue);
+        const id = encodeBase64Url(randomBytes(16));
+        const record: CliDocumentRecord = {
+            id,
+            groupId,
+            name,
+            operations: [],
+            actorHighWaterMarks: [],
+        };
+        await this.#publishDocumentApplication(
+            groupId,
+            group,
+            {
+                documentId: id,
+                name,
+            },
+            record,
+        );
+        return id;
+    }
+
+    /** Insert one immutable span into a shared document. */
+    async insertDocument(
+        documentValue: string,
+        text: string,
+        after: DocumentOperationId | null = null,
+    ): Promise<DocumentOperationId> {
+        const resolved = await this.#resolveDocument(documentValue);
+        const actor = identityId(this.#requireAccount().identity);
+        const sequence = nextCliDocumentOperationSequence(resolved.record, actor);
+        const operation = createDocumentInsert(
+            createDocumentOperationId(actor, sequence),
+            after,
+            text,
+        );
+        await this.#publishDocumentOperation(resolved.record, operation);
+        return operation.id;
+    }
+
+    /** Add one permanent tombstone to a shared document. */
+    async deleteDocument(
+        documentValue: string,
+        target: DocumentOperationId,
+    ): Promise<DocumentOperationId> {
+        const resolved = await this.#resolveDocument(documentValue);
+        const actor = identityId(this.#requireAccount().identity);
+        const sequence = nextCliDocumentOperationSequence(resolved.record, actor);
+        const operation = createDocumentDelete(createDocumentOperationId(actor, sequence), target);
+        await this.#publishDocumentOperation(resolved.record, operation);
+        return operation.id;
+    }
+
+    /** List deterministic rendered views of locally known shared documents. */
+    async documents(groupValue?: string): Promise<readonly CliDocumentSummary[]> {
+        const ownerId = identityId(this.#requireAccount().identity);
+        const groupId = groupValue === undefined ? undefined : this.#resolveGroup(groupValue)[0];
+        const entries = await this.#store.list(`${DOCUMENT_PREFIX}/${ownerId}/`);
+        const documents: CliDocumentSummary[] = [];
+        try {
+            for (const [key, value] of entries) {
+                const record = decodeCliDocumentRecord(value);
+                if (key !== cliDocumentKey(ownerId, record.groupId, record.id)) {
+                    throw new Error("Durable CLI document key does not match its record");
+                }
+                if (groupId !== undefined && record.groupId !== groupId) {
+                    continue;
+                }
+                const document = openCliDocument(record);
+                documents.push({
+                    id: record.id,
+                    groupId: record.groupId,
+                    name: record.name,
+                    text: document.render(),
+                    operationCount: record.operations.length,
+                    operations: document.operations(),
+                });
+            }
+        } finally {
+            for (const value of entries.values()) {
+                zeroBytes(value);
+            }
+        }
+        return documents.sort((left, right) =>
+            left.id < right.id ? -1 : left.id > right.id ? 1 : 0,
+        );
+    }
+
     /** Encrypt files and one signed private message to an authenticated contact. */
     async send(
         recipientValue: string,
@@ -1061,6 +1196,7 @@ export class MurmurCliRuntime {
         let groupMessages = 0;
         let groupCommits = 0;
         let invitations = 0;
+        let documentUpdates = 0;
 
         for (let batch = 0; batch < 625; batch += 1) {
             const deliveries = await client.sync(batch === 0 ? waitMilliseconds : 0, signal);
@@ -1205,11 +1341,14 @@ export class MurmurCliRuntime {
                     );
                     if (result === "message") {
                         groupMessages += 1;
+                    } else if (result === "document") {
+                        documentUpdates += 1;
                     } else if (result === "commit") {
                         groupCommits += 1;
                     } else if (result === "duplicate") {
                         duplicates += 1;
                     } else {
+                        this.#deferGroupDelivery(delivery);
                         deferred += 1;
                     }
                     continue;
@@ -1233,6 +1372,12 @@ export class MurmurCliRuntime {
                 throw new Error("Murmur sync exceeded its 10000-delivery drain budget");
             }
         }
+        const deferredRetry = await this.#retryDeferredGroupDeliveries(ownerId);
+        groupMessages += deferredRetry.messages;
+        documentUpdates += deferredRetry.documents;
+        groupCommits += deferredRetry.commits;
+        duplicates += deferredRetry.duplicates;
+        deferred = Math.max(0, deferred - deferredRetry.resolved);
         return {
             profiles,
             messages,
@@ -1244,6 +1389,7 @@ export class MurmurCliRuntime {
             groupMessages,
             groupCommits,
             invitations,
+            documentUpdates,
         };
     }
 
@@ -1399,6 +1545,7 @@ export class MurmurCliRuntime {
             pending.prepared.abandonPersisted();
         }
         this.#pendingGroupPublications.clear();
+        this.#deferredGroupDeliveries.clear();
         for (const group of this.#groups.values()) {
             group.channel.destroy();
         }
@@ -1470,6 +1617,129 @@ export class MurmurCliRuntime {
         } finally {
             for (const value of entries.values()) {
                 zeroBytes(value);
+            }
+        }
+    }
+
+    async #resolveDocument(
+        value: string,
+    ): Promise<{ readonly key: string; readonly record: CliDocumentRecord }> {
+        const ownerId = identityId(this.#requireAccount().identity);
+        const entries = await this.#store.list(`${DOCUMENT_PREFIX}/${ownerId}/`);
+        const matches: Array<{ readonly key: string; readonly record: CliDocumentRecord }> = [];
+        try {
+            for (const [key, bytes] of entries) {
+                const record = decodeCliDocumentRecord(bytes);
+                if (key !== cliDocumentKey(ownerId, record.groupId, record.id)) {
+                    throw new Error("Durable CLI document key does not match its record");
+                }
+                if (record.id === value || record.name === value) {
+                    matches.push({ key, record });
+                }
+            }
+        } finally {
+            for (const bytes of entries.values()) {
+                zeroBytes(bytes);
+            }
+        }
+        const exact = matches.find((match) => match.record.id === value);
+        if (exact !== undefined) {
+            return exact;
+        }
+        if (matches.length !== 1) {
+            throw new Error(
+                matches.length === 0 ? "Document not found" : "Document name is ambiguous",
+            );
+        }
+        return matches[0]!;
+    }
+
+    async #publishDocumentOperation(
+        record: CliDocumentRecord,
+        operation: DocumentOperation,
+    ): Promise<void> {
+        const group = this.#groups.get(record.groupId);
+        if (group === undefined) {
+            throw new Error("Document MLS group is no longer active");
+        }
+        const updated = applyCliDocumentOperation(
+            record,
+            operation,
+            identityId(this.#requireAccount().identity),
+        );
+        await this.#publishDocumentApplication(
+            record.groupId,
+            group,
+            {
+                documentId: record.id,
+                name: record.name,
+                operation,
+            },
+            updated,
+        );
+    }
+
+    async #publishDocumentApplication(
+        groupId: string,
+        group: LoadedCliGroup,
+        application: CliDocumentApplication,
+        document: CliDocumentRecord,
+    ): Promise<void> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        await this.#ensureNoDurableGroupOutbox(ownerId, groupId);
+        const applicationData = encodeCliDocumentApplication(application);
+        const prepared = group.channel.prepareSend(applicationData);
+        let persisted = false;
+        let checkpoint: Uint8Array | undefined;
+        try {
+            if (prepared.payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
+                throw new Error("MLS document update exceeds the relay payload limit");
+            }
+            checkpoint = prepared.serializeEpoch();
+            const event = createRelayEvent(account.identity, group.channel.topic, prepared.payload);
+            const outboxKey = cliGroupOutboundKey(ownerId, groupId, event, 2);
+            await this.#store.transaction(async (transaction) => {
+                await persistCliDocumentRecord(
+                    transaction,
+                    cliDocumentKey(ownerId, groupId, document.id),
+                    document,
+                );
+                await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                    name: group.name,
+                    epochState: checkpoint!,
+                    persistenceGeneration: prepared.persistenceGeneration,
+                    appliedCommitFingerprints: group.channel.appliedCommitFingerprints,
+                    appliedApplicationFingerprints: includeFingerprint(
+                        group.channel.appliedApplicationFingerprints,
+                        prepared.fingerprint,
+                    ),
+                });
+                await persistCliGroupOutbound(transaction, outboxKey, {
+                    kind: "document",
+                    groupId,
+                    event,
+                });
+            });
+            persisted = true;
+            prepared.markPersisted();
+            const pending: PendingCliGroupPublication = {
+                kind: "document",
+                groupId,
+                outboxKey,
+                prepared,
+            };
+            this.#pendingGroupPublications.set(event.id, pending);
+            await this.#publishPendingGroupDocument(event, pending);
+        } catch (error: unknown) {
+            if (!persisted) {
+                prepared.cancel();
+            }
+            throw error;
+        } finally {
+            zeroBytes(applicationData);
+            if (checkpoint !== undefined) {
+                zeroBytes(checkpoint);
             }
         }
     }
@@ -1582,12 +1852,132 @@ export class MurmurCliRuntime {
         }
     }
 
+    async #applyDocumentApplication(
+        transaction: StoreTransaction,
+        ownerId: string,
+        groupId: string,
+        group: LoadedCliGroup,
+        sender: number,
+        application: CliDocumentApplication,
+    ): Promise<void> {
+        const signingKey = group.channel.memberSignatureKeys[sender];
+        if (signingKey === undefined) {
+            throw new Error("MLS document sender is not an active group member");
+        }
+        const actor = identityId({ signingKey });
+        const key = cliDocumentKey(ownerId, groupId, application.documentId);
+        const encoded = await transaction.get(key);
+        let existing: CliDocumentRecord | undefined;
+        if (encoded !== undefined) {
+            try {
+                existing = decodeCliDocumentRecord(encoded);
+            } finally {
+                zeroBytes(encoded);
+            }
+            if (existing.id !== application.documentId || existing.groupId !== groupId) {
+                throw new Error("Durable CLI document key does not match its record");
+            }
+        }
+        const name =
+            existing === undefined || application.name < existing.name
+                ? application.name
+                : existing.name;
+        const base: CliDocumentRecord = existing ?? {
+            id: application.documentId,
+            groupId,
+            name,
+            operations: [],
+            actorHighWaterMarks: [],
+        };
+        const updated =
+            application.operation === undefined
+                ? { ...base, name }
+                : {
+                      ...applyCliDocumentOperation(base, application.operation, actor),
+                      name,
+                  };
+        await persistCliDocumentRecord(transaction, key, updated);
+    }
+
+    #deferGroupDelivery(delivery: ReceivedEvent): void {
+        const key = `${delivery.event.id}/${encodeBase64Url(delivery.event.signature)}`;
+        if (
+            !this.#deferredGroupDeliveries.has(key) &&
+            this.#deferredGroupDeliveries.size >= MAXIMUM_DEFERRED_GROUP_DELIVERIES
+        ) {
+            throw new Error("Too many deferred MLS group deliveries");
+        }
+        this.#deferredGroupDeliveries.set(key, delivery);
+    }
+
+    async #retryDeferredGroupDeliveries(ownerId: string): Promise<{
+        readonly messages: number;
+        readonly documents: number;
+        readonly commits: number;
+        readonly duplicates: number;
+        readonly resolved: number;
+    }> {
+        let messages = 0;
+        let documents = 0;
+        let commits = 0;
+        let duplicates = 0;
+        let resolved = 0;
+        for (let pass = 0; pass < Math.max(1, this.#deferredGroupDeliveries.size); pass += 1) {
+            let progressed = false;
+            for (const [key, delivery] of this.#deferredGroupDeliveries) {
+                const groupEntry = [...this.#groups.entries()].find(
+                    ([, group]) => group.channel.topic === delivery.event.topic,
+                );
+                let result: CliGroupDeliveryResult;
+                if (groupEntry !== undefined) {
+                    result = await this.#handleGroupDelivery(
+                        ownerId,
+                        groupEntry[0],
+                        groupEntry[1],
+                        delivery,
+                    );
+                } else if (
+                    delivery.event.topic.startsWith("mls:") &&
+                    this.#removedGroups.has(delivery.event.topic.slice(4))
+                ) {
+                    try {
+                        await delivery.acknowledge();
+                        result = "duplicate";
+                    } catch {
+                        result = "deferred";
+                    }
+                } else {
+                    result = "deferred";
+                }
+                if (result === "deferred") {
+                    continue;
+                }
+                this.#deferredGroupDeliveries.delete(key);
+                progressed = true;
+                resolved += 1;
+                if (result === "message") {
+                    messages += 1;
+                } else if (result === "document") {
+                    documents += 1;
+                } else if (result === "commit") {
+                    commits += 1;
+                } else {
+                    duplicates += 1;
+                }
+            }
+            if (!progressed) {
+                break;
+            }
+        }
+        return { messages, documents, commits, duplicates, resolved };
+    }
+
     async #handleGroupDelivery(
         ownerId: string,
         groupId: string,
         group: LoadedCliGroup,
         delivery: ReceivedEvent,
-    ): Promise<"message" | "commit" | "duplicate" | "deferred"> {
+    ): Promise<CliGroupDeliveryResult> {
         const handled = group.channel.handle(delivery);
         if (handled === undefined || handled.status === "deferred") {
             return "deferred";
@@ -1657,22 +2047,39 @@ export class MurmurCliRuntime {
         let persisted = false;
         let checkpoint: Uint8Array | undefined;
         try {
-            const message = decodeCliGroupMessage(handled.message.applicationData);
+            const documentApplication = decodeCliDocumentApplication(
+                handled.message.applicationData,
+            );
+            const message =
+                documentApplication === undefined
+                    ? decodeCliGroupMessage(handled.message.applicationData)
+                    : undefined;
             checkpoint = handled.serializeEpoch();
             await this.#store.transaction(async (transaction) => {
-                const stored: CliStoredGroupMessage = {
-                    sequence: await nextGroupSequence(transaction, ownerId),
-                    groupId,
-                    direction: "incoming",
-                    status: "received",
-                    sender: handled.message.sender,
-                    message,
-                };
-                await persistCliStoredGroupMessage(
-                    transaction,
-                    cliGroupMessageKey(ownerId, stored),
-                    stored,
-                );
+                if (documentApplication === undefined) {
+                    const stored: CliStoredGroupMessage = {
+                        sequence: await nextGroupSequence(transaction, ownerId),
+                        groupId,
+                        direction: "incoming",
+                        status: "received",
+                        sender: handled.message.sender,
+                        message: message!,
+                    };
+                    await persistCliStoredGroupMessage(
+                        transaction,
+                        cliGroupMessageKey(ownerId, stored),
+                        stored,
+                    );
+                } else {
+                    await this.#applyDocumentApplication(
+                        transaction,
+                        ownerId,
+                        groupId,
+                        group,
+                        handled.message.sender,
+                        documentApplication,
+                    );
+                }
                 await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
                     name: group.name,
                     epochState: checkpoint!,
@@ -1687,7 +2094,7 @@ export class MurmurCliRuntime {
             persisted = true;
             handled.markPersisted();
             await handled.acknowledge();
-            return "message";
+            return documentApplication === undefined ? "message" : "document";
         } catch {
             if (!persisted) {
                 await this.#reloadGroup(groupId);
@@ -1757,6 +2164,15 @@ export class MurmurCliRuntime {
         this.#pendingGroupPublications.delete(event.id);
     }
 
+    async #publishPendingGroupDocument(
+        event: CliGroupOutbound["event"],
+        pending: Extract<PendingCliGroupPublication, { readonly kind: "document" }>,
+    ): Promise<void> {
+        await pending.prepared.publish(this.#exactGroupPublisher(event));
+        await this.#store.delete(pending.outboxKey);
+        this.#pendingGroupPublications.delete(event.id);
+    }
+
     async #completeRetriedGroupPublication(
         result: Awaited<ReturnType<MurmurClient["publishEvent"]>>,
     ): Promise<void> {
@@ -1768,8 +2184,10 @@ export class MurmurCliRuntime {
         if (pending.kind === "commit") {
             pending.prepared.adopt();
             await this.#store.delete(pending.outboxKey);
-        } else {
+        } else if (pending.kind === "application") {
             await this.#completeGroupApplicationOutbox(pending.outboxKey, pending.messageKey);
+        } else {
+            await this.#store.delete(pending.outboxKey);
         }
         this.#pendingGroupPublications.delete(result.event.id);
     }
@@ -1794,6 +2212,8 @@ export class MurmurCliRuntime {
                     await this.#publishPendingGroupCommit(outbound.event, pending);
                 } else if (pending?.kind === "application") {
                     await this.#publishPendingGroupApplication(outbound.event, pending);
+                } else if (pending?.kind === "document") {
+                    await this.#publishPendingGroupDocument(outbound.event, pending);
                 } else {
                     await this.#requireClient().publishEvent(outbound.event);
                     if (outbound.kind === "application") {

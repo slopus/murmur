@@ -24,11 +24,27 @@ describe("runCli", () => {
             output.push(text),
         );
         await runCli(runtime, ["groups"], (text) => output.push(text));
+        const groupId = (JSON.parse(output[2] ?? "{}") as { id?: string }).id ?? "";
+        await runCli(
+            runtime,
+            ["documents", "create", "--group", groupId, "--name", "Draft"],
+            (text) => output.push(text),
+        );
+        const documentId = (JSON.parse(output[4] ?? "{}") as { id?: string }).id ?? "";
+        await runCli(
+            runtime,
+            ["documents", "insert", "--document", documentId, "--text", "hello"],
+            (text) => output.push(text),
+        );
+        await runCli(runtime, ["documents"], (text) => output.push(text));
 
         expect(JSON.parse(output[0] ?? "{}")).toMatchObject({ name: "Alice Agent" });
         expect(JSON.parse(output[1] ?? "{}")).toEqual(JSON.parse(output[0] ?? "{}"));
         expect(JSON.parse(output[2] ?? "{}")).toMatchObject({ status: "created" });
         expect(JSON.parse(output[3] ?? "[]")).toMatchObject([{ name: "Agents", epoch: "0" }]);
+        expect(JSON.parse(output[6] ?? "[]")).toMatchObject([
+            { id: documentId, name: "Draft", text: "hello", operationCount: 1 },
+        ]);
         await expect(
             runtime.send(
                 "missing",

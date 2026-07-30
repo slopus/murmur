@@ -1,6 +1,6 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { identityId } from "@murmur/core";
+import { createDocumentOperationId, identityId, type DocumentOperationId } from "@murmur/core";
 import {
     MAX_CLI_ATTACHMENTS,
     MAX_CLI_ATTACHMENT_BYTES,
@@ -92,6 +92,16 @@ function positiveInteger(value: string | undefined, fallback: number): number {
     return parsed;
 }
 
+function documentOperationId(value: string): DocumentOperationId {
+    const separator = value.lastIndexOf(":");
+    if (separator < 0) {
+        throw new Error("Document operation ID must be <actor>:<sequence>");
+    }
+    const actor = value.slice(0, separator);
+    const sequence = Number(value.slice(separator + 1));
+    return createDocumentOperationId(actor, sequence);
+}
+
 function help(): string {
     return [
         "Usage:",
@@ -110,6 +120,10 @@ function help(): string {
         "  murmur groups remove --group <id-or-name> --contact <identity>",
         "  murmur groups send --group <id-or-name> --message <text>",
         "  murmur groups messages [--group <id-or-name>] [--limit <count>]",
+        "  murmur documents [--group <id-or-name>]",
+        "  murmur documents create --group <id-or-name> --name <name>",
+        "  murmur documents insert --document <id-or-name> --text <text> [--after <actor>:<sequence>]",
+        "  murmur documents delete --document <id-or-name> --target <actor>:<sequence>",
         "",
         "Global: --relay <url> (repeatable), --db <sqlite-path>",
     ].join("\n");
@@ -342,6 +356,40 @@ export async function runCli(
                     })),
                 )}\n`,
             );
+            return;
+        }
+        case "documents": {
+            const action = parsed.positionals[0];
+            if (action === "create") {
+                const id = await runtime.createDocument(
+                    option(parsed, "group", true) ?? "",
+                    option(parsed, "name", true) ?? "",
+                );
+                write(`${JSON.stringify({ id, status: "created" })}\n`);
+                return;
+            }
+            if (action === "insert") {
+                const after = option(parsed, "after");
+                const id = await runtime.insertDocument(
+                    option(parsed, "document", true) ?? "",
+                    option(parsed, "text", true) ?? "",
+                    after === undefined ? null : documentOperationId(after),
+                );
+                write(`${JSON.stringify({ id, status: "inserted" })}\n`);
+                return;
+            }
+            if (action === "delete") {
+                const id = await runtime.deleteDocument(
+                    option(parsed, "document", true) ?? "",
+                    documentOperationId(option(parsed, "target", true) ?? ""),
+                );
+                write(`${JSON.stringify({ id, status: "deleted" })}\n`);
+                return;
+            }
+            if (action !== undefined) {
+                throw new Error(`Unknown documents action: ${action}`);
+            }
+            write(`${JSON.stringify(await runtime.documents(option(parsed, "group")))}\n`);
             return;
         }
         default:

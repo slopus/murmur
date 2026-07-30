@@ -407,4 +407,134 @@ describe("MurmurCliRuntime", () => {
         reopenedAlice.destroy();
         bob.destroy();
     });
+
+    it("retries a future-epoch application after its delayed Commit arrives", async () => {
+        const relayA = new RelayService(new MemoryRelayStore());
+        const relayB = new RelayService(new MemoryRelayStore());
+        const aliceA = new ControlledTransport("alice-a", relayA);
+        const alice = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [aliceA, new EmbeddedRelayTransport("alice-b", relayB)],
+        });
+        const bob = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [new EmbeddedRelayTransport("bob-a", relayA)],
+        });
+        const carol = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [
+                new EmbeddedRelayTransport("carol-a", relayA),
+                new EmbeddedRelayTransport("carol-b", relayB),
+            ],
+        });
+        const aliceIdentity = await alice.signIn({ name: "Alice" });
+        const bobIdentity = await bob.signIn({ name: "Bob" });
+        const carolIdentity = await carol.signIn({ name: "Carol" });
+        await alice.shareProfile(bobIdentity.token);
+        await alice.shareProfile(carolIdentity.token);
+        await bob.shareProfile(aliceIdentity.token);
+        await carol.shareProfile(aliceIdentity.token);
+        await alice.sync();
+        await bob.sync();
+        await carol.sync();
+        const groupId = await alice.createGroup("Delayed epoch");
+        await alice.inviteToGroup(groupId, bobIdentity.id);
+        await bob.sync();
+
+        aliceA.rejectPublish = true;
+        await alice.inviteToGroup(groupId, carolIdentity.id);
+        await carol.sync();
+        await carol.sendToGroup(groupId, "future epoch", 500);
+
+        const beforeCommit = await bob.sync();
+        expect(beforeCommit.groupMessages).toBe(0);
+        expect(beforeCommit.deferred).toBeGreaterThan(0);
+
+        aliceA.rejectPublish = false;
+        await alice.sync();
+        const afterCommit = await bob.sync();
+        expect(afterCommit.groupCommits).toBe(1);
+        expect(afterCommit.groupMessages).toBe(1);
+        expect((await bob.groupMessages(groupId)).at(-1)?.message.text).toBe("future epoch");
+
+        alice.destroy();
+        bob.destroy();
+        carol.destroy();
+    });
+
+    it("converges a shared document across a three-member MLS group", async () => {
+        const relay = new RelayService(new MemoryRelayStore());
+        const transport = (id: string): EmbeddedRelayTransport =>
+            new EmbeddedRelayTransport(id, relay);
+        const alice = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [transport("alice")],
+        });
+        const bob = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [transport("bob")],
+        });
+        const carol = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [transport("carol")],
+        });
+        const aliceIdentity = await alice.signIn({ name: "Alice" });
+        const bobIdentity = await bob.signIn({ name: "Bob" });
+        const carolIdentity = await carol.signIn({ name: "Carol" });
+        await alice.shareProfile(bobIdentity.token);
+        await alice.shareProfile(carolIdentity.token);
+        await bob.shareProfile(aliceIdentity.token);
+        await carol.shareProfile(aliceIdentity.token);
+        await alice.sync();
+        await bob.sync();
+        await carol.sync();
+
+        const groupId = await alice.createGroup("Writers");
+        await alice.inviteToGroup(groupId, bobIdentity.id);
+        await bob.sync();
+        await alice.inviteToGroup(groupId, carolIdentity.id);
+        await bob.sync();
+        await carol.sync();
+        expect(alice.groups()[0]?.members.filter(Boolean)).toHaveLength(3);
+        expect(bob.groups()[0]?.members.filter(Boolean)).toHaveLength(3);
+        expect(carol.groups()[0]?.members.filter(Boolean)).toHaveLength(3);
+
+        const documentId = await alice.createDocument(groupId, "Draft");
+        await bob.sync();
+        await carol.sync();
+        const aliceInsert = await alice.insertDocument(documentId, "A");
+        await bob.insertDocument(documentId, "B");
+
+        await alice.sync();
+        await bob.sync();
+        await carol.sync();
+        const concurrent = [
+            (await alice.documents(groupId))[0]?.text,
+            (await bob.documents(groupId))[0]?.text,
+            (await carol.documents(groupId))[0]?.text,
+        ];
+        expect(new Set(concurrent).size).toBe(1);
+        expect(concurrent[0]).toHaveLength(2);
+
+        await carol.deleteDocument(documentId, aliceInsert);
+        await alice.sync();
+        await bob.sync();
+        const afterDelete = [
+            (await alice.documents(groupId))[0]?.text,
+            (await bob.documents(groupId))[0]?.text,
+            (await carol.documents(groupId))[0]?.text,
+        ];
+        expect(afterDelete).toEqual(["B", "B", "B"]);
+
+        await alice.removeFromGroup(groupId, bobIdentity.id);
+        await bob.sync();
+        await carol.sync();
+        expect(alice.groups()[0]?.members.filter(Boolean)).toHaveLength(2);
+        expect(carol.groups()[0]?.members.filter(Boolean)).toHaveLength(2);
+        expect(bob.groups()).toEqual([]);
+
+        alice.destroy();
+        bob.destroy();
+        carol.destroy();
+    });
 });

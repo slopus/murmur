@@ -3,6 +3,7 @@ import type {
     IdentityKeyPair,
     IdentityProfile,
     IdentityPublicKeys,
+    DocumentOperation,
     PrivateMessage,
 } from "@murmur/core";
 
@@ -53,6 +54,16 @@ export interface CliGroupSummary {
     readonly members: readonly (string | undefined)[];
 }
 
+/** Rendered local view of one convergent shared text document. */
+export interface CliDocumentSummary {
+    readonly id: string;
+    readonly groupId: string;
+    readonly name: string;
+    readonly text: string;
+    readonly operationCount: number;
+    readonly operations: readonly DocumentOperation[];
+}
+
 /** Stable public account information safe to print or exchange. */
 export interface CliPublicIdentity {
     readonly id: string;
@@ -73,6 +84,7 @@ export interface CliSyncResult {
     readonly groupMessages: number;
     readonly groupCommits: number;
     readonly invitations: number;
+    readonly documentUpdates: number;
 }
 
 /** Contact type re-exported for programmatic CLI consumers. */

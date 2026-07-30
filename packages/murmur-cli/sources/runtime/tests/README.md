@@ -11,3 +11,12 @@ MLS coverage creates epoch zero, exchanges one-use KeyPackages through
 profiles, joins through Welcome, replays the retained Commit, persists
 bidirectional group messages across restart, and retires a removed member while
 draining later ciphertext without decryption.
+
+The completion scenario uses three MLS members, applies concurrent document
+inserts on two replicas, converges a third replica over the relay, propagates a
+tombstone, and then cryptographically removes one editor.
+
+Failure coverage also delays an epoch Commit on one relay while a future-epoch
+application arrives first, proving the CLI retains and retries the unacknowledged
+delivery after adoption. A quota-edge codec test proves discarded operations
+still advance a durable actor sequence and can never cause ID reuse.

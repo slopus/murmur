@@ -61,6 +61,22 @@ Welcome, Commit, epoch checkpoints, replay markers, and exact relay events use
 ordered durable outboxes. A restart cannot publish a Commit without its
 corresponding next-epoch private state.
 
+## Shared documents
+
+Documents are operation-based replicated text objects carried as ordinary MLS
+application messages; relays see the same opaque group ciphertext as chat.
+
+```bash
+murmur documents create --group <group-id> --name "Draft"
+murmur documents insert --document <document-id> --text "hello"
+murmur documents
+murmur documents delete --document <document-id> --target <actor>:<sequence>
+```
+
+Concurrent inserts converge by canonical operation ID. Every mutation actor is
+bound to the authenticated MLS leaf before its CRDT state and post-open epoch
+checkpoint are committed atomically.
+
 ## Development
 
 ```bash

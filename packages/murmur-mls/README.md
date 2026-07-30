@@ -11,8 +11,12 @@ The implementation is built in conformance layers:
 
 The package now includes authenticated PublicMessage Commits with inline Add
 and Remove proposals, RFC TreeKEM public-tree validation, UpdatePath
-creation/opening, and Welcome path-secret delivery. Integration of these
-transitions into the durable group state is still in progress, so this remains
-an RFC subset rather than a complete MLS implementation. Code only claims RFC
-behavior implemented and tested in that layer. A Murmur-specific group
-protocol is never labeled MLS.
+creation/opening, Welcome path-secret delivery, epoch-zero creation,
+forward-secret durable epoch checkpoints, and transactional relay publication.
+
+Official RFC 9180 HPKE and MLS working-group ratchet-tree/UpdatePath vectors
+exercise the available interoperable layers. This remains an RFC subset rather
+than a complete general-purpose MLS implementation: PSKs, external Commits,
+proposal references, Update proposals, and arbitrary extensions are outside the
+Murmur profile. Code only claims RFC behavior implemented and tested in that
+layer. A Murmur-specific application protocol is never labeled MLS.
