@@ -7,7 +7,7 @@
  * - Messages (encrypted content)
  */
 
-import type { SerializedAgentState } from '../encryption/session/types.js'
+import type { SerializedAgentState } from "../encryption/session/types.js";
 
 /**
  * Contact information stored locally.
@@ -15,21 +15,21 @@ import type { SerializedAgentState } from '../encryption/session/types.js'
  */
 export interface Contact {
     /** Contact's identity public key (base64) */
-    identityKey: string
+    identityKey: string;
     /** Contact's profile public key for fetching profile */
-    profilePublicKey: string
+    profilePublicKey: string;
     /** Contact's profile secret key (base64url, optional) */
-    profileSecretKey?: string
+    profileSecretKey?: string;
     /** Decrypted first name */
-    firstName: string
+    firstName: string;
     /** Decrypted last name (optional) */
-    lastName?: string
+    lastName?: string;
     /** When the contact was added */
-    addedAt: number
+    addedAt: number;
     /** When the contact was last updated */
-    updatedAt: number
+    updatedAt: number;
     /** Whether the contact is blocked */
-    blocked: boolean
+    blocked: boolean;
 }
 
 /**
@@ -38,19 +38,19 @@ export interface Contact {
  */
 export interface StoredContact {
     /** Contact's identity public key (base64) */
-    identityKey: string
+    identityKey: string;
     /** Contact's profile public key (base64) */
-    profilePublicKey: string
+    profilePublicKey: string;
     /** Contact's profile secret key (base64) */
-    profileSecretKey?: string
+    profileSecretKey?: string;
     /** Encrypted profile blob (base64) */
-    encryptedProfile: string
+    encryptedProfile: string;
     /** When the contact was added */
-    addedAt: number
+    addedAt: number;
     /** When the contact was last updated */
-    updatedAt: number
+    updatedAt: number;
     /** Whether the contact is blocked */
-    blocked: boolean
+    blocked: boolean;
 }
 
 /**
@@ -58,15 +58,15 @@ export interface StoredContact {
  */
 export interface StoredAttachment {
     /** Attachment filename (no path) */
-    fileName: string
+    fileName: string;
     /** SHA-256 hash of encrypted bytes (hex) */
-    hash: string
+    hash: string;
     /** AES-GCM IV (base64) */
-    iv: string
+    iv: string;
     /** AES-GCM key (base64) */
-    key: string
+    key: string;
     /** AES-GCM encrypted payload (base64) */
-    ciphertext: string
+    ciphertext: string;
 }
 
 /**
@@ -74,19 +74,19 @@ export interface StoredAttachment {
  */
 export interface StoredMessage {
     /** Unique message ID (cuid2) */
-    id: string
+    id: string;
     /** Conversation ID (peer's identity key) */
-    conversationId: string
+    conversationId: string;
     /** Whether this message was sent by us */
-    isOutgoing: boolean
+    isOutgoing: boolean;
     /** Decrypted message text */
-    text: string
+    text: string;
     /** When the message was created/sent */
-    createdAt: number
+    createdAt: number;
     /** Whether the message has been read */
-    read: boolean
+    read: boolean;
     /** Optional attachments stored with the message */
-    attachments?: StoredAttachment[]
+    attachments?: StoredAttachment[];
 }
 
 /**
@@ -94,19 +94,19 @@ export interface StoredMessage {
  */
 export interface Account {
     /** Our identity public key (base64) */
-    identityKey: string
+    identityKey: string;
     /** Our profile public key (base64) */
-    profilePublicKey: string
+    profilePublicKey: string;
     /** Our profile secret key (base64) for decrypting our own profile */
-    profileSecretKey: string
+    profileSecretKey: string;
     /** Our encrypted profile blob */
-    encryptedProfile: string
+    encryptedProfile: string;
     /** Our first name (decrypted) */
-    firstName: string
+    firstName: string;
     /** Our last name (decrypted, optional) */
-    lastName?: string
+    lastName?: string;
     /** When the account was created */
-    createdAt: number
+    createdAt: number;
 }
 
 /**
@@ -114,28 +114,28 @@ export interface Account {
  */
 export interface AppState {
     /** Account information (null if not set up) */
-    account: Account | null
+    account: Account | null;
     /** Serialized agent state (encryption keys and sessions) */
-    agentState: SerializedAgentState | null
+    agentState: SerializedAgentState | null;
 }
 
 /**
  * Supported hook types.
  */
-export type HookType = 'message'
+export type HookType = "message";
 
 /**
  * Hook definition stored locally.
  */
 export interface StoredHook {
     /** Hook ID */
-    id: string
+    id: string;
     /** Hook type */
-    type: HookType
+    type: HookType;
     /** Path to the hook command */
-    path: string
+    path: string;
     /** Arguments passed to the hook command */
-    args: string[]
+    args: string[];
     /** When the hook was added */
-    createdAt: number
+    createdAt: number;
 }

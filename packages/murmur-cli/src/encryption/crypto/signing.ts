@@ -12,26 +12,26 @@
  * - Signature: 64 bytes
  */
 
-import { ed25519 } from '@noble/curves/ed25519'
-import { getRandomBytes } from './utils.js'
+import { ed25519 } from "@noble/curves/ed25519";
+import { getRandomBytes } from "./utils.js";
 
 /** Length of Ed25519 private key (seed) in bytes */
-export const SIGNING_PRIVATE_KEY_LENGTH = 32
+export const SIGNING_PRIVATE_KEY_LENGTH = 32;
 
 /** Length of Ed25519 public key in bytes */
-export const SIGNING_PUBLIC_KEY_LENGTH = 32
+export const SIGNING_PUBLIC_KEY_LENGTH = 32;
 
 /** Length of Ed25519 signature in bytes */
-export const SIGNATURE_LENGTH = 64
+export const SIGNATURE_LENGTH = 64;
 
 /**
  * An Ed25519 signing key pair for identity.
  */
 export interface SigningKeyPair {
     /** Private key seed (32 bytes) - must be kept secret */
-    privateKey: Uint8Array
+    privateKey: Uint8Array;
     /** Public key (32 bytes) - serves as identity */
-    publicKey: Uint8Array
+    publicKey: Uint8Array;
 }
 
 /**
@@ -48,9 +48,9 @@ export interface SigningKeyPair {
  * ```
  */
 export function generateSigningKeyPair(): SigningKeyPair {
-    const privateKey = getRandomBytes(SIGNING_PRIVATE_KEY_LENGTH)
-    const publicKey = ed25519.getPublicKey(privateKey)
-    return { privateKey, publicKey }
+    const privateKey = getRandomBytes(SIGNING_PRIVATE_KEY_LENGTH);
+    const publicKey = ed25519.getPublicKey(privateKey);
+    return { privateKey, publicKey };
 }
 
 /**
@@ -61,9 +61,11 @@ export function generateSigningKeyPair(): SigningKeyPair {
  */
 export function signingPublicKeyFromPrivate(privateKey: Uint8Array): Uint8Array {
     if (privateKey.length !== SIGNING_PRIVATE_KEY_LENGTH) {
-        throw new Error(`Invalid private key length: expected ${SIGNING_PRIVATE_KEY_LENGTH}, got ${privateKey.length}`)
+        throw new Error(
+            `Invalid private key length: expected ${SIGNING_PRIVATE_KEY_LENGTH}, got ${privateKey.length}`,
+        );
     }
-    return ed25519.getPublicKey(privateKey)
+    return ed25519.getPublicKey(privateKey);
 }
 
 /**
@@ -80,9 +82,11 @@ export function signingPublicKeyFromPrivate(privateKey: Uint8Array): Uint8Array 
  */
 export function sign(message: Uint8Array, privateKey: Uint8Array): Uint8Array {
     if (privateKey.length !== SIGNING_PRIVATE_KEY_LENGTH) {
-        throw new Error(`Invalid private key length: expected ${SIGNING_PRIVATE_KEY_LENGTH}, got ${privateKey.length}`)
+        throw new Error(
+            `Invalid private key length: expected ${SIGNING_PRIVATE_KEY_LENGTH}, got ${privateKey.length}`,
+        );
     }
-    return ed25519.sign(message, privateKey)
+    return ed25519.sign(message, privateKey);
 }
 
 /**
@@ -99,21 +103,17 @@ export function sign(message: Uint8Array, privateKey: Uint8Array): Uint8Array {
  * if (!isValid) throw new Error('Invalid signature')
  * ```
  */
-export function verify(
-    message: Uint8Array,
-    signature: Uint8Array,
-    publicKey: Uint8Array
-): boolean {
+export function verify(message: Uint8Array, signature: Uint8Array, publicKey: Uint8Array): boolean {
     if (signature.length !== SIGNATURE_LENGTH) {
-        return false
+        return false;
     }
     if (publicKey.length !== SIGNING_PUBLIC_KEY_LENGTH) {
-        return false
+        return false;
     }
     try {
-        return ed25519.verify(signature, message, publicKey)
+        return ed25519.verify(signature, message, publicKey);
     } catch {
-        return false
+        return false;
     }
 }
 
@@ -124,5 +124,5 @@ export function verify(
  * @returns true if the public key appears valid
  */
 export function isValidSigningPublicKey(publicKey: Uint8Array): boolean {
-    return publicKey.length === SIGNING_PUBLIC_KEY_LENGTH
+    return publicKey.length === SIGNING_PUBLIC_KEY_LENGTH;
 }

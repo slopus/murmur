@@ -1,7 +1,7 @@
-import Redis from 'ioredis';
-import { log } from '@/log';
-import { forever } from '@/utils/timing';
-import { getShutdownSignal } from '@/shutdown';
+import Redis from "ioredis";
+import { log } from "@/log";
+import { forever } from "@/utils/timing";
+import { getShutdownSignal } from "@/shutdown";
 import {
     EventEnvelope,
     EventEnvelopeSchema,
@@ -11,7 +11,7 @@ import {
     MessageEnvelope,
     isGlobalEnvelope,
     isMessageEnvelope,
-} from './types';
+} from "./types";
 
 /**
  * Event handler type definitions
@@ -30,10 +30,10 @@ export type MessageEventHandler = (envelope: MessageEnvelope) => void | Promise<
  */
 export class EventBus {
     private client: Redis;
-    private readonly STREAM_KEY = 'murmur:events';
+    private readonly STREAM_KEY = "murmur:events";
     private readonly STREAM_MAXLEN =
-        Number.parseInt(process.env.EVENT_STREAM_MAXLEN ?? '', 10) || 10000;
-    private lastStreamId: string = '$';
+        Number.parseInt(process.env.EVENT_STREAM_MAXLEN ?? "", 10) || 10000;
+    private lastStreamId: string = "$";
 
     private globalEventHandlers: Set<GlobalEventHandler> = new Set();
     private messageEventHandlers: Set<MessageEventHandler> = new Set();
@@ -42,7 +42,7 @@ export class EventBus {
     private readLoopPromise: Promise<void> | null = null;
 
     constructor(redisUrl?: string) {
-        const url = redisUrl || process.env.REDIS_URL || 'redis://localhost:6379';
+        const url = redisUrl || process.env.REDIS_URL || "redis://localhost:6379";
 
         this.client = new Redis(url, {
             maxRetriesPerRequest: 3,
@@ -52,7 +52,7 @@ export class EventBus {
             },
         });
 
-        this.client.on('error', (err) => {
+        this.client.on("error", (err) => {
             log(`EventBus Redis error: ${err.message}`);
         });
     }
@@ -62,19 +62,22 @@ export class EventBus {
      */
     async start(): Promise<void> {
         if (this.isRunning) {
-            log('EventBus already started');
+            log("EventBus already started");
             return;
         }
 
         try {
-            const streamInfo = await this.client.xinfo('STREAM', this.STREAM_KEY) as Array<string>;
-            const lastIdIndex = streamInfo.indexOf('last-generated-id');
+            const streamInfo = (await this.client.xinfo(
+                "STREAM",
+                this.STREAM_KEY,
+            )) as Array<string>;
+            const lastIdIndex = streamInfo.indexOf("last-generated-id");
             if (lastIdIndex >= 0 && streamInfo[lastIdIndex + 1]) {
                 this.lastStreamId = streamInfo[lastIdIndex + 1];
             }
         } catch (error) {
             log(`EventBus stream info unavailable: ${error}`);
-            this.lastStreamId = '$';
+            this.lastStreamId = "$";
         }
 
         this.isRunning = true;
@@ -82,7 +85,7 @@ export class EventBus {
         const shutdownSignal = getShutdownSignal();
         this.readLoopPromise = this.readLoop(shutdownSignal);
 
-        log('EventBus started with Redis Streams (broadcast)');
+        log("EventBus started with Redis Streams (broadcast)");
     }
 
     /**
@@ -90,9 +93,9 @@ export class EventBus {
      */
     async publishGlobal(event: GlobalEvent): Promise<string> {
         const envelope: GlobalEnvelope = {
-            type: 'global',
+            type: "global",
             timestamp: Date.now(),
-            channel: 'global',
+            channel: "global",
             event,
         };
 
@@ -105,7 +108,7 @@ export class EventBus {
      */
     async publishUser(userId: string, event: UserEvent): Promise<string> {
         const envelope: MessageEnvelope = {
-            type: 'message',
+            type: "message",
             timestamp: Date.now(),
             channel: `user:${userId}`,
             event,
@@ -155,7 +158,7 @@ export class EventBus {
      * Shutdown the EventBus gracefully.
      */
     async shutdown(): Promise<void> {
-        log('Shutting down EventBus...');
+        log("Shutting down EventBus...");
 
         this.isRunning = false;
 
@@ -171,7 +174,7 @@ export class EventBus {
         this.globalEventHandlers.clear();
         this.messageEventHandlers.clear();
 
-        log('EventBus shutdown complete');
+        log("EventBus shutdown complete");
     }
 
     /**
@@ -185,12 +188,12 @@ export class EventBus {
             // The '*' means auto-generate stream ID (different from our message IDs)
             const streamId = await this.client.xadd(
                 this.STREAM_KEY,
-                'MAXLEN',
-                '~',
+                "MAXLEN",
+                "~",
                 this.STREAM_MAXLEN,
-                '*',
-                'data',
-                messageData
+                "*",
+                "data",
+                messageData,
             );
             return streamId as string;
         } catch (error) {
@@ -205,37 +208,41 @@ export class EventBus {
      * Uses forever helper to loop until shutdown.
      */
     private async readLoop(signal: AbortSignal): Promise<void> {
-        await forever(async () => {
-            try {
-                // XREAD BLOCK ms COUNT n STREAMS stream last-id
-                const results = await this.client.xread(
-                    'COUNT',
-                    10, // Read up to 10 messages at a time
-                    'BLOCK',
-                    5000, // Block for 5 seconds
-                    'STREAMS',
-                    this.STREAM_KEY,
-                    this.lastStreamId
-                ) as any; // Type assertion needed due to ioredis typing limitations
+        await forever(
+            async () => {
+                try {
+                    // XREAD BLOCK ms COUNT n STREAMS stream last-id
+                    const results = (await this.client.xread(
+                        "COUNT",
+                        10, // Read up to 10 messages at a time
+                        "BLOCK",
+                        5000, // Block for 5 seconds
+                        "STREAMS",
+                        this.STREAM_KEY,
+                        this.lastStreamId,
+                    )) as any; // Type assertion needed due to ioredis typing limitations
 
-                if (!results || results.length === 0) {
-                    return;
-                }
+                    if (!results || results.length === 0) {
+                        return;
+                    }
 
-                // Process messages
-                for (const [_streamKey, messages] of results) {
-                    for (const [streamId, fields] of messages) {
-                        this.lastStreamId = streamId;
-                        await this.handleStreamMessage(streamId, fields as string[]);
+                    // Process messages
+                    for (const [_streamKey, messages] of results) {
+                        for (const [streamId, fields] of messages) {
+                            this.lastStreamId = streamId;
+                            await this.handleStreamMessage(streamId, fields as string[]);
+                        }
+                    }
+                } catch (error: any) {
+                    if (this.isRunning) {
+                        log(`Error in read loop: ${error.message}`);
+                        throw error; // Re-throw to let forever handle it
                     }
                 }
-            } catch (error: any) {
-                if (this.isRunning) {
-                    log(`Error in read loop: ${error.message}`);
-                    throw error; // Re-throw to let forever handle it
-                }
-            }
-        }, 0, signal); // No delay between iterations since XREAD has its own blocking
+            },
+            0,
+            signal,
+        ); // No delay between iterations since XREAD has its own blocking
     }
 
     /**
@@ -244,7 +251,7 @@ export class EventBus {
     private async handleStreamMessage(streamId: string, fields: string[]): Promise<void> {
         try {
             // Fields are [key1, value1, key2, value2, ...]
-            const dataIndex = fields.indexOf('data');
+            const dataIndex = fields.indexOf("data");
             if (dataIndex === -1 || dataIndex + 1 >= fields.length) {
                 log(`Invalid message format in stream ${streamId}`);
                 return;

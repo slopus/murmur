@@ -16,15 +16,15 @@ Current payload JSON:
 
 ```json
 {
-  "text": "Hello there",
-  "profileSecretKey": "base64url-no-padding",
-  "attachments": {
-    "report.pdf": {
-      "hash": "sha256-hex-of-encrypted-bytes",
-      "iv": "base64",
-      "key": "base64"
+    "text": "Hello there",
+    "profileSecretKey": "base64url-no-padding",
+    "attachments": {
+        "report.pdf": {
+            "hash": "sha256-hex-of-encrypted-bytes",
+            "iv": "base64",
+            "key": "base64"
+        }
     }
-  }
 }
 ```
 
@@ -35,9 +35,9 @@ Notes:
   included so a recipient can resolve the sender profile if not already known.
 - `attachments` is optional. Each entry maps a filename (no path) to the
   AES-GCM parameters for the encrypted attachment bytes:
-  - `hash`: SHA-256 of the encrypted bytes (hex).
-  - `iv`: AES-GCM IV (base64).
-  - `key`: AES-GCM key (base64).
+    - `hash`: SHA-256 of the encrypted bytes (hex).
+    - `iv`: AES-GCM IV (base64).
+    - `key`: AES-GCM key (base64).
 - Legacy payloads may be a raw UTF-8 string; if JSON parsing fails, the client
   treats the plaintext as text.
 
@@ -53,19 +53,19 @@ Protocol messages always use `type: "message"`. Pre-key fields live under
 
 ```json
 {
-  "type": "message",
-  "init": {
-    "ephemeralKey": "base64",
-    "preKey": "base64",
-    "oneTimePreKey": "base64"
-  },
-  "attachments": {
-    "sha256-hex": "base64(encrypted-bytes)"
-  },
-  "ratchetKey": "base64",
-  "previousChainLength": 0,
-  "messageNumber": 0,
-  "ciphertext": "base64"
+    "type": "message",
+    "init": {
+        "ephemeralKey": "base64",
+        "preKey": "base64",
+        "oneTimePreKey": "base64"
+    },
+    "attachments": {
+        "sha256-hex": "base64(encrypted-bytes)"
+    },
+    "ratchetKey": "base64",
+    "previousChainLength": 0,
+    "messageNumber": 0,
+    "ciphertext": "base64"
 }
 ```
 
@@ -73,14 +73,14 @@ Protocol messages always use `type: "message"`. Pre-key fields live under
 
 ```json
 {
-  "type": "message",
-  "attachments": {
-    "sha256-hex": "base64(encrypted-bytes)"
-  },
-  "ratchetKey": "base64",
-  "previousChainLength": 0,
-  "messageNumber": 0,
-  "ciphertext": "base64"
+    "type": "message",
+    "attachments": {
+        "sha256-hex": "base64(encrypted-bytes)"
+    },
+    "ratchetKey": "base64",
+    "previousChainLength": 0,
+    "messageNumber": 0,
+    "ciphertext": "base64"
 }
 ```
 
@@ -105,19 +105,19 @@ Field details:
 1. Fetch recipient prekey bundle from server and verify the bundle signature.
 2. The receiver will derive the sender identity DH key from the sender Ed25519 public key.
 3. Run X3DH (sender side) using:
-   - Alice identity DH keypair (derived from her Ed25519 identity key)
-   - Bob prekey (from bundle)
-   - Optional Bob one-time prekey (from bundle)
+    - Alice identity DH keypair (derived from her Ed25519 identity key)
+    - Bob prekey (from bundle)
+    - Optional Bob one-time prekey (from bundle)
 4. Initialize Double Ratchet (Alice) with the X3DH shared secret and Bob's prekey public key.
 5. Ratchet encrypt the plaintext to get:
-   - Header fields: `ratchetKey`, `previousChainLength`, `messageNumber`
-   - Ciphertext bytes
+    - Header fields: `ratchetKey`, `previousChainLength`, `messageNumber`
+    - Ciphertext bytes
 6. Build protocol message JSON with:
-   - `type: "message"`
-   - `init` containing `ephemeralKey`, `preKey`, and optional `oneTimePreKey` (from bundle)
-   - `attachments` map (if any)
-   - `ratchetKey`, `previousChainLength`, `messageNumber`
-   - `ciphertext` (base64)
+    - `type: "message"`
+    - `init` containing `ephemeralKey`, `preKey`, and optional `oneTimePreKey` (from bundle)
+    - `attachments` map (if any)
+    - `ratchetKey`, `previousChainLength`, `messageNumber`
+    - `ciphertext` (base64)
 7. Base64-encode the JSON to create the server `blob`.
 8. Sign `blobBytes || messageIdBytes` with Alice's Ed25519 identity key.
 
@@ -128,10 +128,10 @@ Field details:
 3. Look up `init.preKey` (and optional `init.oneTimePreKey`) in the local key store to find the matching private keys.
 4. Derive Alice identity DH public key from her Ed25519 public key.
 5. Run X3DH (receiver side) using:
-   - Bob identity DH keypair
-   - Bob prekey private key
-   - Optional Bob one-time prekey private key
-   - Alice derived identity DH key and `init.ephemeralKey`
+    - Bob identity DH keypair
+    - Bob prekey private key
+    - Optional Bob one-time prekey private key
+    - Alice derived identity DH key and `init.ephemeralKey`
 6. Initialize Double Ratchet (Bob) with the X3DH shared secret and Bob's prekey keypair.
 7. Build the internal header from `ratchetKey`, `previousChainLength`, `messageNumber`.
 8. Ratchet decrypt the ciphertext to recover plaintext.
@@ -140,13 +140,13 @@ Field details:
 
 1. Use the existing Double Ratchet session for the recipient.
 2. Ratchet encrypt the plaintext to get:
-   - `ratchetKey`, `previousChainLength`, `messageNumber`
-   - Ciphertext bytes
+    - `ratchetKey`, `previousChainLength`, `messageNumber`
+    - Ciphertext bytes
 3. Build protocol message JSON with:
-   - `type: "message"`
-   - `attachments` map (if any)
-   - `ratchetKey`, `previousChainLength`, `messageNumber`
-   - `ciphertext` (base64)
+    - `type: "message"`
+    - `attachments` map (if any)
+    - `ratchetKey`, `previousChainLength`, `messageNumber`
+    - `ciphertext` (base64)
 4. Base64-encode the JSON to create the server `blob`.
 5. Sign `blobBytes || messageIdBytes` with the sender identity key.
 
@@ -181,10 +181,10 @@ To send, the client builds:
 
 ```json
 {
-  "messageId": "cuid",
-  "recipientId": "base64-identity-key",
-  "blob": "base64(protocol_message_json)",
-  "signature": "base64"
+    "messageId": "cuid",
+    "recipientId": "base64-identity-key",
+    "blob": "base64(protocol_message_json)",
+    "signature": "base64"
 }
 ```
 
@@ -199,11 +199,11 @@ Inbox messages returned by the server include:
 
 ```json
 {
-  "id": "messageId",
-  "senderId": "base64-identity-key",
-  "blob": "base64(protocol_message_json)",
-  "signature": "base64",
-  "createdAt": 1710000000000,
-  "expiresAt": 1712592000000
+    "id": "messageId",
+    "senderId": "base64-identity-key",
+    "blob": "base64(protocol_message_json)",
+    "signature": "base64",
+    "createdAt": 1710000000000,
+    "expiresAt": 1712592000000
 }
 ```

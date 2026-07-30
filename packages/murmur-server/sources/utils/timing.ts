@@ -11,7 +11,7 @@
 export async function delay(ms: number, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {
         if (signal?.aborted) {
-            reject(new DOMException('Delay aborted', 'AbortError'));
+            reject(new DOMException("Delay aborted", "AbortError"));
             return;
         }
 
@@ -23,13 +23,13 @@ export async function delay(ms: number, signal?: AbortSignal): Promise<void> {
         const abortHandler = () => {
             clearTimeout(timeout);
             cleanup();
-            reject(new DOMException('Delay aborted', 'AbortError'));
+            reject(new DOMException("Delay aborted", "AbortError"));
         };
 
-        signal?.addEventListener('abort', abortHandler);
+        signal?.addEventListener("abort", abortHandler);
 
         function cleanup() {
-            signal?.removeEventListener('abort', abortHandler);
+            signal?.removeEventListener("abort", abortHandler);
         }
     });
 }
@@ -49,13 +49,9 @@ export async function forever(
         initialDelayMs?: number;
         maxDelayMs?: number;
         multiplier?: number;
-    }
+    },
 ): Promise<void> {
-    const {
-        initialDelayMs = 100,
-        maxDelayMs = 30000,
-        multiplier = 2,
-    } = backoffOptions || {};
+    const { initialDelayMs = 100, maxDelayMs = 30000, multiplier = 2 } = backoffOptions || {};
 
     let currentBackoffDelay = initialDelayMs;
 
@@ -79,7 +75,7 @@ export async function forever(
                     await delay(intervalMs, signal);
                 } catch (error) {
                     // Delay was aborted, exit the loop
-                    if (error instanceof DOMException && error.name === 'AbortError') {
+                    if (error instanceof DOMException && error.name === "AbortError") {
                         break;
                     }
                     throw error;
@@ -87,7 +83,7 @@ export async function forever(
             }
         } catch (error) {
             // If aborted, exit the loop
-            if (error instanceof DOMException && (error as DOMException).name === 'AbortError') {
+            if (error instanceof DOMException && (error as DOMException).name === "AbortError") {
                 break;
             }
 
@@ -97,7 +93,10 @@ export async function forever(
                 currentBackoffDelay = Math.min(currentBackoffDelay * multiplier, maxDelayMs);
             } catch (abortError) {
                 // Backoff delay was aborted, exit the loop
-                if (abortError instanceof DOMException && (abortError as DOMException).name === 'AbortError') {
+                if (
+                    abortError instanceof DOMException &&
+                    (abortError as DOMException).name === "AbortError"
+                ) {
                     break;
                 }
             }
@@ -118,7 +117,7 @@ export async function retryWithBackoff<T>(
         maxDelayMs?: number;
         multiplier?: number;
         maxAttempts?: number;
-    }
+    },
 ): Promise<T> {
     const {
         signal,
@@ -138,7 +137,7 @@ export async function retryWithBackoff<T>(
             return await fn();
         } catch (error) {
             if (signal.aborted) {
-                throw new DOMException('Operation aborted', 'AbortError');
+                throw new DOMException("Operation aborted", "AbortError");
             }
 
             // If we've hit max attempts, throw the error
@@ -152,10 +151,10 @@ export async function retryWithBackoff<T>(
                 currentDelay = Math.min(currentDelay * multiplier, maxDelayMs);
             } catch (abortError) {
                 // Delay was aborted
-                throw new DOMException('Operation aborted', 'AbortError');
+                throw new DOMException("Operation aborted", "AbortError");
             }
         }
     }
 
-    throw new DOMException('Operation aborted', 'AbortError');
+    throw new DOMException("Operation aborted", "AbortError");
 }

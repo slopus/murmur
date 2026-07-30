@@ -5,31 +5,31 @@
  * providing a high-level API for secure communication between agents.
  */
 
-import type { RatchetState, SerializedRatchetState } from '../ratchet/types.js'
-import type { X3DHKeyStore, SerializedX3DHKeyStore } from '../x3dh/types.js'
+import type { RatchetState, SerializedRatchetState } from "../ratchet/types.js";
+import type { X3DHKeyStore, SerializedX3DHKeyStore } from "../x3dh/types.js";
 
 /**
  * Active session with a peer.
  */
 export interface Session {
     /** Peer's identity public key (Ed25519) */
-    peerIdentityKey: Uint8Array
+    peerIdentityKey: Uint8Array;
     /** Double Ratchet state for this session */
-    ratchetState: RatchetState
+    ratchetState: RatchetState;
     /** When the session was established */
-    establishedAt: number
+    establishedAt: number;
     /** When the last message was sent/received */
-    lastActivityAt: number
+    lastActivityAt: number;
 }
 
 /**
  * Serializable session for persistence.
  */
 export interface SerializedSession {
-    peerIdentityKey: string
-    ratchetState: SerializedRatchetState
-    establishedAt: number
-    lastActivityAt: number
+    peerIdentityKey: string;
+    ratchetState: SerializedRatchetState;
+    establishedAt: number;
+    lastActivityAt: number;
 }
 
 /**
@@ -37,17 +37,17 @@ export interface SerializedSession {
  */
 export interface AgentState {
     /** X3DH key store (identity, signed prekey, one-time prekeys) */
-    keyStore: X3DHKeyStore
+    keyStore: X3DHKeyStore;
     /** Active sessions keyed by peer identity (base64) */
-    sessions: Map<string, Session>
+    sessions: Map<string, Session>;
 }
 
 /**
  * Serializable agent state for persistence.
  */
 export interface SerializedAgentState {
-    keyStore: SerializedX3DHKeyStore
-    sessions: Array<[string, SerializedSession]>
+    keyStore: SerializedX3DHKeyStore;
+    sessions: Array<[string, SerializedSession]>;
 }
 
 /**
@@ -55,11 +55,11 @@ export interface SerializedAgentState {
  */
 export interface OutgoingMessage {
     /** Recipient's identity public key */
-    recipientId: string
+    recipientId: string;
     /** Encrypted message blob (base64) */
-    blob: string
+    blob: string;
     /** Signature of blob + messageId */
-    signature: string
+    signature: string;
 }
 
 /**
@@ -67,15 +67,15 @@ export interface OutgoingMessage {
  */
 export interface IncomingMessage {
     /** Message ID */
-    id: string
+    id: string;
     /** Sender's identity public key */
-    senderId: string
+    senderId: string;
     /** Encrypted message blob (base64) */
-    blob: string
+    blob: string;
     /** Signature */
-    signature: string
+    signature: string;
     /** Server timestamp */
-    createdAt: number
+    createdAt: number;
 }
 
 /**
@@ -86,26 +86,26 @@ export interface IncomingMessage {
  */
 export interface ProtocolMessage {
     /** Message type identifier */
-    type: 'message'
+    type: "message";
     /** Optional attachment payloads keyed by sha256 hash */
-    attachments?: Record<string, string>
+    attachments?: Record<string, string>;
     /** Optional session init fields for pre-key messages */
     init?: {
         /** Alice's ephemeral public key (for X3DH) */
-        ephemeralKey: string
+        ephemeralKey: string;
         /** Bob's prekey public key used */
-        preKey: string
+        preKey: string;
         /** Bob's one-time prekey public key used (if any) */
-        oneTimePreKey?: string
-    }
+        oneTimePreKey?: string;
+    };
     /** Ratchet public key (X25519) */
-    ratchetKey: string
+    ratchetKey: string;
     /** Number of messages in previous sending chain */
-    previousChainLength: number
+    previousChainLength: number;
     /** Message number in current chain */
-    messageNumber: number
+    messageNumber: number;
     /** Encrypted ciphertext */
-    ciphertext: string
+    ciphertext: string;
 }
 
 /**
@@ -113,9 +113,9 @@ export interface ProtocolMessage {
  */
 export interface DecryptedMessage {
     /** Decrypted plaintext */
-    plaintext: Uint8Array
+    plaintext: Uint8Array;
     /** Sender's identity key */
-    senderIdentityKey: Uint8Array
+    senderIdentityKey: Uint8Array;
     /** Optional attachment payloads keyed by sha256 hash */
-    attachments?: Record<string, string>
+    attachments?: Record<string, string>;
 }

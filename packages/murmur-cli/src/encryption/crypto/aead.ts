@@ -15,25 +15,25 @@
  * without requiring separate nonce transmission.
  */
 
-import { chacha20poly1305 } from '@noble/ciphers/chacha'
-import { hkdf } from '@noble/hashes/hkdf'
-import { sha256 } from '@noble/hashes/sha256'
-import { concatBytes, stringToBytes } from './utils.js'
+import { chacha20poly1305 } from "@noble/ciphers/chacha";
+import { hkdf } from "@noble/hashes/hkdf";
+import { sha256 } from "@noble/hashes/sha256";
+import { concatBytes, stringToBytes } from "./utils.js";
 
 /** Length of encryption key in bytes */
-export const AEAD_KEY_LENGTH = 32
+export const AEAD_KEY_LENGTH = 32;
 
 /** Length of nonce in bytes (IETF ChaCha20-Poly1305) */
-export const AEAD_NONCE_LENGTH = 12
+export const AEAD_NONCE_LENGTH = 12;
 
 /** Length of authentication tag in bytes */
-export const AEAD_TAG_LENGTH = 16
+export const AEAD_TAG_LENGTH = 16;
 
 /** HKDF info for deriving encryption key from message key */
-const HKDF_INFO_ENCRYPTION = stringToBytes('MurmurEncryption')
+const HKDF_INFO_ENCRYPTION = stringToBytes("MurmurEncryption");
 
 /** HKDF info for deriving nonce from message key */
-const HKDF_INFO_NONCE = stringToBytes('MurmurNonce')
+const HKDF_INFO_NONCE = stringToBytes("MurmurNonce");
 
 /**
  * Derive encryption key and nonce from a message key.
@@ -48,12 +48,21 @@ const HKDF_INFO_NONCE = stringToBytes('MurmurNonce')
  * @param messageKey - 32-byte message key from KDF_CK
  * @returns Object with encryptionKey and nonce
  */
-function deriveKeyAndNonce(messageKey: Uint8Array): { encryptionKey: Uint8Array; nonce: Uint8Array } {
+function deriveKeyAndNonce(messageKey: Uint8Array): {
+    encryptionKey: Uint8Array;
+    nonce: Uint8Array;
+} {
     // Use message key as input key material with no salt
-    const encryptionKey = hkdf(sha256, messageKey, undefined, HKDF_INFO_ENCRYPTION, AEAD_KEY_LENGTH)
-    const nonce = hkdf(sha256, messageKey, undefined, HKDF_INFO_NONCE, AEAD_NONCE_LENGTH)
+    const encryptionKey = hkdf(
+        sha256,
+        messageKey,
+        undefined,
+        HKDF_INFO_ENCRYPTION,
+        AEAD_KEY_LENGTH,
+    );
+    const nonce = hkdf(sha256, messageKey, undefined, HKDF_INFO_NONCE, AEAD_NONCE_LENGTH);
 
-    return { encryptionKey, nonce }
+    return { encryptionKey, nonce };
 }
 
 /**
@@ -79,12 +88,12 @@ function deriveKeyAndNonce(messageKey: Uint8Array): { encryptionKey: Uint8Array;
 export function encrypt(
     messageKey: Uint8Array,
     plaintext: Uint8Array,
-    associatedData: Uint8Array
+    associatedData: Uint8Array,
 ): Uint8Array {
-    const { encryptionKey, nonce } = deriveKeyAndNonce(messageKey)
+    const { encryptionKey, nonce } = deriveKeyAndNonce(messageKey);
 
-    const cipher = chacha20poly1305(encryptionKey, nonce, associatedData)
-    return cipher.encrypt(plaintext)
+    const cipher = chacha20poly1305(encryptionKey, nonce, associatedData);
+    return cipher.encrypt(plaintext);
 }
 
 /**
@@ -112,12 +121,12 @@ export function encrypt(
 export function decrypt(
     messageKey: Uint8Array,
     ciphertext: Uint8Array,
-    associatedData: Uint8Array
+    associatedData: Uint8Array,
 ): Uint8Array {
-    const { encryptionKey, nonce } = deriveKeyAndNonce(messageKey)
+    const { encryptionKey, nonce } = deriveKeyAndNonce(messageKey);
 
-    const cipher = chacha20poly1305(encryptionKey, nonce, associatedData)
-    return cipher.decrypt(ciphertext)
+    const cipher = chacha20poly1305(encryptionKey, nonce, associatedData);
+    return cipher.decrypt(ciphertext);
 }
 
 /**
@@ -133,10 +142,10 @@ export function decrypt(
 export function encryptJson(
     messageKey: Uint8Array,
     data: unknown,
-    associatedData: Uint8Array
+    associatedData: Uint8Array,
 ): Uint8Array {
-    const plaintext = stringToBytes(JSON.stringify(data))
-    return encrypt(messageKey, plaintext, associatedData)
+    const plaintext = stringToBytes(JSON.stringify(data));
+    return encrypt(messageKey, plaintext, associatedData);
 }
 
 /**
@@ -151,8 +160,8 @@ export function encryptJson(
 export function decryptJson<T = unknown>(
     messageKey: Uint8Array,
     ciphertext: Uint8Array,
-    associatedData: Uint8Array
+    associatedData: Uint8Array,
 ): T {
-    const plaintext = decrypt(messageKey, ciphertext, associatedData)
-    return JSON.parse(new TextDecoder().decode(plaintext))
+    const plaintext = decrypt(messageKey, ciphertext, associatedData);
+    return JSON.parse(new TextDecoder().decode(plaintext));
 }

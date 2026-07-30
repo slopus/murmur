@@ -1,4 +1,4 @@
-import { log } from './log';
+import { log } from "./log";
 
 type ShutdownHandler = () => Promise<void>;
 
@@ -24,11 +24,11 @@ export function getShutdownSignal(): AbortSignal {
 
 async function performShutdown() {
     if (isShuttingDown) {
-        log('Shutdown already in progress...');
+        log("Shutdown already in progress...");
         return;
     }
     isShuttingDown = true;
-    log('Shutdown initiated...');
+    log("Shutdown initiated...");
 
     // Signal shutdown via AbortController
     shutdownController.abort();
@@ -54,16 +54,16 @@ export function awaitShutdown(): Promise<void> {
 }
 
 // Handle shutdown signals
-process.on('SIGINT', async () => {
-    log('Received SIGINT');
+process.on("SIGINT", async () => {
+    log("Received SIGINT");
     await performShutdown();
     if (shutdownResolver) {
         shutdownResolver();
     }
 });
 
-process.on('SIGTERM', async () => {
-    log('Received SIGTERM');
+process.on("SIGTERM", async () => {
+    log("Received SIGTERM");
     await performShutdown();
     if (shutdownResolver) {
         shutdownResolver();

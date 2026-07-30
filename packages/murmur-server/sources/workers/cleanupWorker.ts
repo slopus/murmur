@@ -1,8 +1,8 @@
-import { db } from '@/db';
-import { log } from '@/log';
-import { forever } from '@/utils/timing';
-import { getShutdownSignal } from '@/shutdown';
-import { cleanupRunsTotal, messagesExpiredTotal } from '@/metrics/prometheus';
+import { db } from "@/db";
+import { log } from "@/log";
+import { forever } from "@/utils/timing";
+import { getShutdownSignal } from "@/shutdown";
+import { cleanupRunsTotal, messagesExpiredTotal } from "@/metrics/prometheus";
 
 /**
  * Cleanup function that deletes expired messages
@@ -25,10 +25,10 @@ async function cleanup(): Promise<void> {
             messagesExpiredTotal.inc(result.count);
         }
 
-        cleanupRunsTotal.inc({ status: 'success' });
+        cleanupRunsTotal.inc({ status: "success" });
     } catch (error) {
         log(`Error during cleanup: ${error}`);
-        cleanupRunsTotal.inc({ status: 'error' });
+        cleanupRunsTotal.inc({ status: "error" });
         throw error;
     }
 }
@@ -41,18 +41,13 @@ export async function startCleanupWorker(): Promise<void> {
     const CHECK_INTERVAL_MS = 60 * 60 * 1000; // 1 hour
     const shutdownSignal = getShutdownSignal();
 
-    log('Starting cleanup worker...');
+    log("Starting cleanup worker...");
 
-    await forever(
-        cleanup,
-        CHECK_INTERVAL_MS,
-        shutdownSignal,
-        {
-            initialDelayMs: 1000,
-            maxDelayMs: 60000,
-            multiplier: 2,
-        }
-    );
+    await forever(cleanup, CHECK_INTERVAL_MS, shutdownSignal, {
+        initialDelayMs: 1000,
+        maxDelayMs: 60000,
+        multiplier: 2,
+    });
 
-    log('Cleanup worker stopped');
+    log("Cleanup worker stopped");
 }

@@ -31,7 +31,7 @@ export function validateBlobSize(base64String: string, maxSize: number, fieldNam
     if (decodedSize > maxSize) {
         throw new Error(
             `${fieldName} exceeds maximum size of ${formatBytes(maxSize)} ` +
-            `(got ${formatBytes(decodedSize)})`
+                `(got ${formatBytes(decodedSize)})`,
         );
     }
 }
@@ -43,7 +43,7 @@ export function validateStringLength(str: string, maxLength: number, fieldName: 
     if (str.length > maxLength) {
         throw new Error(
             `${fieldName} exceeds maximum length of ${maxLength} characters ` +
-            `(got ${str.length})`
+                `(got ${str.length})`,
         );
     }
 }
@@ -51,7 +51,12 @@ export function validateStringLength(str: string, maxLength: number, fieldName: 
 /**
  * Validate array length
  */
-export function validateArrayLength<T>(arr: T[], min: number, max: number, fieldName: string): void {
+export function validateArrayLength<T>(
+    arr: T[],
+    min: number,
+    max: number,
+    fieldName: string,
+): void {
     if (arr.length < min) {
         throw new Error(`${fieldName} must contain at least ${min} items (got ${arr.length})`);
     }
@@ -78,10 +83,10 @@ export function validateMessageData(data: {
     signature: string;
     recipientId: string;
 }): void {
-    validateStringLength(data.messageId, SIZE_LIMITS.MESSAGE_ID, 'messageId');
-    validateBlobSize(data.blob, SIZE_LIMITS.MESSAGE_BLOB, 'blob');
-    validateBlobSize(data.signature, SIZE_LIMITS.SIGNATURE, 'signature');
-    validateStringLength(data.recipientId, SIZE_LIMITS.PUBLIC_KEY, 'recipientId');
+    validateStringLength(data.messageId, SIZE_LIMITS.MESSAGE_ID, "messageId");
+    validateBlobSize(data.blob, SIZE_LIMITS.MESSAGE_BLOB, "blob");
+    validateBlobSize(data.signature, SIZE_LIMITS.SIGNATURE, "signature");
+    validateStringLength(data.recipientId, SIZE_LIMITS.PUBLIC_KEY, "recipientId");
 }
 
 /**
@@ -92,20 +97,17 @@ export function validateProfileData(data: {
     profileKeySignature: string;
     encryptedProfile: string;
 }): void {
-    validateStringLength(data.profilePublicKey, SIZE_LIMITS.PUBLIC_KEY, 'profilePublicKey');
-    validateBlobSize(data.profileKeySignature, SIZE_LIMITS.SIGNATURE, 'profileKeySignature');
-    validateBlobSize(data.encryptedProfile, SIZE_LIMITS.PROFILE_BLOB, 'encryptedProfile');
+    validateStringLength(data.profilePublicKey, SIZE_LIMITS.PUBLIC_KEY, "profilePublicKey");
+    validateBlobSize(data.profileKeySignature, SIZE_LIMITS.SIGNATURE, "profileKeySignature");
+    validateBlobSize(data.encryptedProfile, SIZE_LIMITS.PROFILE_BLOB, "encryptedProfile");
 }
 
 /**
  * Validate prekey data before processing
  */
-export function validatePreKeyData(data: {
-    publicKey: string;
-    signature: string;
-}): void {
-    validateStringLength(data.publicKey, SIZE_LIMITS.PREKEY_PUBLIC, 'publicKey');
-    validateBlobSize(data.signature, SIZE_LIMITS.SIGNATURE, 'signature');
+export function validatePreKeyData(data: { publicKey: string; signature: string }): void {
+    validateStringLength(data.publicKey, SIZE_LIMITS.PREKEY_PUBLIC, "publicKey");
+    validateBlobSize(data.signature, SIZE_LIMITS.SIGNATURE, "signature");
 }
 
 const USERNAME_REGEX = /^[a-z0-9][a-z0-9_-]{2,31}$/;
@@ -116,11 +118,11 @@ const USERNAME_REGEX = /^[a-z0-9][a-z0-9_-]{2,31}$/;
 export function validatePublicProfileUsername(value: string): void {
     const username = value.trim();
     if (username.length === 0) {
-        throw new Error('username is required');
+        throw new Error("username is required");
     }
-    validateStringLength(username, SIZE_LIMITS.PUBLIC_PROFILE_USERNAME, 'username');
+    validateStringLength(username, SIZE_LIMITS.PUBLIC_PROFILE_USERNAME, "username");
     if (!USERNAME_REGEX.test(username)) {
-        throw new Error('username must be 3-32 chars (lowercase letters, numbers, _ or -)');
+        throw new Error("username must be 3-32 chars (lowercase letters, numbers, _ or -)");
     }
 }
 
@@ -130,9 +132,9 @@ export function validatePublicProfileUsername(value: string): void {
 export function validatePublicProfileDescription(value: string): void {
     const description = value.trim();
     if (description.length === 0) {
-        throw new Error('description is required');
+        throw new Error("description is required");
     }
-    validateStringLength(description, SIZE_LIMITS.PUBLIC_PROFILE_DESCRIPTION, 'description');
+    validateStringLength(description, SIZE_LIMITS.PUBLIC_PROFILE_DESCRIPTION, "description");
 }
 
 /**
@@ -148,14 +150,18 @@ export function validatePublicProfileData(data: {
     validatePublicProfileDescription(data.description);
     if (data.avatarImage) {
         if (data.avatarImage.trim().length === 0) {
-            throw new Error('avatar image is required');
+            throw new Error("avatar image is required");
         }
-        validateBlobSize(data.avatarImage, SIZE_LIMITS.PUBLIC_PROFILE_AVATAR, 'avatar');
+        validateBlobSize(data.avatarImage, SIZE_LIMITS.PUBLIC_PROFILE_AVATAR, "avatar");
     }
     if (data.avatarThumbhash) {
         if (data.avatarThumbhash.trim().length === 0) {
-            throw new Error('thumbhash is required');
+            throw new Error("thumbhash is required");
         }
-        validateStringLength(data.avatarThumbhash, SIZE_LIMITS.PUBLIC_PROFILE_THUMBHASH, 'thumbhash');
+        validateStringLength(
+            data.avatarThumbhash,
+            SIZE_LIMITS.PUBLIC_PROFILE_THUMBHASH,
+            "thumbhash",
+        );
     }
 }

@@ -15,16 +15,22 @@
  * Based on: https://signal.org/docs/specifications/x3dh/
  */
 
-import { generateDH, dh, publicKeyFromPrivate, deriveDhKeyPairFromSigningKey, type DHKeyPair } from '../crypto/dh.js'
+import {
+    generateDH,
+    dh,
+    publicKeyFromPrivate,
+    deriveDhKeyPairFromSigningKey,
+    type DHKeyPair,
+} from "../crypto/dh.js";
 import {
     generateSigningKeyPair,
     sign,
     verify,
     signingPublicKeyFromPrivate,
-    type SigningKeyPair
-} from '../crypto/signing.js'
-import { hkdfExpand } from '../crypto/kdf.js'
-import { concatBytes, encodeBase64, decodeBase64 } from '../crypto/utils.js'
+    type SigningKeyPair,
+} from "../crypto/signing.js";
+import { hkdfExpand } from "../crypto/kdf.js";
+import { concatBytes, encodeBase64, decodeBase64 } from "../crypto/utils.js";
 import type {
     IdentityKeyPair,
     SignedPreKey,
@@ -34,14 +40,14 @@ import type {
     X3DHReceiverKeys,
     X3DHReceiverResult,
     X3DHKeyStore,
-    SerializedX3DHKeyStore
-} from './types.js'
+    SerializedX3DHKeyStore,
+} from "./types.js";
 
 /** HKDF info string for X3DH shared secret derivation */
-const X3DH_INFO = 'MurmurX3DH'
+const X3DH_INFO = "MurmurX3DH";
 
 /** 32 zero bytes prepended to DH outputs per X3DH spec */
-const ZERO_BYTES = new Uint8Array(32)
+const ZERO_BYTES = new Uint8Array(32);
 
 /**
  * Generate a new identity key pair.
@@ -59,14 +65,14 @@ const ZERO_BYTES = new Uint8Array(32)
  * ```
  */
 export function generateIdentityKeyPair(): IdentityKeyPair {
-    const signingKeyPair = generateSigningKeyPair()
+    const signingKeyPair = generateSigningKeyPair();
     // Derive DH key pair from signing private key
-    const dhKeyPair = deriveDhKeyPairFromSigningKey(signingKeyPair.privateKey)
+    const dhKeyPair = deriveDhKeyPairFromSigningKey(signingKeyPair.privateKey);
 
     return {
         ...signingKeyPair,
-        dhKeyPair
-    }
+        dhKeyPair,
+    };
 }
 
 /**
@@ -85,19 +91,16 @@ export function generateIdentityKeyPair(): IdentityKeyPair {
  * // Upload signedPreKey.keyPair.publicKey and signedPreKey.signature to server
  * ```
  */
-export function generateSignedPreKey(
-    identityKeyPair: IdentityKeyPair,
-    id: number
-): SignedPreKey {
-    const keyPair = generateDH()
-    const signature = sign(keyPair.publicKey, identityKeyPair.privateKey)
+export function generateSignedPreKey(identityKeyPair: IdentityKeyPair, id: number): SignedPreKey {
+    const keyPair = generateDH();
+    const signature = sign(keyPair.publicKey, identityKeyPair.privateKey);
 
     return {
         id,
         keyPair,
         signature,
-        createdAt: Date.now()
-    }
+        createdAt: Date.now(),
+    };
 }
 
 /**
@@ -112,8 +115,8 @@ export function generateSignedPreKey(
 export function generateOneTimePreKey(id: number): OneTimePreKey {
     return {
         id,
-        keyPair: generateDH()
-    }
+        keyPair: generateDH(),
+    };
 }
 
 /**
@@ -124,11 +127,11 @@ export function generateOneTimePreKey(id: number): OneTimePreKey {
  * @returns Array of one-time prekeys
  */
 export function generateOneTimePreKeys(startId: number, count: number): OneTimePreKey[] {
-    const preKeys: OneTimePreKey[] = []
+    const preKeys: OneTimePreKey[] = [];
     for (let i = 0; i < count; i++) {
-        preKeys.push(generateOneTimePreKey(startId + i))
+        preKeys.push(generateOneTimePreKey(startId + i));
     }
-    return preKeys
+    return preKeys;
 }
 
 /**
@@ -142,14 +145,14 @@ export function generateOneTimePreKeys(startId: number, count: number): OneTimeP
 export function createPreKeyBundle(
     identityKeyPair: IdentityKeyPair,
     signedPreKey: SignedPreKey,
-    oneTimePreKey?: OneTimePreKey
+    oneTimePreKey?: OneTimePreKey,
 ): PreKeyBundle {
     return {
         identityKey: identityKeyPair.publicKey,
         signedPreKey: signedPreKey.keyPair.publicKey,
         signedPreKeySignature: signedPreKey.signature,
-        oneTimePreKey: oneTimePreKey?.keyPair.publicKey
-    }
+        oneTimePreKey: oneTimePreKey?.keyPair.publicKey,
+    };
 }
 
 /**
@@ -162,7 +165,7 @@ export function createPreKeyBundle(
  * @returns true if signature is valid
  */
 export function verifyPreKeyBundle(bundle: PreKeyBundle): boolean {
-    return verify(bundle.signedPreKey, bundle.signedPreKeySignature, bundle.identityKey)
+    return verify(bundle.signedPreKey, bundle.signedPreKeySignature, bundle.identityKey);
 }
 
 /**
@@ -191,43 +194,43 @@ export function verifyPreKeyBundle(bundle: PreKeyBundle): boolean {
  */
 export function x3dhSender(
     aliceIdentity: IdentityKeyPair,
-    bobBundle: PreKeyBundle
+    bobBundle: PreKeyBundle,
 ): X3DHSenderResult {
     // Verify the bundle first
     if (!verifyPreKeyBundle(bobBundle)) {
-        throw new Error('Invalid prekey bundle signature')
+        throw new Error("Invalid prekey bundle signature");
     }
 
     // Generate ephemeral key pair for this session
-    const ephemeralKeyPair = generateDH()
+    const ephemeralKeyPair = generateDH();
 
     // Perform DH calculations
     // DH1: IK_A × SPK_B (Alice's identity DH key with Bob's signed prekey)
-    const dh1 = dh(aliceIdentity.dhKeyPair, bobBundle.signedPreKey)
+    const dh1 = dh(aliceIdentity.dhKeyPair, bobBundle.signedPreKey);
 
     // DH2: EK_A × SPK_B (Alice's ephemeral with Bob's signed prekey)
-    const dh2 = dh(ephemeralKeyPair, bobBundle.signedPreKey)
+    const dh2 = dh(ephemeralKeyPair, bobBundle.signedPreKey);
 
     // Concatenate DH outputs (with leading zeros per spec)
-    let dhConcat: Uint8Array
+    let dhConcat: Uint8Array;
     if (bobBundle.oneTimePreKey) {
         // DH3: EK_A × OPK_B (Alice's ephemeral with Bob's one-time prekey)
-        const dh3 = dh(ephemeralKeyPair, bobBundle.oneTimePreKey)
-        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2, dh3)
+        const dh3 = dh(ephemeralKeyPair, bobBundle.oneTimePreKey);
+        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2, dh3);
     } else {
-        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2)
+        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2);
     }
 
     // Derive shared secret using HKDF
-    const sharedSecret = hkdfExpand(dhConcat, undefined, X3DH_INFO, 32)
+    const sharedSecret = hkdfExpand(dhConcat, undefined, X3DH_INFO, 32);
 
     return {
         sharedSecret,
         ephemeralPublicKey: ephemeralKeyPair.publicKey,
         bobSignedPreKey: bobBundle.signedPreKey,
         // Also include Alice's identity DH public key for Bob to compute DH1
-        aliceIdentityDHKey: aliceIdentity.dhKeyPair.publicKey
-    }
+        aliceIdentityDHKey: aliceIdentity.dhKeyPair.publicKey,
+    };
 }
 
 /**
@@ -257,32 +260,32 @@ export function x3dhReceiver(
     bobKeys: X3DHReceiverKeys,
     aliceIdentityKey: Uint8Array,
     aliceIdentityDHKey: Uint8Array,
-    aliceEphemeralKey: Uint8Array
+    aliceEphemeralKey: Uint8Array,
 ): X3DHReceiverResult {
     // Perform DH calculations (mirror of sender)
     // DH1: SPK_B × IK_A_DH (Bob's signed prekey with Alice's identity DH key)
-    const dh1 = dh(bobKeys.signedPreKey.keyPair, aliceIdentityDHKey)
+    const dh1 = dh(bobKeys.signedPreKey.keyPair, aliceIdentityDHKey);
 
     // DH2: SPK_B × EK_A (Bob's signed prekey with Alice's ephemeral)
-    const dh2 = dh(bobKeys.signedPreKey.keyPair, aliceEphemeralKey)
+    const dh2 = dh(bobKeys.signedPreKey.keyPair, aliceEphemeralKey);
 
     // Concatenate DH outputs
-    let dhConcat: Uint8Array
+    let dhConcat: Uint8Array;
     if (bobKeys.oneTimePreKey) {
         // DH3: OPK_B × EK_A (Bob's one-time prekey with Alice's ephemeral)
-        const dh3 = dh(bobKeys.oneTimePreKey.keyPair, aliceEphemeralKey)
-        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2, dh3)
+        const dh3 = dh(bobKeys.oneTimePreKey.keyPair, aliceEphemeralKey);
+        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2, dh3);
     } else {
-        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2)
+        dhConcat = concatBytes(ZERO_BYTES, dh1, dh2);
     }
 
     // Derive shared secret using HKDF
-    const sharedSecret = hkdfExpand(dhConcat, undefined, X3DH_INFO, 32)
+    const sharedSecret = hkdfExpand(dhConcat, undefined, X3DH_INFO, 32);
 
     return {
         sharedSecret,
-        aliceIdentityKey
-    }
+        aliceIdentityKey,
+    };
 }
 
 /**
@@ -297,21 +300,21 @@ export function x3dhReceiver(
  * @returns Initialized key store
  */
 export function initializeKeyStore(oneTimePreKeyCount: number = 99): X3DHKeyStore {
-    const identityKeyPair = generateIdentityKeyPair()
-    const signedPreKey = generateSignedPreKey(identityKeyPair, 0)
-    const oneTimePreKeys = new Map<number, OneTimePreKey>()
+    const identityKeyPair = generateIdentityKeyPair();
+    const signedPreKey = generateSignedPreKey(identityKeyPair, 0);
+    const oneTimePreKeys = new Map<number, OneTimePreKey>();
 
     for (let i = 0; i < oneTimePreKeyCount; i++) {
-        const otpk = generateOneTimePreKey(i + 1)
-        oneTimePreKeys.set(otpk.id, otpk)
+        const otpk = generateOneTimePreKey(i + 1);
+        oneTimePreKeys.set(otpk.id, otpk);
     }
 
     return {
         identityKeyPair,
         signedPreKey,
         oneTimePreKeys,
-        nextPreKeyId: oneTimePreKeyCount + 1
-    }
+        nextPreKeyId: oneTimePreKeyCount + 1,
+    };
 }
 
 /**
@@ -331,15 +334,15 @@ export function serializeKeyStore(store: X3DHKeyStore): SerializedX3DHKeyStore {
             privateKey: encodeBase64(store.signedPreKey.keyPair.privateKey),
             publicKey: encodeBase64(store.signedPreKey.keyPair.publicKey),
             signature: encodeBase64(store.signedPreKey.signature),
-            createdAt: store.signedPreKey.createdAt
+            createdAt: store.signedPreKey.createdAt,
         },
-        oneTimePreKeys: Array.from(store.oneTimePreKeys.values()).map(otpk => ({
+        oneTimePreKeys: Array.from(store.oneTimePreKeys.values()).map((otpk) => ({
             id: otpk.id,
             privateKey: encodeBase64(otpk.keyPair.privateKey),
-            publicKey: encodeBase64(otpk.keyPair.publicKey)
+            publicKey: encodeBase64(otpk.keyPair.publicKey),
         })),
-        nextPreKeyId: store.nextPreKeyId
-    }
+        nextPreKeyId: store.nextPreKeyId,
+    };
 }
 
 /**
@@ -354,37 +357,37 @@ export function deserializeKeyStore(serialized: SerializedX3DHKeyStore): X3DHKey
         publicKey: decodeBase64(serialized.identityPublicKey),
         dhKeyPair: {
             privateKey: decodeBase64(serialized.identityDHPrivateKey),
-            publicKey: decodeBase64(serialized.identityDHPublicKey)
-        }
-    }
+            publicKey: decodeBase64(serialized.identityDHPublicKey),
+        },
+    };
 
     const signedPreKey: SignedPreKey = {
         id: serialized.signedPreKey.id,
         keyPair: {
             privateKey: decodeBase64(serialized.signedPreKey.privateKey),
-            publicKey: decodeBase64(serialized.signedPreKey.publicKey)
+            publicKey: decodeBase64(serialized.signedPreKey.publicKey),
         },
         signature: decodeBase64(serialized.signedPreKey.signature),
-        createdAt: serialized.signedPreKey.createdAt
-    }
+        createdAt: serialized.signedPreKey.createdAt,
+    };
 
-    const oneTimePreKeys = new Map<number, OneTimePreKey>()
+    const oneTimePreKeys = new Map<number, OneTimePreKey>();
     for (const otpk of serialized.oneTimePreKeys) {
         oneTimePreKeys.set(otpk.id, {
             id: otpk.id,
             keyPair: {
                 privateKey: decodeBase64(otpk.privateKey),
-                publicKey: decodeBase64(otpk.publicKey)
-            }
-        })
+                publicKey: decodeBase64(otpk.publicKey),
+            },
+        });
     }
 
     return {
         identityKeyPair,
         signedPreKey,
         oneTimePreKeys,
-        nextPreKeyId: serialized.nextPreKeyId
-    }
+        nextPreKeyId: serialized.nextPreKeyId,
+    };
 }
 
 /**
@@ -396,15 +399,12 @@ export function deserializeKeyStore(serialized: SerializedX3DHKeyStore): X3DHKey
  * @param id - ID of the one-time prekey to consume
  * @returns The consumed one-time prekey, or undefined if not found
  */
-export function consumeOneTimePreKey(
-    store: X3DHKeyStore,
-    id: number
-): OneTimePreKey | undefined {
-    const otpk = store.oneTimePreKeys.get(id)
+export function consumeOneTimePreKey(store: X3DHKeyStore, id: number): OneTimePreKey | undefined {
+    const otpk = store.oneTimePreKeys.get(id);
     if (otpk) {
-        store.oneTimePreKeys.delete(id)
+        store.oneTimePreKeys.delete(id);
     }
-    return otpk
+    return otpk;
 }
 
 /**
@@ -414,23 +414,20 @@ export function consumeOneTimePreKey(
  * @param targetCount - Desired number of one-time prekeys
  * @returns Array of newly generated prekeys (to upload to server)
  */
-export function replenishOneTimePreKeys(
-    store: X3DHKeyStore,
-    targetCount: number
-): OneTimePreKey[] {
-    const currentCount = store.oneTimePreKeys.size
+export function replenishOneTimePreKeys(store: X3DHKeyStore, targetCount: number): OneTimePreKey[] {
+    const currentCount = store.oneTimePreKeys.size;
     if (currentCount >= targetCount) {
-        return []
+        return [];
     }
 
-    const toGenerate = targetCount - currentCount
-    const newKeys: OneTimePreKey[] = []
+    const toGenerate = targetCount - currentCount;
+    const newKeys: OneTimePreKey[] = [];
 
     for (let i = 0; i < toGenerate; i++) {
-        const otpk = generateOneTimePreKey(store.nextPreKeyId++)
-        store.oneTimePreKeys.set(otpk.id, otpk)
-        newKeys.push(otpk)
+        const otpk = generateOneTimePreKey(store.nextPreKeyId++);
+        store.oneTimePreKeys.set(otpk.id, otpk);
+        newKeys.push(otpk);
     }
 
-    return newKeys
+    return newKeys;
 }

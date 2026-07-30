@@ -6,8 +6,8 @@
  * signed prekeys, and one-time prekeys.
  */
 
-import type { SigningKeyPair } from '../crypto/signing.js'
-import type { DHKeyPair } from '../crypto/dh.js'
+import type { SigningKeyPair } from "../crypto/signing.js";
+import type { DHKeyPair } from "../crypto/dh.js";
 
 /**
  * Identity key pair using Ed25519 for signing.
@@ -15,7 +15,7 @@ import type { DHKeyPair } from '../crypto/dh.js'
  */
 export interface IdentityKeyPair extends SigningKeyPair {
     /** DH key pair derived from identity for key agreement */
-    dhKeyPair: DHKeyPair
+    dhKeyPair: DHKeyPair;
 }
 
 /**
@@ -24,13 +24,13 @@ export interface IdentityKeyPair extends SigningKeyPair {
  */
 export interface SignedPreKey {
     /** Unique identifier for this prekey */
-    id: number
+    id: number;
     /** X25519 key pair for DH */
-    keyPair: DHKeyPair
+    keyPair: DHKeyPair;
     /** Ed25519 signature of the public key by identity key */
-    signature: Uint8Array
+    signature: Uint8Array;
     /** Timestamp when this key was created */
-    createdAt: number
+    createdAt: number;
 }
 
 /**
@@ -39,9 +39,9 @@ export interface SignedPreKey {
  */
 export interface OneTimePreKey {
     /** Unique identifier for this prekey */
-    id: number
+    id: number;
     /** X25519 key pair for DH */
-    keyPair: DHKeyPair
+    keyPair: DHKeyPair;
 }
 
 /**
@@ -50,13 +50,13 @@ export interface OneTimePreKey {
  */
 export interface PreKeyBundle {
     /** Bob's identity public key (Ed25519) */
-    identityKey: Uint8Array
+    identityKey: Uint8Array;
     /** Bob's signed prekey public key */
-    signedPreKey: Uint8Array
+    signedPreKey: Uint8Array;
     /** Signature of signedPreKey by identityKey */
-    signedPreKeySignature: Uint8Array
+    signedPreKeySignature: Uint8Array;
     /** Optional one-time prekey public key (may be exhausted) */
-    oneTimePreKey?: Uint8Array
+    oneTimePreKey?: Uint8Array;
 }
 
 /**
@@ -64,13 +64,13 @@ export interface PreKeyBundle {
  */
 export interface X3DHSenderResult {
     /** The shared secret (32 bytes) for Double Ratchet initialization */
-    sharedSecret: Uint8Array
+    sharedSecret: Uint8Array;
     /** Alice's ephemeral public key (to send to Bob) */
-    ephemeralPublicKey: Uint8Array
+    ephemeralPublicKey: Uint8Array;
     /** Alice's identity DH public key (to send to Bob for DH computation) */
-    aliceIdentityDHKey: Uint8Array
+    aliceIdentityDHKey: Uint8Array;
     /** Bob's signed prekey public key (for Double Ratchet init) */
-    bobSignedPreKey: Uint8Array
+    bobSignedPreKey: Uint8Array;
 }
 
 /**
@@ -78,17 +78,17 @@ export interface X3DHSenderResult {
  */
 export interface X3DHInitialMessage {
     /** Alice's identity public key */
-    identityKey: Uint8Array
+    identityKey: Uint8Array;
     /** Alice's ephemeral public key */
-    ephemeralKey: Uint8Array
+    ephemeralKey: Uint8Array;
     /** Bob's signed prekey public key that was used */
-    signedPreKey: Uint8Array
+    signedPreKey: Uint8Array;
     /** Bob's one-time prekey public key that was used (if any) */
-    oneTimePreKey?: Uint8Array
+    oneTimePreKey?: Uint8Array;
     /** The first Double Ratchet encrypted message */
-    initialCiphertext: Uint8Array
+    initialCiphertext: Uint8Array;
     /** Header of the first message */
-    initialHeader: Uint8Array
+    initialHeader: Uint8Array;
 }
 
 /**
@@ -96,11 +96,11 @@ export interface X3DHInitialMessage {
  */
 export interface X3DHReceiverKeys {
     /** Bob's identity key pair */
-    identityKeyPair: IdentityKeyPair
+    identityKeyPair: IdentityKeyPair;
     /** Bob's signed prekey (matched by ID) */
-    signedPreKey: SignedPreKey
+    signedPreKey: SignedPreKey;
     /** Bob's one-time prekey if referenced (matched by ID) */
-    oneTimePreKey?: OneTimePreKey
+    oneTimePreKey?: OneTimePreKey;
 }
 
 /**
@@ -108,9 +108,9 @@ export interface X3DHReceiverKeys {
  */
 export interface X3DHReceiverResult {
     /** The shared secret (32 bytes) - same as Alice computed */
-    sharedSecret: Uint8Array
+    sharedSecret: Uint8Array;
     /** Alice's identity public key (for verification) */
-    aliceIdentityKey: Uint8Array
+    aliceIdentityKey: Uint8Array;
 }
 
 /**
@@ -118,34 +118,34 @@ export interface X3DHReceiverResult {
  */
 export interface X3DHKeyStore {
     /** Our identity key pair */
-    identityKeyPair: IdentityKeyPair
+    identityKeyPair: IdentityKeyPair;
     /** Current signed prekey */
-    signedPreKey: SignedPreKey
+    signedPreKey: SignedPreKey;
     /** Pool of unused one-time prekeys */
-    oneTimePreKeys: Map<number, OneTimePreKey>
+    oneTimePreKeys: Map<number, OneTimePreKey>;
     /** Counter for generating unique prekey IDs */
-    nextPreKeyId: number
+    nextPreKeyId: number;
 }
 
 /**
  * Serializable version of X3DHKeyStore for persistence.
  */
 export interface SerializedX3DHKeyStore {
-    identityPrivateKey: string
-    identityPublicKey: string
-    identityDHPrivateKey: string
-    identityDHPublicKey: string
+    identityPrivateKey: string;
+    identityPublicKey: string;
+    identityDHPrivateKey: string;
+    identityDHPublicKey: string;
     signedPreKey: {
-        id: number
-        privateKey: string
-        publicKey: string
-        signature: string
-        createdAt: number
-    }
+        id: number;
+        privateKey: string;
+        publicKey: string;
+        signature: string;
+        createdAt: number;
+    };
     oneTimePreKeys: Array<{
-        id: number
-        privateKey: string
-        publicKey: string
-    }>
-    nextPreKeyId: number
+        id: number;
+        privateKey: string;
+        publicKey: string;
+    }>;
+    nextPreKeyId: number;
 }

@@ -1,3 +1,3 @@
-import { EventBus } from './eventbus';
+import { EventBus } from "./eventbus";
 
 export const events = new EventBus();

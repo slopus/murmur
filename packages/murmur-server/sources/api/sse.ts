@@ -1,4 +1,4 @@
-import type { FastifyReply } from 'fastify';
+import type { FastifyReply } from "fastify";
 
 /**
  * SSE (Server-Sent Events) connection manager
@@ -12,13 +12,13 @@ export class SSEConnection {
 
         // Set SSE headers
         reply.raw.writeHead(200, {
-            'Content-Type': 'text/event-stream',
-            'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
+            "Content-Type": "text/event-stream",
+            "Cache-Control": "no-cache",
+            Connection: "keep-alive",
         });
 
         // Handle client disconnect
-        reply.raw.on('close', () => {
+        reply.raw.on("close", () => {
             this.closed = true;
         });
     }
@@ -44,7 +44,7 @@ export class SSEConnection {
             return;
         }
 
-        this.reply.raw.write(': heartbeat\n\n');
+        this.reply.raw.write(": heartbeat\n\n");
     }
 
     /**

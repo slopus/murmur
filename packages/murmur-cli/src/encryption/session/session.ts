@@ -25,8 +25,8 @@ import {
     replenishOneTimePreKeys,
     type X3DHKeyStore,
     type PreKeyBundle,
-    type X3DHReceiverKeys
-} from '../x3dh/index.js'
+    type X3DHReceiverKeys,
+} from "../x3dh/index.js";
 import {
     initializeAlice,
     initializeBob,
@@ -35,18 +35,18 @@ import {
     serializeState,
     deserializeState,
     type RatchetState,
-    type EncryptedMessage
-} from '../ratchet/index.js'
+    type EncryptedMessage,
+} from "../ratchet/index.js";
 import {
     encodeBase64,
     decodeBase64,
     stringToBytes,
     bytesToString,
     concatBytes,
-    constantTimeEqual
-} from '../crypto/utils.js'
-import { deriveDhPublicKeyFromSigningPublicKey } from '../crypto/dh.js'
-import { sign, verify } from '../crypto/signing.js'
+    constantTimeEqual,
+} from "../crypto/utils.js";
+import { deriveDhPublicKeyFromSigningPublicKey } from "../crypto/dh.js";
+import { sign, verify } from "../crypto/signing.js";
 import type {
     Session,
     SerializedSession,
@@ -54,8 +54,8 @@ import type {
     SerializedAgentState,
     ProtocolMessage,
     DecryptedMessage,
-    OutgoingMessage
-} from './types.js'
+    OutgoingMessage,
+} from "./types.js";
 
 /**
  * Create a new agent with fresh keys.
@@ -73,8 +73,8 @@ import type {
 export function createAgent(oneTimePreKeyCount: number = 99): AgentState {
     return {
         keyStore: initializeKeyStore(oneTimePreKeyCount),
-        sessions: new Map()
-    }
+        sessions: new Map(),
+    };
 }
 
 /**
@@ -84,7 +84,7 @@ export function createAgent(oneTimePreKeyCount: number = 99): AgentState {
  * @returns Base64-encoded identity public key
  */
 export function getIdentityKey(agent: AgentState): string {
-    return encodeBase64(agent.keyStore.identityKeyPair.publicKey)
+    return encodeBase64(agent.keyStore.identityKeyPair.publicKey);
 }
 
 /**
@@ -94,20 +94,23 @@ export function getIdentityKey(agent: AgentState): string {
  * @param includeOneTimePreKey - Whether to include a one-time prekey
  * @returns Prekey bundle ready to publish
  */
-export function getPreKeyBundle(agent: AgentState, includeOneTimePreKey: boolean = true): PreKeyBundle {
-    let oneTimePreKey
+export function getPreKeyBundle(
+    agent: AgentState,
+    includeOneTimePreKey: boolean = true,
+): PreKeyBundle {
+    let oneTimePreKey;
     if (includeOneTimePreKey && agent.keyStore.oneTimePreKeys.size > 0) {
         // Get the first available one-time prekey
-        const firstEntry = agent.keyStore.oneTimePreKeys.entries().next()
+        const firstEntry = agent.keyStore.oneTimePreKeys.entries().next();
         if (!firstEntry.done) {
-            oneTimePreKey = firstEntry.value[1]
+            oneTimePreKey = firstEntry.value[1];
         }
     }
     return createPreKeyBundle(
         agent.keyStore.identityKeyPair,
         agent.keyStore.signedPreKey,
-        oneTimePreKey
-    )
+        oneTimePreKey,
+    );
 }
 
 /**
@@ -128,55 +131,60 @@ export function getPreKeyBundle(agent: AgentState, includeOneTimePreKey: boolean
 export function createPreKeyMessage(
     agent: AgentState,
     peerBundle: PreKeyBundle,
-    initialMessage: Uint8Array
+    initialMessage: Uint8Array,
 ): { message: ProtocolMessage; session: Session } {
     // Perform X3DH
-    const x3dhResult = x3dhSender(agent.keyStore.identityKeyPair, peerBundle)
+    const x3dhResult = x3dhSender(agent.keyStore.identityKeyPair, peerBundle);
 
     // Initialize Double Ratchet as Alice
-    const ratchetState = initializeAlice(x3dhResult.sharedSecret, x3dhResult.bobSignedPreKey)
+    const ratchetState = initializeAlice(x3dhResult.sharedSecret, x3dhResult.bobSignedPreKey);
 
     // Create session
     const session: Session = {
         peerIdentityKey: peerBundle.identityKey,
         ratchetState,
         establishedAt: Date.now(),
-        lastActivityAt: Date.now()
-    }
+        lastActivityAt: Date.now(),
+    };
 
     // Store session
-    const peerIdKey = encodeBase64(peerBundle.identityKey)
-    agent.sessions.set(peerIdKey, session)
+    const peerIdKey = encodeBase64(peerBundle.identityKey);
+    agent.sessions.set(peerIdKey, session);
 
     // Encrypt first message with Double Ratchet
-    const encrypted = ratchetEncrypt(ratchetState, initialMessage)
+    const encrypted = ratchetEncrypt(ratchetState, initialMessage);
 
     const message: ProtocolMessage = {
-        type: 'message',
+        type: "message",
         init: {
             ephemeralKey: encodeBase64(x3dhResult.ephemeralPublicKey),
             preKey: encodeBase64(peerBundle.signedPreKey),
-            oneTimePreKey: peerBundle.oneTimePreKey ? encodeBase64(peerBundle.oneTimePreKey) : undefined
+            oneTimePreKey: peerBundle.oneTimePreKey
+                ? encodeBase64(peerBundle.oneTimePreKey)
+                : undefined,
         },
         ratchetKey: encodeBase64(encrypted.header.publicKey),
         previousChainLength: encrypted.header.previousChainLength,
         messageNumber: encrypted.header.messageNumber,
-        ciphertext: encodeBase64(encrypted.ciphertext)
-    }
+        ciphertext: encodeBase64(encrypted.ciphertext),
+    };
 
-    return { message, session }
+    return { message, session };
 }
 
 /**
  * Find a one-time prekey by public key.
  */
-function findOneTimePreKey(store: X3DHKeyStore, publicKey: Uint8Array): X3DHReceiverKeys['oneTimePreKey'] {
+function findOneTimePreKey(
+    store: X3DHKeyStore,
+    publicKey: Uint8Array,
+): X3DHReceiverKeys["oneTimePreKey"] {
     for (const otpk of store.oneTimePreKeys.values()) {
         if (constantTimeEqual(otpk.keyPair.publicKey, publicKey)) {
-            return otpk
+            return otpk;
         }
     }
-    return undefined
+    return undefined;
 }
 
 /**
@@ -190,69 +198,67 @@ function findOneTimePreKey(store: X3DHKeyStore, publicKey: Uint8Array): X3DHRece
 export function receivePreKeyMessage(
     agent: AgentState,
     senderId: string,
-    message: ProtocolMessage
+    message: ProtocolMessage,
 ): DecryptedMessage {
     if (!message.init) {
-        throw new Error('Missing pre-key fields in message')
+        throw new Error("Missing pre-key fields in message");
     }
 
-    const senderIdentityKey = decodeBase64(senderId)
-    const identityDHKey = deriveDhPublicKeyFromSigningPublicKey(senderIdentityKey)
-    const ephemeralKey = decodeBase64(message.init.ephemeralKey)
+    const senderIdentityKey = decodeBase64(senderId);
+    const identityDHKey = deriveDhPublicKeyFromSigningPublicKey(senderIdentityKey);
+    const ephemeralKey = decodeBase64(message.init.ephemeralKey);
 
     if (!message.init.preKey) {
-        throw new Error('Missing prekey in message')
+        throw new Error("Missing prekey in message");
     }
-    const expectedSignedPreKey = decodeBase64(message.init.preKey)
+    const expectedSignedPreKey = decodeBase64(message.init.preKey);
     if (!constantTimeEqual(expectedSignedPreKey, agent.keyStore.signedPreKey.keyPair.publicKey)) {
-        throw new Error('Prekey does not match current key')
+        throw new Error("Prekey does not match current key");
     }
 
     // Get the one-time prekey if used
-    let oneTimePreKey
+    let oneTimePreKey;
     if (message.init.oneTimePreKey) {
-        const expectedOneTimePreKey = decodeBase64(message.init.oneTimePreKey)
-        const resolvedOneTimePreKey = findOneTimePreKey(agent.keyStore, expectedOneTimePreKey)
+        const expectedOneTimePreKey = decodeBase64(message.init.oneTimePreKey);
+        const resolvedOneTimePreKey = findOneTimePreKey(agent.keyStore, expectedOneTimePreKey);
         if (!resolvedOneTimePreKey) {
-            throw new Error('Unknown one-time prekey')
+            throw new Error("Unknown one-time prekey");
         }
-        oneTimePreKey = resolvedOneTimePreKey
+        oneTimePreKey = resolvedOneTimePreKey;
     }
 
     // Perform X3DH
     const receiverKeys: X3DHReceiverKeys = {
         identityKeyPair: agent.keyStore.identityKeyPair,
         signedPreKey: agent.keyStore.signedPreKey,
-        oneTimePreKey
-    }
+        oneTimePreKey,
+    };
 
-    const x3dhResult = x3dhReceiver(
-        receiverKeys,
-        senderIdentityKey,
-        identityDHKey,
-        ephemeralKey
-    )
+    const x3dhResult = x3dhReceiver(receiverKeys, senderIdentityKey, identityDHKey, ephemeralKey);
 
     // Initialize Double Ratchet as Bob
-    const ratchetState = initializeBob(x3dhResult.sharedSecret, agent.keyStore.signedPreKey.keyPair)
+    const ratchetState = initializeBob(
+        x3dhResult.sharedSecret,
+        agent.keyStore.signedPreKey.keyPair,
+    );
 
     // Create and store session
     const session: Session = {
         peerIdentityKey: senderIdentityKey,
         ratchetState,
         establishedAt: Date.now(),
-        lastActivityAt: Date.now()
-    }
-    agent.sessions.set(senderId, session)
+        lastActivityAt: Date.now(),
+    };
+    agent.sessions.set(senderId, session);
 
     // Decrypt the first message
-    const encryptedMessage = parseEncryptedMessage(message)
-    const plaintext = ratchetDecrypt(ratchetState, encryptedMessage)
+    const encryptedMessage = parseEncryptedMessage(message);
+    const plaintext = ratchetDecrypt(ratchetState, encryptedMessage);
 
     return {
         plaintext,
-        senderIdentityKey
-    }
+        senderIdentityKey,
+    };
 }
 
 /**
@@ -267,23 +273,23 @@ export function receivePreKeyMessage(
 export function encryptMessage(
     agent: AgentState,
     peerId: string,
-    plaintext: Uint8Array
+    plaintext: Uint8Array,
 ): ProtocolMessage {
-    const session = agent.sessions.get(peerId)
+    const session = agent.sessions.get(peerId);
     if (!session) {
-        throw new Error(`No session with peer: ${peerId}`)
+        throw new Error(`No session with peer: ${peerId}`);
     }
 
-    const encrypted = ratchetEncrypt(session.ratchetState, plaintext)
-    session.lastActivityAt = Date.now()
+    const encrypted = ratchetEncrypt(session.ratchetState, plaintext);
+    session.lastActivityAt = Date.now();
 
     return {
-        type: 'message',
+        type: "message",
         ratchetKey: encodeBase64(encrypted.header.publicKey),
         previousChainLength: encrypted.header.previousChainLength,
         messageNumber: encrypted.header.messageNumber,
-        ciphertext: encodeBase64(encrypted.ciphertext)
-    }
+        ciphertext: encodeBase64(encrypted.ciphertext),
+    };
 }
 
 /**
@@ -297,30 +303,30 @@ export function encryptMessage(
 export function decryptMessage(
     agent: AgentState,
     senderId: string,
-    message: ProtocolMessage
+    message: ProtocolMessage,
 ): DecryptedMessage {
-    if (message.type !== 'message') {
-        throw new Error(`Invalid message type: ${message.type}`)
+    if (message.type !== "message") {
+        throw new Error(`Invalid message type: ${message.type}`);
     }
 
     if (message.init) {
-        return receivePreKeyMessage(agent, senderId, message)
+        return receivePreKeyMessage(agent, senderId, message);
     }
 
     // Handle regular message
-    const session = agent.sessions.get(senderId)
+    const session = agent.sessions.get(senderId);
     if (!session) {
-        throw new Error(`No session with peer: ${senderId}`)
+        throw new Error(`No session with peer: ${senderId}`);
     }
 
-    const encryptedMessage = parseEncryptedMessage(message)
-    const plaintext = ratchetDecrypt(session.ratchetState, encryptedMessage)
-    session.lastActivityAt = Date.now()
+    const encryptedMessage = parseEncryptedMessage(message);
+    const plaintext = ratchetDecrypt(session.ratchetState, encryptedMessage);
+    session.lastActivityAt = Date.now();
 
     return {
         plaintext,
-        senderIdentityKey: session.peerIdentityKey
-    }
+        senderIdentityKey: session.peerIdentityKey,
+    };
 }
 
 /**
@@ -328,17 +334,17 @@ export function decryptMessage(
  */
 function parseEncryptedMessage(message: ProtocolMessage): EncryptedMessage {
     if (!message.ratchetKey) {
-        throw new Error('Missing ratchet key in message')
+        throw new Error("Missing ratchet key in message");
     }
 
     const header = {
         publicKey: decodeBase64(message.ratchetKey),
         previousChainLength: message.previousChainLength,
-        messageNumber: message.messageNumber
-    }
-    const ciphertext = decodeBase64(message.ciphertext)
+        messageNumber: message.messageNumber,
+    };
+    const ciphertext = decodeBase64(message.ciphertext);
 
-    return { header, ciphertext }
+    return { header, ciphertext };
 }
 
 /**
@@ -349,7 +355,7 @@ function parseEncryptedMessage(message: ProtocolMessage): EncryptedMessage {
  * @returns true if session exists
  */
 export function hasSession(agent: AgentState, peerId: string): boolean {
-    return agent.sessions.has(peerId)
+    return agent.sessions.has(peerId);
 }
 
 /**
@@ -360,7 +366,7 @@ export function hasSession(agent: AgentState, peerId: string): boolean {
  * @returns Session or undefined
  */
 export function getSession(agent: AgentState, peerId: string): Session | undefined {
-    return agent.sessions.get(peerId)
+    return agent.sessions.get(peerId);
 }
 
 /**
@@ -371,7 +377,7 @@ export function getSession(agent: AgentState, peerId: string): Session | undefin
  * @returns true if session was deleted
  */
 export function deleteSession(agent: AgentState, peerId: string): boolean {
-    return agent.sessions.delete(peerId)
+    return agent.sessions.delete(peerId);
 }
 
 /**
@@ -381,7 +387,7 @@ export function deleteSession(agent: AgentState, peerId: string): boolean {
  * @returns JSON-serializable object
  */
 export function serializeAgent(agent: AgentState): SerializedAgentState {
-    const serializedSessions: Array<[string, SerializedSession]> = []
+    const serializedSessions: Array<[string, SerializedSession]> = [];
 
     for (const [peerId, session] of agent.sessions) {
         serializedSessions.push([
@@ -390,15 +396,15 @@ export function serializeAgent(agent: AgentState): SerializedAgentState {
                 peerIdentityKey: encodeBase64(session.peerIdentityKey),
                 ratchetState: serializeState(session.ratchetState),
                 establishedAt: session.establishedAt,
-                lastActivityAt: session.lastActivityAt
-            }
-        ])
+                lastActivityAt: session.lastActivityAt,
+            },
+        ]);
     }
 
     return {
         keyStore: serializeKeyStore(agent.keyStore),
-        sessions: serializedSessions
-    }
+        sessions: serializedSessions,
+    };
 }
 
 /**
@@ -408,21 +414,21 @@ export function serializeAgent(agent: AgentState): SerializedAgentState {
  * @returns Restored agent state
  */
 export function deserializeAgent(serialized: SerializedAgentState): AgentState {
-    const sessions = new Map<string, Session>()
+    const sessions = new Map<string, Session>();
 
     for (const [peerId, serializedSession] of serialized.sessions) {
         sessions.set(peerId, {
             peerIdentityKey: decodeBase64(serializedSession.peerIdentityKey),
             ratchetState: deserializeState(serializedSession.ratchetState),
             establishedAt: serializedSession.establishedAt,
-            lastActivityAt: serializedSession.lastActivityAt
-        })
+            lastActivityAt: serializedSession.lastActivityAt,
+        });
     }
 
     return {
         keyStore: deserializeKeyStore(serialized.keyStore),
-        sessions
-    }
+        sessions,
+    };
 }
 
 /**
@@ -433,18 +439,14 @@ export function deserializeAgent(serialized: SerializedAgentState): AgentState {
  * @param messageId - Message ID
  * @returns Base64-encoded signature
  */
-export function signMessageForServer(
-    agent: AgentState,
-    blob: string,
-    messageId: string
-): string {
-    const blobBytes = decodeBase64(blob)
-    const messageIdBytes = stringToBytes(messageId)
-    const message = new Uint8Array(blobBytes.length + messageIdBytes.length)
-    message.set(blobBytes, 0)
-    message.set(messageIdBytes, blobBytes.length)
-    const signature = sign(message, agent.keyStore.identityKeyPair.privateKey)
-    return encodeBase64(signature)
+export function signMessageForServer(agent: AgentState, blob: string, messageId: string): string {
+    const blobBytes = decodeBase64(blob);
+    const messageIdBytes = stringToBytes(messageId);
+    const message = new Uint8Array(blobBytes.length + messageIdBytes.length);
+    message.set(blobBytes, 0);
+    message.set(messageIdBytes, blobBytes.length);
+    const signature = sign(message, agent.keyStore.identityKeyPair.privateKey);
+    return encodeBase64(signature);
 }
 
 /**
@@ -460,16 +462,16 @@ export function verifyMessageSignature(
     senderId: string,
     blob: string,
     messageId: string,
-    signature: string
+    signature: string,
 ): boolean {
-    const senderKey = decodeBase64(senderId)
-    const blobBytes = decodeBase64(blob)
-    const messageIdBytes = stringToBytes(messageId)
-    const message = new Uint8Array(blobBytes.length + messageIdBytes.length)
-    message.set(blobBytes, 0)
-    message.set(messageIdBytes, blobBytes.length)
-    const signatureBytes = decodeBase64(signature)
-    return verify(message, signatureBytes, senderKey)
+    const senderKey = decodeBase64(senderId);
+    const blobBytes = decodeBase64(blob);
+    const messageIdBytes = stringToBytes(messageId);
+    const message = new Uint8Array(blobBytes.length + messageIdBytes.length);
+    message.set(blobBytes, 0);
+    message.set(messageIdBytes, blobBytes.length);
+    const signatureBytes = decodeBase64(signature);
+    return verify(message, signatureBytes, senderKey);
 }
 
 /**
@@ -488,33 +490,33 @@ export function prepareOutgoingMessage(
     plaintext: Uint8Array,
     messageId: string,
     preKeyBundle?: PreKeyBundle,
-    attachments?: Record<string, string>
+    attachments?: Record<string, string>,
 ): { outgoing: OutgoingMessage; protocolMessage: ProtocolMessage } {
-    let protocolMessage: ProtocolMessage
+    let protocolMessage: ProtocolMessage;
 
     if (hasSession(agent, peerId)) {
-        protocolMessage = encryptMessage(agent, peerId, plaintext)
+        protocolMessage = encryptMessage(agent, peerId, plaintext);
     } else if (preKeyBundle) {
-        protocolMessage = createPreKeyMessage(agent, preKeyBundle, plaintext).message
+        protocolMessage = createPreKeyMessage(agent, preKeyBundle, plaintext).message;
     } else {
-        throw new Error(`No session with peer: ${peerId}. Provide a prekey bundle.`)
+        throw new Error(`No session with peer: ${peerId}. Provide a prekey bundle.`);
     }
 
     if (attachments && Object.keys(attachments).length > 0) {
-        protocolMessage.attachments = attachments
+        protocolMessage.attachments = attachments;
     }
 
-    const blob = encodeBase64(stringToBytes(JSON.stringify(protocolMessage)))
-    const signature = signMessageForServer(agent, blob, messageId)
+    const blob = encodeBase64(stringToBytes(JSON.stringify(protocolMessage)));
+    const signature = signMessageForServer(agent, blob, messageId);
 
     return {
         outgoing: {
             recipientId: peerId,
             blob,
-            signature
+            signature,
         },
-        protocolMessage
-    }
+        protocolMessage,
+    };
 }
 
 /**
@@ -532,27 +534,27 @@ export function processIncomingMessage(
     senderId: string,
     blob: string,
     messageId: string,
-    signature: string
+    signature: string,
 ): DecryptedMessage {
     // Verify signature
     if (!verifyMessageSignature(senderId, blob, messageId, signature)) {
-        throw new Error('Invalid message signature')
+        throw new Error("Invalid message signature");
     }
 
     // Decode and parse protocol message
-    const protocolMessageJson = bytesToString(decodeBase64(blob))
-    const protocolMessage = JSON.parse(protocolMessageJson) as ProtocolMessage
+    const protocolMessageJson = bytesToString(decodeBase64(blob));
+    const protocolMessage = JSON.parse(protocolMessageJson) as ProtocolMessage;
 
     // Decrypt
-    const decrypted = decryptMessage(agent, senderId, protocolMessage)
+    const decrypted = decryptMessage(agent, senderId, protocolMessage);
     if (protocolMessage.attachments) {
         return {
             ...decrypted,
-            attachments: protocolMessage.attachments
-        }
+            attachments: protocolMessage.attachments,
+        };
     }
 
-    return decrypted
+    return decrypted;
 }
 
 /**
@@ -563,7 +565,7 @@ export function processIncomingMessage(
  * @returns Array of new prekeys to upload to server
  */
 export function replenishPreKeys(agent: AgentState, targetCount: number = 100) {
-    return replenishOneTimePreKeys(agent.keyStore, targetCount)
+    return replenishOneTimePreKeys(agent.keyStore, targetCount);
 }
 
 /**
@@ -573,5 +575,5 @@ export function replenishPreKeys(agent: AgentState, targetCount: number = 100) {
  * @returns Number of available one-time prekeys
  */
 export function getOneTimePreKeyCount(agent: AgentState): number {
-    return agent.keyStore.oneTimePreKeys.size
+    return agent.keyStore.oneTimePreKeys.size;
 }

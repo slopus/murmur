@@ -1,9 +1,8 @@
-import rateLimit from '@fastify/rate-limit';
-import type { FastifyInstance } from 'fastify';
-import { rateLimitHitsTotal } from '@/metrics/prometheus';
+import rateLimit from "@fastify/rate-limit";
+import type { FastifyInstance } from "fastify";
+import { rateLimitHitsTotal } from "@/metrics/prometheus";
 
-const AUTH_RATE_LIMIT_MAX =
-    Number.parseInt(process.env.AUTH_RATE_LIMIT_MAX ?? '', 10) || 1000;
+const AUTH_RATE_LIMIT_MAX = Number.parseInt(process.env.AUTH_RATE_LIMIT_MAX ?? "", 10) || 1000;
 
 function getAuthenticatedRateLimitKey(req: any): string {
     return req.userId || req.user?.id || req.ip;
@@ -27,9 +26,9 @@ export async function registerRateLimiting(app: FastifyInstance) {
     await app.register(rateLimit, {
         global: false, // Don't apply globally, we'll configure per-route
         redis: process.env.REDIS_URL ? undefined : undefined, // Use in-memory for now
-        nameSpace: 'murmur-rate-limit:',
+        nameSpace: "murmur-rate-limit:",
         onExceeded: (req) => {
-            const route = req.routeOptions?.url || 'unknown';
+            const route = req.routeOptions?.url || "unknown";
             rateLimitHitsTotal.inc({ route });
         },
     });
@@ -42,7 +41,7 @@ export const rateLimitConfigs = {
     // Public authentication endpoints (prevent brute force)
     auth: {
         max: AUTH_RATE_LIMIT_MAX,
-        timeWindow: '1 minute',
+        timeWindow: "1 minute",
         keyGenerator: getAuthRateLimitKey,
         errorResponseBuilder: () => ({
             error: `Authentication rate limit exceeded. Max ${AUTH_RATE_LIMIT_MAX} attempts per minute.`,
@@ -53,10 +52,10 @@ export const rateLimitConfigs = {
     // Message sending (prevent spam)
     messageSend: {
         max: 100, // 100 messages
-        timeWindow: '1 hour',
+        timeWindow: "1 hour",
         keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
-            error: 'Message sending rate limit exceeded. Max 100 messages per hour.',
+            error: "Message sending rate limit exceeded. Max 100 messages per hour.",
             retryAfter: 3600,
         }),
     },
@@ -64,10 +63,10 @@ export const rateLimitConfigs = {
     // Message fetching (prevent abuse)
     messageFetch: {
         max: 1000, // 1000 requests
-        timeWindow: '1 hour',
+        timeWindow: "1 hour",
         keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
-            error: 'Message fetching rate limit exceeded. Max 1000 requests per hour.',
+            error: "Message fetching rate limit exceeded. Max 1000 requests per hour.",
             retryAfter: 3600,
         }),
     },
@@ -75,10 +74,10 @@ export const rateLimitConfigs = {
     // PreKey operations (prevent prekey exhaustion attacks)
     preKey: {
         max: 50, // 50 requests
-        timeWindow: '1 hour',
+        timeWindow: "1 hour",
         keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
-            error: 'PreKey operation rate limit exceeded. Max 50 requests per hour.',
+            error: "PreKey operation rate limit exceeded. Max 50 requests per hour.",
             retryAfter: 3600,
         }),
     },
@@ -86,10 +85,10 @@ export const rateLimitConfigs = {
     // Profile operations (prevent spam)
     profile: {
         max: 200, // 200 requests
-        timeWindow: '1 hour',
+        timeWindow: "1 hour",
         keyGenerator: getAuthenticatedRateLimitKey,
         errorResponseBuilder: () => ({
-            error: 'Profile operation rate limit exceeded. Max 200 requests per hour.',
+            error: "Profile operation rate limit exceeded. Max 200 requests per hour.",
             retryAfter: 3600,
         }),
     },

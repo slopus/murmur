@@ -1,15 +1,23 @@
-import * as privacyKit from 'privacy-kit';
+import * as privacyKit from "privacy-kit";
 
-const JWT_SEED = process.env.JWT_SEED || 'dev-seed-change-in-production';
+const JWT_SEED = process.env.JWT_SEED || "dev-seed-change-in-production";
 const ACCESS_TOKEN_TTL_MS =
-    Number.parseInt(process.env.ACCESS_TOKEN_TTL_MS ?? '', 10) || 1000 * 60 * 60 * 24; // 24 hours in ms
-const REFRESH_TOKEN_SERVICE = 'murmur-refresh';
-const ACCESS_TOKEN_SERVICE = 'murmur-access';
+    Number.parseInt(process.env.ACCESS_TOKEN_TTL_MS ?? "", 10) || 1000 * 60 * 60 * 24; // 24 hours in ms
+const REFRESH_TOKEN_SERVICE = "murmur-refresh";
+const ACCESS_TOKEN_SERVICE = "murmur-access";
 
-let refreshTokenGenerator: Awaited<ReturnType<typeof privacyKit.createPersistentTokenGenerator>> | null = null;
-let refreshTokenVerifier: Awaited<ReturnType<typeof privacyKit.createPersistentTokenVerifier>> | null = null;
-let accessTokenGenerator: Awaited<ReturnType<typeof privacyKit.createEphemeralTokenGenerator>> | null = null;
-let accessTokenVerifier: Awaited<ReturnType<typeof privacyKit.createEphemeralTokenVerifier>> | null = null;
+let refreshTokenGenerator: Awaited<
+    ReturnType<typeof privacyKit.createPersistentTokenGenerator>
+> | null = null;
+let refreshTokenVerifier: Awaited<
+    ReturnType<typeof privacyKit.createPersistentTokenVerifier>
+> | null = null;
+let accessTokenGenerator: Awaited<
+    ReturnType<typeof privacyKit.createEphemeralTokenGenerator>
+> | null = null;
+let accessTokenVerifier: Awaited<
+    ReturnType<typeof privacyKit.createEphemeralTokenVerifier>
+> | null = null;
 
 /**
  * Initialize the token generators and verifiers
@@ -60,7 +68,7 @@ export interface TokenPair {
  */
 export async function generateToken(userId: string): Promise<TokenPair> {
     if (!accessTokenGenerator || !refreshTokenGenerator) {
-        throw new Error('JWT not initialized. Call initializeJWT() first.');
+        throw new Error("JWT not initialized. Call initializeJWT() first.");
     }
 
     const [accessToken, refreshToken] = await Promise.all([
@@ -80,7 +88,7 @@ export async function generateToken(userId: string): Promise<TokenPair> {
  */
 export async function verifyAccessToken(token: string): Promise<JWTPayload | null> {
     if (!accessTokenVerifier) {
-        throw new Error('JWT not initialized. Call initializeJWT() first.');
+        throw new Error("JWT not initialized. Call initializeJWT() first.");
     }
 
     try {
@@ -106,7 +114,7 @@ export async function verifyAccessToken(token: string): Promise<JWTPayload | nul
  */
 export async function verifyRefreshToken(token: string): Promise<JWTPayload | null> {
     if (!refreshTokenVerifier) {
-        throw new Error('JWT not initialized. Call initializeJWT() first.');
+        throw new Error("JWT not initialized. Call initializeJWT() first.");
     }
 
     try {
@@ -139,7 +147,7 @@ export async function refreshAccessToken(refreshToken: string): Promise<string |
     }
 
     if (!accessTokenGenerator) {
-        throw new Error('JWT not initialized. Call initializeJWT() first.');
+        throw new Error("JWT not initialized. Call initializeJWT() first.");
     }
 
     // Generate new access token with same user ID

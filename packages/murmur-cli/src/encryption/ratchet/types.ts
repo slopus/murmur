@@ -5,7 +5,7 @@
  * Signal Protocol's Double Ratchet algorithm.
  */
 
-import type { DHKeyPair } from '../crypto/dh.js'
+import type { DHKeyPair } from "../crypto/dh.js";
 
 /**
  * Message header containing ratchet metadata.
@@ -17,13 +17,13 @@ import type { DHKeyPair } from '../crypto/dh.js'
  */
 export interface MessageHeader {
     /** Sender's current DH ratchet public key (32 bytes) */
-    publicKey: Uint8Array
+    publicKey: Uint8Array;
 
     /** Message number in current sending chain (starts at 0) */
-    messageNumber: number
+    messageNumber: number;
 
     /** Number of messages sent in the previous sending chain */
-    previousChainLength: number
+    previousChainLength: number;
 }
 
 /**
@@ -33,10 +33,10 @@ export interface MessageHeader {
  */
 export interface EncryptedMessage {
     /** Message header (not encrypted, but authenticated) */
-    header: MessageHeader
+    header: MessageHeader;
 
     /** Encrypted message content with auth tag */
-    ciphertext: Uint8Array
+    ciphertext: Uint8Array;
 }
 
 /**
@@ -47,10 +47,10 @@ export interface EncryptedMessage {
  */
 export interface SkippedKeyIndex {
     /** The DH ratchet public key when this key was valid */
-    publicKey: Uint8Array
+    publicKey: Uint8Array;
 
     /** The message number in that chain */
-    messageNumber: number
+    messageNumber: number;
 }
 
 /**
@@ -59,7 +59,7 @@ export interface SkippedKeyIndex {
  * Uses string keys (base64 encoded public key + ":" + message number)
  * because JavaScript Maps use reference equality for object keys.
  */
-export type SkippedMessageKeys = Map<string, Uint8Array>
+export type SkippedMessageKeys = Map<string, Uint8Array>;
 
 /**
  * Complete Double Ratchet session state.
@@ -80,55 +80,55 @@ export interface RatchetState {
      * Our current DH ratchet key pair (DHs in spec).
      * Used to compute new chain keys when we send.
      */
-    dhSelf: DHKeyPair
+    dhSelf: DHKeyPair;
 
     /**
      * Their current DH ratchet public key (DHr in spec).
      * Null until we receive the first message.
      */
-    dhRemote: Uint8Array | null
+    dhRemote: Uint8Array | null;
 
     /**
      * 32-byte root key (RK in spec).
      * Mixed with DH outputs to derive chain keys.
      */
-    rootKey: Uint8Array
+    rootKey: Uint8Array;
 
     /**
      * 32-byte sending chain key (CKs in spec).
      * Null if we haven't established a sending chain yet.
      */
-    sendingChainKey: Uint8Array | null
+    sendingChainKey: Uint8Array | null;
 
     /**
      * 32-byte receiving chain key (CKr in spec).
      * Null if we haven't established a receiving chain yet.
      */
-    receivingChainKey: Uint8Array | null
+    receivingChainKey: Uint8Array | null;
 
     /**
      * Number of messages sent in current sending chain (Ns in spec).
      * Incremented after each message sent.
      */
-    sendingMessageNumber: number
+    sendingMessageNumber: number;
 
     /**
      * Number of messages received in current receiving chain (Nr in spec).
      * Incremented after each message received.
      */
-    receivingMessageNumber: number
+    receivingMessageNumber: number;
 
     /**
      * Number of messages in previous sending chain (PN in spec).
      * Sent in header to help receiver handle out-of-order messages.
      */
-    previousSendingChainLength: number
+    previousSendingChainLength: number;
 
     /**
      * Stored message keys for out-of-order messages (MKSKIPPED in spec).
      * Keys are indexed by (public_key, message_number).
      */
-    skippedMessageKeys: SkippedMessageKeys
+    skippedMessageKeys: SkippedMessageKeys;
 }
 
 /**
@@ -138,16 +138,16 @@ export interface RatchetState {
  * The skippedMessageKeys map is converted to an array of entries.
  */
 export interface SerializedRatchetState {
-    dhSelfPrivateKey: string
-    dhSelfPublicKey: string
-    dhRemote: string | null
-    rootKey: string
-    sendingChainKey: string | null
-    receivingChainKey: string | null
-    sendingMessageNumber: number
-    receivingMessageNumber: number
-    previousSendingChainLength: number
-    skippedMessageKeys: Array<[string, string]>
+    dhSelfPrivateKey: string;
+    dhSelfPublicKey: string;
+    dhRemote: string | null;
+    rootKey: string;
+    sendingChainKey: string | null;
+    receivingChainKey: string | null;
+    sendingMessageNumber: number;
+    receivingMessageNumber: number;
+    previousSendingChainLength: number;
+    skippedMessageKeys: Array<[string, string]>;
 }
 
 /**
@@ -159,11 +159,11 @@ export interface RatchetInitOptions {
      * Prevents DoS attacks where attacker sends messages with huge gaps.
      * Default: 1000
      */
-    maxSkip?: number
+    maxSkip?: number;
 }
 
 /**
  * Default maximum number of skipped messages allowed.
  * Balances tolerance for network reordering with DoS protection.
  */
-export const DEFAULT_MAX_SKIP = 1000
+export const DEFAULT_MAX_SKIP = 1000;

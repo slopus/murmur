@@ -10,26 +10,26 @@
  * - Shared secrets: 32 bytes
  */
 
-import { ed25519, x25519 } from '@noble/curves/ed25519'
-import { getRandomBytes } from './utils.js'
+import { ed25519, x25519 } from "@noble/curves/ed25519";
+import { getRandomBytes } from "./utils.js";
 
 /** Length of X25519 private key in bytes */
-export const DH_PRIVATE_KEY_LENGTH = 32
+export const DH_PRIVATE_KEY_LENGTH = 32;
 
 /** Length of X25519 public key in bytes */
-export const DH_PUBLIC_KEY_LENGTH = 32
+export const DH_PUBLIC_KEY_LENGTH = 32;
 
 /** Length of X25519 shared secret in bytes */
-export const DH_SHARED_SECRET_LENGTH = 32
+export const DH_SHARED_SECRET_LENGTH = 32;
 
 /**
  * A Diffie-Hellman key pair for X25519
  */
 export interface DHKeyPair {
     /** Private key (32 bytes) - must be kept secret */
-    privateKey: Uint8Array
+    privateKey: Uint8Array;
     /** Public key (32 bytes) - can be shared */
-    publicKey: Uint8Array
+    publicKey: Uint8Array;
 }
 
 /**
@@ -48,9 +48,9 @@ export interface DHKeyPair {
  * ```
  */
 export function generateDH(): DHKeyPair {
-    const privateKey = getRandomBytes(DH_PRIVATE_KEY_LENGTH)
-    const publicKey = x25519.getPublicKey(privateKey)
-    return { privateKey, publicKey }
+    const privateKey = getRandomBytes(DH_PRIVATE_KEY_LENGTH);
+    const publicKey = x25519.getPublicKey(privateKey);
+    return { privateKey, publicKey };
 }
 
 /**
@@ -63,12 +63,14 @@ export function generateDH(): DHKeyPair {
  */
 export function deriveDhKeyPairFromSigningKey(signingPrivateKey: Uint8Array): DHKeyPair {
     if (signingPrivateKey.length !== DH_PRIVATE_KEY_LENGTH) {
-        throw new Error(`Invalid signing key length: expected ${DH_PRIVATE_KEY_LENGTH}, got ${signingPrivateKey.length}`)
+        throw new Error(
+            `Invalid signing key length: expected ${DH_PRIVATE_KEY_LENGTH}, got ${signingPrivateKey.length}`,
+        );
     }
 
-    const privateKey = ed25519.utils.toMontgomerySecret(signingPrivateKey)
-    const publicKey = x25519.getPublicKey(privateKey)
-    return { privateKey, publicKey }
+    const privateKey = ed25519.utils.toMontgomerySecret(signingPrivateKey);
+    const publicKey = x25519.getPublicKey(privateKey);
+    return { privateKey, publicKey };
 }
 
 /**
@@ -79,9 +81,11 @@ export function deriveDhKeyPairFromSigningKey(signingPrivateKey: Uint8Array): DH
  */
 export function deriveDhPublicKeyFromSigningPublicKey(signingPublicKey: Uint8Array): Uint8Array {
     if (signingPublicKey.length !== DH_PUBLIC_KEY_LENGTH) {
-        throw new Error(`Invalid signing public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${signingPublicKey.length}`)
+        throw new Error(
+            `Invalid signing public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${signingPublicKey.length}`,
+        );
     }
-    return ed25519.utils.toMontgomery(signingPublicKey)
+    return ed25519.utils.toMontgomery(signingPublicKey);
 }
 
 /**
@@ -93,9 +97,11 @@ export function deriveDhPublicKeyFromSigningPublicKey(signingPublicKey: Uint8Arr
  */
 export function publicKeyFromPrivate(privateKey: Uint8Array): Uint8Array {
     if (privateKey.length !== DH_PRIVATE_KEY_LENGTH) {
-        throw new Error(`Invalid private key length: expected ${DH_PRIVATE_KEY_LENGTH}, got ${privateKey.length}`)
+        throw new Error(
+            `Invalid private key length: expected ${DH_PRIVATE_KEY_LENGTH}, got ${privateKey.length}`,
+        );
     }
-    return x25519.getPublicKey(privateKey)
+    return x25519.getPublicKey(privateKey);
 }
 
 /**
@@ -123,9 +129,11 @@ export function publicKeyFromPrivate(privateKey: Uint8Array): Uint8Array {
  */
 export function dh(keyPair: DHKeyPair, remotePublicKey: Uint8Array): Uint8Array {
     if (remotePublicKey.length !== DH_PUBLIC_KEY_LENGTH) {
-        throw new Error(`Invalid public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${remotePublicKey.length}`)
+        throw new Error(
+            `Invalid public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${remotePublicKey.length}`,
+        );
     }
-    return x25519.getSharedSecret(keyPair.privateKey, remotePublicKey)
+    return x25519.getSharedSecret(keyPair.privateKey, remotePublicKey);
 }
 
 /**
@@ -138,5 +146,5 @@ export function dh(keyPair: DHKeyPair, remotePublicKey: Uint8Array): Uint8Array 
  * @returns true if the public key appears valid
  */
 export function isValidPublicKey(publicKey: Uint8Array): boolean {
-    return publicKey.length === DH_PUBLIC_KEY_LENGTH
+    return publicKey.length === DH_PUBLIC_KEY_LENGTH;
 }

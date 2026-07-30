@@ -9,13 +9,13 @@
  */
 
 // Export cryptographic primitives
-export * from './crypto/index.js'
+export * from "./crypto/index.js";
 
 // Export Double Ratchet protocol
-export * from './ratchet/index.js'
+export * from "./ratchet/index.js";
 
 // Export X3DH key agreement
-export * from './x3dh/index.js'
+export * from "./x3dh/index.js";
 
 // Export Session management
-export * from './session/index.js'
+export * from "./session/index.js";

@@ -1,5 +1,5 @@
-import type { FastifyRequest, FastifyReply } from 'fastify';
-import { verifyAccessToken } from '@/utils/jwt';
+import type { FastifyRequest, FastifyReply } from "fastify";
+import { verifyAccessToken } from "@/utils/jwt";
 
 /**
  * Authentication hook for Fastify routes
@@ -7,19 +7,19 @@ import { verifyAccessToken } from '@/utils/jwt';
  */
 export async function authenticationHook(
     request: FastifyRequest,
-    reply: FastifyReply
+    reply: FastifyReply,
 ): Promise<void> {
     const authHeader = request.headers.authorization;
 
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-        return reply.status(401).send({ error: 'Missing or invalid authorization header' });
+    if (!authHeader || !authHeader.startsWith("Bearer ")) {
+        return reply.status(401).send({ error: "Missing or invalid authorization header" });
     }
 
     const token = authHeader.slice(7); // Remove 'Bearer ' prefix
     const payload = await verifyAccessToken(token);
 
     if (!payload || !payload.userId) {
-        return reply.status(401).send({ error: 'Invalid or expired token' });
+        return reply.status(401).send({ error: "Invalid or expired token" });
     }
 
     // Attach user ID to request for use in route handlers

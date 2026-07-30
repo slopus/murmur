@@ -1,75 +1,75 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: murmur-redis
-  labels:
-    app: murmur-redis
+    name: murmur-redis
+    labels:
+        app: murmur-redis
 spec:
-  ports:
-  - port: 6379
-    name: redis
-  selector:
-    app: murmur-redis
+    ports:
+        - port: 6379
+          name: redis
+    selector:
+        app: murmur-redis
 ---
 apiVersion: v1
 kind: ConfigMap
 metadata:
-  name: murmur-redis-config
+    name: murmur-redis-config
 data:
-  redis.conf: |
-    dir /data
-    appendonly yes
-    appendfsync everysec
-    save 900 1
-    save 300 10
-    save 60 10000
-    maxmemory-policy noeviction
+    redis.conf: |
+        dir /data
+        appendonly yes
+        appendfsync everysec
+        save 900 1
+        save 300 10
+        save 60 10000
+        maxmemory-policy noeviction
 ---
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: murmur-redis
+    name: murmur-redis
 spec:
-  serviceName: murmur-redis
-  replicas: 1
-  selector:
-    matchLabels:
-      app: murmur-redis
-  template:
-    metadata:
-      labels:
-        app: murmur-redis
-    spec:
-      containers:
-      - name: redis
-        image: redis:7-alpine
-        command:
-          - redis-server
-          - "/etc/redis/redis.conf"
-        ports:
-        - containerPort: 6379
-          name: redis
-        volumeMounts:
-        - name: redis-data
-          mountPath: /data
-        - name: redis-config
-          mountPath: /etc/redis
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-          limits:
-            cpu: 500m
-            memory: 512Mi
-      volumes:
-      - name: redis-config
-        configMap:
-          name: murmur-redis-config
-  volumeClaimTemplates:
-  - metadata:
-      name: redis-data
-    spec:
-      accessModes: [ "ReadWriteOnce" ]
-      resources:
-        requests:
-          storage: 1Gi
+    serviceName: murmur-redis
+    replicas: 1
+    selector:
+        matchLabels:
+            app: murmur-redis
+    template:
+        metadata:
+            labels:
+                app: murmur-redis
+        spec:
+            containers:
+                - name: redis
+                  image: redis:7-alpine
+                  command:
+                      - redis-server
+                      - "/etc/redis/redis.conf"
+                  ports:
+                      - containerPort: 6379
+                        name: redis
+                  volumeMounts:
+                      - name: redis-data
+                        mountPath: /data
+                      - name: redis-config
+                        mountPath: /etc/redis
+                  resources:
+                      requests:
+                          cpu: 100m
+                          memory: 256Mi
+                      limits:
+                          cpu: 500m
+                          memory: 512Mi
+            volumes:
+                - name: redis-config
+                  configMap:
+                      name: murmur-redis-config
+    volumeClaimTemplates:
+        - metadata:
+              name: redis-data
+          spec:
+              accessModes: ["ReadWriteOnce"]
+              resources:
+                  requests:
+                      storage: 1Gi

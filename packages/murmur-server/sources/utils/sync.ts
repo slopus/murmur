@@ -76,7 +76,7 @@ export class InvalidateSync {
 
     private async waitForExecution(): Promise<void> {
         while (this.executing) {
-            await new Promise(resolve => setTimeout(resolve, 10));
+            await new Promise((resolve) => setTimeout(resolve, 10));
         }
     }
 }

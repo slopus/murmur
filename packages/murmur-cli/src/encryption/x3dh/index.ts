@@ -5,5 +5,5 @@
  * between parties who may not be online simultaneously.
  */
 
-export * from './types.js'
-export * from './x3dh.js'
+export * from "./types.js";
+export * from "./x3dh.js";

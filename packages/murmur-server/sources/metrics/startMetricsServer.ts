@@ -1,10 +1,14 @@
-import fastify from 'fastify';
-import { register } from './prometheus';
-import { db } from '@/db';
-import { log } from '@/log';
-import { onShutdown } from '@/shutdown';
-import { events } from '@/events';
-import { undeliveredMessagesGauge, unallocatedPreKeysGauge, dbConnectionsActive } from './prometheus';
+import fastify from "fastify";
+import { register } from "./prometheus";
+import { db } from "@/db";
+import { log } from "@/log";
+import { onShutdown } from "@/shutdown";
+import { events } from "@/events";
+import {
+    undeliveredMessagesGauge,
+    unallocatedPreKeysGauge,
+    dbConnectionsActive,
+} from "./prometheus";
 
 /**
  * Start metrics and health check server on separate port
@@ -19,78 +23,78 @@ export async function startMetricsServer() {
     });
 
     // Prometheus metrics endpoint
-    app.get('/metrics', async (_request, reply) => {
+    app.get("/metrics", async (_request, reply) => {
         try {
             // Update gauge metrics before serving
             await updateGaugeMetrics();
 
             const metrics = await register.metrics();
-            reply.header('Content-Type', register.contentType);
+            reply.header("Content-Type", register.contentType);
             reply.send(metrics);
         } catch (error) {
             log(`Metrics error: ${error}`);
-            reply.status(500).send({ error: 'Failed to collect metrics' });
+            reply.status(500).send({ error: "Failed to collect metrics" });
         }
     });
 
     // Health check endpoint
-    app.get('/health', async (_request, reply) => {
+    app.get("/health", async (_request, reply) => {
         const health = {
-            status: 'healthy',
+            status: "healthy",
             timestamp: Date.now(),
             dependencies: {
-                postgres: 'unknown',
-                redis: 'unknown',
+                postgres: "unknown",
+                redis: "unknown",
             },
         };
 
         try {
             // Check PostgreSQL
             await db.$queryRaw`SELECT 1`;
-            health.dependencies.postgres = 'connected';
+            health.dependencies.postgres = "connected";
         } catch (error) {
-            health.status = 'unhealthy';
-            health.dependencies.postgres = 'disconnected';
+            health.status = "unhealthy";
+            health.dependencies.postgres = "disconnected";
         }
 
         // Check Redis via events singleton
         try {
             if (events) {
-                health.dependencies.redis = 'connected';
+                health.dependencies.redis = "connected";
             } else {
-                health.dependencies.redis = 'disconnected';
-                health.status = 'unhealthy';
+                health.dependencies.redis = "disconnected";
+                health.status = "unhealthy";
             }
         } catch (error) {
-            health.dependencies.redis = 'disconnected';
-            health.status = 'unhealthy';
+            health.dependencies.redis = "disconnected";
+            health.status = "unhealthy";
         }
 
-        const statusCode = health.status === 'healthy' ? 200 : 503;
+        const statusCode = health.status === "healthy" ? 200 : 503;
         reply.status(statusCode).send(health);
     });
 
     // Liveness probe (simpler, always returns OK if server is running)
-    app.get('/liveness', async (_request, reply) => {
-        reply.send({ status: 'alive', timestamp: Date.now() });
+    app.get("/liveness", async (_request, reply) => {
+        reply.send({ status: "alive", timestamp: Date.now() });
     });
 
     // Readiness probe (checks if server is ready to accept traffic)
-    app.get('/readiness', async (_request, reply) => {
+    app.get("/readiness", async (_request, reply) => {
         try {
             await db.$queryRaw`SELECT 1`;
-            reply.send({ status: 'ready', timestamp: Date.now() });
+            reply.send({ status: "ready", timestamp: Date.now() });
         } catch (error) {
-            reply.status(503).send({ status: 'not ready', timestamp: Date.now() });
+            reply.status(503).send({ status: "not ready", timestamp: Date.now() });
         }
     });
 
     // Start metrics server on separate port
     const port = process.env.METRICS_PORT ? parseInt(process.env.METRICS_PORT, 10) : 9090;
-    await app.listen({ port, host: '0.0.0.0' });
+    await app.listen({ port, host: "0.0.0.0" });
     log(`Metrics server started on port ${port}`);
 
-    onShutdown('metrics', async () => {
+    onShutdown("metrics", async () => {
         await app.close();
     });
 }
@@ -122,7 +126,7 @@ async function updateGaugeMetrics() {
 
         // Get active database connections from Prisma metrics
         const metrics = await db.$metrics.json();
-        const poolSize = metrics.counters.find((c: any) => c.key === 'prisma_client_queries_total');
+        const poolSize = metrics.counters.find((c: any) => c.key === "prisma_client_queries_total");
         if (poolSize) {
             dbConnectionsActive.set(poolSize.value);
         }

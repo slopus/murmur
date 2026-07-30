@@ -11,8 +11,8 @@ Profile JSON payload:
 
 ```json
 {
-  "firstName": "Alice",
-  "lastName": "Smith"
+    "firstName": "Alice",
+    "lastName": "Smith"
 }
 ```
 
@@ -21,18 +21,18 @@ Profile JSON payload:
 ## Key Material
 
 - **Profile secret key**: 32-byte X25519 private key.
-  - Serialized as base64url without padding.
+    - Serialized as base64url without padding.
 - **Profile public key**: X25519 public key derived from the secret key.
-  - Serialized as standard base64.
+    - Serialized as standard base64.
 - **Identity key**: Ed25519 keypair used to sign the profile public key.
 
 ## Encryption
 
 1. Serialize the profile JSON to UTF-8 bytes.
 2. Derive a 32-byte encryption key using HKDF-SHA-256:
-   - IKM: profile secret key
-   - Salt: empty (undefined)
-   - Info: `"murmur-profile-encryption"`
+    - IKM: profile secret key
+    - Salt: empty (undefined)
+    - Info: `"murmur-profile-encryption"`
 3. Generate a 12-byte random nonce.
 4. Encrypt with ChaCha20-Poly1305.
 5. Concatenate `nonce || ciphertext` (ciphertext includes the auth tag).

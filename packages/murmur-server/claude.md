@@ -13,14 +13,14 @@ Murmur Server is an encrypted message transfer server using NaCl-based authentic
 **Messages are stored in PostgreSQL, NOT in Redis.**
 
 - **Storage Layer**: PostgreSQL database (via Prisma ORM)
-  - User accounts and profiles
-  - Message blobs (encrypted content)
-  - All persistent data
+    - User accounts and profiles
+    - Message blobs (encrypted content)
+    - All persistent data
 
 - **Delivery Layer**: Redis Streams
-  - Inter-node event notifications only
-  - Reliable delivery of "new message" events across server instances
-  - NOT used for message storage or retrieval
+    - Inter-node event notifications only
+    - Reliable delivery of "new message" events across server instances
+    - NOT used for message storage or retrieval
 
 **Key Point**: Reading messages does NOT acknowledge them in Redis. Messages only exist in the database. Redis is purely for notifying nodes about new messages.
 
@@ -39,6 +39,7 @@ export function getShutdownSignal(): AbortSignal {
 ```
 
 **No Custom Shutdown Hacks**:
+
 - Don't create custom shutdown callbacks or state management
 - Use the centralized `getShutdownSignal()` from shutdown module
 - All timing utilities accept `AbortSignal` parameter
@@ -49,11 +50,13 @@ export function getShutdownSignal(): AbortSignal {
 Located in `sources/utils/timing.ts`:
 
 #### `delay(ms: number, signal?: AbortSignal)`
+
 - Standard abortable delay
 - Rejects with `DOMException('Delay aborted', 'AbortError')` when signal aborts
 - Works without signal for backward compatibility
 
 #### `forever(fn, intervalMs, signal, backoffOptions?)`
+
 - **Runs code with exponential backoff OUTSIDE the loop**
 - On error, applies backoff delay before retrying
 - On success, waits `intervalMs` before next iteration
@@ -67,14 +70,15 @@ await forever(
     60000, // Run every hour on success
     signal,
     {
-        initialDelayMs: 1000,  // Start with 1s delay on error
-        maxDelayMs: 60000,      // Max 60s delay on error
-        multiplier: 2           // Double delay each retry
-    }
+        initialDelayMs: 1000, // Start with 1s delay on error
+        maxDelayMs: 60000, // Max 60s delay on error
+        multiplier: 2, // Double delay each retry
+    },
 );
 ```
 
 #### `retryWithBackoff(fn, options)`
+
 - Exponential backoff retry logic
 - Configurable initial delay, max delay, multiplier
 - Respects max attempts
@@ -92,19 +96,17 @@ await forever(
 export async function startCleanupWorker(): Promise<void> {
     const signal = getShutdownSignal();
 
-    await forever(
-        async () => await cleanup(),
-        CHECK_INTERVAL_MS,
-        signal,
-        { /* backoff options */ }
-    );
+    await forever(async () => await cleanup(), CHECK_INTERVAL_MS, signal, {
+        /* backoff options */
+    });
 }
 ```
 
 **Usage in main.ts**:
+
 ```typescript
 // Start in background, don't await
-startCleanupWorker().catch(err => {
+startCleanupWorker().catch((err) => {
     log(`Cleanup worker error: ${err}`);
 });
 ```
@@ -116,19 +118,22 @@ startCleanupWorker().catch(err => {
 Located in `sources/eventbus/eventBus.ts`:
 
 **Consumer Groups with cuid2**:
+
 - Consumer names generated with `cuid2.createId()` (async import)
 - Each server instance has unique consumer name
 - Enables distributed processing across multiple nodes
 
 **Hard Crash on Consumer Group Deletion**:
+
 ```typescript
-if (error.message && error.message.includes('NOGROUP')) {
+if (error.message && error.message.includes("NOGROUP")) {
     log(`FATAL: Consumer group deleted!`);
-    process.exit(1);  // Hard crash - don't try to recover
+    process.exit(1); // Hard crash - don't try to recover
 }
 ```
 
 **Read Loop with forever**:
+
 ```typescript
 private async readLoop(signal: AbortSignal): Promise<void> {
     await forever(async () => {
@@ -143,21 +148,23 @@ private async readLoop(signal: AbortSignal): Promise<void> {
 **Two-Tier Token System**:
 
 - **Access Tokens**: Ephemeral, 1-hour TTL
-  - Created with `createEphemeralTokenGenerator` from privacy-kit
-  - Used for API authentication
-  - Short-lived for security
+    - Created with `createEphemeralTokenGenerator` from privacy-kit
+    - Used for API authentication
+    - Short-lived for security
 
 - **Refresh Tokens**: Persistent, long-lived
-  - Created with `createPersistentTokenGenerator` from privacy-kit
-  - Used to get new access tokens
-  - Stored securely by client
+    - Created with `createPersistentTokenGenerator` from privacy-kit
+    - Used to get new access tokens
+    - Stored securely by client
 
 **Public Key Management**:
+
 - Verifier takes public key directly from generator
 - No need for external public key configuration
 - `verifier.publicKey = generator.publicKey`
 
 **Endpoints**:
+
 - `/v1/auth/register` - Returns both tokens
 - `/v1/auth/login` - Returns both tokens
 - `/v1/auth/refresh` - Takes refresh token, returns new access token
@@ -171,15 +178,18 @@ Most requests sign `JSON.stringify(payload)`, while message sends sign raw blob 
 concatenated with UTF-8 bytes of `messageId`.
 
 **Message Integrity**:
+
 - Message signatures include BOTH blob and messageId
 - Prevents tampering and replay attacks
 - Message IDs must be valid cuid2 format
 
 **Profile Security**:
+
 - Profile encryption keys signed by identity key
 - Prevents unauthorized profile key changes
 
 **PreKey System** (Signal Protocol):
+
 - Signed prekeys and one-time prekeys stored in unified `PreKey` table
 - `oneTime` flag distinguishes between signed (false) and one-time (true) prekeys
 - PreKeys permanently allocated to users who claim them (not deleted)
@@ -191,11 +201,13 @@ concatenated with UTF-8 bytes of `messageId`.
 ### 8. Testing Philosophy
 
 **Comprehensive Unit Tests**:
+
 - Tests cover crypto, JWT, timing, and sync helpers
 - All new features should include tests
 - Focus on edge cases and error scenarios
 
 **Test Organization**:
+
 ```
 sources/utils/
 ├── timing.test.ts      # 15 tests - delay, forever, backoff
@@ -211,7 +223,7 @@ sources/utils/
 
 ```typescript
 // DON'T await - let it run in background
-startCleanupWorker().catch(err => {
+startCleanupWorker().catch((err) => {
     log(`Worker error: ${err}`);
 });
 ```
@@ -219,8 +231,8 @@ startCleanupWorker().catch(err => {
 ### 2. Implementing Loops with Graceful Shutdown
 
 ```typescript
-import { forever } from '@/utils/timing';
-import { getShutdownSignal } from '@/shutdown';
+import { forever } from "@/utils/timing";
+import { getShutdownSignal } from "@/shutdown";
 
 const signal = getShutdownSignal();
 
@@ -234,39 +246,36 @@ await forever(
         // Optional backoff on errors
         initialDelayMs: 100,
         maxDelayMs: 30000,
-        multiplier: 2
-    }
+        multiplier: 2,
+    },
 );
 ```
 
 ### 3. Implementing Retry Logic
 
 ```typescript
-import { retryWithBackoff } from '@/utils/timing';
-import { getShutdownSignal } from '@/shutdown';
+import { retryWithBackoff } from "@/utils/timing";
+import { getShutdownSignal } from "@/shutdown";
 
-const result = await retryWithBackoff(
-    async () => await riskyOperation(),
-    {
-        signal: getShutdownSignal(),
-        initialDelayMs: 100,
-        maxDelayMs: 30000,
-        multiplier: 2,
-        maxAttempts: 5
-    }
-);
+const result = await retryWithBackoff(async () => await riskyOperation(), {
+    signal: getShutdownSignal(),
+    initialDelayMs: 100,
+    maxDelayMs: 30000,
+    multiplier: 2,
+    maxAttempts: 5,
+});
 ```
 
 ### 4. Implementing Abortable Delays
 
 ```typescript
-import { delay } from '@/utils/timing';
-import { getShutdownSignal } from '@/shutdown';
+import { delay } from "@/utils/timing";
+import { getShutdownSignal } from "@/shutdown";
 
 try {
     await delay(5000, getShutdownSignal());
 } catch (error) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
+    if (error instanceof DOMException && error.name === "AbortError") {
         // Shutdown requested
         return;
     }
@@ -296,8 +305,12 @@ export function signalShutdown() {
 ```typescript
 // BAD - complex class with state management
 export class CleanupWorker {
-    async start() { /* ... */ }
-    async stop() { /* ... */ }
+    async start() {
+        /* ... */
+    }
+    async stop() {
+        /* ... */
+    }
 }
 ```
 
@@ -334,7 +347,7 @@ while (true) {
 ```typescript
 // BAD - don't acknowledge messages when reading from DB
 const messages = await db.message.findMany();
-await redis.xack('messages', group, messageIds);
+await redis.xack("messages", group, messageIds);
 ```
 
 **Instead**: Messages in DB are independent from Redis events.
@@ -342,6 +355,7 @@ await redis.xack('messages', group, messageIds);
 ## Dependencies and Versions
 
 ### Core Dependencies
+
 - **Fastify**: Web framework
 - **Prisma**: ORM for PostgreSQL
 - **ioredis**: Redis client
@@ -351,6 +365,7 @@ await redis.xack('messages', group, messageIds);
 - **zod**: Runtime type validation
 
 ### Development
+
 - **TypeScript**: Type safety
 - **Vitest**: Testing framework
 - **tsx**: TypeScript execution
@@ -358,6 +373,7 @@ await redis.xack('messages', group, messageIds);
 ## Database Schema
 
 ### User
+
 - `id`: Identity public key (base64 with padding)
 - `profilePublicKey`: Profile encryption key (base64 with padding)
 - `profileKeySignature`: Signature of profile key by identity
@@ -366,6 +382,7 @@ await redis.xack('messages', group, messageIds);
 - `createdAt`: Account creation
 
 ### Message
+
 - `id`: cuid2 message ID (primary key)
 - `senderId`: Sender's identity public key
 - `recipientId`: Recipient's identity public key
@@ -377,33 +394,39 @@ await redis.xack('messages', group, messageIds);
 ## Environment Configuration
 
 ### Required Variables
+
 - `DATABASE_URL`: PostgreSQL connection string
 - `REDIS_URL`: Redis connection string (default: redis://localhost:6379)
 - `JWT_SEED`: Secret seed for JWT generation
 
 ### Optional Variables
+
 - `PORT`: HTTP server port (default: 3000)
 - `NODE_ENV`: Environment (development/production)
 
 ## Deployment Considerations
 
 ### Multi-Node Deployment
+
 - Each node runs independent EventBus consumer
 - Consumer groups ensure messages processed only once across all nodes
 - Redis Streams provide at-least-once delivery semantics with consumer group acknowledgments
 - Nodes can be added/removed without coordination
 
 ### Database
+
 - Use connection pooling for PostgreSQL
 - Regular backups of PostgreSQL data
 - Messages auto-delete after 30 days via cleanup worker
 
 ### Redis
+
 - Redis Streams require persistence (AOF or RDB)
 - Consumer group state stored in Redis
 - If Redis restarts, consumer groups recreated automatically
 
 ### Monitoring
+
 - Watch for consumer group deletion (causes process.exit(1))
 - Monitor message expiration cleanup success rate
 - Track SSE connection counts and durations

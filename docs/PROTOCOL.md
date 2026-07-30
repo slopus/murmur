@@ -44,10 +44,10 @@ When Alice has no session with Bob:
 2. Verify the signed prekey signature using Bob's identity public key.
 3. Generate an ephemeral X25519 keypair.
 4. Run X3DH with:
-   - Alice identity DH key (derived from Ed25519).
-   - Alice ephemeral key.
-   - Bob signed prekey.
-   - Optional Bob one-time prekey.
+    - Alice identity DH key (derived from Ed25519).
+    - Alice ephemeral key.
+    - Bob signed prekey.
+    - Optional Bob one-time prekey.
 5. Initialize Double Ratchet with the X3DH shared secret.
 6. Encrypt the application payload and send a prekey message containing the
    `init` block with the ephemeral key and the prekeys used.
@@ -100,10 +100,10 @@ Messages are sent to the server as:
 
 ```json
 {
-  "messageId": "cuid2",
-  "recipientId": "base64-identity-key",
-  "blob": "base64(protocol_message_json)",
-  "signature": "base64"
+    "messageId": "cuid2",
+    "recipientId": "base64-identity-key",
+    "blob": "base64(protocol_message_json)",
+    "signature": "base64"
 }
 ```
 

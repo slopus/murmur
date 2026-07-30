@@ -1,50 +1,50 @@
-version: '3.8'
+version: "3.8"
 
 services:
-  postgres:
-    image: postgres:16
-    environment:
-      POSTGRES_PASSWORD: postgres
-      POSTGRES_DB: murmur
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5438:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    postgres:
+        image: postgres:16
+        environment:
+            POSTGRES_PASSWORD: postgres
+            POSTGRES_DB: murmur
+        volumes:
+            - postgres_data:/var/lib/postgresql/data
+        ports:
+            - "5438:5432"
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U postgres"]
+            interval: 5s
+            timeout: 5s
+            retries: 5
 
-  redis:
-    image: redis:7-alpine
-    volumes:
-      - redis_data:/data
-    ports:
-      - "6379:6379"
-    command: redis-server --appendonly yes
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    redis:
+        image: redis:7-alpine
+        volumes:
+            - redis_data:/data
+        ports:
+            - "6379:6379"
+        command: redis-server --appendonly yes
+        healthcheck:
+            test: ["CMD", "redis-cli", "ping"]
+            interval: 5s
+            timeout: 5s
+            retries: 5
 
-  murmur:
-    build: .
-    environment:
-      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/murmur
-      REDIS_URL: redis://redis:6379
-      JWT_SECRET: ${JWT_SECRET:-dev-secret-change-in-production}
-      PORT: 3000
-    ports:
-      - "3000:3000"
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
-    restart: unless-stopped
+    murmur:
+        build: .
+        environment:
+            DATABASE_URL: postgresql://postgres:postgres@postgres:5432/murmur
+            REDIS_URL: redis://redis:6379
+            JWT_SECRET: ${JWT_SECRET:-dev-secret-change-in-production}
+            PORT: 3000
+        ports:
+            - "3000:3000"
+        depends_on:
+            postgres:
+                condition: service_healthy
+            redis:
+                condition: service_healthy
+        restart: unless-stopped
 
 volumes:
-  postgres_data:
-  redis_data:
+    postgres_data:
+    redis_data:

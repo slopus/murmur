@@ -16,18 +16,13 @@
  * Based on: https://signal.org/docs/specifications/doubleratchet/
  */
 
-import { generateDH, dh, type DHKeyPair, DH_PUBLIC_KEY_LENGTH } from '../crypto/dh.js'
-import { kdfRK, kdfCK } from '../crypto/kdf.js'
-import { encrypt, decrypt } from '../crypto/aead.js'
-import { constantTimeEqual, concatBytes, numberToBytes } from '../crypto/utils.js'
-import { makeSkippedKeyIndex } from './state.js'
-import type {
-    RatchetState,
-    MessageHeader,
-    EncryptedMessage,
-    RatchetInitOptions
-} from './types.js'
-import { DEFAULT_MAX_SKIP } from './types.js'
+import { generateDH, dh, type DHKeyPair, DH_PUBLIC_KEY_LENGTH } from "../crypto/dh.js";
+import { kdfRK, kdfCK } from "../crypto/kdf.js";
+import { encrypt, decrypt } from "../crypto/aead.js";
+import { constantTimeEqual, concatBytes, numberToBytes } from "../crypto/utils.js";
+import { makeSkippedKeyIndex } from "./state.js";
+import type { RatchetState, MessageHeader, EncryptedMessage, RatchetInitOptions } from "./types.js";
+import { DEFAULT_MAX_SKIP } from "./types.js";
 
 /**
  * Initialize the Double Ratchet as Alice (initiator).
@@ -51,20 +46,17 @@ import { DEFAULT_MAX_SKIP } from './types.js'
  * // Alice can now send messages
  * ```
  */
-export function initializeAlice(
-    sharedSecret: Uint8Array,
-    bobPublicKey: Uint8Array
-): RatchetState {
+export function initializeAlice(sharedSecret: Uint8Array, bobPublicKey: Uint8Array): RatchetState {
     if (sharedSecret.length !== 32) {
-        throw new Error(`Invalid shared secret length: expected 32, got ${sharedSecret.length}`)
+        throw new Error(`Invalid shared secret length: expected 32, got ${sharedSecret.length}`);
     }
 
     // Generate Alice's ratchet key pair
-    const dhSelf = generateDH()
+    const dhSelf = generateDH();
 
     // Perform initial DH to derive first sending chain
-    const dhOutput = dh(dhSelf, bobPublicKey)
-    const [rootKey, sendingChainKey] = kdfRK(sharedSecret, dhOutput)
+    const dhOutput = dh(dhSelf, bobPublicKey);
+    const [rootKey, sendingChainKey] = kdfRK(sharedSecret, dhOutput);
 
     return {
         dhSelf,
@@ -75,8 +67,8 @@ export function initializeAlice(
         sendingMessageNumber: 0,
         receivingMessageNumber: 0,
         previousSendingChainLength: 0,
-        skippedMessageKeys: new Map()
-    }
+        skippedMessageKeys: new Map(),
+    };
 }
 
 /**
@@ -101,12 +93,9 @@ export function initializeAlice(
  * // Bob waits for Alice's first message before sending
  * ```
  */
-export function initializeBob(
-    sharedSecret: Uint8Array,
-    bobKeyPair: DHKeyPair
-): RatchetState {
+export function initializeBob(sharedSecret: Uint8Array, bobKeyPair: DHKeyPair): RatchetState {
     if (sharedSecret.length !== 32) {
-        throw new Error(`Invalid shared secret length: expected 32, got ${sharedSecret.length}`)
+        throw new Error(`Invalid shared secret length: expected 32, got ${sharedSecret.length}`);
     }
 
     return {
@@ -118,8 +107,8 @@ export function initializeBob(
         sendingMessageNumber: 0,
         receivingMessageNumber: 0,
         previousSendingChainLength: 0,
-        skippedMessageKeys: new Map()
-    }
+        skippedMessageKeys: new Map(),
+    };
 }
 
 /**
@@ -145,36 +134,38 @@ export function initializeBob(
 export function ratchetEncrypt(
     state: RatchetState,
     plaintext: Uint8Array,
-    associatedData: Uint8Array = new Uint8Array(0)
+    associatedData: Uint8Array = new Uint8Array(0),
 ): EncryptedMessage {
     // Ensure we have a sending chain
     if (!state.sendingChainKey) {
-        throw new Error('Cannot encrypt: sending chain not initialized. ' +
-            'Bob must receive a message from Alice before sending.')
+        throw new Error(
+            "Cannot encrypt: sending chain not initialized. " +
+                "Bob must receive a message from Alice before sending.",
+        );
     }
 
     // Symmetric ratchet step: derive message key and advance chain
-    const [newChainKey, messageKey] = kdfCK(state.sendingChainKey)
-    state.sendingChainKey = newChainKey
+    const [newChainKey, messageKey] = kdfCK(state.sendingChainKey);
+    state.sendingChainKey = newChainKey;
 
     // Create header with current ratchet key and message number
     const header: MessageHeader = {
         publicKey: state.dhSelf.publicKey,
         previousChainLength: state.previousSendingChainLength,
-        messageNumber: state.sendingMessageNumber
-    }
+        messageNumber: state.sendingMessageNumber,
+    };
 
     // Increment message counter
-    state.sendingMessageNumber++
+    state.sendingMessageNumber++;
 
     // Encode header and use as additional authenticated data
-    const encodedHeader = encodeHeader(header)
-    const fullAD = concatBytes(associatedData, encodedHeader)
+    const encodedHeader = encodeHeader(header);
+    const fullAD = concatBytes(associatedData, encodedHeader);
 
     // Encrypt the plaintext
-    const ciphertext = encrypt(messageKey, plaintext, fullAD)
+    const ciphertext = encrypt(messageKey, plaintext, fullAD);
 
-    return { header, ciphertext }
+    return { header, ciphertext };
 }
 
 /**
@@ -202,43 +193,42 @@ export function ratchetDecrypt(
     state: RatchetState,
     message: EncryptedMessage,
     associatedData: Uint8Array = new Uint8Array(0),
-    options: RatchetInitOptions = {}
+    options: RatchetInitOptions = {},
 ): Uint8Array {
-    const maxSkip = options.maxSkip ?? DEFAULT_MAX_SKIP
-    const { header, ciphertext } = message
+    const maxSkip = options.maxSkip ?? DEFAULT_MAX_SKIP;
+    const { header, ciphertext } = message;
 
     // Encode header for authentication
-    const encodedHeader = encodeHeader(header)
-    const fullAD = concatBytes(associatedData, encodedHeader)
+    const encodedHeader = encodeHeader(header);
+    const fullAD = concatBytes(associatedData, encodedHeader);
 
     // Case 1: Try to decrypt with a previously skipped message key
-    const skippedKey = trySkippedMessageKeys(state, header)
+    const skippedKey = trySkippedMessageKeys(state, header);
     if (skippedKey) {
-        return decrypt(skippedKey, ciphertext, fullAD)
+        return decrypt(skippedKey, ciphertext, fullAD);
     }
 
     // Case 2: Check if we need to perform a DH ratchet step
     // This happens when we receive a new ratchet public key from the sender
-    const isNewRatchetKey = !state.dhRemote ||
-        !constantTimeEqual(header.publicKey, state.dhRemote)
+    const isNewRatchetKey = !state.dhRemote || !constantTimeEqual(header.publicKey, state.dhRemote);
 
     if (isNewRatchetKey) {
         // Skip any remaining messages in the current receiving chain
-        skipMessageKeys(state, header.previousChainLength, maxSkip)
+        skipMessageKeys(state, header.previousChainLength, maxSkip);
         // Perform the DH ratchet step
-        dhRatchet(state, header)
+        dhRatchet(state, header);
     }
 
     // Case 3: Skip to the message number and decrypt
-    skipMessageKeys(state, header.messageNumber, maxSkip)
+    skipMessageKeys(state, header.messageNumber, maxSkip);
 
     // Derive the message key for this message
-    const [newChainKey, messageKey] = kdfCK(state.receivingChainKey)
-    state.receivingChainKey = newChainKey
-    state.receivingMessageNumber++
+    const [newChainKey, messageKey] = kdfCK(state.receivingChainKey);
+    state.receivingChainKey = newChainKey;
+    state.receivingMessageNumber++;
 
     // Decrypt and return
-    return decrypt(messageKey, ciphertext, fullAD)
+    return decrypt(messageKey, ciphertext, fullAD);
 }
 
 /**
@@ -252,20 +242,17 @@ export function ratchetDecrypt(
  * @param header - Message header
  * @returns Message key if found, null otherwise
  */
-function trySkippedMessageKeys(
-    state: RatchetState,
-    header: MessageHeader
-): Uint8Array | null {
-    const key = makeSkippedKeyIndex(header.publicKey, header.messageNumber)
-    const messageKey = state.skippedMessageKeys.get(key)
+function trySkippedMessageKeys(state: RatchetState, header: MessageHeader): Uint8Array | null {
+    const key = makeSkippedKeyIndex(header.publicKey, header.messageNumber);
+    const messageKey = state.skippedMessageKeys.get(key);
 
     if (messageKey) {
         // Remove the key after use (one-time use)
-        state.skippedMessageKeys.delete(key)
-        return messageKey
+        state.skippedMessageKeys.delete(key);
+        return messageKey;
     }
 
-    return null
+    return null;
 }
 
 /**
@@ -280,31 +267,27 @@ function trySkippedMessageKeys(
  * @param maxSkip - Maximum allowed skip (DoS protection)
  * @throws Error if skip would exceed maxSkip limit
  */
-function skipMessageKeys(
-    state: RatchetState,
-    until: number,
-    maxSkip: number
-): void {
+function skipMessageKeys(state: RatchetState, until: number, maxSkip: number): void {
     // Check for DoS: don't skip too many messages
     if (state.receivingMessageNumber + maxSkip < until) {
         throw new Error(
             `Cannot skip ${until - state.receivingMessageNumber} messages ` +
-            `(max: ${maxSkip}). Possible attack or severe message loss.`
-        )
+                `(max: ${maxSkip}). Possible attack or severe message loss.`,
+        );
     }
 
     // Only skip if we have a receiving chain
     if (state.receivingChainKey && state.dhRemote) {
         while (state.receivingMessageNumber < until) {
             // Derive message key and advance chain
-            const [newChainKey, messageKey] = kdfCK(state.receivingChainKey)
-            state.receivingChainKey = newChainKey
+            const [newChainKey, messageKey] = kdfCK(state.receivingChainKey);
+            state.receivingChainKey = newChainKey;
 
             // Store the skipped key indexed by (ratchet_key, message_number)
-            const key = makeSkippedKeyIndex(state.dhRemote, state.receivingMessageNumber)
-            state.skippedMessageKeys.set(key, messageKey)
+            const key = makeSkippedKeyIndex(state.dhRemote, state.receivingMessageNumber);
+            state.skippedMessageKeys.set(key, messageKey);
 
-            state.receivingMessageNumber++
+            state.receivingMessageNumber++;
         }
     }
 }
@@ -330,52 +313,54 @@ function skipMessageKeys(
  */
 function dhRatchet(state: RatchetState, header: MessageHeader): void {
     // Save the number of messages sent in the previous sending chain
-    state.previousSendingChainLength = state.sendingMessageNumber
+    state.previousSendingChainLength = state.sendingMessageNumber;
 
     // Reset message counters for new chains
-    state.sendingMessageNumber = 0
-    state.receivingMessageNumber = 0
+    state.sendingMessageNumber = 0;
+    state.receivingMessageNumber = 0;
 
     // Update the remote ratchet public key
-    state.dhRemote = header.publicKey
+    state.dhRemote = header.publicKey;
 
     // Derive new receiving chain key
     // DH: our current private key × their new public key
-    const dhOutputReceive = dh(state.dhSelf, state.dhRemote)
-    const [rootKey1, receivingChainKey] = kdfRK(state.rootKey, dhOutputReceive)
-    state.rootKey = rootKey1
-    state.receivingChainKey = receivingChainKey
+    const dhOutputReceive = dh(state.dhSelf, state.dhRemote);
+    const [rootKey1, receivingChainKey] = kdfRK(state.rootKey, dhOutputReceive);
+    state.rootKey = rootKey1;
+    state.receivingChainKey = receivingChainKey;
 
     // Generate new ratchet key pair for sending
-    state.dhSelf = generateDH()
+    state.dhSelf = generateDH();
 
     // Derive new sending chain key
     // DH: our new private key × their public key
-    const dhOutputSend = dh(state.dhSelf, state.dhRemote)
-    const [rootKey2, sendingChainKey] = kdfRK(state.rootKey, dhOutputSend)
-    state.rootKey = rootKey2
-    state.sendingChainKey = sendingChainKey
+    const dhOutputSend = dh(state.dhSelf, state.dhRemote);
+    const [rootKey2, sendingChainKey] = kdfRK(state.rootKey, dhOutputSend);
+    state.rootKey = rootKey2;
+    state.sendingChainKey = sendingChainKey;
 }
 
 function encodeHeader(header: MessageHeader): Uint8Array {
     if (!header.publicKey) {
-        throw new Error('Header public key must not be null')
+        throw new Error("Header public key must not be null");
     }
     if (header.publicKey.length !== DH_PUBLIC_KEY_LENGTH) {
-        throw new Error(`Invalid public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${header.publicKey.length}`)
+        throw new Error(
+            `Invalid public key length: expected ${DH_PUBLIC_KEY_LENGTH}, got ${header.publicKey.length}`,
+        );
     }
     if (header.messageNumber < 0 || !Number.isInteger(header.messageNumber)) {
-        throw new Error(`Invalid message number: ${header.messageNumber}`)
+        throw new Error(`Invalid message number: ${header.messageNumber}`);
     }
     if (header.previousChainLength < 0 || !Number.isInteger(header.previousChainLength)) {
-        throw new Error(`Invalid previous chain length: ${header.previousChainLength}`)
+        throw new Error(`Invalid previous chain length: ${header.previousChainLength}`);
     }
 
-    const pnBytes = numberToBytes(header.previousChainLength)
-    const nBytes = numberToBytes(header.messageNumber)
-    const reserved = new Uint8Array(4)
+    const pnBytes = numberToBytes(header.previousChainLength);
+    const nBytes = numberToBytes(header.messageNumber);
+    const reserved = new Uint8Array(4);
 
-    return concatBytes(header.publicKey, pnBytes, nBytes, reserved)
+    return concatBytes(header.publicKey, pnBytes, nBytes, reserved);
 }
 
 /**
@@ -387,7 +372,7 @@ function encodeHeader(header: MessageHeader): Uint8Array {
  * @returns Number of stored skipped keys
  */
 export function getSkippedKeyCount(state: RatchetState): number {
-    return state.skippedMessageKeys.size
+    return state.skippedMessageKeys.size;
 }
 
 /**
@@ -401,7 +386,7 @@ export function getSkippedKeyCount(state: RatchetState): number {
  * @returns Number of keys cleared
  */
 export function clearSkippedKeys(state: RatchetState): number {
-    const count = state.skippedMessageKeys.size
-    state.skippedMessageKeys.clear()
-    return count
+    const count = state.skippedMessageKeys.size;
+    state.skippedMessageKeys.clear();
+    return count;
 }

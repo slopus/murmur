@@ -1,14 +1,14 @@
-import { ed25519 } from '@noble/curves/ed25519';
+import { ed25519 } from "@noble/curves/ed25519";
 
 /**
  * Base64 encoding/decoding utilities
  */
 function encodeBase64(bytes: Uint8Array): string {
-    return Buffer.from(bytes).toString('base64');
+    return Buffer.from(bytes).toString("base64");
 }
 
 function decodeBase64(str: string): Uint8Array {
-    return new Uint8Array(Buffer.from(str, 'base64'));
+    return new Uint8Array(Buffer.from(str, "base64"));
 }
 
 /**
@@ -21,12 +21,11 @@ function decodeBase64(str: string): Uint8Array {
 export function verifySignature(
     message: string | Uint8Array,
     signature: string,
-    publicKey: string
+    publicKey: string,
 ): boolean {
     try {
-        const messageBytes = typeof message === 'string'
-            ? new TextEncoder().encode(message)
-            : message;
+        const messageBytes =
+            typeof message === "string" ? new TextEncoder().encode(message) : message;
         const signatureBytes = decodeBase64(signature);
         const publicKeyBytes = decodeBase64(publicKey);
 
@@ -43,9 +42,7 @@ export function verifySignature(
  * @returns The signature in base64 format
  */
 export function signMessage(message: string | Uint8Array, privateKey: string): string {
-    const messageBytes = typeof message === 'string'
-        ? new TextEncoder().encode(message)
-        : message;
+    const messageBytes = typeof message === "string" ? new TextEncoder().encode(message) : message;
     const privateKeyBytes = decodeBase64(privateKey);
 
     const signature = ed25519.sign(messageBytes, privateKeyBytes);
@@ -84,7 +81,7 @@ export function isValidPublicKey(publicKey: string): boolean {
 export function normalizePublicKey(publicKey: string): string {
     const bytes = decodeBase64(publicKey);
     if (bytes.length !== 32) {
-        throw new Error('Invalid public key format');
+        throw new Error("Invalid public key format");
     }
     return encodeBase64(bytes);
 }
@@ -95,7 +92,7 @@ export function normalizePublicKey(publicKey: string): string {
 export function publicKeyToExternal(publicKey: string): string {
     const bytes = decodeBase64(publicKey);
     if (bytes.length !== 32) {
-        throw new Error('Invalid public key format');
+        throw new Error("Invalid public key format");
     }
     return encodeBase64(bytes);
 }

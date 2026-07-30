@@ -4,76 +4,76 @@
  * Simulates the server API for local testing of all chat mechanisms.
  */
 
-import type { InboxMessage, ServerProfile, AuthTokens } from './api.js'
+import type { InboxMessage, ServerProfile, AuthTokens } from "./api.js";
 
 /**
  * Prekey stored in mock server.
  */
 interface MockPreKey {
-    publicKey: string
-    signature: string
-    oneTime: boolean
-    createdAt: number
-    allocated: boolean
+    publicKey: string;
+    signature: string;
+    oneTime: boolean;
+    createdAt: number;
+    allocated: boolean;
 }
 
 /**
  * Prekey data stored for a user.
  */
 interface MockPreKeyData {
-    signedPreKey: MockPreKey | null
-    oneTimePreKeys: MockPreKey[]
+    signedPreKey: MockPreKey | null;
+    oneTimePreKeys: MockPreKey[];
 }
 
 /**
  * User stored in mock server.
  */
 interface MockUser {
-    identityPublicKey: string
-    profilePublicKey: string
-    profileKeySignature: string
-    encryptedProfile: string
-    createdAt: number
-    refreshToken: string
-    preKeyData?: MockPreKeyData
+    identityPublicKey: string;
+    profilePublicKey: string;
+    profileKeySignature: string;
+    encryptedProfile: string;
+    createdAt: number;
+    refreshToken: string;
+    preKeyData?: MockPreKeyData;
 }
 
 /**
  * Message stored in mock server.
  */
 interface MockMessage {
-    id: string
-    senderId: string
-    recipientId: string
-    blob: string
-    signature: string
-    createdAt: number
-    expiresAt: number
-    acknowledged: boolean
+    id: string;
+    senderId: string;
+    recipientId: string;
+    blob: string;
+    signature: string;
+    createdAt: number;
+    expiresAt: number;
+    acknowledged: boolean;
 }
 
 /**
  * Mock server for testing.
  */
 export class MockServer {
-    private users: Map<string, MockUser> = new Map()
-    private messages: Map<string, MockMessage> = new Map()
-    private accessTokens: Map<string, string> = new Map() // token -> userId
-    private tokenCounter: number = 0
-    private messageCounter: number = 0 // For unique timestamps in tests
+    private users: Map<string, MockUser> = new Map();
+    private messages: Map<string, MockMessage> = new Map();
+    private accessTokens: Map<string, string> = new Map(); // token -> userId
+    private tokenCounter: number = 0;
+    private messageCounter: number = 0; // For unique timestamps in tests
 
     /**
      * Generate a mock access token.
      */
     private generateAccessToken(): string {
-        return `mock-access-token-${++this.tokenCounter}`
+        return `mock-access-token-${++this.tokenCounter}`;
     }
 
     /**
      * Generate a mock refresh token.
      */
     private generateRefreshToken(): string {
-        return `mock-refresh-token-${++this.tokenCounter}`
+        return `mock-refresh-token-${++this.tokenCounter}`;
     }
 
     /**
@@ -83,29 +83,29 @@ export class MockServer {
         identityPublicKey: string,
         profilePublicKey: string,
         profileKeySignature: string,
-        encryptedProfile: string
+        encryptedProfile: string,
     ): { tokens: AuthTokens; user: { id: string; createdAt: number } } {
         // Check if already exists
-        const existing = this.users.get(identityPublicKey)
+        const existing = this.users.get(identityPublicKey);
         if (existing) {
             // Return success for idempotency
-            const accessToken = this.generateAccessToken()
-            this.accessTokens.set(accessToken, identityPublicKey)
+            const accessToken = this.generateAccessToken();
+            this.accessTokens.set(accessToken, identityPublicKey);
             return {
                 tokens: {
                     accessToken,
-                    refreshToken: existing.refreshToken
+                    refreshToken: existing.refreshToken,
                 },
                 user: {
                     id: identityPublicKey,
-                    createdAt: existing.createdAt
-                }
-            }
+                    createdAt: existing.createdAt,
+                },
+            };
         }
 
-        const createdAt = Date.now()
-        const refreshToken = this.generateRefreshToken()
-        const accessToken = this.generateAccessToken()
+        const createdAt = Date.now();
+        const refreshToken = this.generateRefreshToken();
+        const accessToken = this.generateAccessToken();
 
         this.users.set(identityPublicKey, {
             identityPublicKey,
@@ -113,39 +113,42 @@ export class MockServer {
             profileKeySignature,
             encryptedProfile,
             createdAt,
-            refreshToken
-        })
+            refreshToken,
+        });
 
-        this.accessTokens.set(accessToken, identityPublicKey)
+        this.accessTokens.set(accessToken, identityPublicKey);
 
         return {
             tokens: { accessToken, refreshToken },
-            user: { id: identityPublicKey, createdAt }
-        }
+            user: { id: identityPublicKey, createdAt },
+        };
     }
 
     /**
      * Login an existing user.
      */
-    login(identityPublicKey: string): { tokens: AuthTokens; user: { id: string; createdAt: number } } {
-        const user = this.users.get(identityPublicKey)
+    login(identityPublicKey: string): {
+        tokens: AuthTokens;
+        user: { id: string; createdAt: number };
+    } {
+        const user = this.users.get(identityPublicKey);
         if (!user) {
-            throw new Error('User not found')
+            throw new Error("User not found");
         }
 
-        const accessToken = this.generateAccessToken()
-        this.accessTokens.set(accessToken, identityPublicKey)
+        const accessToken = this.generateAccessToken();
+        this.accessTokens.set(accessToken, identityPublicKey);
 
         return {
             tokens: {
                 accessToken,
-                refreshToken: user.refreshToken
+                refreshToken: user.refreshToken,
             },
             user: {
                 id: identityPublicKey,
-                createdAt: user.createdAt
-            }
-        }
+                createdAt: user.createdAt,
+            },
+        };
     }
 
     /**
@@ -155,30 +158,30 @@ export class MockServer {
         // Find user with this refresh token
         for (const user of this.users.values()) {
             if (user.refreshToken === refreshToken) {
-                const accessToken = this.generateAccessToken()
-                this.accessTokens.set(accessToken, user.identityPublicKey)
-                return accessToken
+                const accessToken = this.generateAccessToken();
+                this.accessTokens.set(accessToken, user.identityPublicKey);
+                return accessToken;
             }
         }
-        throw new Error('Invalid refresh token')
+        throw new Error("Invalid refresh token");
     }
 
     /**
      * Delete a user account.
      */
     deleteAccount(accessToken: string): void {
-        const userId = this.verifyToken(accessToken)
-        this.users.delete(userId)
+        const userId = this.verifyToken(accessToken);
+        this.users.delete(userId);
 
         for (const [token, ownerId] of Array.from(this.accessTokens.entries())) {
             if (ownerId === userId) {
-                this.accessTokens.delete(token)
+                this.accessTokens.delete(token);
             }
         }
 
         for (const [messageId, message] of Array.from(this.messages.entries())) {
             if (message.senderId === userId || message.recipientId === userId) {
-                this.messages.delete(messageId)
+                this.messages.delete(messageId);
             }
         }
     }
@@ -187,11 +190,11 @@ export class MockServer {
      * Verify access token and get user ID.
      */
     private verifyToken(accessToken: string): string {
-        const userId = this.accessTokens.get(accessToken)
+        const userId = this.accessTokens.get(accessToken);
         if (!userId) {
-            throw new Error('Invalid access token')
+            throw new Error("Invalid access token");
         }
-        return userId
+        return userId;
     }
 
     /**
@@ -202,21 +205,21 @@ export class MockServer {
         messageId: string,
         recipientId: string,
         blob: string,
-        signature: string
+        signature: string,
     ): { id: string; createdAt: number; expiresAt: number } {
-        const senderId = this.verifyToken(accessToken)
+        const senderId = this.verifyToken(accessToken);
 
         if (!this.users.has(recipientId)) {
-            throw new Error('Recipient not found')
+            throw new Error("Recipient not found");
         }
 
         if (this.messages.has(messageId)) {
-            throw new Error('Message ID already exists')
+            throw new Error("Message ID already exists");
         }
 
         // Use counter to ensure unique timestamps even in rapid succession
-        const createdAt = Date.now() + this.messageCounter++
-        const expiresAt = createdAt + 30 * 24 * 60 * 60 * 1000 // 30 days
+        const createdAt = Date.now() + this.messageCounter++;
+        const expiresAt = createdAt + 30 * 24 * 60 * 60 * 1000; // 30 days
 
         this.messages.set(messageId, {
             id: messageId,
@@ -226,10 +229,10 @@ export class MockServer {
             signature,
             createdAt,
             expiresAt,
-            acknowledged: false
-        })
+            acknowledged: false,
+        });
 
-        return { id: messageId, createdAt, expiresAt }
+        return { id: messageId, createdAt, expiresAt };
     }
 
     /**
@@ -238,53 +241,51 @@ export class MockServer {
     getInbox(
         accessToken: string,
         limit: number = 50,
-        cursor?: string
+        cursor?: string,
     ): { messages: InboxMessage[]; nextCursor: string | null; hasMore: boolean } {
-        const userId = this.verifyToken(accessToken)
+        const userId = this.verifyToken(accessToken);
 
         // Get unacknowledged messages for this user
-        const userMessages: MockMessage[] = []
+        const userMessages: MockMessage[] = [];
         for (const msg of this.messages.values()) {
             if (msg.recipientId === userId && !msg.acknowledged) {
-                userMessages.push(msg)
+                userMessages.push(msg);
             }
         }
 
         // Sort by createdAt ascending
-        userMessages.sort((a, b) => a.createdAt - b.createdAt)
+        userMessages.sort((a, b) => a.createdAt - b.createdAt);
 
         // Apply cursor (skip messages at or before cursor time)
-        let startIndex = 0
+        let startIndex = 0;
         if (cursor) {
-            const cursorTime = parseInt(cursor, 10)
+            const cursorTime = parseInt(cursor, 10);
             // Find first message with createdAt > cursorTime
             for (let i = 0; i < userMessages.length; i++) {
                 if (userMessages[i].createdAt > cursorTime) {
-                    startIndex = i
-                    break
+                    startIndex = i;
+                    break;
                 }
-                startIndex = userMessages.length // No messages after cursor
+                startIndex = userMessages.length; // No messages after cursor
             }
         }
 
-        const sliced = userMessages.slice(startIndex, startIndex + limit)
-        const hasMore = startIndex + sliced.length < userMessages.length
-        const nextCursor = sliced.length > 0
-            ? String(sliced[sliced.length - 1].createdAt)
-            : null
+        const sliced = userMessages.slice(startIndex, startIndex + limit);
+        const hasMore = startIndex + sliced.length < userMessages.length;
+        const nextCursor = sliced.length > 0 ? String(sliced[sliced.length - 1].createdAt) : null;
 
         return {
-            messages: sliced.map(m => ({
+            messages: sliced.map((m) => ({
                 id: m.id,
                 senderId: m.senderId,
                 blob: m.blob,
                 signature: m.signature,
                 createdAt: m.createdAt,
-                expiresAt: m.expiresAt
+                expiresAt: m.expiresAt,
             })),
             nextCursor,
-            hasMore
-        }
+            hasMore,
+        };
     }
 
     /**
@@ -292,44 +293,44 @@ export class MockServer {
      */
     acknowledgeMessages(
         accessToken: string,
-        messageIds: string[]
+        messageIds: string[],
     ): { acknowledged: number; failed: Array<{ messageId: string; error: string }> } {
-        const userId = this.verifyToken(accessToken)
+        const userId = this.verifyToken(accessToken);
 
-        let acknowledged = 0
-        const failed: Array<{ messageId: string; error: string }> = []
+        let acknowledged = 0;
+        const failed: Array<{ messageId: string; error: string }> = [];
 
         for (const messageId of messageIds) {
-            const msg = this.messages.get(messageId)
+            const msg = this.messages.get(messageId);
             if (!msg) {
-                failed.push({ messageId, error: 'Message not found' })
+                failed.push({ messageId, error: "Message not found" });
             } else if (msg.recipientId !== userId) {
-                failed.push({ messageId, error: 'Not your message' })
+                failed.push({ messageId, error: "Not your message" });
             } else {
-                msg.acknowledged = true
-                acknowledged++
+                msg.acknowledged = true;
+                acknowledged++;
             }
         }
 
-        return { acknowledged, failed }
+        return { acknowledged, failed };
     }
 
     /**
      * Get profile by profile public key.
      */
     getProfile(accessToken: string, profilePublicKey: string): ServerProfile {
-        this.verifyToken(accessToken)
+        this.verifyToken(accessToken);
 
-        let matched: MockUser | undefined
+        let matched: MockUser | undefined;
         for (const user of this.users.values()) {
             if (user.profilePublicKey === profilePublicKey) {
-                matched = user
-                break
+                matched = user;
+                break;
             }
         }
 
         if (!matched) {
-            throw new Error('User not found')
+            throw new Error("User not found");
         }
 
         return {
@@ -337,16 +338,16 @@ export class MockServer {
             profilePublicKey: matched.profilePublicKey,
             profileKeySignature: matched.profileKeySignature,
             encryptedProfile: matched.encryptedProfile,
-            profileUpdatedAt: matched.createdAt
-        }
+            profileUpdatedAt: matched.createdAt,
+        };
     }
 
     /**
      * Get own profile.
      */
     getMyProfile(accessToken: string): ServerProfile & { createdAt: number } {
-        const userId = this.verifyToken(accessToken)
-        const user = this.users.get(userId)!
+        const userId = this.verifyToken(accessToken);
+        const user = this.users.get(userId)!;
 
         return {
             id: userId,
@@ -354,8 +355,8 @@ export class MockServer {
             profileKeySignature: user.profileKeySignature,
             encryptedProfile: user.encryptedProfile,
             profileUpdatedAt: user.createdAt,
-            createdAt: user.createdAt
-        }
+            createdAt: user.createdAt,
+        };
     }
 
     /**
@@ -365,14 +366,14 @@ export class MockServer {
         accessToken: string,
         profilePublicKey: string,
         profileKeySignature: string,
-        encryptedProfile: string
+        encryptedProfile: string,
     ): void {
-        const userId = this.verifyToken(accessToken)
-        const user = this.users.get(userId)!
+        const userId = this.verifyToken(accessToken);
+        const user = this.users.get(userId)!;
 
-        user.profilePublicKey = profilePublicKey
-        user.profileKeySignature = profileKeySignature
-        user.encryptedProfile = encryptedProfile
+        user.profilePublicKey = profilePublicKey;
+        user.profileKeySignature = profileKeySignature;
+        user.encryptedProfile = encryptedProfile;
     }
 
     /**
@@ -380,34 +381,34 @@ export class MockServer {
      */
     uploadPreKeys(
         accessToken: string,
-        preKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }>
+        preKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }>,
     ): { uploaded: number } {
-        const userId = this.verifyToken(accessToken)
-        const user = this.users.get(userId)!
+        const userId = this.verifyToken(accessToken);
+        const user = this.users.get(userId)!;
 
         if (!user.preKeyData) {
-            user.preKeyData = { signedPreKey: null, oneTimePreKeys: [] }
+            user.preKeyData = { signedPreKey: null, oneTimePreKeys: [] };
         }
 
-        const now = Date.now()
+        const now = Date.now();
         for (const pk of preKeys) {
             const mockPreKey: MockPreKey = {
                 publicKey: pk.publicKey,
                 signature: pk.signature,
                 oneTime: pk.oneTime,
                 createdAt: now,
-                allocated: false
-            }
+                allocated: false,
+            };
 
             if (pk.oneTime) {
-                user.preKeyData.oneTimePreKeys.push(mockPreKey)
+                user.preKeyData.oneTimePreKeys.push(mockPreKey);
             } else {
                 // Replace signed prekey
-                user.preKeyData.signedPreKey = mockPreKey
+                user.preKeyData.signedPreKey = mockPreKey;
             }
         }
 
-        return { uploaded: preKeys.length }
+        return { uploaded: preKeys.length };
     }
 
     /**
@@ -416,42 +417,42 @@ export class MockServer {
      */
     getPreKeyBundle(
         accessToken: string,
-        identityPublicKey: string
+        identityPublicKey: string,
     ): {
-        identityKey: string
+        identityKey: string;
         signedPreKey: {
-            publicKey: string
-            signature: string
-            createdAt: number
-        }
+            publicKey: string;
+            signature: string;
+            createdAt: number;
+        };
         oneTimePreKey: {
-            publicKey: string
-            signature: string
-        } | null
+            publicKey: string;
+            signature: string;
+        } | null;
     } {
-        this.verifyToken(accessToken)
+        this.verifyToken(accessToken);
 
-        const user = this.users.get(identityPublicKey)
+        const user = this.users.get(identityPublicKey);
         if (!user) {
-            throw new Error('User not found')
+            throw new Error("User not found");
         }
 
         if (!user.preKeyData || !user.preKeyData.signedPreKey) {
-            throw new Error('No prekey bundle available')
+            throw new Error("No prekey bundle available");
         }
 
-        const signedPreKey = user.preKeyData.signedPreKey
-        let oneTimePreKey: { publicKey: string; signature: string } | null = null
+        const signedPreKey = user.preKeyData.signedPreKey;
+        let oneTimePreKey: { publicKey: string; signature: string } | null = null;
 
         // Find and allocate one unallocated one-time prekey
         for (const otpk of user.preKeyData.oneTimePreKeys) {
             if (!otpk.allocated) {
-                otpk.allocated = true
+                otpk.allocated = true;
                 oneTimePreKey = {
                     publicKey: otpk.publicKey,
-                    signature: otpk.signature
-                }
-                break
+                    signature: otpk.signature,
+                };
+                break;
             }
         }
 
@@ -460,49 +461,49 @@ export class MockServer {
             signedPreKey: {
                 publicKey: signedPreKey.publicKey,
                 signature: signedPreKey.signature,
-                createdAt: signedPreKey.createdAt
+                createdAt: signedPreKey.createdAt,
             },
-            oneTimePreKey
-        }
+            oneTimePreKey,
+        };
     }
 
     /**
      * Get unallocated one-time prekey count.
      */
     getOneTimePreKeyCount(accessToken: string): number {
-        const userId = this.verifyToken(accessToken)
-        const user = this.users.get(userId)!
+        const userId = this.verifyToken(accessToken);
+        const user = this.users.get(userId)!;
 
         if (!user.preKeyData) {
-            return 0
+            return 0;
         }
 
-        return user.preKeyData.oneTimePreKeys.filter(pk => !pk.allocated).length
+        return user.preKeyData.oneTimePreKeys.filter((pk) => !pk.allocated).length;
     }
 
     /**
      * Clear all data.
      */
     reset(): void {
-        this.users.clear()
-        this.messages.clear()
-        this.accessTokens.clear()
-        this.tokenCounter = 0
-        this.messageCounter = 0
+        this.users.clear();
+        this.messages.clear();
+        this.accessTokens.clear();
+        this.tokenCounter = 0;
+        this.messageCounter = 0;
     }
 
     /**
      * Get user count (for testing).
      */
     getUserCount(): number {
-        return this.users.size
+        return this.users.size;
     }
 
     /**
      * Get message count (for testing).
      */
     getMessageCount(): number {
-        return this.messages.size
+        return this.messages.size;
     }
 }
 
@@ -510,8 +511,8 @@ export class MockServer {
  * Create a mock API client that uses the mock server.
  */
 export function createMockApi(server: MockServer) {
-    let accessToken: string | null = null
-    let refreshToken: string | null = null
+    let accessToken: string | null = null;
+    let refreshToken: string | null = null;
 
     return {
         async register(
@@ -519,98 +520,103 @@ export function createMockApi(server: MockServer) {
             _identityPrivateKey: Uint8Array,
             profilePublicKey: string,
             profileKeySignature: string,
-            encryptedProfile: string
+            encryptedProfile: string,
         ) {
             const result = server.register(
                 identityPublicKey,
                 profilePublicKey,
                 profileKeySignature,
-                encryptedProfile
-            )
-            accessToken = result.tokens.accessToken
-            refreshToken = result.tokens.refreshToken
-            return result
+                encryptedProfile,
+            );
+            accessToken = result.tokens.accessToken;
+            refreshToken = result.tokens.refreshToken;
+            return result;
         },
 
         async login(identityPublicKey: string, _identityPrivateKey: Uint8Array) {
-            const result = server.login(identityPublicKey)
-            accessToken = result.tokens.accessToken
-            refreshToken = result.tokens.refreshToken
-            return result
+            const result = server.login(identityPublicKey);
+            accessToken = result.tokens.accessToken;
+            refreshToken = result.tokens.refreshToken;
+            return result;
         },
 
         async refresh() {
-            if (!refreshToken) throw new Error('No refresh token')
-            accessToken = server.refresh(refreshToken)
-            return accessToken
+            if (!refreshToken) throw new Error("No refresh token");
+            accessToken = server.refresh(refreshToken);
+            return accessToken;
         },
 
         async deleteAccount() {
-            if (!accessToken) throw new Error('Not authenticated')
-            server.deleteAccount(accessToken)
-            accessToken = null
-            refreshToken = null
+            if (!accessToken) throw new Error("Not authenticated");
+            server.deleteAccount(accessToken);
+            accessToken = null;
+            refreshToken = null;
         },
 
         async sendMessage(recipientId: string, blob: string, messageId: string) {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.sendMessage(accessToken, messageId, recipientId, blob, 'mock-signature')
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.sendMessage(accessToken, messageId, recipientId, blob, "mock-signature");
         },
 
         async getInbox(limit?: number, cursor?: string) {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.getInbox(accessToken, limit, cursor)
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.getInbox(accessToken, limit, cursor);
         },
 
         async acknowledgeMessages(messageIds: string[]) {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.acknowledgeMessages(accessToken, messageIds)
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.acknowledgeMessages(accessToken, messageIds);
         },
 
         async getProfile(profilePublicKey: string) {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.getProfile(accessToken, profilePublicKey)
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.getProfile(accessToken, profilePublicKey);
         },
 
         async getMyProfile() {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.getMyProfile(accessToken)
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.getMyProfile(accessToken);
         },
 
         async updateProfile(
             profilePublicKey: string,
             profileKeySignature: string,
-            encryptedProfile: string
+            encryptedProfile: string,
         ) {
-            if (!accessToken) throw new Error('Not authenticated')
-            server.updateProfile(accessToken, profilePublicKey, profileKeySignature, encryptedProfile)
+            if (!accessToken) throw new Error("Not authenticated");
+            server.updateProfile(
+                accessToken,
+                profilePublicKey,
+                profileKeySignature,
+                encryptedProfile,
+            );
         },
 
         async uploadPreKeys(
-            preKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }>
+            preKeys: Array<{ publicKey: string; signature: string; oneTime: boolean }>,
         ) {
-            if (!accessToken) throw new Error('Not authenticated')
-            server.uploadPreKeys(accessToken, preKeys)
+            if (!accessToken) throw new Error("Not authenticated");
+            server.uploadPreKeys(accessToken, preKeys);
         },
 
         async getPreKeyBundle(identityPublicKey: string) {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.getPreKeyBundle(accessToken, identityPublicKey)
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.getPreKeyBundle(accessToken, identityPublicKey);
         },
 
         async getOneTimePreKeyCount() {
-            if (!accessToken) throw new Error('Not authenticated')
-            return server.getOneTimePreKeyCount(accessToken)
+            if (!accessToken) throw new Error("Not authenticated");
+            return server.getOneTimePreKeyCount(accessToken);
         },
 
         getTokens() {
-            if (!accessToken || !refreshToken) return null
-            return { accessToken, refreshToken }
+            if (!accessToken || !refreshToken) return null;
+            return { accessToken, refreshToken };
         },
 
         setCredentials(_key: Uint8Array, at: string, rt: string) {
-            accessToken = at
-            refreshToken = rt
-        }
-    }
+            accessToken = at;
+            refreshToken = rt;
+        },
+    };
 }

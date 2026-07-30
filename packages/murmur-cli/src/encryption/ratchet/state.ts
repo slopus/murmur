@@ -6,13 +6,9 @@
  * messages to maintain cryptographic continuity.
  */
 
-import { generateDH, publicKeyFromPrivate, type DHKeyPair } from '../crypto/dh.js'
-import { encodeBase64, decodeBase64 } from '../crypto/utils.js'
-import type {
-    RatchetState,
-    SerializedRatchetState,
-    SkippedMessageKeys
-} from './types.js'
+import { generateDH, publicKeyFromPrivate, type DHKeyPair } from "../crypto/dh.js";
+import { encodeBase64, decodeBase64 } from "../crypto/utils.js";
+import type { RatchetState, SerializedRatchetState, SkippedMessageKeys } from "./types.js";
 
 /**
  * Create a string key for the skipped message keys map.
@@ -25,7 +21,7 @@ import type {
  * @returns String key for Map
  */
 export function makeSkippedKeyIndex(publicKey: Uint8Array, messageNumber: number): string {
-    return `${encodeBase64(publicKey)}:${messageNumber}`
+    return `${encodeBase64(publicKey)}:${messageNumber}`;
 }
 
 /**
@@ -34,20 +30,23 @@ export function makeSkippedKeyIndex(publicKey: Uint8Array, messageNumber: number
  * @param key - String key from skipped message keys map
  * @returns Object with publicKey and messageNumber
  */
-export function parseSkippedKeyIndex(key: string): { publicKey: Uint8Array; messageNumber: number } {
-    const separatorIndex = key.lastIndexOf(':')
+export function parseSkippedKeyIndex(key: string): {
+    publicKey: Uint8Array;
+    messageNumber: number;
+} {
+    const separatorIndex = key.lastIndexOf(":");
     if (separatorIndex === -1) {
-        throw new Error(`Invalid skipped key index: ${key}`)
+        throw new Error(`Invalid skipped key index: ${key}`);
     }
-    const publicKeyBase64 = key.substring(0, separatorIndex)
-    const messageNumber = parseInt(key.substring(separatorIndex + 1), 10)
+    const publicKeyBase64 = key.substring(0, separatorIndex);
+    const messageNumber = parseInt(key.substring(separatorIndex + 1), 10);
     if (isNaN(messageNumber)) {
-        throw new Error(`Invalid message number in skipped key index: ${key}`)
+        throw new Error(`Invalid message number in skipped key index: ${key}`);
     }
     return {
         publicKey: decodeBase64(publicKeyBase64),
-        messageNumber
-    }
+        messageNumber,
+    };
 }
 
 /**
@@ -80,10 +79,11 @@ export function serializeState(state: RatchetState): SerializedRatchetState {
         sendingMessageNumber: state.sendingMessageNumber,
         receivingMessageNumber: state.receivingMessageNumber,
         previousSendingChainLength: state.previousSendingChainLength,
-        skippedMessageKeys: Array.from(state.skippedMessageKeys.entries()).map(
-            ([k, v]) => [k, encodeBase64(v)]
-        )
-    }
+        skippedMessageKeys: Array.from(state.skippedMessageKeys.entries()).map(([k, v]) => [
+            k,
+            encodeBase64(v),
+        ]),
+    };
 }
 
 /**
@@ -105,24 +105,28 @@ export function serializeState(state: RatchetState): SerializedRatchetState {
 export function deserializeState(serialized: SerializedRatchetState): RatchetState {
     const dhSelf: DHKeyPair = {
         privateKey: decodeBase64(serialized.dhSelfPrivateKey),
-        publicKey: decodeBase64(serialized.dhSelfPublicKey)
-    }
+        publicKey: decodeBase64(serialized.dhSelfPublicKey),
+    };
 
     const skippedMessageKeys: SkippedMessageKeys = new Map(
-        serialized.skippedMessageKeys.map(([k, v]) => [k, decodeBase64(v)])
-    )
+        serialized.skippedMessageKeys.map(([k, v]) => [k, decodeBase64(v)]),
+    );
 
     return {
         dhSelf,
         dhRemote: serialized.dhRemote ? decodeBase64(serialized.dhRemote) : null,
         rootKey: decodeBase64(serialized.rootKey),
-        sendingChainKey: serialized.sendingChainKey ? decodeBase64(serialized.sendingChainKey) : null,
-        receivingChainKey: serialized.receivingChainKey ? decodeBase64(serialized.receivingChainKey) : null,
+        sendingChainKey: serialized.sendingChainKey
+            ? decodeBase64(serialized.sendingChainKey)
+            : null,
+        receivingChainKey: serialized.receivingChainKey
+            ? decodeBase64(serialized.receivingChainKey)
+            : null,
         sendingMessageNumber: serialized.sendingMessageNumber,
         receivingMessageNumber: serialized.receivingMessageNumber,
         previousSendingChainLength: serialized.previousSendingChainLength,
-        skippedMessageKeys
-    }
+        skippedMessageKeys,
+    };
 }
 
 /**
@@ -135,10 +139,7 @@ export function deserializeState(serialized: SerializedRatchetState): RatchetSta
  * @param dhKeyPair - Optional DH key pair (generates new one if not provided)
  * @returns Uninitialized RatchetState
  */
-export function createEmptyState(
-    rootKey: Uint8Array,
-    dhKeyPair?: DHKeyPair
-): RatchetState {
+export function createEmptyState(rootKey: Uint8Array, dhKeyPair?: DHKeyPair): RatchetState {
     return {
         dhSelf: dhKeyPair ?? generateDH(),
         dhRemote: null,
@@ -148,8 +149,8 @@ export function createEmptyState(
         sendingMessageNumber: 0,
         receivingMessageNumber: 0,
         previousSendingChainLength: 0,
-        skippedMessageKeys: new Map()
-    }
+        skippedMessageKeys: new Map(),
+    };
 }
 
 /**
@@ -164,7 +165,7 @@ export function cloneState(state: RatchetState): RatchetState {
     return {
         dhSelf: {
             privateKey: new Uint8Array(state.dhSelf.privateKey),
-            publicKey: new Uint8Array(state.dhSelf.publicKey)
+            publicKey: new Uint8Array(state.dhSelf.publicKey),
         },
         dhRemote: state.dhRemote ? new Uint8Array(state.dhRemote) : null,
         rootKey: new Uint8Array(state.rootKey),
@@ -174,9 +175,7 @@ export function cloneState(state: RatchetState): RatchetState {
         receivingMessageNumber: state.receivingMessageNumber,
         previousSendingChainLength: state.previousSendingChainLength,
         skippedMessageKeys: new Map(
-            Array.from(state.skippedMessageKeys.entries()).map(
-                ([k, v]) => [k, new Uint8Array(v)]
-            )
-        )
-    }
+            Array.from(state.skippedMessageKeys.entries()).map(([k, v]) => [k, new Uint8Array(v)]),
+        ),
+    };
 }

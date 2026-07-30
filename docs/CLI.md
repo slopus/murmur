@@ -70,12 +70,12 @@ temp folder containing:
 
 ```json
 {
-  "text": "Hello",
-  "out": true,
-  "id": "cuid2",
-  "from": "<profile-id>",
-  "to": "<profile-id>",
-  "attachments": ["file.txt"]
+    "text": "Hello",
+    "out": true,
+    "id": "cuid2",
+    "from": "<profile-id>",
+    "to": "<profile-id>",
+    "attachments": ["file.txt"]
 }
 ```
 

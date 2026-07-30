@@ -18,4 +18,4 @@
  */
 
 // Re-export all encryption modules
-export * from './encryption/index.js'
+export * from "./encryption/index.js";

@@ -1,17 +1,23 @@
-import { z } from 'zod';
-import type { Fastify } from '@/types';
-import { db } from '@/db';
-import { getAuthUserId } from '@/api/auth';
-import { normalizePublicKey, publicKeyToExternal, verifySignature } from '@/utils/crypto';
-import { events } from '@/events';
-import { sseManager, SSEConnection } from '@/api/sse';
-import { rateLimitConfigs } from '@/api/rateLimit';
-import { messagesSentTotal, messagesDeliveredTotal, messagesAcknowledgedTotal, messageSize, sseActiveConnections } from '@/metrics/prometheus';
-import { validateMessageData } from '@/api/validation';
+import { z } from "zod";
+import type { Fastify } from "@/types";
+import { db } from "@/db";
+import { getAuthUserId } from "@/api/auth";
+import { normalizePublicKey, publicKeyToExternal, verifySignature } from "@/utils/crypto";
+import { events } from "@/events";
+import { sseManager, SSEConnection } from "@/api/sse";
+import { rateLimitConfigs } from "@/api/rateLimit";
+import {
+    messagesSentTotal,
+    messagesDeliveredTotal,
+    messagesAcknowledgedTotal,
+    messageSize,
+    sseActiveConnections,
+} from "@/metrics/prometheus";
+import { validateMessageData } from "@/api/validation";
 
 // Dynamic import for cuid2
 async function validateCuid(id: string): Promise<boolean> {
-    const { isCuid } = await import('@paralleldrive/cuid2');
+    const { isCuid } = await import("@paralleldrive/cuid2");
     return isCuid(id);
 }
 
@@ -31,308 +37,337 @@ const AckMessagesSchema = z.object({
  */
 export async function messageRoutes(app: Fastify) {
     // Send a message
-    app.post('/v1/messages/send', {
-        schema: {
-            body: SendMessageSchema,
-        },
-        config: {
-            rateLimit: rateLimitConfigs.messageSend,
-        },
-    }, async (request, reply) => {
-        const senderId = getAuthUserId(request);
-        const { messageId, recipientId, blob, signature } = request.body;
-        let normalizedRecipientId: string;
-
-        // Validate size limits
-        try {
-            validateMessageData({ messageId, blob, signature, recipientId });
-        } catch (error: any) {
-            messagesSentTotal.inc({ status: 'size_limit_exceeded' });
-            return reply.status(400).send({ error: error.message });
-        }
-
-        // Normalize recipient public key
-        try {
-            normalizedRecipientId = normalizePublicKey(recipientId);
-        } catch (error: any) {
-            messagesSentTotal.inc({ status: 'invalid_recipient_key' });
-            return reply.status(400).send({ error: 'Invalid recipient public key format' });
-        }
-
-        // Validate message ID is a valid cuid2
-        const isValidCuid = await validateCuid(messageId);
-        if (!isValidCuid) {
-            messagesSentTotal.inc({ status: 'invalid_message_id' });
-            return reply.status(400).send({ error: 'Invalid message ID format (must be cuid2)' });
-        }
-
-        // Check if message ID already exists (repeat protection)
-        const existingMessage = await db.message.findUnique({
-            where: { id: messageId },
-        });
-
-        if (existingMessage) {
-            messagesSentTotal.inc({ status: 'duplicate_message_id' });
-            return reply.status(409).send({ error: 'Message ID already exists (duplicate message)' });
-        }
-
-        // Check if recipient exists
-        const recipient = await db.user.findUnique({
-            where: { id: normalizedRecipientId },
-        });
-
-        if (!recipient) {
-            messagesSentTotal.inc({ status: 'recipient_not_found' });
-            return reply.status(404).send({ error: 'Recipient not found' });
-        }
-
-        // Parse base64 to binary
-        const blobBuffer = Buffer.from(blob, 'base64');
-        const signatureBuffer = Buffer.from(signature, 'base64');
-
-        // Verify signature (blob bytes + messageId bytes concatenated, signed by sender's identity key)
-        const messageIdBytes = new TextEncoder().encode(messageId);
-        const messageToSign = new Uint8Array(blobBuffer.length + messageIdBytes.length);
-        messageToSign.set(blobBuffer, 0);
-        messageToSign.set(messageIdBytes, blobBuffer.length);
-
-        if (!verifySignature(messageToSign, signature, senderId)) {
-            messagesSentTotal.inc({ status: 'invalid_signature' });
-            return reply.status(400).send({ error: 'Invalid message signature' });
-        }
-
-        // Calculate expiration (30 days from now)
-        const expiresAt = new Date();
-        expiresAt.setDate(expiresAt.getDate() + 30);
-
-        // Create message with provided ID
-        const message = await db.message.create({
-            data: {
-                id: messageId,
-                senderId,
-                recipientId: normalizedRecipientId,
-                blob: blobBuffer,
-                signature: signatureBuffer,
-                expiresAt,
+    app.post(
+        "/v1/messages/send",
+        {
+            schema: {
+                body: SendMessageSchema,
             },
-        });
-
-        // Track message size and count
-        messageSize.observe(blobBuffer.length);
-        messagesSentTotal.inc({ status: 'success' });
-
-        // Publish message event to notify recipient
-        await events.publishUser(normalizedRecipientId, {
-            type: 'message:new',
-            messageId: message.id,
-        });
-
-        return reply.send({
-            success: true,
-            message: {
-                id: message.id,
-                createdAt: message.createdAt.getTime(),
-                expiresAt: message.expiresAt.getTime(),
+            config: {
+                rateLimit: rateLimitConfigs.messageSend,
             },
-        });
-    });
+        },
+        async (request, reply) => {
+            const senderId = getAuthUserId(request);
+            const { messageId, recipientId, blob, signature } = request.body;
+            let normalizedRecipientId: string;
+
+            // Validate size limits
+            try {
+                validateMessageData({ messageId, blob, signature, recipientId });
+            } catch (error: any) {
+                messagesSentTotal.inc({ status: "size_limit_exceeded" });
+                return reply.status(400).send({ error: error.message });
+            }
+
+            // Normalize recipient public key
+            try {
+                normalizedRecipientId = normalizePublicKey(recipientId);
+            } catch (error: any) {
+                messagesSentTotal.inc({ status: "invalid_recipient_key" });
+                return reply.status(400).send({ error: "Invalid recipient public key format" });
+            }
+
+            // Validate message ID is a valid cuid2
+            const isValidCuid = await validateCuid(messageId);
+            if (!isValidCuid) {
+                messagesSentTotal.inc({ status: "invalid_message_id" });
+                return reply
+                    .status(400)
+                    .send({ error: "Invalid message ID format (must be cuid2)" });
+            }
+
+            // Check if message ID already exists (repeat protection)
+            const existingMessage = await db.message.findUnique({
+                where: { id: messageId },
+            });
+
+            if (existingMessage) {
+                messagesSentTotal.inc({ status: "duplicate_message_id" });
+                return reply
+                    .status(409)
+                    .send({ error: "Message ID already exists (duplicate message)" });
+            }
+
+            // Check if recipient exists
+            const recipient = await db.user.findUnique({
+                where: { id: normalizedRecipientId },
+            });
+
+            if (!recipient) {
+                messagesSentTotal.inc({ status: "recipient_not_found" });
+                return reply.status(404).send({ error: "Recipient not found" });
+            }
+
+            // Parse base64 to binary
+            const blobBuffer = Buffer.from(blob, "base64");
+            const signatureBuffer = Buffer.from(signature, "base64");
+
+            // Verify signature (blob bytes + messageId bytes concatenated, signed by sender's identity key)
+            const messageIdBytes = new TextEncoder().encode(messageId);
+            const messageToSign = new Uint8Array(blobBuffer.length + messageIdBytes.length);
+            messageToSign.set(blobBuffer, 0);
+            messageToSign.set(messageIdBytes, blobBuffer.length);
+
+            if (!verifySignature(messageToSign, signature, senderId)) {
+                messagesSentTotal.inc({ status: "invalid_signature" });
+                return reply.status(400).send({ error: "Invalid message signature" });
+            }
+
+            // Calculate expiration (30 days from now)
+            const expiresAt = new Date();
+            expiresAt.setDate(expiresAt.getDate() + 30);
+
+            // Create message with provided ID
+            const message = await db.message.create({
+                data: {
+                    id: messageId,
+                    senderId,
+                    recipientId: normalizedRecipientId,
+                    blob: blobBuffer,
+                    signature: signatureBuffer,
+                    expiresAt,
+                },
+            });
+
+            // Track message size and count
+            messageSize.observe(blobBuffer.length);
+            messagesSentTotal.inc({ status: "success" });
+
+            // Publish message event to notify recipient
+            await events.publishUser(normalizedRecipientId, {
+                type: "message:new",
+                messageId: message.id,
+            });
+
+            return reply.send({
+                success: true,
+                message: {
+                    id: message.id,
+                    createdAt: message.createdAt.getTime(),
+                    expiresAt: message.expiresAt.getTime(),
+                },
+            });
+        },
+    );
 
     // Get pending messages with cursor-based pagination
-    app.get('/v1/messages/inbox', {
-        schema: {
-            querystring: z.object({
-                limit: z.string().optional().transform(val => {
-                    const parsed = val ? parseInt(val) : 50;
-                    return Math.min(parsed, 100); // Cap at 100
+    app.get(
+        "/v1/messages/inbox",
+        {
+            schema: {
+                querystring: z.object({
+                    limit: z
+                        .string()
+                        .optional()
+                        .transform((val) => {
+                            const parsed = val ? parseInt(val) : 50;
+                            return Math.min(parsed, 100); // Cap at 100
+                        }),
+                    cursor: z.string().optional(),
                 }),
-                cursor: z.string().optional(),
-            }),
+            },
+            config: {
+                rateLimit: rateLimitConfigs.messageFetch,
+            },
         },
-        config: {
-            rateLimit: rateLimitConfigs.messageFetch,
-        },
-    }, async (request, reply) => {
-        const userId = getAuthUserId(request);
-        const { limit, cursor } = request.query;
+        async (request, reply) => {
+            const userId = getAuthUserId(request);
+            const { limit, cursor } = request.query;
 
-        // Decode cursor (base64-encoded timestamp)
-        let cursorDate: Date | undefined;
-        if (cursor) {
-            try {
-                const decodedTimestamp = parseInt(Buffer.from(cursor, 'base64').toString('utf-8'));
-                cursorDate = new Date(decodedTimestamp);
-            } catch (error) {
-                return reply.status(400).send({ error: 'Invalid cursor' });
+            // Decode cursor (base64-encoded timestamp)
+            let cursorDate: Date | undefined;
+            if (cursor) {
+                try {
+                    const decodedTimestamp = parseInt(
+                        Buffer.from(cursor, "base64").toString("utf-8"),
+                    );
+                    cursorDate = new Date(decodedTimestamp);
+                } catch (error) {
+                    return reply.status(400).send({ error: "Invalid cursor" });
+                }
             }
-        }
 
-        // Fetch messages (oldest first)
-        const messages = await db.message.findMany({
-            where: {
-                recipientId: userId,
-                expiresAt: {
-                    gt: new Date(), // Only non-expired messages
-                },
-                ...(cursorDate ? {
-                    createdAt: {
-                        gt: cursorDate, // Messages after cursor
+            // Fetch messages (oldest first)
+            const messages = await db.message.findMany({
+                where: {
+                    recipientId: userId,
+                    expiresAt: {
+                        gt: new Date(), // Only non-expired messages
                     },
-                } : {}),
-            },
-            orderBy: {
-                createdAt: 'asc', // Oldest first
-            },
-            take: limit + 1, // Fetch one extra to check if there are more
-            select: {
-                id: true,
-                senderId: true,
-                blob: true,
-                signature: true,
-                createdAt: true,
-                expiresAt: true,
-            },
-        });
+                    ...(cursorDate
+                        ? {
+                              createdAt: {
+                                  gt: cursorDate, // Messages after cursor
+                              },
+                          }
+                        : {}),
+                },
+                orderBy: {
+                    createdAt: "asc", // Oldest first
+                },
+                take: limit + 1, // Fetch one extra to check if there are more
+                select: {
+                    id: true,
+                    senderId: true,
+                    blob: true,
+                    signature: true,
+                    createdAt: true,
+                    expiresAt: true,
+                },
+            });
 
-        // Check if there are more messages
-        const hasMore = messages.length > limit;
-        const returnMessages = hasMore ? messages.slice(0, limit) : messages;
+            // Check if there are more messages
+            const hasMore = messages.length > limit;
+            const returnMessages = hasMore ? messages.slice(0, limit) : messages;
 
-        // Generate next cursor from last message
-        let nextCursor: string | null = null;
-        if (hasMore && returnMessages.length > 0) {
-            const lastMessage = returnMessages[returnMessages.length - 1];
-            nextCursor = Buffer.from(lastMessage.createdAt.getTime().toString()).toString('base64');
-        }
+            // Generate next cursor from last message
+            let nextCursor: string | null = null;
+            if (hasMore && returnMessages.length > 0) {
+                const lastMessage = returnMessages[returnMessages.length - 1];
+                nextCursor = Buffer.from(lastMessage.createdAt.getTime().toString()).toString(
+                    "base64",
+                );
+            }
 
-        // Convert to Unix timestamps and encode binary to base64
-        const formattedMessages = returnMessages.map(m => ({
-            id: m.id,
-            senderId: publicKeyToExternal(m.senderId),
-            blob: Buffer.from(m.blob).toString('base64'),
-            signature: Buffer.from(m.signature).toString('base64'),
-            createdAt: m.createdAt.getTime(),
-            expiresAt: m.expiresAt.getTime(),
-        }));
+            // Convert to Unix timestamps and encode binary to base64
+            const formattedMessages = returnMessages.map((m) => ({
+                id: m.id,
+                senderId: publicKeyToExternal(m.senderId),
+                blob: Buffer.from(m.blob).toString("base64"),
+                signature: Buffer.from(m.signature).toString("base64"),
+                createdAt: m.createdAt.getTime(),
+                expiresAt: m.expiresAt.getTime(),
+            }));
 
-        return reply.send({
-            messages: formattedMessages,
-            nextCursor,
-            hasMore,
-        });
-    });
+            return reply.send({
+                messages: formattedMessages,
+                nextCursor,
+                hasMore,
+            });
+        },
+    );
 
     // Get a specific message by ID
-    app.get('/v1/messages/:messageId', {
-        schema: {
-            params: z.object({
-                messageId: z.string(),
-            }),
-        },
-        config: {
-            rateLimit: rateLimitConfigs.messageFetch,
-        },
-    }, async (request, reply) => {
-        const userId = getAuthUserId(request);
-        const { messageId } = request.params;
-
-        const message = await db.message.findUnique({
-            where: { id: messageId },
-            select: {
-                id: true,
-                senderId: true,
-                recipientId: true,
-                blob: true,
-                signature: true,
-                createdAt: true,
-                expiresAt: true,
-                deliveredAt: true,
+    app.get(
+        "/v1/messages/:messageId",
+        {
+            schema: {
+                params: z.object({
+                    messageId: z.string(),
+                }),
             },
-        });
+            config: {
+                rateLimit: rateLimitConfigs.messageFetch,
+            },
+        },
+        async (request, reply) => {
+            const userId = getAuthUserId(request);
+            const { messageId } = request.params;
 
-        if (!message) {
-            return reply.status(404).send({ error: 'Message not found' });
-        }
-
-        // Ensure user is the recipient
-        if (message.recipientId !== userId) {
-            return reply.status(403).send({ error: 'Not authorized to view this message' });
-        }
-
-        // Mark as delivered if not already
-        if (!message.deliveredAt) {
-            await db.message.update({
+            const message = await db.message.findUnique({
                 where: { id: messageId },
-                data: { deliveredAt: new Date() },
+                select: {
+                    id: true,
+                    senderId: true,
+                    recipientId: true,
+                    blob: true,
+                    signature: true,
+                    createdAt: true,
+                    expiresAt: true,
+                    deliveredAt: true,
+                },
             });
-            messagesDeliveredTotal.inc();
-        }
 
-        return reply.send({
-            id: message.id,
-            senderId: publicKeyToExternal(message.senderId),
-            blob: Buffer.from(message.blob).toString('base64'),
-            signature: Buffer.from(message.signature).toString('base64'),
-            createdAt: message.createdAt.getTime(),
-            expiresAt: message.expiresAt.getTime(),
-        });
-    });
+            if (!message) {
+                return reply.status(404).send({ error: "Message not found" });
+            }
+
+            // Ensure user is the recipient
+            if (message.recipientId !== userId) {
+                return reply.status(403).send({ error: "Not authorized to view this message" });
+            }
+
+            // Mark as delivered if not already
+            if (!message.deliveredAt) {
+                await db.message.update({
+                    where: { id: messageId },
+                    data: { deliveredAt: new Date() },
+                });
+                messagesDeliveredTotal.inc();
+            }
+
+            return reply.send({
+                id: message.id,
+                senderId: publicKeyToExternal(message.senderId),
+                blob: Buffer.from(message.blob).toString("base64"),
+                signature: Buffer.from(message.signature).toString("base64"),
+                createdAt: message.createdAt.getTime(),
+                expiresAt: message.expiresAt.getTime(),
+            });
+        },
+    );
 
     // Acknowledge (delete) messages in batch
-    app.post('/v1/messages/ack', {
-        schema: {
-            body: AckMessagesSchema,
+    app.post(
+        "/v1/messages/ack",
+        {
+            schema: {
+                body: AckMessagesSchema,
+            },
+            config: {
+                rateLimit: rateLimitConfigs.messageFetch,
+            },
         },
-        config: {
-            rateLimit: rateLimitConfigs.messageFetch,
-        },
-    }, async (request, reply) => {
-        const userId = getAuthUserId(request);
-        const { messageIds } = request.body;
+        async (request, reply) => {
+            const userId = getAuthUserId(request);
+            const { messageIds } = request.body;
 
-        const failed: Array<{ messageId: string; error: string }> = [];
-        let acknowledged = 0;
+            const failed: Array<{ messageId: string; error: string }> = [];
+            let acknowledged = 0;
 
-        // Process each message
-        for (const messageId of messageIds) {
-            try {
-                const message = await db.message.findUnique({
-                    where: { id: messageId },
-                });
+            // Process each message
+            for (const messageId of messageIds) {
+                try {
+                    const message = await db.message.findUnique({
+                        where: { id: messageId },
+                    });
 
-                if (!message) {
-                    failed.push({ messageId, error: 'Message not found' });
-                    continue;
+                    if (!message) {
+                        failed.push({ messageId, error: "Message not found" });
+                        continue;
+                    }
+
+                    if (message.recipientId !== userId) {
+                        failed.push({ messageId, error: "Not authorized" });
+                        continue;
+                    }
+
+                    // Delete the message
+                    await db.message.delete({
+                        where: { id: messageId },
+                    });
+
+                    acknowledged++;
+                    messagesAcknowledgedTotal.inc();
+                } catch (error) {
+                    failed.push({ messageId, error: "Failed to acknowledge" });
                 }
-
-                if (message.recipientId !== userId) {
-                    failed.push({ messageId, error: 'Not authorized' });
-                    continue;
-                }
-
-                // Delete the message
-                await db.message.delete({
-                    where: { id: messageId },
-                });
-
-                acknowledged++;
-                messagesAcknowledgedTotal.inc();
-            } catch (error) {
-                failed.push({ messageId, error: 'Failed to acknowledge' });
             }
-        }
 
-        // Return 207 Multi-Status if there are failures, otherwise 200
-        const statusCode = failed.length > 0 ? 207 : 200;
+            // Return 207 Multi-Status if there are failures, otherwise 200
+            const statusCode = failed.length > 0 ? 207 : 200;
 
-        return reply.status(statusCode).send({
-            success: true,
-            acknowledged,
-            failed,
-        });
-    });
+            return reply.status(statusCode).send({
+                success: true,
+                acknowledged,
+                failed,
+            });
+        },
+    );
 
     // SSE stream for new messages
-    app.get('/v1/messages/stream', async (request, reply) => {
+    app.get("/v1/messages/stream", async (request, reply) => {
         const userId = getAuthUserId(request);
 
         // Get all undelivered message IDs
@@ -348,7 +383,7 @@ export async function messageRoutes(app: Fastify) {
                 id: true,
             },
             orderBy: {
-                createdAt: 'asc', // Oldest first
+                createdAt: "asc", // Oldest first
             },
         });
 
@@ -357,14 +392,14 @@ export async function messageRoutes(app: Fastify) {
         sseActiveConnections.inc();
 
         // Send initial connected event
-        connection.send('connected', {
+        connection.send("connected", {
             userId: publicKeyToExternal(userId),
             timestamp: Date.now(),
         });
 
         // Send all undelivered messages as message events
         for (const message of undeliveredMessages) {
-            connection.send('message:new', {
+            connection.send("message:new", {
                 messageId: message.id,
             });
         }
@@ -379,7 +414,7 @@ export async function messageRoutes(app: Fastify) {
         }, 30000);
 
         // Clean up on disconnect
-        request.raw.on('close', () => {
+        request.raw.on("close", () => {
             clearInterval(heartbeatInterval);
             connection.close();
             sseActiveConnections.dec();

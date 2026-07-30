@@ -5,24 +5,24 @@
  * The profile key is derived from a secret that only the owner knows.
  */
 
-import { chacha20poly1305 } from '@noble/ciphers/chacha'
-import { generateDH, publicKeyFromPrivate, type DHKeyPair } from '../encryption/crypto/dh.js'
-import { generateSigningKeyPair, sign, verify } from '../encryption/crypto/signing.js'
+import { chacha20poly1305 } from "@noble/ciphers/chacha";
+import { generateDH, publicKeyFromPrivate, type DHKeyPair } from "../encryption/crypto/dh.js";
+import { generateSigningKeyPair, sign, verify } from "../encryption/crypto/signing.js";
 import {
     encodeBase64,
     decodeBase64,
     stringToBytes,
     bytesToString,
-    getRandomBytes
-} from '../encryption/crypto/utils.js'
-import { hkdfExpand } from '../encryption/crypto/kdf.js'
+    getRandomBytes,
+} from "../encryption/crypto/utils.js";
+import { hkdfExpand } from "../encryption/crypto/kdf.js";
 
 /**
  * Profile data structure.
  */
 export interface Profile {
-    firstName: string
-    lastName?: string
+    firstName: string;
+    lastName?: string;
 }
 
 /**
@@ -30,50 +30,50 @@ export interface Profile {
  * The private key is used to decrypt, public key is used to fetch from server.
  */
 export function generateProfileKeyPair(): DHKeyPair {
-    return generateDH()
+    return generateDH();
 }
 
 /**
  * Derive encryption key from profile secret key.
  */
 function deriveProfileEncryptionKey(profileSecretKey: Uint8Array): Uint8Array {
-    return hkdfExpand(profileSecretKey, undefined, 'murmur-profile-encryption', 32)
+    return hkdfExpand(profileSecretKey, undefined, "murmur-profile-encryption", 32);
 }
 
 /**
  * Encrypt a profile with the profile secret key.
  */
 export function encryptProfile(profile: Profile, profileSecretKey: Uint8Array): string {
-    const plaintext = stringToBytes(JSON.stringify(profile))
-    const key = deriveProfileEncryptionKey(profileSecretKey)
-    const nonce = getRandomBytes(12)
+    const plaintext = stringToBytes(JSON.stringify(profile));
+    const key = deriveProfileEncryptionKey(profileSecretKey);
+    const nonce = getRandomBytes(12);
 
     // Use chacha20poly1305 directly with explicit nonce
-    const cipher = chacha20poly1305(key, nonce)
-    const ciphertext = cipher.encrypt(plaintext)
+    const cipher = chacha20poly1305(key, nonce);
+    const ciphertext = cipher.encrypt(plaintext);
 
     // Combine nonce + ciphertext (ciphertext includes auth tag)
-    const combined = new Uint8Array(nonce.length + ciphertext.length)
-    combined.set(nonce)
-    combined.set(ciphertext, nonce.length)
+    const combined = new Uint8Array(nonce.length + ciphertext.length);
+    combined.set(nonce);
+    combined.set(ciphertext, nonce.length);
 
-    return encodeBase64(combined)
+    return encodeBase64(combined);
 }
 
 /**
  * Decrypt a profile with the profile secret key.
  */
 export function decryptProfile(encryptedProfile: string, profileSecretKey: Uint8Array): Profile {
-    const combined = decodeBase64(encryptedProfile)
-    const nonce = combined.slice(0, 12)
-    const ciphertext = combined.slice(12)
-    const key = deriveProfileEncryptionKey(profileSecretKey)
+    const combined = decodeBase64(encryptedProfile);
+    const nonce = combined.slice(0, 12);
+    const ciphertext = combined.slice(12);
+    const key = deriveProfileEncryptionKey(profileSecretKey);
 
     // Use chacha20poly1305 directly with explicit nonce
-    const cipher = chacha20poly1305(key, nonce)
-    const plaintext = cipher.decrypt(ciphertext)
+    const cipher = chacha20poly1305(key, nonce);
+    const plaintext = cipher.decrypt(ciphertext);
 
-    return JSON.parse(bytesToString(plaintext))
+    return JSON.parse(bytesToString(plaintext));
 }
 
 /**
@@ -83,11 +83,11 @@ export function decryptProfile(encryptedProfile: string, profileSecretKey: Uint8
  */
 export function signProfileKey(
     profilePublicKey: Uint8Array,
-    identityPrivateKey: Uint8Array
+    identityPrivateKey: Uint8Array,
 ): string {
     // Sign the raw bytes of the profile public key
-    const signature = sign(profilePublicKey, identityPrivateKey)
-    return encodeBase64(signature)
+    const signature = sign(profilePublicKey, identityPrivateKey);
+    return encodeBase64(signature);
 }
 
 /**
@@ -97,10 +97,10 @@ export function signProfileKey(
 export function verifyProfileKeySignature(
     profilePublicKey: Uint8Array,
     signature: string,
-    identityPublicKey: Uint8Array
+    identityPublicKey: Uint8Array,
 ): boolean {
     // Verify against raw bytes, matching signProfileKey
-    return verify(profilePublicKey, decodeBase64(signature), identityPublicKey)
+    return verify(profilePublicKey, decodeBase64(signature), identityPublicKey);
 }
 
 /**
@@ -108,25 +108,25 @@ export function verifyProfileKeySignature(
  */
 export function createProfileForRegistration(
     profile: Profile,
-    identityPrivateKey: Uint8Array
+    identityPrivateKey: Uint8Array,
 ): {
-    profileKeyPair: DHKeyPair
-    profilePublicKey: string
-    profileSecretKey: string
-    profileKeySignature: string
-    encryptedProfile: string
+    profileKeyPair: DHKeyPair;
+    profilePublicKey: string;
+    profileSecretKey: string;
+    profileKeySignature: string;
+    encryptedProfile: string;
 } {
-    const profileKeyPair = generateProfileKeyPair()
-    const profilePublicKey = encodeBase64(profileKeyPair.publicKey)
-    const profileSecretKey = encodeBase64(profileKeyPair.privateKey, 'base64url')
-    const profileKeySignature = signProfileKey(profileKeyPair.publicKey, identityPrivateKey)
-    const encryptedProfile = encryptProfile(profile, profileKeyPair.privateKey)
+    const profileKeyPair = generateProfileKeyPair();
+    const profilePublicKey = encodeBase64(profileKeyPair.publicKey);
+    const profileSecretKey = encodeBase64(profileKeyPair.privateKey, "base64url");
+    const profileKeySignature = signProfileKey(profileKeyPair.publicKey, identityPrivateKey);
+    const encryptedProfile = encryptProfile(profile, profileKeyPair.privateKey);
 
     return {
         profileKeyPair,
         profilePublicKey,
         profileSecretKey,
         profileKeySignature,
-        encryptedProfile
-    }
+        encryptedProfile,
+    };
 }

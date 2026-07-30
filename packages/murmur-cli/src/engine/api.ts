@@ -5,132 +5,132 @@
  * https://murmur.cluster-fluster.com
  */
 
-import {
-    encodeBase64,
-    decodeBase64,
-    stringToBytes
-} from '../encryption/crypto/utils.js'
-import { sign } from '../encryption/crypto/signing.js'
-import { logger } from '../logger.js'
+import { encodeBase64, decodeBase64, stringToBytes } from "../encryption/crypto/utils.js";
+import { sign } from "../encryption/crypto/signing.js";
+import { logger } from "../logger.js";
 
 /** Base URL for the Murmur server */
-const API_BASE = 'https://murmur.cluster-fluster.com'
-const MESSAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000
+const API_BASE = "https://murmur.cluster-fluster.com";
+const MESSAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
 function isDuplicateMessageIdError(error: unknown): boolean {
     if (!(error instanceof Error)) {
-        return false
+        return false;
     }
-    const message = error.message.toLowerCase()
-    return message.includes('message id already exists') || message.includes('duplicate message')
+    const message = error.message.toLowerCase();
+    return message.includes("message id already exists") || message.includes("duplicate message");
 }
 
 function shouldRetrySend(error: unknown): boolean {
     if (!(error instanceof Error)) {
-        return true
+        return true;
     }
-    const message = error.message.toLowerCase()
-    if (message.startsWith('http 4') && !message.startsWith('http 429')) {
-        return false
+    const message = error.message.toLowerCase();
+    if (message.startsWith("http 4") && !message.startsWith("http 429")) {
+        return false;
     }
-    if (message.includes('recipient not found')) {
-        return false
+    if (message.includes("recipient not found")) {
+        return false;
     }
-    if (message.includes('invalid message id')) {
-        return false
+    if (message.includes("invalid message id")) {
+        return false;
     }
-    return true
+    return true;
 }
 
 function sleep(ms: number): Promise<void> {
-    return new Promise(resolve => setTimeout(resolve, ms))
+    return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function buildApiErrorMessage(
     status: number,
-    errorData: { error?: string; retryAfter?: number }
+    errorData: { error?: string; retryAfter?: number },
 ): string {
-    const message = errorData.error || `HTTP ${status}`
-    if (typeof errorData.retryAfter === 'number' && Number.isFinite(errorData.retryAfter) && errorData.retryAfter > 0) {
-        return `${message} Rate limit resets in ${errorData.retryAfter}s.`
+    const message = errorData.error || `HTTP ${status}`;
+    if (
+        typeof errorData.retryAfter === "number" &&
+        Number.isFinite(errorData.retryAfter) &&
+        errorData.retryAfter > 0
+    ) {
+        return `${message} Rate limit resets in ${errorData.retryAfter}s.`;
     }
-    return message
+    return message;
 }
 
 /**
  * Authentication tokens from the server.
  */
 export interface AuthTokens {
-    accessToken: string
-    refreshToken: string
+    accessToken: string;
+    refreshToken: string;
 }
 
 /**
  * User info returned from auth endpoints.
  */
 export interface UserInfo {
-    id: string
-    createdAt: number
+    id: string;
+    createdAt: number;
 }
 
 /**
  * Message from the server inbox.
  */
 export interface InboxMessage {
-    id: string
-    senderId: string
-    blob: string
-    signature: string
-    createdAt: number
-    expiresAt: number
+    id: string;
+    senderId: string;
+    blob: string;
+    signature: string;
+    createdAt: number;
+    expiresAt: number;
 }
 
 /**
  * Profile data from the server.
  */
 export interface ServerProfile {
-    id: string
-    profilePublicKey: string
-    profileKeySignature: string
-    encryptedProfile: string
-    profileUpdatedAt: number
+    id: string;
+    profilePublicKey: string;
+    profileKeySignature: string;
+    encryptedProfile: string;
+    profileUpdatedAt: number;
 }
 
 /**
  * Public profile (username-based).
  */
 export interface PublicProfile {
-    username: string
-    identityKey: string
-    description: string
-    avatar: { image: string; thumbhash: string } | null
-    createdAt: number
-    updatedAt: number
+    username: string;
+    identityKey: string;
+    description: string;
+    avatar: { image: string; thumbhash: string } | null;
+    createdAt: number;
+    updatedAt: number;
 }
 
 /**
  * Prekey from server upload.
  */
 export interface PreKeyUpload {
-    publicKey: string
-    signature: string
-    oneTime: boolean
+    publicKey: string;
+    signature: string;
+    oneTime: boolean;
 }
 
 /**
  * Prekey bundle from the server.
  */
 export interface ServerPreKeyBundle {
-    identityKey: string
+    identityKey: string;
     signedPreKey: {
-        publicKey: string
-        signature: string
-        createdAt: number
-    }
+        publicKey: string;
+        signature: string;
+        createdAt: number;
+    };
     oneTimePreKey: {
-        publicKey: string
-        signature: string
-    } | null
+        publicKey: string;
+        signature: string;
+    } | null;
 }
 
 /**
@@ -138,13 +138,11 @@ export interface ServerPreKeyBundle {
  * Handles all communication with the server including authentication.
  */
 export class MurmurApi {
-    private accessToken: string | null = null
-    private refreshToken: string | null = null
-    private identityPrivateKey: Uint8Array | null = null
+    private accessToken: string | null = null;
+    private refreshToken: string | null = null;
+    private identityPrivateKey: Uint8Array | null = null;
 
-    constructor(
-        private baseUrl: string = API_BASE
-    ) {}
+    constructor(private baseUrl: string = API_BASE) {}
 
     /**
      * Set credentials for authenticated requests.
@@ -152,22 +150,22 @@ export class MurmurApi {
     setCredentials(
         identityPrivateKey: Uint8Array,
         accessToken: string,
-        refreshToken: string
+        refreshToken: string,
     ): void {
-        this.identityPrivateKey = identityPrivateKey
-        this.accessToken = accessToken
-        this.refreshToken = refreshToken
+        this.identityPrivateKey = identityPrivateKey;
+        this.accessToken = accessToken;
+        this.refreshToken = refreshToken;
     }
 
     /**
      * Get current tokens.
      */
     getTokens(): AuthTokens | null {
-        if (!this.accessToken || !this.refreshToken) return null
+        if (!this.accessToken || !this.refreshToken) return null;
         return {
             accessToken: this.accessToken,
-            refreshToken: this.refreshToken
-        }
+            refreshToken: this.refreshToken,
+        };
     }
 
     /**
@@ -175,10 +173,10 @@ export class MurmurApi {
      */
     private sign(data: string): string {
         if (!this.identityPrivateKey) {
-            throw new Error('Identity private key not set')
+            throw new Error("Identity private key not set");
         }
-        const signature = sign(stringToBytes(data), this.identityPrivateKey)
-        return encodeBase64(signature)
+        const signature = sign(stringToBytes(data), this.identityPrivateKey);
+        return encodeBase64(signature);
     }
 
     /**
@@ -186,10 +184,10 @@ export class MurmurApi {
      */
     private signBytes(data: Uint8Array): string {
         if (!this.identityPrivateKey) {
-            throw new Error('Identity private key not set')
+            throw new Error("Identity private key not set");
         }
-        const signature = sign(data, this.identityPrivateKey)
-        return encodeBase64(signature)
+        const signature = sign(data, this.identityPrivateKey);
+        return encodeBase64(signature);
     }
 
     /**
@@ -201,58 +199,60 @@ export class MurmurApi {
         body?: unknown,
         requireAuth: boolean = true,
         timeoutMs: number = 30000,
-        allowRetry: boolean = true
+        allowRetry: boolean = true,
     ): Promise<T> {
         const headers: Record<string, string> = {
-            'Content-Type': 'application/json'
-        }
+            "Content-Type": "application/json",
+        };
 
         if (requireAuth) {
             if (!this.accessToken) {
-                throw new Error('Not authenticated')
+                throw new Error("Not authenticated");
             }
-            headers['Authorization'] = `Bearer ${this.accessToken}`
+            headers["Authorization"] = `Bearer ${this.accessToken}`;
         }
 
-        const controller = new AbortController()
-        const timeout = setTimeout(() => controller.abort(), timeoutMs)
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
         try {
             const response = await fetch(`${this.baseUrl}${path}`, {
                 method,
                 headers,
                 body: body ? JSON.stringify(body) : undefined,
-                signal: controller.signal
-            })
+                signal: controller.signal,
+            });
 
             if (response.status === 401 && requireAuth && allowRetry && this.refreshToken) {
-                logger.warn('Access token expired. Attempting refresh...')
+                logger.warn("Access token expired. Attempting refresh...");
                 try {
-                    await this.refresh()
-                    logger.info('Access token refreshed.')
+                    await this.refresh();
+                    logger.info("Access token refreshed.");
                 } catch {
-                    logger.error('Access token refresh failed.')
+                    logger.error("Access token refresh failed.");
                     // Fall through to normal error handling.
                 }
-                return this.request(method, path, body, requireAuth, timeoutMs, false)
+                return this.request(method, path, body, requireAuth, timeoutMs, false);
             }
 
             if (!response.ok) {
-                const errorData = await response.json().catch(() => ({ error: 'Unknown error' })) as {
-                    error?: string
-                    retryAfter?: number
-                }
-                throw new Error(buildApiErrorMessage(response.status, errorData))
+                const errorData = (await response
+                    .json()
+                    .catch(() => ({ error: "Unknown error" }))) as {
+                    error?: string;
+                    retryAfter?: number;
+                };
+                throw new Error(buildApiErrorMessage(response.status, errorData));
             }
 
-            return response.json() as Promise<T>
+            return response.json() as Promise<T>;
         } catch (error) {
-            if (error instanceof Error && error.name === 'AbortError') {
-                throw new Error('Request timed out')
+            if (error instanceof Error && error.name === "AbortError") {
+                throw new Error("Request timed out");
             }
-            throw error
+            throw error;
         } finally {
-            clearTimeout(timeout)
+            clearTimeout(timeout);
         }
     }
 
@@ -261,96 +261,96 @@ export class MurmurApi {
      */
     async streamMessages(
         onEvent: (event: { event: string; data: unknown }) => void | Promise<void>,
-        options?: { signal?: AbortSignal }
+        options?: { signal?: AbortSignal },
     ): Promise<void> {
         if (!this.accessToken) {
-            throw new Error('Not authenticated')
+            throw new Error("Not authenticated");
         }
-        let refreshed = false
+        let refreshed = false;
 
         while (true) {
             const response = await fetch(`${this.baseUrl}/v1/messages/stream`, {
-                method: 'GET',
+                method: "GET",
                 headers: {
-                    'Accept': 'text/event-stream',
-                    'Authorization': `Bearer ${this.accessToken}`
+                    Accept: "text/event-stream",
+                    Authorization: `Bearer ${this.accessToken}`,
                 },
-                signal: options?.signal
-            })
+                signal: options?.signal,
+            });
 
             if (response.status === 401 && this.refreshToken && !refreshed) {
-                logger.warn('Realtime stream unauthorized. Refreshing token...')
-                await this.refresh()
-                logger.info('Realtime stream token refreshed.')
-                refreshed = true
-                continue
+                logger.warn("Realtime stream unauthorized. Refreshing token...");
+                await this.refresh();
+                logger.info("Realtime stream token refreshed.");
+                refreshed = true;
+                continue;
             }
 
             if (!response.ok) {
-                const errorText = await response.text().catch(() => '')
-                throw new Error(errorText || `HTTP ${response.status}`)
+                const errorText = await response.text().catch(() => "");
+                throw new Error(errorText || `HTTP ${response.status}`);
             }
 
             if (!response.body) {
-                throw new Error('SSE response missing body')
+                throw new Error("SSE response missing body");
             }
 
-            const reader = response.body.getReader()
-            const decoder = new TextDecoder()
-            let buffer = ''
-            let eventName = 'message'
-            let dataLines: string[] = []
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = "";
+            let eventName = "message";
+            let dataLines: string[] = [];
 
             const dispatchEvent = async (): Promise<void> => {
                 if (dataLines.length === 0) {
-                    eventName = 'message'
-                    return
+                    eventName = "message";
+                    return;
                 }
-                const dataText = dataLines.join('\n')
-                let data: unknown = dataText
+                const dataText = dataLines.join("\n");
+                let data: unknown = dataText;
                 try {
-                    data = JSON.parse(dataText)
+                    data = JSON.parse(dataText);
                 } catch {
                     // Leave as raw string.
                 }
-                await onEvent({ event: eventName, data })
-                eventName = 'message'
-                dataLines = []
-            }
+                await onEvent({ event: eventName, data });
+                eventName = "message";
+                dataLines = [];
+            };
 
             try {
                 while (true) {
-                    const { value, done } = await reader.read()
+                    const { value, done } = await reader.read();
                     if (done) {
-                        break
+                        break;
                     }
-                    buffer += decoder.decode(value, { stream: true })
+                    buffer += decoder.decode(value, { stream: true });
 
-                    let newlineIndex = buffer.indexOf('\n')
+                    let newlineIndex = buffer.indexOf("\n");
                     while (newlineIndex >= 0) {
-                        let line = buffer.slice(0, newlineIndex)
-                        if (line.endsWith('\r')) {
-                            line = line.slice(0, -1)
+                        let line = buffer.slice(0, newlineIndex);
+                        if (line.endsWith("\r")) {
+                            line = line.slice(0, -1);
                         }
-                        buffer = buffer.slice(newlineIndex + 1)
+                        buffer = buffer.slice(newlineIndex + 1);
 
-                        if (line === '') {
-                            await dispatchEvent()
-                        } else if (line.startsWith('event:')) {
-                            eventName = line.slice(6).trim() || 'message'
-                        } else if (line.startsWith('data:')) {
-                            dataLines.push(line.slice(5).trimStart())
+                        if (line === "") {
+                            await dispatchEvent();
+                        } else if (line.startsWith("event:")) {
+                            eventName = line.slice(6).trim() || "message";
+                        } else if (line.startsWith("data:")) {
+                            dataLines.push(line.slice(5).trimStart());
                         }
 
-                        newlineIndex = buffer.indexOf('\n')
+                        newlineIndex = buffer.indexOf("\n");
                     }
                 }
-                await dispatchEvent()
+                await dispatchEvent();
             } finally {
-                reader.releaseLock()
+                reader.releaseLock();
             }
 
-            return
+            return;
         }
     }
 
@@ -362,9 +362,9 @@ export class MurmurApi {
         identityPrivateKey: Uint8Array,
         profilePublicKey: string,
         profileKeySignature: string,
-        encryptedProfile: string
+        encryptedProfile: string,
     ): Promise<{ tokens: AuthTokens; user: UserInfo }> {
-        const timestamp = Date.now()
+        const timestamp = Date.now();
 
         // Sign the entire request
         const requestBody = {
@@ -372,32 +372,37 @@ export class MurmurApi {
             profilePublicKey,
             profileKeySignature,
             encryptedProfile,
-            timestamp
-        }
-        const requestJson = JSON.stringify(requestBody)
-        const signature = encodeBase64(sign(stringToBytes(requestJson), identityPrivateKey))
+            timestamp,
+        };
+        const requestJson = JSON.stringify(requestBody);
+        const signature = encodeBase64(sign(stringToBytes(requestJson), identityPrivateKey));
 
         const response = await this.request<{
-            success: boolean
-            accessToken: string
-            refreshToken: string
-            user: UserInfo
-        }>('POST', '/v1/auth/register', {
-            ...requestBody,
-            signature
-        }, false)
+            success: boolean;
+            accessToken: string;
+            refreshToken: string;
+            user: UserInfo;
+        }>(
+            "POST",
+            "/v1/auth/register",
+            {
+                ...requestBody,
+                signature,
+            },
+            false,
+        );
 
-        this.identityPrivateKey = identityPrivateKey
-        this.accessToken = response.accessToken
-        this.refreshToken = response.refreshToken
+        this.identityPrivateKey = identityPrivateKey;
+        this.accessToken = response.accessToken;
+        this.refreshToken = response.refreshToken;
 
         return {
             tokens: {
                 accessToken: response.accessToken,
-                refreshToken: response.refreshToken
+                refreshToken: response.refreshToken,
             },
-            user: response.user
-        }
+            user: response.user,
+        };
     }
 
     /**
@@ -405,34 +410,39 @@ export class MurmurApi {
      */
     async login(
         identityPublicKey: string,
-        identityPrivateKey: Uint8Array
+        identityPrivateKey: Uint8Array,
     ): Promise<{ tokens: AuthTokens; user: UserInfo }> {
-        const timestamp = Date.now()
-        const message = `${identityPublicKey}:${timestamp}`
-        const signature = encodeBase64(sign(stringToBytes(message), identityPrivateKey))
+        const timestamp = Date.now();
+        const message = `${identityPublicKey}:${timestamp}`;
+        const signature = encodeBase64(sign(stringToBytes(message), identityPrivateKey));
 
         const response = await this.request<{
-            success: boolean
-            accessToken: string
-            refreshToken: string
-            user: UserInfo
-        }>('POST', '/v1/auth/login', {
-            identityPublicKey,
-            timestamp,
-            signature
-        }, false)
+            success: boolean;
+            accessToken: string;
+            refreshToken: string;
+            user: UserInfo;
+        }>(
+            "POST",
+            "/v1/auth/login",
+            {
+                identityPublicKey,
+                timestamp,
+                signature,
+            },
+            false,
+        );
 
-        this.identityPrivateKey = identityPrivateKey
-        this.accessToken = response.accessToken
-        this.refreshToken = response.refreshToken
+        this.identityPrivateKey = identityPrivateKey;
+        this.accessToken = response.accessToken;
+        this.refreshToken = response.refreshToken;
 
         return {
             tokens: {
                 accessToken: response.accessToken,
-                refreshToken: response.refreshToken
+                refreshToken: response.refreshToken,
             },
-            user: response.user
-        }
+            user: response.user,
+        };
     }
 
     /**
@@ -440,18 +450,25 @@ export class MurmurApi {
      */
     async refresh(): Promise<string> {
         if (!this.refreshToken) {
-            throw new Error('No refresh token')
+            throw new Error("No refresh token");
         }
 
         const response = await this.request<{
-            success: boolean
-            accessToken: string
-        }>('POST', '/v1/auth/refresh', {
-            refreshToken: this.refreshToken
-        }, false, 30000, false)
+            success: boolean;
+            accessToken: string;
+        }>(
+            "POST",
+            "/v1/auth/refresh",
+            {
+                refreshToken: this.refreshToken,
+            },
+            false,
+            30000,
+            false,
+        );
 
-        this.accessToken = response.accessToken
-        return response.accessToken
+        this.accessToken = response.accessToken;
+        return response.accessToken;
     }
 
     /**
@@ -461,53 +478,53 @@ export class MurmurApi {
         recipientId: string,
         blob: string,
         messageId: string,
-        retries: number = 3
+        retries: number = 3,
     ): Promise<{ id: string; createdAt: number; expiresAt: number }> {
         // Server verifies signature of: blobBytes + messageIdBytes (concatenated raw bytes)
-        const blobBytes = decodeBase64(blob)
-        const messageIdBytes = stringToBytes(messageId)
-        const messageToSign = new Uint8Array(blobBytes.length + messageIdBytes.length)
-        messageToSign.set(blobBytes, 0)
-        messageToSign.set(messageIdBytes, blobBytes.length)
-        const signature = this.signBytes(messageToSign)
+        const blobBytes = decodeBase64(blob);
+        const messageIdBytes = stringToBytes(messageId);
+        const messageToSign = new Uint8Array(blobBytes.length + messageIdBytes.length);
+        messageToSign.set(blobBytes, 0);
+        messageToSign.set(messageIdBytes, blobBytes.length);
+        const signature = this.signBytes(messageToSign);
 
-        const attempts = Math.max(1, Math.floor(retries))
-        let lastError: unknown
+        const attempts = Math.max(1, Math.floor(retries));
+        let lastError: unknown;
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
             try {
                 const response = await this.request<{
-                    success: boolean
+                    success: boolean;
                     message: {
-                        id: string
-                        createdAt: number
-                        expiresAt: number
-                    }
-                }>('POST', '/v1/messages/send', {
+                        id: string;
+                        createdAt: number;
+                        expiresAt: number;
+                    };
+                }>("POST", "/v1/messages/send", {
                     messageId,
                     recipientId,
                     blob,
-                    signature
-                })
-                return response.message
+                    signature,
+                });
+                return response.message;
             } catch (error) {
                 if (isDuplicateMessageIdError(error)) {
-                    const now = Date.now()
+                    const now = Date.now();
                     return {
                         id: messageId,
                         createdAt: now,
-                        expiresAt: now + MESSAGE_TTL_MS
-                    }
+                        expiresAt: now + MESSAGE_TTL_MS,
+                    };
                 }
-                lastError = error
+                lastError = error;
                 if (!shouldRetrySend(error) || attempt === attempts) {
-                    throw error
+                    throw error;
                 }
-                const delayMs = 250 * attempt
-                logger.warn(`Send failed (attempt ${attempt} of ${attempts}). Retrying...`)
-                await sleep(delayMs)
+                const delayMs = 250 * attempt;
+                logger.warn(`Send failed (attempt ${attempt} of ${attempts}). Retrying...`);
+                await sleep(delayMs);
             }
         }
-        throw lastError ?? new Error('Failed to send message')
+        throw lastError ?? new Error("Failed to send message");
     }
 
     /**
@@ -515,68 +532,65 @@ export class MurmurApi {
      */
     async getInbox(
         limit: number = 50,
-        cursor?: string
+        cursor?: string,
     ): Promise<{ messages: InboxMessage[]; nextCursor: string | null; hasMore: boolean }> {
-        let path = `/v1/messages/inbox?limit=${limit}`
+        let path = `/v1/messages/inbox?limit=${limit}`;
         if (cursor) {
-            path += `&cursor=${encodeURIComponent(cursor)}`
+            path += `&cursor=${encodeURIComponent(cursor)}`;
         }
 
         return this.request<{
-            messages: InboxMessage[]
-            nextCursor: string | null
-            hasMore: boolean
-        }>('GET', path)
+            messages: InboxMessage[];
+            nextCursor: string | null;
+            hasMore: boolean;
+        }>("GET", path);
     }
 
     /**
      * Get a specific message by ID.
      */
     async getMessage(messageId: string): Promise<InboxMessage> {
-        return this.request<InboxMessage>(
-            'GET',
-            `/v1/messages/${encodeURIComponent(messageId)}`
-        )
+        return this.request<InboxMessage>("GET", `/v1/messages/${encodeURIComponent(messageId)}`);
     }
 
     /**
      * Acknowledge (delete) messages.
      */
     async acknowledgeMessages(messageIds: string[]): Promise<{
-        acknowledged: number
-        failed: Array<{ messageId: string; error: string }>
+        acknowledged: number;
+        failed: Array<{ messageId: string; error: string }>;
     }> {
         const response = await this.request<{
-            success: boolean
-            acknowledged: number
-            failed: Array<{ messageId: string; error: string }>
-        }>('POST', '/v1/messages/ack', { messageIds })
+            success: boolean;
+            acknowledged: number;
+            failed: Array<{ messageId: string; error: string }>;
+        }>("POST", "/v1/messages/ack", { messageIds });
 
         return {
             acknowledged: response.acknowledged,
-            failed: response.failed
-        }
+            failed: response.failed,
+        };
     }
 
     /**
      * Get own profile.
      */
     async getMyProfile(): Promise<ServerProfile & { createdAt: number }> {
-        return this.request<ServerProfile & { createdAt: number }>('GET', '/v1/profile/me')
+        return this.request<ServerProfile & { createdAt: number }>("GET", "/v1/profile/me");
     }
 
     /**
      * Delete the current account.
      */
     async deleteAccount(): Promise<void> {
-        const timestamp = Date.now()
-        const requestBody = { timestamp }
-        const signature = this.sign(JSON.stringify(requestBody))
+        const timestamp = Date.now();
+        const requestBody = { timestamp };
+        const signature = this.sign(JSON.stringify(requestBody));
 
-        await this.request<{ success: boolean }>('POST', '/v1/account/delete', {
+        await this.request<{ success: boolean }>("POST", "/v1/account/delete", {
             ...requestBody,
-            signature
-        })
+            signature,
+        });
     }
 
     /**
@@ -584,9 +598,9 @@ export class MurmurApi {
      */
     async getProfile(profilePublicKey: string): Promise<ServerProfile> {
         return this.request<ServerProfile>(
-            'GET',
-            `/v1/profile/${encodeURIComponent(profilePublicKey)}`
-        )
+            "GET",
+            `/v1/profile/${encodeURIComponent(profilePublicKey)}`,
+        );
     }
 
     /**
@@ -594,11 +608,11 @@ export class MurmurApi {
      */
     async getPublicProfile(profilePublicKey: string): Promise<ServerProfile> {
         return this.request<ServerProfile>(
-            'GET',
+            "GET",
             `/v1/profile/${encodeURIComponent(profilePublicKey)}`,
             undefined,
-            false
-        )
+            false,
+        );
     }
 
     /**
@@ -607,22 +621,22 @@ export class MurmurApi {
     async updateProfile(
         profilePublicKey: string,
         profileKeySignature: string,
-        encryptedProfile: string
+        encryptedProfile: string,
     ): Promise<void> {
-        const timestamp = Date.now()
+        const timestamp = Date.now();
 
         const requestBody = {
             profilePublicKey,
             profileKeySignature,
             encryptedProfile,
-            timestamp
-        }
-        const signature = this.sign(JSON.stringify(requestBody))
+            timestamp,
+        };
+        const signature = this.sign(JSON.stringify(requestBody));
 
-        await this.request<{ success: boolean }>('POST', '/v1/profile/update', {
+        await this.request<{ success: boolean }>("POST", "/v1/profile/update", {
             ...requestBody,
-            signature
-        })
+            signature,
+        });
     }
 
     /**
@@ -631,62 +645,62 @@ export class MurmurApi {
     async commitPublicProfile(
         username: string,
         description: string,
-        avatar?: { image: string; thumbhash: string }
+        avatar?: { image: string; thumbhash: string },
     ): Promise<PublicProfile> {
-        const normalizedUsername = username.trim().toLowerCase()
-        const normalizedDescription = description.trim()
-        const timestamp = Date.now()
+        const normalizedUsername = username.trim().toLowerCase();
+        const normalizedDescription = description.trim();
+        const timestamp = Date.now();
 
         const requestBody: {
-            username: string
-            description: string
-            avatar?: { image: string; thumbhash: string }
-            timestamp: number
+            username: string;
+            description: string;
+            avatar?: { image: string; thumbhash: string };
+            timestamp: number;
         } = {
             username: normalizedUsername,
             description: normalizedDescription,
-            timestamp
-        }
+            timestamp,
+        };
         if (avatar) {
-            requestBody.avatar = avatar
+            requestBody.avatar = avatar;
         }
-        const signature = this.sign(JSON.stringify(requestBody))
+        const signature = this.sign(JSON.stringify(requestBody));
 
-        return this.request<PublicProfile>('POST', '/v1/public-profile/commit', {
+        return this.request<PublicProfile>("POST", "/v1/public-profile/commit", {
             ...requestBody,
-            signature
-        })
+            signature,
+        });
     }
 
     /**
      * Get public profile by username (no auth).
      */
     async getPublicProfileByUsername(username: string): Promise<PublicProfile> {
-        const normalizedUsername = username.trim().toLowerCase()
+        const normalizedUsername = username.trim().toLowerCase();
         return this.request<PublicProfile>(
-            'GET',
+            "GET",
             `/v1/public-profile/${encodeURIComponent(normalizedUsername)}`,
             undefined,
-            false
-        )
+            false,
+        );
     }
 
     /**
      * Upload prekeys.
      */
     async uploadPreKeys(preKeys: PreKeyUpload[]): Promise<void> {
-        const timestamp = Date.now()
+        const timestamp = Date.now();
 
         const requestBody = {
             preKeys,
-            timestamp
-        }
-        const signature = this.sign(JSON.stringify(requestBody))
+            timestamp,
+        };
+        const signature = this.sign(JSON.stringify(requestBody));
 
-        await this.request<{ success: boolean }>('POST', '/v1/prekeys/upload', {
+        await this.request<{ success: boolean }>("POST", "/v1/prekeys/upload", {
             ...requestBody,
-            signature
-        })
+            signature,
+        });
     }
 
     /**
@@ -694,16 +708,16 @@ export class MurmurApi {
      */
     async getPreKeyBundle(identityPublicKey: string): Promise<ServerPreKeyBundle> {
         return this.request<ServerPreKeyBundle>(
-            'GET',
-            `/v1/prekeys/${encodeURIComponent(identityPublicKey)}`
-        )
+            "GET",
+            `/v1/prekeys/${encodeURIComponent(identityPublicKey)}`,
+        );
     }
 
     /**
      * Get count of unallocated one-time prekeys.
      */
     async getOneTimePreKeyCount(): Promise<number> {
-        const result = await this.request<{ count: number }>('GET', '/v1/prekeys/onetime/count')
-        return result.count
+        const result = await this.request<{ count: number }>("GET", "/v1/prekeys/onetime/count");
+        return result.count;
     }
 }
