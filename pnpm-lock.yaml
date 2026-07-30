@@ -130,6 +130,25 @@ importers:
         specifier: ^3.2.7
         version: 3.2.7(@types/node@24.13.3)(jiti@2.7.0)(tsx@4.23.1)(yaml@2.9.0)
 
+  packages/murmur-relay-node:
+    dependencies:
+      '@murmur/core':
+        specifier: workspace:*
+        version: link:../murmur-core
+      '@murmur/relay':
+        specifier: workspace:*
+        version: link:../murmur-relay
+    devDependencies:
+      '@types/node':
+        specifier: ^24.0.10
+        version: 24.13.3
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.7
+        version: 3.2.7(@types/node@24.13.3)(jiti@2.7.0)(tsx@4.23.1)(yaml@2.9.0)
+
   packages/murmur-server:
     dependencies:
       '@fastify/rate-limit':

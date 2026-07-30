@@ -1,0 +1,40 @@
+{
+    "name": "@murmur/relay-node",
+    "version": "0.1.0",
+    "description": "Durable SQLite and HTTP host for the Murmur rendezvous relay",
+    "bin": {
+        "murmur-relay": "./dist/server/main.js"
+    },
+    "files": [
+        "dist",
+        "README.md",
+        "package.json"
+    ],
+    "type": "module",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "check": "tsc --noEmit -p tsconfig.json",
+        "test": "NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run",
+        "test:watch": "NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest"
+    },
+    "dependencies": {
+        "@murmur/core": "workspace:*",
+        "@murmur/relay": "workspace:*"
+    },
+    "devDependencies": {
+        "@types/node": "^24.0.10",
+        "typescript": "^5.9.3",
+        "vitest": "^3.2.7"
+    },
+    "engines": {
+        "node": ">=22.5.0"
+    }
+}
