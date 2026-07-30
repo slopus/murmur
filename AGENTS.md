@@ -23,50 +23,49 @@ including `docs/plans/`.
 
 ## Project Structure
 
+A pnpm workspace. Packages live in `packages/*`:
+
 ```
 murmur/
-├── src/
-│   ├── index.ts                 # Main exports
-│   ├── crypto/                  # Cryptographic primitives
-│   │   ├── utils.ts            # Base64, random bytes, byte manipulation
-│   │   ├── dh.ts               # X25519 Diffie-Hellman
-│   │   ├── signing.ts          # Ed25519 signatures
-│   │   ├── kdf.ts              # HKDF/HMAC key derivation
-│   │   ├── aead.ts             # ChaCha20-Poly1305 encryption
-│   │   └── index.ts            # Crypto exports
-│   ├── x3dh/                    # X3DH key agreement
-│   │   ├── types.ts            # Type definitions
-│   │   ├── x3dh.ts             # Protocol implementation
-│   │   └── index.ts            # X3DH exports
-│   ├── ratchet/                 # Double Ratchet implementation
-│   │   ├── types.ts            # Type definitions
-│   │   ├── header.ts           # Message header encoding
-│   │   ├── state.ts            # State serialization
-│   │   ├── ratchet.ts          # Core algorithm
-│   │   └── index.ts            # Ratchet exports
-│   ├── session/                 # High-level Session API
-│   │   ├── types.ts            # Session type definitions
-│   │   ├── session.ts          # Session management
-│   │   └── index.ts            # Session exports
-│   └── integration.test.ts      # Full protocol tests
-├── bin/
-│   └── murmur.mjs              # CLI entry point
-├── package.json
-├── tsconfig.json
-└── vitest.config.ts
+├── master-plans/            # Product intent, read these first
+├── packages/
+│   ├── murmur-cli/          # CLI, MCP server, client engine, crypto
+│   └── murmur-server/       # Relay: Fastify + Postgres + Redis
+├── package.json             # Workspace scripts and shared dev tooling
+├── pnpm-workspace.yaml
+├── tsconfig.base.json       # Shared strict TypeScript options
+├── .oxfmtrc.json            # Formatter config
+└── .oxlintrc.json           # Linter config
 ```
+
+How code is laid out inside a package is dictated by
+[`master-plans/02-code-organization.md`](master-plans/02-code-organization.md):
+source in `sources`, `main.ts` for executables and `index.ts` for exported
+packages, domain modules with an `impl` directory beneath them, `utils` for
+self-contained helpers, tests in `tests` and `impl/tests`, and a `README.md` in
+every directory. Read that plan before adding files. The existing packages
+predate it and are not to be reorganized unless the user asks.
 
 ## Code Style
 
-- **Strict TypeScript**: All types explicit, no `any`
+- **Strict TypeScript**: All types explicit, no `any`. New packages extend
+  `tsconfig.base.json`.
 - **ESM only**: Use `.js` extensions in imports
-- **Noble crypto**: Use @noble/* libraries for all cryptography
+- **Noble crypto**: Use @noble/\* libraries for all cryptography
 - **Comprehensive JSDoc**: Document all public functions
-- **Co-located tests**: `*.test.ts` next to implementation
+- **Tests in `tests` directories**: not beside the file they cover
+
+## Tooling
+
+- **pnpm** is the package manager. Never use yarn or npm here.
+- **oxfmt** formats everything: four spaces, no tabs.
+- **oxlint** lints everything.
 
 ## Workflow
 
 - Run tests and typechecks before finishing work.
+- Run `pnpm format` before every commit and include all of its output in the
+  commit, including changes to files in `master-plans`.
 - Always commit and push changes when done.
 - Use Angular-style commit messages (e.g., `feat(cli): add webhook sync`).
 
@@ -80,10 +79,12 @@ murmur/
 ## Testing
 
 ```bash
-yarn test        # Run vitest tests
-yarn test:watch  # Watch mode
-yarn typecheck   # TypeScript validation
-yarn build       # Build for distribution
+pnpm test          # Run vitest tests across the workspace
+pnpm typecheck     # TypeScript validation
+pnpm build         # Build for distribution
+pnpm lint          # oxlint
+pnpm format        # oxfmt --write .
+pnpm format:check  # oxfmt --check .
 ```
 
 ## Dependencies
@@ -139,21 +140,16 @@ Skipped message keys are stored for out-of-order message handling.
 
 Use `murmur` subcommands to sign in, send messages, sync, and view recent history.
 
-## Feedback Loop Guides
+## Feedback Loop
 
-For testing best practices and feedback loop optimization, see:
-
-- **Main Guide**: [GUIDE_FEEDBACK_LOOP.md](./GUIDE_FEEDBACK_LOOP.md) - Complete feedback loop manifesto
-- **Subguides**: [feedback-loop/](./feedback-loop/) - Detailed guides by topic
-
-Key principles:
 1. **LOCAL FEEDBACK ONLY** - Never wait for CI
 2. **DON'T MOCK SERVICES YOU OWN** - Run PGlite, SQLite :memory:, local servers
 3. **NARROW THE SCOPE** - One function, one test file
 4. **KEEP ENVIRONMENT WORKING** - Tests pass before and after changes
 
 Quick reference:
-- Unit testing: `yarn test` or `npx vitest`
+
+- Unit testing: `pnpm test`, or `pnpm vitest` inside a package
 - PostgreSQL testing: Use PGlite (no Docker needed)
-- Watch mode: `npx vitest --watch`
+- Watch mode: `pnpm vitest --watch`
 - TDD workflow: Red → Green → Refactor

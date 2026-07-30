@@ -1,10 +1,29 @@
 {
-  "name": "murmur",
-  "private": true,
-  "scripts": {
-    "test": "yarn --cwd packages/murmur-cli test && yarn --cwd packages/murmur-server test",
-    "typecheck": "yarn --cwd packages/murmur-cli typecheck && yarn --cwd packages/murmur-server build",
-    "build": "yarn --cwd packages/murmur-cli build && yarn --cwd packages/murmur-server build"
-  },
-  "packageManager": "yarn@1.22.22"
+    "name": "murmur-workspace",
+    "private": true,
+    "type": "module",
+    "scripts": {
+        "build": "pnpm --filter murmur-chat build && pnpm --filter murmur-server build",
+        "format": "oxfmt --write .",
+        "format:check": "oxfmt --check .",
+        "lint": "oxlint .",
+        "test": "pnpm --recursive --filter './packages/**' run test",
+        "typecheck": "pnpm --filter murmur-chat typecheck && pnpm --filter murmur-server build"
+    },
+    "devDependencies": {
+        "@types/node": "^24.0.10",
+        "oxfmt": "^0.57.0",
+        "oxlint": "^1.72.0",
+        "tsx": "^4.23.0",
+        "typescript": "^5.8.3"
+    },
+    "packageManager": "pnpm@10.28.1",
+    "pnpm": {
+        "onlyBuiltDependencies": [
+            "@prisma/client",
+            "@prisma/engines",
+            "esbuild",
+            "prisma"
+        ]
+    }
 }
