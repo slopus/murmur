@@ -39,6 +39,7 @@ export {
 export const MAX_RELAY_RECIPIENTS = 1_024;
 export const MAX_RELAY_TOPIC_CHARACTERS = 512;
 export const MAX_RELAY_DELIVERY_BATCH = 16;
+export const MAX_NESTED_TOPIC_COMPONENT_BYTES = 1_024;
 
 function publicIdentityJson(identity: IdentityPublicKeys): JsonValue {
     const serialized = serializePublicIdentity(identity);
@@ -46,6 +47,27 @@ function publicIdentityJson(identity: IdentityPublicKeys): JsonValue {
         encryptionKey: serialized.encryptionKey,
         signingKey: serialized.signingKey,
     };
+}
+
+/** Derive an opaque child topic which can itself be nested without a depth limit. */
+export function deriveNestedTopic(parentTopic: string, component: Uint8Array): string {
+    if (
+        parentTopic.length === 0 ||
+        parentTopic.length > MAX_RELAY_TOPIC_CHARACTERS ||
+        component.length === 0 ||
+        component.length > MAX_NESTED_TOPIC_COMPONENT_BYTES
+    ) {
+        throw new Error("Invalid nested topic input");
+    }
+    return `topic:${encodeBase64Url(
+        hashBytes(
+            canonicalJsonBytes({
+                component: encodeBase64Url(component),
+                parent: parentTopic,
+                version: 1,
+            }),
+        ),
+    )}`;
 }
 
 /** Whether a string is the canonical base64url form of a 32-byte identity key. */

@@ -2,6 +2,7 @@ export * from "./cipherSuite/index.js";
 export * from "./encoding/index.js";
 export * from "./epoch/index.js";
 export * from "./groupContext/index.js";
+export * from "./groupChannel/index.js";
 export * from "./keySchedule/index.js";
 export * from "./keyPackage/index.js";
 export * from "./privateMessage/index.js";

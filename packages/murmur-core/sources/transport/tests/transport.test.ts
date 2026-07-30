@@ -15,6 +15,7 @@ import {
     decodeRelayDeliveriesWire,
     decodeRelayEventWire,
     decodeTopicSubscriptionWire,
+    deriveNestedTopic,
     encodeQueueRequestWire,
     encodeRelayDeliveriesWire,
     encodeRelayEventWire,
@@ -74,6 +75,16 @@ describe("relay protocol", () => {
 
         expect(verifyRelayBlob(blob)).toBe(true);
         expect(verifyRelayBlob({ ...blob, bytes: utf8Encode("changed") })).toBe(false);
+    });
+
+    it("derives opaque nested topics without a depth limit in the relay API", () => {
+        const document = deriveNestedTopic("group", utf8Encode("document"));
+        const comments = deriveNestedTopic(document, utf8Encode("comments"));
+
+        expect(document).toMatch(/^topic:[A-Za-z0-9_-]{43}$/);
+        expect(comments).toMatch(/^topic:[A-Za-z0-9_-]{43}$/);
+        expect(comments).not.toBe(document);
+        expect(deriveNestedTopic("group", utf8Encode("document"))).toBe(document);
     });
 
     it("round trips every HTTP JSON envelope without secret-key extras", () => {
