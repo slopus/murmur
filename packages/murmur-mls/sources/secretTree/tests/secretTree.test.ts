@@ -1,6 +1,6 @@
 import { equalBytes, hashBytes, utf8Encode } from "@murmur/core";
 import { describe, expect, it } from "vitest";
-import { destroyMlsGenerationKey, MlsSecretTree } from "../index.js";
+import { destroyMlsGenerationKey, destroyMlsSecretTreeState, MlsSecretTree } from "../index.js";
 
 describe("MLS Secret Tree", () => {
     it("derives matching one-time application keys for independent members", () => {
@@ -92,5 +92,46 @@ describe("MLS Secret Tree", () => {
         expect(() => tree.use(0, "application", 0, async () => 1)).toThrow("synchronous");
         expect(() => tree.take(0, "application", 0)).toThrow("consumed");
         tree.destroy();
+    });
+
+    it("snapshots ratchet generations, skipped keys, and the forward-secret frontier", () => {
+        const tree = new MlsSecretTree(hashBytes(utf8Encode("durable root")), 4);
+        destroyMlsGenerationKey(tree.next(1, "application"));
+        destroyMlsGenerationKey(tree.take(2, "application", 2));
+        const state = tree.snapshot();
+        const restored = MlsSecretTree.fromState(state);
+
+        const originalNext = tree.next(1, "application");
+        const restoredNext = restored.next(1, "application");
+        const originalSkipped = tree.take(2, "application", 0);
+        const restoredSkipped = restored.take(2, "application", 0);
+
+        expect(restoredNext.generation).toBe(1);
+        expect(equalBytes(restoredNext.key, originalNext.key)).toBe(true);
+        expect(equalBytes(restoredSkipped.key, originalSkipped.key)).toBe(true);
+        expect(() =>
+            MlsSecretTree.fromState({
+                ...state,
+                nodeSecrets: [...state.nodeSecrets, ...state.nodeSecrets],
+            }),
+        ).toThrow("snapshot");
+
+        for (const key of [originalNext, restoredNext, originalSkipped, restoredSkipped]) {
+            destroyMlsGenerationKey(key);
+        }
+        tree.destroy();
+        restored.destroy();
+        destroyMlsSecretTreeState(state);
+        expect(
+            state.ratchets.every(
+                (ratchet) =>
+                    ratchet.secret.every((byte) => byte === 0) &&
+                    ratchet.skipped.every(
+                        (skipped) =>
+                            skipped.key.every((byte) => byte === 0) &&
+                            skipped.nonce.every((byte) => byte === 0),
+                    ),
+            ),
+        ).toBe(true);
     });
 });

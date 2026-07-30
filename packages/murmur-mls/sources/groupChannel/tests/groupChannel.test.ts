@@ -104,7 +104,17 @@ describe("MLS group relay channel", () => {
             },
         };
         await bobChannel.subscribe(client);
-        const published = await aliceChannel.send(client, utf8Encode("hello"));
+        const prepared = aliceChannel.prepareSend(utf8Encode("hello"));
+        const outboundCheckpoint = prepared.serializeEpoch();
+        const restoredOutbound = MlsEpochState.deserialize(outboundCheckpoint, {
+            localSigningSecretKey: alice.signingSecretKey,
+            minimumPersistenceGeneration: prepared.persistenceGeneration,
+        });
+        restoredOutbound.destroy();
+        await expect(prepared.publish(client)).rejects.toThrow("prepared");
+        prepared.markPersisted();
+        const published = await prepared.publish(client);
+        expect(() => prepared.serializeEpoch()).toThrow("confirmed");
         const acknowledge = vi.fn(async (): Promise<void> => undefined);
         const received: ReceivedEvent = { event: published.event, acknowledge };
 
@@ -112,11 +122,45 @@ describe("MLS group relay channel", () => {
 
         expect(subscriptions).toEqual([bobChannel.topic]);
         expect(delivery?.status).toBe("opened");
+        let durableInboundCheckpoint: Uint8Array | undefined;
         if (delivery?.status === "opened") {
             expect(utf8Decode(delivery.message.applicationData)).toBe("hello");
+            const inboundCheckpoint = delivery.serializeEpoch();
+            durableInboundCheckpoint = inboundCheckpoint.slice();
+            const restoredInbound = MlsEpochState.deserialize(inboundCheckpoint, {
+                localSigningSecretKey: bob.signingSecretKey,
+                minimumPersistenceGeneration: delivery.persistenceGeneration,
+            });
+            restoredInbound.destroy();
+            await expect(delivery.acknowledge()).rejects.toThrow("persisted");
+            delivery.markPersisted();
             await delivery.acknowledge();
         }
         expect(acknowledge).toHaveBeenCalledOnce();
+        expect(aliceChannel.appliedApplicationFingerprints).toEqual([prepared.fingerprint]);
+        expect(bobChannel.appliedApplicationFingerprints).toHaveLength(1);
+        if (delivery?.status !== "opened" || durableInboundCheckpoint === undefined) {
+            throw new Error("Expected durable inbound MLS checkpoint");
+        }
+        const restoredBob = new MlsGroupChannel(
+            MlsEpochState.deserialize(durableInboundCheckpoint, {
+                localSigningSecretKey: bob.signingSecretKey,
+                minimumPersistenceGeneration: delivery.persistenceGeneration,
+            }),
+            [],
+            bobChannel.appliedApplicationFingerprints,
+        );
+        const replayAcknowledge = vi.fn(async (): Promise<void> => undefined);
+        const replay = restoredBob.handle({
+            event: published.event,
+            acknowledge: replayAcknowledge,
+        });
+        expect(replay?.status).toBe("application-applied");
+        if (replay?.status === "application-applied") {
+            await replay.acknowledge();
+        }
+        expect(replayAcknowledge).toHaveBeenCalledOnce();
+        restoredBob.destroy();
         aliceChannel.destroy();
         bobChannel.destroy();
     });
@@ -207,6 +251,14 @@ describe("MLS group relay channel", () => {
             }),
         };
         const outbound = aliceChannel.prepareCommit([]);
+        const stagedCheckpoint = outbound.serializeNextEpoch();
+        const restoredStaged = MlsEpochState.deserialize(stagedCheckpoint, {
+            localSigningSecretKey: alice.signingSecretKey,
+            authenticateCredential,
+            minimumPersistenceGeneration: outbound.persistenceGeneration,
+        });
+        expect(restoredStaged.context.epoch).toBe(current.epoch + 1n);
+        restoredStaged.destroy();
         const originalPayload = outbound.payload.slice();
         outbound.payload.fill(0);
         const acknowledge = vi.fn(async (): Promise<void> => undefined);
@@ -221,9 +273,19 @@ describe("MLS group relay channel", () => {
         await expect(delivery.acknowledge()).rejects.toThrow("adopted");
         expect(() => outbound.adopt()).toThrow("prepared");
         expect(() => aliceChannel.destroy()).toThrow("pending outbound");
+        outbound.markPersisted();
         const committed = await outbound.publish(client);
         expect(() => outbound.cancel()).toThrow("confirmed");
         outbound.adopt();
+        expect(() => outbound.serializeNextEpoch()).toThrow("settled");
+        const inboundCommitCheckpoint = delivery.serializeNextEpoch();
+        const restoredInboundCommit = MlsEpochState.deserialize(inboundCommitCheckpoint, {
+            localSigningSecretKey: bob.signingSecretKey,
+            authenticateCredential,
+            minimumPersistenceGeneration: delivery.persistenceGeneration,
+        });
+        restoredInboundCommit.destroy();
+        delivery.markPersisted();
         delivery.adopt();
         await delivery.acknowledge();
         expect(acknowledge).toHaveBeenCalledOnce();
@@ -239,7 +301,10 @@ describe("MLS group relay channel", () => {
             aliceChannel.forgetAppliedCommit(echo.fingerprint);
         }
         expect(echoAcknowledge).toHaveBeenCalledOnce();
-        const published = await aliceChannel.send(client, utf8Encode("new epoch"));
+        const preparedApplication = aliceChannel.prepareSend(utf8Encode("new epoch"));
+        preparedApplication.serializeEpoch().fill(0);
+        preparedApplication.markPersisted();
+        const published = await preparedApplication.publish(client);
         const opened = bobChannel.handle({
             event: published.event,
             acknowledge: async (): Promise<void> => undefined,
@@ -247,9 +312,13 @@ describe("MLS group relay channel", () => {
         expect(opened?.status).toBe("opened");
         if (opened?.status === "opened") {
             expect(utf8Decode(opened.message.applicationData)).toBe("new epoch");
+            opened.serializeEpoch().fill(0);
+            opened.markPersisted();
         }
 
         const ambiguous = aliceChannel.prepareCommit([]);
+        ambiguous.serializeNextEpoch().fill(0);
+        ambiguous.markPersisted();
         await expect(
             ambiguous.publish({
                 subscribe: async (): Promise<void> => undefined,

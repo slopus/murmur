@@ -1,4 +1,5 @@
 import {
+    encodeBase64Url,
     equalBytes,
     generateIdentityKeyPair,
     hashBytes,
@@ -149,6 +150,98 @@ describe("MLS epoch application state", () => {
                 }),
         ).toThrow("does not match");
         destroyMlsEpochSecrets(secrets);
+    });
+
+    it("persists sender ratchets and skipped generations without the signing key", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const members = [{ signatureKey: alice.signingKey }, { signatureKey: bob.signingKey }];
+        const joinerSecret = hashBytes(utf8Encode("durable legacy epoch"));
+        const aliceSecrets = deriveMlsEpochSecretsFromJoiner(
+            joinerSecret,
+            encodeMlsGroupContext(context()),
+        );
+        const originalRoot = encodeBase64Url(aliceSecrets.encryptionSecret);
+        const originalEpochSecret = encodeBase64Url(aliceSecrets.epochSecret);
+        const aliceEpoch = new MlsEpochState({
+            context: context(),
+            secrets: aliceSecrets,
+            members,
+            localLeaf: 0,
+            localSigningSecretKey: alice.signingSecretKey,
+        });
+        const bobEpoch = new MlsEpochState({
+            context: context(),
+            secrets: deriveMlsEpochSecretsFromJoiner(
+                joinerSecret,
+                encodeMlsGroupContext(context()),
+            ),
+            members,
+            localLeaf: 1,
+            localSigningSecretKey: bob.signingSecretKey,
+        });
+        const first = aliceEpoch.seal(utf8Encode("first"));
+        const second = aliceEpoch.seal(utf8Encode("second"));
+        expect(utf8Decode(bobEpoch.open(second).applicationData)).toBe("second");
+
+        const aliceState = aliceEpoch.serialize();
+        const bobState = bobEpoch.serialize();
+        expect(utf8Decode(aliceState)).not.toContain(encodeBase64Url(alice.signingSecretKey));
+        expect(utf8Decode(aliceState)).not.toContain(originalRoot);
+        expect(utf8Decode(aliceState)).not.toContain(originalEpochSecret);
+        expect(aliceEpoch.persistenceGeneration).toBe(2n);
+        expect(() =>
+            MlsEpochState.deserialize(aliceState, {
+                localSigningSecretKey: alice.signingSecretKey,
+                minimumPersistenceGeneration: 3n,
+            }),
+        ).toThrow("rolled back");
+        const duplicateKeyState = utf8Encode(
+            utf8Decode(aliceState).replace('{"context":', '{"context":"duplicate","context":'),
+        );
+        expect(() =>
+            MlsEpochState.deserialize(duplicateKeyState, {
+                localSigningSecretKey: alice.signingSecretKey,
+                minimumPersistenceGeneration: 2n,
+            }),
+        ).toThrow("canonical JSON");
+        const wrongIdentity = generateIdentityKeyPair();
+        expect(() =>
+            MlsEpochState.deserialize(aliceState, {
+                localSigningSecretKey: wrongIdentity.signingSecretKey,
+                minimumPersistenceGeneration: 2n,
+            }),
+        ).toThrow("does not match");
+        const restoredAlice = MlsEpochState.deserialize(aliceState, {
+            localSigningSecretKey: alice.signingSecretKey,
+            minimumPersistenceGeneration: 2n,
+        });
+        const restoredBob = MlsEpochState.deserialize(bobState, {
+            localSigningSecretKey: bob.signingSecretKey,
+            minimumPersistenceGeneration: 1n,
+        });
+        expect(restoredAlice.persistenceGeneration).toBe(2n);
+        aliceEpoch.destroy();
+        bobEpoch.destroy();
+
+        const beforeInvalid = restoredBob.serialize();
+        const beforeInvalidGeneration = restoredBob.persistenceGeneration;
+        const invalid = first.slice();
+        invalid[invalid.length - 1] = (invalid[invalid.length - 1] ?? 0) ^ 1;
+        expect(() => restoredBob.openWithCheckpoint(invalid)).toThrow();
+        expect(restoredBob.persistenceGeneration).toBe(beforeInvalidGeneration);
+        expect(restoredBob.serialize()).toEqual(beforeInvalid);
+        const checkpointedFirst = restoredBob.openWithCheckpoint(first);
+        expect(utf8Decode(checkpointedFirst.message.applicationData)).toBe("first");
+        expect(checkpointedFirst.state).toEqual(restoredBob.serialize());
+        expect(() => restoredBob.open(first)).toThrow("already consumed");
+        expect(
+            utf8Decode(
+                restoredAlice.open(restoredBob.seal(utf8Encode("after restart"))).applicationData,
+            ),
+        ).toBe("after restart");
+        restoredAlice.destroy();
+        restoredBob.destroy();
     });
 
     it("prepares and applies an add-only epoch transition", () => {
@@ -311,6 +404,16 @@ describe("MLS epoch application state", () => {
             { type: "remove", removed: 1 },
             { type: "add", keyPackage: bundles[3]!.keyPackage },
         ]);
+        expect(() => aliceCurrent.serialize()).toThrow("pending transition");
+        expect(() => aliceCurrent.open(new Uint8Array())).toThrow("pending transition");
+        const stagedCheckpoint = prepared.transition.serialize();
+        const restoredStaged = MlsEpochState.deserialize(stagedCheckpoint, {
+            localSigningSecretKey: identities[0]!.signingSecretKey,
+            authenticateCredential,
+            minimumPersistenceGeneration: prepared.transition.persistenceGeneration,
+        });
+        expect(restoredStaged.context.epoch).toBe(currentContext.epoch + 1n);
+        restoredStaged.destroy();
         expect(prepared.removedLeaves).toEqual([1]);
         expect(prepared.addedLeaves).toEqual([1]);
         expect(prepared.welcome).toBeDefined();
@@ -358,8 +461,25 @@ describe("MLS epoch application state", () => {
             utf8Decode(aliceNext.open(daveNext.seal(utf8Encode("joined"))).applicationData),
         ).toBe("joined");
 
-        bobCurrent.destroy();
+        const persistedAlice = aliceNext.serialize();
+        const restoredAlice = MlsEpochState.deserialize(persistedAlice, {
+            localSigningSecretKey: identities[0]!.signingSecretKey,
+            authenticateCredential,
+            minimumPersistenceGeneration: aliceNext.persistenceGeneration,
+        });
         aliceNext.destroy();
+        expect(
+            utf8Decode(
+                carolNext.open(restoredAlice.seal(utf8Encode("persisted TreeKEM"))).applicationData,
+            ),
+        ).toBe("persisted TreeKEM");
+        const stagedRemoval = restoredAlice.prepareCommit([
+            { type: "remove", removed: prepared.addedLeaves[0]! },
+        ]);
+        stagedRemoval.transition.cancel();
+
+        bobCurrent.destroy();
+        restoredAlice.destroy();
         carolNext.destroy();
         daveNext.destroy();
         for (const bundle of bundles) {

@@ -18,3 +18,32 @@ validates the joining member's private direct path.
 
 The earlier add-only/external-tree methods remain as a compatibility layer for
 callers which have not moved tree ownership into this state.
+
+`serialize()` snapshots the remaining Secret Tree frontier, sender ratchets,
+skipped generations, TreeKEM path keys, and epoch secrets for durable local
+storage. It deliberately excludes the identity signing secret. `deserialize()`
+requires that secret again and proves that it owns the authenticated local
+LeafNode before accepting the restored state. Persisted bytes are sensitive and
+must receive identity-key-equivalent storage protection.
+
+The key-schedule ancestors (`joiner_secret`, `member_secret`, `epoch_secret`,
+and the original `encryption_secret`) are erased as soon as the Secret Tree is
+initialized and are never serialized. Every successful application seal/open
+and every adopted epoch transition advances `persistenceGeneration`. Durable
+applications must atomically store the serialized epoch, that generation, and
+the corresponding outbound event or accepted application record before
+publishing or acknowledging. On restore, pass the independently retained
+minimum generation to reject stale checkpoints. Whole-storage rollback requires
+an external rollback-resistant counter; no local serialization format can
+detect an attacker reverting both the checkpoint and its metadata.
+
+Durable inbound processing uses `openWithCheckpoint()`. It rolls the Secret Tree
+and generation back if authentication or checkpoint serialization fails, so a
+valid delivery is never hidden after its one-time key was consumed.
+
+For an outbound Commit, persist the Commit bytes plus
+`transition.serialize()` and `transition.persistenceGeneration` in the same
+transaction before publication. Adopt the already-checkpointed transition only
+after publication is confirmed. Both inbound opens and outbound seals are
+blocked while a transition is staged so the staged checkpoint cannot lose a
+later current-epoch ratchet mutation.

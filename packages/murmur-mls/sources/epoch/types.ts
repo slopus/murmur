@@ -7,6 +7,7 @@ import type { MlsRatchetTree } from "../ratchetTree/index.js";
 import type { HpkeKeyPair } from "../cipherSuite/index.js";
 import type { MlsTreePrivateKey } from "../updatePath/index.js";
 import type { OpenedMlsWelcome } from "../welcome/index.js";
+import type { MlsSecretTreeState } from "../secretTree/index.js";
 
 /** Public member data needed to authenticate one MLS epoch. */
 export interface MlsEpochMember {
@@ -21,6 +22,10 @@ interface CreateMlsEpochBaseOptions {
     readonly localLeaf: number;
     readonly localSigningSecretKey: Uint8Array;
     readonly interimTranscriptHash?: Uint8Array;
+    /** Monotonic local checkpoint generation, restored from durable metadata. */
+    readonly persistenceGeneration?: bigint;
+    /** Restored mutable ratchet state; consumed only after successful construction. */
+    readonly secretTreeState?: MlsSecretTreeState;
 }
 
 /** Compatibility inputs for an epoch without integrated TreeKEM state. */
@@ -57,6 +62,10 @@ export type MlsAddTreeValidator = (
 
 /** Explicit lifecycle for a staged next epoch and external tree. */
 export interface MlsEpochTransition {
+    /** Monotonic generation of the staged next-epoch checkpoint. */
+    readonly persistenceGeneration: bigint;
+    /** Serialize the staged next epoch before publishing its Commit. */
+    serialize(): Uint8Array;
     commit(): import("./index.js").MlsEpochState;
     cancel(): void;
 }
@@ -104,3 +113,16 @@ export interface CreateMlsTreeEpochFromWelcomeOptions {
 
 /** Full TreeKEM proposals accepted by integrated epoch transitions. */
 export type MlsEpochCommitProposal = MlsTreeCommitProposal;
+
+/** External key binding and credential policy used to restore a durable epoch. */
+export interface DeserializeMlsEpochOptions {
+    readonly localSigningSecretKey: Uint8Array;
+    readonly authenticateCredential?: (leafNode: MlsLeafNode, leafIndex: number) => boolean;
+    /**
+     * Smallest checkpoint generation accepted from rollback-resistant metadata.
+     *
+     * Applications should update this metadata atomically with the serialized
+     * epoch and any event or application state produced from it.
+     */
+    readonly minimumPersistenceGeneration: bigint;
+}

@@ -27,19 +27,25 @@ import {
     type OpenedMlsApplicationMessage,
 } from "../privateMessage/index.js";
 import { type MlsRatchetTree } from "../ratchetTree/index.js";
-import { MlsSecretTree } from "../secretTree/index.js";
+import { destroyMlsSecretTreeState, MlsSecretTree } from "../secretTree/index.js";
 import { directPath, leafNode } from "../tree/index.js";
 import {
     deriveMlsWelcomePrivateKeys,
     destroyMlsTreePrivateKeys,
     type MlsTreePrivateKey,
 } from "../updatePath/index.js";
+import {
+    decodeMlsEpochState,
+    destroyDecodedMlsEpochState,
+    encodeMlsEpochState,
+} from "./impl/stateCodec.js";
 import type {
     CreateLegacyMlsEpochOptions,
     CreateMlsEpochOptions,
     CreateMlsEpochFromWelcomeOptions,
     CreateMlsTreeEpochFromWelcomeOptions,
     CreateTreeMlsEpochOptions,
+    DeserializeMlsEpochOptions,
     MlsAddTreeValidator,
     MlsEpochCommitProposal,
     MlsEpochMember,
@@ -55,6 +61,7 @@ export type {
     CreateMlsEpochFromWelcomeOptions,
     CreateMlsTreeEpochFromWelcomeOptions,
     CreateTreeMlsEpochOptions,
+    DeserializeMlsEpochOptions,
     MlsAddTreeValidator,
     MlsEpochCommitProposal,
     MlsEpochMember,
@@ -68,6 +75,7 @@ export type {
 const OWNERSHIP_LABEL = "Murmur Epoch Ownership";
 const OWNERSHIP_CONTENT = new Uint8Array();
 const MAXIMUM_EPOCH_MEMBERS = 100_000;
+const MAXIMUM_PERSISTENCE_GENERATION = 0xffff_ffff_ffff_ffffn;
 
 function copyContext(context: MlsGroupContext): MlsGroupContext {
     return {
@@ -233,6 +241,18 @@ class StagedEpochTransition implements MlsEpochTransition {
         this.#onSettle = onSettle;
     }
 
+    /** Monotonic generation of the staged next-epoch checkpoint. */
+    get persistenceGeneration(): bigint {
+        this.#ensurePending();
+        return this.#next.persistenceGeneration;
+    }
+
+    /** Serialize the staged next epoch for atomic Commit/outbox persistence. */
+    serialize(): Uint8Array {
+        this.#ensurePending();
+        return this.#next.serialize();
+    }
+
     commit(): MlsEpochState {
         this.#ensurePending();
         this.#state = "committing";
@@ -275,9 +295,11 @@ class StagedEpochTransition implements MlsEpochTransition {
  *
  * After successful construction, the instance takes ownership of
  * `options.secrets` and integrated TreeKEM private keys by cloning them
- * privately and zeroing every input array. Construction failure leaves
- * ownership with the caller. Full Commit transitions stage an independently
- * owned next state until explicit adoption or cancellation.
+ * privately and zeroing every input array. A restored Secret Tree snapshot is
+ * likewise copied and consumed only after successful construction.
+ * Construction failure leaves ownership with the caller. Full Commit
+ * transitions stage an independently owned next state until explicit adoption
+ * or cancellation.
  */
 export class MlsEpochState {
     readonly #context: MlsGroupContext;
@@ -285,13 +307,14 @@ export class MlsEpochState {
     readonly #members: readonly (MlsEpochMember | undefined)[];
     readonly #localLeaf: number;
     readonly #localSigningSecretKey: Uint8Array;
-    readonly #secretTree: MlsSecretTree;
+    #secretTree: MlsSecretTree;
     readonly #interimTranscriptHash: Uint8Array | undefined;
     readonly #tree: MlsRatchetTree | undefined;
     readonly #privateKeys: readonly MlsTreePrivateKey[];
     readonly #authenticateCredential:
         | ((leafNode: MlsLeafNode, leafIndex: number) => boolean)
         | undefined;
+    #persistenceGeneration: bigint;
     #destroyed = false;
     #pendingTransition: StagedEpochTransition | undefined;
     #transitionState: "idle" | "preparing" | "staged" = "idle";
@@ -322,7 +345,10 @@ export class MlsEpochState {
             !Number.isSafeInteger(options.localLeaf) ||
             options.localLeaf < 0 ||
             options.localLeaf >= configuredMembers.length ||
-            options.localSigningSecretKey.length !== 32
+            options.localSigningSecretKey.length !== 32 ||
+            (options.persistenceGeneration !== undefined &&
+                (options.persistenceGeneration < 0n ||
+                    options.persistenceGeneration > MAXIMUM_PERSISTENCE_GENERATION))
         ) {
             throw new Error("Invalid MLS epoch configuration");
         }
@@ -391,7 +417,20 @@ export class MlsEpochState {
                     integrated.privateKeys,
                 );
             }
-            secretTree = new MlsSecretTree(ownedSecrets.encryptionSecret, members.length);
+            if (
+                options.secretTreeState !== undefined &&
+                options.secretTreeState.leafCount !== members.length
+            ) {
+                throw new Error("MLS Secret Tree snapshot does not match epoch members");
+            }
+            secretTree =
+                options.secretTreeState === undefined
+                    ? new MlsSecretTree(ownedSecrets.encryptionSecret, members.length)
+                    : MlsSecretTree.fromState(options.secretTreeState);
+            zeroBytes(ownedSecrets.joinerSecret);
+            zeroBytes(ownedSecrets.memberSecret);
+            zeroBytes(ownedSecrets.epochSecret);
+            zeroBytes(ownedSecrets.encryptionSecret);
             this.#context = copyContext(options.context);
             this.#secrets = ownedSecrets;
             this.#members = members;
@@ -402,6 +441,7 @@ export class MlsEpochState {
             this.#tree = tree;
             this.#privateKeys = privateKeys;
             this.#authenticateCredential = integrated?.authenticateCredential;
+            this.#persistenceGeneration = options.persistenceGeneration ?? 0n;
         } catch (error: unknown) {
             secretTree?.destroy();
             destroyMlsTreePrivateKeys(privateKeys);
@@ -415,12 +455,108 @@ export class MlsEpochState {
         if (integrated !== undefined) {
             destroyMlsTreePrivateKeys(integrated.privateKeys);
         }
+        if (options.secretTreeState !== undefined) {
+            destroyMlsSecretTreeState(options.secretTreeState);
+        }
+    }
+
+    /**
+     * Restore an authenticated local epoch without persisting its signing key.
+     *
+     * Integrated TreeKEM records require the same credential authenticator used
+     * for external tree validation. The supplied signing key is rebound to the
+     * authenticated local LeafNode by the constructor.
+     */
+    static deserialize(bytes: Uint8Array, options: DeserializeMlsEpochOptions): MlsEpochState {
+        const decoded = decodeMlsEpochState(bytes, options.authenticateCredential);
+        try {
+            if (
+                options.minimumPersistenceGeneration < 0n ||
+                options.minimumPersistenceGeneration > MAXIMUM_PERSISTENCE_GENERATION ||
+                decoded.persistenceGeneration < options.minimumPersistenceGeneration
+            ) {
+                throw new Error("Durable MLS epoch state was rolled back");
+            }
+            if (decoded.tree === undefined) {
+                if (decoded.members === undefined) {
+                    throw new Error("Durable legacy MLS epoch is missing members");
+                }
+                return new MlsEpochState({
+                    context: decoded.context,
+                    secrets: decoded.secrets,
+                    members: decoded.members,
+                    localLeaf: decoded.localLeaf,
+                    localSigningSecretKey: options.localSigningSecretKey,
+                    persistenceGeneration: decoded.persistenceGeneration,
+                    ...(decoded.interimTranscriptHash === undefined
+                        ? {}
+                        : { interimTranscriptHash: decoded.interimTranscriptHash }),
+                    secretTreeState: decoded.secretTreeState,
+                });
+            }
+            if (options.authenticateCredential === undefined) {
+                throw new Error("Durable TreeKEM state requires credential authentication");
+            }
+            return new MlsEpochState({
+                context: decoded.context,
+                secrets: decoded.secrets,
+                tree: decoded.tree,
+                privateKeys: decoded.privateKeys,
+                localLeaf: decoded.localLeaf,
+                localSigningSecretKey: options.localSigningSecretKey,
+                authenticateCredential: options.authenticateCredential,
+                persistenceGeneration: decoded.persistenceGeneration,
+                ...(decoded.interimTranscriptHash === undefined
+                    ? {}
+                    : { interimTranscriptHash: decoded.interimTranscriptHash }),
+                secretTreeState: decoded.secretTreeState,
+            });
+        } finally {
+            destroyDecodedMlsEpochState(decoded);
+        }
     }
 
     /** Immutable public context for this epoch. */
     get context(): MlsGroupContext {
         this.#ensureActive();
         return copyContext(this.#context);
+    }
+
+    /** Monotonic generation to store with the durable epoch checkpoint. */
+    get persistenceGeneration(): bigint {
+        this.#ensureActive();
+        return this.#persistenceGeneration;
+    }
+
+    /**
+     * Serialize this active epoch's sensitive local state.
+     *
+     * The returned bytes do not contain the local signing secret key. They must
+     * nevertheless be stored confidentially because they contain epoch,
+     * TreeKEM, and sender-ratchet secrets.
+     */
+    serialize(): Uint8Array {
+        this.#ensureActive();
+        if (this.#transitionState !== "idle") {
+            throw new Error("Cannot serialize an MLS epoch with a pending transition");
+        }
+        const secretTreeState = this.#secretTree.snapshot();
+        try {
+            return encodeMlsEpochState({
+                context: this.#context,
+                secrets: this.#secrets,
+                ...(this.#tree === undefined ? { members: this.#members } : { tree: this.#tree }),
+                privateKeys: this.#privateKeys,
+                localLeaf: this.#localLeaf,
+                persistenceGeneration: this.#persistenceGeneration,
+                ...(this.#interimTranscriptHash === undefined
+                    ? {}
+                    : { interimTranscriptHash: this.#interimTranscriptHash }),
+                secretTreeState,
+            });
+        } finally {
+            destroyMlsSecretTreeState(secretTreeState);
+        }
     }
 
     /** Sign and encrypt application bytes as the local member. */
@@ -433,6 +569,7 @@ export class MlsEpochState {
         if (this.#transitionState !== "idle") {
             throw new Error("MLS epoch has a pending transition");
         }
+        this.#persistenceGeneration = this.#nextPersistenceGeneration();
         return sealMlsApplicationMessage({
             context: this.#context,
             sender: this.#localLeaf,
@@ -448,6 +585,10 @@ export class MlsEpochState {
     /** Authenticate and decrypt application bytes from another member. */
     open(message: Uint8Array): OpenedMlsApplicationMessage {
         this.#ensureActive();
+        if (this.#transitionState !== "idle") {
+            throw new Error("MLS epoch has a pending transition");
+        }
+        this.#persistenceGeneration = this.#nextPersistenceGeneration();
         return openMlsApplicationMessage({
             context: this.#context,
             senderDataSecret: this.#secrets.senderDataSecret,
@@ -455,6 +596,55 @@ export class MlsEpochState {
             message,
             signatureKeyFor: (sender) => this.#members[sender]?.signatureKey,
         });
+    }
+
+    /**
+     * Authenticate an application message and create its durable checkpoint as
+     * one rollback-safe operation.
+     *
+     * If either authentication or checkpoint serialization fails, the prior
+     * Secret Tree and persistence generation are restored before the error is
+     * rethrown.
+     */
+    openWithCheckpoint(message: Uint8Array): {
+        readonly message: OpenedMlsApplicationMessage;
+        readonly state: Uint8Array;
+        readonly persistenceGeneration: bigint;
+    } {
+        this.#ensureActive();
+        if (this.#transitionState !== "idle") {
+            throw new Error("MLS epoch has a pending transition");
+        }
+        const priorTree = this.#secretTree.snapshot();
+        const priorGeneration = this.#persistenceGeneration;
+        let opened: OpenedMlsApplicationMessage | undefined;
+        try {
+            opened = this.open(message);
+            return {
+                message: opened,
+                state: this.serialize(),
+                persistenceGeneration: this.#persistenceGeneration,
+            };
+        } catch (error: unknown) {
+            if (opened !== undefined) {
+                zeroBytes(opened.applicationData);
+                zeroBytes(opened.authenticatedData);
+            }
+            let restored: MlsSecretTree;
+            try {
+                restored = MlsSecretTree.fromState(priorTree);
+            } catch (rollbackError: unknown) {
+                throw new Error("MLS epoch checkpoint rollback failed", {
+                    cause: rollbackError,
+                });
+            }
+            this.#secretTree.destroy();
+            this.#secretTree = restored;
+            this.#persistenceGeneration = priorGeneration;
+            throw error;
+        } finally {
+            destroyMlsSecretTreeState(priorTree);
+        }
     }
 
     /**
@@ -516,6 +706,7 @@ export class MlsEpochState {
                 localLeaf: this.#localLeaf,
                 localSigningSecretKey: this.#localSigningSecretKey,
                 interimTranscriptHash: created.interimTranscriptHash,
+                persistenceGeneration: this.#nextPersistenceGeneration(),
             });
             return {
                 commit: created.commit,
@@ -586,6 +777,7 @@ export class MlsEpochState {
                 localLeaf: this.#localLeaf,
                 localSigningSecretKey: this.#localSigningSecretKey,
                 interimTranscriptHash: applied.interimTranscriptHash,
+                persistenceGeneration: this.#nextPersistenceGeneration(),
             });
             return this.#stage(next, tree);
         } catch (error: unknown) {
@@ -642,6 +834,7 @@ export class MlsEpochState {
                 localSigningSecretKey: this.#localSigningSecretKey,
                 authenticateCredential,
                 interimTranscriptHash: created.interimTranscriptHash,
+                persistenceGeneration: this.#nextPersistenceGeneration(),
             });
             return {
                 commit: created.commit,
@@ -692,6 +885,7 @@ export class MlsEpochState {
                 localSigningSecretKey: this.#localSigningSecretKey,
                 authenticateCredential,
                 interimTranscriptHash: applied.interimTranscriptHash,
+                persistenceGeneration: this.#nextPersistenceGeneration(),
             });
             return this.#stage(next);
         } catch (error: unknown) {
@@ -735,6 +929,13 @@ export class MlsEpochState {
             throw new Error("MLS epoch already has a pending transition");
         }
         this.#transitionState = "preparing";
+    }
+
+    #nextPersistenceGeneration(): bigint {
+        if (this.#persistenceGeneration >= MAXIMUM_PERSISTENCE_GENERATION) {
+            throw new Error("MLS persistence generation is exhausted");
+        }
+        return this.#persistenceGeneration + 1n;
     }
 
     #abortTransitionPreparation(): void {

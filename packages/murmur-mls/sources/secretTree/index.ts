@@ -6,10 +6,15 @@ import {
     mlsExpandWithLabel,
 } from "../cipherSuite/index.js";
 import { encodeUint32 } from "../encoding/index.js";
-import { leafNode, leftChild, parentNode, rightChild, treeRoot } from "../tree/index.js";
-import type { MlsGenerationKey, MlsRatchetType } from "./types.js";
+import { leafNode, leftChild, parentNode, rightChild, treeRoot, treeWidth } from "../tree/index.js";
+import type { MlsGenerationKey, MlsRatchetType, MlsSecretTreeState } from "./types.js";
 
-export type { MlsGenerationKey, MlsRatchetType } from "./types.js";
+export type {
+    MlsGenerationKey,
+    MlsRatchetType,
+    MlsSecretTreeRatchetState,
+    MlsSecretTreeState,
+} from "./types.js";
 
 const DEFAULT_MAXIMUM_FORWARD_DISTANCE = 1_000;
 const DEFAULT_MAXIMUM_SKIPPED_KEYS = 10_000;
@@ -48,6 +53,30 @@ function isPromiseLike(value: unknown): value is PromiseLike<unknown> {
 export function destroyMlsGenerationKey(generationKey: MlsGenerationKey): void {
     zeroBytes(generationKey.key);
     zeroBytes(generationKey.nonce);
+}
+
+/** Zero every secret contained in a detached Secret Tree snapshot. */
+export function destroyMlsSecretTreeState(state: MlsSecretTreeState): void {
+    for (const node of state.nodeSecrets) {
+        zeroBytes(node.secret);
+    }
+    for (const ratchet of state.ratchets) {
+        zeroBytes(ratchet.secret);
+        for (const skipped of ratchet.skipped) {
+            destroyMlsGenerationKey(skipped);
+        }
+    }
+}
+
+function nodePathToRoot(node: number, leafCount: number): readonly number[] {
+    const root = treeRoot(leafCount);
+    const path = [node];
+    let current = node;
+    while (current !== root) {
+        current = parentNode(current, leafCount);
+        path.push(current);
+    }
+    return path;
 }
 
 /**
@@ -99,6 +128,158 @@ export class MlsSecretTree {
         this.#maximumForwardDistance = maximumForwardDistance;
         this.#maximumSkippedKeys = maximumSkippedKeys;
         this.#nodeSecrets.set(treeRoot(leafCount), encryptionSecret.slice());
+    }
+
+    /** Reconstruct a structurally validated mutable Secret Tree snapshot. */
+    static fromState(state: MlsSecretTreeState): MlsSecretTree {
+        const placeholder = new Uint8Array(MLS_HASH_LENGTH);
+        const tree = new MlsSecretTree(
+            placeholder,
+            state.leafCount,
+            state.maximumForwardDistance,
+            state.maximumSkippedKeys,
+        );
+        for (const secret of tree.#nodeSecrets.values()) {
+            zeroBytes(secret);
+        }
+        tree.#nodeSecrets.clear();
+        try {
+            const width = treeWidth(state.leafCount);
+            const cachedNodes = new Set<number>();
+            for (const entry of state.nodeSecrets) {
+                if (
+                    !Number.isSafeInteger(entry.node) ||
+                    entry.node < 0 ||
+                    entry.node >= width ||
+                    entry.secret.length !== MLS_HASH_LENGTH ||
+                    cachedNodes.has(entry.node)
+                ) {
+                    throw new Error("Invalid MLS Secret Tree node snapshot");
+                }
+                cachedNodes.add(entry.node);
+                tree.#nodeSecrets.set(entry.node, entry.secret.slice());
+            }
+            for (const node of cachedNodes) {
+                if (
+                    nodePathToRoot(node, state.leafCount)
+                        .slice(1)
+                        .some((ancestor) => cachedNodes.has(ancestor))
+                ) {
+                    throw new Error("Overlapping MLS Secret Tree node snapshot");
+                }
+            }
+
+            const ratchetKeys = new Set<string>();
+            const ratchetedSenders = new Set<number>();
+            for (const snapshot of state.ratchets) {
+                if (
+                    (snapshot.type !== "handshake" && snapshot.type !== "application") ||
+                    !Number.isSafeInteger(snapshot.generation) ||
+                    snapshot.generation < 0 ||
+                    snapshot.generation > MAXIMUM_GENERATION + 1 ||
+                    snapshot.secret.length !== MLS_HASH_LENGTH
+                ) {
+                    throw new Error("Invalid MLS sender-ratchet snapshot");
+                }
+                leafNode(snapshot.sender, state.leafCount);
+                const key = `${snapshot.sender}/${snapshot.type}`;
+                if (ratchetKeys.has(key)) {
+                    throw new Error("Duplicate MLS sender-ratchet snapshot");
+                }
+                ratchetKeys.add(key);
+                ratchetedSenders.add(snapshot.sender);
+                const skipped = new Map<number, MlsGenerationKey>();
+                for (const generationKey of snapshot.skipped) {
+                    if (
+                        generationKey.sender !== snapshot.sender ||
+                        generationKey.type !== snapshot.type ||
+                        !Number.isSafeInteger(generationKey.generation) ||
+                        generationKey.generation < 0 ||
+                        generationKey.generation >= snapshot.generation ||
+                        generationKey.key.length !== MLS_AEAD_KEY_LENGTH ||
+                        generationKey.nonce.length !== MLS_AEAD_NONCE_LENGTH ||
+                        skipped.has(generationKey.generation)
+                    ) {
+                        throw new Error("Invalid MLS skipped-key snapshot");
+                    }
+                    skipped.set(generationKey.generation, {
+                        sender: generationKey.sender,
+                        type: generationKey.type,
+                        generation: generationKey.generation,
+                        key: generationKey.key.slice(),
+                        nonce: generationKey.nonce.slice(),
+                    });
+                    tree.#skippedKeyCount += 1;
+                }
+                if (tree.#skippedKeyCount > state.maximumSkippedKeys) {
+                    throw new Error("MLS skipped-key snapshot exceeds its budget");
+                }
+                tree.#ratchets.set(key, {
+                    secret: snapshot.secret.slice(),
+                    generation: snapshot.generation,
+                    skipped,
+                });
+            }
+            for (const sender of ratchetedSenders) {
+                if (
+                    !ratchetKeys.has(`${sender}/handshake`) ||
+                    !ratchetKeys.has(`${sender}/application`)
+                ) {
+                    throw new Error("Incomplete MLS sender-ratchet snapshot");
+                }
+            }
+            for (let sender = 0; sender < state.leafCount; sender += 1) {
+                const coveringSecrets = nodePathToRoot(
+                    leafNode(sender, state.leafCount),
+                    state.leafCount,
+                ).filter((node) => cachedNodes.has(node)).length;
+                if (
+                    (ratchetedSenders.has(sender) && coveringSecrets !== 0) ||
+                    (!ratchetedSenders.has(sender) && coveringSecrets !== 1)
+                ) {
+                    throw new Error("MLS Secret Tree frontier snapshot is inconsistent");
+                }
+            }
+            return tree;
+        } catch (error: unknown) {
+            tree.destroy();
+            throw error;
+        }
+    }
+
+    /** Copy all sensitive mutable state for durable local persistence. */
+    snapshot(): MlsSecretTreeState {
+        this.#ensureActive();
+        return {
+            leafCount: this.#leafCount,
+            maximumForwardDistance: this.#maximumForwardDistance,
+            maximumSkippedKeys: this.#maximumSkippedKeys,
+            nodeSecrets: [...this.#nodeSecrets]
+                .sort(([left], [right]) => left - right)
+                .map(([node, secret]) => ({ node, secret: secret.slice() })),
+            ratchets: [...this.#ratchets]
+                .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
+                .map(([key, state]) => {
+                    const separator = key.indexOf("/");
+                    const sender = Number(key.slice(0, separator));
+                    const type = key.slice(separator + 1) as MlsRatchetType;
+                    return {
+                        sender,
+                        type,
+                        secret: state.secret.slice(),
+                        generation: state.generation,
+                        skipped: [...state.skipped.values()]
+                            .sort((left, right) => left.generation - right.generation)
+                            .map((generationKey) => ({
+                                sender: generationKey.sender,
+                                type: generationKey.type,
+                                generation: generationKey.generation,
+                                key: generationKey.key.slice(),
+                                nonce: generationKey.nonce.slice(),
+                            })),
+                    };
+                }),
+        };
     }
 
     /** Derive the next outbound key for one sender and content type. */

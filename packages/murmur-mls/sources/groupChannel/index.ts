@@ -2,6 +2,7 @@ import {
     encodeBase64Url,
     equalBytes,
     hashBytes,
+    zeroBytes,
     type PublishResult,
     type ReceivedEvent,
 } from "@murmur/core";
@@ -10,10 +11,12 @@ import type {
     MlsGroupDelivery,
     MlsGroupMurmurClient,
     MlsGroupPublishResult,
+    PreparedMlsGroupApplication,
     PreparedMlsGroupCommit,
 } from "./types.js";
 
 export type {
+    AppliedMlsGroupApplicationDelivery,
     DeferredMlsGroupDelivery,
     AppliedMlsGroupCommitDelivery,
     MlsGroupDelivery,
@@ -21,6 +24,7 @@ export type {
     MlsGroupMurmurClient,
     MlsGroupPublishResult,
     OpenedMlsGroupDelivery,
+    PreparedMlsGroupApplication,
     PreparedMlsGroupCommit,
     StagedMlsGroupCommitDelivery,
 } from "./types.js";
@@ -48,7 +52,7 @@ function validatePublishResult(
         result.event.recipients.length !== 0 ||
         !equalBytes(hashBytes(result.event.payload), fingerprint)
     ) {
-        throw new Error("Publish result does not match the prepared MLS Commit");
+        throw new Error("Publish result does not match the prepared MLS event");
     }
 }
 
@@ -71,19 +75,31 @@ export class MlsGroupChannel {
     #epoch: MlsEpochState;
     readonly #topic: string;
     readonly #appliedCommits = new Map<string, Uint8Array>();
+    readonly #appliedApplications = new Map<string, Uint8Array>();
     #pendingOutbound = false;
+    #pendingInbound = false;
+    #pendingInboundCheckpoint: Uint8Array | undefined;
 
-    constructor(epoch: MlsEpochState, appliedCommitFingerprints: readonly Uint8Array[] = []) {
+    constructor(
+        epoch: MlsEpochState,
+        appliedCommitFingerprints: readonly Uint8Array[] = [],
+        appliedApplicationFingerprints: readonly Uint8Array[] = [],
+    ) {
         if (
             appliedCommitFingerprints.length > MAXIMUM_APPLIED_COMMIT_MARKERS ||
-            appliedCommitFingerprints.some((fingerprint) => fingerprint.length !== 32)
+            appliedCommitFingerprints.some((fingerprint) => fingerprint.length !== 32) ||
+            appliedApplicationFingerprints.length > MAXIMUM_APPLIED_COMMIT_MARKERS ||
+            appliedApplicationFingerprints.some((fingerprint) => fingerprint.length !== 32)
         ) {
-            throw new Error("Invalid applied MLS Commit fingerprints");
+            throw new Error("Invalid applied MLS fingerprints");
         }
         this.#epoch = epoch;
         this.#topic = mlsGroupTopic(epoch.context.groupId);
         for (const fingerprint of appliedCommitFingerprints) {
             this.#appliedCommits.set(encodeBase64Url(fingerprint), fingerprint.slice());
+        }
+        for (const fingerprint of appliedApplicationFingerprints) {
+            this.#appliedApplications.set(encodeBase64Url(fingerprint), fingerprint.slice());
         }
     }
 
@@ -92,9 +108,27 @@ export class MlsGroupChannel {
         return this.#topic;
     }
 
+    /** Monotonic generation of the currently owned epoch. */
+    get persistenceGeneration(): bigint {
+        return this.#epoch.persistenceGeneration;
+    }
+
+    /** Serialize the current epoch after an inbound delivery or adoption. */
+    serializeEpoch(): Uint8Array {
+        if (this.#pendingOutbound || this.#pendingInbound) {
+            throw new Error("MLS group channel has a pending event");
+        }
+        return this.#epoch.serialize();
+    }
+
     /** Commit replay markers which must be persisted atomically with the epoch. */
     get appliedCommitFingerprints(): readonly Uint8Array[] {
         return [...this.#appliedCommits.values()].map((fingerprint) => fingerprint.slice());
+    }
+
+    /** Application replay markers persisted atomically with the epoch. */
+    get appliedApplicationFingerprints(): readonly Uint8Array[] {
+        return [...this.#appliedApplications.values()].map((fingerprint) => fingerprint.slice());
     }
 
     /** Forget one replay marker only after every relevant relay delivery is acknowledged. */
@@ -105,53 +139,162 @@ export class MlsGroupChannel {
         this.#appliedCommits.delete(encodeBase64Url(fingerprint));
     }
 
+    /** Forget an application replay marker after all relay echoes are acknowledged. */
+    forgetAppliedApplication(fingerprint: Uint8Array): void {
+        if (fingerprint.length !== 32) {
+            throw new Error("Invalid applied MLS application fingerprint");
+        }
+        this.#appliedApplications.delete(encodeBase64Url(fingerprint));
+    }
+
     /** Subscribe the local Murmur identity to the group's relay topic. */
     async subscribe(client: MlsGroupMurmurClient): Promise<void> {
         await client.subscribe(this.#topic);
     }
 
-    /** Encrypt and publish current-epoch application content. */
-    async send(
-        client: MlsGroupMurmurClient,
+    /**
+     * Prepare application content for durable publication.
+     *
+     * Persist `payload`, `serializeEpoch()`, and `persistenceGeneration`
+     * atomically before calling `publish()`.
+     */
+    prepareSend(
         applicationData: Uint8Array,
         authenticatedData: Uint8Array = new Uint8Array(),
         paddingBytes: number = 0,
-    ): Promise<MlsGroupPublishResult> {
-        return client.publish(
-            this.#topic,
-            this.#epoch.seal(applicationData, authenticatedData, paddingBytes),
-        );
+    ): PreparedMlsGroupApplication {
+        if (this.#pendingOutbound || this.#pendingInbound) {
+            throw new Error("MLS group channel has a pending event");
+        }
+        if (this.#appliedApplications.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
+            throw new Error("Too many outstanding applied MLS application markers");
+        }
+        const payload = this.#epoch.seal(applicationData, authenticatedData, paddingBytes);
+        const checkpoint = this.#epoch.serialize();
+        const persistenceGeneration = this.#epoch.persistenceGeneration;
+        const fingerprint = hashBytes(payload);
+        const fingerprintId = encodeBase64Url(fingerprint);
+        this.#pendingOutbound = true;
+        let publication:
+            | "prepared"
+            | "persisted"
+            | "publishing"
+            | "ambiguous"
+            | "confirmed"
+            | "cancelled" = "prepared";
+        let settled = false;
+        let markerInserted = false;
+        const settle = (): void => {
+            zeroBytes(checkpoint);
+            settled = true;
+            this.#pendingOutbound = false;
+        };
+        return {
+            payload: payload.slice(),
+            fingerprint: fingerprint.slice(),
+            persistenceGeneration,
+            serializeEpoch: (): Uint8Array => {
+                if (settled) {
+                    throw new Error(`MLS group application publication is ${publication}`);
+                }
+                return checkpoint.slice();
+            },
+            markPersisted: (): void => {
+                if (settled || publication !== "prepared") {
+                    throw new Error(`MLS group application publication is ${publication}`);
+                }
+                if (!this.#appliedApplications.has(fingerprintId)) {
+                    this.#appliedApplications.set(fingerprintId, fingerprint.slice());
+                    markerInserted = true;
+                }
+                publication = "persisted";
+            },
+            publish: async (client): Promise<MlsGroupPublishResult> => {
+                if (settled || publication !== "persisted") {
+                    throw new Error(`MLS group application publication is ${publication}`);
+                }
+                publication = "publishing";
+                try {
+                    const result = await client.publish(this.#topic, payload.slice());
+                    validatePublishResult(result, this.#topic, fingerprint);
+                    publication = "confirmed";
+                    settle();
+                    return result;
+                } catch (error: unknown) {
+                    publication = "ambiguous";
+                    throw error;
+                }
+            },
+            confirmPublished: (result): void => {
+                if (settled || publication !== "ambiguous") {
+                    throw new Error(`MLS group application publication is ${publication}`);
+                }
+                validatePublishResult(result, this.#topic, fingerprint);
+                publication = "confirmed";
+                settle();
+            },
+            cancel: (): void => {
+                if (settled || (publication !== "prepared" && publication !== "persisted")) {
+                    throw new Error(`MLS group application publication is ${publication}`);
+                }
+                publication = "cancelled";
+                if (markerInserted) {
+                    this.#appliedApplications.delete(fingerprintId);
+                }
+                settle();
+            },
+        };
     }
 
     /**
      * Stage a full Add/Remove Commit for ordered durable publication.
      *
-     * The caller persists the returned public tree and Welcome, calls the
-     * handle's `publish()`, then calls `adopt()`. A pre-publication abort calls
-     * `cancel()`. Network-ambiguous publication must remain staged until the
-     * retained Murmur outbox is resolved.
+     * The caller atomically persists the payload, Welcome, replay marker, and
+     * `serializeNextEpoch()` checkpoint before `publish()`, then calls
+     * `adopt()`. A pre-publication abort calls `cancel()`. Network-ambiguous
+     * publication must remain staged until the retained Murmur outbox is
+     * resolved.
      */
     prepareCommit(
         proposals: readonly MlsEpochCommitProposal[],
         authenticatedData: Uint8Array = new Uint8Array(),
     ): PreparedMlsGroupCommit {
-        if (this.#pendingOutbound) {
-            throw new Error("MLS group channel already has a pending outbound Commit");
+        if (this.#pendingOutbound || this.#pendingInbound) {
+            throw new Error("MLS group channel already has a pending event");
+        }
+        if (this.#appliedCommits.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
+            throw new Error("Too many outstanding applied MLS Commit markers");
         }
         const prepared = this.#epoch.prepareCommit(proposals, authenticatedData);
         this.#pendingOutbound = true;
-        let publication: "prepared" | "publishing" | "ambiguous" | "confirmed" = "prepared";
+        let publication: "prepared" | "persisted" | "publishing" | "ambiguous" | "confirmed" =
+            "prepared";
         let settled = false;
         const commit = prepared.commit.slice();
         const fingerprint = hashBytes(commit);
+        const fingerprintId = encodeBase64Url(fingerprint);
+        let markerInserted = false;
         return {
             payload: commit.slice(),
+            fingerprint: fingerprint.slice(),
             ...(prepared.welcome === undefined ? {} : { welcome: prepared.welcome }),
             tree: prepared.tree,
             addedLeaves: prepared.addedLeaves,
             removedLeaves: prepared.removedLeaves,
-            publish: async (client): Promise<MlsGroupPublishResult> => {
+            persistenceGeneration: prepared.transition.persistenceGeneration,
+            serializeNextEpoch: (): Uint8Array => prepared.transition.serialize(),
+            markPersisted: (): void => {
                 if (settled || publication !== "prepared") {
+                    throw new Error(`MLS group Commit publication is ${publication}`);
+                }
+                if (!this.#appliedCommits.has(fingerprintId)) {
+                    this.#appliedCommits.set(fingerprintId, fingerprint.slice());
+                    markerInserted = true;
+                }
+                publication = "persisted";
+            },
+            publish: async (client): Promise<MlsGroupPublishResult> => {
+                if (settled || publication !== "persisted") {
                     throw new Error(`MLS group Commit publication is ${publication}`);
                 }
                 publication = "publishing";
@@ -176,23 +319,23 @@ export class MlsGroupChannel {
                 if (settled || publication !== "confirmed") {
                     throw new Error(`MLS group Commit publication is ${publication}`);
                 }
-                const inserted = this.#recordAppliedCommit(fingerprint);
                 try {
                     this.#epoch = prepared.transition.commit();
                 } catch (error: unknown) {
-                    this.#rollbackAppliedCommit(fingerprint, inserted);
+                    this.#rollbackAppliedCommit(fingerprint, markerInserted);
                     throw error;
                 }
                 settled = true;
                 this.#pendingOutbound = false;
             },
             cancel: (): void => {
-                if (settled || publication !== "prepared") {
+                if (settled || (publication !== "prepared" && publication !== "persisted")) {
                     throw new Error(`MLS group Commit publication is ${publication}`);
                 }
                 try {
                     prepared.transition.cancel();
                 } finally {
+                    this.#rollbackAppliedCommit(fingerprint, markerInserted);
                     settled = true;
                     this.#pendingOutbound = false;
                 }
@@ -210,6 +353,14 @@ export class MlsGroupChannel {
         if (received.event.topic !== this.#topic) {
             return undefined;
         }
+        if (this.#pendingOutbound || this.#pendingInbound) {
+            return {
+                status: "deferred",
+                error: new Error("MLS group channel has a pending event"),
+                event: received.event,
+                acknowledge: received.acknowledge,
+            };
+        }
         try {
             if (isPublicMlsMessage(received.event.payload)) {
                 const fingerprint = hashBytes(received.event.payload);
@@ -221,20 +372,38 @@ export class MlsGroupChannel {
                         acknowledge: received.acknowledge,
                     };
                 }
+                if (this.#appliedCommits.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
+                    throw new Error("Too many outstanding applied MLS Commit markers");
+                }
                 const transition = this.#epoch.applyCommit(received.event.payload);
-                let state: "staged" | "adopted" | "cancelled" = "staged";
+                let state: "staged" | "persisted" | "adopted" | "cancelled" = "staged";
+                let markerInserted = false;
                 return {
                     status: "commit",
                     event: received.event,
-                    adopt: (): void => {
+                    fingerprint: fingerprint.slice(),
+                    persistenceGeneration: transition.persistenceGeneration,
+                    serializeNextEpoch: (): Uint8Array => {
                         if (state !== "staged") {
                             throw new Error(`MLS group Commit delivery is ${state}`);
                         }
-                        const inserted = this.#recordAppliedCommit(fingerprint);
+                        return transition.serialize();
+                    },
+                    markPersisted: (): void => {
+                        if (state !== "staged") {
+                            throw new Error(`MLS group Commit delivery is ${state}`);
+                        }
+                        markerInserted = this.#recordAppliedCommit(fingerprint);
+                        state = "persisted";
+                    },
+                    adopt: (): void => {
+                        if (state !== "persisted") {
+                            throw new Error(`MLS group Commit delivery is ${state}`);
+                        }
                         try {
                             this.#epoch = transition.commit();
                         } catch (error: unknown) {
-                            this.#rollbackAppliedCommit(fingerprint, inserted);
+                            this.#rollbackAppliedCommit(fingerprint, markerInserted);
                             throw error;
                         }
                         state = "adopted";
@@ -259,11 +428,57 @@ export class MlsGroupChannel {
                     },
                 };
             }
+            const fingerprint = hashBytes(received.event.payload);
+            const fingerprintId = encodeBase64Url(fingerprint);
+            if (this.#appliedApplications.has(fingerprintId)) {
+                return {
+                    status: "application-applied",
+                    fingerprint: fingerprint.slice(),
+                    event: received.event,
+                    acknowledge: received.acknowledge,
+                };
+            }
+            if (this.#appliedApplications.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
+                throw new Error("Too many outstanding applied MLS application markers");
+            }
+            const opened = this.#epoch.openWithCheckpoint(received.event.payload);
+            const message = opened.message;
+            const checkpoint = opened.state;
+            const persistenceGeneration = opened.persistenceGeneration;
+            this.#pendingInbound = true;
+            this.#pendingInboundCheckpoint = checkpoint;
+            let state: "opened" | "persisted" | "acknowledged" = "opened";
             return {
                 status: "opened",
-                message: this.#epoch.open(received.event.payload),
+                message,
                 event: received.event,
-                acknowledge: received.acknowledge,
+                persistenceGeneration,
+                fingerprint: fingerprint.slice(),
+                serializeEpoch: (): Uint8Array => {
+                    if (state !== "opened") {
+                        throw new Error(`MLS group application delivery is ${state}`);
+                    }
+                    return checkpoint.slice();
+                },
+                markPersisted: (): void => {
+                    if (state !== "opened") {
+                        throw new Error(`MLS group application delivery is ${state}`);
+                    }
+                    this.#appliedApplications.set(fingerprintId, fingerprint.slice());
+                    zeroBytes(checkpoint);
+                    state = "persisted";
+                    this.#pendingInbound = false;
+                    this.#pendingInboundCheckpoint = undefined;
+                },
+                acknowledge: async (): Promise<void> => {
+                    if (state !== "persisted") {
+                        throw new Error(
+                            "MLS group application must be persisted before acknowledgment",
+                        );
+                    }
+                    await received.acknowledge();
+                    state = "acknowledged";
+                },
             };
         } catch (error: unknown) {
             return {
@@ -278,8 +493,13 @@ export class MlsGroupChannel {
     /** Destroy the owned current epoch. */
     destroy(): void {
         if (this.#pendingOutbound) {
-            throw new Error("Cannot destroy MLS group channel with pending outbound Commit");
+            throw new Error("Cannot destroy MLS group channel with a pending outbound event");
         }
+        if (this.#pendingInboundCheckpoint !== undefined) {
+            zeroBytes(this.#pendingInboundCheckpoint);
+            this.#pendingInboundCheckpoint = undefined;
+        }
+        this.#pendingInbound = false;
         this.#epoch.destroy();
     }
 
