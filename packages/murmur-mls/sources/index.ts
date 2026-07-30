@@ -6,3 +6,4 @@ export * from "./keyPackage/index.js";
 export * from "./privateMessage/index.js";
 export * from "./secretTree/index.js";
 export * from "./tree/index.js";
+export * from "./welcome/index.js";
