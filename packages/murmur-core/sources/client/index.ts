@@ -18,9 +18,14 @@ import {
 } from "../transport/index.js";
 import { encodeBase64Url, equalBytes } from "../utils/index.js";
 import { decodeOutboundRecord, encodeOutboundRecord } from "./impl/eventCodec.js";
-import type { PublishResult, ReceivedEvent } from "./types.js";
+import type { PublishResult, ReceivedEvent, RetryOutboundReport } from "./types.js";
 
-export type { PublishResult, ReceivedEvent } from "./types.js";
+export type {
+    PublishResult,
+    ReceivedEvent,
+    RetryOutboundFailure,
+    RetryOutboundReport,
+} from "./types.js";
 
 const DEFAULT_OUTBOUND_HISTORY = 256;
 
@@ -101,24 +106,94 @@ export class MurmurClient {
         recipients: readonly IdentityPublicKeys[] = [],
     ): Promise<PublishResult> {
         const event = createRelayEvent(this.#identity, topic, payload, recipients);
-        const key = `${this.#outboundPrefix}${event.createdAt.toString().padStart(16, "0")}/${event.id}`;
-        await this.#store.set(key, encodeOutboundRecord(event, []));
-        const result = await this.#publishRecord(key, event, []);
+        return this.publishEvent(event);
+    }
+
+    /**
+     * Durably publish one pre-created event owned by this client identity.
+     *
+     * Reusing the same event resumes its existing relay-acceptance record.
+     */
+    async publishEvent(event: RelayEvent): Promise<PublishResult> {
+        const preparedEvent: RelayEvent = {
+            version: event.version,
+            id: event.id,
+            topic: event.topic,
+            sender: {
+                signingKey: event.sender.signingKey.slice(),
+                encryptionKey: event.sender.encryptionKey.slice(),
+            },
+            recipients: [...event.recipients],
+            createdAt: event.createdAt,
+            payload: event.payload.slice(),
+            signature: event.signature.slice(),
+        };
+        if (
+            !verifyRelayEvent(preparedEvent) ||
+            !equalBytes(preparedEvent.sender.signingKey, this.#identity.signingKey) ||
+            !equalBytes(preparedEvent.sender.encryptionKey, this.#identity.encryptionKey)
+        ) {
+            throw new Error("Prepared relay event is not owned by this Murmur client");
+        }
+        const key = `${this.#outboundPrefix}${preparedEvent.createdAt
+            .toString()
+            .padStart(16, "0")}/${preparedEvent.id}`;
+        const existing = await this.#store.get(key);
+        let publishedRelayIds: readonly string[] = [];
+        if (existing === undefined) {
+            await this.#store.set(key, encodeOutboundRecord(preparedEvent, []));
+        } else {
+            const record = decodeOutboundRecord(existing);
+            if (
+                !equalBytes(
+                    relayEventSignaturePayload(record.event),
+                    relayEventSignaturePayload(preparedEvent),
+                ) ||
+                !equalBytes(record.event.signature, preparedEvent.signature)
+            ) {
+                throw new Error("Prepared relay event collides with retained outbound state");
+            }
+            publishedRelayIds = record.publishedRelayIds;
+        }
+        const result = await this.#publishRecord(key, preparedEvent, publishedRelayIds);
         await this.#pruneOutboundHistory();
         return result;
     }
 
     /** Retry retained events on transports which have not accepted them. */
     async retryOutbound(): Promise<readonly PublishResult[]> {
+        const report = await this.retryOutboundSettled();
+        if (report.failures.length > 0) {
+            throw new AggregateError(
+                report.failures.map((failure) => failure.error),
+                "Some retained Murmur events remain unpublished",
+            );
+        }
+        return report.results;
+    }
+
+    /** Retry every retained event independently and report all failures. */
+    async retryOutboundSettled(): Promise<RetryOutboundReport> {
         const records = await this.#store.list(this.#outboundPrefix);
         const results: PublishResult[] = [];
+        const failures: RetryOutboundReport["failures"][number][] = [];
         for (const [key, value] of [...records].sort(([left], [right]) =>
             left.localeCompare(right),
         )) {
             const record = decodeOutboundRecord(value);
-            results.push(await this.#publishRecord(key, record.event, record.publishedRelayIds));
+            try {
+                results.push(
+                    await this.#publishRecord(key, record.event, record.publishedRelayIds),
+                );
+            } catch (error: unknown) {
+                failures.push({
+                    event: record.event,
+                    error: error instanceof Error ? error : new Error(String(error)),
+                });
+            }
         }
-        return results;
+        await this.#pruneOutboundHistory();
+        return { results, failures };
     }
 
     async #publishRecord(
@@ -327,7 +402,14 @@ export class MurmurClient {
     }
 
     async #pruneOutboundHistory(): Promise<void> {
-        const records = [...(await this.#store.list(this.#outboundPrefix)).keys()].sort();
+        const transportIds = new Set(this.#transports.map((transport) => transport.id));
+        const records = [...(await this.#store.list(this.#outboundPrefix))]
+            .filter(([, value]) => {
+                const record = decodeOutboundRecord(value);
+                return [...transportIds].every((id) => record.publishedRelayIds.includes(id));
+            })
+            .map(([key]) => key)
+            .sort();
         const excess = records.length - this.#outboundHistoryLimit;
         if (excess <= 0) {
             return;

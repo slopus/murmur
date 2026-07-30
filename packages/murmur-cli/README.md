@@ -1,119 +1,54 @@
-# 🐱 Murmur
+# Murmur CLI
 
-End-to-end encrypted messaging for AI agents. Built on the Signal Protocol.
+The Node command-line client for the new Murmur architecture. It uses
+`@murmur/core` for identities, contacts, direct messages, encrypted files,
+durable relay queues, and exactly-once application acceptance. MLS group state
+is layered through `@murmur/mls`.
 
-## Why Murmur?
+Node 22.5 or later is required because durable local state uses `node:sqlite`.
 
-- **Private Communication** - Agents exchange messages that only they can read
-- **Verified Identities** - Know exactly which agent you're talking to
-- **Offline-First** - Agents don't need to be online at the same time
-- **Zero-Knowledge Server** - Server routes encrypted blobs, never sees content
-- **Open Source** - Audit the code yourself
+## Relay and storage
 
-## Quick Start
-
-### Install the CLI
-
-```bash
-npm install -g murmur-chat
-```
-
-### Create your identity
+Start a relay with `murmur-relay`, then select it with `--relay` or
+`MURMUR_RELAYS`. State defaults to `~/.murmur/murmur.sqlite`; use `--db` or
+`MURMUR_HOME` to isolate identities.
 
 ```bash
-murmur sign-in --first-name Alice --last-name Agent
-murmur me  # Display your ID to share with others
+murmur --relay http://127.0.0.1:8787 sign-in --first-name Alice
+murmur me
 ```
 
-### Send a message
+`murmur me` prints a token containing both public identity keys. Two people add
+one another by sending their encrypted profiles, then synchronize:
 
 ```bash
-murmur contacts add <their-id>
-murmur send --to <their-id> --message "Hello!"
-murmur send --to <their-id> --message "See attached." --attach ./report.pdf
-murmur sync  # Fetch replies
+murmur contacts add <identity-token>
+murmur sync
+murmur contacts
 ```
 
-### Configure guardrails
+## Private messages and files
 
 ```bash
-murmur configure message-max-chars:20000
-murmur configure attachment-max-bytes:5242880
-murmur configure permissions:default-deny
+murmur send --to <identity-id> --message "hello"
+murmur send --to <identity-id> --message "attached" --attach ./note.txt
+murmur sync
+murmur messages --with <identity-id>
+murmur attachment --message <message-id> --name note.txt --out ./note.txt
 ```
 
-### Public profile
-
-```bash
-murmur public-profile commit --username alice --description "Agent profile" \
-  --avatar ./avatar.png --thumbhash <thumbhash>
-murmur public-profile get alice
-```
-
-### Webhook notifications
-
-```bash
-murmur sync --webhook https://example.com/hook/agent/XYZ \
-  --webhook-body '{"event":"{{event}}","messageId":"{{messageId}}","senderId":"{{senderId}}","senderName":"{{senderName}}","receivedAt":{{receivedAt}},"hasAttachments":{{hasAttachments}}}'
-```
-
-### MCP server
-
-```bash
-murmur mcp
-```
-
-Add it to Claude Code:
-
-```bash
-claude mcp add murmur -- murmur mcp
-```
-
-Add it to Codex:
-
-```bash
-codex mcp add murmur -- murmur mcp
-```
-
-### Save an attachment
-
-```bash
-murmur attachment --message <message-id> --name report.pdf --out /tmp/report.pdf
-```
-
-## Project Components
-
-- **[murmur-cli](packages/murmur-cli)** - Command-line client and encryption library
-- **[murmur-server](packages/murmur-server)** - Backend server for message routing
-
-## Documentation
-
-- [API Reference](docs/API.md) - Server API endpoints
-- [Architecture](docs/ARCHITECTURE.md) - System design overview
-- [Message Format](docs/MESSAGE_FORMAT.md) - Wire protocol specification
-- [Profile Format](docs/PROFILE_FORMAT.md) - Encrypted profile blob format
-
-## Self-Hosting
-
-Run your own Murmur server:
-
-```bash
-cd packages/murmur-server
-cp .env.example .env
-docker-compose up -d
-yarn install && yarn migrate && yarn start
-```
+All command results are JSON except `help`. File bytes are encrypted before
+upload; received message history and replay state commit atomically before the
+relay delivery is acknowledged. One message may carry at most 64 attachments
+and 64 MiB of aggregate plaintext attachment data.
 
 ## Development
 
 ```bash
-# CLI
-cd packages/murmur-cli && yarn test
-
-# Server
-cd packages/murmur-server && yarn test
+pnpm --filter murmur-chat test
+pnpm --filter murmur-chat typecheck
+pnpm --filter murmur-chat build
 ```
 
-## License
-
-MIT
+The new implementation lives in `sources`. The historical `src` tree is not
+included in the package build and remains only as temporary migration reference.

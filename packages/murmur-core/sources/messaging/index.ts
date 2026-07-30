@@ -72,6 +72,14 @@ const MAX_DIRECT_WIRE_BYTES = MAX_RELAY_EVENT_PAYLOAD_BYTES;
 const MAX_MESSAGE_BASE64URL_CHARACTERS = Math.ceil((MAX_MESSAGE_BYTES * 4) / 3);
 const DIRECT_MESSAGE_REPLAY_PREFIX = "private-message-replay/v1";
 
+/** Authenticated reuse of one sender/message ID for different signed content. */
+export class DirectMessageIdCollisionError extends Error {
+    constructor() {
+        super("Authenticated direct private message ID collision");
+        this.name = "DirectMessageIdCollisionError";
+    }
+}
+
 function directSignaturePayload(messageBytes: Uint8Array, recipient: string): Uint8Array {
     return canonicalJsonBytes({
         message: encodeBase64Url(messageBytes),
@@ -358,7 +366,7 @@ export async function acceptPrivateMessageFromContact(
             if (equalBytes(existing, record)) {
                 return "duplicate" as const;
             }
-            throw new Error("Authenticated direct private message ID collision");
+            throw new DirectMessageIdCollisionError();
         });
         const accepted: AcceptedPrivateMessage = {
             ...opened,

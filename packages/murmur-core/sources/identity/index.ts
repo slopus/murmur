@@ -6,6 +6,7 @@ import {
     encodeBase64Url,
     utf8Decode,
     utf8Encode,
+    zeroBytes,
 } from "../utils/index.js";
 import { decodeProfilePayload, encodeProfilePayload } from "./impl/profileCodec.js";
 import type {
@@ -28,6 +29,18 @@ const MAX_PROFILE_BYTES = 1024 * 1024;
 const MAX_PROFILE_PLAINTEXT_BYTES = Math.ceil((MAX_PROFILE_BYTES * 4) / 3) + 1_024;
 const MAX_ENCRYPTED_PROFILE_BYTES = MAX_PROFILE_PLAINTEXT_BYTES + 16;
 const MAX_ENCRYPTED_PROFILE_BASE64URL_CHARACTERS = Math.ceil((MAX_ENCRYPTED_PROFILE_BYTES * 4) / 3);
+
+/** Validate one profile against every core serialization and size bound. */
+export function validateIdentityProfile(profile: IdentityProfile): void {
+    const bytes = encodeProfilePayload(profile);
+    try {
+        if (bytes.length > MAX_PROFILE_BYTES) {
+            throw new Error(`Profile exceeds ${MAX_PROFILE_BYTES} bytes`);
+        }
+    } finally {
+        zeroBytes(bytes);
+    }
+}
 
 /** Serialize an identity's public keys for a wire boundary. */
 export function serializePublicIdentity(identity: IdentityPublicKeys): SerializedPublicIdentity {

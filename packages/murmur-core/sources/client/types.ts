@@ -12,3 +12,15 @@ export interface PublishResult {
     readonly publishedRelayIds: readonly string[];
     readonly failedRelayIds: readonly string[];
 }
+
+/** One retained event which every pending relay still rejected. */
+export interface RetryOutboundFailure {
+    readonly event: RelayEvent;
+    readonly error: Error;
+}
+
+/** Isolated retry results which never hide later records or incoming sync. */
+export interface RetryOutboundReport {
+    readonly results: readonly PublishResult[];
+    readonly failures: readonly RetryOutboundFailure[];
+}

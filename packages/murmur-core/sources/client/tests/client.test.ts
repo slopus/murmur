@@ -70,6 +70,12 @@ class TestTransport implements RelayTransport {
     }
 }
 
+class RejectingTransport extends TestTransport {
+    override async publish(): Promise<void> {
+        throw new Error(`Relay ${this.id} is offline`);
+    }
+}
+
 describe("MurmurClient", () => {
     it("merges duplicate relay deliveries and acknowledges every copy", async () => {
         const alice = generateIdentityKeyPair();
@@ -224,5 +230,51 @@ describe("MurmurClient", () => {
         await aliceDelivery[0]?.acknowledge();
 
         expect(await bobClient.sync()).toHaveLength(1);
+    });
+
+    it("publishes prepared events and isolates retained retry failures", async () => {
+        const alice = generateIdentityKeyPair();
+        const healthy = new TestTransport("healthy");
+        const offline = new RejectingTransport("offline");
+        const client = new MurmurClient({
+            identity: alice,
+            store: new MemoryMurmurStore(),
+            transports: [offline, healthy],
+        });
+        const prepared = createRelayEvent(alice, "direct", utf8Encode("prepared"));
+
+        const published = await client.publishEvent(prepared);
+        const retried = await client.retryOutboundSettled();
+
+        expect(published.event.id).toBe(prepared.id);
+        expect(retried.results).toHaveLength(1);
+        expect(retried.failures).toHaveLength(0);
+
+        const unavailable = new MurmurClient({
+            identity: alice,
+            store: new MemoryMurmurStore(),
+            transports: [offline],
+        });
+        await expect(unavailable.publish("direct", utf8Encode("pending"))).rejects.toThrow();
+        const report = await unavailable.retryOutboundSettled();
+        expect(report.results).toHaveLength(0);
+        expect(report.failures).toHaveLength(1);
+    });
+
+    it("never prunes events still pending on one relay", async () => {
+        const alice = generateIdentityKeyPair();
+        const healthy = new TestTransport("healthy");
+        const offline = new RejectingTransport("offline");
+        const client = new MurmurClient({
+            identity: alice,
+            store: new MemoryMurmurStore(),
+            transports: [healthy, offline],
+            outboundHistoryLimit: 1,
+        });
+
+        await client.publish("direct", utf8Encode("first"));
+        await client.publish("direct", utf8Encode("second"));
+
+        expect((await client.retryOutboundSettled()).results).toHaveLength(2);
     });
 });
