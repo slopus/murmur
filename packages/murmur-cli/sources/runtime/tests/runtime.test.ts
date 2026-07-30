@@ -6,7 +6,7 @@ import {
     utf8Encode,
     type RelayBlob,
     type RelayEvent,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { EmbeddedRelayTransport, MemoryRelayStore, RelayService } from "@murmur/relay";
 import { describe, expect, it } from "vitest";
 import { MurmurCliRuntime, cliDirectMessageTopic, encodeCliIdentityToken } from "../index.js";

@@ -44,7 +44,7 @@ import {
     type RelayBlob,
     type RelayTransport,
     type StoreTransaction,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import {
     MlsEpochState,
     MlsGroupChannel,

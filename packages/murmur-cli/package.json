@@ -36,8 +36,8 @@
         "prepublishOnly": "$npm_execpath run build && $npm_execpath test"
     },
     "dependencies": {
-        "@murmur/core": "workspace:*",
-        "@murmur/mls": "workspace:*"
+        "@murmur/mls": "workspace:*",
+        "@slopus/murmur": "workspace:*"
     },
     "devDependencies": {
         "@murmur/relay": "workspace:*",

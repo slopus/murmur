@@ -1,9 +1,9 @@
 # Murmur CLI
 
-The Node command-line client for the new Murmur architecture. It uses
-`@murmur/core` for identities, contacts, direct messages, encrypted files,
-durable relay queues, and exactly-once application acceptance. MLS group state
-is layered through `@murmur/mls`.
+The Node command-line client for the new Murmur architecture. It uses the
+`@slopus/murmur` library for identities, contacts, direct messages, encrypted
+files, durable relay queues, exactly-once application acceptance, and MLS group
+state.
 
 Node 22.5 or later is required because durable local state uses `node:sqlite`.
 

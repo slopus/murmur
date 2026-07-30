@@ -1,6 +1,6 @@
 import { readFile, stat, writeFile } from "node:fs/promises";
 import { basename } from "node:path";
-import { createDocumentOperationId, identityId, type DocumentOperationId } from "@murmur/core";
+import { createDocumentOperationId, identityId, type DocumentOperationId } from "@slopus/murmur";
 import {
     MAX_CLI_ATTACHMENTS,
     MAX_CLI_ATTACHMENT_BYTES,

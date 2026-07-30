@@ -5,7 +5,7 @@ import {
     hashBytes,
     utf8Encode,
     zeroBytes,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { deriveHpkeKeyPair, mlsSignWithLabel } from "../../cipherSuite/index.js";
 import { createMlsKeyPackage, destroyMlsKeyPackageBundle } from "../../keyPackage/index.js";

@@ -3,7 +3,7 @@
 import { lstat, mkdir } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { HttpRelayTransport } from "@murmur/core";
+import { HttpRelayTransport } from "@slopus/murmur";
 import { runCli } from "./cli/index.js";
 import { MurmurCliRuntime } from "./runtime/index.js";
 import { SqliteMurmurStore } from "./storage/index.js";

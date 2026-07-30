@@ -4,7 +4,7 @@ import {
     hashBytes,
     utf8Encode,
     zeroBytes,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import {
     createMlsAddCommit,

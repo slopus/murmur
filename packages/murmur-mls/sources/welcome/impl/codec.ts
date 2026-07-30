@@ -1,4 +1,4 @@
-import { concatBytes } from "@murmur/core";
+import { concatBytes } from "@slopus/murmur";
 import {
     MLS_CIPHER_SUITE,
     MLS_HASH_LENGTH,

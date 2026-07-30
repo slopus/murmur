@@ -6,7 +6,7 @@ import type {
     RelayEvent,
     RelayTransport,
     TopicSubscription,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import type { RelayService } from "../relay/index.js";
 
 /** In-process transport over a relay service. */

@@ -1,8 +1,8 @@
-# `@murmur/core`
+# `@slopus/murmur`
 
-Transport-neutral, end-to-end encrypted messaging primitives for browsers and
-Node.js. The package provides identities, authenticated profiles, direct
-messages, encrypted files, durable relay delivery, and convergent text
+Transport-neutral, end-to-end encrypted messaging for browsers and Node.js. The
+single package provides identities, authenticated profiles, direct messages,
+encrypted files, durable relay delivery, MLS groups, and convergent text
 documents. Applications own message semantics and provide durable storage.
 
 ```text
@@ -19,14 +19,14 @@ The package is ESM-only, side-effect free, and includes TypeScript declarations
 and source maps. It has no Node.js imports. Node.js 20 or later is supported;
 modern browsers can use the same exports.
 
-> `@murmur/core` is a `0.x` API and has not received an independent security
-> audit. MLS groups live in the separate experimental `@murmur/mls` package and
-> are not part of this package's stable surface.
+> `@slopus/murmur` is a `0.x` API and has not received an independent security
+> audit. Its MLS implementation is an experimental Murmur profile and remains
+> an RFC 9420 subset.
 
 ## Install
 
 ```bash
-pnpm add @murmur/core
+pnpm add @slopus/murmur
 ```
 
 ## Start a client
@@ -39,7 +39,7 @@ import {
     generateIdentityKeyPair,
     identityInboxTopic,
     utf8Decode,
-} from "@murmur/core";
+} from "@slopus/murmur";
 
 const identity = generateIdentityKeyPair();
 const store = new MemoryMurmurStore();
@@ -67,25 +67,28 @@ store.
 
 ## Public API
 
-Everything is available from `@murmur/core`. Domain subpaths are also public for
-smaller, explicit imports:
+The common API is available from `@slopus/murmur`. Domain subpaths and the MLS
+API are part of the same npm package:
 
 ```typescript
-import { MurmurClient } from "@murmur/core/client";
-import { generateIdentityKeyPair } from "@murmur/core/crypto";
-import type { RelayTransport } from "@murmur/core/transport";
+import { MurmurClient } from "@slopus/murmur/client";
+import { generateIdentityKeyPair } from "@slopus/murmur/crypto";
+import { MlsGroupChannel } from "@slopus/murmur/mls";
+import type { RelayTransport } from "@slopus/murmur/transport";
 ```
 
-| Import                   | Main API                                                                                        |
-| ------------------------ | ----------------------------------------------------------------------------------------------- |
-| `@murmur/core/client`    | `MurmurClient`, `PublishResult`, `ReceivedEvent`, `RetryOutboundReport`                         |
-| `@murmur/core/crypto`    | identity generation/import/destruction, signing, verification, sealed boxes, hashing            |
-| `@murmur/core/identity`  | public identity serialization, inbox topics, encrypted profiles, `ContactBook`                  |
-| `@murmur/core/messaging` | direct-message encryption and acceptance, file encryption, message codecs and limits            |
-| `@murmur/core/transport` | `RelayTransport`, `HttpRelayTransport`, signed relay events, queue requests, blobs, wire codecs |
-| `@murmur/core/storage`   | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                          |
-| `@murmur/core/document`  | `SharedTextDocument` and convergent insert/delete operations                                    |
-| `@murmur/core/utils`     | strict base64url, UTF-8, canonical JSON, byte comparison and zeroing                            |
+| Import                     | Main API                                                                                        |
+| -------------------------- | ----------------------------------------------------------------------------------------------- |
+| `@slopus/murmur`           | complete common API                                                                             |
+| `@slopus/murmur/client`    | `MurmurClient`, `PublishResult`, `ReceivedEvent`, `RetryOutboundReport`                         |
+| `@slopus/murmur/crypto`    | identity generation/import/destruction, signing, verification, sealed boxes, hashing            |
+| `@slopus/murmur/identity`  | public identity serialization, inbox topics, encrypted profiles, `ContactBook`                  |
+| `@slopus/murmur/messaging` | direct-message encryption and acceptance, file encryption, message codecs and limits            |
+| `@slopus/murmur/mls`       | MLS groups, epochs, KeyPackages, Commits, Welcome, TreeKEM, and private messages                |
+| `@slopus/murmur/transport` | `RelayTransport`, `HttpRelayTransport`, signed relay events, queue requests, blobs, wire codecs |
+| `@slopus/murmur/storage`   | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                          |
+| `@slopus/murmur/document`  | `SharedTextDocument` and convergent insert/delete operations                                    |
+| `@slopus/murmur/utils`     | strict base64url, UTF-8, canonical JSON, byte comparison and zeroing                            |
 
 ### `MurmurClient`
 
@@ -188,13 +191,13 @@ interface MurmurStore {
 
 ## Publish
 
-The `prepack` lifecycle runs tests, strict TypeScript validation, and a clean
-declaration build before npm creates the tarball:
+The `prepack` lifecycle runs common and MLS tests, strict TypeScript validation,
+and a clean declaration build before npm creates the single tarball:
 
 ```bash
-pnpm --filter @murmur/core pack
-pnpm --filter @murmur/core publish
+pnpm --filter @slopus/murmur pack
+pnpm --filter @slopus/murmur publish
 ```
 
-Publishing requires npm access to the public `@murmur` scope. The package
+Publishing requires npm access to the public `@slopus` scope. The package
 metadata sets public access and the npm registry explicitly.

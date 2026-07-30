@@ -1,6 +1,8 @@
-# `@murmur/mls`
+# MLS internals
 
-Murmur's browser-safe path toward RFC 9420.
+Murmur's browser-safe path toward RFC 9420. This workspace package is private;
+its public API ships inside the single `@slopus/murmur` npm package and is
+available from `@slopus/murmur/mls`.
 
 The implementation is built in conformance layers:
 

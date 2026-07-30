@@ -1,4 +1,4 @@
-import { concatBytes, equalBytes, randomBytes, zeroBytes } from "@murmur/core";
+import { concatBytes, equalBytes, randomBytes, zeroBytes } from "@slopus/murmur";
 import {
     MLS_AEAD_KEY_LENGTH,
     MLS_AEAD_NONCE_LENGTH,

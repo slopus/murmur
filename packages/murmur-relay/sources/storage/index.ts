@@ -8,7 +8,7 @@ import {
     type RelayDelivery,
     type RelayEvent,
     type TopicSubscription,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import type { PruneResult } from "../relay/types.js";
 import type { RelayPublishResult, RelayStore } from "./types.js";
 

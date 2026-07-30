@@ -1,6 +1,7 @@
 {
     "name": "murmur-server",
     "version": "1.0.0",
+    "private": true,
     "description": "Encrypted message transfer server with NaCl-based authentication",
     "license": "MIT",
     "author": "Steve Korshakov <steve@korshakov.com>",

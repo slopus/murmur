@@ -1,4 +1,4 @@
-import { generateIdentityKeyPair } from "@murmur/core";
+import { generateIdentityKeyPair } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import {
     createMlsKeyPackage,

@@ -5,7 +5,7 @@ import {
     zeroBytes,
     type PublishResult,
     type ReceivedEvent,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { MlsLocalMemberRemovedError } from "../commit/index.js";
 import { MlsEpochState, type MlsEpochCommitProposal } from "../epoch/index.js";
 import type {

@@ -5,7 +5,7 @@ runtime. Domain modules keep durable storage, user-facing command parsing, and
 encrypted messaging behavior separate.
 
 ```text
-main.ts -> cli -> runtime -> @murmur/core / @murmur/mls
+main.ts -> cli -> runtime -> @slopus/murmur + private MLS workspace
                     |
                  storage -> SQLite
 ```

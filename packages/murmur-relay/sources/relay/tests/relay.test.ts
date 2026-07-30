@@ -15,7 +15,7 @@ import {
     type IdentityKeyPair,
     type RelayEvent,
     type TopicSubscription,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { RelayService } from "../index.js";
 import { MemoryRelayStore } from "../../storage/index.js";

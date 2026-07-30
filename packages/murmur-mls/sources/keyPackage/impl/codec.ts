@@ -1,4 +1,4 @@
-import { concatBytes } from "@murmur/core";
+import { concatBytes } from "@slopus/murmur";
 import { MLS_CIPHER_SUITE, MLS_PROTOCOL_VERSION } from "../../cipherSuite/index.js";
 import { decodeVarint, encodeOpaqueV, encodeUint16 } from "../../encoding/index.js";
 import {

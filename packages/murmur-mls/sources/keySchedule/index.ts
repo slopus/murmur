@@ -4,7 +4,7 @@ import {
     mlsExpandWithLabel,
     mlsExtract,
 } from "../cipherSuite/index.js";
-import { zeroBytes } from "@murmur/core";
+import { zeroBytes } from "@slopus/murmur";
 import type { MlsEpochSecrets } from "./types.js";
 
 export type { MlsEpochSecrets } from "./types.js";

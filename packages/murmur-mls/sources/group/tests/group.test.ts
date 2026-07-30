@@ -1,4 +1,4 @@
-import { equalBytes, generateIdentityKeyPair, utf8Decode, utf8Encode } from "@murmur/core";
+import { equalBytes, generateIdentityKeyPair, utf8Decode, utf8Encode } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { createMlsTreeEpochFromWelcome, MlsEpochState } from "../../epoch/index.js";
 import { authenticateMurmurMlsCredential, createMlsGroup } from "../index.js";

@@ -26,12 +26,12 @@ importers:
 
   packages/murmur-cli:
     dependencies:
-      '@murmur/core':
-        specifier: workspace:*
-        version: link:../murmur-core
       '@murmur/mls':
         specifier: workspace:*
         version: link:../murmur-mls
+      '@slopus/murmur':
+        specifier: workspace:*
+        version: link:../murmur-core
     devDependencies:
       '@murmur/relay':
         specifier: workspace:*
@@ -70,9 +70,6 @@ importers:
 
   packages/murmur-mls:
     dependencies:
-      '@murmur/core':
-        specifier: workspace:*
-        version: link:../murmur-core
       '@noble/ciphers':
         specifier: ^1.2.1
         version: 1.3.0
@@ -82,6 +79,9 @@ importers:
       '@noble/hashes':
         specifier: ^1.7.1
         version: 1.8.0
+      '@slopus/murmur':
+        specifier: workspace:*
+        version: link:../murmur-core
     devDependencies:
       typescript:
         specifier: ^5.9.3
@@ -92,7 +92,7 @@ importers:
 
   packages/murmur-relay:
     dependencies:
-      '@murmur/core':
+      '@slopus/murmur':
         specifier: workspace:*
         version: link:../murmur-core
     devDependencies:
@@ -105,12 +105,12 @@ importers:
 
   packages/murmur-relay-node:
     dependencies:
-      '@murmur/core':
-        specifier: workspace:*
-        version: link:../murmur-core
       '@murmur/relay':
         specifier: workspace:*
         version: link:../murmur-relay
+      '@slopus/murmur':
+        specifier: workspace:*
+        version: link:../murmur-core
     devDependencies:
       '@types/node':
         specifier: ^24.0.10

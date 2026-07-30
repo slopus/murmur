@@ -1,6 +1,7 @@
 {
     "name": "@murmur/relay-node",
     "version": "0.1.0",
+    "private": true,
     "description": "Durable SQLite and HTTP host for the Murmur rendezvous relay",
     "bin": {
         "murmur-relay": "./dist/server/main.js"
@@ -26,8 +27,8 @@
         "test:watch": "NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest"
     },
     "dependencies": {
-        "@murmur/core": "workspace:*",
-        "@murmur/relay": "workspace:*"
+        "@murmur/relay": "workspace:*",
+        "@slopus/murmur": "workspace:*"
     },
     "devDependencies": {
         "@types/node": "^24.0.10",

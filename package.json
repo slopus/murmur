@@ -3,12 +3,12 @@
     "private": true,
     "type": "module",
     "scripts": {
-        "build": "pnpm --filter @murmur/core build && pnpm --filter @murmur/mls build && pnpm --filter @murmur/relay build && pnpm --filter @murmur/relay-node build && pnpm --filter murmur-chat build && pnpm --filter murmur-server build",
+        "build": "pnpm --filter @slopus/murmur build && pnpm --filter @murmur/relay build && pnpm --filter @murmur/relay-node build && pnpm --filter murmur-chat build && pnpm --filter murmur-server build",
         "format": "oxfmt --write .",
         "format:check": "oxfmt --check .",
         "lint": "oxlint .",
-        "test": "pnpm --recursive --filter './packages/**' run test",
-        "typecheck": "pnpm --filter @murmur/core check && pnpm --filter @murmur/mls check && pnpm --filter @murmur/relay check && pnpm --filter @murmur/relay-node check && pnpm --filter murmur-chat typecheck && pnpm --filter murmur-server build"
+        "test": "pnpm --filter @slopus/murmur build && pnpm --recursive --filter './packages/**' run test",
+        "typecheck": "pnpm --filter @slopus/murmur build && pnpm --filter @slopus/murmur check && pnpm --filter @murmur/mls check && pnpm --filter @murmur/relay check && pnpm --filter @murmur/relay-node check && pnpm --filter murmur-chat typecheck && pnpm --filter murmur-server build"
     },
     "devDependencies": {
         "@types/node": "^24.0.10",

@@ -1,4 +1,4 @@
-import { createDocumentInsert, createDocumentOperationId, encodeBase64Url } from "@murmur/core";
+import { createDocumentInsert, createDocumentOperationId, encodeBase64Url } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import {
     applyCliDocumentOperation,

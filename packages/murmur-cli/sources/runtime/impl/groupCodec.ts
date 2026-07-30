@@ -7,7 +7,7 @@ import {
     utf8Decode,
     utf8Encode,
     type RelayEvent,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import type { CliGroupMessage, CliStoredGroupMessage } from "../types.js";
 
 const MAXIMUM_GROUP_NAME_BYTES = 128;

@@ -14,7 +14,7 @@ import {
     type EncryptedProfile,
     type IdentityProfile,
     type RelayEvent,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { decodeMlsKeyPackage, encodeMlsKeyPackage, type MlsKeyPackage } from "@murmur/mls";
 import type { CliAccount, CliStoredMessage } from "../types.js";
 

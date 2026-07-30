@@ -1,4 +1,4 @@
-import { equalBytes, randomBytes, zeroBytes, type IdentityKeyPair } from "@murmur/core";
+import { equalBytes, randomBytes, zeroBytes, type IdentityKeyPair } from "@slopus/murmur";
 import { MlsEpochState } from "../epoch/index.js";
 import {
     createMlsConfirmationTag,

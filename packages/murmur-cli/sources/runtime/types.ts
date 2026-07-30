@@ -5,7 +5,7 @@ import type {
     IdentityPublicKeys,
     DocumentOperation,
     PrivateMessage,
-} from "@murmur/core";
+} from "@slopus/murmur";
 
 /** Durable local account owned by one CLI data directory. */
 export interface CliAccount {

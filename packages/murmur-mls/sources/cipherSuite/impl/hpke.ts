@@ -3,7 +3,7 @@ import { x25519 } from "@noble/curves/ed25519";
 import { expand as hkdfExpand, extract as hkdfExtract } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
 import { randomBytes } from "@noble/hashes/utils";
-import { concatBytes, utf8Encode, zeroBytes } from "@murmur/core";
+import { concatBytes, utf8Encode, zeroBytes } from "@slopus/murmur";
 import type { HpkeCiphertext, HpkeKeyPair } from "../types.js";
 
 const EMPTY = new Uint8Array();

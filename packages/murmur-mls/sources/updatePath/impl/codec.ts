@@ -1,4 +1,4 @@
-import { concatBytes } from "@murmur/core";
+import { concatBytes } from "@slopus/murmur";
 import { decodeVarint, encodeOpaqueV } from "../../encoding/index.js";
 import {
     decodeMlsLeafNode,

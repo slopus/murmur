@@ -7,7 +7,7 @@ import {
     encodeRelayDeliveriesWire,
     type QueueAcknowledgeRequest,
     type QueueReadRequest,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { RelayProtocolError, type RelayService } from "../relay/index.js";
 
 const MAXIMUM_JSON_BODY_BYTES = 4 * 1024 * 1024;

@@ -5,7 +5,7 @@ import {
     hashBytes,
     utf8Decode,
     utf8Encode,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import {
     createMlsEpochFromWelcome,

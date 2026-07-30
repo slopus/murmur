@@ -1,4 +1,4 @@
-import { generateIdentityKeyPair, hashBytes, utf8Decode, utf8Encode } from "@murmur/core";
+import { generateIdentityKeyPair, hashBytes, utf8Decode, utf8Encode } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { type MlsGroupContext } from "../../groupContext/index.js";
 import { MlsSecretTree } from "../../secretTree/index.js";

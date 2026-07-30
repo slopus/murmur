@@ -1,4 +1,4 @@
-import { randomBytes, utf8Encode } from "@murmur/core";
+import { randomBytes, utf8Encode } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { deriveMlsEpochSecrets, deriveMlsInitialEpochSecrets } from "../index.js";
 

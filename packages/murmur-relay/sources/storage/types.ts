@@ -1,4 +1,4 @@
-import type { RelayBlob, RelayDelivery, RelayEvent, TopicSubscription } from "@murmur/core";
+import type { RelayBlob, RelayDelivery, RelayEvent, TopicSubscription } from "@slopus/murmur";
 import type { PruneResult } from "../relay/types.js";
 
 /** Result of atomically recording and fanning out a publication. */

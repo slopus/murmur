@@ -1,4 +1,4 @@
-import { concatBytes, encodeBase64Url, equalBytes, hashBytes } from "@murmur/core";
+import { concatBytes, encodeBase64Url, equalBytes, hashBytes } from "@slopus/murmur";
 import { canonicalizeHpkePublicKey, MLS_HASH_LENGTH } from "../cipherSuite/index.js";
 import { encodeOpaqueV, encodeUint32 } from "../encoding/index.js";
 import { decodeMlsLeafNodeBytes, verifyMlsLeafNodeSignature } from "../leafNode/index.js";

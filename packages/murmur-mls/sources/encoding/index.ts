@@ -1,4 +1,4 @@
-import { concatBytes } from "@murmur/core";
+import { concatBytes } from "@slopus/murmur";
 
 const MAXIMUM_VARINT = (1n << 30n) - 1n;
 

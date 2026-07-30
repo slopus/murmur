@@ -10,7 +10,7 @@ import {
     type RelayDelivery,
     type RelayEvent,
     type TopicSubscription,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import type { PruneResult, RelayPublishResult, RelayStore } from "@murmur/relay";
 
 function eventFingerprint(event: RelayEvent): string {

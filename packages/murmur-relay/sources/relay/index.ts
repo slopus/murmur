@@ -12,7 +12,7 @@ import {
     type RelayDelivery,
     type RelayEvent,
     type TopicSubscription,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import type { RelayStore } from "../storage/index.js";
 import type { PruneResult, RelayOptions } from "./types.js";
 

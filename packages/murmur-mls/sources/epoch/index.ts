@@ -1,4 +1,4 @@
-import { equalBytes, zeroBytes } from "@murmur/core";
+import { equalBytes, zeroBytes } from "@slopus/murmur";
 import {
     canonicalizeHpkePublicKey,
     isHpkeKeyPair,

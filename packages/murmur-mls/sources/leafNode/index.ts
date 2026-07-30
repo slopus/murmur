@@ -1,4 +1,4 @@
-import { concatBytes, equalBytes } from "@murmur/core";
+import { concatBytes, equalBytes } from "@slopus/murmur";
 import {
     canonicalizeHpkePublicKey,
     MLS_CIPHER_SUITE,

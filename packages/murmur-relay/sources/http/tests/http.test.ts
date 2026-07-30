@@ -7,7 +7,7 @@ import {
     encodeRelayEventWire,
     utf8Decode,
     utf8Encode,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { RelayService } from "../../relay/index.js";
 import { MemoryRelayStore } from "../../storage/index.js";

@@ -1,6 +1,6 @@
-import { equalBytes, generateIdentityKeyPair, hashBytes, utf8Encode } from "@murmur/core";
+import { equalBytes, generateIdentityKeyPair, hashBytes, utf8Encode } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
-import { type IdentityKeyPair } from "@murmur/core";
+import { type IdentityKeyPair } from "@slopus/murmur";
 import {
     createMlsKeyPackage,
     destroyMlsKeyPackageBundle,

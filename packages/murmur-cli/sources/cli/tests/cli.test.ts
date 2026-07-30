@@ -1,4 +1,4 @@
-import { MemoryMurmurStore } from "@murmur/core";
+import { MemoryMurmurStore } from "@slopus/murmur";
 import { EmbeddedRelayTransport, MemoryRelayStore, RelayService } from "@murmur/relay";
 import { describe, expect, it } from "vitest";
 import { MurmurCliRuntime } from "../../runtime/index.js";

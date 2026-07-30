@@ -6,7 +6,7 @@ import {
     utf8Decode,
     zeroBytes,
     type JsonValue,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import {
     decodeMlsGroupContext,
     encodeMlsGroupContext,

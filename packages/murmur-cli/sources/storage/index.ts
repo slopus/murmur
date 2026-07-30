@@ -1,6 +1,6 @@
 import { chmodSync, closeSync, existsSync, lstatSync, openSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
-import type { MurmurStore, StoreTransaction } from "@murmur/core";
+import type { MurmurStore, StoreTransaction } from "@slopus/murmur";
 
 const MAXIMUM_KEY_CHARACTERS = 4_096;
 const MAXIMUM_VALUE_BYTES = 64 * 1024 * 1024;

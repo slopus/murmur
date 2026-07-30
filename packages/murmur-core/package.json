@@ -1,11 +1,12 @@
 {
-    "name": "@murmur/core",
+    "name": "@slopus/murmur",
     "version": "0.1.0",
-    "description": "Transport-agnostic encrypted messaging primitives for Murmur",
+    "description": "Transport-agnostic encrypted messaging and MLS for Murmur",
     "keywords": [
         "encrypted-messaging",
         "end-to-end-encryption",
         "messaging",
+        "mls",
         "relay",
         "typescript"
     ],
@@ -51,6 +52,10 @@
             "types": "./dist/identity/index.d.ts",
             "import": "./dist/identity/index.js"
         },
+        "./mls": {
+            "types": "./dist/mls/index.d.ts",
+            "import": "./dist/mls/index.js"
+        },
         "./messaging": {
             "types": "./dist/messaging/index.d.ts",
             "import": "./dist/messaging/index.js"
@@ -75,11 +80,11 @@
     },
     "scripts": {
         "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
-        "build": "pnpm run clean && tsc -p tsconfig.build.json",
+        "build": "pnpm run clean && tsc -p tsconfig.build.json && pnpm --dir ../murmur-mls build && node --input-type=module -e \"import { cpSync } from 'node:fs'; cpSync('../murmur-mls/dist', 'dist/mls', { recursive: true });\"",
         "check": "tsc --noEmit -p tsconfig.json",
         "test": "vitest run",
         "test:watch": "vitest",
-        "prepack": "pnpm run test && pnpm run check && pnpm run build"
+        "prepack": "pnpm run check && pnpm run build && pnpm run test && pnpm --filter @murmur/mls test"
     },
     "dependencies": {
         "@noble/ciphers": "^1.2.1",

@@ -1,4 +1,4 @@
-import { encodeBase64Url, equalBytes, randomBytes, zeroBytes } from "@murmur/core";
+import { encodeBase64Url, equalBytes, randomBytes, zeroBytes } from "@slopus/murmur";
 import {
     canonicalizeHpkePublicKey,
     deriveHpkeKeyPair,

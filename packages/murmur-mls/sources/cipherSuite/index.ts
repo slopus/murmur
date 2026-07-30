@@ -10,7 +10,7 @@ import {
     utf8Encode,
     verifyBytes,
     zeroBytes,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { encodeOpaqueV, encodeUint16 } from "../encoding/index.js";
 import { hpkeOpenBase, hpkeSealBase } from "./impl/hpke.js";
 import type { HpkeCiphertext, HpkeKeyPair } from "./types.js";

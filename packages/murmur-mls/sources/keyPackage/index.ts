@@ -4,7 +4,7 @@ import {
     randomBytes,
     type IdentityKeyPair,
     zeroBytes,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import {
     canonicalizeHpkePublicKey,
     deriveHpkeKeyPair,

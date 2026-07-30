@@ -1,4 +1,4 @@
-import { encodeBase64Url, equalBytes, zeroBytes } from "@murmur/core";
+import { encodeBase64Url, equalBytes, zeroBytes } from "@slopus/murmur";
 import {
     canonicalizeHpkePublicKey,
     MLS_HASH_LENGTH,

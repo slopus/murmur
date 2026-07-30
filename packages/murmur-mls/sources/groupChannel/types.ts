@@ -1,4 +1,4 @@
-import type { MurmurClient, PublishResult, ReceivedEvent } from "@murmur/core";
+import type { MurmurClient, PublishResult, ReceivedEvent } from "@slopus/murmur";
 import type { MlsEpochCommitProposal } from "../epoch/index.js";
 import type { OpenedMlsApplicationMessage } from "../privateMessage/index.js";
 import type { MlsRatchetTree } from "../ratchetTree/index.js";

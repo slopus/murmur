@@ -9,7 +9,7 @@ import {
     utf8Encode,
     type DocumentOperation,
     type DocumentOperationId,
-} from "@murmur/core";
+} from "@slopus/murmur";
 
 const MAXIMUM_DOCUMENT_NAME_BYTES = 128;
 const MAXIMUM_DOCUMENT_RECORD_BYTES = 16 * 1024 * 1024;

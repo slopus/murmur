@@ -10,7 +10,7 @@ import {
     generateIdentityKeyPair,
     utf8Decode,
     utf8Encode,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { RelayService } from "@murmur/relay";
 import { afterEach, describe, expect, it } from "vitest";
 import { SqliteRelayStore } from "../index.js";

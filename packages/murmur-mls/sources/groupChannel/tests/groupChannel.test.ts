@@ -7,7 +7,7 @@ import {
     utf8Encode,
     type PublishResult,
     type ReceivedEvent,
-} from "@murmur/core";
+} from "@slopus/murmur";
 import { describe, expect, it, vi } from "vitest";
 import { MlsEpochState } from "../../epoch/index.js";
 import { encodeMlsGroupContext, type MlsGroupContext } from "../../groupContext/index.js";
