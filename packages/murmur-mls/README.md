@@ -9,8 +9,9 @@ The implementation is built in conformance layers:
    math.
 3. KeyPackage, Welcome, Proposal, Commit, and application-message state.
 
-The package now includes authenticated add-only PublicMessage Commits with an
-external ratchet tree. Remove and Update still require TreeKEM UpdatePath
-support, so this remains an RFC subset rather than a complete MLS
+The package now includes authenticated add-only PublicMessage Commits plus RFC
+TreeKEM public-tree validation and UpdatePath creation/opening. Authenticated
+Remove proposals and Commit integration with the new TreeKEM state are still
+in progress, so this remains an RFC subset rather than a complete MLS
 implementation. Code only claims RFC behavior implemented and tested in that
 layer. A Murmur-specific group protocol is never labeled MLS.

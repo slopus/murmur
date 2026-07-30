@@ -180,6 +180,8 @@ export function encodeMlsGroupInfo(groupInfo: MlsGroupInfo): Uint8Array {
 /** Decode the extension-free RFC 9420 GroupInfo profile. */
 export function decodeMlsGroupInfo(bytes: Uint8Array): MlsGroupInfo {
     const reader = new WelcomeReader(bytes);
+    const version = reader.readUint16();
+    const cipherSuite = reader.readUint16();
     const contextBytesStart = reader.readOpaqueV(255);
     // GroupContext is not nested on the wire. Reconstruct its exact encoding
     // from sequential fields so its shared strict decoder remains authoritative.
@@ -188,6 +190,8 @@ export function decodeMlsGroupInfo(bytes: Uint8Array): MlsGroupInfo {
     const transcriptHash = reader.readOpaqueV(MLS_HASH_LENGTH);
     const contextExtensions = reader.readOpaqueV(0);
     const contextBytes = concatBytes(
+        encodeUint16(version),
+        encodeUint16(cipherSuite),
         encodeOpaqueV(contextBytesStart),
         epoch,
         encodeOpaqueV(treeHash),

@@ -12,6 +12,34 @@ import {
 import { ed25519 } from "@noble/curves/ed25519";
 
 describe("RFC 9180 HPKE base mode", () => {
+    it("opens the official X25519/HKDF-SHA256/AES-128-GCM vector", () => {
+        const fromHex = (value: string): Uint8Array => Uint8Array.from(Buffer.from(value, "hex"));
+        const plaintext = hpkeOpenBase(
+            {
+                secretKey: fromHex(
+                    "4612c550263fc8ad58375df3f557aac531d26850903e55a9f23f21d8534e8ac8",
+                ),
+                publicKey: fromHex(
+                    "3948cfe0ad1ddb695d780e59077195da6c56506b027329794ab02bca80815c4d",
+                ),
+            },
+            fromHex("4f6465206f6e2061204772656369616e2055726e"),
+            fromHex("436f756e742d30"),
+            {
+                encapsulatedKey: fromHex(
+                    "37fda3567bdbd628e88668c3c8d7e97d1d1253b6d4ea6d44c150f741f1bf4431",
+                ),
+                ciphertext: fromHex(
+                    "f938558b5d72f1a23810b4be2ab4f84331acc02fc97babc53a52ae8218a355a96d8770ac83d07bea87e13c512a",
+                ),
+            },
+        );
+
+        expect(Buffer.from(plaintext).toString("hex")).toBe(
+            "4265617574792069732074727574682c20747275746820626561757479",
+        );
+    });
+
     it("round trips and binds info plus associated data", () => {
         const recipient = deriveHpkeKeyPair(randomBytes(32));
         const info = utf8Encode("group context");

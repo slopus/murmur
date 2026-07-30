@@ -1,6 +1,12 @@
 import { concatBytes, equalBytes, hashBytes } from "@murmur/core";
-import { MLS_HASH_LENGTH, mlsMac, mlsVerifyMac } from "../cipherSuite/index.js";
-import { decodeVarint, encodeOpaqueV, encodeUint64 } from "../encoding/index.js";
+import {
+    MLS_CIPHER_SUITE,
+    MLS_HASH_LENGTH,
+    MLS_PROTOCOL_VERSION,
+    mlsMac,
+    mlsVerifyMac,
+} from "../cipherSuite/index.js";
+import { decodeVarint, encodeOpaqueV, encodeUint16, encodeUint64 } from "../encoding/index.js";
 import type { MlsGroupContext } from "./types.js";
 
 export type { MlsGroupContext } from "./types.js";
@@ -18,6 +24,10 @@ class Reader {
             throw new Error("Truncated MLS GroupContext");
         }
         return this.bytes[this.#offset++] ?? 0;
+    }
+
+    readUint16(): number {
+        return (this.readUint8() << 8) | this.readUint8();
     }
 
     readUint64(): bigint {
@@ -67,6 +77,8 @@ function validateGroupContext(context: MlsGroupContext): void {
 export function encodeMlsGroupContext(context: MlsGroupContext): Uint8Array {
     validateGroupContext(context);
     return concatBytes(
+        encodeUint16(MLS_PROTOCOL_VERSION),
+        encodeUint16(MLS_CIPHER_SUITE),
         encodeOpaqueV(context.groupId),
         encodeUint64(context.epoch),
         encodeOpaqueV(context.treeHash),
@@ -78,6 +90,9 @@ export function encodeMlsGroupContext(context: MlsGroupContext): Uint8Array {
 /** Decode the extension-free RFC 9420 GroupContext profile. */
 export function decodeMlsGroupContext(bytes: Uint8Array): MlsGroupContext {
     const reader = new Reader(bytes);
+    if (reader.readUint16() !== MLS_PROTOCOL_VERSION || reader.readUint16() !== MLS_CIPHER_SUITE) {
+        throw new Error("Unsupported MLS GroupContext profile");
+    }
     const context: MlsGroupContext = {
         groupId: reader.readOpaqueV(MAXIMUM_GROUP_ID_BYTES),
         epoch: reader.readUint64(),

@@ -1,18 +1,17 @@
 import { concatBytes } from "@murmur/core";
 import { MLS_CIPHER_SUITE, MLS_PROTOCOL_VERSION } from "../../cipherSuite/index.js";
-import { decodeVarint, encodeOpaqueV, encodeUint16, encodeUint64 } from "../../encoding/index.js";
-import type { MlsBasicCredential, MlsKeyPackage, MlsKeyPackageLeafNode } from "../types.js";
+import { decodeVarint, encodeOpaqueV, encodeUint16 } from "../../encoding/index.js";
+import {
+    decodeMlsLeafNode,
+    defaultMlsLeafCapabilities,
+    encodeMlsLeafNode,
+    encodeMlsLeafNodeTbs,
+    type MlsLeafNode,
+    type MlsLeafNodeReader,
+} from "../../leafNode/index.js";
+import type { MlsKeyPackage, MlsKeyPackageLeafNode } from "../types.js";
 
-const CREDENTIAL_TYPE_BASIC = 1;
-const LEAF_NODE_SOURCE_KEY_PACKAGE = 1;
-const SUPPORTED_PROPOSALS = [1, 2, 3] as const;
-
-export interface MlsKeyPackageReader {
-    readUint8(): number;
-    readUint16(): number;
-    readUint64(): bigint;
-    readOpaqueV(): Uint8Array;
-}
+export interface MlsKeyPackageReader extends MlsLeafNodeReader {}
 
 class Reader implements MlsKeyPackageReader {
     #offset = 0;
@@ -30,6 +29,15 @@ class Reader implements MlsKeyPackageReader {
         return (this.readUint8() << 8) | this.readUint8();
     }
 
+    readUint32(): number {
+        return (
+            this.readUint8() * 0x1_00_00_00 +
+            (this.readUint8() << 16) +
+            (this.readUint8() << 8) +
+            this.readUint8()
+        );
+    }
+
     readUint64(): bigint {
         let value = 0n;
         for (let index = 0; index < 8; index += 1) {
@@ -38,10 +46,10 @@ class Reader implements MlsKeyPackageReader {
         return value;
     }
 
-    readOpaqueV(): Uint8Array {
+    readOpaqueV(maximumBytes: number = 16 * 1024 * 1024): Uint8Array {
         const decoded = decodeVarint(this.bytes, this.#offset);
         this.#offset += decoded.bytesRead;
-        if (decoded.value > BigInt(Number.MAX_SAFE_INTEGER)) {
+        if (decoded.value > BigInt(maximumBytes)) {
             throw new Error("MLS vector is too large");
         }
         const length = Number(decoded.value);
@@ -60,102 +68,51 @@ class Reader implements MlsKeyPackageReader {
     }
 }
 
-function encodeUint16Vector(values: readonly number[]): Uint8Array {
-    return encodeOpaqueV(concatBytes(...values.map((value) => encodeUint16(value))));
-}
-
-function decodeUint16Vector(reader: MlsKeyPackageReader): readonly number[] {
-    const encoded = reader.readOpaqueV();
-    if (encoded.length % 2 !== 0) {
-        throw new Error("Invalid uint16 MLS vector");
-    }
-    const result: number[] = [];
-    for (let index = 0; index < encoded.length; index += 2) {
-        result.push(((encoded[index] ?? 0) << 8) | (encoded[index + 1] ?? 0));
-    }
-    return result;
-}
-
-function encodeCredential(credential: MlsBasicCredential): Uint8Array {
-    return concatBytes(encodeUint16(CREDENTIAL_TYPE_BASIC), encodeOpaqueV(credential.identity));
-}
-
-function decodeCredential(reader: MlsKeyPackageReader): MlsBasicCredential {
-    if (reader.readUint16() !== CREDENTIAL_TYPE_BASIC) {
-        throw new Error("Unsupported MLS credential type");
-    }
-    return { identity: reader.readOpaqueV() };
-}
-
-function encodeCapabilities(): Uint8Array {
-    return concatBytes(
-        encodeUint16Vector([MLS_PROTOCOL_VERSION]),
-        encodeUint16Vector([MLS_CIPHER_SUITE]),
-        encodeUint16Vector([]),
-        encodeUint16Vector(SUPPORTED_PROPOSALS),
-        encodeUint16Vector([CREDENTIAL_TYPE_BASIC]),
-    );
-}
-
-function decodeCapabilities(reader: MlsKeyPackageReader): void {
-    const [versions, suites, extensions, proposals, credentials] = [
-        decodeUint16Vector(reader),
-        decodeUint16Vector(reader),
-        decodeUint16Vector(reader),
-        decodeUint16Vector(reader),
-        decodeUint16Vector(reader),
-    ];
-    if (
-        versions.length !== 1 ||
-        versions[0] !== MLS_PROTOCOL_VERSION ||
-        suites.length !== 1 ||
-        suites[0] !== MLS_CIPHER_SUITE ||
-        extensions.length !== 0 ||
-        proposals.length !== SUPPORTED_PROPOSALS.length ||
-        proposals.some((proposal, index) => proposal !== SUPPORTED_PROPOSALS[index]) ||
-        credentials.length !== 1 ||
-        credentials[0] !== CREDENTIAL_TYPE_BASIC
-    ) {
-        throw new Error("Unsupported MLS capabilities");
-    }
+function genericLeafNodeTbs(
+    leafNode: Omit<MlsKeyPackageLeafNode, "signature">,
+): Omit<MlsLeafNode, "signature"> {
+    return {
+        encryptionKey: leafNode.encryptionKey,
+        signatureKey: leafNode.signatureKey,
+        credential: leafNode.credential,
+        capabilities: defaultMlsLeafCapabilities(),
+        source: "key_package",
+        notBefore: leafNode.notBefore,
+        notAfter: leafNode.notAfter,
+        extensions: [],
+    };
 }
 
 /** Encode the fields covered by a key-package LeafNode signature. */
 export function encodeLeafNodeTbs(leafNode: Omit<MlsKeyPackageLeafNode, "signature">): Uint8Array {
-    return concatBytes(
-        encodeOpaqueV(leafNode.encryptionKey),
-        encodeOpaqueV(leafNode.signatureKey),
-        encodeCredential(leafNode.credential),
-        encodeCapabilities(),
-        encodeOpaqueV(new Uint8Array()),
-        new Uint8Array([LEAF_NODE_SOURCE_KEY_PACKAGE]),
-        encodeUint64(leafNode.notBefore),
-        encodeUint64(leafNode.notAfter),
-    );
+    return encodeMlsLeafNodeTbs(genericLeafNodeTbs(leafNode));
 }
 
-function encodeLeafNode(leafNode: MlsKeyPackageLeafNode): Uint8Array {
-    return concatBytes(encodeLeafNodeTbs(leafNode), encodeOpaqueV(leafNode.signature));
+/** Encode a complete KeyPackage-source LeafNode. */
+export function encodeKeyPackageLeafNode(leafNode: MlsKeyPackageLeafNode): Uint8Array {
+    return encodeMlsLeafNode({
+        ...genericLeafNodeTbs(leafNode),
+        signature: leafNode.signature,
+    });
 }
 
-function decodeLeafNode(reader: MlsKeyPackageReader): MlsKeyPackageLeafNode {
-    const encryptionKey = reader.readOpaqueV();
-    const signatureKey = reader.readOpaqueV();
-    const credential = decodeCredential(reader);
-    decodeCapabilities(reader);
-    if (reader.readOpaqueV().length !== 0) {
-        throw new Error("Unsupported LeafNode extension");
-    }
-    if (reader.readUint8() !== LEAF_NODE_SOURCE_KEY_PACKAGE) {
-        throw new Error("Expected a key-package LeafNode");
+function decodeKeyPackageLeafNode(reader: MlsKeyPackageReader): MlsKeyPackageLeafNode {
+    const leafNode = decodeMlsLeafNode(reader);
+    if (
+        leafNode.source !== "key_package" ||
+        leafNode.notBefore === undefined ||
+        leafNode.notAfter === undefined ||
+        leafNode.extensions.length !== 0
+    ) {
+        throw new Error("Expected an extension-free key-package LeafNode");
     }
     return {
-        encryptionKey,
-        signatureKey,
-        credential,
-        notBefore: reader.readUint64(),
-        notAfter: reader.readUint64(),
-        signature: reader.readOpaqueV(),
+        encryptionKey: leafNode.encryptionKey,
+        signatureKey: leafNode.signatureKey,
+        credential: leafNode.credential,
+        notBefore: leafNode.notBefore,
+        notAfter: leafNode.notAfter,
+        signature: leafNode.signature,
     };
 }
 
@@ -165,7 +122,7 @@ export function encodeKeyPackageTbs(keyPackage: Omit<MlsKeyPackage, "signature">
         encodeUint16(keyPackage.version),
         encodeUint16(keyPackage.cipherSuite),
         encodeOpaqueV(keyPackage.initKey),
-        encodeLeafNode(keyPackage.leafNode),
+        encodeKeyPackageLeafNode(keyPackage.leafNode),
         encodeOpaqueV(new Uint8Array()),
     );
 }
@@ -185,15 +142,14 @@ export function decodeMlsKeyPackageFromReader(reader: MlsKeyPackageReader): MlsK
     const keyPackage: MlsKeyPackage = {
         version: 1,
         cipherSuite: 0x0001,
-        initKey: reader.readOpaqueV(),
-        leafNode: decodeLeafNode(reader),
+        initKey: reader.readOpaqueV(32),
+        leafNode: decodeKeyPackageLeafNode(reader),
         signature: new Uint8Array(),
     };
-    if (reader.readOpaqueV().length !== 0) {
+    if (reader.readOpaqueV(0).length !== 0) {
         throw new Error("Unsupported KeyPackage extension");
     }
-    const signature = reader.readOpaqueV();
-    return { ...keyPackage, signature };
+    return { ...keyPackage, signature: reader.readOpaqueV(64) };
 }
 
 /** Decode the supported RFC 9420 KeyPackage profile. */

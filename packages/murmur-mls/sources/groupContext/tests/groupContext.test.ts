@@ -21,9 +21,14 @@ describe("MLS GroupContext and transcripts", () => {
             confirmedTranscriptHash: hashBytes(utf8Encode("transcript")),
         };
 
-        const decoded = decodeMlsGroupContext(encodeMlsGroupContext(context));
+        const encoded = encodeMlsGroupContext(context);
+        const decoded = decodeMlsGroupContext(encoded);
 
+        expect(encoded.slice(0, 4)).toEqual(Uint8Array.of(0, 1, 0, 1));
         expect(equalMlsGroupContext(decoded, context)).toBe(true);
+        const unsupportedVersion = encoded.slice();
+        unsupportedVersion[1] = 2;
+        expect(() => decodeMlsGroupContext(unsupportedVersion)).toThrow("profile");
     });
 
     it("updates transcript hashes and authenticates confirmation", () => {
