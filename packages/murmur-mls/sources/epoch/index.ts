@@ -1,6 +1,18 @@
 import { equalBytes, zeroBytes } from "@murmur/core";
-import { mlsSignWithLabel, mlsVerifyWithLabel } from "../cipherSuite/index.js";
-import { createMlsAddCommit, openMlsAddCommit, type MlsCommitMember } from "../commit/index.js";
+import {
+    canonicalizeHpkePublicKey,
+    isHpkeKeyPair,
+    mlsSignWithLabel,
+    mlsVerifyWithLabel,
+} from "../cipherSuite/index.js";
+import {
+    createMlsAddCommit,
+    createMlsTreeCommit,
+    destroyMlsTreeCommitResult,
+    openMlsAddCommit,
+    openMlsTreeCommit,
+    type MlsCommitMember,
+} from "../commit/index.js";
 import {
     encodeMlsGroupContext,
     updateInterimTranscriptHash,
@@ -8,30 +20,48 @@ import {
 } from "../groupContext/index.js";
 import type { MlsKeyPackage } from "../keyPackage/index.js";
 import { destroyMlsEpochSecrets, type MlsEpochSecrets } from "../keySchedule/index.js";
+import { decodeMlsLeafNodeBytes, type MlsLeafNode } from "../leafNode/index.js";
 import {
     openMlsApplicationMessage,
     sealMlsApplicationMessage,
     type OpenedMlsApplicationMessage,
 } from "../privateMessage/index.js";
+import { type MlsRatchetTree } from "../ratchetTree/index.js";
 import { MlsSecretTree } from "../secretTree/index.js";
+import { directPath, leafNode } from "../tree/index.js";
+import {
+    deriveMlsWelcomePrivateKeys,
+    destroyMlsTreePrivateKeys,
+    type MlsTreePrivateKey,
+} from "../updatePath/index.js";
 import type {
+    CreateLegacyMlsEpochOptions,
     CreateMlsEpochOptions,
     CreateMlsEpochFromWelcomeOptions,
+    CreateMlsTreeEpochFromWelcomeOptions,
+    CreateTreeMlsEpochOptions,
     MlsAddTreeValidator,
+    MlsEpochCommitProposal,
     MlsEpochMember,
     MlsEpochTransition,
     MlsExternalTreeTransition,
     PreparedMlsAddEpoch,
+    PreparedMlsTreeEpoch,
 } from "./types.js";
 
 export type {
+    CreateLegacyMlsEpochOptions,
     CreateMlsEpochOptions,
     CreateMlsEpochFromWelcomeOptions,
+    CreateMlsTreeEpochFromWelcomeOptions,
+    CreateTreeMlsEpochOptions,
     MlsAddTreeValidator,
+    MlsEpochCommitProposal,
     MlsEpochMember,
     MlsEpochTransition,
     MlsExternalTreeTransition,
     PreparedMlsAddEpoch,
+    PreparedMlsTreeEpoch,
     MlsValidatedWelcomeTree,
 } from "./types.js";
 
@@ -112,22 +142,94 @@ function copyEpochSecrets(secrets: MlsEpochSecrets): MlsEpochSecrets {
     }
 }
 
+function membersFromTree(tree: MlsRatchetTree): readonly (MlsEpochMember | undefined)[] {
+    const nodes = tree.nodes;
+    return Array.from({ length: tree.leafCount }, (_, leaf) => {
+        const node = nodes[leafNode(leaf, tree.leafCount)];
+        if (node?.type !== "leaf") {
+            return undefined;
+        }
+        const decoded = decodeMlsLeafNodeBytes(node.encoded);
+        return {
+            signatureKey: decoded.signatureKey.slice(),
+            encryptionKey: decoded.encryptionKey.slice(),
+        };
+    });
+}
+
+function copyAndValidateTreePrivateKeys(
+    tree: MlsRatchetTree,
+    localLeaf: number,
+    privateKeys: readonly MlsTreePrivateKey[],
+): readonly MlsTreePrivateKey[] {
+    const allowed = new Set([
+        leafNode(localLeaf, tree.leafCount),
+        ...directPath(localLeaf, tree.leafCount),
+    ]);
+    const nodes = tree.nodes;
+    const seen = new Set<number>();
+    const copies: MlsTreePrivateKey[] = [];
+    try {
+        for (const key of privateKeys) {
+            const node = nodes[key.node];
+            if (
+                !Number.isSafeInteger(key.node) ||
+                !allowed.has(key.node) ||
+                seen.has(key.node) ||
+                node === undefined ||
+                !isHpkeKeyPair(key.keyPair) ||
+                !equalBytes(
+                    canonicalizeHpkePublicKey(node.encryptionKey),
+                    canonicalizeHpkePublicKey(key.keyPair.publicKey),
+                )
+            ) {
+                throw new Error("Invalid MLS epoch TreeKEM private key");
+            }
+            seen.add(key.node);
+            copies.push({
+                node: key.node,
+                keyPair: {
+                    secretKey: key.keyPair.secretKey.slice(),
+                    publicKey: node.encryptionKey.slice(),
+                },
+            });
+        }
+        if (!seen.has(leafNode(localLeaf, tree.leafCount))) {
+            throw new Error("MLS epoch is missing its leaf private key");
+        }
+        for (const nodeIndex of directPath(localLeaf, tree.leafCount)) {
+            const node = nodes[nodeIndex];
+            if (
+                node?.type === "parent" &&
+                !node.unmergedLeaves.includes(localLeaf) &&
+                !seen.has(nodeIndex)
+            ) {
+                throw new Error("MLS epoch is missing a merged direct-path private key");
+            }
+        }
+        return copies;
+    } catch (error: unknown) {
+        destroyMlsTreePrivateKeys(copies);
+        throw error;
+    }
+}
+
 class StagedEpochTransition implements MlsEpochTransition {
     readonly #current: MlsEpochState;
     readonly #next: MlsEpochState;
-    readonly #tree: MlsExternalTreeTransition;
+    readonly #external: MlsExternalTreeTransition | undefined;
     readonly #onSettle: () => void;
     #state: "pending" | "committing" | "cancelling" | "settled" = "pending";
 
     constructor(
         current: MlsEpochState,
         next: MlsEpochState,
-        tree: MlsExternalTreeTransition,
+        external: MlsExternalTreeTransition | undefined,
         onSettle: () => void,
     ) {
         this.#current = current;
         this.#next = next;
-        this.#tree = tree;
+        this.#external = external;
         this.#onSettle = onSettle;
     }
 
@@ -135,7 +237,7 @@ class StagedEpochTransition implements MlsEpochTransition {
         this.#ensurePending();
         this.#state = "committing";
         try {
-            this.#tree.commit();
+            this.#external?.commit();
         } catch (error: unknown) {
             this.#state = "pending";
             throw error;
@@ -150,7 +252,7 @@ class StagedEpochTransition implements MlsEpochTransition {
         this.#ensurePending();
         this.#state = "cancelling";
         try {
-            this.#tree.cancel();
+            this.#external?.cancel();
         } finally {
             try {
                 this.#next.destroy();
@@ -172,10 +274,10 @@ class StagedEpochTransition implements MlsEpochTransition {
  * Mutable application state for one authenticated RFC 9420 epoch.
  *
  * After successful construction, the instance takes ownership of
- * `options.secrets` by cloning them privately and zeroing every input array.
- * Construction failure leaves ownership with the caller. A Commit transition
- * creates a new instance only after the separate TreeKEM/Commit layer has
- * authenticated the next context and secrets.
+ * `options.secrets` and integrated TreeKEM private keys by cloning them
+ * privately and zeroing every input array. Construction failure leaves
+ * ownership with the caller. Full Commit transitions stage an independently
+ * owned next state until explicit adoption or cancellation.
  */
 export class MlsEpochState {
     readonly #context: MlsGroupContext;
@@ -185,6 +287,11 @@ export class MlsEpochState {
     readonly #localSigningSecretKey: Uint8Array;
     readonly #secretTree: MlsSecretTree;
     readonly #interimTranscriptHash: Uint8Array | undefined;
+    readonly #tree: MlsRatchetTree | undefined;
+    readonly #privateKeys: readonly MlsTreePrivateKey[];
+    readonly #authenticateCredential:
+        | ((leafNode: MlsLeafNode, leafIndex: number) => boolean)
+        | undefined;
     #destroyed = false;
     #pendingTransition: StagedEpochTransition | undefined;
     #transitionState: "idle" | "preparing" | "staged" = "idle";
@@ -192,21 +299,38 @@ export class MlsEpochState {
     constructor(options: CreateMlsEpochOptions) {
         encodeMlsGroupContext(options.context);
         const inputSecrets = snapshotEpochSecrets(options.secrets);
+        const integrated =
+            options.tree === undefined ? undefined : (options as CreateTreeMlsEpochOptions);
+        let tree: MlsRatchetTree | undefined;
+        let configuredMembers: readonly (MlsEpochMember | undefined)[];
+        if (integrated === undefined) {
+            configuredMembers = (options as CreateLegacyMlsEpochOptions).members;
+        } else {
+            tree = integrated.tree.clone();
+            tree.validate({
+                groupId: options.context.groupId,
+                authenticateCredential: integrated.authenticateCredential,
+            });
+            if (!equalBytes(tree.treeHash(), options.context.treeHash)) {
+                throw new Error("MLS epoch tree does not match its GroupContext");
+            }
+            configuredMembers = membersFromTree(tree);
+        }
         if (
-            options.members.length === 0 ||
-            options.members.length > MAXIMUM_EPOCH_MEMBERS ||
+            configuredMembers.length === 0 ||
+            configuredMembers.length > MAXIMUM_EPOCH_MEMBERS ||
             !Number.isSafeInteger(options.localLeaf) ||
             options.localLeaf < 0 ||
-            options.localLeaf >= options.members.length ||
+            options.localLeaf >= configuredMembers.length ||
             options.localSigningSecretKey.length !== 32
         ) {
             throw new Error("Invalid MLS epoch configuration");
         }
-        const localMember = options.members[options.localLeaf];
+        const localMember = configuredMembers[options.localLeaf];
         if (
             localMember === undefined ||
             localMember.signatureKey.length !== 32 ||
-            options.members.some(
+            configuredMembers.some(
                 (member) =>
                     member !== undefined &&
                     (member.signatureKey.length !== 32 ||
@@ -241,9 +365,10 @@ export class MlsEpochState {
         const ownedSecrets = copyEpochSecrets(inputSecrets);
         let localSigningSecretKey: Uint8Array | undefined;
         let secretTree: MlsSecretTree | undefined;
+        let privateKeys: readonly MlsTreePrivateKey[] = [];
         try {
             localSigningSecretKey = options.localSigningSecretKey.slice();
-            const members = options.members.map((member) =>
+            const members = configuredMembers.map((member) =>
                 member === undefined
                     ? undefined
                     : member.encryptionKey === undefined
@@ -259,6 +384,13 @@ export class MlsEpochState {
             ) {
                 throw new Error("Invalid MLS interim transcript hash");
             }
+            if (integrated !== undefined && tree !== undefined) {
+                privateKeys = copyAndValidateTreePrivateKeys(
+                    tree,
+                    options.localLeaf,
+                    integrated.privateKeys,
+                );
+            }
             secretTree = new MlsSecretTree(ownedSecrets.encryptionSecret, members.length);
             this.#context = copyContext(options.context);
             this.#secrets = ownedSecrets;
@@ -267,8 +399,12 @@ export class MlsEpochState {
             this.#localSigningSecretKey = localSigningSecretKey;
             this.#secretTree = secretTree;
             this.#interimTranscriptHash = options.interimTranscriptHash?.slice();
+            this.#tree = tree;
+            this.#privateKeys = privateKeys;
+            this.#authenticateCredential = integrated?.authenticateCredential;
         } catch (error: unknown) {
             secretTree?.destroy();
+            destroyMlsTreePrivateKeys(privateKeys);
             destroyMlsEpochSecrets(ownedSecrets);
             if (localSigningSecretKey !== undefined) {
                 zeroBytes(localSigningSecretKey);
@@ -276,6 +412,9 @@ export class MlsEpochState {
             throw error;
         }
         destroyMlsEpochSecrets(inputSecrets);
+        if (integrated !== undefined) {
+            destroyMlsTreePrivateKeys(integrated.privateKeys);
+        }
     }
 
     /** Immutable public context for this epoch. */
@@ -330,6 +469,7 @@ export class MlsEpochState {
         authenticatedData: Uint8Array = new Uint8Array(),
     ): PreparedMlsAddEpoch {
         this.#ensureActive();
+        this.#ensureLegacyTransitionMode();
         const interimTranscriptHash = this.#requireInterimTranscriptHash();
         const members = this.#commitMembers();
         this.#beginTransitionPreparation();
@@ -404,6 +544,7 @@ export class MlsEpochState {
      */
     applyAdd(message: Uint8Array, validateExternalTree: MlsAddTreeValidator): MlsEpochTransition {
         this.#ensureActive();
+        this.#ensureLegacyTransitionMode();
         this.#beginTransitionPreparation();
         let tree: MlsExternalTreeTransition | undefined;
         let applied: ReturnType<typeof openMlsAddCommit>;
@@ -462,6 +603,108 @@ export class MlsEpochState {
         }
     }
 
+    /**
+     * Prepare a full Add/Remove Commit and an integrated next TreeKEM epoch.
+     *
+     * The transition blocks current-epoch sends until `commit()` adopts the
+     * next epoch or `cancel()` destroys the staged secrets.
+     */
+    prepareCommit(
+        proposals: readonly MlsEpochCommitProposal[],
+        authenticatedData: Uint8Array = new Uint8Array(),
+    ): PreparedMlsTreeEpoch {
+        this.#ensureActive();
+        const interimTranscriptHash = this.#requireInterimTranscriptHash();
+        const tree = this.#requireIntegratedTree();
+        const authenticateCredential = this.#requireCredentialAuthenticator();
+        this.#beginTransitionPreparation();
+        let created: ReturnType<typeof createMlsTreeCommit> | undefined;
+        let next: MlsEpochState | undefined;
+        try {
+            created = createMlsTreeCommit({
+                context: this.#context,
+                interimTranscriptHash,
+                nextInitSecret: this.#secrets.nextInitSecret,
+                membershipKey: this.#secrets.membershipKey,
+                tree,
+                sender: this.#localLeaf,
+                signingSecretKey: this.#localSigningSecretKey,
+                proposals,
+                authenticateCredential,
+                authenticatedData,
+            });
+            next = new MlsEpochState({
+                context: created.context,
+                secrets: created.secrets,
+                tree: created.tree,
+                privateKeys: created.privateKeys,
+                localLeaf: this.#localLeaf,
+                localSigningSecretKey: this.#localSigningSecretKey,
+                authenticateCredential,
+                interimTranscriptHash: created.interimTranscriptHash,
+            });
+            return {
+                commit: created.commit,
+                ...(created.welcome === undefined ? {} : { welcome: created.welcome }),
+                tree: created.tree.clone(),
+                addedLeaves: [...created.addedLeaves],
+                removedLeaves: [...created.removedLeaves],
+                transition: this.#stage(next),
+            };
+        } catch (error: unknown) {
+            next?.destroy();
+            this.#abortTransitionPreparation();
+            throw error;
+        } finally {
+            if (created !== undefined) {
+                destroyMlsTreeCommitResult(created);
+            }
+        }
+    }
+
+    /** Authenticate a full Add/Remove Commit and stage the retained next epoch. */
+    applyCommit(message: Uint8Array): MlsEpochTransition {
+        this.#ensureActive();
+        const interimTranscriptHash = this.#requireInterimTranscriptHash();
+        const tree = this.#requireIntegratedTree();
+        const authenticateCredential = this.#requireCredentialAuthenticator();
+        this.#beginTransitionPreparation();
+        let applied: ReturnType<typeof openMlsTreeCommit> | undefined;
+        let next: MlsEpochState | undefined;
+        try {
+            applied = openMlsTreeCommit({
+                message,
+                context: this.#context,
+                interimTranscriptHash,
+                nextInitSecret: this.#secrets.nextInitSecret,
+                membershipKey: this.#secrets.membershipKey,
+                tree,
+                localLeaf: this.#localLeaf,
+                privateKeys: this.#privateKeys,
+                authenticateCredential,
+            });
+            next = new MlsEpochState({
+                context: applied.context,
+                secrets: applied.secrets,
+                tree: applied.tree,
+                privateKeys: applied.privateKeys,
+                localLeaf: this.#localLeaf,
+                localSigningSecretKey: this.#localSigningSecretKey,
+                authenticateCredential,
+                interimTranscriptHash: applied.interimTranscriptHash,
+            });
+            return this.#stage(next);
+        } catch (error: unknown) {
+            next?.destroy();
+            this.#abortTransitionPreparation();
+            throw error;
+        } finally {
+            if (applied !== undefined) {
+                destroyMlsTreeCommitResult(applied);
+            }
+        }
+    }
+
     /** Destroy the epoch and every secret it owns. */
     destroy(): void {
         if (this.#destroyed) {
@@ -473,6 +716,7 @@ export class MlsEpochState {
             this.#destroyed = true;
             this.#secretTree.destroy();
             destroyMlsEpochSecrets(this.#secrets);
+            destroyMlsTreePrivateKeys(this.#privateKeys);
             zeroBytes(this.#localSigningSecretKey);
             if (this.#interimTranscriptHash !== undefined) {
                 zeroBytes(this.#interimTranscriptHash);
@@ -499,12 +743,12 @@ export class MlsEpochState {
         }
     }
 
-    #stage(next: MlsEpochState, tree: MlsExternalTreeTransition): StagedEpochTransition {
+    #stage(next: MlsEpochState, external?: MlsExternalTreeTransition): StagedEpochTransition {
         if (this.#transitionState !== "preparing") {
             next.destroy();
             throw new Error("MLS epoch transition was not reserved");
         }
-        const transition = new StagedEpochTransition(this, next, tree, () => {
+        const transition = new StagedEpochTransition(this, next, external, () => {
             this.#pendingTransition = undefined;
             this.#transitionState = "idle";
         });
@@ -518,6 +762,26 @@ export class MlsEpochState {
             throw new Error("MLS epoch has no interim transcript hash");
         }
         return this.#interimTranscriptHash;
+    }
+
+    #requireIntegratedTree(): MlsRatchetTree {
+        if (this.#tree === undefined) {
+            throw new Error("MLS epoch has no integrated TreeKEM state");
+        }
+        return this.#tree;
+    }
+
+    #requireCredentialAuthenticator(): (leafNode: MlsLeafNode, leafIndex: number) => boolean {
+        if (this.#authenticateCredential === undefined) {
+            throw new Error("MLS epoch has no credential authenticator");
+        }
+        return this.#authenticateCredential;
+    }
+
+    #ensureLegacyTransitionMode(): void {
+        if (this.#tree !== undefined) {
+            throw new Error("Integrated TreeKEM epochs must use full Commit transitions");
+        }
     }
 
     #commitMembers(): readonly (MlsCommitMember | undefined)[] {
@@ -540,6 +804,9 @@ export class MlsEpochState {
 export function createMlsEpochFromWelcome(
     options: CreateMlsEpochFromWelcomeOptions,
 ): MlsEpochState {
+    if (options.opened.pathSecret !== undefined) {
+        throw new Error("Path-bearing MLS Welcome requires integrated TreeKEM adoption");
+    }
     if (!equalBytes(options.tree.treeHash, options.opened.groupInfo.context.treeHash)) {
         throw new Error("MLS Welcome tree view does not match GroupInfo");
     }
@@ -554,4 +821,51 @@ export function createMlsEpochFromWelcome(
             options.opened.groupInfo.confirmationTag,
         ),
     });
+}
+
+/**
+ * Adopt an authenticated Welcome into an epoch which owns full TreeKEM state.
+ *
+ * On success this consumes the opened epoch secrets, the supplied leaf private
+ * key, and the optional Welcome path secret.
+ */
+export function createMlsTreeEpochFromWelcome(
+    options: CreateMlsTreeEpochFromWelcomeOptions,
+): MlsEpochState {
+    if (!equalBytes(options.tree.treeHash(), options.opened.groupInfo.context.treeHash)) {
+        throw new Error("MLS Welcome tree does not match GroupInfo");
+    }
+    const privateKeys = deriveMlsWelcomePrivateKeys({
+        tree: options.tree,
+        groupId: options.opened.groupInfo.context.groupId,
+        sender: options.opened.groupInfo.signer,
+        localLeaf: options.localLeaf,
+        leafKeyPair: options.leafKeyPair,
+        ...(options.opened.pathSecret === undefined
+            ? {}
+            : { pathSecret: options.opened.pathSecret }),
+        authenticateCredential: options.authenticateCredential,
+    });
+    try {
+        const epoch = new MlsEpochState({
+            context: options.opened.groupInfo.context,
+            secrets: options.opened.epochSecrets,
+            tree: options.tree,
+            privateKeys,
+            localLeaf: options.localLeaf,
+            localSigningSecretKey: options.localSigningSecretKey,
+            authenticateCredential: options.authenticateCredential,
+            interimTranscriptHash: updateInterimTranscriptHash(
+                options.opened.groupInfo.context.confirmedTranscriptHash,
+                options.opened.groupInfo.confirmationTag,
+            ),
+        });
+        if (options.opened.pathSecret !== undefined) {
+            zeroBytes(options.opened.pathSecret);
+        }
+        zeroBytes(options.leafKeyPair.secretKey);
+        return epoch;
+    } finally {
+        destroyMlsTreePrivateKeys(privateKeys);
+    }
 }
