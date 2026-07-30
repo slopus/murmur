@@ -25,7 +25,9 @@ import type {
     MlsTreePrivateKey,
     MlsUpdatePath,
     MlsUpdatePathResult,
+    MlsValidatedUpdatePath,
     OpenMlsUpdatePathOptions,
+    ValidateMlsUpdatePathOptions,
 } from "./types.js";
 
 export type {
@@ -35,7 +37,9 @@ export type {
     MlsUpdatePath,
     MlsUpdatePathNode,
     MlsUpdatePathResult,
+    MlsValidatedUpdatePath,
     OpenMlsUpdatePathOptions,
+    ValidateMlsUpdatePathOptions,
 } from "./types.js";
 export {
     decodeMlsUpdatePath,
@@ -144,10 +148,6 @@ function equalLeafMetadata(left: MlsLeafNode, right: MlsLeafNode): boolean {
 
 /** Generate, sign, merge, and encrypt one RFC 9420 UpdatePath. */
 export function createMlsUpdatePath(options: CreateMlsUpdatePathOptions): MlsUpdatePathResult {
-    options.tree.validate({
-        groupId: options.provisionalContext.groupId,
-        authenticateCredential: options.authenticateCredential,
-    });
     const tree = options.tree.clone();
     const currentPublicLeaf = tree.nodes[leafNode(options.sender, tree.leafCount)];
     if (currentPublicLeaf?.type !== "leaf") {
@@ -286,12 +286,12 @@ export function createMlsUpdatePath(options: CreateMlsUpdatePathOptions): MlsUpd
     }
 }
 
-/** Merge, decrypt, and authenticate an RFC 9420 UpdatePath. */
-export function openMlsUpdatePath(options: OpenMlsUpdatePathOptions): MlsUpdatePathResult {
-    options.tree.validate({
-        groupId: options.provisionalContext.groupId,
-        authenticateCredential: options.authenticateCredential,
-    });
+function authenticatePublicUpdatePath(options: ValidateMlsUpdatePathOptions): {
+    readonly treeBefore: CreateMlsUpdatePathOptions["tree"];
+    readonly entries: readonly { readonly node: number; readonly sibling: number }[];
+    readonly tree: CreateMlsUpdatePathOptions["tree"];
+    readonly context: MlsGroupContext;
+} {
     const treeBefore = options.tree.clone();
     const entries = pathEntries(treeBefore, options.sender);
     if (entries.length !== options.path.nodes.length) {
@@ -322,6 +322,58 @@ export function openMlsUpdatePath(options: OpenMlsUpdatePathOptions): MlsUpdateP
         options.path.leafNode.encryptionKey,
         ...options.path.nodes.map((node) => node.encryptionKey),
     ]);
+    for (let pathIndex = 0; pathIndex < entries.length; pathIndex += 1) {
+        const entry = entries[pathIndex]!;
+        if (
+            treeBefore.resolution(entry.sibling, options.excludedNewLeaves).length !==
+            options.path.nodes[pathIndex]!.encryptedPathSecrets.length
+        ) {
+            throw new Error("MLS UpdatePath ciphertext count does not match resolution");
+        }
+    }
+    const publicLeafNode = publicLeaf(
+        options.path.leafNode,
+        options.sender,
+        options.provisionalContext.groupId,
+    );
+    const tree = treeBefore.clone();
+    tree.mergeUpdatePath(
+        options.sender,
+        publicLeafNode,
+        options.path.nodes.map((node) => node.encryptionKey),
+    );
+    tree.validate({
+        groupId: options.provisionalContext.groupId,
+        authenticateCredential: options.authenticateCredential,
+    });
+    return {
+        treeBefore,
+        entries,
+        tree,
+        context: {
+            ...options.provisionalContext,
+            groupId: options.provisionalContext.groupId.slice(),
+            confirmedTranscriptHash: options.provisionalContext.confirmedTranscriptHash.slice(),
+            treeHash: tree.treeHash(),
+        },
+    };
+}
+
+/** Authenticate and merge the public portion of an RFC 9420 UpdatePath. */
+export function validateMlsUpdatePath(
+    options: ValidateMlsUpdatePathOptions,
+): MlsValidatedUpdatePath {
+    const validated = authenticatePublicUpdatePath(options);
+    return {
+        tree: validated.tree,
+        context: validated.context,
+    };
+}
+
+/** Merge, decrypt, and authenticate an RFC 9420 UpdatePath. */
+export function openMlsUpdatePath(options: OpenMlsUpdatePathOptions): MlsUpdatePathResult {
+    const validated = authenticatePublicUpdatePath(options);
+    const { treeBefore, entries, tree, context } = validated;
     const treeSnapshot = treeBefore.nodes;
     const localLeafNode =
         Number.isSafeInteger(options.localLeaf) &&
@@ -364,9 +416,6 @@ export function openMlsUpdatePath(options: OpenMlsUpdatePathOptions): MlsUpdateP
         const entry = entries[pathIndex]!;
         const resolution = treeBefore.resolution(entry.sibling, options.excludedNewLeaves);
         const ciphertexts = options.path.nodes[pathIndex]!.encryptedPathSecrets;
-        if (resolution.length !== ciphertexts.length) {
-            throw new Error("MLS UpdatePath ciphertext count does not match resolution");
-        }
         for (let index = 0; index < resolution.length; index += 1) {
             const keyPair = privateKeys.get(resolution[index]!);
             const ciphertext = ciphertexts[index];
@@ -391,27 +440,6 @@ export function openMlsUpdatePath(options: OpenMlsUpdatePathOptions): MlsUpdateP
     if (encrypted === undefined) {
         throw new Error("Local member cannot decrypt MLS UpdatePath");
     }
-    const publicLeafNode = publicLeaf(
-        options.path.leafNode,
-        options.sender,
-        options.provisionalContext.groupId,
-    );
-    const tree = treeBefore.clone();
-    tree.mergeUpdatePath(
-        options.sender,
-        publicLeafNode,
-        options.path.nodes.map((node) => node.encryptionKey),
-    );
-    tree.validate({
-        groupId: options.provisionalContext.groupId,
-        authenticateCredential: options.authenticateCredential,
-    });
-    const context: MlsGroupContext = {
-        ...options.provisionalContext,
-        groupId: options.provisionalContext.groupId.slice(),
-        confirmedTranscriptHash: options.provisionalContext.confirmedTranscriptHash.slice(),
-        treeHash: tree.treeHash(),
-    };
     const encodedContext = encodeMlsGroupContext(context);
     let currentPathSecret = mlsDecryptWithLabel(
         {

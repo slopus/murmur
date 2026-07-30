@@ -16,3 +16,8 @@ to a future authenticated Update-proposal path.
 Welcome joiners reconstruct their private direct path from the delivered
 common-ancestor path secret. Every derived private key is matched against the
 authenticated public tree before it can be adopted.
+
+Removed members cannot derive the next epoch, but they can still authenticate
+the current-epoch membership/signature boundary and the complete public
+UpdatePath. This lets applications retire local group secrets and acknowledge
+the removal without treating a valid Commit as poison.

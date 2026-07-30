@@ -20,9 +20,15 @@ describe("runCli", () => {
             (text) => output.push(text),
         );
         await runCli(runtime, ["me"], (text) => output.push(text));
+        await runCli(runtime, ["groups", "create", "--name", "Agents"], (text) =>
+            output.push(text),
+        );
+        await runCli(runtime, ["groups"], (text) => output.push(text));
 
         expect(JSON.parse(output[0] ?? "{}")).toMatchObject({ name: "Alice Agent" });
         expect(JSON.parse(output[1] ?? "{}")).toEqual(JSON.parse(output[0] ?? "{}"));
+        expect(JSON.parse(output[2] ?? "{}")).toMatchObject({ status: "created" });
+        expect(JSON.parse(output[3] ?? "[]")).toMatchObject([{ name: "Agents", epoch: "0" }]);
         await expect(
             runtime.send(
                 "missing",

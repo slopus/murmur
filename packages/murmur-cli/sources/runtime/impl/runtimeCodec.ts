@@ -15,6 +15,7 @@ import {
     type IdentityProfile,
     type RelayEvent,
 } from "@murmur/core";
+import { decodeMlsKeyPackage, encodeMlsKeyPackage, type MlsKeyPackage } from "@murmur/mls";
 import type { CliAccount, CliStoredMessage } from "../types.js";
 
 /** Durable application outbox entry tied to one exact core relay event. */
@@ -22,6 +23,12 @@ export interface CliOutboundMessage {
     readonly event: RelayEvent;
     readonly messageKey: string;
     readonly blobIds: readonly string[];
+}
+
+/** Strict profile relay payload with an optional RFC 9420 KeyPackage. */
+export interface CliProfileEnvelope {
+    readonly encrypted: EncryptedProfile;
+    readonly keyPackage?: MlsKeyPackage;
 }
 
 function record(value: unknown, fields: readonly string[], name: string): Record<string, unknown> {
@@ -225,24 +232,42 @@ export function decodeCliOutboundMessage(bytes: Uint8Array): CliOutboundMessage 
     };
 }
 
-/** Encode an encrypted profile with an explicit relay payload discriminator. */
-export function encodeCliProfileEnvelope(encrypted: EncryptedProfile): Uint8Array {
+/** Encode an encrypted profile and optional public KeyPackage. */
+export function encodeCliProfileEnvelope(
+    encrypted: EncryptedProfile,
+    keyPackage?: MlsKeyPackage,
+): Uint8Array {
     return utf8Encode(
-        JSON.stringify({
-            kind: "murmur.profile.v1",
-            encrypted,
-        }),
+        JSON.stringify(
+            keyPackage === undefined
+                ? {
+                      kind: "murmur.profile.v1",
+                      encrypted,
+                  }
+                : {
+                      kind: "murmur.profile.v2",
+                      encrypted,
+                      keyPackage: encodeBase64Url(encodeMlsKeyPackage(keyPackage)),
+                  },
+        ),
     );
 }
 
 /** Decode the strict profile relay payload boundary. */
-export function decodeCliProfileEnvelope(bytes: Uint8Array): EncryptedProfile {
+export function decodeCliProfileEnvelope(bytes: Uint8Array): CliProfileEnvelope {
+    const parsed = JSON.parse(utf8Decode(bytes)) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("Invalid CLI profile envelope");
+    }
+    const candidate = parsed as Record<string, unknown>;
+    const version =
+        candidate.kind === "murmur.profile.v1" ? 1 : candidate.kind === "murmur.profile.v2" ? 2 : 0;
     const envelope = record(
-        JSON.parse(utf8Decode(bytes)) as unknown,
-        ["kind", "encrypted"],
+        candidate,
+        version === 2 ? ["kind", "encrypted", "keyPackage"] : ["kind", "encrypted"],
         "CLI profile envelope",
     );
-    if (envelope.kind !== "murmur.profile.v1") {
+    if (version === 0 || (version === 2 && typeof envelope.keyPackage !== "string")) {
         throw new Error("Invalid CLI profile envelope");
     }
     const encrypted = record(
@@ -267,14 +292,21 @@ export function decodeCliProfileEnvelope(bytes: Uint8Array): EncryptedProfile {
         throw new Error("Invalid CLI encrypted profile");
     }
     return {
-        version: 1,
-        sender: {
-            signingKey: sender.signingKey,
-            encryptionKey: sender.encryptionKey,
+        encrypted: {
+            version: 1,
+            sender: {
+                signingKey: sender.signingKey,
+                encryptionKey: sender.encryptionKey,
+            },
+            recipient: encrypted.recipient,
+            ephemeralPublicKey: encrypted.ephemeralPublicKey,
+            nonce: encrypted.nonce,
+            ciphertext: encrypted.ciphertext,
         },
-        recipient: encrypted.recipient,
-        ephemeralPublicKey: encrypted.ephemeralPublicKey,
-        nonce: encrypted.nonce,
-        ciphertext: encrypted.ciphertext,
+        ...(version === 2
+            ? {
+                  keyPackage: decodeMlsKeyPackage(decodeBase64Url(envelope.keyPackage as string)),
+              }
+            : {}),
     };
 }

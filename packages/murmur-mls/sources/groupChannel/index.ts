@@ -6,6 +6,7 @@ import {
     type PublishResult,
     type ReceivedEvent,
 } from "@murmur/core";
+import { MlsLocalMemberRemovedError } from "../commit/index.js";
 import { MlsEpochState, type MlsEpochCommitProposal } from "../epoch/index.js";
 import type {
     MlsGroupDelivery,
@@ -26,6 +27,7 @@ export type {
     OpenedMlsGroupDelivery,
     PreparedMlsGroupApplication,
     PreparedMlsGroupCommit,
+    RemovedMlsGroupDelivery,
     StagedMlsGroupCommitDelivery,
 } from "./types.js";
 
@@ -108,9 +110,24 @@ export class MlsGroupChannel {
         return this.#topic;
     }
 
+    /** Defensive copy of the stable MLS group identifier. */
+    get groupId(): Uint8Array {
+        return this.#epoch.groupId;
+    }
+
     /** Monotonic generation of the currently owned epoch. */
     get persistenceGeneration(): bigint {
         return this.#epoch.persistenceGeneration;
+    }
+
+    /** Current RFC epoch number. */
+    get epoch(): bigint {
+        return this.#epoch.context.epoch;
+    }
+
+    /** Defensive member signing-key view indexed by MLS leaf number. */
+    get memberSignatureKeys(): readonly (Uint8Array | undefined)[] {
+        return this.#epoch.memberSignatureKeys;
     }
 
     /** Serialize the current epoch after an inbound delivery or adoption. */
@@ -181,7 +198,8 @@ export class MlsGroupChannel {
             | "publishing"
             | "ambiguous"
             | "confirmed"
-            | "cancelled" = "prepared";
+            | "cancelled"
+            | "abandoned" = "prepared";
         let settled = false;
         let markerInserted = false;
         const settle = (): void => {
@@ -243,6 +261,20 @@ export class MlsGroupChannel {
                 }
                 settle();
             },
+            abandonPersisted: (): void => {
+                if (settled) {
+                    return;
+                }
+                if (
+                    publication !== "persisted" &&
+                    publication !== "ambiguous" &&
+                    publication !== "confirmed"
+                ) {
+                    throw new Error(`MLS group application publication is ${publication}`);
+                }
+                publication = "abandoned";
+                settle();
+            },
         };
     }
 
@@ -267,8 +299,13 @@ export class MlsGroupChannel {
         }
         const prepared = this.#epoch.prepareCommit(proposals, authenticatedData);
         this.#pendingOutbound = true;
-        let publication: "prepared" | "persisted" | "publishing" | "ambiguous" | "confirmed" =
-            "prepared";
+        let publication:
+            | "prepared"
+            | "persisted"
+            | "publishing"
+            | "ambiguous"
+            | "confirmed"
+            | "abandoned" = "prepared";
         let settled = false;
         const commit = prepared.commit.slice();
         const fingerprint = hashBytes(commit);
@@ -340,6 +377,25 @@ export class MlsGroupChannel {
                     this.#pendingOutbound = false;
                 }
             },
+            abandonPersisted: (): void => {
+                if (settled) {
+                    return;
+                }
+                if (
+                    publication !== "persisted" &&
+                    publication !== "ambiguous" &&
+                    publication !== "confirmed"
+                ) {
+                    throw new Error(`MLS group Commit publication is ${publication}`);
+                }
+                publication = "abandoned";
+                try {
+                    prepared.transition.cancel();
+                } finally {
+                    settled = true;
+                    this.#pendingOutbound = false;
+                }
+            },
         };
     }
 
@@ -375,7 +431,44 @@ export class MlsGroupChannel {
                 if (this.#appliedCommits.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
                     throw new Error("Too many outstanding applied MLS Commit markers");
                 }
-                const transition = this.#epoch.applyCommit(received.event.payload);
+                let transition: ReturnType<MlsEpochState["applyCommit"]>;
+                try {
+                    transition = this.#epoch.applyCommit(received.event.payload);
+                } catch (error: unknown) {
+                    if (!(error instanceof MlsLocalMemberRemovedError)) {
+                        throw error;
+                    }
+                    this.#pendingInbound = true;
+                    let state: "staged" | "persisted" | "cancelled" = "staged";
+                    return {
+                        status: "removed",
+                        event: received.event,
+                        fingerprint: fingerprint.slice(),
+                        markPersisted: (): void => {
+                            if (state !== "staged") {
+                                throw new Error(`MLS group removal delivery is ${state}`);
+                            }
+                            this.#epoch.destroy();
+                            this.#pendingInbound = false;
+                            state = "persisted";
+                        },
+                        cancel: (): void => {
+                            if (state !== "staged") {
+                                throw new Error(`MLS group removal delivery is ${state}`);
+                            }
+                            this.#pendingInbound = false;
+                            state = "cancelled";
+                        },
+                        acknowledge: async (): Promise<void> => {
+                            if (state !== "persisted") {
+                                throw new Error(
+                                    "MLS group removal must be persisted before acknowledgment",
+                                );
+                            }
+                            await received.acknowledge();
+                        },
+                    };
+                }
                 let state: "staged" | "persisted" | "adopted" | "cancelled" = "staged";
                 let markerInserted = false;
                 return {

@@ -38,6 +38,7 @@ import {
     createMlsUpdatePath,
     destroyMlsUpdatePathResult,
     openMlsUpdatePath,
+    validateMlsUpdatePath,
     type MlsTreePrivateKey,
     type MlsUpdatePathResult,
 } from "../updatePath/index.js";
@@ -84,6 +85,14 @@ export type {
     OpenMlsAddCommitOptions,
     OpenMlsTreeCommitOptions,
 } from "./types.js";
+
+/** Authenticated Commit which removes the local member from the next epoch. */
+export class MlsLocalMemberRemovedError extends Error {
+    constructor() {
+        super("Local member was removed by MLS Commit");
+        this.name = "MlsLocalMemberRemovedError";
+    }
+}
 export { decodeMlsAddCommit, encodeMlsAddCommit } from "./impl/codec.js";
 export { decodeMlsTreeCommit, encodeMlsTreeCommit } from "./impl/treeCodec.js";
 
@@ -797,7 +806,19 @@ export function openMlsTreeCommit(options: OpenMlsTreeCommitOptions): MlsApplied
     }
     const proposals = applyTreeCommitProposals(options.tree, message.sender, message.proposals);
     if (proposals.removedLeaves.includes(options.localLeaf)) {
-        throw new Error("Local member was removed by MLS Commit");
+        validateMlsUpdatePath({
+            tree: proposals.tree,
+            sender: message.sender,
+            path: message.path,
+            provisionalContext: {
+                groupId: options.context.groupId,
+                epoch: options.context.epoch + 1n,
+                confirmedTranscriptHash: options.context.confirmedTranscriptHash,
+            },
+            excludedNewLeaves: new Set(proposals.addedLeaves),
+            authenticateCredential: options.authenticateCredential,
+        });
+        throw new MlsLocalMemberRemovedError();
     }
     const candidateNodes = proposals.tree.nodes;
     const usablePrivateKeys = options.privateKeys.filter(

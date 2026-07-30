@@ -11,3 +11,7 @@ The supported RFC 9420 KeyPackage profile uses:
 
 KeyPackage and LeafNode signatures use their RFC labels. Consuming a bundle
 zeros both HPKE secret keys.
+
+Applications can serialize a bundle into private durable state. Restoration
+revalidates the public KeyPackage and proves that both stored HPKE private keys
+own the exact public init/leaf keys before returning the one-use bundle.

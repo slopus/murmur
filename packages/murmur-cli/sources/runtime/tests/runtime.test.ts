@@ -252,4 +252,159 @@ describe("MurmurCliRuntime", () => {
         bob.destroy();
         carol.destroy();
     });
+
+    it("creates, welcomes, persists, and messages an RFC MLS group", async () => {
+        const relay = new RelayService(new MemoryRelayStore());
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const alice = await MurmurCliRuntime.open({
+            store: aliceStore,
+            transports: [new EmbeddedRelayTransport("alice-relay", relay)],
+        });
+        const bob = await MurmurCliRuntime.open({
+            store: bobStore,
+            transports: [new EmbeddedRelayTransport("bob-relay", relay)],
+        });
+        const aliceIdentity = await alice.signIn({ name: "Alice" });
+        const bobIdentity = await bob.signIn({ name: "Bob" });
+        await alice.shareProfile(bobIdentity.token);
+        await bob.shareProfile(aliceIdentity.token);
+        await alice.sync();
+        await bob.sync();
+
+        const groupId = await alice.createGroup("Protocol team");
+        await alice.inviteToGroup(groupId, bobIdentity.id);
+        const joined = await bob.sync();
+
+        expect(joined.invitations).toBe(1);
+        expect(bob.groups()).toEqual([
+            {
+                id: groupId,
+                name: "Protocol team",
+                epoch: 1n,
+                members: [aliceIdentity.id, bobIdentity.id],
+            },
+        ]);
+        expect(alice.groups()[0]?.epoch).toBe(1n);
+
+        const first = await alice.sendToGroup(groupId, "hello group", 100);
+        expect((await bob.sync()).groupMessages).toBe(1);
+        expect(await bob.groupMessages(groupId)).toEqual([
+            {
+                sequence: 1,
+                groupId,
+                direction: "incoming",
+                status: "received",
+                sender: 0,
+                message: {
+                    id: first,
+                    sentAt: 100,
+                    text: "hello group",
+                },
+            },
+        ]);
+
+        const reply = await bob.sendToGroup(groupId, "durable reply", 200);
+        expect((await alice.sync()).groupMessages).toBe(1);
+        expect((await alice.groupMessages(groupId)).at(-1)?.message.id).toBe(reply);
+
+        bob.destroy();
+        const reopenedBob = await MurmurCliRuntime.open({
+            store: bobStore,
+            transports: [new EmbeddedRelayTransport("bob-reopened", relay)],
+        });
+        expect(reopenedBob.groups()[0]?.epoch).toBe(1n);
+        await alice.sendToGroup(groupId, "after restart", 300);
+        expect((await reopenedBob.sync()).groupMessages).toBe(1);
+        expect(
+            (await reopenedBob.groupMessages(groupId)).map((stored) => stored.message.text),
+        ).toEqual(["hello group", "durable reply", "after restart"]);
+
+        alice.destroy();
+        reopenedBob.destroy();
+    });
+
+    it("retires a removed member and drains later ciphertext without decrypting it", async () => {
+        const relay = new RelayService(new MemoryRelayStore());
+        const bobStore = new MemoryMurmurStore();
+        const alice = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [new EmbeddedRelayTransport("alice-relay", relay)],
+        });
+        const bob = await MurmurCliRuntime.open({
+            store: bobStore,
+            transports: [new EmbeddedRelayTransport("bob-relay", relay)],
+        });
+        const aliceIdentity = await alice.signIn({ name: "Alice" });
+        const bobIdentity = await bob.signIn({ name: "Bob" });
+        await alice.shareProfile(bobIdentity.token);
+        await bob.shareProfile(aliceIdentity.token);
+        await alice.sync();
+        await bob.sync();
+        const groupId = await alice.createGroup("Removal");
+        await alice.inviteToGroup(groupId, bobIdentity.id);
+        await bob.sync();
+
+        await alice.removeFromGroup(groupId, bobIdentity.id);
+        const removed = await bob.sync();
+        expect(removed.groupCommits).toBe(1);
+        expect(bob.groups()).toEqual([]);
+        expect(alice.groups()[0]?.members).toEqual([aliceIdentity.id]);
+
+        bob.destroy();
+        const reopenedBob = await MurmurCliRuntime.open({
+            store: bobStore,
+            transports: [new EmbeddedRelayTransport("bob-reopened", relay)],
+        });
+        expect(reopenedBob.groups()).toEqual([]);
+        await alice.sendToGroup(groupId, "not for Bob", 400);
+        const drained = await reopenedBob.sync();
+        expect(drained.groupMessages).toBe(0);
+        expect(drained.quarantined).toBe(0);
+
+        alice.destroy();
+        reopenedBob.destroy();
+    });
+
+    it("recovers ordered Welcome then Commit publication after relay failure", async () => {
+        const relay = new RelayService(new MemoryRelayStore());
+        const aliceTransport = new ControlledTransport("alice-relay", relay);
+        const aliceStore = new MemoryMurmurStore();
+        const alice = await MurmurCliRuntime.open({
+            store: aliceStore,
+            transports: [aliceTransport],
+        });
+        const bob = await MurmurCliRuntime.open({
+            store: new MemoryMurmurStore(),
+            transports: [new EmbeddedRelayTransport("bob-relay", relay)],
+        });
+        const aliceIdentity = await alice.signIn({ name: "Alice" });
+        const bobIdentity = await bob.signIn({ name: "Bob" });
+        await alice.shareProfile(bobIdentity.token);
+        await bob.shareProfile(aliceIdentity.token);
+        await alice.sync();
+        await bob.sync();
+        const groupId = await alice.createGroup("Recovered invite");
+
+        aliceTransport.rejectPublish = true;
+        await expect(alice.inviteToGroup(groupId, bobIdentity.id)).rejects.toThrow(
+            "Every transport rejected",
+        );
+        await expect(alice.sendToGroup(groupId, "must wait")).rejects.toThrow(
+            "unresolved durable publication",
+        );
+
+        alice.destroy();
+        const reopenedAlice = await MurmurCliRuntime.open({
+            store: aliceStore,
+            transports: [aliceTransport],
+        });
+        aliceTransport.rejectPublish = false;
+        expect((await reopenedAlice.sync()).retryFailures).toBe(0);
+        expect((await bob.sync()).invitations).toBe(1);
+        expect(bob.groups()[0]?.id).toBe(groupId);
+
+        reopenedAlice.destroy();
+        bob.destroy();
+    });
 });

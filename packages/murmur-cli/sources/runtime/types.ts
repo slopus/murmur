@@ -28,6 +28,31 @@ export interface CliStoredMessage {
     readonly message: PrivateMessage;
 }
 
+/** Authenticated application payload carried by one MLS PrivateMessage. */
+export interface CliGroupMessage {
+    readonly id: string;
+    readonly sentAt: number;
+    readonly text: string;
+}
+
+/** One durable incoming or outgoing MLS group message. */
+export interface CliStoredGroupMessage {
+    readonly sequence: number;
+    readonly groupId: string;
+    readonly direction: "incoming" | "outgoing";
+    readonly status: "received" | "pending" | "sent";
+    readonly sender: number;
+    readonly message: CliGroupMessage;
+}
+
+/** Public summary of one locally owned MLS group. */
+export interface CliGroupSummary {
+    readonly id: string;
+    readonly name: string;
+    readonly epoch: bigint;
+    readonly members: readonly (string | undefined)[];
+}
+
 /** Stable public account information safe to print or exchange. */
 export interface CliPublicIdentity {
     readonly id: string;
@@ -45,6 +70,9 @@ export interface CliSyncResult {
     readonly retriedOutbound: number;
     readonly retryFailures: number;
     readonly quarantined: number;
+    readonly groupMessages: number;
+    readonly groupCommits: number;
+    readonly invitations: number;
 }
 
 /** Contact type re-exported for programmatic CLI consumers. */

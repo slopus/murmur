@@ -42,6 +42,25 @@ upload; received message history and replay state commit atomically before the
 relay delivery is acknowledged. One message may carry at most 64 attachments
 and 64 MiB of aggregate plaintext attachment data.
 
+## MLS groups
+
+Profile exchange also distributes a signed one-use RFC KeyPackage. Create a
+group, invite an authenticated contact, and exchange forward-secret group
+messages:
+
+```bash
+murmur groups create --name "Protocol team"
+murmur groups invite --group <group-id> --contact <identity-id>
+murmur sync
+murmur groups send --group <group-id> --message "hello"
+murmur groups messages --group <group-id>
+murmur groups remove --group <group-id> --contact <identity-id>
+```
+
+Welcome, Commit, epoch checkpoints, replay markers, and exact relay events use
+ordered durable outboxes. A restart cannot publish a Commit without its
+corresponding next-epoch private state.
+
 ## Development
 
 ```bash

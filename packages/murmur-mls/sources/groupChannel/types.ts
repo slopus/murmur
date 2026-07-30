@@ -60,6 +60,18 @@ export interface AppliedMlsGroupCommitDelivery {
     acknowledge(): Promise<void>;
 }
 
+/** Authenticated Commit which removes the local member from the next epoch. */
+export interface RemovedMlsGroupDelivery {
+    readonly status: "removed";
+    readonly fingerprint: Uint8Array;
+    readonly event: ReceivedEvent["event"];
+    /** Confirm durable group retirement before secret destruction and ack. */
+    markPersisted(): void;
+    /** Release the current epoch when durable retirement failed. */
+    cancel(): void;
+    acknowledge(): Promise<void>;
+}
+
 /** Outbound application ciphertext and its post-ratchet durable checkpoint. */
 export interface PreparedMlsGroupApplication {
     readonly payload: Uint8Array;
@@ -74,6 +86,8 @@ export interface PreparedMlsGroupApplication {
     confirmPublished(result: PublishResult): void;
     /** Burn the unused generation and release the channel before publication. */
     cancel(): void;
+    /** Destroy in-memory state after its checkpoint/outbox is durably recoverable. */
+    abandonPersisted(): void;
 }
 
 /** Result of dispatching one transport delivery to a current-epoch channel. */
@@ -82,6 +96,7 @@ export type MlsGroupDelivery =
     | AppliedMlsGroupApplicationDelivery
     | StagedMlsGroupCommitDelivery
     | AppliedMlsGroupCommitDelivery
+    | RemovedMlsGroupDelivery
     | DeferredMlsGroupDelivery;
 
 /** Published relay result returned by prepared application and Commit handles. */
@@ -106,6 +121,8 @@ export interface PreparedMlsGroupCommit {
     confirmPublished(result: PublishResult): void;
     adopt(): void;
     cancel(): void;
+    /** Destroy both staged/current in-memory epochs without altering durable state. */
+    abandonPersisted(): void;
 }
 
 /** Full Commit proposal type exposed by the group channel. */

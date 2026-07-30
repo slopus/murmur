@@ -104,6 +104,12 @@ function help(): string {
         "  murmur sync [--realtime] [--timeout <milliseconds>]",
         "  murmur messages [--with <identity-id-or-token>] [--limit <count>]",
         "  murmur attachment --message <id> --name <file> --out <path>",
+        "  murmur groups",
+        "  murmur groups create --name <name>",
+        "  murmur groups invite --group <id-or-name> --contact <identity>",
+        "  murmur groups remove --group <id-or-name> --contact <identity>",
+        "  murmur groups send --group <id-or-name> --message <text>",
+        "  murmur groups messages [--group <id-or-name>] [--limit <count>]",
         "",
         "Global: --relay <url> (repeatable), --db <sqlite-path>",
     ].join("\n");
@@ -284,6 +290,58 @@ export async function runCli(
                 plaintext.fill(0);
             }
             write(`${JSON.stringify({ messageId, name, output })}\n`);
+            return;
+        }
+        case "groups": {
+            const action = parsed.positionals[0];
+            if (action === "create") {
+                const id = await runtime.createGroup(option(parsed, "name", true) ?? "");
+                write(`${JSON.stringify({ id, status: "created" })}\n`);
+                return;
+            }
+            if (action === "invite") {
+                await runtime.inviteToGroup(
+                    option(parsed, "group", true) ?? "",
+                    option(parsed, "contact", true) ?? "",
+                );
+                write(`${JSON.stringify({ status: "invited" })}\n`);
+                return;
+            }
+            if (action === "send") {
+                const id = await runtime.sendToGroup(
+                    option(parsed, "group", true) ?? "",
+                    option(parsed, "message", true) ?? "",
+                );
+                write(`${JSON.stringify({ id, status: "sent" })}\n`);
+                return;
+            }
+            if (action === "remove") {
+                await runtime.removeFromGroup(
+                    option(parsed, "group", true) ?? "",
+                    option(parsed, "contact", true) ?? "",
+                );
+                write(`${JSON.stringify({ status: "removed" })}\n`);
+                return;
+            }
+            if (action === "messages") {
+                const messages = await runtime.groupMessages(
+                    option(parsed, "group"),
+                    positiveInteger(option(parsed, "limit"), 100),
+                );
+                write(`${JSON.stringify(messages)}\n`);
+                return;
+            }
+            if (action !== undefined) {
+                throw new Error(`Unknown groups action: ${action}`);
+            }
+            write(
+                `${JSON.stringify(
+                    runtime.groups().map((group) => ({
+                        ...group,
+                        epoch: group.epoch.toString(),
+                    })),
+                )}\n`,
+            );
             return;
         }
         default:

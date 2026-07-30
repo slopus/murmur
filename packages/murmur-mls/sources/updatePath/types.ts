@@ -47,6 +47,18 @@ export interface OpenMlsUpdatePathOptions {
     readonly authenticateCredential: (leafNode: MlsLeafNode, leafIndex: number) => boolean;
 }
 
+/** Inputs for authenticating only the public portion of an UpdatePath. */
+export type ValidateMlsUpdatePathOptions = Omit<
+    OpenMlsUpdatePathOptions,
+    "localLeaf" | "privateKeys"
+>;
+
+/** Authenticated public-tree result available even to a removed member. */
+export interface MlsValidatedUpdatePath {
+    readonly tree: MlsRatchetTree;
+    readonly context: MlsGroupContext;
+}
+
 /** New TreeKEM private state and commit secret after an UpdatePath. */
 export interface MlsUpdatePathResult {
     readonly tree: MlsRatchetTree;

@@ -3,9 +3,11 @@ import { describe, expect, it } from "vitest";
 import {
     createMlsKeyPackage,
     decodeMlsKeyPackage,
+    deserializeMlsKeyPackageBundle,
     destroyMlsKeyPackageBundle,
     encodeMlsKeyPackage,
     mlsKeyPackageReference,
+    serializeMlsKeyPackageBundle,
     verifyMlsKeyPackage,
 } from "../index.js";
 
@@ -78,5 +80,21 @@ describe("RFC 9420 KeyPackage profile", () => {
 
         expect(bundle.initKeyPair.secretKey.every((byte) => byte === 0)).toBe(true);
         expect(bundle.leafKeyPair.secretKey.every((byte) => byte === 0)).toBe(true);
+    });
+
+    it("round trips private durable KeyPackage state with key binding", () => {
+        const bundle = createMlsKeyPackage(generateIdentityKeyPair());
+        const encoded = serializeMlsKeyPackageBundle(bundle);
+        const restored = deserializeMlsKeyPackageBundle(encoded);
+
+        expect(restored.keyPackage).toEqual(bundle.keyPackage);
+        expect(restored.initKeyPair).toEqual(bundle.initKeyPair);
+        expect(restored.leafKeyPair).toEqual(bundle.leafKeyPair);
+        const corrupt = encoded.slice();
+        corrupt[corrupt.length - 1] = (corrupt[corrupt.length - 1] ?? 0) ^ 1;
+        expect(() => deserializeMlsKeyPackageBundle(corrupt)).toThrow("key binding");
+
+        destroyMlsKeyPackageBundle(restored);
+        destroyMlsKeyPackageBundle(bundle);
     });
 });

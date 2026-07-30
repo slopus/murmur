@@ -21,10 +21,12 @@ import {
     encryptFile,
     encryptPrivateMessageForContact,
     encryptProfileForContact,
+    equalBytes,
     generateIdentityKeyPair,
     identityId,
     identityInboxTopic,
     hashBytes,
+    randomBytes,
     utf8Decode,
     utf8Encode,
     validateIdentityProfile,
@@ -39,6 +41,43 @@ import {
     type StoreTransaction,
 } from "@murmur/core";
 import {
+    MlsEpochState,
+    MlsGroupChannel,
+    authenticateMurmurMlsCredential,
+    createMlsGroup,
+    createMlsKeyPackage,
+    createMlsTreeEpochFromWelcome,
+    decodeMlsKeyPackage,
+    decodeMlsRatchetTree,
+    deserializeMlsKeyPackageBundle,
+    destroyMlsKeyPackageBundle,
+    destroyMlsEpochSecrets,
+    encodeMlsKeyPackage,
+    encodeMlsRatchetTree,
+    mlsKeyPackageReference,
+    openMlsWelcome,
+    serializeMlsKeyPackageBundle,
+    verifyMlsKeyPackage,
+    type MlsKeyPackage,
+    type PreparedMlsGroupApplication,
+    type PreparedMlsGroupCommit,
+} from "@murmur/mls";
+import {
+    decodeCliGroupInvitation,
+    decodeCliGroupMessage,
+    decodeCliGroupOutbound,
+    decodeCliGroupRecord,
+    decodeCliStoredGroupMessage,
+    encodeCliGroupInvitation,
+    encodeCliGroupMessage,
+    encodeCliGroupOutbound,
+    encodeCliGroupRecord,
+    encodeCliStoredGroupMessage,
+    type CliGroupOutbound,
+    type CliGroupInvitation,
+    type CliGroupRecord,
+} from "./impl/groupCodec.js";
+import {
     decodeCliAccount,
     decodeCliOutboundMessage,
     decodeCliProfileEnvelope,
@@ -52,8 +91,11 @@ import {
 import type {
     CliAccount,
     CliAttachmentInput,
+    CliGroupMessage,
+    CliGroupSummary,
     CliPublicIdentity,
     CliStoredMessage,
+    CliStoredGroupMessage,
     CliSyncResult,
 } from "./types.js";
 
@@ -61,7 +103,10 @@ export type {
     CliAccount,
     CliAttachmentInput,
     CliContact,
+    CliGroupMessage,
+    CliGroupSummary,
     CliPublicIdentity,
+    CliStoredGroupMessage,
     CliStoredMessage,
     CliSyncResult,
 } from "./types.js";
@@ -72,8 +117,36 @@ const MESSAGE_SEQUENCE_PREFIX = "cli/message-sequence/v1";
 const OUTBOUND_PREFIX = "cli/outbound/v1";
 const OUTBOUND_BLOB_PREFIX = "cli/outbound-blobs/v1";
 const QUARANTINE_PREFIX = "cli/quarantine/v1";
+const LOCAL_KEY_PACKAGE_PREFIX = "cli/key-packages/local/v1";
+const CONTACT_KEY_PACKAGE_PREFIX = "cli/key-packages/contact/v1";
+const GROUP_PREFIX = "cli/groups/v1";
+const REMOVED_GROUP_PREFIX = "cli/removed-groups/v1";
+const GROUP_OUTBOUND_PREFIX = "cli/group-outbound/v1";
+const GROUP_MESSAGE_PREFIX = "cli/group-messages/v1";
+const GROUP_SEQUENCE_PREFIX = "cli/group-sequence/v1";
 const MAXIMUM_QUARANTINE_RECORDS = 64;
+const MAXIMUM_LOCAL_KEY_PACKAGES = 64;
 const DIRECT_TOPIC_COMPONENT = utf8Encode("direct-private-message/v1");
+
+interface LoadedCliGroup {
+    readonly name: string;
+    readonly channel: MlsGroupChannel;
+}
+
+type PendingCliGroupPublication =
+    | {
+          readonly kind: "commit";
+          readonly groupId: string;
+          readonly outboxKey: string;
+          readonly prepared: PreparedMlsGroupCommit;
+      }
+    | {
+          readonly kind: "application";
+          readonly groupId: string;
+          readonly outboxKey: string;
+          readonly messageKey: string;
+          readonly prepared: PreparedMlsGroupApplication;
+      };
 
 /** Maximum total plaintext attachment bytes retained for one CLI message. */
 export const MAX_CLI_ATTACHMENT_BYTES = MAX_FILE_BYTES;
@@ -180,6 +253,42 @@ function outboundBlobKey(ownerId: string, eventId: string, blobId: string): stri
     return `${OUTBOUND_BLOB_PREFIX}/${ownerId}/${eventId}/${blobId}`;
 }
 
+function localKeyPackageKey(ownerId: string, reference: Uint8Array): string {
+    return `${LOCAL_KEY_PACKAGE_PREFIX}/${ownerId}/${encodeBase64Url(reference)}`;
+}
+
+function contactKeyPackageKey(ownerId: string, contactId: string): string {
+    return `${CONTACT_KEY_PACKAGE_PREFIX}/${ownerId}/${contactId}`;
+}
+
+function cliGroupId(groupId: Uint8Array): string {
+    return encodeBase64Url(hashBytes(groupId));
+}
+
+function cliGroupKey(ownerId: string, groupId: string): string {
+    return `${GROUP_PREFIX}/${ownerId}/${groupId}`;
+}
+
+function cliGroupOutboundKey(
+    ownerId: string,
+    groupId: string,
+    event: Pick<CliGroupOutbound["event"], "id" | "createdAt">,
+    order: number,
+): string {
+    return `${GROUP_OUTBOUND_PREFIX}/${ownerId}/${groupId}/${event.createdAt
+        .toString()
+        .padStart(16, "0")}/${order}/${event.id}`;
+}
+
+function cliGroupMessageKey(
+    ownerId: string,
+    stored: Pick<CliStoredGroupMessage, "sequence" | "groupId" | "message" | "direction">,
+): string {
+    return `${GROUP_MESSAGE_PREFIX}/${ownerId}/${stored.sequence
+        .toString()
+        .padStart(16, "0")}/${stored.groupId}/${stored.message.id}/${stored.direction}`;
+}
+
 async function persistOutboundMessage(
     transaction: StoreTransaction,
     key: string,
@@ -193,16 +302,101 @@ async function persistOutboundMessage(
     }
 }
 
-function validateCliShareableProfile(account: CliAccount): void {
-    const payload = encodeCliProfileEnvelope(
-        encryptProfileForContact(account.identity, account.identity, account.profile),
-    );
+async function persistCliGroupRecord(
+    transaction: Pick<StoreTransaction, "set">,
+    key: string,
+    record: CliGroupRecord,
+): Promise<void> {
+    const encoded = encodeCliGroupRecord(record);
     try {
+        await transaction.set(key, encoded.slice());
+    } finally {
+        zeroBytes(encoded);
+    }
+}
+
+async function persistCliGroupOutbound(
+    transaction: Pick<StoreTransaction, "set">,
+    key: string,
+    outbound: CliGroupOutbound,
+): Promise<void> {
+    const encoded = encodeCliGroupOutbound(outbound);
+    try {
+        await transaction.set(key, encoded.slice());
+    } finally {
+        zeroBytes(encoded);
+    }
+}
+
+async function persistCliStoredGroupMessage(
+    transaction: Pick<StoreTransaction, "set">,
+    key: string,
+    stored: CliStoredGroupMessage,
+): Promise<void> {
+    const encoded = encodeCliStoredGroupMessage(stored);
+    try {
+        await transaction.set(key, encoded.slice());
+    } finally {
+        zeroBytes(encoded);
+    }
+}
+
+async function nextGroupSequence(transaction: StoreTransaction, ownerId: string): Promise<number> {
+    const key = `${GROUP_SEQUENCE_PREFIX}/${ownerId}`;
+    const currentBytes = await transaction.get(key);
+    let current = 0;
+    if (currentBytes !== undefined) {
+        try {
+            const value = utf8Decode(currentBytes);
+            if (!/^(?:0|[1-9]\d*)$/.test(value)) {
+                throw new Error("Invalid CLI group message sequence");
+            }
+            current = Number(value);
+            if (!Number.isSafeInteger(current) || current < 0) {
+                throw new Error("Invalid CLI group message sequence");
+            }
+        } finally {
+            zeroBytes(currentBytes);
+        }
+    }
+    const next = current + 1;
+    if (!Number.isSafeInteger(next)) {
+        throw new Error("CLI group message sequence is exhausted");
+    }
+    const encoded = utf8Encode(String(next));
+    try {
+        await transaction.set(key, encoded.slice());
+    } finally {
+        zeroBytes(encoded);
+    }
+    return next;
+}
+
+function includeFingerprint(
+    fingerprints: readonly Uint8Array[],
+    fingerprint: Uint8Array,
+): readonly Uint8Array[] {
+    return fingerprints.some((current) => equalBytes(current, fingerprint))
+        ? fingerprints.map((current) => current.slice())
+        : [...fingerprints.map((current) => current.slice()), fingerprint.slice()];
+}
+
+function validateCliShareableProfile(account: CliAccount): void {
+    const bundle = createMlsKeyPackage(account.identity);
+    let payload: Uint8Array | undefined;
+    try {
+        payload = encodeCliProfileEnvelope(
+            encryptProfileForContact(account.identity, account.identity, account.profile),
+            bundle.keyPackage,
+        );
         if (payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
             throw new Error("CLI encrypted profile exceeds the relay event payload limit");
         }
     } finally {
-        zeroBytes(payload);
+        if (payload !== undefined) {
+            zeroBytes(payload);
+        }
+        destroyMlsKeyPackageBundle(bundle);
     }
 }
 
@@ -244,6 +438,9 @@ export class MurmurCliRuntime {
     #account: CliAccount | undefined;
     #client: MurmurClient | undefined;
     #contacts: ContactBook | undefined;
+    readonly #groups = new Map<string, LoadedCliGroup>();
+    readonly #removedGroups = new Set<string>();
+    readonly #pendingGroupPublications = new Map<string, PendingCliGroupPublication>();
 
     private constructor(
         store: MurmurStore,
@@ -272,11 +469,18 @@ export class MurmurCliRuntime {
             return new MurmurCliRuntime(options.store, options.transports);
         }
         let account: CliAccount | undefined;
+        let runtime: MurmurCliRuntime | undefined;
         try {
             account = decodeCliAccount(encoded);
             validateCliShareableProfile(account);
-            return new MurmurCliRuntime(options.store, options.transports, account);
+            runtime = new MurmurCliRuntime(options.store, options.transports, account);
+            await runtime.#loadGroups();
+            await runtime.#loadRemovedGroups();
+            return runtime;
         } catch (error: unknown) {
+            if (runtime !== undefined) {
+                runtime.#destroyGroups();
+            }
             if (account !== undefined) {
                 destroyIdentity(account.identity);
                 if (account.profile.avatar !== undefined) {
@@ -357,15 +561,35 @@ export class MurmurCliRuntime {
     async shareProfile(token: string): Promise<void> {
         const account = this.#requireAccount();
         const recipient = decodeCliIdentityToken(token);
-        const payload = encodeCliProfileEnvelope(
-            encryptProfileForContact(account.identity, recipient, account.profile),
-        );
+        const bundle = createMlsKeyPackage(account.identity);
+        const reference = mlsKeyPackageReference(bundle.keyPackage);
+        let durableBundle: Uint8Array | undefined;
+        let payload: Uint8Array | undefined;
         try {
+            durableBundle = serializeMlsKeyPackageBundle(bundle);
+            await this.#store.set(
+                localKeyPackageKey(identityId(account.identity), reference),
+                durableBundle.slice(),
+            );
+            await this.#pruneLocalKeyPackages(identityId(account.identity));
+            payload = encodeCliProfileEnvelope(
+                encryptProfileForContact(account.identity, recipient, account.profile),
+                bundle.keyPackage,
+            );
+            if (payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
+                throw new Error("CLI encrypted profile exceeds the relay event payload limit");
+            }
             await this.#requireClient().publish(identityInboxTopic(recipient), payload, [
                 recipient,
             ]);
         } finally {
-            zeroBytes(payload);
+            if (durableBundle !== undefined) {
+                zeroBytes(durableBundle);
+            }
+            if (payload !== undefined) {
+                zeroBytes(payload);
+            }
+            destroyMlsKeyPackageBundle(bundle);
         }
     }
 
@@ -376,8 +600,356 @@ export class MurmurCliRuntime {
 
     /** Remove one local contact by signing identity or full token. */
     async removeContact(value: string): Promise<void> {
+        const account = this.#requireAccount();
         const contact = await this.#resolveContact(value);
         await this.#requireContacts().remove(contact.identity);
+        await this.#store.delete(
+            contactKeyPackageKey(identityId(account.identity), identityId(contact.identity)),
+        );
+    }
+
+    /** Create, persist, and subscribe a one-member RFC 9420 group. */
+    async createGroup(name: string): Promise<string> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const epoch = createMlsGroup(account.identity);
+        const channel = new MlsGroupChannel(epoch);
+        const groupId = cliGroupId(channel.groupId);
+        let state: Uint8Array | undefined;
+        try {
+            if (this.#groups.has(groupId) || this.#removedGroups.has(groupId)) {
+                throw new Error("Generated MLS group identifier collided");
+            }
+            state = channel.serializeEpoch();
+            await persistCliGroupRecord(this.#store, cliGroupKey(ownerId, groupId), {
+                name,
+                epochState: state,
+                persistenceGeneration: channel.persistenceGeneration,
+                appliedCommitFingerprints: [],
+                appliedApplicationFingerprints: [],
+            });
+            this.#groups.set(groupId, { name, channel });
+            await channel.subscribe(this.#requireClient());
+            return groupId;
+        } catch (error: unknown) {
+            if (!this.#groups.has(groupId)) {
+                channel.destroy();
+            }
+            throw error;
+        } finally {
+            if (state !== undefined) {
+                zeroBytes(state);
+            }
+        }
+    }
+
+    /** List locally owned MLS groups and authenticated member identities. */
+    groups(): readonly CliGroupSummary[] {
+        return [...this.#groups.entries()]
+            .map(([id, group]) => ({
+                id,
+                name: group.name,
+                epoch: group.channel.epoch,
+                members: group.channel.memberSignatureKeys.map((key) =>
+                    key === undefined ? undefined : identityId({ signingKey: key }),
+                ),
+            }))
+            .sort((left, right) => (left.id < right.id ? -1 : left.id > right.id ? 1 : 0));
+    }
+
+    /** Add one contact with a fresh one-use KeyPackage and send its Welcome. */
+    async inviteToGroup(groupValue: string, contactValue: string): Promise<void> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const [groupId, group] = this.#resolveGroup(groupValue);
+        await this.#ensureNoDurableGroupOutbox(ownerId, groupId);
+        const contact = await this.#resolveContact(contactValue);
+        const contactId = identityId(contact.identity);
+        const encodedKeyPackage = await this.#store.get(contactKeyPackageKey(ownerId, contactId));
+        if (encodedKeyPackage === undefined) {
+            throw new Error("Contact has no unused MLS KeyPackage; exchange profiles again");
+        }
+        let keyPackage: MlsKeyPackage;
+        try {
+            keyPackage = decodeMlsKeyPackage(encodedKeyPackage);
+        } finally {
+            zeroBytes(encodedKeyPackage);
+        }
+        if (
+            !verifyMlsKeyPackage(keyPackage) ||
+            !equalBytes(keyPackage.leafNode.signatureKey, contact.identity.signingKey)
+        ) {
+            throw new Error("Contact MLS KeyPackage does not match the authenticated profile");
+        }
+        const prepared = group.channel.prepareCommit([{ type: "add", keyPackage }]);
+        let persisted = false;
+        let checkpoint: Uint8Array | undefined;
+        let treeBytes: Uint8Array | undefined;
+        let invitationPayload: Uint8Array | undefined;
+        try {
+            if (prepared.welcome === undefined || prepared.addedLeaves.length !== 1) {
+                throw new Error("MLS Add did not produce exactly one Welcome leaf");
+            }
+            checkpoint = prepared.serializeNextEpoch();
+            treeBytes = encodeMlsRatchetTree(prepared.tree);
+            const invitationText = encodeCliGroupInvitation({
+                name: group.name,
+                groupId: group.channel.groupId,
+                welcome: prepared.welcome,
+                tree: treeBytes,
+                keyPackageReference: mlsKeyPackageReference(keyPackage),
+                commitFingerprint: prepared.fingerprint,
+            });
+            const invitationMessage = createPrivateMessage(invitationText);
+            invitationPayload = encodeEncryptedPrivateMessage(
+                encryptPrivateMessageForContact(
+                    account.identity,
+                    contact.identity,
+                    invitationMessage,
+                ),
+            );
+            if (invitationPayload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
+                throw new Error("MLS group invitation exceeds the relay payload limit");
+            }
+            const publicationTime = Date.now();
+            const invitationEvent = createRelayEvent(
+                account.identity,
+                cliDirectMessageTopic(contact.identity),
+                invitationPayload,
+                [contact.identity],
+                publicationTime,
+            );
+            const commitEvent = createRelayEvent(
+                account.identity,
+                group.channel.topic,
+                prepared.payload,
+                [],
+                publicationTime,
+            );
+            const invitationOutboxKey = cliGroupOutboundKey(ownerId, groupId, invitationEvent, 0);
+            const commitOutboxKey = cliGroupOutboundKey(ownerId, groupId, commitEvent, 1);
+            await this.#store.transaction(async (transaction) => {
+                await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                    name: group.name,
+                    epochState: checkpoint!,
+                    persistenceGeneration: prepared.persistenceGeneration,
+                    appliedCommitFingerprints: includeFingerprint(
+                        group.channel.appliedCommitFingerprints,
+                        prepared.fingerprint,
+                    ),
+                    appliedApplicationFingerprints: group.channel.appliedApplicationFingerprints,
+                });
+                await persistCliGroupOutbound(transaction, invitationOutboxKey, {
+                    kind: "invitation",
+                    groupId,
+                    event: invitationEvent,
+                });
+                await persistCliGroupOutbound(transaction, commitOutboxKey, {
+                    kind: "commit",
+                    groupId,
+                    event: commitEvent,
+                });
+                await transaction.delete(contactKeyPackageKey(ownerId, contactId));
+            });
+            persisted = true;
+            prepared.markPersisted();
+            const pending: PendingCliGroupPublication = {
+                kind: "commit",
+                groupId,
+                outboxKey: commitOutboxKey,
+                prepared,
+            };
+            this.#pendingGroupPublications.set(commitEvent.id, pending);
+            await this.#requireClient().publishEvent(invitationEvent);
+            await this.#store.delete(invitationOutboxKey);
+            await this.#publishPendingGroupCommit(commitEvent, pending);
+        } catch (error: unknown) {
+            if (!persisted) {
+                prepared.cancel();
+            }
+            throw error;
+        } finally {
+            if (checkpoint !== undefined) {
+                zeroBytes(checkpoint);
+            }
+            if (treeBytes !== undefined) {
+                zeroBytes(treeBytes);
+            }
+            if (invitationPayload !== undefined) {
+                zeroBytes(invitationPayload);
+            }
+        }
+    }
+
+    /** Cryptographically remove one authenticated contact from an MLS group. */
+    async removeFromGroup(groupValue: string, contactValue: string): Promise<void> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const [groupId, group] = this.#resolveGroup(groupValue);
+        await this.#ensureNoDurableGroupOutbox(ownerId, groupId);
+        const contact = await this.#resolveContact(contactValue);
+        const removed = group.channel.memberSignatureKeys.findIndex(
+            (key) => key !== undefined && equalBytes(key, contact.identity.signingKey),
+        );
+        if (removed < 0) {
+            throw new Error("Contact is not an active MLS group member");
+        }
+        const prepared = group.channel.prepareCommit([{ type: "remove", removed }]);
+        let persisted = false;
+        let checkpoint: Uint8Array | undefined;
+        try {
+            checkpoint = prepared.serializeNextEpoch();
+            const event = createRelayEvent(account.identity, group.channel.topic, prepared.payload);
+            const outboxKey = cliGroupOutboundKey(ownerId, groupId, event, 1);
+            await this.#store.transaction(async (transaction) => {
+                await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                    name: group.name,
+                    epochState: checkpoint!,
+                    persistenceGeneration: prepared.persistenceGeneration,
+                    appliedCommitFingerprints: includeFingerprint(
+                        group.channel.appliedCommitFingerprints,
+                        prepared.fingerprint,
+                    ),
+                    appliedApplicationFingerprints: group.channel.appliedApplicationFingerprints,
+                });
+                await persistCliGroupOutbound(transaction, outboxKey, {
+                    kind: "commit",
+                    groupId,
+                    event,
+                });
+            });
+            persisted = true;
+            prepared.markPersisted();
+            const pending: PendingCliGroupPublication = {
+                kind: "commit",
+                groupId,
+                outboxKey,
+                prepared,
+            };
+            this.#pendingGroupPublications.set(event.id, pending);
+            await this.#publishPendingGroupCommit(event, pending);
+        } catch (error: unknown) {
+            if (!persisted) {
+                prepared.cancel();
+            }
+            throw error;
+        } finally {
+            if (checkpoint !== undefined) {
+                zeroBytes(checkpoint);
+            }
+        }
+    }
+
+    /** Encrypt, checkpoint, persist, and publish one MLS group message. */
+    async sendToGroup(groupValue: string, text: string, now: number = Date.now()): Promise<string> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const [groupId, group] = this.#resolveGroup(groupValue);
+        await this.#ensureNoDurableGroupOutbox(ownerId, groupId);
+        const sender = group.channel.memberSignatureKeys.findIndex(
+            (key) => key !== undefined && equalBytes(key, account.identity.signingKey),
+        );
+        if (sender < 0) {
+            throw new Error("Local identity is not an active MLS group member");
+        }
+        const message: CliGroupMessage = {
+            id: encodeBase64Url(randomBytes(16)),
+            sentAt: now,
+            text,
+        };
+        const applicationData = encodeCliGroupMessage(message);
+        const prepared = group.channel.prepareSend(applicationData);
+        let persisted = false;
+        let checkpoint: Uint8Array | undefined;
+        try {
+            if (prepared.payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
+                throw new Error("MLS group message exceeds the relay payload limit");
+            }
+            checkpoint = prepared.serializeEpoch();
+            const event = createRelayEvent(account.identity, group.channel.topic, prepared.payload);
+            const outboxKey = cliGroupOutboundKey(ownerId, groupId, event, 2);
+            let messageKey = "";
+            await this.#store.transaction(async (transaction) => {
+                const stored: CliStoredGroupMessage = {
+                    sequence: await nextGroupSequence(transaction, ownerId),
+                    groupId,
+                    direction: "outgoing",
+                    status: "pending",
+                    sender,
+                    message,
+                };
+                messageKey = cliGroupMessageKey(ownerId, stored);
+                await persistCliStoredGroupMessage(transaction, messageKey, stored);
+                await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                    name: group.name,
+                    epochState: checkpoint!,
+                    persistenceGeneration: prepared.persistenceGeneration,
+                    appliedCommitFingerprints: group.channel.appliedCommitFingerprints,
+                    appliedApplicationFingerprints: includeFingerprint(
+                        group.channel.appliedApplicationFingerprints,
+                        prepared.fingerprint,
+                    ),
+                });
+                await persistCliGroupOutbound(transaction, outboxKey, {
+                    kind: "application",
+                    groupId,
+                    event,
+                    messageKey,
+                });
+            });
+            persisted = true;
+            prepared.markPersisted();
+            const pending: PendingCliGroupPublication = {
+                kind: "application",
+                groupId,
+                outboxKey,
+                messageKey,
+                prepared,
+            };
+            this.#pendingGroupPublications.set(event.id, pending);
+            await this.#publishPendingGroupApplication(event, pending);
+            return message.id;
+        } catch (error: unknown) {
+            if (!persisted) {
+                prepared.cancel();
+            }
+            throw error;
+        } finally {
+            zeroBytes(applicationData);
+            if (checkpoint !== undefined) {
+                zeroBytes(checkpoint);
+            }
+        }
+    }
+
+    /** Read durable group history, optionally filtered to one group. */
+    async groupMessages(
+        groupValue?: string,
+        limit: number = 100,
+    ): Promise<readonly CliStoredGroupMessage[]> {
+        if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000) {
+            throw new Error("Group message limit must be between 1 and 10000");
+        }
+        const ownerId = identityId(this.#requireAccount().identity);
+        const groupId = groupValue === undefined ? undefined : this.#resolveGroup(groupValue)[0];
+        const values = [
+            ...(await this.#store.list(`${GROUP_MESSAGE_PREFIX}/${ownerId}/`)).values(),
+        ];
+        const messages: CliStoredGroupMessage[] = [];
+        try {
+            for (const value of values) {
+                messages.push(decodeCliStoredGroupMessage(value));
+            }
+        } finally {
+            for (const value of values) {
+                zeroBytes(value);
+            }
+        }
+        const filtered =
+            groupId === undefined
+                ? messages
+                : messages.filter((message) => message.groupId === groupId);
+        return filtered.slice(Math.max(0, filtered.length - limit));
     }
 
     /** Encrypt files and one signed private message to an authenticated contact. */
@@ -468,18 +1040,27 @@ export class MurmurCliRuntime {
         const account = this.#requireAccount();
         const client = this.#requireClient();
         const ownerId = identityId(account.identity);
+        await Promise.all(
+            [...this.#groups.values()].map(async (group) => group.channel.subscribe(client)),
+        );
         const retryReport = await client.retryOutboundSettled();
         for (const result of retryReport.results) {
             await this.#completeOutboundMessage(ownerId, result.event.id);
+            await this.#completeRetriedGroupPublication(result);
         }
         const applicationRetryFailures = await this.#flushOutboundMessages(ownerId);
+        const groupRetryFailures = await this.#flushGroupOutbound(ownerId);
         const retriedOutbound = retryReport.results.length;
-        const retryFailures = retryReport.failures.length + applicationRetryFailures;
+        const retryFailures =
+            retryReport.failures.length + applicationRetryFailures + groupRetryFailures;
         let profiles = 0;
         let messages = 0;
         let duplicates = 0;
         let deferred = 0;
         let quarantined = 0;
+        let groupMessages = 0;
+        let groupCommits = 0;
+        let invitations = 0;
 
         for (let batch = 0; batch < 625; batch += 1) {
             const deliveries = await client.sync(batch === 0 ? waitMilliseconds : 0, signal);
@@ -489,11 +1070,23 @@ export class MurmurCliRuntime {
             for (const delivery of deliveries) {
                 if (delivery.event.topic === identityInboxTopic(account.identity)) {
                     let opened: ReturnType<typeof decryptContactProfile>;
+                    let keyPackage: MlsKeyPackage | undefined;
                     try {
-                        opened = decryptContactProfile(
-                            account.identity,
-                            decodeCliProfileEnvelope(delivery.event.payload),
-                        );
+                        const envelope = decodeCliProfileEnvelope(delivery.event.payload);
+                        opened = decryptContactProfile(account.identity, envelope.encrypted);
+                        keyPackage = envelope.keyPackage;
+                        if (
+                            keyPackage !== undefined &&
+                            (!verifyMlsKeyPackage(keyPackage) ||
+                                !equalBytes(
+                                    keyPackage.leafNode.signatureKey,
+                                    opened.identity.signingKey,
+                                ))
+                        ) {
+                            throw new Error(
+                                "Profile KeyPackage does not match its authenticated sender",
+                            );
+                        }
                     } catch {
                         await this.#quarantine(ownerId, delivery, "invalid-profile");
                         quarantined += 1;
@@ -501,6 +1094,17 @@ export class MurmurCliRuntime {
                     }
                     try {
                         await this.#requireContacts().save(opened);
+                        if (keyPackage !== undefined) {
+                            const encodedKeyPackage = encodeMlsKeyPackage(keyPackage);
+                            try {
+                                await this.#store.set(
+                                    contactKeyPackageKey(ownerId, identityId(opened.identity)),
+                                    encodedKeyPackage.slice(),
+                                );
+                            } finally {
+                                zeroBytes(encodedKeyPackage);
+                            }
+                        }
                         await delivery.acknowledge();
                         profiles += 1;
                     } catch {
@@ -528,12 +1132,23 @@ export class MurmurCliRuntime {
                     let accepted:
                         | Awaited<ReturnType<typeof acceptPrivateMessageFromContact>>
                         | undefined;
+                    let acceptedGroup:
+                        | { readonly id: string; readonly group: LoadedCliGroup }
+                        | undefined;
                     try {
                         accepted = await acceptPrivateMessageFromContact(
                             this.#store,
                             account.identity,
                             decodeEncryptedPrivateMessage(delivery.event.payload),
                             async (transaction, opened): Promise<void> => {
+                                const invitation = decodeCliGroupInvitation(opened.message.text);
+                                if (invitation !== undefined) {
+                                    acceptedGroup = await this.#acceptGroupInvitation(
+                                        transaction,
+                                        opened.identity,
+                                        invitation,
+                                    );
+                                }
                                 const stored: CliStoredMessage = {
                                     sequence: await nextMessageSequence(transaction, ownerId),
                                     direction: "incoming",
@@ -548,9 +1163,16 @@ export class MurmurCliRuntime {
                                 );
                             },
                         );
+                        if (acceptedGroup !== undefined) {
+                            this.#groups.set(acceptedGroup.id, acceptedGroup.group);
+                            await acceptedGroup.group.channel.subscribe(client);
+                        }
                         await delivery.acknowledge();
                         if (accepted.status === "opened") {
                             messages += 1;
+                            if (acceptedGroup !== undefined) {
+                                invitations += 1;
+                            }
                         } else {
                             duplicates += 1;
                         }
@@ -561,10 +1183,46 @@ export class MurmurCliRuntime {
                         } else {
                             deferred += 1;
                         }
+                        if (acceptedGroup !== undefined && !this.#groups.has(acceptedGroup.id)) {
+                            acceptedGroup.group.channel.destroy();
+                        }
                     } finally {
                         if (accepted !== undefined) {
                             clearMessageSecrets(accepted);
                         }
+                    }
+                    continue;
+                }
+                const groupEntry = [...this.#groups.entries()].find(
+                    ([, group]) => group.channel.topic === delivery.event.topic,
+                );
+                if (groupEntry !== undefined) {
+                    const result = await this.#handleGroupDelivery(
+                        ownerId,
+                        groupEntry[0],
+                        groupEntry[1],
+                        delivery,
+                    );
+                    if (result === "message") {
+                        groupMessages += 1;
+                    } else if (result === "commit") {
+                        groupCommits += 1;
+                    } else if (result === "duplicate") {
+                        duplicates += 1;
+                    } else {
+                        deferred += 1;
+                    }
+                    continue;
+                }
+                if (
+                    delivery.event.topic.startsWith("mls:") &&
+                    this.#removedGroups.has(delivery.event.topic.slice(4))
+                ) {
+                    try {
+                        await delivery.acknowledge();
+                        duplicates += 1;
+                    } catch {
+                        deferred += 1;
                     }
                     continue;
                 }
@@ -583,6 +1241,9 @@ export class MurmurCliRuntime {
             retriedOutbound,
             retryFailures,
             quarantined,
+            groupMessages,
+            groupCommits,
+            invitations,
         };
     }
 
@@ -658,6 +1319,515 @@ export class MurmurCliRuntime {
                 clearMessageSecrets(stored);
             }
         }
+    }
+
+    async #loadGroups(): Promise<void> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const entries = await this.#store.list(`${GROUP_PREFIX}/${ownerId}/`);
+        try {
+            for (const [key, value] of entries) {
+                const expectedPrefix = `${GROUP_PREFIX}/${ownerId}/`;
+                const groupId = key.slice(expectedPrefix.length);
+                const loaded = this.#decodeLoadedGroup(groupId, value);
+                if (this.#groups.has(groupId)) {
+                    loaded.channel.destroy();
+                    throw new Error("Duplicate durable CLI group");
+                }
+                this.#groups.set(groupId, loaded);
+            }
+        } catch (error: unknown) {
+            this.#destroyGroups();
+            throw error;
+        } finally {
+            for (const value of entries.values()) {
+                zeroBytes(value);
+            }
+        }
+    }
+
+    async #loadRemovedGroups(): Promise<void> {
+        const ownerId = identityId(this.#requireAccount().identity);
+        const prefix = `${REMOVED_GROUP_PREFIX}/${ownerId}/`;
+        const entries = await this.#store.list(prefix);
+        for (const [key, value] of entries) {
+            try {
+                const groupId = key.slice(prefix.length);
+                if (
+                    !/^[A-Za-z0-9_-]{43}$/.test(groupId) ||
+                    value.length !== 1 ||
+                    value[0] !== 1 ||
+                    this.#groups.has(groupId)
+                ) {
+                    throw new Error("Invalid removed CLI group tombstone");
+                }
+                this.#removedGroups.add(groupId);
+            } finally {
+                zeroBytes(value);
+            }
+        }
+    }
+
+    #decodeLoadedGroup(groupId: string, bytes: Uint8Array): LoadedCliGroup {
+        const account = this.#requireAccount();
+        const record = decodeCliGroupRecord(bytes);
+        let epoch: MlsEpochState | undefined;
+        try {
+            epoch = MlsEpochState.deserialize(record.epochState, {
+                localSigningSecretKey: account.identity.signingSecretKey,
+                authenticateCredential: authenticateMurmurMlsCredential,
+                minimumPersistenceGeneration: record.persistenceGeneration,
+            });
+            if (cliGroupId(epoch.groupId) !== groupId) {
+                throw new Error("Durable CLI group key does not match its MLS group");
+            }
+            const channel = new MlsGroupChannel(
+                epoch,
+                record.appliedCommitFingerprints,
+                record.appliedApplicationFingerprints,
+            );
+            epoch = undefined;
+            return { name: record.name, channel };
+        } finally {
+            zeroBytes(record.epochState);
+            epoch?.destroy();
+        }
+    }
+
+    #destroyGroups(): void {
+        for (const pending of this.#pendingGroupPublications.values()) {
+            pending.prepared.abandonPersisted();
+        }
+        this.#pendingGroupPublications.clear();
+        for (const group of this.#groups.values()) {
+            group.channel.destroy();
+        }
+        this.#groups.clear();
+        this.#removedGroups.clear();
+    }
+
+    async #pruneLocalKeyPackages(ownerId: string): Promise<void> {
+        const entries = await this.#store.list(`${LOCAL_KEY_PACKAGE_PREFIX}/${ownerId}/`);
+        const retained: Array<{
+            readonly key: string;
+            readonly notBefore: bigint;
+        }> = [];
+        const invalid: string[] = [];
+        for (const [key, value] of entries) {
+            try {
+                const bundle = deserializeMlsKeyPackageBundle(value);
+                try {
+                    retained.push({
+                        key,
+                        notBefore: bundle.keyPackage.leafNode.notBefore,
+                    });
+                } finally {
+                    destroyMlsKeyPackageBundle(bundle);
+                }
+            } catch {
+                invalid.push(key);
+            } finally {
+                zeroBytes(value);
+            }
+        }
+        retained.sort((left, right) =>
+            left.notBefore < right.notBefore
+                ? -1
+                : left.notBefore > right.notBefore
+                  ? 1
+                  : left.key < right.key
+                    ? -1
+                    : left.key > right.key
+                      ? 1
+                      : 0,
+        );
+        const excess = Math.max(0, retained.length - MAXIMUM_LOCAL_KEY_PACKAGES);
+        await this.#store.transaction(async (transaction) => {
+            for (const key of [...invalid, ...retained.slice(0, excess).map((item) => item.key)]) {
+                await transaction.delete(key);
+            }
+        });
+    }
+
+    #resolveGroup(value: string): readonly [string, LoadedCliGroup] {
+        const direct = this.#groups.get(value);
+        if (direct !== undefined) {
+            return [value, direct];
+        }
+        const matches = [...this.#groups.entries()].filter(([, group]) => group.name === value);
+        if (matches.length !== 1) {
+            throw new Error(matches.length === 0 ? "Group not found" : "Group name is ambiguous");
+        }
+        return matches[0]!;
+    }
+
+    async #ensureNoDurableGroupOutbox(ownerId: string, groupId: string): Promise<void> {
+        const entries = await this.#store.list(`${GROUP_OUTBOUND_PREFIX}/${ownerId}/${groupId}/`);
+        try {
+            if (entries.size > 0) {
+                throw new Error("MLS group has an unresolved durable publication");
+            }
+        } finally {
+            for (const value of entries.values()) {
+                zeroBytes(value);
+            }
+        }
+    }
+
+    async #acceptGroupInvitation(
+        transaction: StoreTransaction,
+        inviter: IdentityPublicKeys,
+        invitation: CliGroupInvitation,
+    ): Promise<{ readonly id: string; readonly group: LoadedCliGroup }> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const groupId = cliGroupId(invitation.groupId);
+        if (
+            this.#groups.has(groupId) ||
+            (await transaction.get(cliGroupKey(ownerId, groupId))) !== undefined
+        ) {
+            throw new Error("MLS group invitation collides with existing local state");
+        }
+        const bundleKey = localKeyPackageKey(ownerId, invitation.keyPackageReference);
+        const encodedBundle = await transaction.get(bundleKey);
+        if (encodedBundle === undefined) {
+            throw new Error("MLS group invitation references an unavailable KeyPackage");
+        }
+        let bundle: ReturnType<typeof deserializeMlsKeyPackageBundle> | undefined;
+        let opened: ReturnType<typeof openMlsWelcome> | undefined;
+        let channel: MlsGroupChannel | undefined;
+        let checkpoint: Uint8Array | undefined;
+        try {
+            bundle = deserializeMlsKeyPackageBundle(encodedBundle);
+            if (
+                !equalBytes(
+                    mlsKeyPackageReference(bundle.keyPackage),
+                    invitation.keyPackageReference,
+                )
+            ) {
+                throw new Error("MLS invitation KeyPackage reference mismatch");
+            }
+            const tree = decodeMlsRatchetTree(invitation.tree, {
+                groupId: invitation.groupId,
+                authenticateCredential: authenticateMurmurMlsCredential,
+            });
+            const nodes = tree.nodes;
+            const localLeaves: number[] = [];
+            for (let leaf = 0; leaf < tree.leafCount; leaf += 1) {
+                const node = nodes[leaf * 2];
+                if (
+                    node?.type === "leaf" &&
+                    equalBytes(node.signatureKey, bundle.keyPackage.leafNode.signatureKey) &&
+                    equalBytes(node.encryptionKey, bundle.keyPackage.leafNode.encryptionKey)
+                ) {
+                    localLeaves.push(leaf);
+                }
+            }
+            if (localLeaves.length !== 1) {
+                throw new Error("MLS invitation tree does not contain exactly one joining leaf");
+            }
+            opened = openMlsWelcome({
+                welcome: invitation.welcome,
+                keyPackageBundle: bundle,
+                expectedGroupId: invitation.groupId,
+                validateExternalTree: (groupInfo) => {
+                    const signer = nodes[groupInfo.signer * 2];
+                    return equalBytes(groupInfo.context.treeHash, tree.treeHash()) &&
+                        equalBytes(groupInfo.context.groupId, invitation.groupId) &&
+                        signer?.type === "leaf" &&
+                        equalBytes(signer.signatureKey, inviter.signingKey)
+                        ? signer.signatureKey
+                        : undefined;
+                },
+            });
+            const epoch = createMlsTreeEpochFromWelcome({
+                opened,
+                tree,
+                localLeaf: localLeaves[0]!,
+                leafKeyPair: bundle.leafKeyPair,
+                localSigningSecretKey: account.identity.signingSecretKey,
+                authenticateCredential: authenticateMurmurMlsCredential,
+            });
+            opened = undefined;
+            channel = new MlsGroupChannel(epoch, [invitation.commitFingerprint]);
+            checkpoint = channel.serializeEpoch();
+            await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                name: invitation.name,
+                epochState: checkpoint,
+                persistenceGeneration: channel.persistenceGeneration,
+                appliedCommitFingerprints: channel.appliedCommitFingerprints,
+                appliedApplicationFingerprints: [],
+            });
+            await transaction.delete(bundleKey);
+            const group = { name: invitation.name, channel };
+            channel = undefined;
+            return { id: groupId, group };
+        } catch (error: unknown) {
+            channel?.destroy();
+            if (opened !== undefined) {
+                destroyMlsEpochSecrets(opened.epochSecrets);
+                if (opened.pathSecret !== undefined) {
+                    zeroBytes(opened.pathSecret);
+                }
+            }
+            throw error;
+        } finally {
+            zeroBytes(encodedBundle);
+            if (checkpoint !== undefined) {
+                zeroBytes(checkpoint);
+            }
+            if (bundle !== undefined) {
+                destroyMlsKeyPackageBundle(bundle);
+            }
+        }
+    }
+
+    async #handleGroupDelivery(
+        ownerId: string,
+        groupId: string,
+        group: LoadedCliGroup,
+        delivery: ReceivedEvent,
+    ): Promise<"message" | "commit" | "duplicate" | "deferred"> {
+        const handled = group.channel.handle(delivery);
+        if (handled === undefined || handled.status === "deferred") {
+            return "deferred";
+        }
+        if (handled.status === "applied" || handled.status === "application-applied") {
+            try {
+                await handled.acknowledge();
+                return "duplicate";
+            } catch {
+                return "deferred";
+            }
+        }
+        if (handled.status === "removed") {
+            let persisted = false;
+            try {
+                await this.#store.transaction(async (transaction) => {
+                    await transaction.delete(cliGroupKey(ownerId, groupId));
+                    await transaction.set(
+                        `${REMOVED_GROUP_PREFIX}/${ownerId}/${groupId}`,
+                        new Uint8Array([1]),
+                    );
+                });
+                persisted = true;
+                handled.markPersisted();
+                this.#groups.delete(groupId);
+                this.#removedGroups.add(groupId);
+                await handled.acknowledge();
+                return "commit";
+            } catch {
+                if (!persisted) {
+                    handled.cancel();
+                }
+                return "deferred";
+            }
+        }
+        if (handled.status === "commit") {
+            let persisted = false;
+            let checkpoint: Uint8Array | undefined;
+            try {
+                checkpoint = handled.serializeNextEpoch();
+                await persistCliGroupRecord(this.#store, cliGroupKey(ownerId, groupId), {
+                    name: group.name,
+                    epochState: checkpoint,
+                    persistenceGeneration: handled.persistenceGeneration,
+                    appliedCommitFingerprints: includeFingerprint(
+                        group.channel.appliedCommitFingerprints,
+                        handled.fingerprint,
+                    ),
+                    appliedApplicationFingerprints: group.channel.appliedApplicationFingerprints,
+                });
+                persisted = true;
+                handled.markPersisted();
+                handled.adopt();
+                await handled.acknowledge();
+                return "commit";
+            } catch {
+                if (!persisted) {
+                    handled.cancel();
+                }
+                return "deferred";
+            } finally {
+                if (checkpoint !== undefined) {
+                    zeroBytes(checkpoint);
+                }
+            }
+        }
+        let persisted = false;
+        let checkpoint: Uint8Array | undefined;
+        try {
+            const message = decodeCliGroupMessage(handled.message.applicationData);
+            checkpoint = handled.serializeEpoch();
+            await this.#store.transaction(async (transaction) => {
+                const stored: CliStoredGroupMessage = {
+                    sequence: await nextGroupSequence(transaction, ownerId),
+                    groupId,
+                    direction: "incoming",
+                    status: "received",
+                    sender: handled.message.sender,
+                    message,
+                };
+                await persistCliStoredGroupMessage(
+                    transaction,
+                    cliGroupMessageKey(ownerId, stored),
+                    stored,
+                );
+                await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                    name: group.name,
+                    epochState: checkpoint!,
+                    persistenceGeneration: handled.persistenceGeneration,
+                    appliedCommitFingerprints: group.channel.appliedCommitFingerprints,
+                    appliedApplicationFingerprints: includeFingerprint(
+                        group.channel.appliedApplicationFingerprints,
+                        handled.fingerprint,
+                    ),
+                });
+            });
+            persisted = true;
+            handled.markPersisted();
+            await handled.acknowledge();
+            return "message";
+        } catch {
+            if (!persisted) {
+                await this.#reloadGroup(groupId);
+            }
+            return "deferred";
+        } finally {
+            zeroBytes(handled.message.applicationData);
+            zeroBytes(handled.message.authenticatedData);
+            if (checkpoint !== undefined) {
+                zeroBytes(checkpoint);
+            }
+        }
+    }
+
+    async #reloadGroup(groupId: string): Promise<void> {
+        const ownerId = identityId(this.#requireAccount().identity);
+        const encoded = await this.#store.get(cliGroupKey(ownerId, groupId));
+        if (encoded === undefined) {
+            throw new Error("Durable CLI group disappeared");
+        }
+        try {
+            const loaded = this.#decodeLoadedGroup(groupId, encoded);
+            const prior = this.#groups.get(groupId);
+            this.#groups.set(groupId, loaded);
+            prior?.channel.destroy();
+        } finally {
+            zeroBytes(encoded);
+        }
+    }
+
+    #exactGroupPublisher(event: CliGroupOutbound["event"]): {
+        publish(topic: string, payload: Uint8Array): ReturnType<MurmurClient["publishEvent"]>;
+        subscribe(topic: string): Promise<void>;
+    } {
+        const client = this.#requireClient();
+        return {
+            publish: async (topic, payload) => {
+                if (
+                    topic !== event.topic ||
+                    !equalBytes(payload, event.payload) ||
+                    event.recipients.length !== 0
+                ) {
+                    throw new Error("Prepared MLS publication changed its exact relay event");
+                }
+                return client.publishEvent(event);
+            },
+            subscribe: async (topic) => client.subscribe(topic),
+        };
+    }
+
+    async #publishPendingGroupCommit(
+        event: CliGroupOutbound["event"],
+        pending: Extract<PendingCliGroupPublication, { readonly kind: "commit" }>,
+    ): Promise<void> {
+        await pending.prepared.publish(this.#exactGroupPublisher(event));
+        pending.prepared.adopt();
+        await this.#store.delete(pending.outboxKey);
+        this.#pendingGroupPublications.delete(event.id);
+    }
+
+    async #publishPendingGroupApplication(
+        event: CliGroupOutbound["event"],
+        pending: Extract<PendingCliGroupPublication, { readonly kind: "application" }>,
+    ): Promise<void> {
+        await pending.prepared.publish(this.#exactGroupPublisher(event));
+        await this.#completeGroupApplicationOutbox(pending.outboxKey, pending.messageKey);
+        this.#pendingGroupPublications.delete(event.id);
+    }
+
+    async #completeRetriedGroupPublication(
+        result: Awaited<ReturnType<MurmurClient["publishEvent"]>>,
+    ): Promise<void> {
+        const pending = this.#pendingGroupPublications.get(result.event.id);
+        if (pending === undefined) {
+            return;
+        }
+        pending.prepared.confirmPublished(result);
+        if (pending.kind === "commit") {
+            pending.prepared.adopt();
+            await this.#store.delete(pending.outboxKey);
+        } else {
+            await this.#completeGroupApplicationOutbox(pending.outboxKey, pending.messageKey);
+        }
+        this.#pendingGroupPublications.delete(result.event.id);
+    }
+
+    async #flushGroupOutbound(ownerId: string): Promise<number> {
+        const entries = await this.#store.list(`${GROUP_OUTBOUND_PREFIX}/${ownerId}/`);
+        let failures = 0;
+        const blockedGroups = new Set<string>();
+        for (const [key, value] of entries) {
+            let outbound: CliGroupOutbound;
+            try {
+                outbound = decodeCliGroupOutbound(value);
+            } finally {
+                zeroBytes(value);
+            }
+            if (blockedGroups.has(outbound.groupId)) {
+                continue;
+            }
+            try {
+                const pending = this.#pendingGroupPublications.get(outbound.event.id);
+                if (pending?.kind === "commit") {
+                    await this.#publishPendingGroupCommit(outbound.event, pending);
+                } else if (pending?.kind === "application") {
+                    await this.#publishPendingGroupApplication(outbound.event, pending);
+                } else {
+                    await this.#requireClient().publishEvent(outbound.event);
+                    if (outbound.kind === "application") {
+                        await this.#completeGroupApplicationOutbox(key, outbound.messageKey!);
+                    } else {
+                        await this.#store.delete(key);
+                    }
+                }
+            } catch {
+                failures += 1;
+                blockedGroups.add(outbound.groupId);
+            }
+        }
+        return failures;
+    }
+
+    async #completeGroupApplicationOutbox(outboxKey: string, messageKey: string): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const encoded = await transaction.get(messageKey);
+            if (encoded === undefined) {
+                throw new Error("CLI group outbox history record is missing");
+            }
+            let stored: CliStoredGroupMessage;
+            try {
+                stored = decodeCliStoredGroupMessage(encoded);
+            } finally {
+                zeroBytes(encoded);
+            }
+            await persistCliStoredGroupMessage(transaction, messageKey, {
+                ...stored,
+                status: "sent",
+            });
+            await transaction.delete(outboxKey);
+        });
     }
 
     async #flushOutboundMessages(ownerId: string): Promise<number> {
@@ -783,6 +1953,7 @@ export class MurmurCliRuntime {
 
     /** Zero the in-memory account secrets. Durable data remains available. */
     destroy(): void {
+        this.#destroyGroups();
         if (this.#account !== undefined) {
             destroyIdentity(this.#account.identity);
             if (this.#account.profile.avatar !== undefined) {

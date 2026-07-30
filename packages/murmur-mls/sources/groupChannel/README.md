@@ -21,9 +21,13 @@ Outbound Commit preparation deliberately does not hide publication ordering.
 The caller atomically persists the exact Commit, Welcome,
 `serializeNextEpoch()` bytes, and `persistenceGeneration`, invokes the handle's
 `publish()`, then adopts. If publication has an ambiguous network result, the
-transition cannot be cancelled or destroyed; it stays staged until Murmur's
-retained outbox has been resolved and `confirmPublished()` is called with the
-matching successful retry result.
+transition cannot be treated as cancelled; it stays staged in a live process
+until Murmur's retained outbox has been resolved and `confirmPublished()` is
+called with the matching successful retry result.
+
+Once that exact checkpoint and outbox are durable, process teardown may call
+`abandonPersisted()`. This zeros the recoverable in-memory staged/current state
+without claiming that publication was cancelled or altering durable recovery.
 
 Commit and application ciphertext fingerprints are exported and restored with
 the epoch. This makes sender echoes and post-crash redeliveries safely
@@ -32,3 +36,7 @@ generation. Markers must be stored in the same transaction as the epoch and
 application/outbox record. They remain until the application has evidence that
 every relevant relay delivery was acknowledged, then are explicitly removed
 with `forgetAppliedCommit()` or `forgetAppliedApplication()`.
+
+An authenticated Commit which removes the local leaf is surfaced as a gated
+`removed` delivery. The application must durably retire its epoch before
+`markPersisted()` destroys the live secrets and unlocks acknowledgment.

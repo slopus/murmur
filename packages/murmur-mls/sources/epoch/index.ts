@@ -534,6 +534,18 @@ export class MlsEpochState {
         return this.#persistenceGeneration;
     }
 
+    /** Defensive copy of the stable MLS group identifier. */
+    get groupId(): Uint8Array {
+        this.#ensureActive();
+        return this.#context.groupId.slice();
+    }
+
+    /** Defensive member signing-key view indexed by MLS leaf number. */
+    get memberSignatureKeys(): readonly (Uint8Array | undefined)[] {
+        this.#ensureActive();
+        return this.#members.map((member) => member?.signatureKey.slice());
+    }
+
     /**
      * Serialize this active epoch's sensitive local state.
      *
