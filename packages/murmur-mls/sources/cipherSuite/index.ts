@@ -1,7 +1,16 @@
+import { gcm } from "@noble/ciphers/aes";
 import { ed25519, x25519 } from "@noble/curves/ed25519";
+import { hmac } from "@noble/hashes/hmac";
 import { expand as hkdfExpand, extract as hkdfExtract } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha256";
-import { concatBytes, hashBytes, utf8Encode, verifyBytes, zeroBytes } from "@murmur/core";
+import {
+    concatBytes,
+    equalBytes,
+    hashBytes,
+    utf8Encode,
+    verifyBytes,
+    zeroBytes,
+} from "@murmur/core";
 import { encodeOpaqueV, encodeUint16 } from "../encoding/index.js";
 import { hpkeOpenBase, hpkeSealBase } from "./impl/hpke.js";
 import type { HpkeCiphertext, HpkeKeyPair } from "./types.js";
@@ -12,6 +21,8 @@ export { deriveHpkeKeyPair, hpkeOpenBase, hpkeSealBase } from "./impl/hpke.js";
 export const MLS_PROTOCOL_VERSION = 1;
 export const MLS_CIPHER_SUITE = 0x0001;
 export const MLS_HASH_LENGTH = 32;
+export const MLS_AEAD_KEY_LENGTH = 16;
+export const MLS_AEAD_NONCE_LENGTH = 12;
 
 const EMPTY = new Uint8Array();
 const MLS_PREFIX = "MLS 1.0 ";
@@ -69,6 +80,49 @@ export function mlsDeriveSecret(secret: Uint8Array, label: string): Uint8Array {
 /** HKDF-Extract used by the RFC 9420 key schedule. */
 export function mlsExtract(salt: Uint8Array, inputKeyMaterial: Uint8Array): Uint8Array {
     return hkdfExtract(sha256, inputKeyMaterial, salt);
+}
+
+/** RFC 9420 MAC for cipher suite 0x0001. */
+export function mlsMac(key: Uint8Array, content: Uint8Array): Uint8Array {
+    return hmac(sha256, key, content);
+}
+
+/** Verify an RFC 9420 MAC in constant time. */
+export function mlsVerifyMac(
+    key: Uint8Array,
+    content: Uint8Array,
+    authenticationTag: Uint8Array,
+): boolean {
+    return (
+        authenticationTag.length === MLS_HASH_LENGTH &&
+        equalBytes(mlsMac(key, content), authenticationTag)
+    );
+}
+
+/** AES-128-GCM seal for the MLS cipher suite. */
+export function mlsAeadSeal(
+    key: Uint8Array,
+    nonce: Uint8Array,
+    authenticatedData: Uint8Array,
+    plaintext: Uint8Array,
+): Uint8Array {
+    if (key.length !== MLS_AEAD_KEY_LENGTH || nonce.length !== MLS_AEAD_NONCE_LENGTH) {
+        throw new Error("Invalid MLS AEAD key or nonce");
+    }
+    return gcm(key, nonce, authenticatedData).encrypt(plaintext);
+}
+
+/** AES-128-GCM open for the MLS cipher suite. */
+export function mlsAeadOpen(
+    key: Uint8Array,
+    nonce: Uint8Array,
+    authenticatedData: Uint8Array,
+    ciphertext: Uint8Array,
+): Uint8Array {
+    if (key.length !== MLS_AEAD_KEY_LENGTH || nonce.length !== MLS_AEAD_NONCE_LENGTH) {
+        throw new Error("Invalid MLS AEAD key or nonce");
+    }
+    return gcm(key, nonce, authenticatedData).decrypt(ciphertext);
 }
 
 function signContent(label: string, content: Uint8Array): Uint8Array {
