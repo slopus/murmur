@@ -139,11 +139,9 @@ export async function authRoutes(app: Fastify) {
                 } else {
                     // Different profile - this is an update, not a registration
                     registrationsTotal.inc({ status: "conflict" });
-                    return reply
-                        .status(400)
-                        .send({
-                            error: "User exists with different profile. Use /v1/profile/update to update profile.",
-                        });
+                    return reply.status(400).send({
+                        error: "User exists with different profile. Use /v1/profile/update to update profile.",
+                    });
                 }
             }
 

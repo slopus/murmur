@@ -1,0 +1,33 @@
+{
+    "name": "@murmur/relay",
+    "version": "0.1.0",
+    "description": "Runtime-neutral dumb relay for Murmur",
+    "files": [
+        "dist",
+        "README.md",
+        "package.json"
+    ],
+    "type": "module",
+    "sideEffects": false,
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "import": "./dist/index.js"
+        }
+    },
+    "scripts": {
+        "build": "tsc -p tsconfig.build.json",
+        "check": "tsc --noEmit -p tsconfig.json",
+        "test": "vitest run",
+        "test:watch": "vitest"
+    },
+    "dependencies": {
+        "@murmur/core": "workspace:*"
+    },
+    "devDependencies": {
+        "typescript": "^5.9.3",
+        "vitest": "^3.2.7"
+    }
+}
