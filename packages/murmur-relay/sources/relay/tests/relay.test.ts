@@ -225,6 +225,24 @@ describe("RelayService", () => {
         await expect(pending).rejects.toThrow("disconnected");
     });
 
+    it("bounds each queue response without dropping retained deliveries", async () => {
+        const relay = new RelayService(new MemoryRelayStore(), {
+            maximumDeliveryBatch: 2,
+        });
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        for (const text of ["one", "two", "three"]) {
+            await relay.publish(createRelayEvent(alice, "direct", utf8Encode(text), [bob]));
+        }
+
+        const first = await pull(relay, bob);
+        expect(first).toHaveLength(2);
+        for (const delivery of first) {
+            await relay.acknowledge(createQueueAcknowledgeRequest(bob, delivery.deliveryId));
+        }
+        expect(await pull(relay, bob)).toHaveLength(1);
+    });
+
     it("strips structural secret-key extras before custom storage", async () => {
         const store = new RecordingStore();
         const relay = new RelayService(store);

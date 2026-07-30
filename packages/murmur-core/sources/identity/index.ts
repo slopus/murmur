@@ -16,11 +16,13 @@ import type {
 } from "./types.js";
 
 export type {
+    Contact,
     EncryptedProfile,
     IdentityProfile,
     OpenedProfile,
     SerializedPublicIdentity,
 } from "./types.js";
+export { ContactBook } from "./contactBook.js";
 
 const MAX_PROFILE_BYTES = 1024 * 1024;
 const MAX_PROFILE_PLAINTEXT_BYTES = Math.ceil((MAX_PROFILE_BYTES * 4) / 3) + 1_024;

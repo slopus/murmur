@@ -38,4 +38,21 @@ describe("identity crypto", () => {
         expect(identity.signingSecretKey.every((byte) => byte === 0)).toBe(true);
         expect(identity.encryptionSecretKey.every((byte) => byte === 0)).toBe(true);
     });
+
+    it("rejects ZIP-215 small-order identity forgeries", () => {
+        const identityPoint = new Uint8Array(32);
+        identityPoint[0] = 1;
+        const forgedSignature = new Uint8Array(64);
+        forgedSignature[0] = 1;
+
+        expect(
+            verifyBytes(
+                {
+                    signingKey: identityPoint,
+                },
+                utf8Encode("any content"),
+                forgedSignature,
+            ),
+        ).toBe(false);
+    });
 });

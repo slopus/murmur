@@ -3,6 +3,7 @@ import { generateIdentityKeyPair } from "../../crypto/index.js";
 import {
     createQueueAcknowledgeRequest,
     createQueueReadRequest,
+    HttpRelayTransport,
     createRelayBlob,
     createRelayEvent,
     createTopicSubscription,
@@ -10,8 +11,16 @@ import {
     verifyRelayEvent,
     verifyQueueRequest,
     verifyTopicSubscription,
+    decodeQueueRequestWire,
+    decodeRelayDeliveriesWire,
+    decodeRelayEventWire,
+    decodeTopicSubscriptionWire,
+    encodeQueueRequestWire,
+    encodeRelayDeliveriesWire,
+    encodeRelayEventWire,
+    encodeTopicSubscriptionWire,
 } from "../index.js";
-import { utf8Encode } from "../../utils/index.js";
+import { utf8Decode, utf8Encode } from "../../utils/index.js";
 
 describe("relay protocol", () => {
     it("binds a publisher signature to the payload and recipients", () => {
@@ -65,5 +74,81 @@ describe("relay protocol", () => {
 
         expect(verifyRelayBlob(blob)).toBe(true);
         expect(verifyRelayBlob({ ...blob, bytes: utf8Encode("changed") })).toBe(false);
+    });
+
+    it("round trips every HTTP JSON envelope without secret-key extras", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const event = createRelayEvent(alice, "topic", utf8Encode("opaque"), [bob], 42);
+        const subscription = createTopicSubscription(bob, "topic", 42);
+        const read = createQueueReadRequest(bob, 42);
+        const acknowledgement = createQueueAcknowledgeRequest(bob, "delivery", 42);
+
+        expect(decodeRelayEventWire(encodeRelayEventWire(event))).toEqual(event);
+        expect(decodeTopicSubscriptionWire(encodeTopicSubscriptionWire(subscription))).toEqual(
+            subscription,
+        );
+        expect(decodeQueueRequestWire(encodeQueueRequestWire(read))).toEqual(read);
+        expect(decodeQueueRequestWire(encodeQueueRequestWire(acknowledgement))).toEqual(
+            acknowledgement,
+        );
+        expect(
+            decodeRelayDeliveriesWire(
+                encodeRelayDeliveriesWire([{ deliveryId: "delivery", event }]),
+            ),
+        ).toEqual([{ deliveryId: "delivery", event }]);
+    });
+
+    it("rejects an oversized HTTP response before reading its body", async () => {
+        const alice = generateIdentityKeyPair();
+        const transport = new HttpRelayTransport(
+            "hostile",
+            "https://relay.test",
+            async () =>
+                new Response("[]", {
+                    headers: {
+                        "content-length": String(33 * 1024 * 1024),
+                    },
+                }),
+        );
+
+        await expect(transport.pull(createQueueReadRequest(alice, 42))).rejects.toThrow(
+            "too large",
+        );
+    });
+
+    it("rejects extra wire fields and unacknowledgeable delivery identifiers", () => {
+        const alice = generateIdentityKeyPair();
+        const event = createRelayEvent(alice, "topic", utf8Encode("opaque"), [], 42);
+        const eventWithExtraField = utf8Decode(encodeRelayEventWire(event)).replace(
+            '"version":1,',
+            '"version":1,"extra":true,',
+        );
+        const oversizedDeliveryId = utf8Decode(
+            encodeRelayDeliveriesWire([{ deliveryId: "delivery", event }]),
+        ).replace('"deliveryId":"delivery"', `"deliveryId":"${"x".repeat(257)}"`);
+        const emptyDeliveryId = utf8Decode(
+            encodeRelayDeliveriesWire([{ deliveryId: "delivery", event }]),
+        ).replace('"deliveryId":"delivery"', '"deliveryId":""');
+
+        expect(() => decodeRelayEventWire(utf8Encode(eventWithExtraField))).toThrow("relay event");
+        expect(() => decodeRelayDeliveriesWire(utf8Encode(oversizedDeliveryId))).toThrow(
+            "deliveryId",
+        );
+        expect(() => decodeRelayDeliveriesWire(utf8Encode(emptyDeliveryId))).toThrow("deliveryId");
+    });
+
+    it("authenticates blobs returned by the public HTTP transport", async () => {
+        const expected = createRelayBlob(utf8Encode("expected"));
+        const transport = new HttpRelayTransport(
+            "hostile",
+            "https://relay.test",
+            async () => new Response(utf8Encode("tampered").slice().buffer as ArrayBuffer),
+        );
+
+        await expect(transport.getBlob(expected.id)).rejects.toThrow("content-address");
+        await expect(transport.getBlob(`${expected.id.slice(0, -1)}B`)).rejects.toThrow(
+            "identifier",
+        );
     });
 });

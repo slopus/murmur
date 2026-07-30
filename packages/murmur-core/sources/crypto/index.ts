@@ -63,7 +63,9 @@ export function verifyBytes(
         return (
             identity.signingKey.length === 32 &&
             signature.length === 64 &&
-            ed25519.verify(signature, message, identity.signingKey)
+            ed25519.verify(signature, message, identity.signingKey, {
+                zip215: false,
+            })
         );
     } catch {
         return false;

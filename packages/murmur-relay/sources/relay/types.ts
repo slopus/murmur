@@ -12,6 +12,8 @@ export interface RelayOptions {
     readonly maximumRecipients?: number;
     /** Maximum simultaneous long polls. Defaults to 10,000. */
     readonly maximumWaiters?: number;
+    /** Maximum deliveries returned by one pull. Defaults to 16. */
+    readonly maximumDeliveryBatch?: number;
 }
 
 /** Count of data removed when expiring inactive topics. */

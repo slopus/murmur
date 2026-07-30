@@ -28,3 +28,11 @@ export interface OpenedProfile {
     readonly identity: IdentityPublicKeys;
     readonly profile: IdentityProfile;
 }
+
+/** Authenticated contact persisted locally by one identity. */
+export interface Contact {
+    readonly identity: IdentityPublicKeys;
+    readonly profile: IdentityProfile;
+    readonly addedAt: number;
+    readonly updatedAt: number;
+}

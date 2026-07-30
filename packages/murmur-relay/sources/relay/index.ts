@@ -22,6 +22,8 @@ const DEFAULT_MAXIMUM_EVENT_BYTES = 1024 * 1024;
 const DEFAULT_MAXIMUM_BLOB_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAXIMUM_ENVELOPE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_MAXIMUM_WAITERS = 10_000;
+const MAXIMUM_DELIVERY_BATCH = 16;
+const DEFAULT_MAXIMUM_DELIVERY_BATCH = MAXIMUM_DELIVERY_BATCH;
 const MAXIMUM_LONG_POLL_MILLISECONDS = 30_000;
 const QUEUE_REQUEST_VALIDITY_MILLISECONDS = 5 * 60 * 1_000;
 
@@ -63,6 +65,16 @@ function abortError(signal: AbortSignal): Error {
     return signal.reason instanceof Error ? signal.reason : new Error("Long poll aborted");
 }
 
+/** Expected client-visible relay failure with an HTTP-compatible status. */
+export class RelayProtocolError extends Error {
+    constructor(
+        readonly status: 400 | 401 | 409 | 413 | 429 | 503,
+        message: string,
+    ) {
+        super(message);
+    }
+}
+
 /** Validation and routing logic for a dumb relay. */
 export class RelayService {
     readonly #store: RelayStore;
@@ -73,6 +85,7 @@ export class RelayService {
     readonly #maximumEnvelopeBytes: number;
     readonly #maximumRecipients: number;
     readonly #maximumWaiters: number;
+    readonly #maximumDeliveryBatch: number;
     readonly #waiters = new Map<string, Set<Waiter>>();
     #waiterCount = 0;
 
@@ -85,6 +98,7 @@ export class RelayService {
         this.#maximumEnvelopeBytes = options.maximumEnvelopeBytes ?? DEFAULT_MAXIMUM_ENVELOPE_BYTES;
         this.#maximumRecipients = options.maximumRecipients ?? MAX_RELAY_RECIPIENTS;
         this.#maximumWaiters = options.maximumWaiters ?? DEFAULT_MAXIMUM_WAITERS;
+        this.#maximumDeliveryBatch = options.maximumDeliveryBatch ?? DEFAULT_MAXIMUM_DELIVERY_BATCH;
 
         for (const [name, value] of [
             ["topic inactivity", this.#topicInactivityMilliseconds],
@@ -93,6 +107,7 @@ export class RelayService {
             ["envelope size", this.#maximumEnvelopeBytes],
             ["recipient count", this.#maximumRecipients],
             ["waiter count", this.#maximumWaiters],
+            ["delivery batch", this.#maximumDeliveryBatch],
         ] as const) {
             if (!Number.isSafeInteger(value) || value < 1) {
                 throw new Error(`Maximum ${name} must be a positive safe integer`);
@@ -101,19 +116,22 @@ export class RelayService {
         if (this.#maximumRecipients > MAX_RELAY_RECIPIENTS) {
             throw new Error(`Maximum recipient count cannot exceed ${MAX_RELAY_RECIPIENTS}`);
         }
+        if (this.#maximumDeliveryBatch > MAXIMUM_DELIVERY_BATCH) {
+            throw new Error(`Maximum delivery batch cannot exceed ${MAXIMUM_DELIVERY_BATCH}`);
+        }
     }
 
     /** Add an authenticated public-key subscription. */
     async subscribe(subscription: TopicSubscription): Promise<void> {
         if (!verifyTopicSubscription(subscription)) {
-            throw new Error("Invalid topic subscription");
+            throw new RelayProtocolError(401, "Invalid topic subscription");
         }
         const now = this.#now();
         if (
             subscription.createdAt < now - QUEUE_REQUEST_VALIDITY_MILLISECONDS ||
             subscription.createdAt > now + QUEUE_REQUEST_VALIDITY_MILLISECONDS
         ) {
-            throw new Error("Expired topic subscription");
+            throw new RelayProtocolError(401, "Expired topic subscription");
         }
         const sanitized = sanitizeSubscription(subscription);
         const replayed = await this.#store.addSubscription(sanitized, now);
@@ -129,10 +147,13 @@ export class RelayService {
             !(event.payload instanceof Uint8Array) ||
             event.payload.length > this.#maximumEventBytes
         ) {
-            throw new Error(`Event exceeds ${this.#maximumEventBytes} bytes`);
+            throw new RelayProtocolError(413, `Event exceeds ${this.#maximumEventBytes} bytes`);
         }
         if (!Array.isArray(event.recipients) || event.recipients.length > this.#maximumRecipients) {
-            throw new Error(`Event exceeds ${this.#maximumRecipients} recipients`);
+            throw new RelayProtocolError(
+                413,
+                `Event exceeds ${this.#maximumRecipients} recipients`,
+            );
         }
         const approximateEnvelopeBytes =
             event.payload.length +
@@ -149,10 +170,13 @@ export class RelayService {
                 : 0) +
             512;
         if (approximateEnvelopeBytes > this.#maximumEnvelopeBytes) {
-            throw new Error(`Event envelope exceeds ${this.#maximumEnvelopeBytes} bytes`);
+            throw new RelayProtocolError(
+                413,
+                `Event envelope exceeds ${this.#maximumEnvelopeBytes} bytes`,
+            );
         }
         if (!verifyRelayEvent(event)) {
-            throw new Error("Invalid relay event");
+            throw new RelayProtocolError(401, "Invalid relay event");
         }
 
         const result = await this.#store.publish(sanitizeEvent(event), this.#now());
@@ -175,18 +199,19 @@ export class RelayService {
             waitMilliseconds < 0 ||
             waitMilliseconds > MAXIMUM_LONG_POLL_MILLISECONDS
         ) {
-            throw new Error(
+            throw new RelayProtocolError(
+                400,
                 `Long poll must be between 0 and ${MAXIMUM_LONG_POLL_MILLISECONDS} milliseconds`,
             );
         }
 
-        const current = await this.#store.pull(recipientId);
+        const current = await this.#store.pull(recipientId, this.#maximumDeliveryBatch);
         if (current.length > 0 || waitMilliseconds === 0) {
             return current;
         }
 
         await this.#wait(recipientId, waitMilliseconds, signal);
-        return this.#store.pull(recipientId);
+        return this.#store.pull(recipientId, this.#maximumDeliveryBatch);
     }
 
     /** Remove one queued copy. Acknowledgement is idempotent. */
@@ -198,10 +223,10 @@ export class RelayService {
     /** Store only a valid content-addressed ciphertext blob. */
     async putBlob(blob: RelayBlob): Promise<void> {
         if (blob.bytes.length > this.#maximumBlobBytes) {
-            throw new Error(`Blob exceeds ${this.#maximumBlobBytes} bytes`);
+            throw new RelayProtocolError(413, `Blob exceeds ${this.#maximumBlobBytes} bytes`);
         }
         if (!verifyRelayBlob(blob)) {
-            throw new Error("Blob content identifier does not match its bytes");
+            throw new RelayProtocolError(400, "Blob content identifier does not match its bytes");
         }
         await this.#store.putBlob(blob);
     }
@@ -220,14 +245,14 @@ export class RelayService {
         request: QueueReadRequest | QueueAcknowledgeRequest,
     ): Promise<string> {
         if (!verifyQueueRequest(request)) {
-            throw new Error("Invalid queue request");
+            throw new RelayProtocolError(401, "Invalid queue request");
         }
         const now = this.#now();
         if (
             request.createdAt < now - QUEUE_REQUEST_VALIDITY_MILLISECONDS ||
             request.createdAt > now + QUEUE_REQUEST_VALIDITY_MILLISECONDS
         ) {
-            throw new Error("Expired queue request");
+            throw new RelayProtocolError(401, "Expired queue request");
         }
         const recipientId = identityId(request.recipient);
         const consumed = await this.#store.consumeQueueRequest(
@@ -237,7 +262,7 @@ export class RelayService {
             now,
         );
         if (!consumed) {
-            throw new Error("Replayed queue request");
+            throw new RelayProtocolError(409, "Replayed queue request");
         }
         return recipientId;
     }
@@ -247,7 +272,7 @@ export class RelayService {
             throw abortError(signal);
         }
         if (this.#waiterCount >= this.#maximumWaiters) {
-            throw new Error("Relay has too many concurrent long polls");
+            throw new RelayProtocolError(503, "Relay has too many concurrent long polls");
         }
 
         await new Promise<void>((resolve, reject) => {
@@ -287,7 +312,7 @@ export class RelayService {
             this.#waiters.set(recipientId, waiters);
             signal?.addEventListener("abort", onAbort, { once: true });
 
-            void this.#store.pull(recipientId).then(
+            void this.#store.pull(recipientId, this.#maximumDeliveryBatch).then(
                 (deliveries) => {
                     if (deliveries.length > 0) {
                         waiter.resolve();

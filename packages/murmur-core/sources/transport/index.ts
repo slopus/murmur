@@ -24,9 +24,21 @@ export type {
     RelayTransport,
     TopicSubscription,
 } from "./types.js";
+export { HttpRelayTransport } from "./impl/httpTransport.js";
+export {
+    decodeQueueRequestWire,
+    decodeRelayDeliveriesWire,
+    decodeRelayEventWire,
+    decodeTopicSubscriptionWire,
+    encodeQueueRequestWire,
+    encodeRelayDeliveriesWire,
+    encodeRelayEventWire,
+    encodeTopicSubscriptionWire,
+} from "./impl/wireCodec.js";
 
 export const MAX_RELAY_RECIPIENTS = 1_024;
 export const MAX_RELAY_TOPIC_CHARACTERS = 512;
+export const MAX_RELAY_DELIVERY_BATCH = 16;
 
 function publicIdentityJson(identity: IdentityPublicKeys): JsonValue {
     const serialized = serializePublicIdentity(identity);

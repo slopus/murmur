@@ -17,7 +17,7 @@ export interface RelayStore {
         expiresAt: number,
         observedAt: number,
     ): Promise<boolean>;
-    pull(recipientId: string): Promise<readonly RelayDelivery[]>;
+    pull(recipientId: string, maximumDeliveries: number): Promise<readonly RelayDelivery[]>;
     acknowledge(recipientId: string, deliveryId: string): Promise<void>;
     putBlob(blob: RelayBlob): Promise<void>;
     getBlob(id: string): Promise<RelayBlob | undefined>;

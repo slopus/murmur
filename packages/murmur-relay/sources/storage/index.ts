@@ -139,8 +139,8 @@ export class MemoryRelayStore implements RelayStore {
         return true;
     }
 
-    async pull(recipientId: string): Promise<readonly RelayDelivery[]> {
-        return (this.#queues.get(recipientId) ?? []).map(copyDelivery);
+    async pull(recipientId: string, maximumDeliveries: number): Promise<readonly RelayDelivery[]> {
+        return (this.#queues.get(recipientId) ?? []).slice(0, maximumDeliveries).map(copyDelivery);
     }
 
     async acknowledge(recipientId: string, deliveryId: string): Promise<void> {

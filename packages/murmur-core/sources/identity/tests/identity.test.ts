@@ -1,6 +1,12 @@
 import { describe, expect, it } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
-import { decryptContactProfile, encryptProfileForContact, identityInboxTopic } from "../index.js";
+import { MemoryMurmurStore } from "../../storage/index.js";
+import {
+    ContactBook,
+    decryptContactProfile,
+    encryptProfileForContact,
+    identityInboxTopic,
+} from "../index.js";
 
 describe("identity profiles", () => {
     it("exchanges an authenticated profile using only public identity keys", () => {
@@ -70,5 +76,35 @@ describe("identity profiles", () => {
         const opened = decryptContactProfile(bob, envelope);
 
         expect(opened.profile.avatar).toEqual(avatar);
+    });
+
+    it("persists authenticated contacts in an owner namespace", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const sharedStore = new MemoryMurmurStore();
+        const aliceContacts = new ContactBook(alice, sharedStore);
+        const bobContacts = new ContactBook(bob, sharedStore);
+        const opened = decryptContactProfile(
+            alice,
+            encryptProfileForContact(bob, alice, { name: "Bob" }),
+        );
+
+        await aliceContacts.save(opened, 10);
+        await aliceContacts.save({ ...opened, profile: { name: "Bobby" } }, 20);
+
+        expect((await aliceContacts.get(bob))?.profile.name).toBe("Bobby");
+        expect((await aliceContacts.get(bob))?.addedAt).toBe(10);
+        expect(await bobContacts.list()).toHaveLength(0);
+        await expect(aliceContacts.save(opened, 5)).rejects.toThrow("backwards");
+
+        await expect(
+            aliceContacts.save({
+                ...opened,
+                identity: { ...opened.identity, encryptionKey: new Uint8Array() },
+            }),
+        ).rejects.toThrow("32 bytes");
+        await expect(aliceContacts.get({ signingKey: new Uint8Array() })).rejects.toThrow(
+            "32 bytes",
+        );
     });
 });
