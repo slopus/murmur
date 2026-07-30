@@ -321,6 +321,12 @@ export class MlsEpochState {
 
     constructor(options: CreateMlsEpochOptions) {
         encodeMlsGroupContext(options.context);
+        if (
+            (options.context.epoch === 0n) !==
+            (options.context.confirmedTranscriptHash.length === 0)
+        ) {
+            throw new Error("Invalid final MLS epoch transcript");
+        }
         const inputSecrets = snapshotEpochSecrets(options.secrets);
         const integrated =
             options.tree === undefined ? undefined : (options as CreateTreeMlsEpochOptions);

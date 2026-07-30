@@ -1,6 +1,6 @@
 import { randomBytes, utf8Encode } from "@murmur/core";
 import { describe, expect, it } from "vitest";
-import { deriveMlsEpochSecrets } from "../index.js";
+import { deriveMlsEpochSecrets, deriveMlsInitialEpochSecrets } from "../index.js";
 
 describe("RFC 9420 epoch key schedule", () => {
     it("derives independent 32-byte epoch secrets", () => {
@@ -22,5 +22,17 @@ describe("RFC 9420 epoch key schedule", () => {
         expect(deriveMlsEpochSecrets(init, commit, utf8Encode("epoch 1")).memberSecret).not.toEqual(
             deriveMlsEpochSecrets(init, commit, utf8Encode("epoch 2")).memberSecret,
         );
+    });
+
+    it("derives epoch zero directly from fresh creator entropy", () => {
+        const epochSecret = randomBytes(32);
+        const expected = epochSecret.slice();
+        const secrets = deriveMlsInitialEpochSecrets(epochSecret);
+
+        expect(epochSecret).toEqual(expected);
+        expect(secrets.epochSecret).toEqual(expected);
+        expect(secrets.joinerSecret).toEqual(new Uint8Array(32));
+        expect(secrets.memberSecret).toEqual(new Uint8Array(32));
+        expect(secrets.confirmationKey).not.toEqual(secrets.encryptionSecret);
     });
 });

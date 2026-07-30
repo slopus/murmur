@@ -76,6 +76,46 @@ export function deriveMlsEpochSecretsFromJoiner(
     }
 }
 
+/**
+ * Derive RFC 9420 epoch-zero secrets from the creator's fresh epoch secret.
+ *
+ * Group creation has no joiner or member secret, so those compatibility fields
+ * are represented by zero arrays and are erased with the other key-schedule
+ * ancestors when an `MlsEpochState` takes ownership.
+ */
+export function deriveMlsInitialEpochSecrets(epochSecret: Uint8Array): MlsEpochSecrets {
+    if (epochSecret.length !== MLS_HASH_LENGTH) {
+        throw new Error("MLS initial epoch secret must be 32 bytes");
+    }
+    const completed: Uint8Array[] = [];
+    const retain = (secret: Uint8Array): Uint8Array => {
+        completed.push(secret);
+        return secret;
+    };
+    try {
+        const ownedEpochSecret = retain(epochSecret.slice());
+        return {
+            joinerSecret: new Uint8Array(MLS_HASH_LENGTH),
+            memberSecret: new Uint8Array(MLS_HASH_LENGTH),
+            epochSecret: ownedEpochSecret,
+            senderDataSecret: retain(mlsDeriveSecret(ownedEpochSecret, "sender data")),
+            encryptionSecret: retain(mlsDeriveSecret(ownedEpochSecret, "encryption")),
+            exporterSecret: retain(mlsDeriveSecret(ownedEpochSecret, "exporter")),
+            epochAuthenticator: retain(mlsDeriveSecret(ownedEpochSecret, "epoch authenticator")),
+            externalSecret: retain(mlsDeriveSecret(ownedEpochSecret, "external")),
+            confirmationKey: retain(mlsDeriveSecret(ownedEpochSecret, "confirm")),
+            membershipKey: retain(mlsDeriveSecret(ownedEpochSecret, "membership")),
+            resumptionPsk: retain(mlsDeriveSecret(ownedEpochSecret, "resumption")),
+            nextInitSecret: retain(mlsDeriveSecret(ownedEpochSecret, "init")),
+        };
+    } catch (error: unknown) {
+        for (const secret of completed) {
+            zeroBytes(secret);
+        }
+        throw error;
+    }
+}
+
 /** Zero every secret retained for one completed MLS epoch. */
 export function destroyMlsEpochSecrets(secrets: MlsEpochSecrets): void {
     for (const secret of [

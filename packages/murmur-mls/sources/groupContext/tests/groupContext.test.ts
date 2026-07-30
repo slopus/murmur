@@ -43,4 +43,35 @@ describe("MLS GroupContext and transcripts", () => {
         expect(updateInterimTranscriptHash(confirmed, tag)).toHaveLength(32);
         expect(initializeConfirmedTranscriptHash(commitInput)).toEqual(hashBytes(commitInput));
     });
+
+    it("encodes the RFC epoch-zero empty transcript", () => {
+        const initial: MlsGroupContext = {
+            groupId: utf8Encode("new group"),
+            epoch: 0n,
+            treeHash: hashBytes(utf8Encode("initial tree")),
+            confirmedTranscriptHash: new Uint8Array(),
+        };
+        const confirmationKey = hashBytes(utf8Encode("initial confirmation"));
+        const tag = createMlsConfirmationTag(confirmationKey, initial.confirmedTranscriptHash);
+
+        expect(decodeMlsGroupContext(encodeMlsGroupContext(initial))).toEqual(initial);
+        expect(updateInterimTranscriptHash(initial.confirmedTranscriptHash, tag)).toHaveLength(32);
+        expect(
+            verifyMlsConfirmationTag(confirmationKey, initial.confirmedTranscriptHash, tag),
+        ).toBe(true);
+        expect(() =>
+            encodeMlsGroupContext({
+                ...initial,
+                confirmedTranscriptHash: new Uint8Array(1),
+            }),
+        ).toThrow("GroupContext");
+        expect(() =>
+            decodeMlsGroupContext(
+                encodeMlsGroupContext({
+                    ...initial,
+                    epoch: 1n,
+                }),
+            ),
+        ).toThrow("final");
+    });
 });

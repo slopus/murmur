@@ -67,7 +67,8 @@ function validateGroupContext(context: MlsGroupContext): void {
         context.epoch < 0n ||
         context.epoch > 0xffff_ffff_ffff_ffffn ||
         context.treeHash.length !== MLS_HASH_LENGTH ||
-        context.confirmedTranscriptHash.length !== MLS_HASH_LENGTH
+        (context.confirmedTranscriptHash.length !== 0 &&
+            context.confirmedTranscriptHash.length !== MLS_HASH_LENGTH)
     ) {
         throw new Error("Invalid MLS GroupContext");
     }
@@ -104,6 +105,9 @@ export function decodeMlsGroupContext(bytes: Uint8Array): MlsGroupContext {
     }
     reader.ensureEnd();
     validateGroupContext(context);
+    if ((context.epoch === 0n) !== (context.confirmedTranscriptHash.length === 0)) {
+        throw new Error("Invalid final MLS GroupContext transcript");
+    }
     return context;
 }
 
@@ -140,7 +144,8 @@ export function updateInterimTranscriptHash(
     confirmationTag: Uint8Array,
 ): Uint8Array {
     if (
-        confirmedTranscriptHash.length !== MLS_HASH_LENGTH ||
+        (confirmedTranscriptHash.length !== 0 &&
+            confirmedTranscriptHash.length !== MLS_HASH_LENGTH) ||
         confirmationTag.length !== MLS_HASH_LENGTH
     ) {
         throw new Error("Invalid MLS transcript confirmation");
@@ -155,7 +160,7 @@ export function createMlsConfirmationTag(
 ): Uint8Array {
     if (
         confirmationKey.length !== MLS_HASH_LENGTH ||
-        confirmedTranscriptHash.length !== MLS_HASH_LENGTH
+        (confirmedTranscriptHash.length !== 0 && confirmedTranscriptHash.length !== MLS_HASH_LENGTH)
     ) {
         throw new Error("Invalid MLS confirmation input");
     }
@@ -170,7 +175,8 @@ export function verifyMlsConfirmationTag(
 ): boolean {
     if (
         confirmationKey.length !== MLS_HASH_LENGTH ||
-        confirmedTranscriptHash.length !== MLS_HASH_LENGTH ||
+        (confirmedTranscriptHash.length !== 0 &&
+            confirmedTranscriptHash.length !== MLS_HASH_LENGTH) ||
         confirmationTag.length !== MLS_HASH_LENGTH
     ) {
         return false;
