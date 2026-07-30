@@ -10,9 +10,15 @@ import type { MlsUpdatePath, MlsUpdatePathNode } from "../types.js";
 
 const MAXIMUM_UPDATE_PATH_BYTES = 16 * 1024 * 1024;
 const MAXIMUM_PATH_NODES = 64;
-const MAXIMUM_CIPHERTEXTS = 100_000;
+const MAXIMUM_PATH_CIPHERTEXTS = 100_000;
+const HPKE_PUBLIC_KEY_BYTES = 32;
+const PATH_SECRET_CIPHERTEXT_BYTES = 48;
 
-class UpdatePathReader implements MlsLeafNodeReader {
+export interface MlsUpdatePathReader extends MlsLeafNodeReader {
+    readonly remaining: number;
+}
+
+class UpdatePathReader implements MlsUpdatePathReader {
     #offset = 0;
     constructor(readonly bytes: Uint8Array) {}
     get remaining(): number {
@@ -89,36 +95,52 @@ export function encodeMlsUpdatePath(
 }
 
 /** Decode an RFC 9420 UpdatePath. */
-export function decodeMlsUpdatePath(bytes: Uint8Array): MlsUpdatePath {
-    if (bytes.length > MAXIMUM_UPDATE_PATH_BYTES) {
-        throw new Error("MLS UpdatePath is too large");
-    }
-    const reader = new UpdatePathReader(bytes);
+export function decodeMlsUpdatePathFromReader(reader: MlsUpdatePathReader): MlsUpdatePath {
     const leafNode = decodeMlsLeafNode(reader);
     const nodesReader = new UpdatePathReader(reader.readOpaqueV(MAXIMUM_UPDATE_PATH_BYTES));
     const nodes: MlsUpdatePathNode[] = [];
+    let totalCiphertexts = 0;
     while (nodesReader.remaining > 0) {
         if (nodes.length >= MAXIMUM_PATH_NODES) {
             throw new Error("MLS UpdatePath has too many nodes");
         }
         const encryptionKey = nodesReader.readOpaqueV(32);
+        if (encryptionKey.length !== HPKE_PUBLIC_KEY_BYTES) {
+            throw new Error("Invalid MLS UpdatePath encryption key");
+        }
         const ciphertextReader = new UpdatePathReader(
             nodesReader.readOpaqueV(MAXIMUM_UPDATE_PATH_BYTES),
         );
         const encryptedPathSecrets: MlsUpdatePathNode["encryptedPathSecrets"][number][] = [];
         while (ciphertextReader.remaining > 0) {
-            if (encryptedPathSecrets.length >= MAXIMUM_CIPHERTEXTS) {
+            if (totalCiphertexts >= MAXIMUM_PATH_CIPHERTEXTS) {
                 throw new Error("MLS UpdatePath has too many ciphertexts");
             }
-            encryptedPathSecrets.push({
-                encapsulatedKey: ciphertextReader.readOpaqueV(32),
-                ciphertext: ciphertextReader.readOpaqueV(MAXIMUM_UPDATE_PATH_BYTES),
-            });
+            const encapsulatedKey = ciphertextReader.readOpaqueV(HPKE_PUBLIC_KEY_BYTES);
+            const ciphertext = ciphertextReader.readOpaqueV(PATH_SECRET_CIPHERTEXT_BYTES);
+            if (
+                encapsulatedKey.length !== HPKE_PUBLIC_KEY_BYTES ||
+                ciphertext.length !== PATH_SECRET_CIPHERTEXT_BYTES
+            ) {
+                throw new Error("Invalid MLS UpdatePath HPKE ciphertext");
+            }
+            encryptedPathSecrets.push({ encapsulatedKey, ciphertext });
+            totalCiphertexts += 1;
         }
         nodes.push({ encryptionKey, encryptedPathSecrets });
     }
+    return { leafNode, nodes };
+}
+
+/** Decode a standalone RFC 9420 UpdatePath. */
+export function decodeMlsUpdatePath(bytes: Uint8Array): MlsUpdatePath {
+    if (bytes.length > MAXIMUM_UPDATE_PATH_BYTES) {
+        throw new Error("MLS UpdatePath is too large");
+    }
+    const reader = new UpdatePathReader(bytes);
+    const path = decodeMlsUpdatePathFromReader(reader);
     if (reader.remaining !== 0) {
         throw new Error("Trailing bytes in MLS UpdatePath");
     }
-    return { leafNode, nodes };
+    return path;
 }

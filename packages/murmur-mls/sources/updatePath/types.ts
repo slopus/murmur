@@ -59,3 +59,14 @@ export interface MlsUpdatePathResult {
         readonly secret: Uint8Array;
     }[];
 }
+
+/** Inputs for reconstructing a Welcome joiner's private TreeKEM path. */
+export interface DeriveMlsWelcomePrivateKeysOptions {
+    readonly tree: MlsRatchetTree;
+    readonly groupId: Uint8Array;
+    readonly sender: number;
+    readonly localLeaf: number;
+    readonly leafKeyPair: HpkeKeyPair;
+    readonly pathSecret?: Uint8Array;
+    readonly authenticateCredential: (leafNode: MlsLeafNode, leafIndex: number) => boolean;
+}

@@ -23,7 +23,7 @@ export interface MlsGroupInfo {
     readonly signature: Uint8Array;
 }
 
-/** Inputs for an RFC Welcome with no PSKs and no path secret. */
+/** Inputs for an RFC Welcome with optional per-member TreeKEM path secrets. */
 export interface CreateMlsWelcomeOptions {
     readonly context: MlsGroupContext;
     readonly joinerSecret: Uint8Array;
@@ -31,6 +31,8 @@ export interface CreateMlsWelcomeOptions {
     readonly signer: number;
     readonly signerSecretKey: Uint8Array;
     readonly newMembers: readonly MlsKeyPackage[];
+    /** Parallel to `newMembers`; omitted entries encode a null path secret. */
+    readonly pathSecrets?: readonly (Uint8Array | undefined)[];
 }
 
 /** Inputs for opening a Welcome using one unconsumed KeyPackage. */
@@ -53,4 +55,6 @@ export interface OpenMlsWelcomeOptions {
 export interface OpenedMlsWelcome {
     readonly groupInfo: MlsGroupInfo;
     readonly epochSecrets: MlsEpochSecrets;
+    /** Common-ancestor TreeKEM path secret, when the creating Commit had a path. */
+    readonly pathSecret?: Uint8Array;
 }

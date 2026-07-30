@@ -56,15 +56,22 @@ const MAXIMUM_GROUP_SECRETS_BYTES = 4 * 1024;
 
 interface GroupSecrets {
     readonly joinerSecret: Uint8Array;
+    readonly pathSecret?: Uint8Array;
 }
 
 function encodeGroupSecrets(groupSecrets: GroupSecrets): Uint8Array {
-    if (groupSecrets.joinerSecret.length !== MLS_HASH_LENGTH) {
+    if (
+        groupSecrets.joinerSecret.length !== MLS_HASH_LENGTH ||
+        (groupSecrets.pathSecret !== undefined &&
+            groupSecrets.pathSecret.length !== MLS_HASH_LENGTH)
+    ) {
         throw new Error("Invalid MLS GroupSecrets");
     }
     return concatBytes(
         encodeOpaqueV(groupSecrets.joinerSecret),
-        new Uint8Array([0]),
+        groupSecrets.pathSecret === undefined
+            ? new Uint8Array([0])
+            : concatBytes(new Uint8Array([1]), encodeOpaqueV(groupSecrets.pathSecret)),
         encodeOpaqueV(EMPTY),
     );
 }
@@ -75,17 +82,33 @@ function decodeGroupSecrets(bytes: Uint8Array): GroupSecrets {
     }
     const reader = new WelcomeReader(bytes);
     const joinerSecret = reader.readOpaqueV(MLS_HASH_LENGTH);
+    let pathSecret: Uint8Array | undefined;
     try {
-        if (joinerSecret.length !== MLS_HASH_LENGTH || reader.readUint8() !== 0) {
-            throw new Error("Unsupported MLS path secret");
+        const pathPresent = reader.readUint8();
+        if (pathPresent === 1) {
+            pathSecret = reader.readOpaqueV(MLS_HASH_LENGTH);
+        } else if (pathPresent !== 0) {
+            throw new Error("Invalid MLS path secret optional");
+        }
+        if (
+            joinerSecret.length !== MLS_HASH_LENGTH ||
+            (pathSecret !== undefined && pathSecret.length !== MLS_HASH_LENGTH)
+        ) {
+            throw new Error("Invalid MLS GroupSecrets");
         }
         if (reader.readOpaqueV(0).length !== 0) {
             throw new Error("Unsupported MLS pre-shared key");
         }
         reader.ensureEnd();
-        return { joinerSecret };
+        return {
+            joinerSecret,
+            ...(pathSecret === undefined ? {} : { pathSecret }),
+        };
     } catch (error: unknown) {
         zeroBytes(joinerSecret);
+        if (pathSecret !== undefined) {
+            zeroBytes(pathSecret);
+        }
         throw error;
     }
 }
@@ -122,7 +145,9 @@ export function createMlsWelcome(options: CreateMlsWelcomeOptions): Uint8Array {
         options.joinerSecret.length !== MLS_HASH_LENGTH ||
         options.confirmationKey.length !== MLS_HASH_LENGTH ||
         options.newMembers.length === 0 ||
-        options.newMembers.length > 1_024
+        options.newMembers.length > 1_024 ||
+        (options.pathSecrets !== undefined &&
+            options.pathSecrets.length !== options.newMembers.length)
     ) {
         throw new Error("Invalid MLS Welcome inputs");
     }
@@ -164,13 +189,16 @@ export function createMlsWelcome(options: CreateMlsWelcomeOptions): Uint8Array {
         zeroBytes(groupInfoPlaintext);
     }
 
-    const groupSecretsPlaintext = encodeGroupSecrets({
-        joinerSecret: options.joinerSecret,
-    });
-    try {
-        const seenReferences: Uint8Array[] = [];
-        const welcome: MlsWelcome = {
-            secrets: options.newMembers.map((keyPackage) => {
+    const seenReferences: Uint8Array[] = [];
+    const welcome: MlsWelcome = {
+        secrets: options.newMembers.map((keyPackage, index) => {
+            const groupSecretsPlaintext = encodeGroupSecrets({
+                joinerSecret: options.joinerSecret,
+                ...(options.pathSecrets?.[index] === undefined
+                    ? {}
+                    : { pathSecret: options.pathSecrets[index] }),
+            });
+            try {
                 if (!verifyMlsKeyPackage(keyPackage)) {
                     throw new Error("Invalid MLS Welcome KeyPackage");
                 }
@@ -188,13 +216,13 @@ export function createMlsWelcome(options: CreateMlsWelcomeOptions): Uint8Array {
                         groupSecretsPlaintext,
                     ),
                 };
-            }),
-            encryptedGroupInfo,
-        };
-        return encodeMlsWelcome(welcome);
-    } finally {
-        zeroBytes(groupSecretsPlaintext);
-    }
+            } finally {
+                zeroBytes(groupSecretsPlaintext);
+            }
+        }),
+        encryptedGroupInfo,
+    };
+    return encodeMlsWelcome(welcome);
 }
 
 /** Open and authenticate an RFC 9420 Welcome against an externally supplied tree. */
@@ -236,6 +264,9 @@ export function openMlsWelcome(options: OpenMlsWelcomeOptions): OpenedMlsWelcome
         );
     } catch (error: unknown) {
         zeroBytes(groupSecrets.joinerSecret);
+        if (groupSecrets.pathSecret !== undefined) {
+            zeroBytes(groupSecrets.pathSecret);
+        }
         throw error;
     } finally {
         if (welcomeKeys !== undefined) {
@@ -284,7 +315,13 @@ export function openMlsWelcome(options: OpenMlsWelcomeOptions): OpenedMlsWelcome
             throw new Error("Invalid MLS GroupInfo signature");
         }
         zeroBytes(options.keyPackageBundle.initKeyPair.secretKey);
-        return { groupInfo, epochSecrets };
+        return {
+            groupInfo,
+            epochSecrets,
+            ...(groupSecrets.pathSecret === undefined
+                ? {}
+                : { pathSecret: groupSecrets.pathSecret.slice() }),
+        };
     } catch (error: unknown) {
         if (epochSecrets !== undefined) {
             destroyMlsEpochSecrets(epochSecrets);
@@ -292,6 +329,9 @@ export function openMlsWelcome(options: OpenMlsWelcomeOptions): OpenedMlsWelcome
         throw error;
     } finally {
         zeroBytes(groupSecrets.joinerSecret);
+        if (groupSecrets.pathSecret !== undefined) {
+            zeroBytes(groupSecrets.pathSecret);
+        }
         zeroBytes(groupInfoPlaintext);
     }
 }

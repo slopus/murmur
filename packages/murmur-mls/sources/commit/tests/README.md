@@ -1,4 +1,5 @@
 # Commit tests
 
-Add-only Commit wire round trips, transcript/key-schedule agreement, Welcome
-join, tamper rejection, and external-tree validation.
+Add-only compatibility coverage plus full Add/Remove Commit wire round trips,
+UpdatePath/key-schedule agreement, Welcome join, removed-member exclusion,
+tamper rejection, and tree validation.

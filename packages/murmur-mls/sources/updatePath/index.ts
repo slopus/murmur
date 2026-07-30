@@ -2,6 +2,7 @@ import { encodeBase64Url, equalBytes, randomBytes, zeroBytes } from "@murmur/cor
 import {
     canonicalizeHpkePublicKey,
     deriveHpkeKeyPair,
+    isHpkeKeyPair,
     mlsDecryptWithLabel,
     mlsDeriveSecret,
     mlsEncryptWithLabel,
@@ -20,6 +21,7 @@ import { type MlsRatchetTreeLeaf } from "../ratchetTree/index.js";
 import { copath, directPath, leafNode } from "../tree/index.js";
 import type {
     CreateMlsUpdatePathOptions,
+    DeriveMlsWelcomePrivateKeysOptions,
     MlsTreePrivateKey,
     MlsUpdatePath,
     MlsUpdatePathResult,
@@ -28,13 +30,19 @@ import type {
 
 export type {
     CreateMlsUpdatePathOptions,
+    DeriveMlsWelcomePrivateKeysOptions,
     MlsTreePrivateKey,
     MlsUpdatePath,
     MlsUpdatePathNode,
     MlsUpdatePathResult,
     OpenMlsUpdatePathOptions,
 } from "./types.js";
-export { decodeMlsUpdatePath, encodeMlsUpdatePath } from "./impl/codec.js";
+export {
+    decodeMlsUpdatePath,
+    decodeMlsUpdatePathFromReader,
+    encodeMlsUpdatePath,
+    type MlsUpdatePathReader,
+} from "./impl/codec.js";
 
 function deriveNodeKeyPair(pathSecret: Uint8Array): HpkeKeyPair {
     const nodeSecret = mlsDeriveSecret(pathSecret, "node");
@@ -458,6 +466,113 @@ export function openMlsUpdatePath(options: OpenMlsUpdatePathOptions): MlsUpdateP
     }
 }
 
+/** Derive the private TreeKEM path delivered to a member through Welcome. */
+export function deriveMlsWelcomePrivateKeys(
+    options: DeriveMlsWelcomePrivateKeysOptions,
+): readonly MlsTreePrivateKey[] {
+    options.tree.validate({
+        groupId: options.groupId,
+        authenticateCredential: options.authenticateCredential,
+    });
+    const nodes = options.tree.nodes;
+    if (
+        !Number.isSafeInteger(options.sender) ||
+        options.sender < 0 ||
+        options.sender >= options.tree.leafCount ||
+        nodes[leafNode(options.sender, options.tree.leafCount)]?.type !== "leaf"
+    ) {
+        throw new Error("Invalid MLS Welcome sender");
+    }
+    const localNodeIndex = leafNode(options.localLeaf, options.tree.leafCount);
+    const localNode = nodes[localNodeIndex];
+    if (
+        localNode?.type !== "leaf" ||
+        !isHpkeKeyPair(options.leafKeyPair) ||
+        !equalBytes(
+            canonicalizeHpkePublicKey(localNode.encryptionKey),
+            canonicalizeHpkePublicKey(options.leafKeyPair.publicKey),
+        )
+    ) {
+        throw new Error("Invalid MLS Welcome leaf private key");
+    }
+    const privateKeys: MlsTreePrivateKey[] = [
+        {
+            node: localNodeIndex,
+            keyPair: {
+                secretKey: options.leafKeyPair.secretKey.slice(),
+                publicKey: localNode.encryptionKey.slice(),
+            },
+        },
+    ];
+    const localPath = new Set(directPath(options.localLeaf, options.tree.leafCount));
+    const commonAncestor = directPath(options.sender, options.tree.leafCount).find((node) =>
+        localPath.has(node),
+    );
+    if (commonAncestor === undefined) {
+        destroyMlsTreePrivateKeys(privateKeys);
+        throw new Error("MLS Welcome path has no common ancestor");
+    }
+    if (options.pathSecret === undefined) {
+        const commonParent = nodes[commonAncestor];
+        if (
+            commonParent?.type === "parent" &&
+            !commonParent.unmergedLeaves.includes(options.localLeaf)
+        ) {
+            destroyMlsTreePrivateKeys(privateKeys);
+            throw new Error("MLS Welcome path secret is required");
+        }
+        return privateKeys;
+    }
+    if (options.pathSecret.length !== 32) {
+        destroyMlsTreePrivateKeys(privateKeys);
+        throw new Error("Invalid MLS Welcome path secret");
+    }
+    const senderPath = options.tree.filteredDirectPath(options.sender);
+    const commonIndex = senderPath.indexOf(commonAncestor);
+    if (commonIndex < 0) {
+        destroyMlsTreePrivateKeys(privateKeys);
+        throw new Error("MLS Welcome path has no common ancestor");
+    }
+    let current: Uint8Array = options.pathSecret.slice();
+    try {
+        for (let index = commonIndex; index < senderPath.length; index += 1) {
+            const nodeIndex = senderPath[index]!;
+            const publicNode = nodes[nodeIndex];
+            if (publicNode === undefined) {
+                throw new Error("MLS Welcome private path contains a blank node");
+            }
+            const keyPair = deriveNodeKeyPair(current);
+            if (
+                !equalBytes(
+                    canonicalizeHpkePublicKey(publicNode.encryptionKey),
+                    canonicalizeHpkePublicKey(keyPair.publicKey),
+                )
+            ) {
+                zeroBytes(keyPair.secretKey);
+                throw new Error("MLS Welcome path secret does not match public tree");
+            }
+            privateKeys.push({
+                node: nodeIndex,
+                keyPair: {
+                    secretKey: keyPair.secretKey,
+                    publicKey: publicNode.encryptionKey.slice(),
+                },
+            });
+            if (index + 1 < senderPath.length) {
+                const next = mlsDeriveSecret(current, "path");
+                zeroBytes(current);
+                current = next;
+            }
+        }
+        return privateKeys;
+    } catch (error: unknown) {
+        destroyMlsTreePrivateKeys(privateKeys);
+        throw error;
+    } finally {
+        zeroBytes(current);
+    }
+}
+
 /** Destroy TreeKEM secrets returned by create/open. */
 export function destroyMlsUpdatePathResult(result: MlsUpdatePathResult): void {
     zeroBytes(result.commitSecret);
@@ -466,5 +581,12 @@ export function destroyMlsUpdatePathResult(result: MlsUpdatePathResult): void {
     }
     for (const secret of result.pathSecrets) {
         zeroBytes(secret.secret);
+    }
+}
+
+/** Destroy an owned collection of TreeKEM private keys. */
+export function destroyMlsTreePrivateKeys(privateKeys: readonly MlsTreePrivateKey[]): void {
+    for (const key of privateKeys) {
+        zeroBytes(key.keyPair.secretKey);
     }
 }

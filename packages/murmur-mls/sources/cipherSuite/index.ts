@@ -54,6 +54,21 @@ export function canonicalizeHpkePublicKey(publicKey: Uint8Array): Uint8Array {
     return canonical;
 }
 
+/** Validate that an X25519 HPKE private key owns the supplied public key. */
+export function isHpkeKeyPair(keyPair: HpkeKeyPair): boolean {
+    try {
+        return (
+            keyPair.secretKey.length === 32 &&
+            equalBytes(
+                canonicalizeHpkePublicKey(x25519.getPublicKey(keyPair.secretKey)),
+                canonicalizeHpkePublicKey(keyPair.publicKey),
+            )
+        );
+    } catch {
+        return false;
+    }
+}
+
 /** RFC 9420 ExpandWithLabel for cipher suite 0x0001. */
 export function mlsExpandWithLabel(
     secret: Uint8Array,
