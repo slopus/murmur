@@ -1,6 +1,6 @@
 # Murmur as a library on top of dumb relays
 
-## Where we are going
+## Vision
 
 Murmur becomes the dumbest possible way for anyone to talk to anyone else,
 encrypted, over the internet. Two parties who know each other's public keys can
@@ -8,8 +8,8 @@ start adding each other to topics. Everything else follows from that.
 
 It ships as a library you can drop into a Node.js process or a browser. It gives
 you keys, an identity, contact discovery by public key, private messaging, and
-later group chats and other shared objects. It does not give you a UI and it does
-not tell you what your messages mean.
+later group chats and other shared objects. It does not give you a graphical
+interface and it does not tell you what your messages mean.
 
 The current codebase is dead. We are reusing the name and a little of the
 concept, and writing the thing again, properly. Because every interesting object
@@ -71,6 +71,15 @@ the log.
 Adding somebody to a topic is cryptographically protected. When you create a
 chat and add someone, they get a notification about the topic, and from then on
 messages into it are durable. The first packet can carry the participant list.
+
+## The CLI
+
+The CLI stays. An agent must be able to use Murmur the ordinary way, from the
+command line, exactly as it can today, and a person has to be able to drive the
+same commands by hand.
+
+That is as far as we go for people, though. Murmur gets no interface built for
+humans to live in — that belongs in Happy.
 
 ## The layers, in order
 
