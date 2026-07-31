@@ -18,6 +18,10 @@ and pairwise chat is just the smallest case of it.
 
 ## The relay
 
+There is always a relay between the parties. It is still encrypted end to end —
+what the relay holds is signed blobs it cannot read — but it is no longer only a
+pipe. It keeps state.
+
 The relay is extremely dumb, and nothing beyond this belongs in it:
 
 - Encrypted topics, many-to-many. A public key publishes into a topic; anyone
@@ -28,25 +32,48 @@ The relay is extremely dumb, and nothing beyond this belongs in it:
 It must be cheap to host, both on your own box and on something like Cloudflare
 Durable Objects.
 
-Retention, simplified: assume for now that a relay never deletes anything. A
-topic has to see activity at least once every 30 days or it is dropped; clients
-can always recreate it and start syncing again, and that is not a hard case.
+### What a topic holds
+
+Every topic has three things: a snapshot, a list of elements, and a log of
+events. The snapshot and the list are the permanent state. The list is
+essentially the list of messages.
+
+Clients write state by generating an event. The same event can also replace the
+snapshot, or change one element of the list — delete, add, replace. Most often
+it appends.
+
+The snapshot and the list are each optional, and a topic uses what it needs. A
+chat needs the list, because the list is its messages. A document probably does
+not: it needs only the snapshot plus events.
+
+The event log is always bounded — a few days, maybe less. The snapshot and the
+list are not: the relay stores them permanently, along with the blobs
+themselves, so a client can ask for the state instead of replaying history it
+can no longer see.
+
+The API follows from that: load the snapshot, load the list, and subscribe to
+events.
+
+Retention, simplified: assume for now that a relay never deletes state. A topic
+has to see activity at least once every 30 days or it is dropped; clients can
+always recreate it and start syncing again, and that is not a hard case.
 
 Relays promise nothing about delivery. Relays could talk to each other — a
 client subscribed through several of them would let them agree on what was
 delivered and drop their caches — but that is not for the first version.
 
-## Transports
+## Transport
 
-All routing is by public key. The transport underneath is replaceable: a local
-network, WebRTC, Bluetooth, anything. The software is configured with the
-transports its peers can reach it on.
+There is one transport, and it goes through a relay. We are dropping the idea
+that the transport underneath is neutral and swappable for a local network,
+WebRTC, or Bluetooth. Routing is by public key, and a relay sits between
+everyone.
 
-The default is a rendezvous point: some relay hosted somewhere. Peers who want
-the private internet instead just change the endpoint. Two peers must be able to
-sync even when the other side is offline, which is exactly what WebRTC alone
-cannot do — it is realtime only, it has no queues, it needs signaling anyway, and
-corporate networks hate it.
+Which relay is still the user's choice: it is a rendezvous point, and peers who
+want their own instead just change the endpoint. What we no longer promise is
+that there could be no relay at all. Two peers must be able to sync when the
+other side is offline, and that needs somewhere to leave state — which is
+exactly what WebRTC alone cannot do.
 
 ## What the library gives its user
 
@@ -64,9 +91,9 @@ Validating what is inside a topic, on the way in and on the way out, is the
 library user's job. Identity, finding people, and sharing entities is the
 library's job.
 
-A topic is a descriptor — itself encrypted — and it carries its own type. There
-are no relay-side snapshots: since the relay keeps everything, a client replays
-the log.
+A topic is a descriptor — itself encrypted — and it carries its own type. A
+client catches up by loading the snapshot and the list, then following events
+from there. It cannot replay the whole log, because the log does not go back far.
 
 Adding somebody to a topic is cryptographically protected. When you create a
 chat and add someone, they get a notification about the topic, and from then on
@@ -116,14 +143,14 @@ humans to live in — that belongs in Happy.
 4. Shared objects: a document edited by two people at once converges, over the
    same topic machinery, with no code in the relay that knows it is a document.
 
-Throughout: the relay stays dumb enough that swapping it for a LAN, WebRTC, or
-Bluetooth transport changes nothing above the transport boundary, and the library
-still loads in a browser.
+Throughout: the relay stays dumb enough that it never learns what a topic
+contains, even though it now stores that topic's state, and the library still
+loads in a browser.
 
 ## Open questions
 
-- Is WebRTC worth carrying at all, given corporate networks and its lack of
-  queues?
+- How long the event log actually keeps events, and whether one window fits
+  chats and documents both.
 - Can we actually promise that a file is never lost, or only that our own relays
   try hard?
 - When, if ever, relays should coordinate deliveries with each other.
