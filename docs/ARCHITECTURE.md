@@ -1,271 +1,151 @@
-# Murmur Server Architecture
+# Architecture
 
-## Overview
+Murmur is a client-side encryption library plus a deliberately dumb relay. All
+meaning lives in the client; the relay is a queue that cannot read anything it
+carries.
 
-Murmur is a secure message relay server using Ed25519 public key cryptography for authentication and message signing. It acts as a message broker, forwarding signed encrypted blobs between users without ever decrypting them.
+## Layers
 
-## Key Concepts
-
-### Identity-Based Authentication
-
-- Users are identified by their Ed25519 public keys (NaCl signing keys)
-- No passwords or traditional accounts
-- Authentication uses cryptographic signatures
-- JWT tokens are issued after signature verification using privacy-kit
-- Tokens include access tokens (configurable TTL, default 24h) and refresh tokens
-- Automatic token refresh without re-authentication
-
-### Signed Blobs
-
-All messages and profile updates are:
-
-1. Created as JSON blobs (encrypted by client)
-2. Signed with the sender's private key
-3. Verified by the server before storage
-4. Forwarded as-is to recipients
-
-The server never decrypts message contents, only verifies signatures.
-
-### Profile System
-
-Each user has two key pairs:
-
-1. **Identity Key**: Ed25519 signing key (permanent identifier)
-2. **Profile Key**: Separate key for profile encryption
-
-The profile key is:
-
-- Signed by the identity key (proves ownership)
-- Used to encrypt the user's profile
-- Can be rotated at any time
-
-This separation allows profile key rotation without changing identity.
-
-## Components
-
-### 1. EventBus (Redis Streams)
-
-The EventBus provides broadcast event distribution using Redis Streams:
-
-**Architecture:**
-
-- Redis Streams for durable event delivery (not pub/sub)
-- Broadcast reads: each node reads the stream independently
-- No consumer groups or acknowledgments required
-- Channel-based routing for future sharding capabilities
-
-**Message Identification:**
-
-- Messages identified by cuid2 IDs provided by sender
-- No sequence numbers needed (distributed ID generation)
-- Repeat protection via unique message IDs
-- Format validation ensures only valid cuid2 IDs accepted
-
-**Delivery Model:**
-
-- Each node receives all events and filters by channel
-- Messages are stored in PostgreSQL; events are realtime hints
-- Inbox messages are deleted via `/v1/messages/ack` (database)
-
-**Channel-Based Routing:**
-
-- Events published to channels (e.g., "user:userId", "global")
-- Allows future sharding: route specific channels to specific servers
-- Currently all channels processed globally
-- Easy migration path to horizontal scaling
-
-### 2. API Layer (Fastify)
-
-**Authentication Flow:**
-
-1. Client signs request with identity private key
-2. Server verifies signature against identity public key
-3. JWT issued for subsequent requests
-4. JWT validated on authenticated routes
-
-**Message Flow:**
-
-1. Sender signs message blob
-2. Server verifies signature
-3. Message stored with 30-day expiration
-4. Event published to recipient's EventBus channel
-5. SSE notification sent if recipient connected
-6. Recipient fetches from inbox
-
-### 3. SSE (Server-Sent Events)
-
-Real-time message delivery using SSE:
-
-- Clients open `/v1/messages/stream` endpoint
-- Connection managed per user
-- Events pushed when messages arrive
-- Automatic reconnection on disconnect
-- Heartbeat every 30 seconds
-
-**Why SSE over WebSocket:**
-
-- Simpler protocol (one-way)
-- Automatic reconnection in browsers
-- Works over HTTP/2
-- Lower overhead for notifications
-
-### 4. Cleanup Worker
-
-Background job that:
-
-- Runs hourly
-- Deletes messages with `expiresAt < now`
-- Ensures 30-day auto-delete guarantee
-
-## Data Models
-
-Public keys are stored internally as standard base64 with padding, and API inputs/outputs use the same base64 encoding.
-
-### User
-
-```
-id: string (Ed25519 public key, base64)
-createdAt: DateTime
-profilePublicKey: string (NaCl public key for profile)
-profileKeySignature: Bytes (signature of profilePublicKey by id)
-encryptedProfile: Bytes (encrypted profile data)
-profileUpdatedAt: DateTime
+```text
+┌─────────────────────────────────────────────────────────┐
+│ application                                             │
+│   decides what messages mean, owns durable storage      │
+├─────────────────────────────────────────────────────────┤
+│ @slopus/murmur                                          │
+│   identity · contacts · direct messages · files         │
+│   MLS groups · shared documents                         │
+│   MurmurClient: publish, sync, acknowledge, retry       │
+├─────────────────────────────────────────────────────────┤
+│ RelayTransport (interface)                              │
+│   HTTP today; LAN, WebRTC, Bluetooth are drop-in        │
+├═════════════════════════════════════════════════════════┤  ← trust boundary
+│ relay                                                   │
+│   verify envelope signature · fan out · queue · blobs   │
+└─────────────────────────────────────────────────────────┘
 ```
 
-### Message
+Everything above the trust boundary runs on the user's machine. Everything below
+it is assumed hostile.
 
+## Packages
+
+| Package             | Published              | Role                                                                               |
+| ------------------- | ---------------------- | ---------------------------------------------------------------------------------- |
+| `murmur-core`       | `@slopus/murmur`       | The library. Browser-safe, no `node:*` imports, Noble-only dependencies.           |
+| `murmur-mls`        | bundled into the above | MLS: TreeKEM, key schedule, KeyPackages, Commits, Welcome, epochs.                 |
+| `murmur-relay`      | internal               | `RelayService` and a runtime-neutral `fetch` handler. No HTTP server, no database. |
+| `murmur-relay-node` | internal               | SQLite `RelayStore` and a Node HTTP host.                                          |
+| `murmur-cli`        | `murmur-chat`          | Node CLI. JSON output so agents can drive it.                                      |
+
+The relay is split in two on purpose: `RelayService` depends only on a
+`RelayStore` interface with 8 methods, so the same logic runs on SQLite, on
+Postgres, or inside a Cloudflare Durable Object.
+
+## What the relay knows
+
+It **can** see:
+
+- Topic identifiers (opaque hashes, but stable and linkable over time)
+- Sender public keys on every envelope, because it verifies signatures
+- Explicit recipient identifiers
+- Message sizes and timing
+- Blob sizes and content hashes
+
+It **cannot** see:
+
+- Any plaintext: profiles, messages, file contents, group traffic, documents
+- Group membership, group names, or epoch contents
+- Whether a topic carries a chat, a document, or something an application
+  invented
+
+Group traffic is indistinguishable from chat traffic at the relay: both are
+opaque MLS ciphertext on the same topic. No relay code knows a document exists.
+
+## Data flow
+
+### Publishing
+
+```text
+publish(topic, payload, recipients?)
+        │
+        ├── sign envelope (Ed25519)
+        ├── record in durable outbox
+        └── send to every transport in parallel
+                 ├── relay A: accepted ─┐
+                 └── relay B: failed    ├─► success if ≥1 accepted
+                                        ┘   remainder retried by retryOutbound()
 ```
-id: string (cuid2 provided by sender)
-createdAt: DateTime
-expiresAt: DateTime (createdAt + 30 days)
-deliveredAt: DateTime | null
-senderId: string (User.id)
-recipientId: string (User.id)
-blob: Bytes (encrypted message)
-signature: Bytes (NaCl signature of blob bytes + messageId bytes)
+
+The outbox remembers _which_ transports accepted an event, so a retry resumes
+only the missing publications instead of duplicating work.
+
+### Receiving
+
+```text
+sync() ──► pull from every transport
+            │
+            ├── verify signatures
+            ├── merge, order, deduplicate across relays
+            └── hand ReceivedEvent to the application
+                     │
+                     ├── application commits its own state
+                     └── application calls acknowledge()
+                              │
+                              └── relay deletes its queued copy
 ```
 
-## Security Considerations
+Nothing is acknowledged automatically. An unacknowledged event is delivered
+again after a restart. This is the core durability contract: **commit, then
+acknowledge**. Acknowledging first turns a crash into data loss.
 
-### Signature Verification
+### Fan-out
 
-All critical operations require signature verification:
+An event either names explicit recipients or is delivered to every subscriber of
+its topic. The relay inserts one delivery row per recipient, so each recipient
+acknowledges independently and a slow client cannot hold up others.
 
-- Registration: Request signed by identity key
-- Login: Timestamp signed by identity key
-- Profile update: Request signed by identity key
-- Message send: Blob + messageId signed by sender's identity key
-- Profile key: Signed by identity key
+Subscribing backfills: a new subscriber receives every retained event on the
+topic that was not addressed to explicit recipients. Since the relay retains
+everything, a client replays the log rather than fetching a snapshot.
 
-### Message ID Security
+## Storage
 
-Message IDs must be cuid2 format:
+The library never picks a database. It requires a `MurmurStore` with atomic
+transactions:
 
-- Provided by sender (not auto-generated)
-- Validated with isCuid() check
-- Included in signature to prevent tampering
-- Repeat protection via unique constraint
-- Distributed ID generation prevents conflicts
+```typescript
+interface MurmurStore {
+    get(key: string): Promise<Uint8Array | undefined>;
+    set(key: string, value: Uint8Array): Promise<void>;
+    delete(key: string): Promise<void>;
+    list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>>;
+    transaction<Result>(
+        operation: (transaction: StoreTransaction) => Promise<Result>,
+    ): Promise<Result>;
+}
+```
 
-### Timestamp Validation
+Transactions are not decorative. Exactly-once message acceptance, MLS epoch
+checkpoints, and document state all depend on writing an application record and
+a protocol marker in the same atomic unit. A store without real transactions
+will silently break those guarantees.
 
-To prevent replay attacks:
+`MemoryMurmurStore` ships for tests and examples. Real applications use
+IndexedDB, SQLite, or similar.
 
-- Requests include timestamp
-- Server checks timestamp is within 5 minutes
-- Prevents old signatures from being reused
+## Retention
 
-### Message Auto-Delete
+A topic must see activity at least once every 30 days or it is pruned. Clients
+can recreate a topic and resume. Relays promise nothing about delivery; the
+guarantees come from client-side acknowledgement and retry, not from relay
+durability.
 
-Messages auto-delete after 30 days:
+## Design rules
 
-- Enforced at DB level with `expiresAt` field
-- Cleanup worker ensures timely deletion
-- Prevents unlimited data accumulation
-
-### No Content Inspection
-
-Server never decrypts:
-
-- Message blobs (end-to-end encrypted by clients)
-- Profile data (encrypted with profile key)
-
-Server only:
-
-- Verifies signatures
-- Stores and forwards blobs
-- Manages message lifecycle
-
-## Scalability
-
-### Horizontal Scaling
-
-Multiple server instances can run simultaneously:
-
-- EventBus coordinates via Redis Streams broadcast reads
-- Each instance has own DB connection pool
-- SSE connections distributed across instances
-- Message IDs remain unique via cuid2 distributed generation
-- Channel-based routing enables future sharding
-
-### Database
-
-PostgreSQL chosen for:
-
-- ACID guarantees for message and profile writes
-- Efficient indexing for message queries
-- Reliable retention for encrypted blobs
-
-### Redis
-
-Used for:
--- Redis Streams for event distribution
--- Cross-node realtime notification delivery
-
-Configured with:
-
-- AOF persistence (append-only file)
-- Ensures messages survive restarts
-- Stream entries are trimmed by `EVENT_STREAM_MAXLEN`
-
-## Deployment
-
-### Docker Compose
-
-Three services:
-
-1. **PostgreSQL**: Persistent data storage
-2. **Redis**: Event bus and caching
-3. **Murmur**: Application server
-
-Each service:
-
-- Has health checks
-- Persists data to volumes
-- Restarts automatically
-
-### Environment Variables
-
-Required:
-
-- `DATABASE_URL`: PostgreSQL connection
-- `REDIS_URL`: Redis connection
-- `JWT_SEED`: Seed for privacy-kit JWT token generation
-- `PORT`: HTTP port (default 3000)
-  Optional:
-- `ACCESS_TOKEN_TTL_MS`: Access token TTL in milliseconds
-- `EVENT_STREAM_MAXLEN`: Redis stream trim length
-- `METRICS_PORT`: Metrics server port
-- `LOG_LEVEL`: Logging level
-
-Generate a JWT seed with: `yarn tsx scripts/generateKeys.ts` (only `JWT_SEED` is used by the server)
-
-## Future Enhancements
-
-Potential improvements:
-
-1. WebSocket support alongside SSE
-2. Message read receipts
-3. Multi-recipient messages (groups)
-4. Message forwarding/routing
-5. Admin API for user management
+1. **The relay stays dumb.** If a change requires the relay to understand
+   message content, it belongs in the client instead.
+2. **The transport is replaceable.** Swapping HTTP for LAN or Bluetooth must
+   change nothing above the `RelayTransport` boundary.
+3. **The library stays browser-safe.** No `node:*` imports in `@slopus/murmur`.
+4. **The application owns durability.** The library never decides when it is
+   safe to forget a message.

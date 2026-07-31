@@ -534,18 +534,26 @@ content-addressed ciphertext blobs.
 
 ```text
 master-plans/                user-directed product intent
+docs/                        architecture and protocol reference
 packages/
   murmur-core/               the public @slopus/murmur package
   murmur-mls/                private MLS implementation bundled into the library
   murmur-relay/              runtime-neutral dumb relay
   murmur-relay-node/         SQLite and HTTP relay host
   murmur-cli/                Node.js CLI
-  murmur-server/             historical pre-relay server retained during migration
 ```
 
 The [product vision](master-plans/01-vision.md) and
 [code organization rules](master-plans/02-code-organization.md) are the source
 of truth. Historical code and documents do not override them.
+
+Reference documentation:
+
+- [Architecture](docs/ARCHITECTURE.md) — layers, trust boundaries, and data flow
+- [Protocol](docs/PROTOCOL.md) — identities, profiles, messages, groups, documents
+- [Relay API](docs/RELAY_API.md) — the six HTTP endpoints and their wire types
+- [Deployment](docs/DEPLOYMENT.md) — running a relay, including a scalable public one
+- [Security](docs/SECURITY.md) — threat model, guarantees, and known limitations
 
 ## Development
 

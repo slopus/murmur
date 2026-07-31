@@ -1,6 +1,8 @@
 # Murmur - Claude Development Guide
 
-Encrypted messenger for AI agents using Signal Protocol (X3DH + Double Ratchet).
+End-to-end encrypted messaging for people and AI agents, over deliberately dumb
+relays. Identities and direct messages use Ed25519 signatures and X25519 sealed
+boxes; groups and shared objects use MLS (an RFC 9420 subset).
 
 ## Master plans
 
@@ -28,15 +30,22 @@ A pnpm workspace. Packages live in `packages/*`:
 ```
 murmur/
 ├── master-plans/            # Product intent, read these first
+├── docs/                    # Architecture and protocol reference
 ├── packages/
-│   ├── murmur-cli/          # CLI, MCP server, client engine, crypto
-│   └── murmur-server/       # Relay: Fastify + Postgres + Redis
+│   ├── murmur-core/         # @slopus/murmur, the single published library
+│   ├── murmur-mls/          # MLS implementation, bundled into the library
+│   ├── murmur-relay/        # Runtime-neutral dumb relay service + HTTP handler
+│   ├── murmur-relay-node/   # SQLite store and Node HTTP host for the relay
+│   └── murmur-cli/          # murmur-chat, the Node CLI
 ├── package.json             # Workspace scripts and shared dev tooling
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json       # Shared strict TypeScript options
 ├── .oxfmtrc.json            # Formatter config
 └── .oxlintrc.json           # Linter config
 ```
+
+`@slopus/murmur` is the only package published to npm as a library, plus
+`murmur-chat` for the CLI. `@murmur/*` packages are internal to the workspace.
 
 How code is laid out inside a package is dictated by
 [`master-plans/02-code-organization.md`](master-plans/02-code-organization.md):
@@ -72,9 +81,12 @@ predate it and are not to be reorganized unless the user asks.
 ## Key Conventions
 
 1. **All cryptographic keys are Uint8Array** - never strings internally
-2. **Base64 encoding is only for serialization** - use encodeBase64/decodeBase64
-3. **State is mutable** - ratchetEncrypt/ratchetDecrypt modify state in place
-4. **Errors throw** - no null returns for cryptographic failures
+2. **Base64url is only for serialization** - use encodeBase64Url/decodeBase64Url
+   at wire and storage boundaries only
+3. **Errors throw** - no null returns for cryptographic failures
+4. **The application owns durability** - nothing is auto-acknowledged. Commit
+   application state first, then acknowledge the delivery
+5. **The relay is untrusted and dumb** - never add message semantics to it
 
 ## Testing
 
@@ -89,45 +101,58 @@ pnpm format:check  # oxfmt --check .
 
 ## Dependencies
 
-- `@noble/curves`: X25519 for Diffie-Hellman
+The published library depends only on Noble:
+
+- `@noble/curves`: Ed25519 signatures and X25519 Diffie-Hellman
 - `@noble/hashes`: SHA-256, HMAC, HKDF
-- `@noble/ciphers`: ChaCha20-Poly1305
-- `node:sqlite`: SQLite database (Node, experimental)
-- `zod`: Schema validation
+- `@noble/ciphers`: ChaCha20-Poly1305 and AES-GCM
+
+`@slopus/murmur` must stay browser-safe: no `node:*` imports, no side effects.
+`node:sqlite` (Node, experimental) is used only by the CLI and the Node relay
+host, which is why those require Node 22.5 or later.
 
 ## Protocol Notes
 
-### X3DH Key Agreement
+See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full description. The parts
+that most often trip up a change:
 
-X3DH establishes a shared secret between parties who may not be online simultaneously:
+### Identity
 
-1. **Bob publishes**: Identity key + Signed prekey + One-time prekeys
-2. **Alice fetches**: Bob's prekey bundle from server
-3. **Alice computes**: Shared secret from multiple DH operations
-4. **Bob computes**: Same shared secret using his private keys
+An identity is two independent key pairs: Ed25519 for signing and X25519 for
+encryption. `identityId` is the base64url public signing key; the inbox topic
+is derived by hashing it, so the relay routes without learning who you are.
+There is no account and no server-side registry.
 
-### Double Ratchet
+### Contacts
 
-The Double Ratchet has two key operations:
+Adding a contact is one signed profile, sealed to the recipient's X25519 key and
+published to their inbox topic. Profiles are bound to a specific recipient, so
+they cannot be replayed at a third party. The exchange is two-directional:
+receiving a profile authenticates the sender to you, not you to them.
 
-1. **DH Ratchet** (`dhRatchet`): Called when receiving a new ratchet public key.
-   Introduces new entropy from Diffie-Hellman.
+### Direct messages
 
-2. **Symmetric Ratchet** (`kdfCK`): Called for each message.
-   Advances chain key to derive message key.
+Signed, then sealed with an ephemeral X25519 key pair.
+`acceptPrivateMessageFromContact` commits the application record and the replay
+marker in one store transaction and reports `"opened"` or `"duplicate"`. Never
+acknowledge a relay delivery before that transaction commits.
 
-Message keys are one-time use. After decryption, they are deleted.
-Skipped message keys are stored for out-of-order message handling.
+### MLS groups
 
-### Full Session Flow
+Groups are forward-secret epochs over a TreeKEM ratchet tree. Every membership
+change is a Commit that advances the epoch. All epochs of a group share one
+opaque relay topic.
 
-```
-1. Bob: initializeKeyStore() → publish prekey bundle to server
-2. Alice: Fetch bundle → x3dhSender() → initializeAlice()
-3. Bob: x3dhReceiver() → initializeBob() → consumeOneTimePreKey()
-4. Both: ratchetEncrypt/ratchetDecrypt for messaging
-5. Both: serializeState for persistence
-```
+Outbound group work always follows **prepare → persist → publish**. A restart
+must never be able to publish a Commit whose next-epoch private state was not
+durably written first; that is what locks a member out of their own group.
+
+### Shared documents
+
+Operation-based replicated text carried as ordinary MLS application messages.
+Operations are idempotent and commutative; deletes are tombstones that may
+arrive before their target. Every operation's actor is bound to the
+authenticated MLS leaf. No relay code knows a document exists.
 
 ## Security Principles
 
@@ -138,7 +163,10 @@ Skipped message keys are stored for out-of-order message handling.
 
 ## CLI
 
-Use `murmur` subcommands to sign in, send messages, sync, and view recent history.
+`murmur` signs in, exchanges contacts, sends messages and attachments, syncs,
+manages MLS groups, and edits shared documents. Every result is JSON except
+`help`, so an agent can drive it directly. Run `murmur help` for the current
+command list, and start a relay with `@murmur/relay-node` for local testing.
 
 ## Feedback Loop
 
