@@ -14,6 +14,7 @@ import {
     encodePrivateMessage,
     encryptFile,
     encryptPrivateMessageForContact,
+    privateMessageListElementId,
     type OpenedPrivateMessage,
 } from "../index.js";
 
@@ -88,6 +89,19 @@ describe("private message content", () => {
 });
 
 describe("direct private messages", () => {
+    it("derives stable author-scoped list element identifiers", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const message = createPrivateMessage("stable", [], 42);
+
+        expect(privateMessageListElementId(alice, message)).toBe(
+            privateMessageListElementId(alice, message),
+        );
+        expect(privateMessageListElementId(bob, message)).not.toBe(
+            privateMessageListElementId(alice, message),
+        );
+    });
+
     it("binds ciphertext and signature to sender, recipient, and content", () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
@@ -240,5 +254,46 @@ describe("direct private messages", () => {
         ).resolves.toMatchObject({
             status: "opened",
         });
+    });
+
+    it("commits duplicate decisions and relay cursors in the same transaction", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        const encrypted = encryptPrivateMessageForContact(
+            alice,
+            bob,
+            createPrivateMessage("atomic cursor", [], 42),
+        );
+
+        await acceptPrivateMessageFromContact(
+            store,
+            bob,
+            encrypted,
+            async (transaction, opened) => {
+                await transaction.set("application/message", utf8Encode(opened.message.text));
+            },
+            async (transaction) => {
+                await transaction.set("relay/cursor", utf8Encode("1"));
+            },
+        );
+        await expect(
+            acceptPrivateMessageFromContact(
+                store,
+                bob,
+                encrypted,
+                async () => {
+                    throw new Error("duplicate must not be reapplied");
+                },
+                async (transaction) => {
+                    await transaction.set("relay/cursor", utf8Encode("2"));
+                },
+            ),
+        ).resolves.toMatchObject({ status: "duplicate" });
+
+        expect(utf8Decode((await store.get("relay/cursor")) ?? new Uint8Array())).toBe("2");
+        expect(utf8Decode((await store.get("application/message")) ?? new Uint8Array())).toBe(
+            "atomic cursor",
+        );
     });
 });

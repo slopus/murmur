@@ -1,35 +1,27 @@
 # CLI runtime
 
-The runtime connects one durable identity to one or more core transports. It
-owns contact/profile/KeyPackage exchange, direct private messages, encrypted
-attachments, RFC 9420 groups, manual relay acknowledgement, and local history.
+The runtime owns one durable identity, local SQLite state, pairwise chats,
+encrypted attachments, MLS groups, and shared documents over fixed-contract
+relays.
 
 ```text
-profile token -> encrypted identity inbox -> ContactBook
-message + file -> durable ciphertext outbox -> every relay blob -> exact event
-relay delivery -> authenticate -> atomic inbox + replay marker -> acknowledge
-profile v2 -> signed one-use KeyPackage -> encrypted Welcome
-group send/Commit -> exact outbox + next epoch -> publish -> adopt
+public inbox event -> authenticated contact + cursor
+pairwise list/event -> message/replay marker + cursor
+group event -> MLS checkpoint/application + cursor
 ```
 
-Outgoing history receives a local monotonic sequence and remains `pending`
-until the exact retained event reaches a relay. Blob ciphertext stays durable
-until every configured relay has accepted it, preventing a message descriptor
-from arriving where its attachment is unavailable. Permanently malformed or
-unsupported deliveries enter a bounded quarantine before acknowledgement, so
-poison queue pages cannot starve later valid events.
+Contact requests seal their sender identity and use one-use relay authors on the
+public first-contact inbox. Once a profile is authenticated, direct messages and
+invitations use the X25519 pairwise topic. Messages append ciphertext to the
+permanent relay list; local history remains the application view.
 
-Outgoing attachments are bounded to 64 entries and 64 MiB in aggregate before
-encryption, limiting simultaneous plaintext, ciphertext, and SQLite copies.
+All inbound success paths update application state and the relay/topic cursor
+in one SQLite transaction. Invalid input is quarantined with that cursor in the
+same transaction. Deferred MLS values do not advance. A relay `reset` is raised
+as an explicit state-reload error rather than reported as an empty sync.
 
-Group creation starts at RFC epoch zero. Add invitations carry an encrypted
-Welcome and authenticated external tree inside the existing pairwise direct
-channel. Add, Remove, and application messages persist their exact event,
-post-ratchet epoch, generation, replay marker, and history atomically before
-publication or acknowledgment. Removed clients retain only a topic tombstone
-so later ciphertext is drained without retaining or using group secrets.
-
-Shared-object state is layered over the same authenticated group application
-channel. Shared text documents persist their deterministic operation log in the
-same transaction as the MLS ratchet checkpoint and exact outbox or inbound
-replay marker. The relay-facing client remains unchanged.
+MLS publication keeps exact durable outboxes and the
+prepare → persist → publish → adopt ordering. Ambiguous publication remains
+staged. The in-process end-to-end test uses one `SqliteRelayStore(":memory:")`
+and injected Fetch, exercising profiles, an attached direct message, group
+invite/message/removal, and document convergence without a TCP socket.

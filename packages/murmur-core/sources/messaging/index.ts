@@ -80,6 +80,28 @@ export class DirectMessageIdCollisionError extends Error {
     }
 }
 
+/**
+ * Derive the stable opaque relay-list element ID for one private message.
+ *
+ * The author key prevents two contacts choosing the same application message
+ * ID from colliding, while the hash keeps that ID out of relay-visible state.
+ */
+export function privateMessageListElementId(
+    sender: Pick<IdentityPublicKeys, "signingKey">,
+    message: Pick<PrivateMessage, "id">,
+): string {
+    const preimage = canonicalJsonBytes({
+        context: "murmur/private-message-list-element/v1",
+        id: message.id,
+        sender: encodeBase64Url(sender.signingKey),
+    });
+    try {
+        return `message:${encodeBase64Url(hashBytes(preimage))}`;
+    } finally {
+        zeroBytes(preimage);
+    }
+}
+
 function directSignaturePayload(messageBytes: Uint8Array, recipient: string): Uint8Array {
     return canonicalJsonBytes({
         message: encodeBase64Url(messageBytes),
@@ -324,15 +346,16 @@ export function decryptPrivateMessageFromContact(
  *
  * The persistence callback runs inside the same store transaction as the replay
  * marker and is invoked only for a first-seen authenticated message.
- * Callers may acknowledge the relay delivery only after this function resolves.
- * A duplicate is safe to acknowledge; an ID collision throws and remains
- * unacknowledged for explicit quarantine or operator handling.
+ * When `advanceCursor` is supplied, it runs in that same transaction after the
+ * application/replay decision. A duplicate still advances safely; an ID
+ * collision throws and leaves both application state and cursor unchanged.
  */
 export async function acceptPrivateMessageFromContact(
     store: MurmurStore,
     recipient: IdentityKeyPair,
     encrypted: EncryptedPrivateMessage,
     persist: (transaction: StoreTransaction, opened: OpenedPrivateMessage) => Promise<void>,
+    advanceCursor?: (transaction: StoreTransaction) => Promise<void>,
 ): Promise<AcceptedPrivateMessage> {
     const opened = decryptPrivateMessageFromContact(recipient, encrypted);
     let messageBytes: Uint8Array | undefined;
@@ -358,15 +381,18 @@ export async function acceptPrivateMessageFromContact(
         replayRecord = record;
         const status = await store.transaction(async (transaction) => {
             const existing = await transaction.get(replayKey);
+            let decision: "opened" | "duplicate";
             if (existing === undefined) {
                 await persist(transaction, opened);
                 await transaction.set(replayKey, record.slice());
-                return "opened" as const;
+                decision = "opened";
+            } else if (equalBytes(existing, record)) {
+                decision = "duplicate";
+            } else {
+                throw new DirectMessageIdCollisionError();
             }
-            if (equalBytes(existing, record)) {
-                return "duplicate" as const;
-            }
-            throw new DirectMessageIdCollisionError();
+            await advanceCursor?.(transaction);
+            return decision;
         });
         const accepted: AcceptedPrivateMessage = {
             ...opened,

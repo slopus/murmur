@@ -1,57 +1,72 @@
-import type { IdentityKeyPair, IdentityPublicKeys } from "../crypto/index.js";
-import { hashBytes } from "../crypto/index.js";
+import type { IdentityKeyPair } from "../crypto/index.js";
+import { destroyIdentity, generateIdentityKeyPair } from "../crypto/index.js";
 import { identityId } from "../identity/index.js";
-import type { MurmurStore } from "../storage/index.js";
+import type { MurmurStore, StoreTransaction } from "../storage/index.js";
 import {
-    createQueueAcknowledgeRequest,
-    createQueueReadRequest,
     createRelayBlob,
     createRelayEvent,
-    createTopicSubscription,
-    relayEventSignaturePayload,
+    equalRelayEvents,
     verifyRelayBlob,
     verifyRelayEvent,
+    type ListOperation,
     type RelayBlob,
-    type RelayDelivery,
-    type RelayEvent,
     type RelayTransport,
+    type SignedRelayEvent,
+    type SnapshotMutation,
 } from "../transport/index.js";
-import { encodeBase64Url, equalBytes } from "../utils/index.js";
+import { encodeBase64Url, equalBytes, utf8Decode, utf8Encode } from "../utils/index.js";
 import { decodeOutboundRecord, encodeOutboundRecord } from "./impl/eventCodec.js";
-import type { PublishResult, ReceivedEvent, RetryOutboundReport } from "./types.js";
-
-export type {
+import type {
+    LoadedTopicState,
     PublishResult,
     ReceivedEvent,
+    RetryOutboundReport,
+    SyncResult,
+    TopicResetRequired,
+} from "./types.js";
+
+export type {
+    LoadedTopicState,
+    PublishResult,
+    ReceivedEvent,
+    RelayPublishResult,
     RetryOutboundFailure,
     RetryOutboundReport,
+    SyncResult,
+    TopicResetRequired,
 } from "./types.js";
 
 const DEFAULT_OUTBOUND_HISTORY = 256;
-
-interface DeliveryOrigin {
-    readonly transport: RelayTransport;
-    readonly deliveryId: string;
-}
-
-interface InFlightEvent {
-    readonly event: RelayEvent;
-    readonly origins: Map<string, DeliveryOrigin>;
-}
+const DEFAULT_EVENT_PAGE_LIMIT = 100;
 
 function isAborted(signal: AbortSignal | undefined): boolean {
     return signal?.aborted === true;
 }
 
-/** Transport-agnostic Murmur event client. */
+function cursorBytes(cursor: bigint): Uint8Array {
+    return utf8Encode(cursor.toString());
+}
+
+function parseCursor(value: Uint8Array | undefined): bigint {
+    if (value === undefined) {
+        return 0n;
+    }
+    const text = utf8Decode(value);
+    if (!/^(0|[1-9]\d*)$/.test(text)) {
+        throw new Error("Invalid persisted Murmur topic cursor");
+    }
+    return BigInt(text);
+}
+
+/** Durable topic client over one or more fixed-contract relays. */
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
-    readonly #recipientId: string;
     readonly #store: MurmurStore;
     readonly #transports: readonly RelayTransport[];
-    readonly #inFlight = new Map<string, InFlightEvent>();
+    readonly #transportById: ReadonlyMap<string, RelayTransport>;
+    readonly #topics = new Set<string>();
     readonly #outboundHistoryLimit: number;
-    readonly #acknowledgedPrefix: string;
+    readonly #cursorPrefix: string;
     readonly #outboundPrefix: string;
 
     constructor(options: {
@@ -71,42 +86,67 @@ export class MurmurClient {
         if (!Number.isSafeInteger(outboundHistoryLimit) || outboundHistoryLimit < 1) {
             throw new Error("Outbound history limit must be a positive safe integer");
         }
-
         this.#identity = options.identity;
-        this.#recipientId = identityId(options.identity);
         this.#store = options.store;
         this.#transports = [...options.transports];
-        this.#outboundHistoryLimit = outboundHistoryLimit;
-        this.#acknowledgedPrefix = `client/${this.#recipientId}/acknowledged/`;
-        this.#outboundPrefix = `client/${this.#recipientId}/outbound/`;
-    }
-
-    /** Subscribe this identity to a topic on every configured transport. */
-    async subscribe(topic: string): Promise<void> {
-        const subscription = createTopicSubscription(this.#identity, topic);
-        const results = await Promise.allSettled(
-            this.#transports.map(async (transport) => transport.subscribe(subscription)),
+        this.#transportById = new Map(
+            this.#transports.map((transport) => [transport.id, transport] as const),
         );
-        if (!results.some((result) => result.status === "fulfilled")) {
-            throw new AggregateError(
-                results
-                    .filter(
-                        (result): result is PromiseRejectedResult => result.status === "rejected",
-                    )
-                    .map((result) => result.reason),
-                "Every transport rejected the subscription",
-            );
-        }
+        this.#outboundHistoryLimit = outboundHistoryLimit;
+        const owner = identityId(options.identity);
+        this.#cursorPrefix = `client/${owner}/cursor/`;
+        this.#outboundPrefix = `client/${owner}/outbound/`;
     }
 
-    /** Publish opaque bytes to subscribers or an explicit recipient list. */
+    /**
+     * Follow a topic locally.
+     *
+     * Relays have no subscription state. This only adds the topic to this
+     * client's synchronization set; persisted cursors remain in `MurmurStore`.
+     */
+    async subscribe(topic: string): Promise<void> {
+        if (!/^[A-Za-z0-9_.:-]{1,512}$/.test(topic)) {
+            throw new Error("Invalid relay topic");
+        }
+        this.#topics.add(topic);
+    }
+
+    /** Publish opaque bytes with optional atomic snapshot/list mutations. */
     async publish(
         topic: string,
         payload: Uint8Array,
-        recipients: readonly IdentityPublicKeys[] = [],
+        mutations: {
+            readonly snapshot?: SnapshotMutation;
+            readonly list?: readonly ListOperation[];
+        } = {},
     ): Promise<PublishResult> {
-        const event = createRelayEvent(this.#identity, topic, payload, recipients);
-        return this.publishEvent(event);
+        return this.publishEvent(createRelayEvent(this.#identity, topic, payload, mutations));
+    }
+
+    /**
+     * Publish with a one-use relay signing identity.
+     *
+     * The opaque payload must carry its own end-to-end authentication. This is
+     * intended for public first-contact inboxes where the ordinary event author
+     * would identify the requester.
+     */
+    async publishUnlinkable(
+        topic: string,
+        payload: Uint8Array,
+        mutations: {
+            readonly snapshot?: SnapshotMutation;
+            readonly list?: readonly ListOperation[];
+        } = {},
+    ): Promise<PublishResult> {
+        const ephemeralAuthor = generateIdentityKeyPair();
+        try {
+            return this.#publishPreparedEvent(
+                createRelayEvent(ephemeralAuthor, topic, payload, mutations),
+                false,
+            );
+        } finally {
+            destroyIdentity(ephemeralAuthor);
+        }
     }
 
     /**
@@ -114,48 +154,35 @@ export class MurmurClient {
      *
      * Reusing the same event resumes its existing relay-acceptance record.
      */
-    async publishEvent(event: RelayEvent): Promise<PublishResult> {
-        const preparedEvent: RelayEvent = {
-            version: event.version,
-            id: event.id,
-            topic: event.topic,
-            sender: {
-                signingKey: event.sender.signingKey.slice(),
-                encryptionKey: event.sender.encryptionKey.slice(),
-            },
-            recipients: [...event.recipients],
-            createdAt: event.createdAt,
-            payload: event.payload.slice(),
-            signature: event.signature.slice(),
-        };
+    async publishEvent(event: SignedRelayEvent): Promise<PublishResult> {
+        return this.#publishPreparedEvent(event, true);
+    }
+
+    async #publishPreparedEvent(
+        event: SignedRelayEvent,
+        requireClientAuthor: boolean,
+    ): Promise<PublishResult> {
         if (
-            !verifyRelayEvent(preparedEvent) ||
-            !equalBytes(preparedEvent.sender.signingKey, this.#identity.signingKey) ||
-            !equalBytes(preparedEvent.sender.encryptionKey, this.#identity.encryptionKey)
+            !verifyRelayEvent(event) ||
+            (requireClientAuthor && !equalBytes(event.author.signingKey, this.#identity.signingKey))
         ) {
             throw new Error("Prepared relay event is not owned by this Murmur client");
         }
-        const key = `${this.#outboundPrefix}${preparedEvent.createdAt
+        const key = `${this.#outboundPrefix}${event.createdAt
             .toString()
-            .padStart(16, "0")}/${preparedEvent.id}`;
+            .padStart(16, "0")}/${event.id}`;
         const existing = await this.#store.get(key);
         let publishedRelayIds: readonly string[] = [];
         if (existing === undefined) {
-            await this.#store.set(key, encodeOutboundRecord(preparedEvent, []));
+            await this.#store.set(key, encodeOutboundRecord(event, []));
         } else {
             const record = decodeOutboundRecord(existing);
-            if (
-                !equalBytes(
-                    relayEventSignaturePayload(record.event),
-                    relayEventSignaturePayload(preparedEvent),
-                ) ||
-                !equalBytes(record.event.signature, preparedEvent.signature)
-            ) {
+            if (!equalRelayEvents(record.event, event)) {
                 throw new Error("Prepared relay event collides with retained outbound state");
             }
             publishedRelayIds = record.publishedRelayIds;
         }
-        const result = await this.#publishRecord(key, preparedEvent, publishedRelayIds);
+        const result = await this.#publishRecord(key, event, publishedRelayIds);
         await this.#pruneOutboundHistory();
         return result;
     }
@@ -196,91 +223,93 @@ export class MurmurClient {
         return { results, failures };
     }
 
-    async #publishRecord(
-        key: string,
-        event: RelayEvent,
-        previouslyPublishedRelayIds: readonly string[],
-    ): Promise<PublishResult> {
-        const published = new Set(previouslyPublishedRelayIds);
-        const pending = this.#transports.filter((transport) => !published.has(transport.id));
-        const attempts = await Promise.allSettled(
-            pending.map(async (transport) => {
-                await transport.publish(event);
-                return transport.id;
-            }),
+    /**
+     * Read retained events after durable per-relay topic cursors.
+     *
+     * If any relay reports `reset`, no events are returned. The caller must
+     * explicitly reload each reported topic with `loadTopic` before retrying.
+     */
+    async sync(waitMilliseconds: number = 0, signal?: AbortSignal): Promise<SyncResult> {
+        const topics = [...this.#topics].sort();
+        const reads = await Promise.allSettled(
+            this.#transports.flatMap((transport) =>
+                topics.map(async (topic) => {
+                    const cursor = await this.#readCursor(transport.id, topic);
+                    return {
+                        transport,
+                        topic,
+                        cursor,
+                        page: await transport.readEvents(
+                            topic,
+                            cursor,
+                            DEFAULT_EVENT_PAGE_LIMIT,
+                            waitMilliseconds,
+                            signal,
+                        ),
+                    };
+                }),
+            ),
         );
-        const failedRelayIds: string[] = [];
-        for (let index = 0; index < attempts.length; index += 1) {
-            const attempt = attempts[index];
-            const transport = pending[index];
-            if (attempt?.status === "fulfilled") {
-                published.add(attempt.value);
-            } else if (transport !== undefined) {
-                failedRelayIds.push(transport.id);
+        if (reads.length > 0 && !reads.some((read) => read.status === "fulfilled")) {
+            throw new Error("Every transport failed while reading events");
+        }
+        const resets: TopicResetRequired[] = [];
+        for (const read of reads) {
+            if (read.status === "fulfilled" && read.value.page?.reset === true) {
+                resets.push({
+                    kind: "reset",
+                    relayId: read.value.transport.id,
+                    topic: read.value.topic,
+                    requestedSince: read.value.cursor,
+                    head: read.value.page.seq,
+                });
             }
         }
-        await this.#store.set(key, encodeOutboundRecord(event, [...published]));
+        if (resets.length > 0) {
+            return { status: "reset", resets };
+        }
 
-        if (published.size === 0) {
-            throw new Error("Every transport rejected the event");
+        const events: ReceivedEvent[] = [];
+        for (const read of reads) {
+            if (read.status !== "fulfilled" || read.value.page === undefined) {
+                continue;
+            }
+            let expectedSequence = read.value.cursor;
+            for (const retained of read.value.page.events) {
+                if (
+                    retained.seq !== expectedSequence + 1n ||
+                    retained.event.topic !== read.value.topic ||
+                    !verifyRelayEvent(retained.event)
+                ) {
+                    throw new Error(
+                        `Relay ${read.value.transport.id} returned an invalid event sequence`,
+                    );
+                }
+                expectedSequence = retained.seq;
+                const cursorKey = this.#cursorKey(read.value.transport.id, read.value.topic);
+                events.push({
+                    kind: "event",
+                    relayId: read.value.transport.id,
+                    seq: retained.seq,
+                    event: retained.event,
+                    advanceCursor: async (transaction): Promise<void> => {
+                        await this.#advanceCursor(transaction, cursorKey, retained.seq);
+                    },
+                });
+            }
         }
         return {
-            event,
-            publishedRelayIds: [...published].sort(),
-            failedRelayIds: failedRelayIds.sort(),
+            status: "events",
+            events: events.sort(
+                (left, right) =>
+                    left.relayId.localeCompare(right.relayId) ||
+                    left.event.topic.localeCompare(right.event.topic) ||
+                    (left.seq < right.seq ? -1 : left.seq > right.seq ? 1 : 0),
+            ),
         };
     }
 
-    /** Pull, authenticate, merge, and order one batch from every relay. */
-    async sync(
-        waitMilliseconds: number = 0,
-        signal?: AbortSignal,
-    ): Promise<readonly ReceivedEvent[]> {
-        const readRequest = createQueueReadRequest(this.#identity);
-        const pulls = await Promise.allSettled(
-            this.#transports.map(async (transport) => ({
-                transport,
-                deliveries: await transport.pull(readRequest, waitMilliseconds, signal),
-            })),
-        );
-        if (!pulls.some((pull) => pull.status === "fulfilled")) {
-            throw new Error("Every transport failed while pulling events");
-        }
-
-        const received: ReceivedEvent[] = [];
-        for (const pull of pulls) {
-            if (pull.status !== "fulfilled") {
-                continue;
-            }
-            for (const delivery of pull.value.deliveries) {
-                if (
-                    !verifyRelayEvent(delivery.event) ||
-                    (delivery.event.recipients.length > 0 &&
-                        !delivery.event.recipients.includes(this.#recipientId))
-                ) {
-                    await Promise.allSettled([
-                        this.#acknowledge(pull.value.transport, delivery.deliveryId),
-                    ]);
-                    continue;
-                }
-                const item = await this.#acceptDelivery(pull.value.transport, delivery);
-                if (item !== undefined) {
-                    received.push(item);
-                }
-            }
-        }
-        return received.sort(
-            (left, right) =>
-                left.event.createdAt - right.event.createdAt ||
-                left.event.id.localeCompare(right.event.id),
-        );
-    }
-
-    /**
-     * Yield near-realtime batches using transport long-polling.
-     *
-     * Breaking the loop does not acknowledge the current event.
-     */
+    /** Yield near-realtime events while making reset handling mandatory. */
     async *events(
         signal?: AbortSignal,
         waitMilliseconds: number = 25_000,
@@ -289,22 +318,61 @@ export class MurmurClient {
             if (isAborted(signal)) {
                 return;
             }
-            let batch: readonly ReceivedEvent[];
-            try {
-                batch = await this.sync(waitMilliseconds, signal);
-            } catch (error: unknown) {
-                if (isAborted(signal)) {
-                    return;
-                }
-                throw error;
+            const result = await this.sync(waitMilliseconds, signal);
+            if (result.status === "reset") {
+                const reset = result.resets[0];
+                throw new Error(
+                    reset === undefined
+                        ? "Relay topic reset required"
+                        : `Relay topic reset required for ${reset.topic} on ${reset.relayId}`,
+                );
             }
-            for (const event of batch) {
+            for (const event of result.events) {
                 if (isAborted(signal)) {
                     return;
                 }
                 yield event;
             }
         }
+    }
+
+    /**
+     * Load permanent snapshot/list state and atomically install its cursor.
+     *
+     * The application callback runs in the same transaction as the new cursor.
+     */
+    async loadTopic<Result>(
+        topic: string,
+        operation: (transaction: StoreTransaction, state: LoadedTopicState) => Promise<Result>,
+        relayId: string = this.#transports[0]?.id ?? "",
+    ): Promise<Result> {
+        const transport = this.#transportById.get(relayId);
+        if (transport === undefined) {
+            throw new Error(`Unknown relay transport ${relayId}`);
+        }
+        const state = await transport.readState(topic, DEFAULT_EVENT_PAGE_LIMIT);
+        const elements = [...(state?.list.elements ?? [])];
+        let nextCursor = state?.list.nextCursor ?? null;
+        while (nextCursor !== null) {
+            const page = await transport.readList(topic, nextCursor, DEFAULT_EVENT_PAGE_LIMIT);
+            if (page === undefined) {
+                throw new Error("Relay topic disappeared while loading its permanent list");
+            }
+            elements.push(...page.elements);
+            nextCursor = page.nextCursor;
+        }
+        const loaded: LoadedTopicState = {
+            relayId,
+            topic,
+            seq: state?.seq ?? 0n,
+            snapshot: state?.snapshot ?? null,
+            elements,
+        };
+        return this.#store.transaction(async (transaction) => {
+            const result = await operation(transaction, loaded);
+            await transaction.set(this.#cursorKey(relayId, topic), cursorBytes(loaded.seq));
+            return result;
+        });
     }
 
     /** Upload ciphertext to all reachable relays and return its content ID. */
@@ -331,74 +399,72 @@ export class MurmurClient {
                     return blob;
                 }
             } catch {
-                // Try the next independently configured transport.
+                // Try the next independently configured relay.
             }
         }
         return undefined;
     }
 
-    async #acceptDelivery(
-        transport: RelayTransport,
-        delivery: RelayDelivery,
-    ): Promise<ReceivedEvent | undefined> {
-        const fingerprintBytes = hashBytes(
-            new Uint8Array([
-                ...relayEventSignaturePayload(delivery.event),
-                ...delivery.event.signature,
-            ]),
+    async #publishRecord(
+        key: string,
+        event: SignedRelayEvent,
+        previouslyPublishedRelayIds: readonly string[],
+    ): Promise<PublishResult> {
+        const published = new Set(previouslyPublishedRelayIds);
+        const pending = this.#transports.filter((transport) => !published.has(transport.id));
+        const attempts = await Promise.allSettled(
+            pending.map(async (transport) => ({
+                relayId: transport.id,
+                outcome: await transport.publish(event),
+            })),
         );
-        const fingerprint = encodeBase64Url(fingerprintBytes);
-        const deduplicationId = `${delivery.event.id}/${fingerprint}`;
-        const acknowledgedKey = `${this.#acknowledgedPrefix}${deduplicationId}`;
-        const acknowledgedFingerprint = await this.#store.get(acknowledgedKey);
-        if (
-            acknowledgedFingerprint !== undefined &&
-            equalBytes(acknowledgedFingerprint, fingerprintBytes)
-        ) {
-            await this.#acknowledge(transport, delivery.deliveryId);
-            return undefined;
+        const publications: PublishResult["publications"][number][] = [];
+        const failedRelayIds: string[] = [];
+        for (let index = 0; index < attempts.length; index += 1) {
+            const attempt = attempts[index];
+            const transport = pending[index];
+            if (attempt?.status === "fulfilled") {
+                published.add(attempt.value.relayId);
+                publications.push(attempt.value);
+            } else if (transport !== undefined) {
+                failedRelayIds.push(transport.id);
+            }
         }
-
-        const existing = this.#inFlight.get(deduplicationId);
-        if (existing !== undefined) {
-            existing.origins.set(transport.id, {
-                transport,
-                deliveryId: delivery.deliveryId,
-            });
-            return undefined;
+        await this.#store.set(key, encodeOutboundRecord(event, [...published]));
+        if (published.size === 0) {
+            throw new Error("Every transport rejected the event");
         }
-
-        const inFlight: InFlightEvent = {
-            event: delivery.event,
-            origins: new Map([
-                [
-                    transport.id,
-                    {
-                        transport,
-                        deliveryId: delivery.deliveryId,
-                    },
-                ],
-            ]),
-        };
-        this.#inFlight.set(deduplicationId, inFlight);
-
         return {
-            event: delivery.event,
-            acknowledge: async (): Promise<void> => {
-                const current = this.#inFlight.get(deduplicationId) ?? inFlight;
-                await this.#store.set(acknowledgedKey, fingerprintBytes);
-                this.#inFlight.delete(deduplicationId);
-                await Promise.allSettled(
-                    [...current.origins.values()].map(async (origin) =>
-                        this.#acknowledge(origin.transport, origin.deliveryId),
-                    ),
-                );
-            },
+            event,
+            publications,
+            publishedRelayIds: [...published].sort(),
+            failedRelayIds: failedRelayIds.sort(),
         };
     }
 
-    async #acknowledge(transport: RelayTransport, deliveryId: string): Promise<void> {
-        await transport.acknowledge(createQueueAcknowledgeRequest(this.#identity, deliveryId));
+    #cursorKey(relayId: string, topic: string): string {
+        return `${this.#cursorPrefix}${encodeBase64Url(utf8Encode(relayId))}/${topic}`;
+    }
+
+    async #readCursor(relayId: string, topic: string): Promise<bigint> {
+        return parseCursor(await this.#store.get(this.#cursorKey(relayId, topic)));
+    }
+
+    async #advanceCursor(
+        transaction: StoreTransaction,
+        key: string,
+        sequence: bigint,
+    ): Promise<void> {
+        const current = parseCursor(await transaction.get(key));
+        if (sequence <= current) {
+            return;
+        }
+        if (sequence !== current + 1n) {
+            throw new Error(
+                `Cannot advance Murmur topic cursor from ${current.toString()} to ${sequence.toString()}`,
+            );
+        }
+        await transaction.set(key, cursorBytes(sequence));
     }
 
     async #pruneOutboundHistory(): Promise<void> {

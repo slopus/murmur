@@ -1,12 +1,12 @@
 import {
     decodeBase64Url,
-    decodeRelayEventWire,
+    decodeSignedRelayEventWire,
     encodeBase64Url,
-    encodeRelayEventWire,
+    encodeSignedRelayEventWire,
     equalBytes,
     utf8Decode,
     utf8Encode,
-    type RelayEvent,
+    type SignedRelayEvent,
 } from "@slopus/murmur";
 import type { CliGroupMessage, CliStoredGroupMessage } from "../types.js";
 
@@ -40,7 +40,7 @@ export interface CliGroupInvitation {
 export interface CliGroupOutbound {
     readonly kind: "invitation" | "commit" | "application" | "document";
     readonly groupId: string;
-    readonly event: RelayEvent;
+    readonly event: SignedRelayEvent;
     readonly messageKey?: string;
 }
 
@@ -368,7 +368,7 @@ export function encodeCliGroupOutbound(outbound: CliGroupOutbound): Uint8Array {
             version: 1,
             kind: outbound.kind,
             groupId: outbound.groupId,
-            event: encodeBase64Url(encodeRelayEventWire(outbound.event)),
+            event: encodeBase64Url(encodeSignedRelayEventWire(outbound.event)),
             messageKey: outbound.messageKey ?? null,
         }),
     );
@@ -397,7 +397,7 @@ export function decodeCliGroupOutbound(bytes: Uint8Array): CliGroupOutbound {
     const outbound: CliGroupOutbound = {
         kind: value.kind as CliGroupOutbound["kind"],
         groupId: value.groupId,
-        event: decodeRelayEventWire(decodeBase64Url(value.event)),
+        event: decodeSignedRelayEventWire(decodeBase64Url(value.event)),
         ...(typeof value.messageKey === "string" ? { messageKey: value.messageKey } : {}),
     };
     if (!equalBytes(encodeCliGroupOutbound(outbound), bytes)) {

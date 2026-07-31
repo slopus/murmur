@@ -1,42 +1,19 @@
 # Group channel
 
-Transport adapter from an authenticated `MlsEpochState` to the
-transport-agnostic `MurmurClient`.
+Adapter from `MlsEpochState` to signed relay topic events. A random group ID
+known only to members derives one capability topic shared by every epoch.
 
-The application owns the single client sync loop and dispatches received events
-by topic. Opened and deferred events preserve manual acknowledgement. Deferred
-events are not deleted automatically because they may belong to a future epoch.
-Durable senders use `prepareSend()`, atomically store its ciphertext and epoch
-checkpoint, call `markPersisted()`, and only then publish. An opened delivery
-likewise exposes its exact post-open checkpoint and refuses acknowledgment until
-the application marks its epoch plus application record as durably committed.
+Outbound work preserves **prepare → persist → publish**. Application sends
+persist their exact ciphertext and post-ratchet checkpoint before publication.
+Commits persist the exact Commit, Welcome, replay marker, and staged next-epoch
+checkpoint before publication, and are adopted only afterward. A timeout stays
+ambiguous and staged until the durable Murmur outbox resolves the exact event.
 
-RFC `PublicMessage` Commits and application `PrivateMessage` values share the
-same opaque topic. Commits are authenticated and staged, then exposed through
-explicit `adopt()`/`cancel()` controls so callers can durably persist the next
-epoch before acknowledging the relay delivery. A staged Commit cannot be
-acknowledged before adoption or after cancellation.
+Inbound statuses retain their protocol meanings: `opened`, `commit`, `applied`,
+`application-applied`, `removed`, and `deferred`. Application records, MLS
+checkpoints, replay markers, and `advanceCursor(transaction)` belong in one
+transaction. A deferred future-epoch value is never advanced automatically.
 
-Outbound Commit preparation deliberately does not hide publication ordering.
-The caller atomically persists the exact Commit, Welcome,
-`serializeNextEpoch()` bytes, and `persistenceGeneration`, invokes the handle's
-`publish()`, then adopts. If publication has an ambiguous network result, the
-transition cannot be treated as cancelled; it stays staged in a live process
-until Murmur's retained outbox has been resolved and `confirmPublished()` is
-called with the matching successful retry result.
-
-Once that exact checkpoint and outbox are durable, process teardown may call
-`abandonPersisted()`. This zeros the recoverable in-memory staged/current state
-without claiming that publication was cancelled or altering durable recovery.
-
-Commit and application ciphertext fingerprints are exported and restored with
-the epoch. This makes sender echoes and post-crash redeliveries safely
-acknowledgeable without applying a transition twice or reopening a consumed
-generation. Markers must be stored in the same transaction as the epoch and
-application/outbox record. They remain until the application has evidence that
-every relevant relay delivery was acknowledged, then are explicitly removed
-with `forgetAppliedCommit()` or `forgetAppliedApplication()`.
-
-An authenticated Commit which removes the local leaf is surfaced as a gated
-`removed` delivery. The application must durably retire its epoch before
-`markPersisted()` destroys the live secrets and unlocks acknowledgment.
+Persisted commit/application fingerprints make sender echoes and crash replays
+idempotent without reopening a consumed MLS generation. Removed members
+durably install a tombstone and cursor before live secrets are destroyed.

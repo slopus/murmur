@@ -51,7 +51,6 @@ function validatePublishResult(
     if (
         result.publishedRelayIds.length === 0 ||
         result.event.topic !== topic ||
-        result.event.recipients.length !== 0 ||
         !equalBytes(hashBytes(result.event.payload), fingerprint)
     ) {
         throw new Error("Publish result does not match the prepared MLS event");
@@ -70,8 +69,8 @@ export function mlsGroupTopic(groupId: Uint8Array): string {
  * Relay adapter for one current MLS epoch.
  *
  * The application calls `MurmurClient.sync()` once and dispatches each
- * `ReceivedEvent` to its channels. This preserves the client's cross-group
- * in-flight deduplication and explicit acknowledgement semantics.
+ * `ReceivedEvent` to its channels. Cursor advancement remains coupled to the
+ * application's durable transaction.
  */
 export class MlsGroupChannel {
     #epoch: MlsEpochState;
@@ -148,7 +147,7 @@ export class MlsGroupChannel {
         return [...this.#appliedApplications.values()].map((fingerprint) => fingerprint.slice());
     }
 
-    /** Forget one replay marker only after every relevant relay delivery is acknowledged. */
+    /** Forget one replay marker only after every relevant relay cursor has advanced. */
     forgetAppliedCommit(fingerprint: Uint8Array): void {
         if (fingerprint.length !== 32) {
             throw new Error("Invalid applied MLS Commit fingerprint");
@@ -156,7 +155,7 @@ export class MlsGroupChannel {
         this.#appliedCommits.delete(encodeBase64Url(fingerprint));
     }
 
-    /** Forget an application replay marker after all relay echoes are acknowledged. */
+    /** Forget an application replay marker after all relay echo cursors advance. */
     forgetAppliedApplication(fingerprint: Uint8Array): void {
         if (fingerprint.length !== 32) {
             throw new Error("Invalid applied MLS application fingerprint");
@@ -403,7 +402,7 @@ export class MlsGroupChannel {
      * Dispatch one already authenticated relay delivery.
      *
      * `undefined` means another channel owns the topic. A deferred result is
-     * deliberately not auto-acknowledged: it may be a valid future-epoch event.
+     * deliberately not auto-consumed: it may be a valid future-epoch event.
      */
     handle(received: ReceivedEvent): MlsGroupDelivery | undefined {
         if (received.event.topic !== this.#topic) {
@@ -414,7 +413,7 @@ export class MlsGroupChannel {
                 status: "deferred",
                 error: new Error("MLS group channel has a pending event"),
                 event: received.event,
-                acknowledge: received.acknowledge,
+                advanceCursor: received.advanceCursor,
             };
         }
         try {
@@ -425,7 +424,7 @@ export class MlsGroupChannel {
                         status: "applied",
                         fingerprint: fingerprint.slice(),
                         event: received.event,
-                        acknowledge: received.acknowledge,
+                        advanceCursor: received.advanceCursor,
                     };
                 }
                 if (this.#appliedCommits.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
@@ -459,14 +458,7 @@ export class MlsGroupChannel {
                             this.#pendingInbound = false;
                             state = "cancelled";
                         },
-                        acknowledge: async (): Promise<void> => {
-                            if (state !== "persisted") {
-                                throw new Error(
-                                    "MLS group removal must be persisted before acknowledgment",
-                                );
-                            }
-                            await received.acknowledge();
-                        },
+                        advanceCursor: received.advanceCursor,
                     };
                 }
                 let state: "staged" | "persisted" | "adopted" | "cancelled" = "staged";
@@ -511,14 +503,7 @@ export class MlsGroupChannel {
                             state = "cancelled";
                         }
                     },
-                    acknowledge: async (): Promise<void> => {
-                        if (state !== "adopted") {
-                            throw new Error(
-                                "MLS group Commit must be adopted before acknowledgment",
-                            );
-                        }
-                        await received.acknowledge();
-                    },
+                    advanceCursor: received.advanceCursor,
                 };
             }
             const fingerprint = hashBytes(received.event.payload);
@@ -528,7 +513,7 @@ export class MlsGroupChannel {
                     status: "application-applied",
                     fingerprint: fingerprint.slice(),
                     event: received.event,
-                    acknowledge: received.acknowledge,
+                    advanceCursor: received.advanceCursor,
                 };
             }
             if (this.#appliedApplications.size >= MAXIMUM_APPLIED_COMMIT_MARKERS) {
@@ -540,7 +525,7 @@ export class MlsGroupChannel {
             const persistenceGeneration = opened.persistenceGeneration;
             this.#pendingInbound = true;
             this.#pendingInboundCheckpoint = checkpoint;
-            let state: "opened" | "persisted" | "acknowledged" = "opened";
+            let state: "opened" | "persisted" = "opened";
             return {
                 status: "opened",
                 message,
@@ -563,22 +548,14 @@ export class MlsGroupChannel {
                     this.#pendingInbound = false;
                     this.#pendingInboundCheckpoint = undefined;
                 },
-                acknowledge: async (): Promise<void> => {
-                    if (state !== "persisted") {
-                        throw new Error(
-                            "MLS group application must be persisted before acknowledgment",
-                        );
-                    }
-                    await received.acknowledge();
-                    state = "acknowledged";
-                },
+                advanceCursor: received.advanceCursor,
             };
         } catch (error: unknown) {
             return {
                 status: "deferred",
                 error: error instanceof Error ? error : new Error("MLS group open failed"),
                 event: received.event,
-                acknowledge: received.acknowledge,
+                advanceCursor: received.advanceCursor,
             };
         }
     }

@@ -1,73 +1,123 @@
-import type { IdentityPublicKeys } from "../crypto/index.js";
-
 /** Maximum opaque event payload accepted by the default protocol profile. */
 export const MAX_RELAY_EVENT_PAYLOAD_BYTES = 1024 * 1024;
 
-/** An opaque, publisher-authenticated event. */
-export interface RelayEvent {
+/** Public signing identity attached to every relay write. */
+export interface RelayAuthor {
+    readonly signingKey: Uint8Array;
+}
+
+/** Optimistic replacement or deletion of the topic snapshot. */
+export interface SnapshotMutation {
+    readonly expectedVersion: number;
+    readonly bytes?: Uint8Array;
+}
+
+/** Append one new opaque list element at the end of the topic order. */
+export interface AppendListOperation {
+    readonly op: "append";
+    readonly id: string;
+    readonly bytes: Uint8Array;
+}
+
+/** Replace one existing opaque list element without changing its position. */
+export interface ReplaceListOperation {
+    readonly op: "replace";
+    readonly id: string;
+    readonly expectedVersion?: number;
+    readonly bytes: Uint8Array;
+}
+
+/** Delete one existing opaque list element. */
+export interface DeleteListOperation {
+    readonly op: "delete";
+    readonly id: string;
+    readonly expectedVersion?: number;
+}
+
+/** One ordered list mutation carried by a signed event. */
+export type ListOperation = AppendListOperation | ReplaceListOperation | DeleteListOperation;
+
+/** Complete authenticated event accepted by the relay. */
+export interface SignedRelayEvent {
     readonly version: 1;
     readonly id: string;
     readonly topic: string;
-    readonly sender: IdentityPublicKeys;
-    readonly recipients: readonly string[];
+    readonly author: RelayAuthor;
     readonly createdAt: number;
     readonly payload: Uint8Array;
+    readonly snapshot?: SnapshotMutation;
+    readonly list?: readonly ListOperation[];
     readonly signature: Uint8Array;
 }
 
-/** Authenticated request to receive publications for a topic. */
-export interface TopicSubscription {
-    readonly version: 1;
-    readonly topic: string;
-    readonly subscriber: IdentityPublicKeys;
-    readonly createdAt: number;
-    readonly signature: Uint8Array;
-}
-
-/** One queued copy of an event for one recipient. */
-export interface RelayDelivery {
-    readonly deliveryId: string;
-    readonly event: RelayEvent;
-}
-
-/** Blob returned by a relay. Its identifier is the SHA-256 of its ciphertext. */
+/** Content-addressed ciphertext retained independently of topics. */
 export interface RelayBlob {
     readonly id: string;
     readonly bytes: Uint8Array;
 }
 
-/** Recipient-signed, single-use request to read its queue. */
-export interface QueueReadRequest {
-    readonly version: 1;
-    readonly action: "read";
-    readonly requestId: string;
-    readonly createdAt: number;
-    readonly recipient: IdentityPublicKeys;
-    readonly signature: Uint8Array;
+/** Result of an atomic publish, preserved exactly for idempotent retries. */
+export interface PublishOutcome {
+    readonly seq: bigint;
+    readonly duplicate: boolean;
+    readonly snapshotVersion?: bigint;
 }
 
-/** Recipient-signed, single-use request to delete one queued delivery. */
-export interface QueueAcknowledgeRequest {
-    readonly version: 1;
-    readonly action: "acknowledge";
-    readonly requestId: string;
-    readonly createdAt: number;
-    readonly recipient: IdentityPublicKeys;
-    readonly deliveryId: string;
-    readonly signature: Uint8Array;
+/** Current opaque snapshot with its last mutation version. */
+export interface TopicSnapshot {
+    readonly version: bigint;
+    readonly bytes: Uint8Array;
 }
 
-/** Replaceable relay or peer-to-peer transport. */
+/** Current opaque list element in relay-assigned order. */
+export interface ListElement {
+    readonly id: string;
+    readonly version: bigint;
+    readonly bytes: Uint8Array;
+}
+
+/** One stable page of current list elements. */
+export interface ListPage {
+    readonly elements: readonly ListElement[];
+    readonly nextCursor: string | null;
+}
+
+/** Snapshot and first list page read at one transactionally consistent sequence. */
+export interface TopicState {
+    readonly seq: bigint;
+    readonly snapshot: TopicSnapshot | null;
+    readonly list: ListPage;
+}
+
+/** One retained signed mutation associated with its per-topic sequence. */
+export interface RetainedRelayEvent {
+    readonly seq: bigint;
+    readonly event: SignedRelayEvent;
+}
+
+/** Bounded retained events plus reset information and the current topic head. */
+export interface EventPage {
+    readonly events: readonly RetainedRelayEvent[];
+    readonly reset: boolean;
+    readonly seq: bigint;
+}
+
+/** Browser-safe fetch signature accepted by the HTTP transport. */
+export type RelayFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+
+/** Relay boundary for signed topic state, retained events, and blobs. */
 export interface RelayTransport {
     readonly id: string;
-    publish(event: RelayEvent): Promise<void>;
-    subscribe(subscription: TopicSubscription): Promise<void>;
-    pull(
-        request: QueueReadRequest,
-        waitMilliseconds?: number,
+    publish(event: SignedRelayEvent): Promise<PublishOutcome>;
+    readState(topic: string, limit?: number): Promise<TopicState | undefined>;
+    readList(topic: string, cursor?: string, limit?: number): Promise<ListPage | undefined>;
+    readEvents(
+        topic: string,
+        since: bigint,
+        limit?: number,
+        wait?: number,
         signal?: AbortSignal,
-    ): Promise<readonly RelayDelivery[]>;
-    acknowledge(request: QueueAcknowledgeRequest): Promise<void>;
+    ): Promise<EventPage | undefined>;
     putBlob(blob: RelayBlob): Promise<void>;
     getBlob(id: string): Promise<RelayBlob | undefined>;
 }

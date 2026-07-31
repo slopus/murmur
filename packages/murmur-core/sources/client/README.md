@@ -1,24 +1,23 @@
 # Client
 
-`MurmurClient` combines one identity, durable storage, and one or more
-transports. It fans outgoing events and blobs across relays, merges duplicate
-deliveries, and exposes manual acknowledgement.
+`MurmurClient` combines an identity, a transactional store, and one or more
+relays. Publishing succeeds after at least one relay accepts the signed event.
+The durable outbox remembers remaining relays; identical retries use the
+relay's original sequence and `duplicate` outcome.
 
 ```text
-             relay A ----\
-identity -> MurmurClient ---> one ordered batch -> application -> ack
-             relay B ----/          |
-                               durable dedupe
+relay event page -> authenticate -> application transaction
+                                      |             |
+                                application state  cursor
 ```
 
-An unacknowledged event may be delivered again after process restart. Once the
-application acknowledges it, every future duplicate is suppressed and its relay
-copy is acknowledged. This is the only lossless form of exactly-once processing
-possible without pretending that application state and relay state share one
-transaction.
+Following a topic is local only; relays keep no subscription records. Each
+relay/topic cursor is durable because relay sequence numbers are local to that
+relay. `ReceivedEvent.advanceCursor(transaction)` must run in the same
+`MurmurStore` transaction as the application effect and rejects sequence gaps.
 
-Applications which need their own durable event mapping can create a signed
-`RelayEvent` first and pass it to `publishEvent()`. Repeating the same event
-resumes its retained relay acceptance state. `retryOutboundSettled()` isolates
-individual failures so one offline relay record never blocks later retries or
-incoming synchronization.
+`sync()` returns a discriminated result. When any event page says `reset: true`,
+the result is `status: "reset"` and contains no events. The caller must use
+`loadTopic()` to apply the permanent snapshot and fully paginated list and
+install their head cursor atomically. Reset can therefore never look like
+"caught up."

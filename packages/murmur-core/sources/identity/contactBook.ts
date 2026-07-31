@@ -1,5 +1,5 @@
 import type { IdentityPublicKeys } from "../crypto/index.js";
-import type { MurmurStore } from "../storage/index.js";
+import type { MurmurStore, StoreTransaction } from "../storage/index.js";
 import { encodeBase64Url } from "../utils/index.js";
 import { decodeContact, encodeContact } from "./impl/contactCodec.js";
 import type { Contact, OpenedProfile } from "./types.js";
@@ -26,6 +26,22 @@ export class ContactBook {
 
     /** Insert or update an authenticated opened profile. */
     async save(openedProfile: OpenedProfile, now: number = Date.now()): Promise<Contact> {
+        return this.#store.transaction(async (transaction) =>
+            this.saveInTransaction(transaction, openedProfile, now),
+        );
+    }
+
+    /**
+     * Insert or update a profile inside a caller-owned atomic transaction.
+     *
+     * This is used when contact state and a relay topic cursor must commit
+     * together.
+     */
+    async saveInTransaction(
+        transaction: StoreTransaction,
+        openedProfile: OpenedProfile,
+        now: number = Date.now(),
+    ): Promise<Contact> {
         if (openedProfile.identity.encryptionKey.length !== 32) {
             throw new Error("Contact encryption key must be 32 bytes");
         }
@@ -33,32 +49,30 @@ export class ContactBook {
             throw new Error("Contact time must be a non-negative safe integer");
         }
         const key = `${this.#prefix}${contactIdentityId(openedProfile.identity)}`;
-        return this.#store.transaction(async (transaction) => {
-            const existing = await transaction.get(key);
-            const existingContact = existing === undefined ? undefined : decodeContact(existing);
-            if (existingContact !== undefined && now < existingContact.updatedAt) {
-                throw new Error("Contact updates must not move backwards in time");
-            }
-            const contact: Contact = {
-                identity: {
-                    signingKey: openedProfile.identity.signingKey.slice(),
-                    encryptionKey: openedProfile.identity.encryptionKey.slice(),
-                },
-                profile: {
-                    name: openedProfile.profile.name,
-                    ...(openedProfile.profile.avatar === undefined
-                        ? {}
-                        : { avatar: openedProfile.profile.avatar.slice() }),
-                    ...(openedProfile.profile.metadata === undefined
-                        ? {}
-                        : { metadata: { ...openedProfile.profile.metadata } }),
-                },
-                addedAt: existingContact?.addedAt ?? now,
-                updatedAt: now,
-            };
-            await transaction.set(key, encodeContact(contact));
-            return contact;
-        });
+        const existing = await transaction.get(key);
+        const existingContact = existing === undefined ? undefined : decodeContact(existing);
+        if (existingContact !== undefined && now < existingContact.updatedAt) {
+            throw new Error("Contact updates must not move backwards in time");
+        }
+        const contact: Contact = {
+            identity: {
+                signingKey: openedProfile.identity.signingKey.slice(),
+                encryptionKey: openedProfile.identity.encryptionKey.slice(),
+            },
+            profile: {
+                name: openedProfile.profile.name,
+                ...(openedProfile.profile.avatar === undefined
+                    ? {}
+                    : { avatar: openedProfile.profile.avatar.slice() }),
+                ...(openedProfile.profile.metadata === undefined
+                    ? {}
+                    : { metadata: { ...openedProfile.profile.metadata } }),
+            },
+            addedAt: existingContact?.addedAt ?? now,
+            updatedAt: now,
+        };
+        await transaction.set(key, encodeContact(contact));
+        return contact;
     }
 
     /** Find a contact by public signing identity. */

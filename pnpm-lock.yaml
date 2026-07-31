@@ -33,6 +33,9 @@ importers:
         specifier: workspace:*
         version: link:../murmur-core
     devDependencies:
+      '@murmur/relay':
+        specifier: workspace:*
+        version: link:../murmur-relay
       '@types/node':
         specifier: '>=20'
         version: 24.13.3

@@ -16,17 +16,17 @@ export interface SerializedPublicIdentity {
 /** Opaque encrypted profile carried by a relay event. */
 export interface EncryptedProfile {
     readonly version: 1;
-    readonly sender: SerializedPublicIdentity;
     readonly recipient: string;
     readonly ephemeralPublicKey: string;
     readonly nonce: string;
     readonly ciphertext: string;
 }
 
-/** Result of authenticating and decrypting a contact profile. */
+/** Result of authenticating and decrypting a contact profile and private data. */
 export interface OpenedProfile {
     readonly identity: IdentityPublicKeys;
     readonly profile: IdentityProfile;
+    readonly privateData?: Uint8Array;
 }
 
 /** Authenticated contact persisted locally by one identity. */

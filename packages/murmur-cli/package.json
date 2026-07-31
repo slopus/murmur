@@ -1,7 +1,7 @@
 {
     "name": "murmur-chat",
     "version": "0.1.8",
-    "description": "Murmur CLI over transport-neutral encrypted relays and MLS",
+    "description": "Murmur CLI over encrypted topic-state relays and MLS",
     "license": "MIT",
     "author": "Steve",
     "bin": {
@@ -40,6 +40,7 @@
         "@slopus/murmur": "workspace:*"
     },
     "devDependencies": {
+        "@murmur/relay": "workspace:*",
         "@types/node": ">=20",
         "tsx": "^4.20.6",
         "typescript": "^5",

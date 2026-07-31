@@ -1,14 +1,41 @@
 import { describe, expect, it } from "vitest";
-import { generateIdentityKeyPair } from "../../crypto/index.js";
+import { generateIdentityKeyPair, hashBytes } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import {
     ContactBook,
     decryptContactProfile,
     encryptProfileForContact,
     identityInboxTopic,
+    pairwiseTopic,
 } from "../index.js";
+import { canonicalJsonBytes, encodeBase64Url, utf8Encode } from "../../utils/index.js";
 
 describe("identity profiles", () => {
+    it("derives symmetric pairwise topics unavailable from public tokens", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const eve = generateIdentityKeyPair();
+        const aliceBob = pairwiseTopic(alice, bob);
+        const publicKeys = [
+            encodeBase64Url(alice.encryptionKey),
+            encodeBase64Url(bob.encryptionKey),
+        ].sort();
+        const publicOnlyGuess = `pairwise:${encodeBase64Url(
+            hashBytes(
+                canonicalJsonBytes({
+                    context: "murmur/pairwise-topic/x25519-sha256/v1",
+                    publicKeys,
+                }),
+            ),
+        )}`;
+
+        expect(pairwiseTopic(bob, alice)).toBe(aliceBob);
+        expect(pairwiseTopic(alice, eve)).not.toBe(aliceBob);
+        expect(pairwiseTopic(eve, bob)).not.toBe(aliceBob);
+        expect(publicOnlyGuess).not.toBe(aliceBob);
+        expect(aliceBob).toMatch(/^pairwise:[A-Za-z0-9_-]{43}$/);
+    });
+
     it("exchanges an authenticated profile using only public identity keys", () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
@@ -19,6 +46,8 @@ describe("identity profiles", () => {
         });
         const opened = decryptContactProfile(bob, envelope);
 
+        expect("sender" in envelope).toBe(false);
+        expect(JSON.stringify(envelope)).not.toContain(encodeBase64Url(alice.signingKey));
         expect(opened.identity.signingKey).toEqual(alice.signingKey);
         expect(opened.profile).toEqual({ name: "Alice", metadata: { role: "agent" } });
         expect(identityInboxTopic(bob)).toMatch(/^identity:/);
@@ -33,6 +62,19 @@ describe("identity profiles", () => {
         expect(() => decryptContactProfile(eve, envelope)).toThrow();
     });
 
+    it("seals sender identity and authenticated private contact data together", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const privateData = utf8Encode("private KeyPackage bytes");
+        const envelope = encryptProfileForContact(alice, bob, { name: "Alice" }, privateData);
+        const wire = JSON.stringify(envelope);
+        const opened = decryptContactProfile(bob, envelope);
+
+        expect(wire).not.toContain(encodeBase64Url(alice.signingKey));
+        expect(wire).not.toContain(encodeBase64Url(privateData));
+        expect(opened.privateData).toEqual(privateData);
+    });
+
     it("rejects oversized ciphertext before attempting decryption", () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
@@ -41,7 +83,7 @@ describe("identity profiles", () => {
         expect(() =>
             decryptContactProfile(bob, {
                 ...envelope,
-                ciphertext: "A".repeat(2_000_000),
+                ciphertext: "A".repeat(3_000_000),
             }),
         ).toThrow("too large");
     });

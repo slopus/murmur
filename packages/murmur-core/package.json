@@ -1,7 +1,7 @@
 {
     "name": "@slopus/murmur",
     "version": "0.1.0",
-    "description": "Transport-agnostic encrypted messaging and MLS for Murmur",
+    "description": "End-to-end encrypted messaging and MLS over dumb Murmur relays",
     "keywords": [
         "encrypted-messaging",
         "end-to-end-encryption",

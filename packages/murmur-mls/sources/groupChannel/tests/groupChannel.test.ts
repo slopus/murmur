@@ -7,6 +7,8 @@ import {
     utf8Encode,
     type PublishResult,
     type ReceivedEvent,
+    type SignedRelayEvent,
+    type StoreTransaction,
 } from "@slopus/murmur";
 import { describe, expect, it, vi } from "vitest";
 import { MlsEpochState } from "../../epoch/index.js";
@@ -59,8 +61,42 @@ function authenticateCredential(leaf: MlsLeafNode): boolean {
     return equalBytes(leaf.credential.identity, leaf.signatureKey);
 }
 
+const transaction: StoreTransaction = {
+    get: async (): Promise<Uint8Array | undefined> => undefined,
+    set: async (): Promise<void> => undefined,
+    delete: async (): Promise<void> => undefined,
+    list: async (): Promise<ReadonlyMap<string, Uint8Array>> => new Map(),
+};
+
+function publishResult(event: SignedRelayEvent): PublishResult {
+    return {
+        event,
+        publications: [
+            {
+                relayId: "test",
+                outcome: { seq: 1n, duplicate: false },
+            },
+        ],
+        publishedRelayIds: ["test"],
+        failedRelayIds: [],
+    };
+}
+
+function receivedEvent(
+    event: SignedRelayEvent,
+    advanceCursor: (transaction: StoreTransaction) => Promise<void>,
+): ReceivedEvent {
+    return {
+        kind: "event",
+        relayId: "test",
+        seq: 1n,
+        event,
+        advanceCursor,
+    };
+}
+
 describe("MLS group relay channel", () => {
-    it("publishes opaque epoch content and preserves manual acknowledgement", async () => {
+    it("publishes opaque epoch content and preserves transactional cursor control", async () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
         const joinerSecret = hashBytes(utf8Encode("joiner"));
@@ -96,11 +132,7 @@ describe("MLS group relay channel", () => {
             },
             publish: async (topic, payload): Promise<PublishResult> => {
                 const event = createRelayEvent(alice, topic, payload);
-                return {
-                    event,
-                    publishedRelayIds: ["test"],
-                    failedRelayIds: [],
-                };
+                return publishResult(event);
             },
         };
         await bobChannel.subscribe(client);
@@ -115,8 +147,8 @@ describe("MLS group relay channel", () => {
         prepared.markPersisted();
         const published = await prepared.publish(client);
         expect(() => prepared.serializeEpoch()).toThrow("confirmed");
-        const acknowledge = vi.fn(async (): Promise<void> => undefined);
-        const received: ReceivedEvent = { event: published.event, acknowledge };
+        const advanceCursor = vi.fn(async (): Promise<void> => undefined);
+        const received = receivedEvent(published.event, advanceCursor);
 
         const delivery = bobChannel.handle(received);
 
@@ -132,11 +164,11 @@ describe("MLS group relay channel", () => {
                 minimumPersistenceGeneration: delivery.persistenceGeneration,
             });
             restoredInbound.destroy();
-            await expect(delivery.acknowledge()).rejects.toThrow("persisted");
+            expect(advanceCursor).not.toHaveBeenCalled();
             delivery.markPersisted();
-            await delivery.acknowledge();
+            await delivery.advanceCursor(transaction);
         }
-        expect(acknowledge).toHaveBeenCalledOnce();
+        expect(advanceCursor).toHaveBeenCalledOnce();
         expect(aliceChannel.appliedApplicationFingerprints).toEqual([prepared.fingerprint]);
         expect(bobChannel.appliedApplicationFingerprints).toHaveLength(1);
         if (delivery?.status !== "opened" || durableInboundCheckpoint === undefined) {
@@ -150,22 +182,19 @@ describe("MLS group relay channel", () => {
             [],
             bobChannel.appliedApplicationFingerprints,
         );
-        const replayAcknowledge = vi.fn(async (): Promise<void> => undefined);
-        const replay = restoredBob.handle({
-            event: published.event,
-            acknowledge: replayAcknowledge,
-        });
+        const replayAdvanceCursor = vi.fn(async (): Promise<void> => undefined);
+        const replay = restoredBob.handle(receivedEvent(published.event, replayAdvanceCursor));
         expect(replay?.status).toBe("application-applied");
         if (replay?.status === "application-applied") {
-            await replay.acknowledge();
+            await replay.advanceCursor(transaction);
         }
-        expect(replayAcknowledge).toHaveBeenCalledOnce();
+        expect(replayAdvanceCursor).toHaveBeenCalledOnce();
         restoredBob.destroy();
         aliceChannel.destroy();
         bobChannel.destroy();
     });
 
-    it("defers invalid or future-epoch payloads without acknowledging them", () => {
+    it("defers invalid or future-epoch payloads without consuming them", () => {
         const alice = generateIdentityKeyPair();
         const secrets = deriveMlsEpochSecretsFromJoiner(
             hashBytes(utf8Encode("joiner")),
@@ -180,14 +209,14 @@ describe("MLS group relay channel", () => {
                 localSigningSecretKey: alice.signingSecretKey,
             }),
         );
-        const acknowledge = vi.fn(async (): Promise<void> => undefined);
-        const received: ReceivedEvent = {
-            event: createRelayEvent(alice, channel.topic, utf8Encode("not an MLS message")),
-            acknowledge,
-        };
+        const advanceCursor = vi.fn(async (): Promise<void> => undefined);
+        const received = receivedEvent(
+            createRelayEvent(alice, channel.topic, utf8Encode("not an MLS message")),
+            advanceCursor,
+        );
 
         expect(channel.handle(received)?.status).toBe("deferred");
-        expect(acknowledge).not.toHaveBeenCalled();
+        expect(advanceCursor).not.toHaveBeenCalled();
         expect(
             channel.handle({
                 ...received,
@@ -244,11 +273,8 @@ describe("MLS group relay channel", () => {
         const bobChannel = createChannel(1, bobBundle);
         const client: MlsGroupMurmurClient = {
             subscribe: async (): Promise<void> => undefined,
-            publish: async (topic, payload): Promise<PublishResult> => ({
-                event: createRelayEvent(alice, topic, payload),
-                publishedRelayIds: ["test"],
-                failedRelayIds: [],
-            }),
+            publish: async (topic, payload): Promise<PublishResult> =>
+                publishResult(createRelayEvent(alice, topic, payload)),
         };
         const outbound = aliceChannel.prepareCommit([]);
         const stagedCheckpoint = outbound.serializeNextEpoch();
@@ -261,16 +287,18 @@ describe("MLS group relay channel", () => {
         restoredStaged.destroy();
         const originalPayload = outbound.payload.slice();
         outbound.payload.fill(0);
-        const acknowledge = vi.fn(async (): Promise<void> => undefined);
-        const delivery = bobChannel.handle({
-            event: createRelayEvent(alice, bobChannel.topic, originalPayload),
-            acknowledge,
-        });
+        const advanceCursor = vi.fn(async (): Promise<void> => undefined);
+        const delivery = bobChannel.handle(
+            receivedEvent(
+                createRelayEvent(alice, bobChannel.topic, originalPayload),
+                advanceCursor,
+            ),
+        );
         expect(delivery?.status).toBe("commit");
         if (delivery?.status !== "commit") {
             throw new Error("Expected staged MLS Commit");
         }
-        await expect(delivery.acknowledge()).rejects.toThrow("adopted");
+        expect(advanceCursor).not.toHaveBeenCalled();
         expect(() => outbound.adopt()).toThrow("prepared");
         expect(() => aliceChannel.destroy()).toThrow("pending outbound");
         outbound.markPersisted();
@@ -287,28 +315,24 @@ describe("MLS group relay channel", () => {
         restoredInboundCommit.destroy();
         delivery.markPersisted();
         delivery.adopt();
-        await delivery.acknowledge();
-        expect(acknowledge).toHaveBeenCalledOnce();
+        await delivery.advanceCursor(transaction);
+        expect(advanceCursor).toHaveBeenCalledOnce();
         expect(aliceChannel.appliedCommitFingerprints).toHaveLength(1);
-        const echoAcknowledge = vi.fn(async (): Promise<void> => undefined);
-        const echo = aliceChannel.handle({
-            event: committed.event,
-            acknowledge: echoAcknowledge,
-        });
+        const echoAdvanceCursor = vi.fn(async (): Promise<void> => undefined);
+        const echo = aliceChannel.handle(receivedEvent(committed.event, echoAdvanceCursor));
         expect(echo?.status).toBe("applied");
         if (echo?.status === "applied") {
-            await echo.acknowledge();
+            await echo.advanceCursor(transaction);
             aliceChannel.forgetAppliedCommit(echo.fingerprint);
         }
-        expect(echoAcknowledge).toHaveBeenCalledOnce();
+        expect(echoAdvanceCursor).toHaveBeenCalledOnce();
         const preparedApplication = aliceChannel.prepareSend(utf8Encode("new epoch"));
         preparedApplication.serializeEpoch().fill(0);
         preparedApplication.markPersisted();
         const published = await preparedApplication.publish(client);
-        const opened = bobChannel.handle({
-            event: published.event,
-            acknowledge: async (): Promise<void> => undefined,
-        });
+        const opened = bobChannel.handle(
+            receivedEvent(published.event, async (): Promise<void> => undefined),
+        );
         expect(opened?.status).toBe("opened");
         if (opened?.status === "opened") {
             expect(utf8Decode(opened.message.applicationData)).toBe("new epoch");
@@ -330,17 +354,15 @@ describe("MLS group relay channel", () => {
         expect(() => ambiguous.cancel()).toThrow("ambiguous");
         expect(() => aliceChannel.destroy()).toThrow("pending outbound");
         expect(() =>
-            ambiguous.confirmPublished({
-                event: createRelayEvent(alice, aliceChannel.topic, utf8Encode("wrong Commit")),
-                publishedRelayIds: ["test"],
-                failedRelayIds: [],
-            }),
+            ambiguous.confirmPublished(
+                publishResult(
+                    createRelayEvent(alice, aliceChannel.topic, utf8Encode("wrong Commit")),
+                ),
+            ),
         ).toThrow("does not match");
-        ambiguous.confirmPublished({
-            event: createRelayEvent(alice, aliceChannel.topic, ambiguous.payload),
-            publishedRelayIds: ["test"],
-            failedRelayIds: [],
-        });
+        ambiguous.confirmPublished(
+            publishResult(createRelayEvent(alice, aliceChannel.topic, ambiguous.payload)),
+        );
         ambiguous.adopt();
 
         aliceChannel.destroy();

@@ -1,54 +1,42 @@
-import {
-    deserializePublicIdentity,
-    serializePublicIdentity,
-    type SerializedPublicIdentity,
-} from "../../identity/index.js";
 import { decodeBase64Url, encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
 import type {
-    QueueAcknowledgeRequest,
-    QueueReadRequest,
-    RelayDelivery,
-    RelayEvent,
-    TopicSubscription,
+    EventPage,
+    ListElement,
+    ListOperation,
+    ListPage,
+    PublishOutcome,
+    SignedRelayEvent,
+    SnapshotMutation,
+    TopicSnapshot,
+    TopicState,
 } from "../types.js";
-import { MAX_RELAY_EVENT_PAYLOAD_BYTES } from "../types.js";
 
-interface WireRelayEvent {
+interface SignedRelayEventJson {
     readonly version: 1;
     readonly id: string;
     readonly topic: string;
-    readonly sender: SerializedPublicIdentity;
-    readonly recipients: readonly string[];
+    readonly author: { readonly signingKey: string };
     readonly createdAt: number;
     readonly payload: string;
+    readonly snapshot?: { readonly expectedVersion: number; readonly bytes?: string };
+    readonly list?: readonly (
+        | { readonly op: "append"; readonly id: string; readonly bytes: string }
+        | {
+              readonly op: "replace";
+              readonly id: string;
+              readonly expectedVersion?: number;
+              readonly bytes: string;
+          }
+        | { readonly op: "delete"; readonly id: string; readonly expectedVersion?: number }
+    )[];
     readonly signature: string;
 }
 
-interface WireTopicSubscription {
-    readonly version: 1;
-    readonly topic: string;
-    readonly subscriber: SerializedPublicIdentity;
-    readonly createdAt: number;
-    readonly signature: string;
-}
-
-interface WireQueueRequest {
-    readonly version: 1;
-    readonly action: "read" | "acknowledge";
-    readonly requestId: string;
-    readonly createdAt: number;
-    readonly recipient: SerializedPublicIdentity;
-    readonly deliveryId?: string;
-    readonly signature: string;
-}
-
-const MAXIMUM_EVENT_WIRE_BYTES = 4 * 1024 * 1024;
-const MAXIMUM_DELIVERY_BATCH_WIRE_BYTES = 32 * 1024 * 1024;
-const MAXIMUM_RELAY_RECIPIENTS = 1_024;
-const MAXIMUM_RELAY_TOPIC_CHARACTERS = 512;
-const MAXIMUM_DELIVERY_BATCH = 16;
-const MAXIMUM_DELIVERY_ID_CHARACTERS = 256;
-const MAXIMUM_EVENT_PAYLOAD_CHARACTERS = Math.ceil((MAX_RELAY_EVENT_PAYLOAD_BYTES * 4) / 3);
+const MAXIMUM_PAGE_WIRE_BYTES = 32 * 1024 * 1024;
+const MAXIMUM_EVENT_WIRE_BYTES = 8 * 1024 * 1024;
+const TOPIC_PATTERN = /^[A-Za-z0-9_.:-]{1,512}$/;
+const ELEMENT_PATTERN = /^[A-Za-z0-9_.:-]{1,256}$/;
+const EVENT_ID_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 
 function object(value: unknown, name: string): Record<string, unknown> {
     if (typeof value !== "object" || value === null || Array.isArray(value)) {
@@ -59,11 +47,15 @@ function object(value: unknown, name: string): Record<string, unknown> {
 
 function exactFields(
     value: Record<string, unknown>,
-    fields: readonly string[],
+    required: readonly string[],
+    optional: readonly string[],
     name: string,
 ): void {
-    const allowed = new Set(fields);
-    if (Object.keys(value).some((field) => !allowed.has(field))) {
+    const allowed = new Set([...required, ...optional]);
+    if (
+        required.some((key) => !Object.hasOwn(value, key)) ||
+        Object.keys(value).some((key) => !allowed.has(key))
+    ) {
         throw new Error(`Invalid ${name}`);
     }
 }
@@ -76,227 +68,293 @@ function stringField(value: Record<string, unknown>, key: string): string {
     return field;
 }
 
-function boundedStringField(
-    value: Record<string, unknown>,
-    key: string,
-    maximumCharacters: number,
-): string {
-    const field = stringField(value, key);
-    if (field.length > maximumCharacters) {
-        throw new Error(`Invalid ${key}`);
+function safeInteger(value: unknown, name: string): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`Invalid ${name}`);
     }
-    return field;
+    return value;
 }
 
-function numberField(value: Record<string, unknown>, key: string): number {
-    const field = value[key];
-    if (typeof field !== "number" || !Number.isSafeInteger(field)) {
-        throw new Error(`Invalid ${key}`);
+function decimalBigint(value: unknown, name: string): bigint {
+    if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) {
+        throw new Error(`Invalid ${name}`);
     }
-    return field;
+    return BigInt(value);
 }
 
-function identityField(value: Record<string, unknown>, key: string): SerializedPublicIdentity {
-    const identity = object(value[key], key);
-    exactFields(identity, ["signingKey", "encryptionKey"], key);
+function canonicalBytes(value: unknown, name: string, length?: number): Uint8Array {
+    if (typeof value !== "string") {
+        throw new Error(`Invalid ${name}`);
+    }
+    const decoded = decodeBase64Url(value);
+    if (encodeBase64Url(decoded) !== value || (length !== undefined && decoded.length !== length)) {
+        throw new Error(`Invalid ${name}`);
+    }
+    return decoded;
+}
+
+function snapshotFromUnknown(value: unknown): SnapshotMutation {
+    const snapshot = object(value, "snapshot mutation");
+    exactFields(snapshot, ["expectedVersion"], ["bytes"], "snapshot mutation");
+    const expectedVersion = safeInteger(snapshot.expectedVersion, "snapshot version");
+    return Object.hasOwn(snapshot, "bytes")
+        ? {
+              expectedVersion,
+              bytes: canonicalBytes(snapshot.bytes, "snapshot bytes"),
+          }
+        : { expectedVersion };
+}
+
+function operationFromUnknown(value: unknown): ListOperation {
+    const operation = object(value, "list operation");
+    const id = stringField(operation, "id");
+    if (!ELEMENT_PATTERN.test(id)) {
+        throw new Error("Invalid list element id");
+    }
+    if (operation.op === "append") {
+        exactFields(operation, ["op", "id", "bytes"], [], "append operation");
+        return {
+            op: "append",
+            id,
+            bytes: canonicalBytes(operation.bytes, "list element bytes"),
+        };
+    }
+    if (operation.op === "replace") {
+        exactFields(operation, ["op", "id", "bytes"], ["expectedVersion"], "replace operation");
+        const common = {
+            op: "replace" as const,
+            id,
+            bytes: canonicalBytes(operation.bytes, "list element bytes"),
+        };
+        return Object.hasOwn(operation, "expectedVersion")
+            ? {
+                  ...common,
+                  expectedVersion: safeInteger(operation.expectedVersion, "list element version"),
+              }
+            : common;
+    }
+    if (operation.op === "delete") {
+        exactFields(operation, ["op", "id"], ["expectedVersion"], "delete operation");
+        const common = { op: "delete" as const, id };
+        return Object.hasOwn(operation, "expectedVersion")
+            ? {
+                  ...common,
+                  expectedVersion: safeInteger(operation.expectedVersion, "list element version"),
+              }
+            : common;
+    }
+    throw new Error("Invalid list operation");
+}
+
+function eventFromUnknown(value: unknown): SignedRelayEvent {
+    const event = object(value, "relay event");
+    exactFields(
+        event,
+        ["version", "id", "topic", "author", "createdAt", "payload", "signature"],
+        ["snapshot", "list"],
+        "relay event",
+    );
+    const id = stringField(event, "id");
+    const topic = stringField(event, "topic");
+    const author = object(event.author, "event author");
+    exactFields(author, ["signingKey"], [], "event author");
+    if (
+        event.version !== 1 ||
+        !EVENT_ID_PATTERN.test(id) ||
+        canonicalBytes(id, "event id", 32).length !== 32 ||
+        !TOPIC_PATTERN.test(topic)
+    ) {
+        throw new Error("Invalid relay event");
+    }
+    const parsed: {
+        version: 1;
+        id: string;
+        topic: string;
+        author: { signingKey: Uint8Array };
+        createdAt: number;
+        payload: Uint8Array;
+        snapshot?: SnapshotMutation;
+        list?: readonly ListOperation[];
+        signature: Uint8Array;
+    } = {
+        version: 1,
+        id,
+        topic,
+        author: { signingKey: canonicalBytes(author.signingKey, "author signing key", 32) },
+        createdAt: safeInteger(event.createdAt, "event timestamp"),
+        payload: canonicalBytes(event.payload, "event payload"),
+        signature: canonicalBytes(event.signature, "event signature", 64),
+    };
+    if (Object.hasOwn(event, "snapshot")) {
+        parsed.snapshot = snapshotFromUnknown(event.snapshot);
+    }
+    if (Object.hasOwn(event, "list")) {
+        if (!Array.isArray(event.list)) {
+            throw new Error("Invalid event list");
+        }
+        parsed.list = event.list.map(operationFromUnknown);
+    }
+    return parsed;
+}
+
+function operationJson(
+    operation: ListOperation,
+): NonNullable<SignedRelayEventJson["list"]>[number] {
+    if (operation.op === "append") {
+        return { op: "append", id: operation.id, bytes: encodeBase64Url(operation.bytes) };
+    }
+    if (operation.op === "replace") {
+        return {
+            op: "replace",
+            id: operation.id,
+            ...(operation.expectedVersion === undefined
+                ? {}
+                : { expectedVersion: operation.expectedVersion }),
+            bytes: encodeBase64Url(operation.bytes),
+        };
+    }
     return {
-        signingKey: boundedStringField(identity, "signingKey", 43),
-        encryptionKey: boundedStringField(identity, "encryptionKey", 43),
+        op: "delete",
+        id: operation.id,
+        ...(operation.expectedVersion === undefined
+            ? {}
+            : { expectedVersion: operation.expectedVersion }),
     };
 }
 
-function wireEvent(event: RelayEvent): WireRelayEvent {
+/** Convert an internal event to the relay's exact JSON representation. */
+export function signedRelayEventToJson(event: SignedRelayEvent): SignedRelayEventJson {
     return {
         version: 1,
         id: event.id,
         topic: event.topic,
-        sender: serializePublicIdentity(event.sender),
-        recipients: [...event.recipients],
+        author: { signingKey: encodeBase64Url(event.author.signingKey) },
         createdAt: event.createdAt,
         payload: encodeBase64Url(event.payload),
+        ...(event.snapshot === undefined
+            ? {}
+            : {
+                  snapshot: {
+                      expectedVersion: event.snapshot.expectedVersion,
+                      ...(event.snapshot.bytes === undefined
+                          ? {}
+                          : { bytes: encodeBase64Url(event.snapshot.bytes) }),
+                  },
+              }),
+        ...(event.list === undefined ? {} : { list: event.list.map(operationJson) }),
         signature: encodeBase64Url(event.signature),
     };
 }
 
-function eventFromUnknown(value: unknown): RelayEvent {
-    const event = object(value, "relay event");
-    exactFields(
-        event,
-        ["version", "id", "topic", "sender", "recipients", "createdAt", "payload", "signature"],
-        "relay event",
-    );
-    if (event.version !== 1 || !Array.isArray(event.recipients)) {
-        throw new Error("Invalid relay event");
-    }
-    if (event.recipients.length > MAXIMUM_RELAY_RECIPIENTS) {
-        throw new Error("Invalid relay recipients");
-    }
-    const recipients = event.recipients.map((recipient) => {
-        if (typeof recipient !== "string" || recipient.length !== 43) {
-            throw new Error("Invalid relay recipient");
-        }
-        return recipient;
-    });
-    return {
-        version: 1,
-        id: boundedStringField(event, "id", 32),
-        topic: boundedStringField(event, "topic", MAXIMUM_RELAY_TOPIC_CHARACTERS),
-        sender: deserializePublicIdentity(identityField(event, "sender")),
-        recipients,
-        createdAt: numberField(event, "createdAt"),
-        payload: decodeBase64Url(
-            boundedStringField(event, "payload", MAXIMUM_EVENT_PAYLOAD_CHARACTERS),
-        ),
-        signature: decodeBase64Url(boundedStringField(event, "signature", 86)),
-    };
+/** Encode one signed event as UTF-8 JSON for an HTTP relay. */
+export function encodeSignedRelayEventWire(event: SignedRelayEvent): Uint8Array {
+    return utf8Encode(JSON.stringify(signedRelayEventToJson(event)));
 }
 
-/** Encode one event as UTF-8 JSON for an HTTP relay. */
-export function encodeRelayEventWire(event: RelayEvent): Uint8Array {
-    return utf8Encode(JSON.stringify(wireEvent(event)));
-}
-
-/** Decode one event from UTF-8 JSON. */
-export function decodeRelayEventWire(bytes: Uint8Array): RelayEvent {
+/** Decode and strictly validate one signed event from UTF-8 JSON. */
+export function decodeSignedRelayEventWire(bytes: Uint8Array): SignedRelayEvent {
     if (bytes.length > MAXIMUM_EVENT_WIRE_BYTES) {
         throw new Error("Relay event wire payload is too large");
     }
     return eventFromUnknown(JSON.parse(utf8Decode(bytes)));
 }
 
-/** Encode one subscription as UTF-8 JSON. */
-export function encodeTopicSubscriptionWire(subscription: TopicSubscription): Uint8Array {
-    const value: WireTopicSubscription = {
-        version: 1,
-        topic: subscription.topic,
-        subscriber: serializePublicIdentity(subscription.subscriber),
-        createdAt: subscription.createdAt,
-        signature: encodeBase64Url(subscription.signature),
-    };
-    return utf8Encode(JSON.stringify(value));
+function parseWire(bytes: Uint8Array): unknown {
+    if (bytes.length > MAXIMUM_PAGE_WIRE_BYTES) {
+        throw new Error("Relay response is too large");
+    }
+    return JSON.parse(utf8Decode(bytes)) as unknown;
 }
 
-/** Decode one subscription from UTF-8 JSON. */
-export function decodeTopicSubscriptionWire(bytes: Uint8Array): TopicSubscription {
-    if (bytes.length > MAXIMUM_EVENT_WIRE_BYTES) {
-        throw new Error("Topic subscription wire payload is too large");
-    }
-    const value = object(JSON.parse(utf8Decode(bytes)), "topic subscription");
-    exactFields(
-        value,
-        ["version", "topic", "subscriber", "createdAt", "signature"],
-        "topic subscription",
-    );
-    if (value.version !== 1) {
-        throw new Error("Invalid topic subscription version");
+function listElementFromUnknown(value: unknown): ListElement {
+    const element = object(value, "list element");
+    exactFields(element, ["id", "version", "bytes"], [], "list element");
+    const id = stringField(element, "id");
+    if (!ELEMENT_PATTERN.test(id)) {
+        throw new Error("Invalid list element");
     }
     return {
-        version: 1,
-        topic: boundedStringField(value, "topic", MAXIMUM_RELAY_TOPIC_CHARACTERS),
-        subscriber: deserializePublicIdentity(identityField(value, "subscriber")),
-        createdAt: numberField(value, "createdAt"),
-        signature: decodeBase64Url(boundedStringField(value, "signature", 86)),
+        id,
+        version: decimalBigint(element.version, "list element version"),
+        bytes: canonicalBytes(element.bytes, "list element bytes"),
     };
 }
 
-function encodeQueueRequestWireValue(
-    request: QueueReadRequest | QueueAcknowledgeRequest,
-): WireQueueRequest {
+function listPageFromUnknown(value: unknown): ListPage {
+    const page = object(value, "list page");
+    exactFields(page, ["elements", "nextCursor"], [], "list page");
+    if (
+        !Array.isArray(page.elements) ||
+        (page.nextCursor !== null && typeof page.nextCursor !== "string")
+    ) {
+        throw new Error("Invalid list page");
+    }
     return {
-        version: 1,
-        action: request.action,
-        requestId: request.requestId,
-        createdAt: request.createdAt,
-        recipient: serializePublicIdentity(request.recipient),
-        ...(request.action === "acknowledge" ? { deliveryId: request.deliveryId } : {}),
-        signature: encodeBase64Url(request.signature),
+        elements: page.elements.map(listElementFromUnknown),
+        nextCursor: page.nextCursor,
     };
 }
 
-/** Encode a signed queue request as UTF-8 JSON. */
-export function encodeQueueRequestWire(
-    request: QueueReadRequest | QueueAcknowledgeRequest,
-): Uint8Array {
-    return utf8Encode(JSON.stringify(encodeQueueRequestWireValue(request)));
+/** Decode a relay list page. */
+export function decodeListPageWire(bytes: Uint8Array): ListPage {
+    return listPageFromUnknown(parseWire(bytes));
 }
 
-/** Decode a signed queue request from UTF-8 JSON. */
-export function decodeQueueRequestWire(
-    bytes: Uint8Array,
-): QueueReadRequest | QueueAcknowledgeRequest {
-    if (bytes.length > MAXIMUM_EVENT_WIRE_BYTES) {
-        throw new Error("Queue request wire payload is too large");
-    }
-    const value = object(JSON.parse(utf8Decode(bytes)), "queue request");
-    if (value.version !== 1 || (value.action !== "read" && value.action !== "acknowledge")) {
-        throw new Error("Invalid queue request");
-    }
-    exactFields(
-        value,
-        value.action === "read"
-            ? ["version", "action", "requestId", "createdAt", "recipient", "signature"]
-            : [
-                  "version",
-                  "action",
-                  "requestId",
-                  "createdAt",
-                  "recipient",
-                  "deliveryId",
-                  "signature",
-              ],
-        "queue request",
-    );
-    const common = {
-        version: 1 as const,
-        requestId: boundedStringField(value, "requestId", 32),
-        createdAt: numberField(value, "createdAt"),
-        recipient: deserializePublicIdentity(identityField(value, "recipient")),
-        signature: decodeBase64Url(boundedStringField(value, "signature", 86)),
-    };
-    return value.action === "read"
-        ? { ...common, action: "read" }
-        : {
-              ...common,
-              action: "acknowledge",
-              deliveryId: boundedStringField(value, "deliveryId", MAXIMUM_DELIVERY_ID_CHARACTERS),
-          };
-}
-
-/** Encode a delivery batch as UTF-8 JSON. */
-export function encodeRelayDeliveriesWire(deliveries: readonly RelayDelivery[]): Uint8Array {
-    return utf8Encode(
-        JSON.stringify(
-            deliveries.map((delivery) => ({
-                deliveryId: delivery.deliveryId,
-                event: wireEvent(delivery.event),
-            })),
-        ),
-    );
-}
-
-/** Decode a delivery batch from UTF-8 JSON. */
-export function decodeRelayDeliveriesWire(bytes: Uint8Array): readonly RelayDelivery[] {
-    if (bytes.length > MAXIMUM_DELIVERY_BATCH_WIRE_BYTES) {
-        throw new Error("Relay delivery batch is too large");
-    }
-    const value: unknown = JSON.parse(utf8Decode(bytes));
-    if (!Array.isArray(value) || value.length > MAXIMUM_DELIVERY_BATCH) {
-        throw new Error("Invalid relay delivery batch");
-    }
-    return value.map((entry) => {
-        const delivery = object(entry, "relay delivery");
-        exactFields(delivery, ["deliveryId", "event"], "relay delivery");
-        const deliveryId = boundedStringField(
-            delivery,
-            "deliveryId",
-            MAXIMUM_DELIVERY_ID_CHARACTERS,
-        );
-        if (deliveryId.length === 0) {
-            throw new Error("Invalid deliveryId");
-        }
-        return {
-            deliveryId,
-            event: eventFromUnknown(delivery.event),
+/** Decode a relay topic state response. */
+export function decodeTopicStateWire(bytes: Uint8Array): TopicState {
+    const state = object(parseWire(bytes), "topic state");
+    exactFields(state, ["seq", "snapshot", "list"], [], "topic state");
+    let snapshot: TopicSnapshot | null = null;
+    if (state.snapshot !== null) {
+        const value = object(state.snapshot, "topic snapshot");
+        exactFields(value, ["version", "bytes"], [], "topic snapshot");
+        snapshot = {
+            version: decimalBigint(value.version, "snapshot version"),
+            bytes: canonicalBytes(value.bytes, "snapshot bytes"),
         };
-    });
+    }
+    return {
+        seq: decimalBigint(state.seq, "topic sequence"),
+        snapshot,
+        list: listPageFromUnknown(state.list),
+    };
+}
+
+/** Decode a retained-event page, including its mandatory reset flag. */
+export function decodeEventPageWire(bytes: Uint8Array): EventPage {
+    const page = object(parseWire(bytes), "event page");
+    exactFields(page, ["events", "reset", "seq"], [], "event page");
+    if (!Array.isArray(page.events) || typeof page.reset !== "boolean") {
+        throw new Error("Invalid event page");
+    }
+    return {
+        events: page.events.map((value) => {
+            const retained = object(value, "retained relay event");
+            const { seq, ...event } = retained;
+            return {
+                seq: decimalBigint(seq, "retained event sequence"),
+                event: eventFromUnknown(event),
+            };
+        }),
+        reset: page.reset,
+        seq: decimalBigint(page.seq, "topic sequence"),
+    };
+}
+
+/** Decode an idempotent publish outcome. */
+export function decodePublishOutcomeWire(bytes: Uint8Array): PublishOutcome {
+    const outcome = object(parseWire(bytes), "publish outcome");
+    exactFields(outcome, ["seq", "duplicate"], ["snapshotVersion"], "publish outcome");
+    if (typeof outcome.duplicate !== "boolean") {
+        throw new Error("Invalid publish outcome");
+    }
+    return {
+        seq: decimalBigint(outcome.seq, "publish sequence"),
+        duplicate: outcome.duplicate,
+        ...(Object.hasOwn(outcome, "snapshotVersion")
+            ? {
+                  snapshotVersion: decimalBigint(outcome.snapshotVersion, "snapshot version"),
+              }
+            : {}),
+    };
 }

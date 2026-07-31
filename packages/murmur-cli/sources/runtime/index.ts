@@ -16,11 +16,10 @@ import {
     decryptContactProfile,
     decryptFile,
     decryptPrivateMessageFromContact,
-    deriveNestedTopic,
     destroyIdentity,
     encodeBase64Url,
     encodeEncryptedPrivateMessage,
-    encodeRelayEventWire,
+    encodeSignedRelayEventWire,
     encryptFile,
     encryptPrivateMessageForContact,
     encryptProfileForContact,
@@ -29,6 +28,8 @@ import {
     identityId,
     identityInboxTopic,
     hashBytes,
+    pairwiseTopic,
+    privateMessageListElementId,
     randomBytes,
     utf8Decode,
     utf8Encode,
@@ -38,6 +39,7 @@ import {
     type DocumentOperation,
     type DocumentOperationId,
     type IdentityProfile,
+    type IdentityKeyPair,
     type IdentityPublicKeys,
     type MurmurStore,
     type ReceivedEvent,
@@ -146,7 +148,6 @@ const DOCUMENT_PREFIX = "cli/documents/v1";
 const MAXIMUM_QUARANTINE_RECORDS = 64;
 const MAXIMUM_LOCAL_KEY_PACKAGES = 64;
 const MAXIMUM_DEFERRED_GROUP_DELIVERIES = 10_000;
-const DIRECT_TOPIC_COMPONENT = utf8Encode("direct-private-message/v1");
 
 interface LoadedCliGroup {
     readonly name: string;
@@ -208,9 +209,9 @@ function validateAttachments(attachments: readonly CliAttachmentInput[]): void {
     }
 }
 
-/** Stable opaque direct-message topic for one CLI identity. */
-export function cliDirectMessageTopic(identity: IdentityPublicKeys): string {
-    return deriveNestedTopic(identityInboxTopic(identity), DIRECT_TOPIC_COMPONENT);
+/** Shared-secret direct-message capability topic for one contact pair. */
+export function cliDirectMessageTopic(self: IdentityKeyPair, peer: IdentityPublicKeys): string {
+    return pairwiseTopic(self, peer);
 }
 
 function clearMessageSecrets(stored: Pick<CliStoredMessage, "message">): void {
@@ -429,10 +430,16 @@ function includeFingerprint(
 function validateCliShareableProfile(account: CliAccount): void {
     const bundle = createMlsKeyPackage(account.identity);
     let payload: Uint8Array | undefined;
+    let keyPackage: Uint8Array | undefined;
     try {
+        keyPackage = encodeMlsKeyPackage(bundle.keyPackage);
         payload = encodeCliProfileEnvelope(
-            encryptProfileForContact(account.identity, account.identity, account.profile),
-            bundle.keyPackage,
+            encryptProfileForContact(
+                account.identity,
+                account.identity,
+                account.profile,
+                keyPackage,
+            ),
         );
         if (payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
             throw new Error("CLI encrypted profile exceeds the relay event payload limit");
@@ -440,6 +447,9 @@ function validateCliShareableProfile(account: CliAccount): void {
     } finally {
         if (payload !== undefined) {
             zeroBytes(payload);
+        }
+        if (keyPackage !== undefined) {
+            zeroBytes(keyPackage);
         }
         destroyMlsKeyPackageBundle(bundle);
     }
@@ -610,6 +620,7 @@ export class MurmurCliRuntime {
         const bundle = createMlsKeyPackage(account.identity);
         const reference = mlsKeyPackageReference(bundle.keyPackage);
         let durableBundle: Uint8Array | undefined;
+        let encodedKeyPackage: Uint8Array | undefined;
         let payload: Uint8Array | undefined;
         try {
             durableBundle = serializeMlsKeyPackageBundle(bundle);
@@ -618,19 +629,33 @@ export class MurmurCliRuntime {
                 durableBundle.slice(),
             );
             await this.#pruneLocalKeyPackages(identityId(account.identity));
+            encodedKeyPackage = encodeMlsKeyPackage(bundle.keyPackage);
             payload = encodeCliProfileEnvelope(
-                encryptProfileForContact(account.identity, recipient, account.profile),
-                bundle.keyPackage,
+                encryptProfileForContact(
+                    account.identity,
+                    recipient,
+                    account.profile,
+                    encodedKeyPackage,
+                ),
             );
             if (payload.length > MAX_RELAY_EVENT_PAYLOAD_BYTES) {
                 throw new Error("CLI encrypted profile exceeds the relay event payload limit");
             }
-            await this.#requireClient().publish(identityInboxTopic(recipient), payload, [
-                recipient,
-            ]);
+            await this.#requireClient().publishUnlinkable(identityInboxTopic(recipient), payload, {
+                list: [
+                    {
+                        op: "append",
+                        id: `profile:${encodeBase64Url(hashBytes(payload))}`,
+                        bytes: payload,
+                    },
+                ],
+            });
         } finally {
             if (durableBundle !== undefined) {
                 zeroBytes(durableBundle);
+            }
+            if (encodedKeyPackage !== undefined) {
+                zeroBytes(encodedKeyPackage);
             }
             if (payload !== undefined) {
                 zeroBytes(payload);
@@ -760,16 +785,24 @@ export class MurmurCliRuntime {
             const publicationTime = Date.now();
             const invitationEvent = createRelayEvent(
                 account.identity,
-                cliDirectMessageTopic(contact.identity),
+                cliDirectMessageTopic(account.identity, contact.identity),
                 invitationPayload,
-                [contact.identity],
+                {
+                    list: [
+                        {
+                            op: "append",
+                            id: privateMessageListElementId(account.identity, invitationMessage),
+                            bytes: invitationPayload,
+                        },
+                    ],
+                },
                 publicationTime,
             );
             const commitEvent = createRelayEvent(
                 account.identity,
                 group.channel.topic,
                 prepared.payload,
-                [],
+                {},
                 publicationTime,
             );
             const invitationOutboxKey = cliGroupOutboundKey(ownerId, groupId, invitationEvent, 0);
@@ -845,7 +878,20 @@ export class MurmurCliRuntime {
         let checkpoint: Uint8Array | undefined;
         try {
             checkpoint = prepared.serializeNextEpoch();
-            const event = createRelayEvent(account.identity, group.channel.topic, prepared.payload);
+            const event = createRelayEvent(
+                account.identity,
+                group.channel.topic,
+                prepared.payload,
+                {
+                    list: [
+                        {
+                            op: "append",
+                            id: `message:${encodeBase64Url(prepared.fingerprint)}`,
+                            bytes: prepared.payload,
+                        },
+                    ],
+                },
+            );
             const outboxKey = cliGroupOutboundKey(ownerId, groupId, event, 1);
             await this.#store.transaction(async (transaction) => {
                 await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
@@ -1121,9 +1167,17 @@ export class MurmurCliRuntime {
             );
             const event = createRelayEvent(
                 account.identity,
-                cliDirectMessageTopic(contact.identity),
+                cliDirectMessageTopic(account.identity, contact.identity),
                 payload,
-                [contact.identity],
+                {
+                    list: [
+                        {
+                            op: "append",
+                            id: privateMessageListElementId(account.identity, message),
+                            bytes: payload,
+                        },
+                    ],
+                },
             );
             const ownerId = identityId(account.identity);
             let outbound: CliOutboundMessage | undefined;
@@ -1175,6 +1229,13 @@ export class MurmurCliRuntime {
         const account = this.#requireAccount();
         const client = this.#requireClient();
         const ownerId = identityId(account.identity);
+        await client.subscribe(identityInboxTopic(account.identity));
+        const knownContacts = [...(await this.#requireContacts().list())];
+        await Promise.all(
+            knownContacts.map(async (contact) =>
+                client.subscribe(cliDirectMessageTopic(account.identity, contact.identity)),
+            ),
+        );
         await Promise.all(
             [...this.#groups.values()].map(async (group) => group.channel.subscribe(client)),
         );
@@ -1199,7 +1260,16 @@ export class MurmurCliRuntime {
         let documentUpdates = 0;
 
         for (let batch = 0; batch < 625; batch += 1) {
-            const deliveries = await client.sync(batch === 0 ? waitMilliseconds : 0, signal);
+            const syncResult = await client.sync(batch === 0 ? waitMilliseconds : 0, signal);
+            if (syncResult.status === "reset") {
+                const reset = syncResult.resets[0];
+                throw new Error(
+                    reset === undefined
+                        ? "Relay topic reset requires a state reload"
+                        : `Relay topic ${reset.topic} on ${reset.relayId} requires a state reload`,
+                );
+            }
+            const deliveries = syncResult.events;
             if (deliveries.length === 0) {
                 break;
             }
@@ -1210,7 +1280,10 @@ export class MurmurCliRuntime {
                     try {
                         const envelope = decodeCliProfileEnvelope(delivery.event.payload);
                         opened = decryptContactProfile(account.identity, envelope.encrypted);
-                        keyPackage = envelope.keyPackage;
+                        keyPackage =
+                            opened.privateData === undefined
+                                ? undefined
+                                : decodeMlsKeyPackage(opened.privateData);
                         if (
                             keyPackage !== undefined &&
                             (!verifyMlsKeyPackage(keyPackage) ||
@@ -1229,19 +1302,43 @@ export class MurmurCliRuntime {
                         continue;
                     }
                     try {
-                        await this.#requireContacts().save(opened);
+                        let encodedKeyPackage: Uint8Array | undefined;
                         if (keyPackage !== undefined) {
-                            const encodedKeyPackage = encodeMlsKeyPackage(keyPackage);
-                            try {
-                                await this.#store.set(
-                                    contactKeyPackageKey(ownerId, identityId(opened.identity)),
-                                    encodedKeyPackage.slice(),
+                            encodedKeyPackage = encodeMlsKeyPackage(keyPackage);
+                        }
+                        try {
+                            const saved = await this.#store.transaction(async (transaction) => {
+                                const contact = await this.#requireContacts().saveInTransaction(
+                                    transaction,
+                                    opened,
                                 );
-                            } finally {
+                                if (encodedKeyPackage !== undefined) {
+                                    await transaction.set(
+                                        contactKeyPackageKey(ownerId, identityId(opened.identity)),
+                                        encodedKeyPackage,
+                                    );
+                                }
+                                await delivery.advanceCursor(transaction);
+                                return contact;
+                            });
+                            if (
+                                !knownContacts.some((contact) =>
+                                    equalBytes(
+                                        contact.identity.signingKey,
+                                        saved.identity.signingKey,
+                                    ),
+                                )
+                            ) {
+                                knownContacts.push(saved);
+                            }
+                        } finally {
+                            if (encodedKeyPackage !== undefined) {
                                 zeroBytes(encodedKeyPackage);
                             }
                         }
-                        await delivery.acknowledge();
+                        await client.subscribe(
+                            cliDirectMessageTopic(account.identity, opened.identity),
+                        );
                         profiles += 1;
                     } catch {
                         deferred += 1;
@@ -1249,10 +1346,18 @@ export class MurmurCliRuntime {
                         if (opened.profile.avatar !== undefined) {
                             zeroBytes(opened.profile.avatar);
                         }
+                        if (opened.privateData !== undefined) {
+                            zeroBytes(opened.privateData);
+                        }
                     }
                     continue;
                 }
-                if (delivery.event.topic === cliDirectMessageTopic(account.identity)) {
+                const directContact = knownContacts.find(
+                    (contact) =>
+                        delivery.event.topic ===
+                        cliDirectMessageTopic(account.identity, contact.identity),
+                );
+                if (directContact !== undefined) {
                     try {
                         const encrypted = decodeEncryptedPrivateMessage(delivery.event.payload);
                         const validated = decryptPrivateMessageFromContact(
@@ -1298,12 +1403,12 @@ export class MurmurCliRuntime {
                                     stored,
                                 );
                             },
+                            delivery.advanceCursor,
                         );
                         if (acceptedGroup !== undefined) {
                             this.#groups.set(acceptedGroup.id, acceptedGroup.group);
                             await acceptedGroup.group.channel.subscribe(client);
                         }
-                        await delivery.acknowledge();
                         if (accepted.status === "opened") {
                             messages += 1;
                             if (acceptedGroup !== undefined) {
@@ -1358,7 +1463,9 @@ export class MurmurCliRuntime {
                     this.#removedGroups.has(delivery.event.topic.slice(4))
                 ) {
                     try {
-                        await delivery.acknowledge();
+                        await this.#store.transaction(async (transaction) =>
+                            delivery.advanceCursor(transaction),
+                        );
                         duplicates += 1;
                     } catch {
                         deferred += 1;
@@ -1941,7 +2048,9 @@ export class MurmurCliRuntime {
                     this.#removedGroups.has(delivery.event.topic.slice(4))
                 ) {
                     try {
-                        await delivery.acknowledge();
+                        await this.#store.transaction(async (transaction) =>
+                            delivery.advanceCursor(transaction),
+                        );
                         result = "duplicate";
                     } catch {
                         result = "deferred";
@@ -1984,7 +2093,9 @@ export class MurmurCliRuntime {
         }
         if (handled.status === "applied" || handled.status === "application-applied") {
             try {
-                await handled.acknowledge();
+                await this.#store.transaction(async (transaction) =>
+                    handled.advanceCursor(transaction),
+                );
                 return "duplicate";
             } catch {
                 return "deferred";
@@ -1999,12 +2110,12 @@ export class MurmurCliRuntime {
                         `${REMOVED_GROUP_PREFIX}/${ownerId}/${groupId}`,
                         new Uint8Array([1]),
                     );
+                    await handled.advanceCursor(transaction);
                 });
                 persisted = true;
                 handled.markPersisted();
                 this.#groups.delete(groupId);
                 this.#removedGroups.add(groupId);
-                await handled.acknowledge();
                 return "commit";
             } catch {
                 if (!persisted) {
@@ -2018,20 +2129,23 @@ export class MurmurCliRuntime {
             let checkpoint: Uint8Array | undefined;
             try {
                 checkpoint = handled.serializeNextEpoch();
-                await persistCliGroupRecord(this.#store, cliGroupKey(ownerId, groupId), {
-                    name: group.name,
-                    epochState: checkpoint,
-                    persistenceGeneration: handled.persistenceGeneration,
-                    appliedCommitFingerprints: includeFingerprint(
-                        group.channel.appliedCommitFingerprints,
-                        handled.fingerprint,
-                    ),
-                    appliedApplicationFingerprints: group.channel.appliedApplicationFingerprints,
+                await this.#store.transaction(async (transaction) => {
+                    await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
+                        name: group.name,
+                        epochState: checkpoint!,
+                        persistenceGeneration: handled.persistenceGeneration,
+                        appliedCommitFingerprints: includeFingerprint(
+                            group.channel.appliedCommitFingerprints,
+                            handled.fingerprint,
+                        ),
+                        appliedApplicationFingerprints:
+                            group.channel.appliedApplicationFingerprints,
+                    });
+                    await handled.advanceCursor(transaction);
                 });
                 persisted = true;
                 handled.markPersisted();
                 handled.adopt();
-                await handled.acknowledge();
                 return "commit";
             } catch {
                 if (!persisted) {
@@ -2090,10 +2204,10 @@ export class MurmurCliRuntime {
                         handled.fingerprint,
                     ),
                 });
+                await handled.advanceCursor(transaction);
             });
             persisted = true;
             handled.markPersisted();
-            await handled.acknowledge();
             return documentApplication === undefined ? "message" : "document";
         } catch {
             if (!persisted) {
@@ -2132,11 +2246,7 @@ export class MurmurCliRuntime {
         const client = this.#requireClient();
         return {
             publish: async (topic, payload) => {
-                if (
-                    topic !== event.topic ||
-                    !equalBytes(payload, event.payload) ||
-                    event.recipients.length !== 0
-                ) {
+                if (topic !== event.topic || !equalBytes(payload, event.payload)) {
                     throw new Error("Prepared MLS publication changed its exact relay event");
                 }
                 return client.publishEvent(event);
@@ -2332,7 +2442,7 @@ export class MurmurCliRuntime {
     }
 
     async #quarantine(ownerId: string, delivery: ReceivedEvent, reason: string): Promise<void> {
-        const eventBytes = encodeRelayEventWire(delivery.event);
+        const eventBytes = encodeSignedRelayEventWire(delivery.event);
         const fingerprint = encodeBase64Url(hashBytes(eventBytes));
         const record = utf8Encode(
             JSON.stringify({
@@ -2340,7 +2450,7 @@ export class MurmurCliRuntime {
                 reason,
                 eventId: delivery.event.id,
                 topic: delivery.event.topic,
-                sender: identityId(delivery.event.sender),
+                sender: identityId(delivery.event.author),
                 payloadBytes: delivery.event.payload.length,
                 fingerprint,
             }),
@@ -2363,12 +2473,12 @@ export class MurmurCliRuntime {
                 )) {
                     await transaction.delete(expired);
                 }
+                await delivery.advanceCursor(transaction);
             });
         } finally {
             zeroBytes(record);
             zeroBytes(eventBytes);
         }
-        await delivery.acknowledge();
     }
 
     /** Zero the in-memory account secrets. Durable data remains available. */

@@ -1,203 +1,160 @@
 # `@slopus/murmur`
 
-Transport-neutral, end-to-end encrypted messaging for browsers and Node.js. The
-single package provides identities, authenticated profiles, direct messages,
-encrypted files, durable relay delivery, MLS groups, and convergent text
-documents. Applications own message semantics and provide durable storage.
+Browser-safe end-to-end encrypted messaging over deliberately dumb relays. The
+single ESM package provides identities, contact profiles, pairwise messages,
+encrypted files, durable topic synchronization, MLS groups, and convergent text
+documents. Applications own semantics and durable storage.
 
 ```text
 application
     |
-MurmurClient
-    |---- MurmurStore
-    `---- RelayTransport[]
-              |
-          dumb relays
+MurmurClient ---- MurmurStore
+    |
+RelayTransport[] ---- topic snapshot + permanent list + bounded event log
 ```
 
-The package is ESM-only, side-effect free, and includes TypeScript declarations
-and source maps. It has no Node.js imports. Node.js 20 or later is supported;
-modern browsers can use the same exports.
-
-> `@slopus/murmur` is a `0.x` API and has not received an independent security
-> audit. Its MLS implementation is an experimental Murmur profile and remains
-> an RFC 9420 subset.
-
-## Install
-
-```bash
-pnpm add @slopus/murmur
-```
+The package has no Node imports or side effects and depends only on Noble
+cryptography. It is a `0.x` API and has not received an independent security
+audit; the bundled MLS profile is an RFC 9420 subset.
 
 ## Start a client
 
-```typescript
+```ts
 import {
     HttpRelayTransport,
     MemoryMurmurStore,
     MurmurClient,
     generateIdentityKeyPair,
     identityInboxTopic,
-    utf8Decode,
 } from "@slopus/murmur";
 
 const identity = generateIdentityKeyPair();
 const store = new MemoryMurmurStore();
-const relay = new HttpRelayTransport("primary", "https://relay.example");
-const murmur = new MurmurClient({
+const client = new MurmurClient({
     identity,
     store,
-    transports: [relay],
+    transports: [new HttpRelayTransport("primary", "https://relay.example")],
 });
 
-await murmur.subscribe(identityInboxTopic(identity));
-
-for await (const received of murmur.events()) {
-    console.log(utf8Decode(received.event.payload));
-
-    // Acknowledgement is explicit. Call it only after application state is
-    // durably committed.
-    await received.acknowledge();
+await client.subscribe(identityInboxTopic(identity));
+const result = await client.sync();
+if (result.status === "reset") {
+    // Reload every reported topic with client.loadTopic(...).
+} else {
+    for (const received of result.events) {
+        await store.transaction(async (transaction) => {
+            // Persist the authenticated application effect first.
+            await received.advanceCursor(transaction);
+        });
+    }
 }
 ```
 
-`MemoryMurmurStore` is useful for tests and examples. Production applications
-should implement `MurmurStore` with IndexedDB, SQLite, or another transactional
-store.
+`subscribe()` only follows a topic in this client instance. The relay has no
+subscription or recipient queue state.
 
 ## Public API
 
-The common API is available from `@slopus/murmur`. Domain subpaths and the MLS
-API are part of the same npm package:
+Domain APIs are exported from the package root and matching subpaths:
 
-```typescript
-import { MurmurClient } from "@slopus/murmur/client";
-import { generateIdentityKeyPair } from "@slopus/murmur/crypto";
-import { MlsGroupChannel } from "@slopus/murmur/mls";
-import type { RelayTransport } from "@slopus/murmur/transport";
-```
+| Import                     | Main API                                                                                  |
+| -------------------------- | ----------------------------------------------------------------------------------------- |
+| `@slopus/murmur/client`    | `MurmurClient`, `SyncResult`, `ReceivedEvent`, `PublishResult`, retained outbox retries   |
+| `@slopus/murmur/crypto`    | Ed25519/X25519 identities, sealed boxes, signing, hashing, secret destruction             |
+| `@slopus/murmur/identity`  | identity tokens, public first-contact inbox, `pairwiseTopic`, profiles, `ContactBook`     |
+| `@slopus/murmur/messaging` | direct-message/file encryption, stable list IDs, atomic replay/cursor acceptance          |
+| `@slopus/murmur/mls`       | epochs, KeyPackages, Welcome, TreeKEM Commits, applications, and `MlsGroupChannel`        |
+| `@slopus/murmur/transport` | fixed relay types, canonical signed events, `HttpRelayTransport`, snapshot/list/log reads |
+| `@slopus/murmur/storage`   | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                    |
+| `@slopus/murmur/document`  | convergent shared-text operations                                                         |
 
-| Import                     | Main API                                                                                        |
-| -------------------------- | ----------------------------------------------------------------------------------------------- |
-| `@slopus/murmur`           | complete common API                                                                             |
-| `@slopus/murmur/client`    | `MurmurClient`, `PublishResult`, `ReceivedEvent`, `RetryOutboundReport`                         |
-| `@slopus/murmur/crypto`    | identity generation/import/destruction, signing, verification, sealed boxes, hashing            |
-| `@slopus/murmur/identity`  | public identity serialization, inbox topics, encrypted profiles, `ContactBook`                  |
-| `@slopus/murmur/messaging` | direct-message encryption and acceptance, file encryption, message codecs and limits            |
-| `@slopus/murmur/mls`       | MLS groups, epochs, KeyPackages, Commits, Welcome, TreeKEM, and private messages                |
-| `@slopus/murmur/transport` | `RelayTransport`, `HttpRelayTransport`, signed relay events, queue requests, blobs, wire codecs |
-| `@slopus/murmur/storage`   | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                          |
-| `@slopus/murmur/document`  | `SharedTextDocument` and convergent insert/delete operations                                    |
-| `@slopus/murmur/utils`     | strict base64url, UTF-8, canonical JSON, byte comparison and zeroing                            |
+The core client surface is:
 
-### `MurmurClient`
-
-```typescript
-new MurmurClient({
-    identity: IdentityKeyPair,
-    store: MurmurStore,
-    transports: readonly RelayTransport[],
-    outboundHistoryLimit?: number,
-});
-
+```ts
 client.subscribe(topic): Promise<void>;
-client.publish(topic, payload, recipients?): Promise<PublishResult>;
+client.publish(topic, payload, { snapshot?, list? }?): Promise<PublishResult>;
+client.publishUnlinkable(topic, payload, mutations?): Promise<PublishResult>;
 client.publishEvent(event): Promise<PublishResult>;
-client.retryOutbound(): Promise<readonly PublishResult[]>;
 client.retryOutboundSettled(): Promise<RetryOutboundReport>;
-client.sync(waitMilliseconds?, signal?): Promise<readonly ReceivedEvent[]>;
-client.events(signal?, waitMilliseconds?): AsyncIterable<ReceivedEvent>;
+client.sync(waitMilliseconds?, signal?): Promise<SyncResult>;
+client.loadTopic(topic, applicationTransaction, relayId?): Promise<Result>;
 client.putBlob(ciphertext): Promise<RelayBlob>;
 client.getBlob(id): Promise<RelayBlob | undefined>;
 ```
 
-Publishing succeeds when at least one configured transport accepts the event.
-The durable outgoing record retains which transports accepted it, so
-`retryOutbound` can resume the remaining publications. Incoming copies from
-multiple transports are authenticated and deduplicated. A `ReceivedEvent`
-remains pending until its `acknowledge()` method is called.
+Publishing succeeds when at least one relay accepts the event. The outbox keeps
+the exact signed event until every configured relay accepts it. Relay retries
+return their original `seq` and `duplicate: true`.
 
-### Identities and contacts
+## Cursor and reset contract
 
-```typescript
-const alice = generateIdentityKeyPair();
-const bob = generateIdentityKeyPair();
+Relay sequences are local to a relay/topic pair, so the store keeps one cursor
+for each pair. `ReceivedEvent.advanceCursor(transaction)` refuses to skip a
+sequence. The application effect and cursor must commit in the same
+`MurmurStore` transaction; rollback makes the event readable again.
 
-const encrypted = encryptProfileForContact(alice, bob, {
-    name: "Alice",
-    metadata: { role: "agent" },
-});
-const opened = decryptContactProfile(bob, encrypted);
+`sync()` is discriminated:
 
-const contacts = new ContactBook(bob, store);
-await contacts.save(opened);
-```
+- `status: "events"` contains retained events after the durable cursors.
+- `status: "reset"` contains reset descriptors and no events.
 
-Internally, all keys are `Uint8Array`. Base64url is used only by serialization
-helpers and wire formats. Call `destroyIdentity(identity)` when secret key
-material is no longer needed.
+A reset means the cursor is outside usable retained history. Call `loadTopic()`;
+it loads the snapshot, follows every list page to `nextCursor: null`, invokes
+the application callback, and installs the returned state sequence in the same
+transaction. Reset is never silently interpreted as caught up.
 
-### Direct messages and files
+## Identity privacy
 
-```typescript
-const attachment = encryptFile(fileBytes, {
-    name: "report.pdf",
-    mediaType: "application/pdf",
-});
-await murmur.putBlob(attachment.blob.bytes);
+`identityInboxTopic()` is for first contact only and is derived from a public
+signing key. Anyone with the public identity token can read it. The sender
+identity is sealed inside the profile payload, and `publishUnlinkable()` uses a
+one-use relay signing identity. The inbox therefore leaks that N unlinkable
+contact requests exist, but not who sent them.
 
-const message = createPrivateMessage("Attached", [attachment.descriptor]);
-const envelope = encryptPrivateMessageForContact(alice, bob, message);
-const opened = decryptPrivateMessageFromContact(bob, envelope);
-```
+Ongoing direct traffic uses `pairwiseTopic(self, peer)`. It derives X25519
+shared secret material, domain-separates it with
+`murmur/pairwise-topic/x25519-sha256/v1`, binds both encryption public keys in
+lexicographic base64url order, hashes the canonical preimage, and zeros the
+shared secret and preimage. Alice and Bob get the same capability; public keys
+alone cannot derive it. Possession of the topic still grants read access, and
+the relay still sees event authors, timing, and ciphertext sizes.
 
-Use `acceptPrivateMessageFromContact` when receiving durable application data.
-It commits the application record and replay marker in one `MurmurStore`
-transaction and reports either `"opened"` or `"duplicate"`.
+## Messages and files
 
-### Replaceable boundaries
+Sending a chat message publishes one event with an `append` list operation
+whose bytes are the same end-to-end encrypted envelope. The stable element ID
+is author-scoped and derived from the application message ID. Full history is
+the permanent list; the event log is only for incremental updates.
 
-Implement `RelayTransport` to use a LAN, WebRTC, Bluetooth, or another relay:
+`acceptPrivateMessageFromContact()` authenticates and decrypts the envelope,
+then commits the application record, message replay marker, and optional cursor
+together. It reports `"opened"` or `"duplicate"` and throws on authenticated
+same-ID content collisions.
 
-```typescript
+Files are encrypted before blob upload. Their key and nonce stay inside
+encrypted message content.
+
+## Relay transport
+
+```ts
 interface RelayTransport {
     readonly id: string;
-    publish(event: RelayEvent): Promise<void>;
-    subscribe(subscription: TopicSubscription): Promise<void>;
-    pull(
-        request: QueueReadRequest,
-        waitMilliseconds?: number,
+    publish(event: SignedRelayEvent): Promise<PublishOutcome>;
+    readState(topic: string, limit?: number): Promise<TopicState | undefined>;
+    readList(topic: string, cursor?: string, limit?: number): Promise<ListPage | undefined>;
+    readEvents(
+        topic: string,
+        since: bigint,
+        limit?: number,
+        wait?: number,
         signal?: AbortSignal,
-    ): Promise<readonly RelayDelivery[]>;
-    acknowledge(request: QueueAcknowledgeRequest): Promise<void>;
+    ): Promise<EventPage | undefined>;
     putBlob(blob: RelayBlob): Promise<void>;
     getBlob(id: string): Promise<RelayBlob | undefined>;
 }
 ```
 
-Implement `MurmurStore` with atomic transactions:
-
-```typescript
-interface MurmurStore {
-    get(key: string): Promise<Uint8Array | undefined>;
-    set(key: string, value: Uint8Array): Promise<void>;
-    delete(key: string): Promise<void>;
-    list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>>;
-    transaction<Result>(
-        operation: (transaction: StoreTransaction) => Promise<Result>,
-    ): Promise<Result>;
-}
-```
-
-## Publish
-
-The `prepack` lifecycle runs common and MLS tests, strict TypeScript validation,
-and a clean declaration build before npm creates the single tarball:
-
-```bash
-pnpm --filter @slopus/murmur pack
-pnpm --filter @slopus/murmur publish
-```
-
-Publishing requires npm access to the public `@slopus` scope. The package
-metadata sets public access and the npm registry explicitly.
+`HttpRelayTransport` accepts an injected Fetch implementation for workers and
+in-process tests. Event signatures are strict Ed25519 over recursively
+key-sorted canonical JSON with `signature` omitted and every `Uint8Array`
+encoded as unpadded base64url.

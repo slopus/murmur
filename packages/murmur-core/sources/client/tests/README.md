@@ -1,4 +1,5 @@
 # Client tests
 
-Multi-relay fan-out, deduplication, manual acknowledgement, retry, and ordering
-tests use an in-process transport double implementing the public contract.
+Multi-relay publication, idempotent retry outcomes, permanent-list loading,
+atomic application/cursor commits, and mandatory reset signaling use an
+in-process transport double implementing the fixed contract.

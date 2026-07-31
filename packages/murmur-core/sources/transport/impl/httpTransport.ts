@@ -1,22 +1,22 @@
-import type {
-    QueueAcknowledgeRequest,
-    QueueReadRequest,
-    RelayBlob,
-    RelayDelivery,
-    RelayEvent,
-    RelayTransport,
-    TopicSubscription,
-} from "../types.js";
 import { hashBytes } from "../../crypto/index.js";
 import { decodeBase64Url, encodeBase64Url, utf8Decode } from "../../utils/index.js";
+import type {
+    EventPage,
+    ListPage,
+    PublishOutcome,
+    RelayBlob,
+    RelayFetch,
+    RelayTransport,
+    SignedRelayEvent,
+    TopicState,
+} from "../types.js";
 import {
-    decodeRelayDeliveriesWire,
-    encodeQueueRequestWire,
-    encodeRelayEventWire,
-    encodeTopicSubscriptionWire,
+    decodeEventPageWire,
+    decodeListPageWire,
+    decodePublishOutcomeWire,
+    decodeTopicStateWire,
+    encodeSignedRelayEventWire,
 } from "./wireCodec.js";
-
-type Fetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
 function requestBody(bytes: Uint8Array): ArrayBuffer {
     return bytes.slice().buffer as ArrayBuffer;
@@ -57,54 +57,87 @@ async function readBoundedResponse(response: Response, maximumBytes: number): Pr
     return bytes;
 }
 
-const MAXIMUM_DELIVERY_RESPONSE_BYTES = 32 * 1024 * 1024;
+const MAXIMUM_PAGE_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_BLOB_RESPONSE_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_ERROR_RESPONSE_BYTES = 1_024;
 
-/** Browser-safe HTTP long-poll transport for the default rendezvous relay. */
+function query(
+    path: string,
+    values: Readonly<Record<string, string | number | undefined>>,
+): string {
+    const parameters = new URLSearchParams();
+    for (const [key, value] of Object.entries(values)) {
+        if (value !== undefined) {
+            parameters.set(key, String(value));
+        }
+    }
+    const encoded = parameters.toString();
+    return encoded.length === 0 ? path : `${path}?${encoded}`;
+}
+
+/** Browser-safe HTTP transport for the fixed topic-state relay protocol. */
 export class HttpRelayTransport implements RelayTransport {
     readonly #baseUrl: string;
-    readonly #fetch: Fetch;
+    readonly #fetch: RelayFetch;
 
     constructor(
         readonly id: string,
         baseUrl: string,
-        fetchImplementation: Fetch = globalThis.fetch,
+        fetchImplementation: RelayFetch = globalThis.fetch,
     ) {
         this.#baseUrl = baseUrl.replace(/\/+$/, "");
         this.#fetch = fetchImplementation;
     }
 
-    async publish(event: RelayEvent): Promise<void> {
-        await this.#post("/v1/events", encodeRelayEventWire(event));
-    }
-
-    async subscribe(subscription: TopicSubscription): Promise<void> {
-        await this.#post("/v1/subscriptions", encodeTopicSubscriptionWire(subscription));
-    }
-
-    async pull(
-        request: QueueReadRequest,
-        waitMilliseconds: number = 0,
-        signal?: AbortSignal,
-    ): Promise<readonly RelayDelivery[]> {
+    async publish(event: SignedRelayEvent): Promise<PublishOutcome> {
         const response = await this.#fetch(
-            `${this.#baseUrl}/v1/queue/pull?wait=${waitMilliseconds}`,
+            `${this.#baseUrl}/v1/topics/${encodeURIComponent(event.topic)}/events`,
             {
                 method: "POST",
                 headers: { "content-type": "application/json" },
-                body: requestBody(encodeQueueRequestWire(request)),
-                ...(signal === undefined ? {} : { signal }),
+                body: requestBody(encodeSignedRelayEventWire(event)),
             },
         );
         await this.#requireOk(response);
-        return decodeRelayDeliveriesWire(
-            await readBoundedResponse(response, MAXIMUM_DELIVERY_RESPONSE_BYTES),
+        return decodePublishOutcomeWire(
+            await readBoundedResponse(response, MAXIMUM_PAGE_RESPONSE_BYTES),
         );
     }
 
-    async acknowledge(request: QueueAcknowledgeRequest): Promise<void> {
-        await this.#post("/v1/queue/acknowledge", encodeQueueRequestWire(request));
+    async readState(topic: string, limit?: number): Promise<TopicState | undefined> {
+        const response = await this.#get(query(this.#topicPath(topic, "state"), { limit }));
+        return response === undefined
+            ? undefined
+            : decodeTopicStateWire(
+                  await readBoundedResponse(response, MAXIMUM_PAGE_RESPONSE_BYTES),
+              );
+    }
+
+    async readList(topic: string, cursor?: string, limit?: number): Promise<ListPage | undefined> {
+        const response = await this.#get(query(this.#topicPath(topic, "list"), { cursor, limit }));
+        return response === undefined
+            ? undefined
+            : decodeListPageWire(await readBoundedResponse(response, MAXIMUM_PAGE_RESPONSE_BYTES));
+    }
+
+    async readEvents(
+        topic: string,
+        since: bigint,
+        limit?: number,
+        wait?: number,
+        signal?: AbortSignal,
+    ): Promise<EventPage | undefined> {
+        const response = await this.#get(
+            query(this.#topicPath(topic, "events"), {
+                since: since.toString(),
+                limit,
+                wait,
+            }),
+            signal,
+        );
+        return response === undefined
+            ? undefined
+            : decodeEventPageWire(await readBoundedResponse(response, MAXIMUM_PAGE_RESPONSE_BYTES));
     }
 
     async putBlob(blob: RelayBlob): Promise<void> {
@@ -133,11 +166,10 @@ export class HttpRelayTransport implements RelayTransport {
         ) {
             throw new Error("Invalid relay blob identifier");
         }
-        const response = await this.#fetch(`${this.#baseUrl}/v1/blobs/${encodeURIComponent(id)}`);
-        if (response.status === 404) {
+        const response = await this.#get(`/v1/blobs/${encodeURIComponent(id)}`);
+        if (response === undefined) {
             return undefined;
         }
-        await this.#requireOk(response);
         const blob = {
             id,
             bytes: await readBoundedResponse(response, MAXIMUM_BLOB_RESPONSE_BYTES),
@@ -148,13 +180,20 @@ export class HttpRelayTransport implements RelayTransport {
         return blob;
     }
 
-    async #post(path: string, body: Uint8Array): Promise<void> {
+    #topicPath(topic: string, resource: "events" | "list" | "state"): string {
+        return `/v1/topics/${encodeURIComponent(topic)}/${resource}`;
+    }
+
+    async #get(path: string, signal?: AbortSignal): Promise<Response | undefined> {
         const response = await this.#fetch(`${this.#baseUrl}${path}`, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: requestBody(body),
+            method: "GET",
+            ...(signal === undefined ? {} : { signal }),
         });
+        if (response.status === 404) {
+            return undefined;
+        }
         await this.#requireOk(response);
+        return response;
     }
 
     async #requireOk(response: Response): Promise<void> {
