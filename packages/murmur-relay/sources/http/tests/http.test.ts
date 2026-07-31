@@ -1,83 +1,240 @@
+import { ed25519 } from "@noble/curves/ed25519";
+import { sha256 } from "@noble/hashes/sha2";
+import { afterEach, describe, expect, it } from "vitest";
 import {
-    HttpRelayTransport,
-    MemoryMurmurStore,
-    MurmurClient,
-    generateIdentityKeyPair,
-    createRelayEvent,
-    encodeRelayEventWire,
-    utf8Decode,
-    utf8Encode,
-} from "@slopus/murmur";
-import { describe, expect, it } from "vitest";
+    relayEventSigningBytes,
+    signedRelayEventToJson,
+    type SignedRelayEvent,
+} from "../../protocol/index.js";
 import { RelayService } from "../../relay/index.js";
-import { MemoryRelayStore } from "../../storage/index.js";
+import { SqliteRelayStore } from "../../storage/sqlite/index.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
 import { createRelayFetchHandler } from "../index.js";
 
-describe("Fetch relay protocol", () => {
-    it("carries realtime/offline events and ciphertext blobs", async () => {
-        const handler = createRelayFetchHandler(new RelayService(new MemoryRelayStore()));
-        const fetch = async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
-            handler(new Request(input, init));
-        const transport = new HttpRelayTransport("fetch", "https://relay.test", fetch);
-        const aliceClient = new MurmurClient({
-            identity: generateIdentityKeyPair(),
-            store: new MemoryMurmurStore(),
-            transports: [transport],
-        });
-        const bobClient = new MurmurClient({
-            identity: generateIdentityKeyPair(),
-            store: new MemoryMurmurStore(),
-            transports: [transport],
-        });
+const now = 2_000_000;
+const privateKey = new Uint8Array(32).fill(11);
+const signingKey = ed25519.getPublicKey(privateKey);
+const encoder = new TextEncoder();
 
-        await bobClient.subscribe("room");
-        await aliceClient.publish("room", utf8Encode("opaque"));
-        const received = await bobClient.sync();
-        expect(utf8Decode(received[0]?.event.payload ?? new Uint8Array())).toBe("opaque");
-        await received[0]?.acknowledge();
-        expect(await bobClient.sync()).toHaveLength(0);
+interface EventOptions {
+    readonly payload?: Uint8Array;
+    readonly list?: readonly {
+        readonly op: "append";
+        readonly id: string;
+        readonly bytes: Uint8Array;
+    }[];
+}
 
-        const uploaded = await aliceClient.putBlob(utf8Encode("ciphertext"));
-        expect((await bobClient.getBlob(uploaded.id))?.bytes).toEqual(utf8Encode("ciphertext"));
+function event(id: string, expectedVersion: number, options: EventOptions = {}): SignedRelayEvent {
+    const unsigned: {
+        version: 1;
+        id: string;
+        topic: string;
+        author: { signingKey: Uint8Array };
+        createdAt: number;
+        payload: Uint8Array;
+        snapshot: {
+            expectedVersion: number;
+            bytes: Uint8Array;
+        };
+        list?: readonly {
+            readonly op: "append";
+            readonly id: string;
+            readonly bytes: Uint8Array;
+        }[];
+        signature: Uint8Array;
+    } = {
+        version: 1,
+        id: encodeBase64Url(sha256(encoder.encode(id))),
+        topic: "http",
+        author: { signingKey },
+        createdAt: now,
+        payload: options.payload ?? encoder.encode("opaque"),
+        snapshot: {
+            expectedVersion,
+            bytes: encoder.encode(`snapshot-${id}`),
+        },
+        signature: new Uint8Array(64),
+    };
+    if (options.list !== undefined) {
+        unsigned.list = options.list;
+    } else if (expectedVersion === 0) {
+        unsigned.list = [{ op: "append", id: "element", bytes: encoder.encode("element") }];
+    }
+    return {
+        ...unsigned,
+        signature: ed25519.sign(relayEventSigningBytes(unsigned), privateKey),
+    };
+}
+
+describe("relay Fetch handler", () => {
+    let service: RelayService | undefined;
+
+    afterEach(async () => {
+        await service?.close();
     });
 
-    it("rejects encoded blob paths and malformed request bodies", async () => {
-        const handler = createRelayFetchHandler(new RelayService(new MemoryRelayStore()));
-
-        expect((await handler(new Request("https://relay.test/v1/blobs/foo%2Fbar"))).status).toBe(
-            404,
-        );
-        expect(
-            (await handler(new Request(`https://relay.test/v1/blobs/${"A".repeat(42)}B`))).status,
-        ).toBe(404);
-        expect(
-            (
-                await handler(
-                    new Request("https://relay.test/v1/events", {
-                        method: "POST",
-                        body: "{",
-                    }),
-                )
-            ).status,
-        ).toBe(400);
-    });
-
-    it("does not expose unexpected store failures", async () => {
-        class FailingStore extends MemoryRelayStore {
-            override async publish(): Promise<never> {
-                throw new Error("database password leaked");
-            }
-        }
-        const handler = createRelayFetchHandler(new RelayService(new FailingStore()));
-        const event = createRelayEvent(generateIdentityKeyPair(), "topic", utf8Encode("opaque"));
-        const response = await handler(
-            new Request("https://relay.test/v1/events", {
+    it("publishes and reads state and retained events as string bigints", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const handler = createRelayFetchHandler(service);
+        const publication = await handler(
+            new Request("https://relay.test/v1/topics/http/events", {
                 method: "POST",
-                body: encodeRelayEventWire(event).slice().buffer as ArrayBuffer,
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(signedRelayEventToJson(event("first", 0))),
             }),
         );
+        expect(publication.status).toBe(200);
+        expect(await publication.json()).toEqual({
+            seq: "1",
+            duplicate: false,
+            snapshotVersion: "1",
+        });
 
-        expect(response.status).toBe(500);
-        expect(await response.text()).toBe("Internal relay error");
+        const state = await handler(new Request("https://relay.test/v1/topics/http/state?limit=1"));
+        expect(await state.json()).toMatchObject({
+            seq: "1",
+            snapshot: { version: "1" },
+            list: {
+                elements: [{ id: "element", version: "1" }],
+                nextCursor: null,
+            },
+        });
+        const events = await handler(
+            new Request("https://relay.test/v1/topics/http/events?since=0"),
+        );
+        expect(await events.json()).toMatchObject({
+            reset: false,
+            seq: "1",
+            events: [{ seq: "1", topic: "http" }],
+        });
+    });
+
+    it("returns machine-readable conflicts and keeps CORS on failures", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const handler = createRelayFetchHandler(service);
+        await handler(
+            new Request("https://relay.test/v1/topics/http/events", {
+                method: "POST",
+                body: JSON.stringify(signedRelayEventToJson(event("first", 0))),
+            }),
+        );
+        const conflict = await handler(
+            new Request("https://relay.test/v1/topics/http/events", {
+                method: "POST",
+                headers: { origin: "https://app.test" },
+                body: JSON.stringify(signedRelayEventToJson(event("stale", 0))),
+            }),
+        );
+        expect(conflict.status).toBe(409);
+        expect(conflict.headers.get("access-control-allow-origin")).toBe("*");
+        expect(await conflict.json()).toEqual({
+            error: "conflict",
+            snapshotVersion: "1",
+            elements: { element: "1" },
+        });
+    });
+
+    it("truncates encoded event and list pages without hiding continuation", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const opaque = new Uint8Array(512).fill(3);
+        await service.publish(
+            event("large-first", 0, {
+                payload: opaque,
+                list: ["a", "b", "c"].map((id) => ({
+                    op: "append" as const,
+                    id,
+                    bytes: opaque,
+                })),
+            }),
+        );
+        await service.publish(event("large-second", 1, { payload: opaque }));
+
+        const oneItemHandler = createRelayFetchHandler(service, {
+            maximumPageResponseBytes: 1,
+        });
+        const eventProbe = await oneItemHandler(
+            new Request("https://relay.test/v1/topics/http/events?since=0"),
+        );
+        const eventBudget = Buffer.byteLength(await eventProbe.text());
+        const boundedHandler = createRelayFetchHandler(service, {
+            maximumPageResponseBytes: eventBudget,
+        });
+        const eventResponse = await boundedHandler(
+            new Request("https://relay.test/v1/topics/http/events?since=0"),
+        );
+        const eventText = await eventResponse.text();
+        const eventPage = JSON.parse(eventText) as {
+            readonly events: readonly { readonly seq: string }[];
+            readonly seq: string;
+        };
+        expect(Buffer.byteLength(eventText)).toBeLessThanOrEqual(eventBudget);
+        expect(eventPage.events.map((retained) => retained.seq)).toEqual(["1"]);
+        expect(eventPage.seq).toBe("2");
+        const eventContinuation = await boundedHandler(
+            new Request("https://relay.test/v1/topics/http/events?since=1"),
+        );
+        await expect(eventContinuation.json()).resolves.toMatchObject({
+            events: [{ seq: "2" }],
+            seq: "2",
+        });
+
+        const listProbe = await oneItemHandler(
+            new Request("https://relay.test/v1/topics/http/list"),
+        );
+        const listBudget = Buffer.byteLength(await listProbe.text());
+        const boundedListHandler = createRelayFetchHandler(service, {
+            maximumPageResponseBytes: listBudget,
+        });
+        const listResponse = await boundedListHandler(
+            new Request("https://relay.test/v1/topics/http/list"),
+        );
+        const listText = await listResponse.text();
+        const listPage = JSON.parse(listText) as {
+            readonly elements: readonly { readonly id: string }[];
+            readonly nextCursor: string | null;
+        };
+        expect(Buffer.byteLength(listText)).toBeLessThanOrEqual(listBudget);
+        expect(listPage.elements.map((element) => element.id)).toEqual(["a"]);
+        expect(listPage.nextCursor).not.toBeNull();
+
+        const continuation = await boundedListHandler(
+            new Request(
+                `https://relay.test/v1/topics/http/list?cursor=${encodeURIComponent(
+                    listPage.nextCursor ?? "",
+                )}`,
+            ),
+        );
+        await expect(continuation.json()).resolves.toMatchObject({
+            elements: [{ id: "b" }],
+        });
+    });
+
+    it("round-trips raw blobs and reports malformed and missing routes", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const handler = createRelayFetchHandler(service);
+        const blob = encoder.encode("ciphertext");
+        const id = encodeBase64Url(sha256(blob));
+        const upload = await handler(
+            new Request(`https://relay.test/v1/blobs/${id}`, {
+                method: "PUT",
+                body: blob,
+            }),
+        );
+        expect(upload.status).toBe(204);
+        const download = await handler(new Request(`https://relay.test/v1/blobs/${id}`));
+        expect(new Uint8Array(await download.arrayBuffer())).toEqual(blob);
+
+        const health = await handler(new Request("https://relay.test/health"));
+        expect(await health.json()).toEqual({ ok: true });
+        const malformed = await handler(
+            new Request("https://relay.test/v1/topics/http/events", {
+                method: "POST",
+                body: "{",
+            }),
+        );
+        expect(malformed.status).toBe(400);
+        const missing = await handler(new Request("https://relay.test/nope"));
+        expect(missing.status).toBe(404);
     });
 });

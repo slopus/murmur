@@ -1,0 +1,112 @@
+import { Client, type ClientConfig, type Notification } from "pg";
+import { POSTGRES_WAKE_CHANNEL } from "../../storage/postgres/index.js";
+import type { WakeSource } from "../types.js";
+
+const RECONNECT_MILLISECONDS = 1_000;
+
+/** Dedicated resilient Postgres LISTEN connection for cross-instance topic wakes. */
+export class PostgresWakeSource implements WakeSource {
+    readonly #configuration: ClientConfig;
+    readonly #listeners = new Set<(topic: string) => void>();
+    #client: Client | undefined;
+    #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    #connecting = false;
+    #closed = false;
+
+    constructor(configuration: ClientConfig) {
+        this.#configuration = configuration;
+    }
+
+    /**
+     * Publication notifications are emitted by PostgresRelayStore inside its
+     * transaction; this method is intentionally a no-op after local commit.
+     */
+    async notify(_topic: string): Promise<void> {
+        // The store's transactional pg_notify is the authoritative cross-instance wake.
+    }
+
+    /** Register a listener and establish the dedicated LISTEN connection in the background. */
+    async subscribe(listener: (topic: string) => void): Promise<void> {
+        if (this.#closed) {
+            throw new Error("Wake source is closed");
+        }
+        this.#listeners.add(listener);
+        await this.#connect();
+    }
+
+    /** End LISTEN and cancel reconnect attempts without affecting the main pool. */
+    async close(): Promise<void> {
+        this.#closed = true;
+        if (this.#reconnectTimer !== undefined) {
+            clearTimeout(this.#reconnectTimer);
+            this.#reconnectTimer = undefined;
+        }
+        const client = this.#client;
+        this.#client = undefined;
+        if (client !== undefined) {
+            await client.end().catch(() => undefined);
+        }
+        this.#listeners.clear();
+    }
+
+    async #connect(): Promise<void> {
+        if (this.#closed || this.#connecting || this.#client !== undefined) {
+            return;
+        }
+        this.#connecting = true;
+        const client = new Client(this.#configuration);
+        this.#client = client;
+        client.on("error", () => {
+            this.#disconnect(client);
+        });
+        client.on("end", () => {
+            this.#disconnect(client);
+        });
+        client.on("notification", (notification: Notification) => {
+            if (
+                notification.channel === POSTGRES_WAKE_CHANNEL &&
+                notification.payload !== undefined
+            ) {
+                for (const listener of this.#listeners) {
+                    listener(notification.payload);
+                }
+            }
+        });
+        try {
+            await client.connect();
+            await client.query(`LISTEN ${POSTGRES_WAKE_CHANNEL}`);
+            if (this.#closed) {
+                if (this.#client === client) {
+                    this.#client = undefined;
+                }
+                await client.end().catch(() => undefined);
+            }
+        } catch {
+            if (this.#client === client) {
+                this.#client = undefined;
+            }
+            await client.end().catch(() => undefined);
+            this.#scheduleReconnect();
+        } finally {
+            this.#connecting = false;
+        }
+    }
+
+    #disconnect(client: Client): void {
+        if (this.#client === client) {
+            this.#client = undefined;
+        }
+        this.#scheduleReconnect();
+    }
+
+    #scheduleReconnect(): void {
+        if (this.#closed || this.#reconnectTimer !== undefined) {
+            return;
+        }
+        this.#reconnectTimer = setTimeout(() => {
+            this.#reconnectTimer = undefined;
+            void this.#connect();
+        }, RECONNECT_MILLISECONDS);
+        this.#reconnectTimer.unref();
+    }
+}

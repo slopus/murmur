@@ -40,7 +40,6 @@
         "@slopus/murmur": "workspace:*"
     },
     "devDependencies": {
-        "@murmur/relay": "workspace:*",
         "@types/node": ">=20",
         "tsx": "^4.20.6",
         "typescript": "^5",

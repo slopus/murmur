@@ -1,287 +1,200 @@
-import {
-    MurmurClient,
-    MemoryMurmurStore,
-    createQueueAcknowledgeRequest,
-    createQueueReadRequest,
-    createPrivateMessage,
-    createRelayBlob,
-    createRelayEvent,
-    createTopicSubscription,
-    encodeEncryptedPrivateMessage,
-    encryptPrivateMessageForContact,
-    generateIdentityKeyPair,
-    utf8Decode,
-    utf8Encode,
-    type IdentityKeyPair,
-    type RelayEvent,
-    type TopicSubscription,
-} from "@slopus/murmur";
-import { describe, expect, it } from "vitest";
+import { ed25519 } from "@noble/curves/ed25519";
+import { sha256 } from "@noble/hashes/sha2";
+import { afterEach, describe, expect, it } from "vitest";
+import { relayEventSigningBytes, type SignedRelayEvent } from "../../protocol/index.js";
+import { SqliteRelayStore } from "../../storage/sqlite/index.js";
+import type { PublishConstraints, RelayStore } from "../../storage/types.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
 import { RelayService } from "../index.js";
-import { MemoryRelayStore } from "../../storage/index.js";
-import { EmbeddedRelayTransport } from "../../transport/index.js";
 
-function pull(
-    relay: RelayService,
-    identity: IdentityKeyPair,
-    waitMilliseconds: number = 0,
-    now: number = Date.now(),
-    signal?: AbortSignal,
-) {
-    return relay.pull(createQueueReadRequest(identity, now), waitMilliseconds, signal);
+const now = 1_000_000;
+const privateKey = new Uint8Array(32).fill(9);
+const signingKey = ed25519.getPublicKey(privateKey);
+const encoder = new TextEncoder();
+
+function resign(event: SignedRelayEvent): SignedRelayEvent {
+    const unsigned: SignedRelayEvent = {
+        ...event,
+        signature: new Uint8Array(64),
+    };
+    return {
+        ...unsigned,
+        signature: ed25519.sign(relayEventSigningBytes(unsigned), privateKey),
+    };
 }
 
-class RecordingStore extends MemoryRelayStore {
-    recordedEvent: RelayEvent | undefined;
-    recordedSubscription: TopicSubscription | undefined;
-
-    override async publish(event: RelayEvent, observedAt: number) {
-        this.recordedEvent = event;
-        return super.publish(event, observedAt);
-    }
-
-    override async addSubscription(
-        subscription: TopicSubscription,
-        observedAt: number,
-    ): Promise<number> {
-        this.recordedSubscription = subscription;
-        return super.addSubscription(subscription, observedAt);
-    }
+function event(id: string, createdAt: number = now): SignedRelayEvent {
+    const unsigned: SignedRelayEvent = {
+        version: 1,
+        id: encodeBase64Url(sha256(encoder.encode(id))),
+        topic: "long-poll",
+        author: { signingKey },
+        createdAt,
+        payload: encoder.encode(id),
+        signature: new Uint8Array(64),
+    };
+    return resign(unsigned);
 }
 
 describe("RelayService", () => {
-    it("fans out one opaque event into per-recipient queues", async () => {
-        const relay = new RelayService(new MemoryRelayStore());
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const carol = generateIdentityKeyPair();
-        await relay.subscribe(createTopicSubscription(bob, "room"));
-        await relay.subscribe(createTopicSubscription(carol, "room"));
+    let service: RelayService | undefined;
 
-        const event = createRelayEvent(alice, "room", utf8Encode("ciphertext"));
-        await relay.publish(event);
-        await relay.publish(event);
-
-        expect(await pull(relay, bob)).toHaveLength(1);
-        expect(await pull(relay, carol)).toHaveLength(1);
-        expect(await pull(relay, alice)).toHaveLength(0);
+    afterEach(async () => {
+        await service?.close();
     });
 
-    it("accepts direct-message ciphertexts only within the shared relay limit", async () => {
-        const relay = new RelayService(new MemoryRelayStore());
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const encrypted = encryptPrivateMessageForContact(
-            alice,
-            bob,
-            createPrivateMessage("x".repeat(500_000), [], 42),
-        );
-        const payload = encodeEncryptedPrivateMessage(encrypted);
+    it("wakes a parked event read and re-reads the committed event", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        await service.publish(event("first"));
+        const pending = service.readEvents("long-poll", 1n, 10, 1_000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await service.publish(event("second"));
 
-        await relay.publish(createRelayEvent(alice, "direct", payload, [bob], 42));
+        const page = await pending;
+        expect(page?.events.map((retained) => retained.seq)).toEqual([2n]);
+    });
 
-        const deliveries = await pull(relay, bob);
-        expect(deliveries).toHaveLength(1);
-        expect(deliveries[0]?.event.payload).toEqual(payload);
-        expect(() =>
-            encryptPrivateMessageForContact(
-                alice,
-                bob,
-                createPrivateMessage("x".repeat(650_000), [], 43),
+    it("uses the post-registration recheck to close the park/arrive race", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        await service.publish(event("first"));
+        const pending = service.readEvents("long-poll", 1n, 10, 1_000);
+        await service.publish(event("racing"));
+
+        await expect(pending).resolves.toMatchObject({
+            reset: false,
+            seq: 2n,
+        });
+    });
+
+    it("returns the original outcome for an authenticated retry regardless of age", async () => {
+        let clock = now;
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => clock);
+        const original = event("durable-retry", clock);
+        await expect(service.publish(original)).resolves.toEqual({
+            seq: 1n,
+            duplicate: false,
+        });
+
+        clock += 300_001;
+        await expect(service.publish(original)).resolves.toEqual({
+            seq: 1n,
+            duplicate: true,
+        });
+        await expect(
+            service.publish(
+                resign({
+                    ...original,
+                    payload: encoder.encode("different"),
+                }),
             ),
-        ).toThrow("too large");
+        ).rejects.toMatchObject({
+            status: 409,
+            body: { error: "id_collision" },
+        });
+        await expect(service.publish(event("genuinely-new", now))).rejects.toMatchObject({
+            status: 401,
+            body: { error: "unauthorized" },
+        });
     });
 
-    it("wakes a long poll and preserves the event until ack", async () => {
-        const relay = new RelayService(new MemoryRelayStore());
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const pendingPull = pull(relay, bob, 1_000);
-
-        await relay.publish(createRelayEvent(alice, "direct", utf8Encode("x"), [bob]));
-        const deliveries = await pendingPull;
-        expect(deliveries).toHaveLength(1);
-        expect(await pull(relay, bob)).toHaveLength(1);
-
-        const deliveryId = deliveries[0]?.deliveryId;
-        expect(deliveryId).toBeDefined();
-        await relay.acknowledge(createQueueAcknowledgeRequest(bob, deliveryId ?? ""));
-        expect(await pull(relay, bob)).toHaveLength(0);
-    });
-
-    it("rejects corrupt blobs", async () => {
-        const relay = new RelayService(new MemoryRelayStore());
-        const blob = createRelayBlob(utf8Encode("ciphertext"));
-
-        await relay.putBlob(blob);
-        await expect(relay.putBlob({ ...blob, bytes: utf8Encode("tampered") })).rejects.toThrow(
-            "does not match",
-        );
-    });
-
-    it("expires inactive topics using relay-observed time", async () => {
-        let now = 100;
-        const relay = new RelayService(
-            new MemoryRelayStore(),
-            { topicInactivityMilliseconds: 10 },
+    it("rejects timestamp, signature, size, and waiter overload failures", async () => {
+        service = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {
+                maximumEventPayloadBytes: 3,
+                maximumConcurrentLongPolls: 1,
+            },
+            undefined,
             () => now,
         );
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        await relay.subscribe(createTopicSubscription(bob, "room", now));
-        await relay.publish(createRelayEvent(alice, "room", utf8Encode("x"), [], 999_999));
-
-        now = 111;
-        expect(await relay.pruneInactiveTopics()).toEqual({ topics: 1, deliveries: 1 });
-        expect(await pull(relay, bob, 0, now)).toHaveLength(0);
-    });
-
-    it("integrates with multi-relay Murmur clients", async () => {
-        const service = new RelayService(new MemoryRelayStore());
-        const transport = new EmbeddedRelayTransport("embedded", service);
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const aliceClient = new MurmurClient({
-            identity: alice,
-            store: new MemoryMurmurStore(),
-            transports: [transport],
+        await expect(service.publish(event("expired", now - 300_001))).rejects.toMatchObject({
+            status: 413,
         });
-        const bobClient = new MurmurClient({
-            identity: bob,
-            store: new MemoryMurmurStore(),
-            transports: [transport],
-        });
-
-        await bobClient.subscribe("room");
-        await aliceClient.publish("room", utf8Encode("opaque"));
-        const received = await bobClient.sync();
-
-        expect(utf8Decode(received[0]?.event.payload ?? new Uint8Array())).toBe("opaque");
-        await received[0]?.acknowledge();
-        expect(await bobClient.sync()).toHaveLength(0);
-    });
-
-    it("stops the client event stream when a long poll is aborted", async () => {
-        const service = new RelayService(new MemoryRelayStore());
-        const transport = new EmbeddedRelayTransport("embedded", service);
-        const client = new MurmurClient({
-            identity: generateIdentityKeyPair(),
-            store: new MemoryMurmurStore(),
-            transports: [transport],
-        });
-        const controller = new AbortController();
-        const iterator = client.events(controller.signal, 1_000)[Symbol.asyncIterator]();
-        const next = iterator.next();
-
-        controller.abort();
-
-        await expect(next).resolves.toEqual({ done: true, value: undefined });
-    });
-
-    it("requires recipient signatures and rejects replayed queue requests", async () => {
-        const relay = new RelayService(new MemoryRelayStore());
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const eve = generateIdentityKeyPair();
-        await relay.publish(createRelayEvent(alice, "direct", utf8Encode("secret"), [bob]));
-        const readRequest = createQueueReadRequest(bob);
-        const deliveries = await relay.pull(readRequest);
-        const deliveryId = deliveries[0]?.deliveryId ?? "";
-        const forged = {
-            ...createQueueAcknowledgeRequest(eve, deliveryId),
-            recipient: {
-                signingKey: bob.signingKey,
-                encryptionKey: bob.encryptionKey,
-            },
+        await expect(
+            service.publish(
+                resign({
+                    ...event("x", now - 300_001),
+                    payload: new Uint8Array(),
+                }),
+            ),
+        ).rejects.toMatchObject({ status: 401 });
+        const small = event("ok");
+        const badSignature = {
+            ...small,
+            payload: new Uint8Array([1]),
+            signature: new Uint8Array(64),
         };
+        await expect(service.publish(badSignature)).rejects.toMatchObject({ status: 401 });
 
-        await expect(relay.acknowledge(forged)).rejects.toThrow("Invalid queue request");
-        expect(await pull(relay, bob)).toHaveLength(1);
-        await expect(relay.pull(readRequest)).rejects.toThrow("Replayed queue request");
-    });
-
-    it("retains future-skewed replay IDs for their entire validity window", async () => {
-        let now = 1_000;
-        const relay = new RelayService(new MemoryRelayStore(), {}, () => now);
-        const bob = generateIdentityKeyPair();
-        const futureRequest = createQueueReadRequest(bob, now + 5 * 60 * 1_000);
-
-        await relay.pull(futureRequest);
-        now += 1;
-
-        await expect(relay.pull(futureRequest)).rejects.toThrow("Replayed queue request");
-    });
-
-    it("rejects stale topic subscriptions", async () => {
-        const now = 10 * 60 * 1_000;
-        const relay = new RelayService(new MemoryRelayStore(), {}, () => now);
-        const bob = generateIdentityKeyPair();
-
-        await expect(
-            relay.subscribe(createTopicSubscription(bob, "room", now - 5 * 60 * 1_000 - 1)),
-        ).rejects.toThrow("Expired topic subscription");
-    });
-
-    it("replays retained broadcast history to a late subscriber", async () => {
-        const relay = new RelayService(new MemoryRelayStore());
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        await relay.publish(createRelayEvent(alice, "room", utf8Encode("before")));
-
-        await relay.subscribe(createTopicSubscription(bob, "room"));
-
-        const deliveries = await pull(relay, bob);
-        expect(deliveries).toHaveLength(1);
-        expect(utf8Decode(deliveries[0]?.event.payload ?? new Uint8Array())).toBe("before");
-    });
-
-    it("bounds recipient fan-out and cancels long polls", async () => {
-        const relay = new RelayService(new MemoryRelayStore(), {
-            maximumRecipients: 1,
+        const validSmallUnsigned: SignedRelayEvent = {
+            ...small,
+            payload: new Uint8Array(),
+            signature: new Uint8Array(64),
+        };
+        const validSmall: SignedRelayEvent = {
+            ...validSmallUnsigned,
+            signature: ed25519.sign(relayEventSigningBytes(validSmallUnsigned), privateKey),
+        };
+        await service.publish(validSmall);
+        const firstWaiter = service.readEvents("long-poll", 1n, 10, 1_000);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        await expect(service.readEvents("long-poll", 1n, 10, 1_000)).rejects.toMatchObject({
+            status: 503,
         });
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const carol = generateIdentityKeyPair();
+        await service.publish(
+            resign({
+                ...event("wake"),
+                payload: new Uint8Array(),
+            }),
+        );
+        await firstWaiter;
+    });
+
+    it("passes list capacity explicitly to a custom store publish", async () => {
+        const backingStore = new SqliteRelayStore(":memory:");
+        let receivedConstraints: PublishConstraints | undefined;
+        const customStore: RelayStore = {
+            readPublishReceipt: (topic, id) => backingStore.readPublishReceipt(topic, id),
+            publish: (published, observedAt, constraints) => {
+                receivedConstraints = constraints;
+                return backingStore.publish(published, observedAt, constraints);
+            },
+            readState: (topic, limit, constraints) =>
+                backingStore.readState(topic, limit, constraints),
+            readList: (topic, cursor, limit, constraints) =>
+                backingStore.readList(topic, cursor, limit, constraints),
+            readEvents: (topic, since, limit, constraints) =>
+                backingStore.readEvents(topic, since, limit, constraints),
+            putBlob: (blob) => backingStore.putBlob(blob),
+            getBlob: (id) => backingStore.getBlob(id),
+            pruneEvents: (olderThan) => backingStore.pruneEvents(olderThan),
+            pruneInactiveTopics: (olderThan) => backingStore.pruneInactiveTopics(olderThan),
+            health: () => backingStore.health(),
+            close: () => backingStore.close(),
+        };
+        service = new RelayService(
+            customStore,
+            { maximumElementsPerTopic: 1 },
+            undefined,
+            () => now,
+        );
+        await service.publish(
+            resign({
+                ...event("capacity-1"),
+                topic: "capacity",
+                list: [{ op: "append", id: "a", bytes: new Uint8Array() }],
+            }),
+        );
         await expect(
-            relay.publish(createRelayEvent(alice, "room", utf8Encode("x"), [bob, carol])),
-        ).rejects.toThrow("recipients");
-
-        const controller = new AbortController();
-        const pending = pull(relay, bob, 1_000, Date.now(), controller.signal);
-        controller.abort(new Error("disconnected"));
-
-        await expect(pending).rejects.toThrow("disconnected");
-    });
-
-    it("bounds each queue response without dropping retained deliveries", async () => {
-        const relay = new RelayService(new MemoryRelayStore(), {
-            maximumDeliveryBatch: 2,
-        });
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        for (const text of ["one", "two", "three"]) {
-            await relay.publish(createRelayEvent(alice, "direct", utf8Encode(text), [bob]));
-        }
-
-        const first = await pull(relay, bob);
-        expect(first).toHaveLength(2);
-        for (const delivery of first) {
-            await relay.acknowledge(createQueueAcknowledgeRequest(bob, delivery.deliveryId));
-        }
-        expect(await pull(relay, bob)).toHaveLength(1);
-    });
-
-    it("strips structural secret-key extras before custom storage", async () => {
-        const store = new RecordingStore();
-        const relay = new RelayService(store);
-        const alice = generateIdentityKeyPair();
-        const event = createRelayEvent(alice, "room", utf8Encode("x"));
-        const subscription = createTopicSubscription(alice, "room");
-
-        await relay.subscribe({ ...subscription, subscriber: alice });
-        await relay.publish({ ...event, sender: alice });
-
-        expect("signingSecretKey" in (store.recordedEvent?.sender ?? {})).toBe(false);
-        expect("encryptionSecretKey" in (store.recordedSubscription?.subscriber ?? {})).toBe(false);
+            service.publish(
+                resign({
+                    ...event("capacity-2"),
+                    topic: "capacity",
+                    list: [{ op: "append", id: "b", bytes: new Uint8Array() }],
+                }),
+            ),
+        ).rejects.toMatchObject({ status: 413 });
+        expect(receivedConstraints).toEqual({ maximumElementsPerTopic: 1 });
+        expect((await service.readState("capacity"))?.seq).toBe(1n);
     });
 });
