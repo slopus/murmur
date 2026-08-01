@@ -1,13 +1,13 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { Readable } from "node:stream";
+import { pipeline } from "node:stream/promises";
+import type { RelayFetchHandler, RelayRequestContext } from "../http/index.js";
 
 /** Node listener address for the standalone relay host. */
 export interface NodeRelayServerOptions {
     readonly host: string;
     readonly port: number;
 }
-
-type RelayFetchHandler = (request: Request) => Promise<Response>;
 
 interface StreamingRequestInit extends RequestInit {
     readonly duplex: "half";
@@ -132,7 +132,7 @@ async function writeResponse(response: Response, outgoing: ServerResponse): Prom
         await endResponse(outgoing);
         return;
     }
-    await endResponse(outgoing, new Uint8Array(await response.arrayBuffer()));
+    await pipeline(Readable.fromWeb(response.body as ReadableStream<Uint8Array>), outgoing);
 }
 
 /** Create an unbound Node HTTP server around a relay Fetch handler. */
@@ -147,8 +147,11 @@ export function createNodeRelayServer(handler: RelayFetchHandler): Server {
             response.end('{"error":"internal"}');
             return;
         }
+        const remoteAddress = request.socket.remoteAddress;
+        const requestMetadata: RelayRequestContext =
+            remoteAddress === undefined ? {} : { remoteAddress };
         void Promise.resolve()
-            .then(() => handler(context.request))
+            .then(() => handler(context.request, requestMetadata))
             .then((result) => writeResponse(result, response))
             .catch(async () => {
                 if (response.destroyed) {

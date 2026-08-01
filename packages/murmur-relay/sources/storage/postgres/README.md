@@ -16,4 +16,4 @@ publish
 
 Schema versioning runs on one dedicated session under `pg_advisory_lock`.
 State reads use repeatable-read transactions. Pruning uses try-locks so only one
-instance performs each sweep.
+instance performs each sweep. Blob bytes are not stored in Postgres.

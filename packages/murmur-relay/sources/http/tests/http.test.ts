@@ -210,20 +210,18 @@ describe("relay Fetch handler", () => {
         });
     });
 
-    it("round-trips raw blobs and reports malformed and missing routes", async () => {
+    it("reports health, malformed bodies, missing routes, and unsigned blob transfers", async () => {
         service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
         const handler = createRelayFetchHandler(service);
         const blob = encoder.encode("ciphertext");
         const id = encodeBase64Url(sha256(blob));
-        const upload = await handler(
+        const unsignedUpload = await handler(
             new Request(`https://relay.test/v1/blobs/${id}`, {
                 method: "PUT",
                 body: blob,
             }),
         );
-        expect(upload.status).toBe(204);
-        const download = await handler(new Request(`https://relay.test/v1/blobs/${id}`));
-        expect(new Uint8Array(await download.arrayBuffer())).toEqual(blob);
+        expect(unsignedUpload.status).toBe(404);
 
         const health = await handler(new Request("https://relay.test/health"));
         expect(await health.json()).toEqual({ ok: true });

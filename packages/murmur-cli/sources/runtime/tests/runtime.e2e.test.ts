@@ -1,5 +1,9 @@
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
     InProcessWakeSource,
+    LocalBlobBackend,
     RelayService,
     SqliteRelayStore,
     createRelayFetchHandler,
@@ -26,7 +30,18 @@ describe("CLI runtime over the fixed relay protocol", () => {
         const relayStore = new SqliteRelayStore(":memory:");
         const service = new RelayService(relayStore, {}, new InProcessWakeSource());
         closeables.push(service);
-        const handler = createRelayFetchHandler(service);
+        const blobRoot = await mkdtemp(join(tmpdir(), "murmur-cli-blobs-"));
+        const blobBackend = new LocalBlobBackend({
+            rootDirectory: blobRoot,
+            secret: new Uint8Array(32).fill(17),
+        });
+        closeables.push({
+            close: async () => {
+                await blobBackend.close();
+                await rm(blobRoot, { recursive: true, force: true });
+            },
+        });
+        const handler = createRelayFetchHandler(service, { blobBackend });
         const fetchRelay = async (
             input: RequestInfo | URL,
             init?: RequestInit,

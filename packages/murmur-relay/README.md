@@ -20,9 +20,6 @@ signed event
 | current bytes   current elements   retained  |
 | permanent*      permanent*         ~7 days   |
 +-----------------------------------------------+
-    |                  |
-    +------ blobs -----+  content-addressed, permanent
-
 * until the whole topic is removed for inactivity (30 days by default)
 ```
 
@@ -59,19 +56,32 @@ wake source.
 
 The executable reads:
 
-| Variable               | Default                      | Meaning                                       |
-| ---------------------- | ---------------------------- | --------------------------------------------- |
-| `MURMUR_RELAY_STORE`   | `sqlite`                     | `sqlite` or `postgres`                        |
-| `MURMUR_RELAY_DB`      | `./data/murmur-relay.sqlite` | SQLite path; required Postgres connection URL |
-| `MURMUR_RELAY_ORIGINS` | `*`                          | `*` or comma-separated CORS origins           |
-| `HOST`                 | `0.0.0.0`                    | Listen address                                |
-| `PORT`                 | `8787`                       | Listen port                                   |
+| Variable                       | Default                      | Meaning                                           |
+| ------------------------------ | ---------------------------- | ------------------------------------------------- |
+| `MURMUR_RELAY_STORE`           | `sqlite`                     | `sqlite` or `postgres`                            |
+| `MURMUR_RELAY_DB`              | `./data/murmur-relay.sqlite` | SQLite path; required Postgres connection URL     |
+| `MURMUR_RELAY_ORIGINS`         | `*`                          | `*` or comma-separated CORS origins               |
+| `MURMUR_RELAY_BLOB_BACKEND`    | `local`                      | `local` or `s3`                                   |
+| `MURMUR_RELAY_BLOB_DIR`        | `./data/blobs`               | Local content-addressed filesystem root           |
+| `MURMUR_RELAY_BLOB_SECRET`     | ephemeral                    | Local signed-link HMAC secret (at least 32 bytes) |
+| `MURMUR_RELAY_TRUSTED_PROXIES` | unset                        | Trusted hop count or comma-separated proxy IPs    |
+| `HOST`                         | `0.0.0.0`                    | Listen address                                    |
+| `PORT`                         | `8787`                       | Listen port                                       |
+
+The S3 backend requires `MURMUR_RELAY_S3_ENDPOINT`,
+`MURMUR_RELAY_S3_REGION`, `MURMUR_RELAY_S3_BUCKET`,
+`MURMUR_RELAY_S3_ACCESS_KEY_ID`, and
+`MURMUR_RELAY_S3_SECRET_ACCESS_KEY`.
+`MURMUR_RELAY_S3_PATH_STYLE=true` enables MinIO-style bucket paths. When the
+local secret is absent, startup warns and generates an ephemeral secret; links
+then stop working after restart and cannot be shared across relay instances.
 
 Embedders can compose the same pieces directly:
 
 ```ts
 import {
     InProcessWakeSource,
+    LocalBlobBackend,
     RelayService,
     SqliteRelayStore,
     createNodeRelayServer,
@@ -83,7 +93,11 @@ const service = new RelayService(
     {},
     new InProcessWakeSource(),
 );
-const server = createNodeRelayServer(createRelayFetchHandler(service));
+const blobs = new LocalBlobBackend({
+    rootDirectory: "./data/blobs",
+    secret: applicationSecretBytes,
+});
+const server = createNodeRelayServer(createRelayFetchHandler(service, { blobBackend: blobs }));
 server.listen(8787, "127.0.0.1");
 ```
 
@@ -102,9 +116,14 @@ bigints are decimal strings.
 | `GET /v1/topics/:topic/state?limit=N`                  | Read the topic head, snapshot, and first list page            |
 | `GET /v1/topics/:topic/list?cursor=C&limit=N`          | Continue the ordered current list                             |
 | `GET /v1/topics/:topic/events?since=S&limit=N&wait=MS` | Read retained events; optionally long-poll up to 30 seconds   |
-| `PUT /v1/blobs/:sha256`                                | Store raw ciphertext under its base64url SHA-256 ID           |
-| `GET /v1/blobs/:sha256`                                | Download raw ciphertext                                       |
+| `POST /v1/blobs/:sha256/upload-link`                   | Issue a short-lived direct PUT link                           |
+| `POST /v1/blobs/:sha256/download-link`                 | Issue a short-lived direct GET link, or return 404            |
 | `OPTIONS /*`                                           | CORS preflight                                                |
+
+With the local backend, those links point to signed `PUT`/`GET
+/v1/blobs/:sha256?expires=...&signature=...` routes. They are not unsigned blob
+API routes. Local transfers stream through Node into sharded filesystem files;
+S3 presigned links transfer directly between the client and S3.
 
 JSON request bodies, individual payloads, snapshots, list elements, operation
 counts, blobs, list capacity, page counts, page response bytes, and concurrent
@@ -113,13 +132,20 @@ to an 8 MiB page budget. A page always includes at least one item when one is
 available, even if that single item exceeds the aggregate budget, so pagination
 cannot stall.
 
+HTTP rate limiting is enabled by default with 1,000 tokens per IP or
+authenticated event author, a 50-token/second refill, and at most 50,000
+in-process buckets. Reads cost 1 token, upload-link requests and signed uploads
+cost 10, and publications cost 25. `RelayOptions.rateLimit` changes these
+values or disables the limiter. Forwarded client addresses are ignored unless
+trusted proxies are explicitly configured.
+
 ## Retention and reset
 
 The standalone process sweeps retention hourly. Event bodies are kept for seven
 days by default; successful event receipts remain with the topic so retries stay
 idempotent. A topic with no successful publish for thirty days is deleted,
-including its snapshot, list, retained events, and receipts. Blobs are
-independent and are not removed by these sweeps.
+including its snapshot, list, retained events, and receipts. Blob lifecycle is
+owned by the selected backend and is not part of topic retention.
 
 Clients must treat cursors as follows:
 

@@ -1,6 +1,7 @@
 # Storage
 
 The `RelayStore` contract is the only persistence dependency of relay policy.
+It contains topic state only; blob storage is intentionally a separate backend.
 Both backends expose identical atomic behavior:
 
 ```text

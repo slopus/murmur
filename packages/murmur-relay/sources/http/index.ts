@@ -1,4 +1,12 @@
-import { RelayError, parseSignedRelayEvent, signedRelayEventToJson } from "../protocol/index.js";
+import {
+    RelayError,
+    parseSignedRelayEvent,
+    signedRelayEventToJson,
+    verifyRelayEventSignature,
+} from "../protocol/index.js";
+import type { BlobBackend } from "../blobs/index.js";
+import { isBlobId } from "../blobs/index.js";
+import { InMemoryTokenBucketRateLimiter, type RateLimiter } from "../rate-limit/index.js";
 import type { RelayService } from "../relay/index.js";
 import type {
     EventPage,
@@ -9,10 +17,13 @@ import type {
 } from "../storage/index.js";
 import { encodeBase64Url } from "../utils/base64Url.js";
 import { encodeListCursor } from "../utils/cursor.js";
+import { resolveClientIp, type TrustedProxyPolicy } from "./impl/clientIp.js";
 import { readBoundedRequestBody } from "./impl/requestReadBody.js";
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const DEFAULT_MAXIMUM_PAGE_RESPONSE_BYTES = 8 * 1024 * 1024;
+
+export type { TrustedProxyPolicy } from "./impl/clientIp.js";
 
 /** CORS policy for the Fetch-compatible relay handler. */
 export interface RelayHttpOptions {
@@ -20,13 +31,40 @@ export interface RelayHttpOptions {
     readonly origins?: "*" | readonly string[];
     /** Aggregate encoded event/list page budget. Defaults to 8 MiB. */
     readonly maximumPageResponseBytes?: number;
+    /** Blob link backend. Blob routes return unavailable when omitted. */
+    readonly blobBackend?: BlobBackend;
+    /** Replacement rate limiter, such as a future shared-store implementation. */
+    readonly rateLimiter?: RateLimiter;
+    /** Explicit proxy hop count or exact trusted proxy address list. */
+    readonly trustedProxies?: TrustedProxyPolicy;
+    /** Clock used for link expiry and rate-limit accounting. */
+    readonly now?: () => number;
 }
 
-type RelayFetchHandler = (request: Request) => Promise<Response>;
+/** Socket metadata supplied by the Node adapter rather than caller headers. */
+export interface RelayRequestContext {
+    readonly remoteAddress?: string;
+}
+
+/** Fetch-compatible relay handler with optional trusted transport metadata. */
+export type RelayFetchHandler = (
+    request: Request,
+    context?: RelayRequestContext,
+) => Promise<Response>;
 
 interface ResolvedRelayHttpOptions {
     readonly origins: "*" | readonly string[];
     readonly maximumPageResponseBytes: number;
+    readonly blobBackend: BlobBackend | undefined;
+    readonly rateLimiter: RateLimiter | undefined;
+    readonly trustedProxies: TrustedProxyPolicy | undefined;
+    readonly now: () => number;
+}
+
+class HttpRateLimitError extends Error {
+    constructor(readonly retryAfterMilliseconds: number) {
+        super("Relay rate limit exceeded");
+    }
 }
 
 function jsonStringify(value: unknown): string {
@@ -44,6 +82,25 @@ function jsonTextResponse(value: string, status: number = 200): Response {
 
 function jsonResponse(value: unknown, status: number = 200): Response {
     return jsonTextResponse(jsonStringify(value), status);
+}
+
+function rateLimitResponse(error: HttpRateLimitError): Response {
+    return new Response(
+        jsonStringify({
+            error: "rate_limited",
+            retryAfterMilliseconds: error.retryAfterMilliseconds,
+        }),
+        {
+            status: 429,
+            headers: {
+                "content-type": "application/json; charset=utf-8",
+                "retry-after": Math.max(
+                    1,
+                    Math.ceil(error.retryAfterMilliseconds / 1_000),
+                ).toString(),
+            },
+        },
+    );
 }
 
 function decodePathSegment(value: string): string {
@@ -232,6 +289,7 @@ async function routeRequest(
     service: RelayService,
     request: Request,
     options: ResolvedRelayHttpOptions,
+    context: RelayRequestContext,
 ): Promise<Response> {
     const url = new URL(request.url);
     const segments = url.pathname
@@ -241,6 +299,39 @@ async function routeRequest(
 
     if (request.method === "OPTIONS") {
         return new Response(null, { status: 204 });
+    }
+    const now = options.now();
+    if (!Number.isSafeInteger(now) || now < 0) {
+        throw new Error("Relay HTTP clock returned an invalid time");
+    }
+    const isPublish =
+        request.method === "POST" &&
+        segments.length === 4 &&
+        segments[0] === "v1" &&
+        segments[1] === "topics" &&
+        segments[3] === "events";
+    const isUpload =
+        (request.method === "POST" &&
+            segments.length === 4 &&
+            segments[0] === "v1" &&
+            segments[1] === "blobs" &&
+            segments[3] === "upload-link") ||
+        (request.method === "PUT" &&
+            segments.length === 3 &&
+            segments[0] === "v1" &&
+            segments[1] === "blobs");
+    const rateLimit = service.options.rateLimit;
+    const cost =
+        rateLimit === false
+            ? 0
+            : isPublish
+              ? rateLimit.costs.publish
+              : isUpload
+                ? rateLimit.costs.upload
+                : rateLimit.costs.read;
+    if (options.rateLimiter !== undefined && cost > 0) {
+        const clientIp = resolveClientIp(request, context.remoteAddress, options.trustedProxies);
+        await consumeRateLimit(options.rateLimiter, `ip:${clientIp}`, cost, now);
     }
     if (request.method === "GET" && segments.length === 1 && segments[0] === "health") {
         await service.health();
@@ -264,6 +355,18 @@ async function routeRequest(
                 throw new RelayError(400, "Route topic does not match signed event", {
                     error: "malformed",
                 });
+            }
+            if (
+                options.rateLimiter !== undefined &&
+                rateLimit !== false &&
+                verifyRelayEventSignature(event)
+            ) {
+                await consumeRateLimit(
+                    options.rateLimiter,
+                    `author:${encodeBase64Url(event.author.signingKey)}`,
+                    rateLimit.costs.publish,
+                    now,
+                );
             }
             return jsonResponse(publishJson(await service.publish(event)));
         }
@@ -322,40 +425,96 @@ async function routeRequest(
             ? jsonResponse({ error: "not_found" }, 404)
             : jsonTextResponse(listPageText(page, options.maximumPageResponseBytes));
     }
-    if (segments.length === 3 && segments[0] === "v1" && segments[1] === "blobs") {
+    if (
+        request.method === "POST" &&
+        segments.length === 4 &&
+        segments[0] === "v1" &&
+        segments[1] === "blobs" &&
+        (segments[3] === "upload-link" || segments[3] === "download-link")
+    ) {
         const id = segments[2];
-        if (id === undefined) {
-            throw new RelayError(400, "Missing blob identifier", {
-                error: "malformed",
+        if (id === undefined || !isBlobId(id)) {
+            throw new RelayError(400, "Invalid blob identifier", { error: "malformed" });
+        }
+        if (options.blobBackend === undefined) {
+            throw new RelayError(503, "Blob backend is unavailable", {
+                error: "blob_unavailable",
             });
         }
-        if (request.method === "PUT") {
-            const bytes = await readBoundedRequestBody(request, service.options.maximumBlobBytes);
-            await service.putBlob({ id, bytes });
-            return new Response(null, { status: 204 });
+        if (segments[3] === "upload-link") {
+            return jsonResponse(await options.blobBackend.createUploadLink(id, now));
         }
-        if (request.method === "GET") {
-            const blob = await service.getBlob(id);
-            return blob === undefined
-                ? jsonResponse({ error: "not_found" }, 404)
-                : new Response(blob.bytes, {
-                      status: 200,
-                      headers: { "content-type": "application/octet-stream" },
-                  });
+        const link = await options.blobBackend.createDownloadLink(id, now);
+        return link === undefined ? jsonResponse({ error: "not_found" }, 404) : jsonResponse(link);
+    }
+    if (
+        segments.length === 3 &&
+        segments[0] === "v1" &&
+        segments[1] === "blobs" &&
+        (request.method === "PUT" || request.method === "GET")
+    ) {
+        const id = segments[2];
+        if (id === undefined || !isBlobId(id)) {
+            throw new RelayError(400, "Invalid blob identifier", { error: "malformed" });
         }
+        if (options.blobBackend?.handleTransfer === undefined) {
+            return jsonResponse({ error: "not_found" }, 404);
+        }
+        return options.blobBackend.handleTransfer(
+            request,
+            id,
+            now,
+            service.options.maximumBlobBytes,
+        );
     }
     return jsonResponse({ error: "not_found" }, 404);
 }
 
-function resolveHttpOptions(options: RelayHttpOptions): ResolvedRelayHttpOptions {
+async function consumeRateLimit(
+    limiter: RateLimiter,
+    key: string,
+    cost: number,
+    now: number,
+): Promise<void> {
+    const decision = await limiter.consume(key, cost, now);
+    if (!decision.allowed) {
+        throw new HttpRateLimitError(decision.retryAfterMilliseconds);
+    }
+}
+
+function resolveHttpOptions(
+    service: RelayService,
+    options: RelayHttpOptions,
+): ResolvedRelayHttpOptions {
     const maximumPageResponseBytes =
         options.maximumPageResponseBytes ?? DEFAULT_MAXIMUM_PAGE_RESPONSE_BYTES;
     if (!Number.isSafeInteger(maximumPageResponseBytes) || maximumPageResponseBytes < 1) {
         throw new Error("Maximum page response bytes must be a positive safe integer");
     }
+    const trustedProxies = options.trustedProxies;
+    if (
+        typeof trustedProxies === "number" &&
+        (!Number.isSafeInteger(trustedProxies) || trustedProxies < 1)
+    ) {
+        throw new Error("Trusted proxy hop count must be a positive safe integer");
+    }
+    const configuredRateLimit = service.options.rateLimit;
+    const rateLimiter =
+        options.rateLimiter ??
+        (configuredRateLimit === false
+            ? undefined
+            : new InMemoryTokenBucketRateLimiter({
+                  capacity: configuredRateLimit.capacity,
+                  refillTokensPerSecond: configuredRateLimit.refillTokensPerSecond,
+                  maximumBuckets: configuredRateLimit.maximumBuckets,
+              }));
     return {
         origins: options.origins ?? "*",
         maximumPageResponseBytes,
+        blobBackend: options.blobBackend,
+        rateLimiter,
+        trustedProxies,
+        now: options.now ?? Date.now,
     };
 }
 
@@ -364,15 +523,18 @@ export function createRelayFetchHandler(
     service: RelayService,
     options: RelayHttpOptions = {},
 ): RelayFetchHandler {
-    const resolvedOptions = resolveHttpOptions(options);
-    return async (request): Promise<Response> => {
+    const resolvedOptions = resolveHttpOptions(service, options);
+    return async (request, context = {}): Promise<Response> => {
         try {
             return withCors(
-                await routeRequest(service, request, resolvedOptions),
+                await routeRequest(service, request, resolvedOptions, context),
                 request,
                 resolvedOptions,
             );
         } catch (error) {
+            if (error instanceof HttpRateLimitError) {
+                return withCors(rateLimitResponse(error), request, resolvedOptions);
+            }
             if (error instanceof RelayError) {
                 return withCors(jsonResponse(error.body, error.status), request, resolvedOptions);
             }

@@ -47,12 +47,6 @@ export interface SignedRelayEvent {
     readonly signature: Uint8Array;
 }
 
-/** Content-addressed ciphertext retained independently of topics. */
-export interface RelayBlob {
-    readonly id: string;
-    readonly bytes: Uint8Array;
-}
-
 /** JSON-compatible representation of a signed event at the HTTP and SQL boundary. */
 export interface SignedRelayEventJson {
     readonly version: 1;

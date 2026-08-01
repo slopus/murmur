@@ -4,13 +4,16 @@ import * as relay from "../index.js";
 describe("@murmur/relay public API", () => {
     it("exports only the supported runtime entry points", () => {
         expect(Object.keys(relay).sort()).toEqual([
+            "InMemoryTokenBucketRateLimiter",
             "InProcessWakeSource",
+            "LocalBlobBackend",
             "PgPoolDatabase",
             "PostgresRelayStore",
             "PostgresWakeSource",
             "RelayConflictError",
             "RelayError",
             "RelayService",
+            "S3BlobBackend",
             "SqliteRelayStore",
             "closeNodeRelayServer",
             "createNodeRelayServer",

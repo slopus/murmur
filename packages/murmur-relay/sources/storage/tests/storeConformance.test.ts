@@ -482,35 +482,13 @@ describe.each(backends)("$name RelayStore conformance", ({ create }) => {
         ).toEqual([2n]);
     });
 
-    it("drops only inactive topics and leaves blobs permanent", async () => {
+    it("drops only inactive topics", async () => {
         await publish(signedEvent({ id: "old", topic: "old" }), 100);
         await publish(signedEvent({ id: "new", topic: "new" }), 300);
-        const blobBytes = bytes("permanent blob");
-        const blobId = encodeBase64Url(sha256(blobBytes));
-        await store.putBlob({ id: blobId, bytes: blobBytes });
 
         expect(await store.pruneInactiveTopics(200)).toEqual({ topics: 1 });
         expect(await readState("old", 10)).toBeUndefined();
         expect(await readState("new", 10)).toBeDefined();
-        expect((await store.getBlob(blobId))?.bytes).toEqual(blobBytes);
-    });
-
-    it("round-trips content-addressed blobs and rejects a hash mismatch", async () => {
-        const blobBytes = bytes("ciphertext");
-        const id = encodeBase64Url(sha256(blobBytes));
-        await store.putBlob({ id, bytes: blobBytes });
-        await store.putBlob({ id, bytes: blobBytes });
-
-        expect(await store.getBlob(id)).toEqual({ id, bytes: blobBytes });
-        await expect(
-            store.putBlob({
-                id,
-                bytes: bytes("tampered"),
-            }),
-        ).rejects.toMatchObject({
-            status: 400,
-            body: { error: "hash_mismatch" },
-        });
     });
 
     it("enforces the configured live element capacity atomically", async () => {

@@ -105,7 +105,7 @@ export interface EventPage {
 /** Browser-safe fetch signature accepted by the HTTP transport. */
 export type RelayFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
-/** Relay boundary for signed topic state, retained events, and blobs. */
+/** Relay boundary for signed topic state and link-mediated blob transfers. */
 export interface RelayTransport {
     readonly id: string;
     publish(event: SignedRelayEvent): Promise<PublishOutcome>;
@@ -118,6 +118,8 @@ export interface RelayTransport {
         wait?: number,
         signal?: AbortSignal,
     ): Promise<EventPage | undefined>;
+    /** Request an upload link and transfer one content-addressed ciphertext blob. */
     putBlob(blob: RelayBlob): Promise<void>;
+    /** Request a download link and return one validated ciphertext blob when present. */
     getBlob(id: string): Promise<RelayBlob | undefined>;
 }

@@ -165,8 +165,6 @@ describe("RelayService", () => {
                 backingStore.readList(topic, cursor, limit, constraints),
             readEvents: (topic, since, limit, constraints) =>
                 backingStore.readEvents(topic, since, limit, constraints),
-            putBlob: (blob) => backingStore.putBlob(blob),
-            getBlob: (id) => backingStore.getBlob(id),
             pruneEvents: (olderThan) => backingStore.pruneEvents(olderThan),
             pruneInactiveTopics: (olderThan) => backingStore.pruneInactiveTopics(olderThan),
             health: () => backingStore.health(),

@@ -18,7 +18,6 @@ export type {
     DeleteListOperation,
     ListOperation,
     RelayAuthor,
-    RelayBlob,
     ReplaceListOperation,
     SignedRelayEvent,
     SignedRelayEventJson,

@@ -46,10 +46,6 @@ const INITIAL_MIGRATION: readonly string[] = [
     )`,
     `CREATE INDEX murmur_relay_events_retention
         ON murmur_relay_events(observed_at)`,
-    `CREATE TABLE murmur_relay_blobs (
-        id text PRIMARY KEY,
-        bytes bytea NOT NULL
-    )`,
 ];
 
 const IDEMPOTENCY_RECEIPT_MIGRATION: readonly string[] = [

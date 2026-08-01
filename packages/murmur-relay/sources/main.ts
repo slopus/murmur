@@ -1,7 +1,11 @@
+import { randomBytes } from "node:crypto";
 import { mkdir } from "node:fs/promises";
+import { isIP } from "node:net";
 import { dirname, resolve } from "node:path";
 import { Pool } from "pg";
+import { LocalBlobBackend, S3BlobBackend, type BlobBackend } from "./blobs/index.js";
 import { createRelayFetchHandler } from "./http/index.js";
+import type { TrustedProxyPolicy } from "./http/impl/clientIp.js";
 import {
     InProcessWakeSource,
     PostgresWakeSource,
@@ -44,6 +48,81 @@ function originsFromEnvironment(value: string | undefined): "*" | readonly strin
     return origins;
 }
 
+function requiredEnvironment(name: string): string {
+    const value = process.env[name];
+    if (value === undefined || value.length === 0) {
+        throw new Error(`${name} is required for the S3 blob backend`);
+    }
+    return value;
+}
+
+function pathStyleFromEnvironment(value: string | undefined): boolean {
+    if (value === undefined || value === "false") {
+        return false;
+    }
+    if (value === "true") {
+        return true;
+    }
+    throw new Error("MURMUR_RELAY_S3_PATH_STYLE must be true or false");
+}
+
+function trustedProxiesFromEnvironment(value: string | undefined): TrustedProxyPolicy | undefined {
+    if (value === undefined) {
+        return undefined;
+    }
+    if (/^[1-9][0-9]*$/.test(value)) {
+        const hops = Number(value);
+        if (Number.isSafeInteger(hops)) {
+            return hops;
+        }
+    }
+    const addresses = value
+        .split(",")
+        .map((address) => address.trim())
+        .filter((address) => address.length > 0);
+    if (addresses.length === 0 || addresses.some((address) => isIP(address) === 0)) {
+        throw new Error(
+            "MURMUR_RELAY_TRUSTED_PROXIES must be a positive hop count or IP address list",
+        );
+    }
+    return addresses;
+}
+
+function createBlobBackend(): BlobBackend {
+    const kind = process.env.MURMUR_RELAY_BLOB_BACKEND ?? "local";
+    if (kind === "local") {
+        const configuredSecret = process.env.MURMUR_RELAY_BLOB_SECRET;
+        let secret: Uint8Array;
+        if (configuredSecret === undefined) {
+            secret = randomBytes(32);
+            console.warn(
+                "MURMUR_RELAY_BLOB_SECRET is unset; blob links use an ephemeral secret and will not survive a restart or work across relay instances",
+            );
+        } else {
+            secret = new TextEncoder().encode(configuredSecret);
+        }
+        try {
+            return new LocalBlobBackend({
+                rootDirectory: resolve(process.env.MURMUR_RELAY_BLOB_DIR ?? "./data/blobs"),
+                secret,
+            });
+        } finally {
+            secret.fill(0);
+        }
+    }
+    if (kind === "s3") {
+        return new S3BlobBackend({
+            endpoint: requiredEnvironment("MURMUR_RELAY_S3_ENDPOINT"),
+            region: requiredEnvironment("MURMUR_RELAY_S3_REGION"),
+            bucket: requiredEnvironment("MURMUR_RELAY_S3_BUCKET"),
+            accessKeyId: requiredEnvironment("MURMUR_RELAY_S3_ACCESS_KEY_ID"),
+            secretAccessKey: requiredEnvironment("MURMUR_RELAY_S3_SECRET_ACCESS_KEY"),
+            pathStyle: pathStyleFromEnvironment(process.env.MURMUR_RELAY_S3_PATH_STYLE),
+        });
+    }
+    throw new Error("MURMUR_RELAY_BLOB_BACKEND must be local or s3");
+}
+
 async function createStore(): Promise<{
     readonly store: RelayStore;
     readonly wakeSource: WakeSource;
@@ -82,18 +161,31 @@ async function createStore(): Promise<{
 /** Start the configured standalone relay and shut it down on process signals. */
 export async function main(): Promise<void> {
     const origins = originsFromEnvironment(process.env.MURMUR_RELAY_ORIGINS);
+    const trustedProxies = trustedProxiesFromEnvironment(process.env.MURMUR_RELAY_TRUSTED_PROXIES);
     const serverOptions = {
         host: process.env.HOST ?? "0.0.0.0",
         port: portFromEnvironment(process.env.PORT),
     };
-    const { store, wakeSource } = await createStore();
+    const blobBackend = createBlobBackend();
+    let relayDependencies: Awaited<ReturnType<typeof createStore>>;
+    try {
+        relayDependencies = await createStore();
+    } catch (error) {
+        await blobBackend.close();
+        throw error;
+    }
+    const { store, wakeSource } = relayDependencies;
     const service = new RelayService(store, {}, wakeSource);
-    const handler = createRelayFetchHandler(service, { origins });
+    const handler = createRelayFetchHandler(service, {
+        origins,
+        blobBackend,
+        ...(trustedProxies === undefined ? {} : { trustedProxies }),
+    });
     const server = createNodeRelayServer(handler);
     try {
         await listenNodeRelayServer(server, serverOptions);
     } catch (error) {
-        await service.close();
+        await Promise.allSettled([blobBackend.close(), service.close()]);
         throw error;
     }
 
@@ -114,7 +206,7 @@ export async function main(): Promise<void> {
         stopping = true;
         clearInterval(pruneTimer);
         void closeNodeRelayServer(server)
-            .then(() => service.close())
+            .then(() => Promise.all([blobBackend.close(), service.close()]))
             .then(
                 () => {
                     process.exitCode = 0;
@@ -128,7 +220,8 @@ export async function main(): Promise<void> {
     process.once("SIGTERM", stop);
 }
 
-void main().catch(() => {
-    console.error("Murmur relay failed to start");
+void main().catch((error: unknown) => {
+    const reason = error instanceof Error ? (error.stack ?? error.message) : String(error);
+    console.error(`Murmur relay failed to start: ${reason}`);
     process.exitCode = 1;
 });

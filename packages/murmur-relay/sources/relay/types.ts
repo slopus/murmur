@@ -1,3 +1,37 @@
+/** Weighted HTTP operation costs applied to each matching rate-limit key. */
+export interface RelayRateLimitCosts {
+    /** Signed event publication cost. Defaults to 25. */
+    readonly publish?: number;
+    /** Upload-link request and signed upload cost. Defaults to 10. */
+    readonly upload?: number;
+    /** State, event, health, download-link, and signed download cost. Defaults to 1. */
+    readonly read?: number;
+}
+
+/** Token-bucket configuration for the relay HTTP boundary. */
+export interface RelayRateLimitOptions {
+    /** Per-key burst capacity. Defaults to 1,000 tokens. */
+    readonly capacity?: number;
+    /** Per-key refill rate. Defaults to 50 tokens per second. */
+    readonly refillTokensPerSecond?: number;
+    /** Maximum in-process key buckets. Defaults to 50,000. */
+    readonly maximumBuckets?: number;
+    /** Weighted costs by operation class. */
+    readonly costs?: RelayRateLimitCosts;
+}
+
+/** Fully resolved token-bucket configuration. */
+export interface ResolvedRelayRateLimitOptions {
+    readonly capacity: number;
+    readonly refillTokensPerSecond: number;
+    readonly maximumBuckets: number;
+    readonly costs: {
+        readonly publish: number;
+        readonly upload: number;
+        readonly read: number;
+    };
+}
+
 /** Relay limits and retention policy, with production-safe defaults. */
 export interface RelayOptions {
     /** Maximum opaque event payload. Defaults to 1 MiB. */
@@ -26,6 +60,8 @@ export interface RelayOptions {
     readonly eventRetentionMilliseconds?: number;
     /** Topic inactivity window. Defaults to thirty days. */
     readonly topicInactivityMilliseconds?: number;
+    /** HTTP rate limiting; pass `false` to disable it. Enabled by default. */
+    readonly rateLimit?: RelayRateLimitOptions | false;
 }
 
 /** Fully resolved immutable policy exposed to the HTTP boundary. */
@@ -43,6 +79,7 @@ export interface ResolvedRelayOptions {
     readonly maximumConcurrentLongPolls: number;
     readonly eventRetentionMilliseconds: number;
     readonly topicInactivityMilliseconds: number;
+    readonly rateLimit: ResolvedRelayRateLimitOptions | false;
 }
 
 /** Counts returned by one retention sweep. */

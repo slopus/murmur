@@ -5,7 +5,6 @@ import {
     isTopicId,
     relayEventFingerprint,
     verifyRelayEventSignature,
-    type RelayBlob,
     type SignedRelayEvent,
 } from "../protocol/index.js";
 import type {
@@ -16,14 +15,27 @@ import type {
     RelayStore,
     TopicState,
 } from "../storage/index.js";
-import { isBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
 import { InProcessWakeSource } from "./impl/wakeInProcess.js";
-import type { RelayOptions, RelayPruneOutcome, ResolvedRelayOptions, WakeSource } from "./types.js";
+import type {
+    RelayOptions,
+    RelayPruneOutcome,
+    ResolvedRelayOptions,
+    ResolvedRelayRateLimitOptions,
+    WakeSource,
+} from "./types.js";
 
 export { InProcessWakeSource } from "./impl/wakeInProcess.js";
 export { PostgresWakeSource } from "./impl/wakePostgres.js";
-export type { RelayOptions, RelayPruneOutcome, ResolvedRelayOptions, WakeSource } from "./types.js";
+export type {
+    RelayOptions,
+    RelayPruneOutcome,
+    RelayRateLimitCosts,
+    RelayRateLimitOptions,
+    ResolvedRelayOptions,
+    ResolvedRelayRateLimitOptions,
+    WakeSource,
+} from "./types.js";
 
 const MEBIBYTE = 1024 * 1024;
 const FIVE_MINUTES = 5 * 60 * 1_000;
@@ -41,6 +53,42 @@ function positiveSafeInteger(value: number, name: string): number {
         throw new Error(`${name} must be a positive safe integer`);
     }
     return value;
+}
+
+function positiveFinite(value: number, name: string): number {
+    if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${name} must be a positive finite number`);
+    }
+    return value;
+}
+
+function resolveRateLimit(
+    options: RelayOptions["rateLimit"],
+): ResolvedRelayRateLimitOptions | false {
+    if (options === false) {
+        return false;
+    }
+    const capacity = positiveFinite(options?.capacity ?? 1_000, "Rate-limit capacity");
+    const costs = {
+        publish: positiveFinite(options?.costs?.publish ?? 25, "Publish rate-limit cost"),
+        upload: positiveFinite(options?.costs?.upload ?? 10, "Upload rate-limit cost"),
+        read: positiveFinite(options?.costs?.read ?? 1, "Read rate-limit cost"),
+    };
+    if (Object.values(costs).some((cost) => cost > capacity)) {
+        throw new Error("Rate-limit costs cannot exceed bucket capacity");
+    }
+    return {
+        capacity,
+        refillTokensPerSecond: positiveFinite(
+            options?.refillTokensPerSecond ?? 50,
+            "Rate-limit refill tokens per second",
+        ),
+        maximumBuckets: positiveSafeInteger(
+            options?.maximumBuckets ?? 50_000,
+            "Maximum rate-limit buckets",
+        ),
+        costs,
+    };
 }
 
 function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
@@ -97,6 +145,7 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
             options.topicInactivityMilliseconds ?? THIRTY_DAYS,
             "Topic inactivity milliseconds",
         ),
+        rateLimit: resolveRateLimit(options.rateLimit),
     };
     if (resolved.maximumLongPollMilliseconds > HARD_MAXIMUM_LONG_POLL_MILLISECONDS) {
         throw new Error("Maximum long poll cannot exceed 30 seconds");
@@ -315,34 +364,6 @@ export class RelayService {
         }
         await this.#park(topic, since, boundedLimit, constraints, waitMilliseconds, signal);
         return this.#store.readEvents(topic, since, boundedLimit, constraints);
-    }
-
-    /** Store one valid, size-bounded content-addressed ciphertext blob. */
-    async putBlob(blob: RelayBlob): Promise<void> {
-        this.#assertOpen();
-        if (!(blob.bytes instanceof Uint8Array)) {
-            throw new RelayError(400, "Invalid blob bytes", { error: "malformed" });
-        }
-        if (blob.bytes.length > this.#options.maximumBlobBytes) {
-            throw new RelayError(413, "Blob exceeds relay limit", { error: "limit" });
-        }
-        if (!isBase64Url(blob.id, 32)) {
-            throw new RelayError(400, "Invalid blob identifier", {
-                error: "malformed",
-            });
-        }
-        await this.#store.putBlob({ id: blob.id, bytes: blob.bytes.slice() });
-    }
-
-    /** Fetch one opaque ciphertext blob when present. */
-    async getBlob(id: string): Promise<RelayBlob | undefined> {
-        this.#assertOpen();
-        if (!isBase64Url(id, 32)) {
-            throw new RelayError(400, "Invalid blob identifier", {
-                error: "malformed",
-            });
-        }
-        return this.#store.getBlob(id);
     }
 
     /** Run both configured retention policies using relay-observed time. */

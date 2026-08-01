@@ -1,4 +1,4 @@
-import type { RelayBlob, SignedRelayEvent } from "../protocol/index.js";
+import type { SignedRelayEvent } from "../protocol/index.js";
 
 /** Result of an atomic publish, preserved exactly for idempotent retries. */
 export interface PublishOutcome {
@@ -96,8 +96,6 @@ export interface RelayStore {
         limit: number,
         constraints: PageReadConstraints,
     ): Promise<EventPage | undefined>;
-    putBlob(blob: RelayBlob): Promise<void>;
-    getBlob(id: string): Promise<RelayBlob | undefined>;
     pruneEvents(olderThan: number): Promise<number>;
     pruneInactiveTopics(olderThan: number): Promise<PruneResult>;
     health(): Promise<void>;

@@ -60,6 +60,57 @@ async function readBoundedResponse(response: Response, maximumBytes: number): Pr
 const MAXIMUM_PAGE_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_BLOB_RESPONSE_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_ERROR_RESPONSE_BYTES = 1_024;
+const MAXIMUM_BLOB_LINK_RESPONSE_BYTES = 16 * 1024;
+
+interface BlobLink {
+    readonly url: string;
+    readonly method: "PUT" | "GET";
+    readonly expiresAt: number;
+    readonly headers?: Readonly<Record<string, string>>;
+}
+
+function blobLink(bytes: Uint8Array, expectedMethod: "PUT" | "GET"): BlobLink {
+    const parsed = JSON.parse(utf8Decode(bytes)) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error("Relay returned an invalid blob link");
+    }
+    const value = parsed as Record<string, unknown>;
+    const allowed = new Set(["url", "method", "expiresAt", "headers"]);
+    if (
+        typeof value.url !== "string" ||
+        value.url.length === 0 ||
+        value.method !== expectedMethod ||
+        typeof value.expiresAt !== "number" ||
+        !Number.isSafeInteger(value.expiresAt) ||
+        value.expiresAt < 0 ||
+        Object.keys(value).some((key) => !allowed.has(key))
+    ) {
+        throw new Error("Relay returned an invalid blob link");
+    }
+    let headers: Readonly<Record<string, string>> | undefined;
+    if (Object.hasOwn(value, "headers")) {
+        if (
+            typeof value.headers !== "object" ||
+            value.headers === null ||
+            Array.isArray(value.headers)
+        ) {
+            throw new Error("Relay returned invalid blob link headers");
+        }
+        const headerRecord = value.headers as Record<string, unknown>;
+        if (Object.values(headerRecord).some((header) => typeof header !== "string")) {
+            throw new Error("Relay returned invalid blob link headers");
+        }
+        headers = Object.fromEntries(
+            Object.entries(headerRecord).map(([name, header]) => [name, String(header)]),
+        );
+    }
+    return {
+        url: value.url,
+        method: expectedMethod,
+        expiresAt: value.expiresAt,
+        ...(headers === undefined ? {} : { headers }),
+    };
+}
 
 function query(
     path: string,
@@ -141,14 +192,12 @@ export class HttpRelayTransport implements RelayTransport {
     }
 
     async putBlob(blob: RelayBlob): Promise<void> {
-        const response = await this.#fetch(
-            `${this.#baseUrl}/v1/blobs/${encodeURIComponent(blob.id)}`,
-            {
-                method: "PUT",
-                headers: { "content-type": "application/octet-stream" },
-                body: requestBody(blob.bytes),
-            },
-        );
+        const link = await this.#blobLink(blob.id, "upload-link", "PUT");
+        const response = await this.#fetch(this.#blobLinkUrl(link.url), {
+            method: link.method,
+            ...(link.headers === undefined ? {} : { headers: link.headers }),
+            body: requestBody(blob.bytes),
+        });
         await this.#requireOk(response);
     }
 
@@ -166,10 +215,18 @@ export class HttpRelayTransport implements RelayTransport {
         ) {
             throw new Error("Invalid relay blob identifier");
         }
-        const response = await this.#get(`/v1/blobs/${encodeURIComponent(id)}`);
-        if (response === undefined) {
+        const link = await this.#blobLink(id, "download-link", "GET", true);
+        if (link === undefined) {
             return undefined;
         }
+        const response = await this.#fetch(this.#blobLinkUrl(link.url), {
+            method: link.method,
+            ...(link.headers === undefined ? {} : { headers: link.headers }),
+        });
+        if (response.status === 404) {
+            return undefined;
+        }
+        await this.#requireOk(response);
         const blob = {
             id,
             bytes: await readBoundedResponse(response, MAXIMUM_BLOB_RESPONSE_BYTES),
@@ -182,6 +239,42 @@ export class HttpRelayTransport implements RelayTransport {
 
     #topicPath(topic: string, resource: "events" | "list" | "state"): string {
         return `/v1/topics/${encodeURIComponent(topic)}/${resource}`;
+    }
+
+    async #blobLink(
+        id: string,
+        resource: "upload-link" | "download-link",
+        method: "PUT" | "GET",
+        allowMissing: true,
+    ): Promise<BlobLink | undefined>;
+    async #blobLink(
+        id: string,
+        resource: "upload-link" | "download-link",
+        method: "PUT" | "GET",
+        allowMissing?: false,
+    ): Promise<BlobLink>;
+    async #blobLink(
+        id: string,
+        resource: "upload-link" | "download-link",
+        method: "PUT" | "GET",
+        allowMissing: boolean = false,
+    ): Promise<BlobLink | undefined> {
+        const response = await this.#fetch(
+            `${this.#baseUrl}/v1/blobs/${encodeURIComponent(id)}/${resource}`,
+            { method: "POST" },
+        );
+        if (allowMissing && response.status === 404) {
+            return undefined;
+        }
+        await this.#requireOk(response);
+        return blobLink(
+            await readBoundedResponse(response, MAXIMUM_BLOB_LINK_RESPONSE_BYTES),
+            method,
+        );
+    }
+
+    #blobLinkUrl(value: string): string {
+        return new URL(value, `${this.#baseUrl}/`).toString();
     }
 
     async #get(path: string, signal?: AbortSignal): Promise<Response | undefined> {

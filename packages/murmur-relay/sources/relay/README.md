@@ -2,7 +2,8 @@
 
 `RelayService` is the package's main API. It accepts already-decoded protocol
 objects, enforces byte/count/timestamp/signature policy, and calls one small
-store contract.
+store contract. Its resolved options also carry HTTP blob-size and rate-limit
+policy without putting either subsystem into topic persistence.
 
 Long polling follows a register-then-recheck sequence:
 

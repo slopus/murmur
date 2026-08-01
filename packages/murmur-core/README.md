@@ -132,7 +132,10 @@ together. It reports `"opened"` or `"duplicate"` and throws on authenticated
 same-ID content collisions.
 
 Files are encrypted before blob upload. Their key and nonce stay inside
-encrypted message content.
+encrypted message content. The HTTP transport requests a short-lived upload or
+download link from the relay and then transfers bytes with the returned URL,
+method, and optional headers. Relative local-backend links and absolute S3 links
+use the same browser-safe injected `fetch`.
 
 ## Relay transport
 

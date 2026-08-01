@@ -4,16 +4,13 @@ import {
     type StatementResultingChanges,
     type StatementSync,
 } from "node:sqlite";
-import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
     parseSignedRelayEvent,
     relayEventFingerprint,
     signedRelayEventToJson,
-    type RelayBlob,
     type SignedRelayEvent,
 } from "../../protocol/index.js";
-import { decodeBase64Url } from "../../utils/base64Url.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
 import { decodeListCursor, encodeListCursor } from "../../utils/cursor.js";
 import { planEventMutations, type ExistingElement } from "../impl/eventPlan.js";
@@ -396,52 +393,6 @@ export class SqliteRelayStore implements RelayStore {
         }
     }
 
-    /** Store a content-addressed ciphertext blob idempotently. */
-    async putBlob(blob: RelayBlob): Promise<void> {
-        this.#assertOpen();
-        let identifier: Uint8Array;
-        try {
-            identifier = decodeBase64Url(blob.id, 32);
-        } catch {
-            throw new RelayError(400, "Invalid blob identifier", { error: "malformed" });
-        }
-        if (!equalBytes(identifier, sha256(blob.bytes))) {
-            throw new RelayError(400, "Blob hash mismatch", { error: "hash_mismatch" });
-        }
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            const existing = this.#get(
-                "SELECT bytes FROM murmur_relay_blobs WHERE id = ?",
-                blob.id,
-            );
-            if (existing === undefined) {
-                this.#run(
-                    "INSERT INTO murmur_relay_blobs (id, bytes) VALUES (?, ?)",
-                    blob.id,
-                    blob.bytes,
-                );
-            } else if (!equalBytes(copyBytes(existing.bytes, "blob"), blob.bytes)) {
-                throw new RelayError(409, "Blob identifier collision", {
-                    error: "id_collision",
-                });
-            }
-            this.#database.exec("COMMIT");
-        } catch (error) {
-            this.#rollback();
-            throw error;
-        }
-    }
-
-    /** Return an isolated copy of one ciphertext blob when present. */
-    async getBlob(id: string): Promise<RelayBlob | undefined> {
-        this.#assertOpen();
-        const row = this.#get("SELECT bytes FROM murmur_relay_blobs WHERE id = ?", id);
-        if (row === undefined) {
-            return undefined;
-        }
-        return { id, bytes: copyBytes(row.bytes, "blob") };
-    }
-
     /** Delete expired event rows and advance every affected topic's reset watermark. */
     async pruneEvents(olderThan: number): Promise<number> {
         this.#assertOpen();
@@ -575,10 +526,6 @@ export class SqliteRelayStore implements RelayStore {
                     CREATE INDEX murmur_relay_events_retention
                         ON murmur_relay_events(observed_at);
 
-                    CREATE TABLE murmur_relay_blobs (
-                        id TEXT PRIMARY KEY,
-                        bytes BLOB NOT NULL
-                    ) STRICT;
                 `);
                 this.#run(
                     `INSERT INTO murmur_relay_schema_migrations (version, applied_at)

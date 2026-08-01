@@ -1,13 +1,10 @@
-import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
     parseSignedRelayEvent,
     relayEventFingerprint,
     signedRelayEventToJson,
-    type RelayBlob,
     type SignedRelayEvent,
 } from "../../protocol/index.js";
-import { decodeBase64Url } from "../../utils/base64Url.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
 import { decodeListCursor, encodeListCursor } from "../../utils/cursor.js";
 import { planEventMutations, type ExistingElement } from "../impl/eventPlan.js";
@@ -444,56 +441,6 @@ export class PostgresRelayStore implements RelayStore {
             );
             return { events, reset: false, seq };
         }, "repeatable read");
-    }
-
-    /** Insert a valid content-addressed blob using race-safe idempotency. */
-    async putBlob(blob: RelayBlob): Promise<void> {
-        this.#assertOpen();
-        let identifier: Uint8Array;
-        try {
-            identifier = decodeBase64Url(blob.id, 32);
-        } catch {
-            throw new RelayError(400, "Invalid blob identifier", { error: "malformed" });
-        }
-        if (!equalBytes(identifier, sha256(blob.bytes))) {
-            throw new RelayError(400, "Blob hash mismatch", { error: "hash_mismatch" });
-        }
-        await this.#database.transaction(async (transaction) => {
-            const insertion = await transaction.query<{ id: string }>(
-                `INSERT INTO murmur_relay_blobs (id, bytes)
-                 VALUES ($1, $2)
-                 ON CONFLICT (id) DO NOTHING
-                 RETURNING id`,
-                [blob.id, blob.bytes],
-            );
-            if (insertion.rows.length > 0) {
-                return;
-            }
-            const existingResult = await transaction.query<{ bytes: unknown }>(
-                "SELECT bytes FROM murmur_relay_blobs WHERE id = $1",
-                [blob.id],
-            );
-            const existing = existingResult.rows[0];
-            if (
-                existing === undefined ||
-                !equalBytes(copyBytes(existing.bytes, "blob"), blob.bytes)
-            ) {
-                throw new RelayError(409, "Blob identifier collision", {
-                    error: "id_collision",
-                });
-            }
-        });
-    }
-
-    /** Fetch an isolated copy of one permanent ciphertext blob. */
-    async getBlob(id: string): Promise<RelayBlob | undefined> {
-        this.#assertOpen();
-        const result = await this.#database.query<{ bytes: unknown }>(
-            "SELECT bytes FROM murmur_relay_blobs WHERE id = $1",
-            [id],
-        );
-        const row = result.rows[0];
-        return row === undefined ? undefined : { id, bytes: copyBytes(row.bytes, "blob") };
     }
 
     /** Prune expired event rows under a cluster-wide try-lock and advance watermarks. */

@@ -141,10 +141,70 @@ describe("relay protocol", () => {
         const corrupt = new HttpRelayTransport(
             "hostile",
             "https://relay.test",
-            async () => new Response(utf8Encode("tampered").slice().buffer as ArrayBuffer),
+            async (input, init) => {
+                const request = new Request(input, init);
+                if (new URL(request.url).pathname.endsWith("/download-link")) {
+                    return Response.json({
+                        url: "/objects/corrupt",
+                        method: "GET",
+                        expiresAt: Date.now() + 1_000,
+                    });
+                }
+                return new Response(utf8Encode("tampered").slice().buffer as ArrayBuffer);
+            },
         );
 
         await expect(oversized.readEvents("topic", 0n)).rejects.toThrow("too large");
         await expect(corrupt.getBlob(blob.id)).rejects.toThrow("content-address");
+    });
+
+    it("requests blob links before direct upload and download transfers", async () => {
+        const blob = createRelayBlob(utf8Encode("linked ciphertext"));
+        const requests: Request[] = [];
+        let stored = new Uint8Array();
+        const transport = new HttpRelayTransport(
+            "linked",
+            "https://relay.test",
+            async (input, init) => {
+                const request = new Request(input, init);
+                requests.push(request);
+                const path = new URL(request.url).pathname;
+                if (path.endsWith("/upload-link")) {
+                    return Response.json({
+                        url: "https://objects.test/blob",
+                        method: "PUT",
+                        expiresAt: Date.now() + 1_000,
+                        headers: { "x-transfer-token": "upload" },
+                    });
+                }
+                if (path.endsWith("/download-link")) {
+                    return Response.json({
+                        url: "https://objects.test/blob",
+                        method: "GET",
+                        expiresAt: Date.now() + 1_000,
+                    });
+                }
+                if (request.method === "PUT") {
+                    expect(request.headers.get("x-transfer-token")).toBe("upload");
+                    stored = new Uint8Array(await request.arrayBuffer());
+                    return new Response(null, { status: 204 });
+                }
+                return new Response(stored.slice().buffer as ArrayBuffer);
+            },
+        );
+
+        await transport.putBlob(blob);
+        await expect(transport.getBlob(blob.id)).resolves.toEqual(blob);
+        expect(
+            requests.map((request) => ({
+                method: request.method,
+                path: new URL(request.url).pathname,
+            })),
+        ).toEqual([
+            { method: "POST", path: `/v1/blobs/${blob.id}/upload-link` },
+            { method: "PUT", path: "/blob" },
+            { method: "POST", path: `/v1/blobs/${blob.id}/download-link` },
+            { method: "GET", path: "/blob" },
+        ]);
     });
 });

@@ -14,4 +14,6 @@ signed event -> /v1/topics/:topic/events
 
 `HttpRelayTransport` supports an injected Fetch implementation, so browsers,
 workers, and in-process test relays use the same code without a TCP socket.
-Blob IDs remain SHA-256 hashes of ciphertext.
+Blob IDs remain SHA-256 hashes of ciphertext. `putBlob` and `getBlob` hide the
+two-step transfer: request a short-lived link from the relay, then use the
+returned method and headers to transfer bytes directly.
