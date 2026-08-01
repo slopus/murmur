@@ -1,166 +1,169 @@
 # Deployment
 
-Running a Murmur relay, from a laptop to a public multi-instance service.
+The Murmur relay is a Node-only service. It stores opaque signed topic state and
+serves or issues links for ciphertext blobs. It does not hold client identity
+secrets or plaintext, but it remains an availability and metadata boundary.
 
-The relay is the only thing you deploy. Clients hold all keys and all plaintext,
-so a relay operator is not trusted with message content — but is trusted for
-availability.
+Node 22.5 or later is required.
 
-## Local relay
+## Local run
 
-```bash
-pnpm --filter @murmur/relay-node build
-PORT=8787 node packages/murmur-relay-node/dist/server/main.js
-```
-
-| Variable               | Default                      | Purpose                      |
-| ---------------------- | ---------------------------- | ---------------------------- |
-| `PORT`                 | `8787`                       | Listen port                  |
-| `HOST`                 | `0.0.0.0`                    | Bind address                 |
-| `MURMUR_RELAY_DB`      | `./data/murmur-relay.sqlite` | SQLite file                  |
-| `MURMUR_RELAY_ORIGINS` | `*`                          | Comma-separated CORS origins |
-
-Point clients at it:
+Build and start the standalone relay:
 
 ```bash
-murmur --relay http://127.0.0.1:8787 sign-in --first-name Alice
+pnpm --filter @murmur/relay build
+
+MURMUR_RELAY_STORE=sqlite \
+MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+pnpm --filter @murmur/relay start
 ```
 
-The process prunes topics inactive for 30 days every hour, and shuts down
-cleanly on `SIGINT`/`SIGTERM`.
+Defaults are SQLite, `./data/murmur-relay.sqlite`, local blobs in
+`./data/blobs`, host `0.0.0.0`, and port `8787`. On startup the process runs a
+retention sweep, then repeats it hourly. It closes the HTTP server, blob
+backend, wake source, and store on `SIGINT` or `SIGTERM`.
+
+Point the CLI at it:
+
+```bash
+murmur sign-in --first-name Alice --relay http://127.0.0.1:8787
+```
+
+## Environment
+
+The standalone executable reads these variables from
+`packages/murmur-relay/sources/main.ts`.
+
+| Variable                            | Default                      | Meaning                                                                   |
+| ----------------------------------- | ---------------------------- | ------------------------------------------------------------------------- |
+| `PORT`                              | `8787`                       | TCP listen port, integer 1 through 65,535.                                |
+| `HOST`                              | `0.0.0.0`                    | TCP listen host.                                                          |
+| `MURMUR_RELAY_STORE`                | `sqlite`                     | Storage backend: `sqlite` or `postgres`.                                  |
+| `MURMUR_RELAY_DB`                   | `./data/murmur-relay.sqlite` | SQLite database path; required Postgres connection string for `postgres`. |
+| `MURMUR_RELAY_ORIGINS`              | `*`                          | `*` or a comma-separated CORS origin list.                                |
+| `MURMUR_RELAY_BLOB_BACKEND`         | `local`                      | Blob backend: `local` or `s3`.                                            |
+| `MURMUR_RELAY_BLOB_DIR`             | `./data/blobs`               | Local content-addressed filesystem root.                                  |
+| `MURMUR_RELAY_BLOB_SECRET`          | generated per process        | Local signed-link HMAC secret, encoded as UTF-8 and at least 32 bytes.    |
+| `MURMUR_RELAY_TRUSTED_PROXIES`      | unset                        | Positive trusted hop count or comma-separated trusted proxy IP list.      |
+| `MURMUR_RELAY_S3_ENDPOINT`          | required for `s3`            | S3-compatible HTTP(S) endpoint without credentials, query, or fragment.   |
+| `MURMUR_RELAY_S3_REGION`            | required for `s3`            | SigV4 region.                                                             |
+| `MURMUR_RELAY_S3_BUCKET`            | required for `s3`            | Bucket name.                                                              |
+| `MURMUR_RELAY_S3_ACCESS_KEY_ID`     | required for `s3`            | SigV4 access key ID.                                                      |
+| `MURMUR_RELAY_S3_SECRET_ACCESS_KEY` | required for `s3`            | SigV4 secret access key.                                                  |
+| `MURMUR_RELAY_S3_PATH_STYLE`        | `false`                      | `true` for path-style S3 URLs, commonly needed by MinIO.                  |
+
+The local blob secret is important. If it is absent, the relay warns and
+generates 32 random bytes. Links issued before a restart then stop working, and
+other instances reject them. Set one stable secret of at least 32 UTF-8 bytes
+for a persistent local deployment. Treat it as a secret.
+
+`MURMUR_RELAY_TRUSTED_PROXIES` is the only setting that permits the relay to
+look at `X-Forwarded-For`. Leave it unset for a direct deployment. Configure it
+only when the immediate network path is understood; otherwise client-provided
+forwarded headers could choose the rate-limit key.
 
 ## Single-instance production
 
-One Node process with SQLite in WAL mode is a genuinely capable deployment:
-small rows, no joins on the hot path, and a workload dominated by
-insert-and-delete. Put it behind TLS, back up the SQLite file, and set
-`MURMUR_RELAY_ORIGINS` if browsers connect.
-
-This is the recommended starting point. Do not scale out before you have a
-measurement showing you need to.
-
-## Scaling out
-
-Two things must be solved before running more than one instance.
-
-### 1. Cross-instance wakeups
-
-`RelayService` keeps long-poll waiters in an **in-process map**. A publish
-handled by instance A cannot wake a client parked on instance B.
-
-This is a **latency** problem, not a correctness one. When a client parks, the
-service first re-checks the store (closing the park/arrive race) and caps the
-wait at 30 seconds, after which it re-reads. So a naive N-instance deployment
-stays correct; realtime just degrades to ~30-second polling.
-
-Sticky routing cannot fix it: the recipient ID lives inside the signed request
-body, not the URL, so no L7 proxy can route on it without parsing the protocol.
-
-The fix is a publish/subscribe wake signal. With Postgres, `LISTEN/NOTIFY` is
-enough and needs no extra infrastructure:
-
-- Each instance holds one dedicated `LISTEN` connection.
-- `publish` and `addSubscription` issue `NOTIFY` with the recipient ID inside
-  the same transaction, so wakes fire only on commit.
-- On notification, the instance wakes its local waiters.
-
-Because the 30-second timeout is the backstop, a dropped `LISTEN` connection
-degrades to polling instead of losing messages. That property is what makes the
-design safe. Implementing it requires a small injectable-wake seam in
-`RelayService`, which does not exist yet.
-
-### 2. A shared store
-
-`SqliteRelayStore` is single-process. Multiple instances need a shared
-`RelayStore`. **No Postgres implementation exists today** — it has to be
-written. The interface is 8 methods
-([RELAY_API.md](RELAY_API.md#implementing-a-store)); the logic above it is
-already host-neutral.
-
-Translating the SQLite schema is mostly mechanical, but four points need care
-because the SQLite store relies on `BEGIN IMMEDIATE` serializing everything:
-
-| Method            | Concern                                                                                                                                                                              |
-| ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `publish`         | Replace `SELECT` then `INSERT` with `INSERT … ON CONFLICT (id) DO NOTHING RETURNING`, then compare fingerprints on the no-op path to preserve the collision error.                   |
-| `putBlob`         | Same read-then-write race, same fix.                                                                                                                                                 |
-| `addSubscription` | Backfills deliveries while a concurrent `publish` may be inserting. `UNIQUE (recipient, event_id)` prevents duplicates; verify no event can be _missed_ in the interleaving.         |
-| `pull` ordering   | `BIGSERIAL` values are allocated before commit, so a reader can see a gap that later fills. Clients deduplicate and order anyway, but this is no longer SQLite's strict total order. |
-
-Do not copy the SQLite store's `CREATE TABLE IF NOT EXISTS` bootstrap: N
-instances starting at once will race on DDL. Use versioned migrations applied
-once.
-
-Test a new store with PGlite rather than a mock, per the repository's
-no-mocking-what-you-own rule, and run it against the existing SQLite store's
-test suite as a conformance suite.
-
-### Target shape
+SQLite is the intended single-instance setup:
 
 ```text
-              TLS load balancer
-                     │
-     ┌───────────────┼───────────────┐
-     │               │               │      stateless relay instances
-  relay-1        relay-2         relay-3    (each LISTENs for wakes)
-     └───────────────┼───────────────┘
-                     │
-            Postgres primary  ──── NOTIFY fans wakes back out
-                     │
-              S3 / R2 for blobs
+TLS reverse proxy
+        |
+        v
+one Node relay process
+        |
+        +-- SQLite database in WAL mode
+        `-- local blob tree, or S3
 ```
 
-Keep Postgres a single primary. The workload is small-row OLTP with heavy
-deletes, and `pull` is read-your-writes sensitive, so read replicas will cause
-missed deliveries for no benefit.
+The process creates the parent SQLite directory if needed and enables WAL and
+foreign keys. SQLite's store and in-process wake source are single-process
+components; do not run multiple processes against the same SQLite deployment.
 
-## Running a public relay
+For a public endpoint, terminate TLS in front of the relay, choose an explicit
+`MURMUR_RELAY_ORIGINS` list when browser access should be restricted, preserve
+the database and local blob directory with ordinary operational backups, and
+monitor process and disk health. Those operational controls are not built into
+the package.
 
-A public relay is an **open write endpoint**. Signature verification proves an
-event came from some keypair, and keypairs are free to generate. The relay code
-has no quota system.
+Local blobs are sharded by the first four characters of the base64url SHA-256
+ID. Uploads stream to a same-directory temporary file, hash during transfer,
+and are atomically installed only after the hash matches. This makes local
+storage a reasonable simple choice for one process with local persistent disk.
 
-Before exposing one publicly:
+## Multiple instances with Postgres
 
-1. **Rate limiting and quotas.** Per-IP and per-identity, on publish and blob
-   upload. Nothing in the relay does this today. `maximumWaiters` (10 000) is
-   per-process and is not a quota.
-2. **Move blobs out of the database.** 64 MiB `bytea` values TOAST badly and
-   will wreck WAL volume and backups. Use S3 or R2.
+Choose Postgres for multiple relay processes:
 
-    Note that `getBlob` returns fully buffered bytes and the HTTP layer buffers
-    the whole response, so each concurrent download can cost 64 MiB of memory.
-    Serving blobs by redirect or stream requires widening the store interface.
-    This is the largest change on the list.
+```bash
+MURMUR_RELAY_STORE=postgres \
+MURMUR_RELAY_DB=postgresql://user:password@postgres.example/murmur \
+MURMUR_RELAY_BLOB_BACKEND=s3 \
+MURMUR_RELAY_S3_ENDPOINT=https://s3.example \
+MURMUR_RELAY_S3_REGION=region \
+MURMUR_RELAY_S3_BUCKET=murmur-blobs \
+MURMUR_RELAY_S3_ACCESS_KEY_ID=access \
+MURMUR_RELAY_S3_SECRET_ACCESS_KEY=secret \
+pnpm --filter @murmur/relay start
+```
 
-3. **Fix pruning for multiple instances.** Every process runs
-   `pruneInactiveTopics` hourly, so N instances means N concurrent prunes, and
-   the delete cascades across topics, events, and deliveries in one unbounded
-   statement. Take a `pg_try_advisory_lock` and delete in batches, or move
-   pruning to a single scheduled job.
-4. **Add a health endpoint** for load-balancer probes. There is none.
-5. **Set `MURMUR_RELAY_ORIGINS`** if you want to restrict browser origins. The
-   `*` default is safe for the protocol but you may want it narrower anyway.
+The Postgres store:
 
-## Suggested order of work
+- runs versioned migrations under a session advisory lock at startup;
+- takes a per-topic transaction advisory lock before publishing, producing
+  gapless per-topic sequences;
+- emits `pg_notify` in the same publish transaction;
+- uses cluster-wide try-locks for event and inactive-topic pruning.
 
-1. Postgres `RelayStore`, tested with PGlite against the shared conformance
-   suite.
-2. Wake seam in `RelayService` plus `LISTEN/NOTIFY`.
-3. Advisory-locked batched pruning, and a health endpoint.
-4. Rate limiting and quotas — **required before public exposure**.
-5. S3/R2 blob backend, which needs the store interface widened.
+Each process owns a `PostgresWakeSource` with a dedicated reconnecting `LISTEN`
+connection. A committed topic wake notifies parked long polls on other
+instances. Wakes are only a latency optimization: event reads re-check the
+store and timeout after at most 30 seconds, so a lost notification does not
+silently lose data.
 
-Steps 1–3 are mechanical. Step 5 touches the transport contract, so decide early
-whether a relay may answer a blob `GET` with a redirect.
+Use S3 rather than local blobs for this configuration. The local backend keeps
+bytes on the filesystem of the particular process and its relative signed links
+also require a shared HMAC secret. The S3 backend returns absolute presigned
+URLs, so bytes bypass every relay process.
 
-## Operational notes
+There is an important testing caveat: Postgres behavior is exercised through
+PGlite in the test suite. `PgPoolDatabase`, a live PostgreSQL service,
+cross-instance `LISTEN`/`NOTIFY`, and advisory-lock contention have not been
+tested against a real running Postgres server.
 
-- **Backups**: the relay holds only ciphertext, but losing it loses undelivered
-  messages. Clients retry from their outbox, so the loss is bounded, not total.
-- **Retention**: topics idle for 30 days are pruned. Clients can recreate a
-  topic and resume.
-- **Metrics**: none built in. Wrap the fetch handler if you need them.
-- **Multiple relays**: clients can publish to several relays at once and
-  deduplicate on receipt. Running two independent relays is a legitimate
-  availability strategy and needs no coordination between them.
+## Blob backend choice
+
+| Backend | Bytes travel through       | Returned link      | Integrity behavior                                                                         | Best fit                                |
+| ------- | -------------------------- | ------------------ | ------------------------------------------------------------------------------------------ | --------------------------------------- |
+| `local` | Relay process              | Relative relay URL | Streams, hashes while uploading, atomically installs only matching content-addressed bytes | One instance with local persistent disk |
+| `s3`    | S3-compatible object store | Absolute SigV4 URL | Upload binds `x-amz-checksum-sha256`; download link follows signed `HEAD` existence check  | Multiple instances or object storage    |
+
+The S3 implementation is verified against the published AWS presigned-GET
+example. It has not been tested against a live bucket or MinIO. Treat an S3 or
+MinIO deployment as an integration task that still needs its own live test,
+including bucket CORS policy for browser clients.
+
+## What is still missing before a public deployment
+
+The code can run a relay, but these gaps remain material:
+
+- There has been no independent security audit. MLS is a tested Murmur RFC 9420
+  subset, not a claim of complete MLS interoperability or review.
+- Public identity tokens are not verified. There is no safety-number workflow
+  and no key transparency, so a machine-in-the-middle on token exchange
+  compromises later contact, direct-message, and group security.
+- Direct messages have no post-compromise security because they are sealed to
+  long-term X25519 identity keys.
+- Relay metadata remains visible: topic IDs, relay event author signing keys,
+  timing, and sizes.
+- The default rate limiter is per process. With `N` instances, its effective
+  allowance is approximately `N` times the configured limit. A shared limiter
+  must be supplied through `RateLimiter` to change that.
+- The SigV4 backend lacks a live S3/MinIO integration test.
+- There is no identity key rotation.
+- There is no CI configured in this repository.
+
+Before exposing a public service, also decide how to manage backups, database
+credentials, S3 credentials, TLS, reverse-proxy limits, monitoring, incident
+response, and retention requirements. Murmur does not provide those operating
+procedures.

@@ -1,188 +1,431 @@
 # Relay HTTP API
 
-The relay exposes six endpoints. Every request body is authenticated by an
-Ed25519 signature over a canonical payload, so the relay needs no sessions,
-tokens, cookies, or CORS credentials.
+`@murmur/relay` exposes a fixed, credential-free HTTP protocol for signed topic
+state and short-lived blob-transfer links. It is implemented by
+`createRelayFetchHandler`; `HttpRelayTransport` is the browser-safe client
+implementation.
 
-Implemented by `createRelayFetchHandler` in `@murmur/relay`. The client side is
-`HttpRelayTransport` in `@slopus/murmur`.
+There are no subscription, recipient, queue-pull, or acknowledgement routes.
+Clients read topics directly using their locally stored cursors.
 
 ## Conventions
 
-- Request and response bodies are JSON, except blob bodies, which are raw
-  `application/octet-stream`.
-- `Uint8Array` fields are base64url. Identity IDs are the 43-character base64url
-  public signing key.
-- Timestamps are milliseconds since the Unix epoch.
-- Signed requests are valid for **±5 minutes** of relay clock time.
-- CORS defaults to `*`, which is safe because the protocol is credential-free.
+- JSON requests and responses use UTF-8.
+- All byte strings are unpadded, canonical base64url.
+- Relay sequences and versions are decimal strings in JSON because they are
+  stored as `bigint`.
+- Timestamps are non-negative integer milliseconds since the Unix epoch.
+- Topic IDs use `[A-Za-z0-9_.:-]`, length 1 through 512.
+- List element IDs use the same alphabet, length 1 through 256.
+- Event IDs and blob IDs are canonical base64url encodings of 32 bytes
+  (43 characters).
+- Unknown routes and unknown topic/blob resources return
+  `{"error":"not_found"}` with HTTP 404.
+- CORS defaults to `Access-Control-Allow-Origin: *`. An explicit origin list
+  returns the requesting allowed origin and `Vary: Origin`.
+
+Event signatures use Ed25519 over recursively key-sorted canonical JSON with
+the `signature` member omitted. The full event shape is in
+[PROTOCOL.md](PROTOCOL.md#relay-events).
 
 ## Endpoints
 
-### `POST /v1/subscriptions`
+### `GET /health`
 
-Subscribe an identity to a topic. Body is a signed `TopicSubscription`:
+Checks whether the backing `RelayStore` can run its health query.
 
-```typescript
-{
-    version: 1,
-    topic: string,
-    subscriber: { signingKey, encryptionKey },
-    createdAt: number,
-    signature: Uint8Array,
-}
+```json
+{ "ok": true }
 ```
 
-`204` on success. A first-time subscription backfills every retained event on
-the topic that was not addressed to explicit recipients, so a new subscriber
-replays history rather than starting empty. Re-subscribing is idempotent.
+Returns HTTP 200 on success. It is a read-rate-limited endpoint.
 
-### `POST /v1/events`
+### `POST /v1/topics/:topic/events`
 
-Publish an opaque event. Body is a signed `RelayEvent`:
+Validates, authenticates, and atomically applies a signed event. The route
+topic must exactly equal the signed event's `topic`.
 
-```typescript
+Request body:
+
+```ts
 {
     version: 1,
     id: string,
     topic: string,
-    sender: { signingKey, encryptionKey },
-    recipients: readonly string[],   // empty means "all topic subscribers"
+    author: { signingKey: string },
     createdAt: number,
-    payload: Uint8Array,             // opaque ciphertext
-    signature: Uint8Array,
+    payload: string,
+    snapshot?: {
+        expectedVersion: number,
+        bytes?: string,
+    },
+    list?: readonly (
+        | { op: "append"; id: string; bytes: string }
+        | { op: "replace"; id: string; expectedVersion?: number; bytes: string }
+        | { op: "delete"; id: string; expectedVersion?: number }
+    )[],
+    signature: string,
 }
 ```
 
-`204` on success. Publication is atomic with fan-out: the relay writes the event
-and one delivery row per recipient in a single transaction.
+`snapshot.bytes` absent means delete the snapshot. For a snapshot mutation,
+`expectedVersion: 0` means no snapshot must currently exist; otherwise the
+version must match. Appending an existing list ID, or replacing/deleting a
+missing element or a mismatched expected version, is a conflict.
 
-Re-publishing the same `id` with identical content is a no-op. The same `id`
-with different content is rejected — the relay stores a fingerprint of the
-signed envelope and refuses to overwrite it.
+Successful response, HTTP 200:
 
-### `POST /v1/queue/pull`
-
-Read the caller's queue. Body is a signed `QueueReadRequest` with
-`action: "read"`. Optional `?wait=<milliseconds>` long-polls, capped at 30 000.
-
-Returns up to 16 deliveries:
-
-```typescript
-[{ deliveryId: string, event: RelayEvent }];
-```
-
-Deliveries are **not** removed by reading; they persist until acknowledged.
-
-`requestId` is single-use: the relay records it and rejects reuse with `409`.
-This prevents a captured request from being replayed to drain a queue.
-
-With `wait`, the relay returns as soon as an event arrives, or an empty array at
-timeout. A relay under long-poll pressure returns `503`.
-
-### `POST /v1/queue/acknowledge`
-
-Delete one queued delivery. Body is a signed `QueueAcknowledgeRequest` with
-`action: "acknowledge"` and a `deliveryId`. `204` on success; idempotent.
-
-Only call this after your application state is durably committed. See
-[ARCHITECTURE.md](ARCHITECTURE.md#receiving).
-
-### `PUT /v1/blobs/:id`
-
-Upload ciphertext. `:id` must be the 43-character base64url SHA-256 of the body.
-Body is raw bytes, up to 64 MiB. `204` on success.
-
-The relay recomputes the hash and rejects a mismatch with `400`. Re-uploading
-identical bytes is a no-op; a different body under an existing ID is rejected.
-Storage is therefore self-verifying and deduplicating.
-
-### `GET /v1/blobs/:id`
-
-Download ciphertext as `application/octet-stream`. `404` if unknown.
-
-There is no authentication on blob reads: possession of the 32-byte content hash
-is the capability. The bytes are useless without the descriptor from the
-message that referenced them.
-
-## Status codes
-
-| Code  | Meaning                                                      |
-| ----- | ------------------------------------------------------------ |
-| `204` | Success, no body                                             |
-| `400` | Malformed body, bad blob hash, or invalid long-poll duration |
-| `401` | Invalid or expired signature                                 |
-| `404` | Unknown route or blob                                        |
-| `408` | Client disconnected during a long poll                       |
-| `409` | Replayed `requestId`                                         |
-| `413` | Body, payload, envelope, or recipient count over limit       |
-| `429` | Rate limited                                                 |
-| `500` | Internal relay error                                         |
-| `503` | Too many concurrent long polls                               |
-
-## Limits
-
-| Limit                           | Default            |
-| ------------------------------- | ------------------ |
-| Event payload                   | 1 MiB              |
-| Event envelope                  | 2 MiB              |
-| JSON request body               | 4 MiB              |
-| Blob                            | 64 MiB             |
-| Recipients per event            | 1 024              |
-| Deliveries per pull             | 16                 |
-| Delivery response               | 32 MiB             |
-| Long poll                       | 30 s               |
-| Concurrent long polls           | 10 000 per process |
-| Signed request validity         | ±5 min             |
-| Topic inactivity before pruning | 30 days            |
-
-Configurable through `RelayOptions`, subject to protocol maxima.
-
-## Implementing a transport
-
-A relay is only one implementation of `RelayTransport`. Anything satisfying this
-interface works — LAN, WebRTC, Bluetooth, a test double:
-
-```typescript
-interface RelayTransport {
-    readonly id: string;
-    publish(event: RelayEvent): Promise<void>;
-    subscribe(subscription: TopicSubscription): Promise<void>;
-    pull(
-        request: QueueReadRequest,
-        waitMilliseconds?: number,
-        signal?: AbortSignal,
-    ): Promise<readonly RelayDelivery[]>;
-    acknowledge(request: QueueAcknowledgeRequest): Promise<void>;
-    putBlob(blob: RelayBlob): Promise<void>;
-    getBlob(id: string): Promise<RelayBlob | undefined>;
+```ts
+{
+    seq: string,
+    duplicate: boolean,
+    snapshotVersion?: string,
 }
 ```
 
-## Implementing a store
+The first accepted publish returns `duplicate: false`. Retrying the exact same
+`(topic, id)` returns the original sequence and `duplicate: true`, even after
+event retention has expired. Reusing the ID for different signed content
+returns:
 
-To host a relay on a different database, implement `RelayStore` from
-`@murmur/relay` — 8 methods:
+```json
+{ "error": "id_collision" }
+```
 
-```typescript
+An optimistic-concurrency conflict returns HTTP 409:
+
+```ts
+{
+    error: "conflict",
+    snapshotVersion: string,
+    elements: Record<string, string>,
+}
+```
+
+`elements` contains the current version, or `"0"`, for every list element
+touched by the event.
+
+The relay accepts event timestamps only within five minutes before or after its
+current clock. It applies the publish cost to the request IP and, after a
+valid event signature, to `author.signingKey`.
+
+### `GET /v1/topics/:topic/state?limit=N`
+
+Reads a transactionally consistent topic head, optional snapshot, and first
+ordered list page. `limit` defaults to 256 and may not exceed the configured
+list-page maximum.
+
+HTTP 200:
+
+```ts
+{
+    seq: string,
+    snapshot: {
+        version: string,
+        bytes: string,
+    } | null,
+    list: {
+        elements: readonly {
+            id: string,
+            version: string,
+            bytes: string,
+        }[],
+        nextCursor: string | null,
+    },
+}
+```
+
+Use `nextCursor` with the list endpoint until it is `null`. `seq` is the head
+to install after the complete state is durably applied. An absent topic returns
+HTTP 404.
+
+### `GET /v1/topics/:topic/list?cursor=C&limit=N`
+
+Reads a later page of the current permanent ordered list. `cursor` is an opaque
+cursor returned by the preceding state or list response; omit it for the first
+page. `limit` has the same default and maximum as the state endpoint.
+
+HTTP 200:
+
+```ts
+{
+    elements: readonly {
+        id: string,
+        version: string,
+        bytes: string,
+    }[],
+    nextCursor: string | null,
+}
+```
+
+The list endpoint does not return a topic head because it is a page
+continuation. A topic that disappears while a client paginates returns HTTP
+404; `MurmurClient.loadTopic()` treats that as a failed load.
+
+### `GET /v1/topics/:topic/events?since=S&limit=N&wait=MS`
+
+Reads retained events strictly after `since`.
+
+| Query   | Default | Meaning                                                                             |
+| ------- | ------- | ----------------------------------------------------------------------------------- |
+| `since` | `0`     | Decimal topic sequence already durably processed.                                   |
+| `limit` | `256`   | Maximum retained events to return; cannot exceed the configured event-page maximum. |
+| `wait`  | `0`     | Long-poll milliseconds. It cannot exceed the configured maximum or 30,000 ms.       |
+
+HTTP 200:
+
+```ts
+{
+    events: readonly ({
+        seq: string,
+        version: 1,
+        id: string,
+        topic: string,
+        author: { signingKey: string },
+        createdAt: number,
+        payload: string,
+        snapshot?: { expectedVersion: number, bytes?: string },
+        list?: readonly (
+            | { op: "append", id: string, bytes: string }
+            | { op: "replace", id: string, expectedVersion?: number, bytes: string }
+            | { op: "delete", id: string, expectedVersion?: number }
+        )[],
+        signature: string,
+    })[],
+    reset: boolean,
+    seq: string, // current topic head
+}
+```
+
+`reset: false` means every returned event is a retained successor of `since`.
+If `reset: true`, `events` is empty and `since` is unusable: it is older than
+the retained window or greater than the current topic head. The client must
+reload state and the full list rather than treating the response as caught up.
+
+An empty `events` array with `reset: false` means no retained successor was
+available at the time of the read. With `wait`, the relay may park until a
+publish wake or the timeout, then re-read. Long-poll capacity exhaustion
+returns HTTP 503 with `{"error":"overloaded"}`.
+
+### `POST /v1/blobs/:id/upload-link`
+
+Requests a short-lived upload link for a content-addressed ciphertext blob.
+There is no request body.
+
+HTTP 200:
+
+```ts
+{
+    url: string,
+    method: "PUT",
+    expiresAt: number,
+    headers?: Readonly<Record<string, string>>,
+}
+```
+
+For the local backend, `url` is a **relative** relay URL and `headers` includes
+`content-type: application/octet-stream`. For the S3 backend, `url` is an
+absolute SigV4 presigned URL and headers include the signed
+`x-amz-checksum-sha256` value. The client must use the returned method, URL,
+and headers.
+
+This endpoint and a local signed `PUT` both use the upload rate-limit cost.
+If no blob backend was configured, it returns HTTP 503
+`{"error":"blob_unavailable"}`.
+
+### `POST /v1/blobs/:id/download-link`
+
+Requests a short-lived download link. There is no request body.
+
+HTTP 200:
+
+```ts
+{
+    url: string,
+    method: "GET",
+    expiresAt: number,
+    headers?: Readonly<Record<string, string>>,
+}
+```
+
+The relative-local versus absolute-S3 rule is the same as for upload links. A
+missing blob returns HTTP 404. The request has the read rate-limit cost.
+
+For S3, the backend performs a signed `HEAD` request before issuing a `GET`
+link. The relay receives that metadata check, but not the download bytes.
+
+### Local signed transfer route: `PUT` or `GET /v1/blobs/:id`
+
+This route is **not** a general blob API. It exists only when the configured
+backend is `LocalBlobBackend`, and only for the signed relative URL returned by
+one of the two link endpoints.
+
+The URL must contain exactly one `expires` and one `signature` query parameter.
+The HMAC authenticates the version, method, blob ID, and expiry. A malformed,
+expired, wrong-method, or bad-signature link returns HTTP 401 with either
+`{"error":"unauthorized"}` or `{"error":"expired"}`.
+
+- Signed `PUT` streams raw ciphertext and returns HTTP 204 after its SHA-256
+  matches `:id`. A size excess returns HTTP 413; a hash mismatch returns HTTP
+  400 `{"error":"hash_mismatch"}`.
+- Signed `GET` returns raw `application/octet-stream` bytes with HTTP 200, or
+  HTTP 404 if the installed file is absent.
+
+With the S3 backend, these relay-local methods return 404 because the returned
+link is an S3 URL. An unsigned direct `PUT` or `GET` should not be used.
+
+### `OPTIONS /*`
+
+Returns HTTP 204 with the configured CORS headers. The allowed methods are
+`GET, POST, PUT, OPTIONS`; allowed request headers are `Content-Type` and
+`Content-Length`.
+
+## Status codes and error bodies
+
+| Status | Body / condition                                                                                                                                                                       |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 200    | Successful JSON read, publish, health check, or issued blob link; local blob `GET` also returns raw bytes.                                                                             |
+| 204    | CORS preflight or successful local blob upload.                                                                                                                                        |
+| 400    | `{"error":"malformed"}` for invalid JSON, fields, path/query parameters, cursor, or `Content-Length`; `hash_mismatch` for a valid signed local upload whose bytes do not match its ID. |
+| 401    | `{"error":"unauthorized"}` for invalid event signatures, expired event timestamps, or invalid local blob links; `{"error":"expired"}` for an expired local blob link.                  |
+| 404    | `{"error":"not_found"}` for an unknown route, topic, blob, or S3-mode local transfer route.                                                                                            |
+| 409    | `{"error":"id_collision"}` for different content under an existing event/blob ID, or the structured `conflict` body for state concurrency failure.                                     |
+| 413    | `{"error":"limit"}` when a configured request, event, state mutation, list, or blob bound is exceeded.                                                                                 |
+| 429    | `{"error":"rate_limited","retryAfterMilliseconds":number}` plus `Retry-After` in seconds.                                                                                              |
+| 500    | `{"error":"internal"}` for unexpected handler or backend errors.                                                                                                                       |
+| 503    | `{"error":"overloaded"}` when the long-poll cap is reached, or `{"error":"blob_unavailable"}` when links are requested without a backend.                                              |
+
+## Default limits
+
+`RelayOptions` controls relay policy. `RelayHttpOptions.maximumPageResponseBytes`
+controls the HTTP page budget separately.
+
+| Limit                         |            Default | Notes                                                                                                |
+| ----------------------------- | -----------------: | ---------------------------------------------------------------------------------------------------- |
+| Event payload                 |              1 MiB | Opaque `payload` bytes before JSON encoding.                                                         |
+| Snapshot mutation             |              4 MiB | Current snapshot bytes.                                                                              |
+| One list element mutation     |            256 KiB | Append or replace bytes.                                                                             |
+| List operations per event     |                256 | Atomic operations, in supplied order.                                                                |
+| Live list elements per topic  |            100,000 | Checked in the publish transaction.                                                                  |
+| Blob bytes                    |             64 MiB | Applied to local transfers.                                                                          |
+| JSON request body             |              8 MiB | Bound while streaming the request.                                                                   |
+| Events per read               |                256 | Applies to `GET events`.                                                                             |
+| List elements per page        |                256 | Applies to state/list reads.                                                                         |
+| Event/list HTTP page response |              8 MiB | An available oversized first item is still returned so pagination cannot stall.                      |
+| Long-poll wait                |               30 s | Hard maximum; lower configuration is allowed.                                                        |
+| Concurrent long polls         | 10,000 per process | Beyond it, reads return 503.                                                                         |
+| Event retention               |             7 days | Only event bodies expire.                                                                            |
+| Topic inactivity              |            30 days | Measured from successful publish; dropping a topic removes its snapshot, list, events, and receipts. |
+| Event clock skew              |         ±5 minutes | Validated after signature and receipt lookup.                                                        |
+| Local blob-link lifetime      |          5 minutes | Backend construction option.                                                                         |
+| S3 presigned-link lifetime    |          5 minutes | Backend construction option, allowed range 1 through 604,800 seconds.                                |
+| Token bucket capacity         |              1,000 | Per key, per process.                                                                                |
+| Token refill                  |        50 tokens/s | Per key, per process.                                                                                |
+| Token-bucket count            |             50,000 | LRU-bounded map, per process.                                                                        |
+| Publish cost                  |                 25 | Charged to IP and valid event author.                                                                |
+| Upload cost                   |                 10 | Upload-link and local signed upload, charged to IP.                                                  |
+| Read cost                     |                  1 | All other routes, charged to IP.                                                                     |
+
+The default rate limiter is not shared. An `N`-instance deployment has
+approximately `N` times the effective default rate limit.
+
+## Extension interfaces
+
+### `RelayStore`
+
+Storage backends implement this interface. `publish()` must atomically allocate
+the topic sequence, apply snapshot/list mutations, write the durable receipt,
+retain the event, and update last activity.
+
+```ts
 interface RelayStore {
-    addSubscription(subscription: TopicSubscription, observedAt: number): Promise<number>;
-    publish(event: RelayEvent, observedAt: number): Promise<RelayPublishResult>;
-    consumeQueueRequest(
-        recipientId: string,
-        requestId: string,
-        expiresAt: number,
-        observedAt: number,
-    ): Promise<boolean>;
-    pull(recipientId: string, maximumDeliveries: number): Promise<readonly RelayDelivery[]>;
-    acknowledge(recipientId: string, deliveryId: string): Promise<void>;
-    putBlob(blob: RelayBlob): Promise<void>;
-    getBlob(id: string): Promise<RelayBlob | undefined>;
-    pruneInactiveTopics(olderThan: number): Promise<PruneResult>;
+    readPublishReceipt(topic: string, id: string): Promise<PublishReceipt | undefined>;
+    publish(
+        event: SignedRelayEvent,
+        now: number,
+        constraints: { maximumElementsPerTopic: number },
+    ): Promise<PublishOutcome>;
+    readState(
+        topic: string,
+        limit: number,
+        constraints: { maximumEncodedBytes: number },
+    ): Promise<TopicState | undefined>;
+    readList(
+        topic: string,
+        cursor: string | undefined,
+        limit: number,
+        constraints: { maximumEncodedBytes: number },
+    ): Promise<ListPage | undefined>;
+    readEvents(
+        topic: string,
+        since: bigint,
+        limit: number,
+        constraints: { maximumEncodedBytes: number },
+    ): Promise<EventPage | undefined>;
+    pruneEvents(olderThan: number): Promise<number>;
+    pruneInactiveTopics(olderThan: number): Promise<{ topics: number }>;
+    health(): Promise<void>;
+    close(): Promise<void>;
 }
 ```
 
-`RelayService` handles all validation, signature verification, and limits, so a
-store only needs to be correct about atomicity. `publish`, `addSubscription`,
-and `consumeQueueRequest` must each be atomic — `consumeQueueRequest` is the
-replay guard, and a non-atomic implementation silently removes it.
+The `TopicState` result contains the head sequence, optional current snapshot,
+and one list page. `EventPage` contains `events`, `reset`, and current head
+`seq`. `PublishOutcome` contains `seq`, `duplicate`, and optionally
+`snapshotVersion`.
+
+### `BlobBackend`
+
+```ts
+interface BlobLink {
+    readonly url: string;
+    readonly method: "PUT" | "GET";
+    readonly expiresAt: number;
+    readonly headers?: Readonly<Record<string, string>>;
+}
+
+interface BlobBackend {
+    createUploadLink(id: string, now: number): Promise<BlobLink>;
+    createDownloadLink(id: string, now: number): Promise<BlobLink | undefined>;
+    handleTransfer?(
+        request: Request,
+        id: string,
+        now: number,
+        maximumBytes: number,
+    ): Promise<Response>;
+    close(): Promise<void>;
+}
+```
+
+A backend that returns relay-local links implements `handleTransfer`. A backend
+such as S3 returns an absolute URL and omits it.
+
+### `RateLimiter`
+
+```ts
+interface RateLimitDecision {
+    readonly allowed: boolean;
+    readonly retryAfterMilliseconds: number;
+}
+
+interface RateLimiter {
+    consume(key: string, cost: number, now: number): Promise<RateLimitDecision>;
+}
+```
+
+Pass one through `RelayHttpOptions.rateLimiter` to replace the in-memory token
+bucket with a shared implementation.
+
+### `WakeSource`
+
+```ts
+interface WakeSource {
+    notify(topic: string): Promise<void>;
+    subscribe(listener: (topic: string) => void): Promise<void>;
+    close(): Promise<void>;
+}
+```
+
+Wake sources affect long-poll latency, not correctness. `InProcessWakeSource`
+is appropriate for SQLite's one-process deployment. `PostgresWakeSource`
+receives the notifications emitted transactionally by `PostgresRelayStore`.

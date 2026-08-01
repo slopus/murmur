@@ -1,115 +1,179 @@
 # Security
 
-> Murmur is a `0.x` project. **It has not received an independent security
-> audit.** The MLS implementation is a tested Murmur profile of RFC 9420, not a
-> complete general-purpose implementation. Do not rely on it for
-> life-safety-critical confidentiality.
+Murmur encrypts application content on clients and treats relays as untrusted
+storage and routing infrastructure. This document states the current
+guarantees and, just as importantly, what is not protected.
+
+Murmur has not received an independent security audit. The MLS implementation
+is a tested Murmur profile and RFC 9420 subset, not a claim of complete
+interoperability or a substitute for an audit.
 
 ## Threat model
 
-### Assumed hostile
+Murmur assumes that a relay, network observer, or storage operator may:
 
-- **The relay.** It may read everything it stores, drop, delay, reorder, or
-  duplicate messages, and lie about what it has. It cannot read plaintext or
-  forge membership.
-- **The network.** Assumed fully observed and modifiable. TLS is defence in
-  depth, not the security boundary — every envelope is independently signed.
-- **Other users.** A group member cannot forge messages or document edits
-  attributed to another member.
+- read all relay database rows and ciphertext blobs;
+- observe topic IDs, outer event author signing keys, event timing, and sizes;
+- delay, drop, reorder, duplicate, or delete responses and stored data;
+- return malformed state, stale state, or arbitrary ciphertext;
+- attempt invalid writes, list mutations, and blob uploads;
+- operate multiple relay instances with independent in-memory rate-limit state.
 
-### Assumed trusted
+The protocol verifies cryptographic input before using it as application data,
+but cannot make a malicious relay available or hide the metadata it must see.
 
-- **The local device**, its RAM, and the `MurmurStore` backing it. Murmur has no
-  defence against a compromised endpoint.
-- **The out-of-band channel** used to exchange identity tokens. See
-  [Key exchange](#key-exchange-is-the-weak-point).
+Murmur also considers a local key compromise and a substituted public identity
+token to be serious threats. They are not magically repaired by relay
+encryption.
 
-## What is guaranteed
+## Guarantees
 
-| Property                       | Mechanism                                               |
-| ------------------------------ | ------------------------------------------------------- |
-| Confidentiality from the relay | All payloads encrypted client-side                      |
-| Sender authenticity            | Ed25519 over a canonical payload                        |
-| Recipient binding              | Signature and AEAD associated data cover the recipient  |
-| Replay resistance (messages)   | Store-transactional replay markers                      |
-| Replay resistance (queue ops)  | Single-use `requestId`, ±5-minute validity              |
-| Exactly-once acceptance        | Application record and replay marker in one transaction |
-| Group forward secrecy          | MLS epochs; a removed member cannot read later traffic  |
-| Membership integrity           | Enforced by TreeKEM, not by the relay                   |
-| File integrity                 | Content-addressed blobs, AEAD-bound metadata            |
-| Document authorship            | Operation actor bound to the authenticated MLS leaf     |
+| Property                                        | What the implementation guarantees                                                                                                   | Conditions and limits                                                                                                        |
+| ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| Identity-key separation                         | Ed25519 signs; X25519 receives sealed boxes.                                                                                         | Compromising one key type does not by itself give the other capability.                                                      |
+| Contact-profile authenticity                    | A decrypted profile is signed by the identity it claims and bound to its intended recipient.                                         | Only meaningful if the recipient already has the genuine sender public token.                                                |
+| First-contact privacy                           | An identity inbox exposes a count of unlinkable outer requests rather than a stable sender author.                                   | The inbox is readable by anyone who knows the recipient token; only `publishUnlinkable()` provides this outer unlinkability. |
+| Pairwise-topic privacy                          | Public identity tokens alone cannot derive a direct conversation topic.                                                              | Both parties need X25519 secret material. Possession of the topic remains read capability.                                   |
+| Direct-message confidentiality and authenticity | Direct message contents are signed by the sender and sealed to the recipient's X25519 key.                                           | Does not provide post-compromise security; see below.                                                                        |
+| File confidentiality and integrity              | Files are AES-GCM encrypted before upload; the descriptor is encrypted with the message; blob IDs verify SHA-256 ciphertext content. | Anyone with the descriptor can decrypt. Blob IDs and ciphertext sizes remain visible.                                        |
+| Local blob transfer authorization               | A local transfer needs an HMAC-SHA256 link bound to version, method, ID, and expiry; comparison is constant time.                    | The local HMAC secret must be stable and private. Links are bearer capabilities until expiry.                                |
+| Relay-event integrity                           | The relay accepts only strictly parsed, Ed25519-signed events within its time window.                                                | This validates the outer relay mutation, not application meaning.                                                            |
+| Atomic relay state mutation                     | One accepted event atomically gets a topic sequence, durable receipt, and all snapshot/list mutations.                               | Storage backend correctness is required.                                                                                     |
+| Crash-safe application consumption              | An application can commit its effect and `ReceivedEvent.advanceCursor(transaction)` in one `MurmurStore` transaction.                | The application must use a genuinely atomic store transaction and advance only after its own writes.                         |
+| Reset safety                                    | A cursor outside retained history is reported as `reset`, and `sync()` cannot return it as ordinary caught-up events.                | The application must call `loadTopic()` and apply the snapshot/list before resuming incremental sync.                        |
+| Group membership evolution                      | MLS group epochs use TreeKEM state and cryptographic Commits; removed members do not receive later epoch secrets.                    | The MLS profile is not independently audited; current members can read current group data.                                   |
+| Group forward secrecy                           | Group application state advances through MLS epochs and sends ratchet state forward.                                                 | Durable prepare → persist → publish discipline is mandatory for recoverability.                                              |
+| Shared-document attribution                     | An operation's actor ID must equal the MLS-authenticated sender leaf supplied to `SharedTextDocument.apply()`.                       | This authenticates only after MLS delivery has been authenticated.                                                           |
 
-## What is not protected
+## The two current design properties that need care
 
-### Metadata
+### Pairwise topics are capability addresses
 
-The relay sees, and can retain indefinitely:
+Topic reads have no identity authentication. Knowing an ID is enough to call
+`readState`, `readList`, or `readEvents`. This is intentional and supports
+opaque shared objects, but it means a public-key-derived direct topic would be a
+privacy bug.
 
-- Topic identifiers — opaque hashes, but **stable and linkable over time**
-- Sender public keys on every envelope, since it verifies signatures
-- Explicit recipient identifiers
-- Message and blob sizes, and precise timing
-- Which identities subscribe to which topics
+Every relay event must expose `author.signingKey` for relay signature
+verification. If direct traffic used a topic derived from a recipient's public
+identity key, anyone holding that public token could read the topic and learn
+which keys write there and when. `pairwiseTopic(self, peer)` instead derives
+the address from an X25519 shared secret plus a fixed domain and both public
+encryption keys. Only the two peers can calculate it.
 
-This is enough to reconstruct a social graph and communication patterns. Murmur
-protects _content_, not _who talks to whom_. There is no cover traffic, no
-padding by default, and no mixing. If metadata resistance matters, run your own
-relay or use a different system.
+Do not place a pairwise topic ID in logs, URLs, telemetry, or an untrusted
+application database unless that disclosure is acceptable.
 
-`prepareSend` accepts a padding argument for MLS application messages, which
-blunts size correlation but does not remove it.
+### Cursors protect durability; they are not acknowledgements
 
-### Key exchange is the weak point
+The relay has no delivery queue and no `acknowledge()` operation. A client keeps
+one local cursor per relay/topic and an event can advance it only inside a
+`MurmurStore` transaction.
 
-Identity tokens are exchanged out of band, and **Murmur does not verify them**.
-An attacker who controls that channel can substitute their own token and mount a
-classic machine-in-the-middle attack. Everything downstream is then correctly
-encrypted to the wrong party.
+```text
+received event
+    |
+    +-- transaction commits application record + next cursor -> not delivered again
+    |
+    `-- transaction fails or process crashes -> old cursor -> event is read again
+```
 
-There is no safety-number comparison, no key-transparency log, and no trust-on-
-first-use warning on key change. Verify tokens over a channel you trust
-independently.
+This protects against a crash between accepting an event and recording its
+application effect. It does not create global exactly-once delivery across
+relays or replace application-level replay handling. Direct messages provide a
+separate sender/message-ID replay marker; MLS channels persist their own replay
+fingerprints and epoch checkpoints.
 
-### Compromise
+Event logs are bounded. An old or invalid future cursor produces `reset`, not a
+silent empty read. The client must atomically replace its materialized state
+from the snapshot and full list using `loadTopic()`.
 
-- **No post-compromise security for direct messages.** They use sealed boxes to
-  a long-term X25519 key, not a Double Ratchet. An attacker who steals a private
-  encryption key can decrypt all past _and future_ direct messages to that
-  identity. Groups do better: MLS epochs give forward secrecy across membership
-  changes.
-- **No secure deletion.** `zeroBytes` clears buffers, but the runtime may have
-  copied them, and durable state is only as protected as the underlying store.
-- **No key rotation.** An identity's keys are fixed for its lifetime; rotation
-  means a new identity.
+## Direct messages are not post-compromise secure
 
-### Availability
+Direct messages use a fresh ephemeral sender X25519 key, but they are sealed to
+the recipient's long-term X25519 identity key. If that recipient encryption key
+is stolen, an attacker who recorded direct-message envelopes can decrypt past
+messages and can decrypt future messages sent to that unchanged key.
 
-Relays promise nothing. A malicious relay can withhold messages indefinitely,
-and clients cannot distinguish that from a quiet peer. Publishing to multiple
-relays mitigates this.
+There is no direct-message key rotation or post-compromise recovery mechanism.
+Groups do better because MLS evolves epoch state and rekeys on membership
+changes, but that does not make direct conversations forward secret.
 
-## Operator exposure
+## Identity tokens are the root of trust
 
-Running a public relay means accepting writes from anyone, because keypairs are
-free. The relay has **no quota system**. Without rate limiting, a public relay
-can be filled at will. See
-[DEPLOYMENT.md](DEPLOYMENT.md#running-a-public-relay).
+Identity tokens are exchanged out of band. Murmur does not verify them, compare
+safety numbers, provide key transparency, or bind them to accounts. An attacker
+who substitutes their own token in that exchange can establish separately valid
+contacts with both parties and defeat all downstream authenticity and
+confidentiality expectations.
 
-Blob reads are unauthenticated: possession of the content hash is the
-capability. The bytes are useless without the descriptor from the message that
-referenced them, but a hash leak means the ciphertext is fetchable.
+Use an authenticated out-of-band channel appropriate to the application. The
+protocol cannot compensate for a machine-in-the-middle there.
 
-## Implementation practices
+## Metadata exposure
 
-- All key material is `Uint8Array`; base64url only at boundaries.
-- Secrets are zeroed with `zeroBytes` on the failure path as well as success.
-- Constant-time comparison for authentication tags.
-- Every input is validated and size-bounded before any cryptographic operation.
-- Cryptographic failures **throw**; there are no null returns to ignore.
-- Only `@noble/*` primitives — no hand-rolled cryptography.
-- Sizes are bounded at every layer to limit memory-exhaustion attacks.
+Encryption does not hide:
 
-## Reporting
+| Visible to relay/operator                     | Why it is visible                                 |
+| --------------------------------------------- | ------------------------------------------------- |
+| Topic IDs                                     | Routing and storage keys.                         |
+| Outer `author.signingKey`                     | Required to verify relay-event signatures.        |
+| Event timing and request timing               | Necessary to serve requests.                      |
+| Event, snapshot, list-element, and blob sizes | Necessary to transmit and enforce limits.         |
+| Blob IDs                                      | SHA-256 content addresses for ciphertext storage. |
 
-Report suspected vulnerabilities privately to the maintainer rather than opening
-a public issue.
+Topic IDs are stable while a topic exists and can link related traffic. Pairwise
+topics keep this metadata from people who have only public identity tokens, not
+from the two participants, the relay operator, or anyone to whom a participant
+leaks the topic.
+
+## Relay and storage limits
+
+- A relay can deny service by refusing, deleting, delaying, or replaying
+  ciphertext. Cryptography does not guarantee delivery or availability.
+- The relay cannot tell a new device the intent of application state. Clients
+  must correctly apply snapshots and lists after a reset.
+- Topics without a successful publish for 30 days are deleted, including their
+  snapshot, list, retained events, and idempotency receipts. Event bodies
+  normally expire after seven days.
+- Blob retention is backend-owned and independent of topic retention. Do not
+  assume a blob has the same lifetime as the message that referenced it.
+- The local backend receives ciphertext bytes and stores them on its filesystem.
+  The S3 backend keeps transfer bytes out of the relay process, but its SigV4
+  behavior has not been tested against a live bucket or MinIO.
+
+## Rate-limit scope
+
+The default rate limiter is an in-memory, per-process token bucket. It limits
+by direct client IP and, for valid event publication, also by outer author
+signing key. It ignores `X-Forwarded-For` unless trusted proxies are explicitly
+configured.
+
+This prevents basic single-process abuse and makes spoofed forwarded headers
+ineffective by default. It is not a distributed rate limit: with `N` instances,
+the effective allowance is approximately `N` times larger. A shared
+`RateLimiter` implementation is needed for a cluster-wide policy.
+
+## Not protected
+
+Murmur does not currently protect against:
+
+- an unverified or substituted identity token;
+- compromise of an endpoint that holds identity keys, local application state,
+  group state, or decrypted messages;
+- past or future direct-message disclosure after compromise of the recipient
+  long-term X25519 key;
+- traffic analysis from the visible metadata above;
+- relay or network denial of service, censorship, or state deletion;
+- disclosure of a topic ID to an unintended reader;
+- a malicious current group member reading current group data or writing
+  application content it is otherwise authorized to send;
+- identity-key rotation or automatic recovery after key loss;
+- a live S3/MinIO integration validation of the custom SigV4 implementation;
+- a live PostgreSQL validation of the pool adapter, cross-instance
+  `LISTEN`/`NOTIFY`, or advisory-lock contention;
+- independent cryptographic review or an existing CI safety net.
+
+Applications must also choose safe local storage, backups, logging, token
+exchange, TLS termination, and operational access controls. Those choices are
+outside the Murmur protocol.
