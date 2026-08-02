@@ -24,6 +24,7 @@
     },
     "scripts": {
         "build": "tsc -p tsconfig.build.json",
+        "build:binary": "bun scripts/buildBinary.ts",
         "check": "tsc --noEmit -p tsconfig.json",
         "start": "node dist/main.js",
         "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run",

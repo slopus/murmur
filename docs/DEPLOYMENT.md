@@ -29,6 +29,34 @@ Point the CLI at it:
 murmur sign-in --first-name Alice --relay http://127.0.0.1:8787
 ```
 
+## Standalone Bun executable
+
+Bun 1.3.6 or later can compile the relay, its JavaScript dependencies, and the
+Bun runtime into one platform-specific executable:
+
+```bash
+pnpm --filter @murmur/relay build:binary
+./packages/murmur-relay/dist/murmur-relay
+```
+
+The build-only adapter maps the relay's `node:sqlite` usage onto Bun's embedded
+SQLite implementation. It does not change the ordinary Node build. The same
+environment variables configure both executables.
+
+To cross-compile, pass one of Bun's compile targets and a distinct output path:
+
+```bash
+pnpm --filter @murmur/relay build:binary -- \
+    --target bun-linux-x64 \
+    --outfile dist/murmur-relay-linux-x64
+```
+
+The output embeds Bun and all bundled JavaScript, but it is not a fully
+statically linked binary: standard operating-system libraries remain dynamic.
+It also does not embed mutable state or configuration. The SQLite database,
+local blob directory, Postgres service, S3 service, secrets, and environment
+remain external.
+
 ## Environment
 
 The standalone executable reads these variables from

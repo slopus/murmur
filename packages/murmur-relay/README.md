@@ -76,6 +76,31 @@ The S3 backend requires `MURMUR_RELAY_S3_ENDPOINT`,
 local secret is absent, startup warns and generates an ephemeral secret; links
 then stop working after restart and cannot be shared across relay instances.
 
+## Standalone Bun executable
+
+Bun 1.3.6 or later can embed the relay, its JavaScript dependencies, and the
+Bun runtime in one platform-specific executable:
+
+```bash
+pnpm --filter @murmur/relay build:binary
+./packages/murmur-relay/dist/murmur-relay
+```
+
+The build replaces `node:sqlite` with a narrow `bun:sqlite` compatibility
+adapter inside the executable. The ordinary Node build remains unchanged.
+Cross-compile by passing a Bun compile target and a distinct output path:
+
+```bash
+pnpm --filter @murmur/relay build:binary -- \
+    --target bun-linux-x64 \
+    --outfile dist/murmur-relay-linux-x64
+```
+
+This is a standalone executable, not a fully statically linked binary. It
+still uses standard operating-system libraries, and configuration, the SQLite
+database, local blobs, Postgres, and S3 remain external. Build one executable
+for each target operating system and CPU architecture.
+
 Embedders can compose the same pieces directly:
 
 ```ts
