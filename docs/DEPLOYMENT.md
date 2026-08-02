@@ -57,6 +57,33 @@ It also does not embed mutable state or configuration. The SQLite database,
 local blob directory, Postgres service, S3 service, secrets, and environment
 remain external.
 
+## Container image
+
+Every version release publishes a multi-architecture image:
+
+```text
+ghcr.io/slopus/murmur-relay:<version>
+    +-- linux/amd64
+    `-- linux/arm64
+```
+
+Run the SQLite and local-blob configuration with a persistent named volume:
+
+```bash
+docker volume create murmur-relay-data
+docker run --detach \
+    --name murmur-relay \
+    --restart unless-stopped \
+    --publish 8787:8787 \
+    --volume murmur-relay-data:/data \
+    --env MURMUR_RELAY_BLOB_SECRET="<stable-secret-at-least-32-characters>" \
+    ghcr.io/slopus/murmur-relay:latest
+```
+
+The image runs as UID/GID 65532 and writes the SQLite database and local blobs
+under `/data`. A bind mount must be writable by that identity. The image does
+not terminate TLS; put it behind an HTTPS reverse proxy for public access.
+
 ## Environment
 
 The standalone executable reads these variables from

@@ -1,0 +1,8 @@
+.context
+.env
+.git
+.pnpm-store
+**/.DS_Store
+**/dist
+**/node_modules
+*.log

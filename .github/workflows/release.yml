@@ -1,0 +1,184 @@
+name: Release
+
+on:
+    push:
+        tags:
+            - "v*"
+
+concurrency:
+    group: release-${{ github.ref }}
+    cancel-in-progress: false
+
+env:
+    IMAGE_NAME: ghcr.io/slopus/murmur-relay
+    PNPM_VERSION: 10.28.1
+
+jobs:
+    verify:
+        name: Verify release
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+        outputs:
+            npm-tag: ${{ steps.release-version.outputs.npm-tag }}
+            prerelease: ${{ steps.release-version.outputs.prerelease }}
+        steps:
+            - uses: actions/checkout@v4
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: ${{ env.PNPM_VERSION }}
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+            - run: pnpm install --frozen-lockfile
+            - name: Verify tag matches package version
+              id: release-version
+              shell: bash
+              run: |
+                  package_version="$(node -p "require('./packages/murmur-core/package.json').version")"
+                  if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
+                      echo "Release tag $GITHUB_REF_NAME does not match @slopus/murmur@$package_version" >&2
+                      exit 1
+                  fi
+                  if [[ "$package_version" == *-* ]]; then
+                      echo "npm-tag=next" >> "$GITHUB_OUTPUT"
+                      echo "prerelease=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "npm-tag=latest" >> "$GITHUB_OUTPUT"
+                      echo "prerelease=false" >> "$GITHUB_OUTPUT"
+                  fi
+            - run: pnpm test
+            - run: pnpm typecheck
+            - run: pnpm lint
+            - run: pnpm format:check
+            - name: Build and inspect npm tarball
+              env:
+                  PACKAGE_SMOKE_DIRECTORY: ${{ runner.temp }}/murmur-package-smoke
+              run: |
+                  mkdir -p .context/release
+                  pnpm --filter @slopus/murmur pack --pack-destination .context/release
+                  tar --list --file .context/release/slopus-murmur-*.tgz
+                  mkdir -p "$PACKAGE_SMOKE_DIRECTORY"
+                  printf '{"private":true,"type":"module"}\n' > "$PACKAGE_SMOKE_DIRECTORY/package.json"
+                  pnpm --dir "$PACKAGE_SMOKE_DIRECTORY" add "$GITHUB_WORKSPACE"/.context/release/slopus-murmur-*.tgz
+                  MURMUR_PACKAGE_DIRECTORY="$PACKAGE_SMOKE_DIRECTORY" \
+                      pnpm --filter @slopus/murmur exec vitest run tests/packageCompatibility.test.ts
+
+    publish-library:
+        name: Publish client library
+        needs: verify
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            id-token: write
+        steps:
+            - uses: actions/checkout@v4
+            - uses: pnpm/action-setup@v4
+              with:
+                  version: ${{ env.PNPM_VERSION }}
+            - uses: actions/setup-node@v4
+              with:
+                  node-version: 24
+                  cache: pnpm
+                  registry-url: https://registry.npmjs.org
+            - run: pnpm install --frozen-lockfile
+            - name: Check whether npm version already exists
+              id: npm-version
+              shell: bash
+              run: |
+                  package_version="$(node -p "require('./packages/murmur-core/package.json').version")"
+                  if pnpm view "@slopus/murmur@$package_version" version --json >/dev/null 2>&1; then
+                      echo "exists=true" >> "$GITHUB_OUTPUT"
+                  else
+                      echo "exists=false" >> "$GITHUB_OUTPUT"
+                  fi
+            - name: Require npm token
+              if: steps.npm-version.outputs.exists != 'true'
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+              shell: bash
+              run: |
+                  if [ -z "$NODE_AUTH_TOKEN" ]; then
+                      echo "Repository secret NPM_TOKEN is required to publish @slopus/murmur" >&2
+                      exit 1
+                  fi
+            - name: Publish @slopus/murmur
+              if: steps.npm-version.outputs.exists != 'true'
+              env:
+                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+              run: >-
+                  pnpm --filter @slopus/murmur publish
+                  --access public
+                  --tag ${{ needs.verify.outputs.npm-tag }}
+                  --provenance
+                  --no-git-checks
+
+    publish-container:
+        name: Publish relay container
+        needs: verify
+        runs-on: ubuntu-latest
+        permissions:
+            contents: read
+            packages: write
+        steps:
+            - uses: actions/checkout@v4
+            - uses: docker/setup-qemu-action@v3
+            - uses: docker/setup-buildx-action@v3
+            - name: Log in to GitHub Container Registry
+              uses: docker/login-action@v3
+              with:
+                  registry: ghcr.io
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+            - name: Calculate image tags
+              id: metadata
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ env.IMAGE_NAME }}
+                  flavor: latest=false
+                  tags: |
+                      type=semver,pattern={{version}}
+                      type=semver,pattern={{major}}.{{minor}},enable=${{ needs.verify.outputs.prerelease != 'true' }}
+                      type=raw,value=latest,enable=${{ needs.verify.outputs.prerelease != 'true' }}
+            - name: Build and publish relay image
+              uses: docker/build-push-action@v6
+              with:
+                  context: .
+                  file: packages/murmur-relay/Dockerfile
+                  platforms: linux/amd64,linux/arm64
+                  push: true
+                  tags: ${{ steps.metadata.outputs.tags }}
+                  labels: ${{ steps.metadata.outputs.labels }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+                  provenance: mode=max
+                  sbom: true
+
+    create-release:
+        name: Create GitHub Release
+        needs:
+            - publish-library
+            - publish-container
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Create release with generated notes
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+                  GH_REPO: ${{ github.repository }}
+                  IS_PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+              shell: bash
+              run: |
+                  if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+                      release_flags=()
+                      if [ "$IS_PRERELEASE" = "true" ]; then
+                          release_flags+=(--prerelease)
+                      fi
+                      gh release create "$GITHUB_REF_NAME" \
+                          --verify-tag \
+                          --title "$GITHUB_REF_NAME" \
+                          --generate-notes \
+                          "${release_flags[@]}"
+                  fi

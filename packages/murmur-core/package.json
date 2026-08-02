@@ -92,6 +92,7 @@
         "@noble/hashes": "^1.7.1"
     },
     "devDependencies": {
+        "esbuild": "^0.28.1",
         "typescript": "^5.9.3",
         "vitest": "^3.2.7"
     },

@@ -101,6 +101,27 @@ still uses standard operating-system libraries, and configuration, the SQLite
 database, local blobs, Postgres, and S3 remain external. Build one executable
 for each target operating system and CPU architecture.
 
+## Container image
+
+Every version release publishes Linux amd64 and arm64 images to
+`ghcr.io/slopus/murmur-relay`. The image runs the standalone Bun executable as
+an unprivileged user and stores SQLite state and local blobs under `/data`.
+
+```bash
+docker volume create murmur-relay-data
+docker run --detach \
+    --name murmur-relay \
+    --restart unless-stopped \
+    --publish 8787:8787 \
+    --volume murmur-relay-data:/data \
+    --env MURMUR_RELAY_BLOB_SECRET="<stable-secret-at-least-32-characters>" \
+    ghcr.io/slopus/murmur-relay:latest
+```
+
+Use a named volume or make a bind-mounted directory writable by UID/GID 65532.
+The container serves HTTP on port 8787; terminate TLS in front of it for a
+public deployment.
+
 Embedders can compose the same pieces directly:
 
 ```ts
