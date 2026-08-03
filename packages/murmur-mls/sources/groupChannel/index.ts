@@ -132,12 +132,12 @@ export class MlsGroupChannel {
     }
 
     /**
-     * Resolve and validate a current-epoch Commit author without applying it.
+     * Parse a Commit's claimed author without authenticating the Commit.
      *
-     * Higher-level protocols use this before `handle()` to enforce a stricter
-     * committer ACL than ordinary MLS membership.
+     * This is only suitable for classifying stale payloads. Authorization must
+     * use the `committer` returned by an authenticated `handle()` delivery.
      */
-    inspectCommitAuthor(payload: Uint8Array): MlsGroupCommitAuthor {
+    parseCommitAuthor(payload: Uint8Array): MlsGroupCommitAuthor {
         if (!isPublicMlsMessage(payload)) {
             throw new Error("MLS payload is not a Commit");
         }
@@ -470,6 +470,10 @@ export class MlsGroupChannel {
                         status: "removed",
                         event: received.event,
                         fingerprint: fingerprint.slice(),
+                        committer: {
+                            sender: error.sender,
+                            signingKey: error.signingKey.slice(),
+                        },
                         markPersisted: (): void => {
                             if (state !== "staged") {
                                 throw new Error(`MLS group removal delivery is ${state}`);
@@ -494,6 +498,10 @@ export class MlsGroupChannel {
                     status: "commit",
                     event: received.event,
                     fingerprint: fingerprint.slice(),
+                    committer: {
+                        sender: transition.sender,
+                        signingKey: this.#epoch.memberSignatureKeys[transition.sender]!.slice(),
+                    },
                     persistenceGeneration: transition.persistenceGeneration,
                     serializeNextEpoch: (): Uint8Array => {
                         if (state !== "staged") {

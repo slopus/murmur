@@ -88,9 +88,14 @@ export type {
 
 /** Authenticated Commit which removes the local member from the next epoch. */
 export class MlsLocalMemberRemovedError extends Error {
-    constructor() {
+    readonly sender: number;
+    readonly signingKey: Uint8Array;
+
+    constructor(sender: number, signingKey: Uint8Array) {
         super("Local member was removed by MLS Commit");
         this.name = "MlsLocalMemberRemovedError";
+        this.sender = sender;
+        this.signingKey = signingKey.slice();
     }
 }
 export { decodeMlsAddCommit, encodeMlsAddCommit } from "./impl/codec.js";
@@ -818,7 +823,7 @@ export function openMlsTreeCommit(options: OpenMlsTreeCommitOptions): MlsApplied
             excludedNewLeaves: new Set(proposals.addedLeaves),
             authenticateCredential: options.authenticateCredential,
         });
-        throw new MlsLocalMemberRemovedError();
+        throw new MlsLocalMemberRemovedError(message.sender, senderLeaf.signatureKey);
     }
     const candidateNodes = proposals.tree.nodes;
     const usablePrivateKeys = options.privateKeys.filter(

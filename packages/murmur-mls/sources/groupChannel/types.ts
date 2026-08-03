@@ -43,6 +43,7 @@ export interface StagedMlsGroupCommitDelivery {
     readonly event: ReceivedEvent["event"];
     readonly fingerprint: Uint8Array;
     readonly persistenceGeneration: bigint;
+    readonly committer: MlsGroupCommitAuthor;
     /** Sensitive staged next-epoch checkpoint for atomic adoption. */
     serializeNextEpoch(): Uint8Array;
     /** Confirm the checkpoint and Commit marker committed atomically. */
@@ -65,6 +66,7 @@ export interface RemovedMlsGroupDelivery {
     readonly status: "removed";
     readonly fingerprint: Uint8Array;
     readonly event: ReceivedEvent["event"];
+    readonly committer: MlsGroupCommitAuthor;
     /** Confirm durable group retirement before secret destruction. */
     markPersisted(): void;
     /** Release the current epoch when durable retirement failed. */

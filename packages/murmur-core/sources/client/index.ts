@@ -192,8 +192,11 @@ export class MurmurClient {
         if (!/^[A-Za-z0-9_.:-]{1,512}$/.test(topic)) {
             throw new Error("Invalid relay topic");
         }
-        for (const relayId of this.relayIds) {
-            await transaction.delete(this.#cursorKey(relayId, topic));
+        const cursors = await transaction.list(this.#cursorPrefix);
+        for (const key of cursors.keys()) {
+            if (key.endsWith(`/${topic}`)) {
+                await transaction.delete(key);
+            }
         }
     }
 

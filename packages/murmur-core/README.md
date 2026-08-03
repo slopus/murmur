@@ -58,22 +58,25 @@ subscription or recipient queue state.
 
 Domain APIs are exported from the package root and matching subpaths:
 
-| Import                      | Main API                                                                                  |
-| --------------------------- | ----------------------------------------------------------------------------------------- |
-| `@slopus/murmur/client`     | `MurmurClient`, `SyncResult`, `ReceivedEvent`, `PublishResult`, retained outbox retries   |
-| `@slopus/murmur/crypto`     | Ed25519/X25519 identities, sealed boxes, signing, hashing, secret destruction             |
-| `@slopus/murmur/identity`   | identity tokens, first-contact inbox, `pairwiseTopic`, profiles, `FriendBook`             |
-| `@slopus/murmur/messaging`  | direct-message/file encryption, stable list IDs, atomic replay/cursor acceptance          |
-| `@slopus/murmur/mls`        | epochs, KeyPackages, Welcome, TreeKEM Commits, applications, and `MlsGroupChannel`        |
-| `@slopus/murmur/transport`  | fixed relay types, canonical signed events, `HttpRelayTransport`, snapshot/list/log reads |
-| `@slopus/murmur/storage`    | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                    |
-| `@slopus/murmur/document`   | convergent shared-text operations                                                         |
-| `@slopus/murmur/directChat` | text DM engine, two-copy history, retry, backfill, replay, and quarantine                 |
+| Import                         | Main API                                                                                  |
+| ------------------------------ | ----------------------------------------------------------------------------------------- |
+| `@slopus/murmur/client`        | `MurmurClient`, `SyncResult`, `ReceivedEvent`, `PublishResult`, retained outbox retries   |
+| `@slopus/murmur/crypto`        | Ed25519/X25519 identities, sealed boxes, signing, hashing, secret destruction             |
+| `@slopus/murmur/identity`      | identity tokens, first-contact inbox, `pairwiseTopic`, profiles, `FriendBook`             |
+| `@slopus/murmur/messaging`     | direct-message/file encryption, stable list IDs, atomic replay/cursor acceptance          |
+| `@slopus/murmur/mls`           | epochs, KeyPackages, Welcome, TreeKEM Commits, applications, and `MlsGroupChannel`        |
+| `@slopus/murmur/transport`     | fixed relay types, canonical signed events, `HttpRelayTransport`, snapshot/list/log reads |
+| `@slopus/murmur/storage`       | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                    |
+| `@slopus/murmur/document`      | convergent shared-text operations                                                         |
+| `@slopus/murmur/directChat`    | text DM engine, two-copy history, retry, backfill, replay, and quarantine                 |
+| `@slopus/murmur/sharedSession` | owner-controlled opaque agent-session sharing, history, posts, revoke, and stop           |
 
 The core client surface is:
 
 ```ts
 client.subscribe(topic): Promise<void>;
+client.unsubscribe(topic): void;
+client.retireTopicCursors(transaction, topic): Promise<void>;
 client.publish(topic, payload, { snapshot?, list? }?): Promise<PublishResult>;
 client.publishUnlinkable(topic, payload, mutations?): Promise<PublishResult>;
 client.publishEvent(event): Promise<PublishResult>;

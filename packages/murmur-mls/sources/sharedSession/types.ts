@@ -179,6 +179,7 @@ export type SharedSessionEventResult =
               | "commit"
               | "removed"
               | "deferred"
+              | "quarantined"
               | "terminated";
       };
 

@@ -2,6 +2,8 @@ import {
     MemoryMurmurStore,
     MurmurClient,
     createRelayBlob,
+    createRelayEvent,
+    decodeBase64Url,
     equalRelayEvents,
     generateIdentityKeyPair,
     identityId,
@@ -16,6 +18,8 @@ import {
 } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { createMlsKeyPackage, destroyMlsKeyPackageBundle } from "../../keyPackage/index.js";
+import { decodeMlsTreeCommit, encodeMlsTreeCommit } from "../../commit/index.js";
+import { mlsGroupTopic } from "../../groupChannel/index.js";
 import {
     SharedSessionMember,
     SharedSessionOwner,
@@ -91,6 +95,10 @@ class MemoryRelayTransport implements RelayTransport {
             throw new Error("blob size mismatch");
         }
         return createRelayBlob(bytes);
+    }
+
+    events(topic: string): readonly SignedRelayEvent[] {
+        return [...(this.#events.get(topic) ?? [])];
     }
 }
 
@@ -378,6 +386,73 @@ describe("shared agent sessions", () => {
             shareSequence: 2,
             payload: { kind: "friend-post", postId: "caller-post-1" },
         });
+
+        owner.destroy();
+        friend.destroy();
+        destroyMlsKeyPackageBundle(bundle);
+    });
+
+    it("defers a structurally valid but unauthenticated forged Commit", async () => {
+        const relay = new MemoryRelayTransport();
+        const ownerIdentity = generateIdentityKeyPair();
+        const friendIdentity = generateIdentityKeyPair();
+        const attackerIdentity = generateIdentityKeyPair();
+        const ownerStore = new MemoryMurmurStore();
+        const friendStore = new MemoryMurmurStore();
+        const ownerClient = client(ownerIdentity, ownerStore, relay);
+        const friendClient = client(friendIdentity, friendStore, relay);
+        const ownerCaptured = captured();
+        const friendCaptured = captured();
+        let invitation: SharedSessionInvitation | undefined;
+        const bundle = createMlsKeyPackage(friendIdentity);
+        const owner = await SharedSessionOwner.create("share_forged_commit", {
+            identity: ownerIdentity,
+            client: ownerClient,
+            store: ownerStore,
+            callbacks: callbacks(ownerCaptured),
+            entrySource: emptySource(),
+            invitationDelivery: {
+                deliver: async (value) => {
+                    invitation = value;
+                },
+            },
+        });
+        const friend = await SharedSessionMember.join({
+            identity: friendIdentity,
+            client: friendClient,
+            store: friendStore,
+            callbacks: callbacks(friendCaptured),
+            invitation: (
+                await owner.invite({
+                    identity: friendIdentity,
+                    keyPackage: bundle.keyPackage,
+                })
+            ).invitations[0]!.text,
+            keyPackageBundle: bundle,
+            expectedOwner: ownerIdentity,
+        });
+        expect(invitation).toBeDefined();
+        await drain(ownerClient, owner);
+        await drain(friendClient, friend);
+
+        const topic = mlsGroupTopic(decodeBase64Url(owner.groupId));
+        const originalCommit = relay.events(topic)[0]!;
+        const parsed = decodeMlsTreeCommit(originalCommit.payload);
+        const forgedPayload = encodeMlsTreeCommit({
+            ...parsed,
+            sender: 1,
+        });
+        await relay.publish(createRelayEvent(attackerIdentity, topic, forgedPayload));
+        const sync = await ownerClient.sync();
+        expect(sync.status).toBe("events");
+        if (sync.status !== "events") {
+            throw new Error("unexpected reset");
+        }
+        expect(sync.events).toHaveLength(1);
+        await expect(owner.handleEvent(sync.events[0]!)).resolves.toEqual({
+            status: "deferred",
+        });
+        expect(ownerCaptured.terminations).toEqual([]);
 
         owner.destroy();
         friend.destroy();

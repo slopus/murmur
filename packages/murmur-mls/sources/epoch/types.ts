@@ -62,6 +62,8 @@ export type MlsAddTreeValidator = (
 
 /** Explicit lifecycle for a staged next epoch and external tree. */
 export interface MlsEpochTransition {
+    /** Authenticated MLS leaf which authored this transition. */
+    readonly sender: number;
     /** Monotonic generation of the staged next-epoch checkpoint. */
     readonly persistenceGeneration: bigint;
     /** Serialize the staged next epoch before publishing its Commit. */

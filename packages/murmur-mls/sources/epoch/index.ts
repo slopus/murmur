@@ -227,17 +227,20 @@ class StagedEpochTransition implements MlsEpochTransition {
     readonly #next: MlsEpochState;
     readonly #external: MlsExternalTreeTransition | undefined;
     readonly #onSettle: () => void;
+    readonly sender: number;
     #state: "pending" | "committing" | "cancelling" | "settled" = "pending";
 
     constructor(
         current: MlsEpochState,
         next: MlsEpochState,
         external: MlsExternalTreeTransition | undefined,
+        sender: number,
         onSettle: () => void,
     ) {
         this.#current = current;
         this.#next = next;
         this.#external = external;
+        this.sender = sender;
         this.#onSettle = onSettle;
     }
 
@@ -797,7 +800,7 @@ export class MlsEpochState {
                 interimTranscriptHash: applied.interimTranscriptHash,
                 persistenceGeneration: this.#nextPersistenceGeneration(),
             });
-            return this.#stage(next, tree);
+            return this.#stage(next, tree, applied.message.sender);
         } catch (error: unknown) {
             try {
                 tree.cancel();
@@ -905,7 +908,7 @@ export class MlsEpochState {
                 interimTranscriptHash: applied.interimTranscriptHash,
                 persistenceGeneration: this.#nextPersistenceGeneration(),
             });
-            return this.#stage(next);
+            return this.#stage(next, undefined, applied.message.sender);
         } catch (error: unknown) {
             next?.destroy();
             this.#abortTransitionPreparation();
@@ -962,12 +965,16 @@ export class MlsEpochState {
         }
     }
 
-    #stage(next: MlsEpochState, external?: MlsExternalTreeTransition): StagedEpochTransition {
+    #stage(
+        next: MlsEpochState,
+        external?: MlsExternalTreeTransition,
+        sender: number = this.#localLeaf,
+    ): StagedEpochTransition {
         if (this.#transitionState !== "preparing") {
             next.destroy();
             throw new Error("MLS epoch transition was not reserved");
         }
-        const transition = new StagedEpochTransition(this, next, external, () => {
+        const transition = new StagedEpochTransition(this, next, external, sender, () => {
             this.#pendingTransition = undefined;
             this.#transitionState = "idle";
         });

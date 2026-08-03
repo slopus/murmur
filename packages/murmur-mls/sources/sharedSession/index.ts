@@ -9,6 +9,7 @@ import {
     hashBytes,
     identityId,
     randomBytes,
+    utf8Decode,
     utf8Encode,
     zeroBytes,
     type DirectChat,
@@ -160,6 +161,45 @@ function sessionPrefix(localId: string, shareId: string): string {
 
 function terminalKey(localId: string, shareId: string): string {
     return `${SESSION_PREFIX}/${localId}/${shareKeyId(shareId)}/terminal`;
+}
+
+function bindingKey(localId: string, shareId: string): string {
+    return `shared-session-binding/v1/${localId}/${shareKeyId(shareId)}`;
+}
+
+function bindingBytes(
+    state: Pick<SharedSessionState, "shareId" | "groupId" | "ownerId">,
+): Uint8Array {
+    return canonicalJsonBytes({
+        groupId: state.groupId,
+        ownerId: state.ownerId,
+        shareId: state.shareId,
+        version: 1,
+    });
+}
+
+function validateBinding(
+    bytes: Uint8Array,
+    state: Pick<SharedSessionState, "shareId" | "groupId" | "ownerId">,
+): void {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(utf8Decode(bytes)) as unknown;
+    } catch {
+        throw new SharedSessionIdentityCollisionError();
+    }
+    if (
+        typeof parsed !== "object" ||
+        parsed === null ||
+        Array.isArray(parsed) ||
+        (parsed as Record<string, unknown>).version !== 1 ||
+        (parsed as Record<string, unknown>).shareId !== state.shareId ||
+        (parsed as Record<string, unknown>).groupId !== state.groupId ||
+        (parsed as Record<string, unknown>).ownerId !== state.ownerId ||
+        !equalBytes(bindingBytes(state), bytes)
+    ) {
+        throw new SharedSessionIdentityCollisionError();
+    }
 }
 
 function outboxPrefix(localId: string, shareId: string): string {
@@ -836,24 +876,31 @@ abstract class SharedSessionBase {
         }
         if (this.isCommit(received.event.payload)) {
             const commit = decodeMlsTreeCommit(received.event.payload);
-            let author: ReturnType<MlsGroupChannel["inspectCommitAuthor"]>;
+            let author: ReturnType<MlsGroupChannel["parseCommitAuthor"]>;
             try {
-                author = this.channel.inspectCommitAuthor(received.event.payload);
+                author = this.channel.parseCommitAuthor(received.event.payload);
             } catch {
                 author = { sender: -1, signingKey: new Uint8Array() };
             }
             if (!equalBytes(author.signingKey, this.record.owner.signingKey)) {
-                const error = new SharedSessionProtocolError(
-                    "unauthorized-commit",
-                    "A non-owner attempted a shared-session MLS Commit",
-                );
-                await this.terminate(received, "protocol-error", error);
-                return { status: "terminated" };
+                // Parsing is intentionally not authorization. Authentication
+                // happens inside `channel.handle()` before the ACL below.
+                author = { sender: -1, signingKey: new Uint8Array() };
             }
-            if (commit.epoch < this.channel.epoch) {
+            if (
+                commit.epoch < this.channel.epoch &&
+                equalBytes(author.signingKey, this.record.owner.signingKey)
+            ) {
                 await this.#store.transaction(received.advanceCursor);
                 return { status: "duplicate" };
             }
+        }
+        if (
+            this.record.history !== undefined &&
+            this.record.history.pendingEntries.length >= MAX_SHARED_SESSION_PENDING_ENTRIES &&
+            !this.isCommit(received.event.payload)
+        ) {
+            return { status: "deferred" };
         }
         const handled = this.channel.handle(received);
         if (handled === undefined) {
@@ -867,6 +914,15 @@ abstract class SharedSessionBase {
             return { status: "duplicate" };
         }
         if (handled.status === "removed") {
+            if (!equalBytes(handled.committer.signingKey, this.record.owner.signingKey)) {
+                handled.cancel();
+                const error = new SharedSessionProtocolError(
+                    "unauthorized-commit",
+                    "A non-owner attempted a shared-session MLS Commit",
+                );
+                await this.terminate(received, "protocol-error", error);
+                return { status: "terminated" };
+            }
             await this.#store.transaction(async (transaction) => {
                 await this.#callbacks.terminate(transaction, {
                     shareId: this.shareId,
@@ -882,6 +938,15 @@ abstract class SharedSessionBase {
             return { status: "removed" };
         }
         if (handled.status === "commit") {
+            if (!equalBytes(handled.committer.signingKey, this.record.owner.signingKey)) {
+                handled.cancel();
+                const error = new SharedSessionProtocolError(
+                    "unauthorized-commit",
+                    "A non-owner attempted a shared-session MLS Commit",
+                );
+                await this.terminate(received, "protocol-error", error);
+                return { status: "terminated" };
+            }
             const checkpoint = handled.serializeNextEpoch();
             const next: DurableSharedSessionRecord = {
                 ...this.record,
@@ -908,6 +973,7 @@ abstract class SharedSessionBase {
         const checkpoint = handled.serializeEpoch();
         let resultStatus: SharedSessionEventResult["status"] = "duplicate";
         let terminateAfter = false;
+        let ownerAuthored = false;
         try {
             const senderKey = this.channel.memberSignatureKeys[handled.message.sender];
             if (senderKey === undefined) {
@@ -916,10 +982,37 @@ abstract class SharedSessionBase {
                     "Shared-session frame sender is not an active MLS member",
                 );
             }
-            const frame = decodeSharedSessionFrame(
-                handled.message.applicationData,
-                this.record.owner,
-            );
+            ownerAuthored = equalBytes(senderKey, this.record.owner.signingKey);
+            let frame: ReturnType<typeof decodeSharedSessionFrame>;
+            try {
+                frame = decodeSharedSessionFrame(
+                    handled.message.applicationData,
+                    this.record.owner,
+                );
+            } catch (error: unknown) {
+                if (
+                    error instanceof SharedSessionProtocolError &&
+                    !equalBytes(senderKey, this.record.owner.signingKey)
+                ) {
+                    const next: DurableSharedSessionRecord = {
+                        ...this.record,
+                        epochState: checkpoint,
+                        persistenceGeneration: handled.persistenceGeneration,
+                        appliedApplicationFingerprints: includeFingerprint(
+                            this.channel.appliedApplicationFingerprints,
+                            handled.fingerprint,
+                        ),
+                    };
+                    await this.#store.transaction(async (transaction) => {
+                        await this.saveRecord(transaction, next);
+                        await handled.advanceCursor(transaction);
+                    });
+                    this.record = next;
+                    handled.markPersisted();
+                    return { status: "quarantined" };
+                }
+                throw error;
+            }
             if (!sameGroupAndShare(this.record, frame)) {
                 throw new SharedSessionProtocolError(
                     "invalid-frame",
@@ -963,15 +1056,6 @@ abstract class SharedSessionBase {
                                 duplicate.shareSequence !== frame.entry.shareSequence)
                         ) {
                             throw new SharedSessionEntryCollisionError();
-                        }
-                        if (
-                            duplicate === undefined &&
-                            history.pendingEntries.length >= MAX_SHARED_SESSION_PENDING_ENTRIES
-                        ) {
-                            throw new SharedSessionProtocolError(
-                                "buffer-exhausted",
-                                "Shared-session live tail buffer is full",
-                            );
                         }
                         next = {
                             ...next,
@@ -1045,76 +1129,89 @@ abstract class SharedSessionBase {
                             shareId: this.shareId,
                             reason: "ended",
                         });
-                        await transaction.delete(this.#recordKey);
                         terminateAfter = true;
                         resultStatus = "terminated";
                     }
                 } else {
                     if (equalBytes(senderKey, this.record.owner.signingKey)) {
-                        throw new SharedSessionProtocolError(
-                            "grant-mismatch",
-                            "Owner cannot create a friend-post frame",
+                        resultStatus = "quarantined";
+                    } else {
+                        const peerId = identityId({ signingKey: senderKey });
+                        const grant = next.state.members.find(
+                            (member) =>
+                                member.peerId === peerId &&
+                                member.status === "active" &&
+                                member.grantEpoch === frame.grantEpoch,
                         );
-                    }
-                    const peerId = identityId({ signingKey: senderKey });
-                    const grant = next.state.members.find(
-                        (member) =>
-                            member.peerId === peerId &&
-                            member.status === "active" &&
-                            member.grantEpoch === frame.grantEpoch,
-                    );
-                    if (grant === undefined) {
-                        throw new SharedSessionProtocolError(
-                            "grant-mismatch",
-                            "Friend post does not match an active owner grant",
-                        );
-                    }
-                    if (next.role === "owner") {
-                        const post: SharedSessionPost = {
-                            shareId: this.shareId,
-                            authenticatedPeerId: peerId,
-                            shareMemberId: grant.shareMemberId,
-                            grantEpoch: grant.grantEpoch,
-                            postId: frame.postId,
-                            timestamp: frame.timestamp,
-                            text: frame.text,
-                        };
-                        const key = postKey(
-                            this.#localId,
-                            this.shareId,
-                            peerId,
-                            grant.grantEpoch,
-                            frame.postId,
-                        );
-                        const fingerprint = hashBytes(handled.message.applicationData);
-                        const existing = await transaction.get(key);
-                        if (existing !== undefined && !equalBytes(existing, fingerprint)) {
-                            throw new SharedSessionProtocolError(
-                                "content-collision",
-                                "Shared-session friend post ID collision",
+                        if (grant === undefined) {
+                            resultStatus = "quarantined";
+                        } else if (next.role === "owner") {
+                            const post: SharedSessionPost = {
+                                shareId: this.shareId,
+                                authenticatedPeerId: peerId,
+                                shareMemberId: grant.shareMemberId,
+                                grantEpoch: grant.grantEpoch,
+                                postId: frame.postId,
+                                timestamp: frame.timestamp,
+                                text: frame.text,
+                            };
+                            const key = postKey(
+                                this.#localId,
+                                this.shareId,
+                                peerId,
+                                grant.grantEpoch,
+                                frame.postId,
                             );
-                        }
-                        if (existing === undefined) {
-                            await this.#callbacks.persistPost(transaction, post);
-                            await transaction.set(key, fingerprint);
-                            resultStatus = "post";
+                            const fingerprint = hashBytes(handled.message.applicationData);
+                            const existing = await transaction.get(key);
+                            if (existing !== undefined && !equalBytes(existing, fingerprint)) {
+                                resultStatus = "quarantined";
+                            } else if (existing === undefined) {
+                                await this.#callbacks.persistPost(transaction, post);
+                                await transaction.set(key, fingerprint);
+                                resultStatus = "post";
+                            }
                         }
                     }
                 }
                 if (!terminateAfter) {
                     await this.saveRecord(transaction, next);
+                } else {
+                    await this.deleteProtocolRows(transaction);
                 }
                 await handled.advanceCursor(transaction);
+                if (terminateAfter) {
+                    await this.#client.retireTopicCursors(transaction, this.channel.topic);
+                }
             });
             this.record = next;
             handled.markPersisted();
             if (terminateAfter) {
+                this.#client.unsubscribe(this.channel.topic);
                 this.channel.destroy();
                 this.#destroyed = true;
             }
             return { status: resultStatus };
         } catch (error: unknown) {
             if (error instanceof SharedSessionProtocolError) {
+                if (!ownerAuthored) {
+                    const next: DurableSharedSessionRecord = {
+                        ...this.record,
+                        epochState: checkpoint,
+                        persistenceGeneration: handled.persistenceGeneration,
+                        appliedApplicationFingerprints: includeFingerprint(
+                            this.channel.appliedApplicationFingerprints,
+                            handled.fingerprint,
+                        ),
+                    };
+                    await this.#store.transaction(async (transaction) => {
+                        await this.saveRecord(transaction, next);
+                        await handled.advanceCursor(transaction);
+                    });
+                    this.record = next;
+                    handled.markPersisted();
+                    return { status: "quarantined" };
+                }
                 await this.terminate(received, "protocol-error", error, handled);
                 return { status: "terminated" };
             }
@@ -1155,6 +1252,12 @@ abstract class SharedSessionBase {
             await this.#client.retireTopicCursors(transaction, this.channel.topic);
         });
         opened?.markPersisted();
+        this.#client.unsubscribe(this.channel.topic);
+        this.channel.destroy();
+        this.#destroyed = true;
+    }
+
+    protected retireInMemory(): void {
         this.#client.unsubscribe(this.channel.topic);
         this.channel.destroy();
         this.#destroyed = true;
@@ -1207,7 +1310,8 @@ export class SharedSessionOwner extends SharedSessionBase {
         const key = recordKey(localId, shareId);
         if (
             (await options.store.get(key)) !== undefined ||
-            (await options.store.get(terminalKey(localId, shareId))) !== undefined
+            (await options.store.get(terminalKey(localId, shareId))) !== undefined ||
+            (await options.store.get(bindingKey(localId, shareId))) !== undefined
         ) {
             throw new SharedSessionIdentityCollisionError();
         }
@@ -1240,6 +1344,7 @@ export class SharedSessionOwner extends SharedSessionBase {
                     throw new SharedSessionIdentityCollisionError();
                 }
                 await transaction.set(key, encodeDurableSharedSessionRecord(record));
+                await transaction.set(bindingKey(localId, shareId), bindingBytes(state));
                 await options.callbacks.persistState(transaction, state);
             });
             const session = new SharedSessionOwner(options, record, channel);
@@ -1277,6 +1382,11 @@ export class SharedSessionOwner extends SharedSessionBase {
         ) {
             throw new SharedSessionIdentityCollisionError();
         }
+        const binding = await options.store.get(bindingKey(identityId(options.identity), shareId));
+        if (binding === undefined) {
+            throw new SharedSessionIdentityCollisionError();
+        }
+        validateBinding(binding, record.state);
         const epoch = MlsEpochState.deserialize(record.epochState, {
             localSigningSecretKey: options.identity.signingSecretKey,
             authenticateCredential: authenticateMurmurMlsCredential,
@@ -1316,6 +1426,13 @@ export class SharedSessionOwner extends SharedSessionBase {
             if (this.record.pendingRemovePeerIds.length > 0) {
                 await this.removePendingMembers(this.record.internalStatus === "stopping");
                 published += 1;
+            }
+            if (
+                this.record.internalStatus === "stopping" &&
+                !this.record.stateDirty &&
+                this.record.pendingRemovePeerIds.length === 0
+            ) {
+                await this.finalizeStop(this.record.state);
             }
         } catch (error: unknown) {
             failures.push(error instanceof Error ? error : new Error(String(error)));
@@ -1380,11 +1497,13 @@ export class SharedSessionOwner extends SharedSessionBase {
         invitees: readonly SharedSessionInvitee[],
     ): Promise<SharedSessionInviteResult> {
         this.ensureActive();
+        const existingPeers = new Set(this.record.state.members.map((member) => member.peerId));
+        const newPeerCount = invitees.filter(
+            (invitee) => !existingPeers.has(identityId(invitee.identity)),
+        ).length;
         if (
             invitees.length === 0 ||
-            invitees.length +
-                this.record.state.members.filter((member) => member.status === "active").length >
-                MAX_SHARED_SESSION_MEMBERS
+            this.record.state.members.length + newPeerCount > MAX_SHARED_SESSION_MEMBERS
         ) {
             throw new Error("Invalid shared-session invite batch size");
         }
@@ -1543,7 +1662,7 @@ export class SharedSessionOwner extends SharedSessionBase {
                 ...this.record,
                 state,
                 stateDirty: true,
-                pendingRemovePeerIds: [peerId],
+                pendingRemovePeerIds: [...new Set([...this.record.pendingRemovePeerIds, peerId])],
             };
             await this.store.transaction(async (transaction) => {
                 await this.saveRecord(transaction, this.record);
@@ -1574,10 +1693,15 @@ export class SharedSessionOwner extends SharedSessionBase {
 
     private async stopExclusive(): Promise<SharedSessionState> {
         this.ensureActive();
-        const active = this.record.state.members.filter((member) => member.status === "active");
+        const membersStillInGroup = this.channel.memberSignatureKeys.flatMap((key) =>
+            key !== undefined && !equalBytes(key, this.identity.signingKey)
+                ? [identityId({ signingKey: key })]
+                : [],
+        );
         const state: SharedSessionState = {
             ...this.record.state,
             stateSequence: this.record.state.stateSequence + 1,
+            status: "stopped",
             members: this.record.state.members.map((member) => ({
                 ...member,
                 status: "ended",
@@ -1588,7 +1712,7 @@ export class SharedSessionOwner extends SharedSessionBase {
             state,
             internalStatus: "stopping",
             stateDirty: true,
-            pendingRemovePeerIds: active.map((member) => member.peerId),
+            pendingRemovePeerIds: membersStillInGroup,
         };
         await this.store.transaction(async (transaction) => {
             await this.saveRecord(transaction, this.record);
@@ -1596,7 +1720,10 @@ export class SharedSessionOwner extends SharedSessionBase {
         });
         await this.publishStateIfDirty(true);
         await this.removePendingMembers(true);
-        const stopped: SharedSessionState = { ...state, status: "stopped" };
+        return this.finalizeStop(state);
+    }
+
+    private async finalizeStop(stopped: SharedSessionState): Promise<SharedSessionState> {
         await this.store.transaction(async (transaction) => {
             await this.callbacks.persistState(transaction, stopped);
             const rows = await transaction.list(sessionPrefix(this.localId, this.shareId));
@@ -1622,8 +1749,7 @@ export class SharedSessionOwner extends SharedSessionBase {
             internalStatus: "stopped",
             pendingRemovePeerIds: [],
         };
-        this.client.unsubscribe(this.channel.topic);
-        this.channel.destroy();
+        this.retireInMemory();
         return copyState(stopped);
     }
 
@@ -1662,16 +1788,23 @@ export class SharedSessionOwner extends SharedSessionBase {
         if (this.record.pendingRemovePeerIds.length === 0) {
             return;
         }
-        const removals = this.record.pendingRemovePeerIds.map((peerId) => {
+        const removals = this.record.pendingRemovePeerIds.flatMap((peerId) => {
             const signingKey = decodeBase64Url(peerId);
             const leaf = this.channel.memberSignatureKeys.findIndex(
                 (key) => key !== undefined && equalBytes(key, signingKey),
             );
             if (leaf < 0) {
-                throw new Error("Pending shared-session removal leaf disappeared");
+                return [];
             }
-            return { type: "remove" as const, removed: leaf };
+            return [{ type: "remove" as const, removed: leaf }];
         });
+        if (removals.length === 0) {
+            this.record = { ...this.record, pendingRemovePeerIds: [] };
+            await this.store.transaction(async (transaction) => {
+                await this.saveRecord(transaction, this.record);
+            });
+            return;
+        }
         if (stopping) {
             this.record = { ...this.record, internalStatus: "active" };
         }
@@ -1855,6 +1988,15 @@ export class SharedSessionMember extends SharedSessionBase {
                 if ((await transaction.get(key)) !== undefined) {
                     throw new SharedSessionIdentityCollisionError();
                 }
+                const binding = await transaction.get(bindingKey(localId, invitation.shareId));
+                if (binding === undefined) {
+                    await transaction.set(
+                        bindingKey(localId, invitation.shareId),
+                        bindingBytes(invitation.state),
+                    );
+                } else {
+                    validateBinding(binding, invitation.state);
+                }
                 await transaction.set(key, encodeDurableSharedSessionRecord(record));
                 await options.callbacks.persistState(transaction, invitation.state);
             });
@@ -1898,6 +2040,16 @@ export class SharedSessionMember extends SharedSessionBase {
             record.appliedCommitFingerprints,
             record.appliedApplicationFingerprints,
         );
+        if (encodeBase64Url(channel.groupId) !== record.state.groupId) {
+            channel.destroy();
+            throw new SharedSessionIdentityCollisionError();
+        }
+        const binding = await options.store.get(bindingKey(identityId(options.identity), shareId));
+        if (binding === undefined) {
+            channel.destroy();
+            throw new SharedSessionIdentityCollisionError();
+        }
+        validateBinding(binding, record.state);
         const session = new SharedSessionMember(options, record, channel);
         await session.subscribe();
         return session;
