@@ -9,6 +9,7 @@ import {
     deriveNestedTopic,
     encodeSignedRelayEventWire,
     HttpRelayTransport,
+    RelayBlobIntegrityError,
     relayEventSigningBytes,
     verifyRelayBlob,
     verifyRelayEvent,
@@ -163,6 +164,71 @@ describe("relay protocol", () => {
         await expect(corrupt.getBlob(blob.id)).rejects.toThrow("content-address");
     });
 
+    it("streams blobs within their exact expected ciphertext length", async () => {
+        const blob = createRelayBlob(utf8Encode("chunked ciphertext"));
+        const transport = new HttpRelayTransport(
+            "chunked",
+            "https://relay.test",
+            async (input, init) => {
+                const request = new Request(input, init);
+                if (new URL(request.url).pathname.endsWith("/download-link")) {
+                    return Response.json({
+                        url: "/objects/chunked",
+                        method: "GET",
+                        expiresAt: Date.now() + 1_000,
+                    });
+                }
+                return new Response(
+                    new ReadableStream<Uint8Array>({
+                        start(controller): void {
+                            controller.enqueue(blob.bytes.slice(0, 5));
+                            controller.enqueue(blob.bytes.slice(5));
+                            controller.close();
+                        },
+                    }),
+                );
+            },
+        );
+
+        await expect(transport.getBlob(blob.id, blob.bytes.length)).resolves.toEqual(blob);
+        await expect(transport.getBlob(blob.id, blob.bytes.length - 1)).rejects.toBeInstanceOf(
+            RelayBlobIntegrityError,
+        );
+    });
+
+    it("cancels an oversized blob stream before concatenating it", async () => {
+        const blob = createRelayBlob(utf8Encode("oversized stream"));
+        let cancelled = false;
+        const transport = new HttpRelayTransport(
+            "hostile",
+            "https://relay.test",
+            async (input, init) => {
+                const request = new Request(input, init);
+                if (new URL(request.url).pathname.endsWith("/download-link")) {
+                    return Response.json({
+                        url: "/objects/oversized",
+                        method: "GET",
+                        expiresAt: Date.now() + 1_000,
+                    });
+                }
+                return new Response(
+                    new ReadableStream<Uint8Array>({
+                        start(controller): void {
+                            controller.enqueue(utf8Encode("first"));
+                            controller.enqueue(utf8Encode("second"));
+                        },
+                        cancel(): void {
+                            cancelled = true;
+                        },
+                    }),
+                );
+            },
+        );
+
+        await expect(transport.getBlob(blob.id, 8)).rejects.toBeInstanceOf(RelayBlobIntegrityError);
+        expect(cancelled).toBe(true);
+    });
+
     it("requests blob links before direct upload and download transfers", async () => {
         const blob = createRelayBlob(utf8Encode("linked ciphertext"));
         const requests: Request[] = [];
@@ -211,5 +277,23 @@ describe("relay protocol", () => {
             { method: "POST", path: `/v1/blobs/${blob.id}/download-link` },
             { method: "GET", path: "/blob" },
         ]);
+    });
+
+    it("rejects credentialed, insecure, and explicit private-network external blob links", async () => {
+        const blob = createRelayBlob(utf8Encode("ciphertext"));
+        for (const url of [
+            "https://user:secret@objects.test/blob",
+            "http://objects.test/blob",
+            "https://127.0.0.1/blob",
+        ]) {
+            const transport = new HttpRelayTransport("hostile", "https://relay.test", async () =>
+                Response.json({
+                    url,
+                    method: "GET",
+                    expiresAt: Date.now() + 1_000,
+                }),
+            );
+            await expect(transport.getBlob(blob.id)).rejects.toThrow("unsafe blob link");
+        }
     });
 });

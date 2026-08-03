@@ -6,6 +6,8 @@ import {
     createRelayBlob,
     createRelayEvent,
     equalRelayEvents,
+    MAX_RELAY_BLOB_BYTES,
+    RelayBlobIntegrityError,
     verifyRelayBlob,
     verifyRelayEvent,
     type ListOperation,
@@ -14,7 +16,13 @@ import {
     type SignedRelayEvent,
     type SnapshotMutation,
 } from "../transport/index.js";
-import { encodeBase64Url, equalBytes, utf8Decode, utf8Encode } from "../utils/index.js";
+import {
+    decodeBase64Url,
+    encodeBase64Url,
+    equalBytes,
+    utf8Decode,
+    utf8Encode,
+} from "../utils/index.js";
 import { decodeOutboundRecord, encodeOutboundRecord } from "./impl/eventCodec.js";
 import type {
     LoadedTopicState,
@@ -101,8 +109,24 @@ function equalEventApplication(left: SignedRelayEvent, right: SignedRelayEvent):
     );
 }
 
+function validateRelayBlobId(id: string): void {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(id)) {
+        throw new Error("Invalid relay blob identifier");
+    }
+    try {
+        const decoded = decodeBase64Url(id);
+        if (decoded.length !== 32 || encodeBase64Url(decoded) !== id) {
+            throw new Error("Invalid relay blob identifier");
+        }
+    } catch {
+        throw new Error("Invalid relay blob identifier");
+    }
+}
+
 /** Durable topic client over one or more fixed-contract relays. */
 export class MurmurClient {
+    /** Identifiers of the configured relays, in configured order. */
+    readonly relayIds: readonly string[];
     readonly #identity: IdentityKeyPair;
     readonly #store: MurmurStore;
     readonly #transports: readonly RelayTransport[];
@@ -132,6 +156,7 @@ export class MurmurClient {
         this.#identity = options.identity;
         this.#store = options.store;
         this.#transports = [...options.transports];
+        this.relayIds = this.#transports.map((transport) => transport.id);
         this.#transportById = new Map(
             this.#transports.map((transport) => [transport.id, transport] as const),
         );
@@ -197,8 +222,36 @@ export class MurmurClient {
      *
      * Reusing the same event resumes its existing relay-acceptance record.
      */
-    async publishEvent(event: SignedRelayEvent): Promise<PublishResult> {
-        return this.#publishPreparedEvent(event, true);
+    async publishEvent(
+        event: SignedRelayEvent,
+        relayIds?: readonly string[],
+    ): Promise<PublishResult> {
+        return this.#publishPreparedEvent(event, true, relayIds);
+    }
+
+    /**
+     * Publish to exactly one relay without adding the generic retained outbox.
+     *
+     * Higher-level protocols may use this only after durably retaining their
+     * own exact event and relay progress. This prevents the generic retry loop
+     * from bypassing protocol-specific prerequisites such as blob uploads.
+     */
+    async publishEventToRelay(event: SignedRelayEvent, relayId: string): Promise<PublishResult> {
+        const transport = this.#transportById.get(relayId);
+        if (
+            transport === undefined ||
+            !verifyRelayEvent(event) ||
+            !equalBytes(event.author.signingKey, this.#identity.signingKey)
+        ) {
+            throw new Error("Prepared relay event is not owned by this Murmur client");
+        }
+        const outcome = await transport.publish(event);
+        return {
+            event,
+            publications: [{ relayId, outcome }],
+            publishedRelayIds: [relayId],
+            failedRelayIds: [],
+        };
     }
 
     /**
@@ -211,7 +264,9 @@ export class MurmurClient {
     async replaceOutboundEvent(
         previous: SignedRelayEvent,
         replacement: SignedRelayEvent,
+        relayIds?: readonly string[],
     ): Promise<PublishResult> {
+        const targetTransports = this.#targetTransports(relayIds);
         if (
             !verifyRelayEvent(previous) ||
             !verifyRelayEvent(replacement) ||
@@ -259,7 +314,12 @@ export class MurmurClient {
             await transaction.delete(previousKey);
             return [...published];
         });
-        const result = await this.#publishRecord(replacementKey, replacement, publishedRelayIds);
+        const result = await this.#publishRecord(
+            replacementKey,
+            replacement,
+            publishedRelayIds,
+            targetTransports,
+        );
         await this.#pruneOutboundHistory();
         return result;
     }
@@ -267,7 +327,9 @@ export class MurmurClient {
     async #publishPreparedEvent(
         event: SignedRelayEvent,
         requireClientAuthor: boolean,
+        relayIds?: readonly string[],
     ): Promise<PublishResult> {
+        const targetTransports = this.#targetTransports(relayIds);
         if (
             !verifyRelayEvent(event) ||
             (requireClientAuthor && !equalBytes(event.author.signingKey, this.#identity.signingKey))
@@ -286,7 +348,7 @@ export class MurmurClient {
             }
             publishedRelayIds = record.publishedRelayIds;
         }
-        const result = await this.#publishRecord(key, event, publishedRelayIds);
+        const result = await this.#publishRecord(key, event, publishedRelayIds, targetTransports);
         await this.#pruneOutboundHistory();
         return result;
     }
@@ -314,7 +376,12 @@ export class MurmurClient {
             const record = decodeOutboundRecord(value);
             try {
                 results.push(
-                    await this.#publishRecord(key, record.event, record.publishedRelayIds),
+                    await this.#publishRecord(
+                        key,
+                        record.event,
+                        record.publishedRelayIds,
+                        this.#transports,
+                    ),
                 );
             } catch (error: unknown) {
                 failures.push({
@@ -491,20 +558,54 @@ export class MurmurClient {
         return blob;
     }
 
-    /** Download a ciphertext blob from the first relay with a valid copy. */
-    async getBlob(id: string): Promise<RelayBlob | undefined> {
+    /** Upload one already content-addressed blob to exactly one configured relay. */
+    async putBlobToRelay(blob: RelayBlob, relayId: string): Promise<void> {
+        const transport = this.#transportById.get(relayId);
+        if (transport === undefined) {
+            throw new Error(`Unknown relay transport ${relayId}`);
+        }
+        if (!verifyRelayBlob(blob)) {
+            throw new Error("Relay blob failed content-address validation");
+        }
+        await transport.putBlob(blob);
+    }
+
+    /**
+     * Download a ciphertext blob from the first relay with a valid copy.
+     *
+     * Missing and temporarily unavailable relays both yield `undefined`. A
+     * corrupt or oversized response is retained as an integrity failure and
+     * thrown when no later relay supplies a valid copy.
+     */
+    async getBlob(id: string, expectedBytes?: number): Promise<RelayBlob | undefined> {
+        validateRelayBlobId(id);
+        const maximumBytes = this.#blobMaximumBytes(expectedBytes);
+        let integrityError: RelayBlobIntegrityError | undefined;
         for (const transport of this.#transports) {
             try {
-                const blob = await transport.getBlob(id);
+                const blob = await transport.getBlob(id, expectedBytes);
                 if (blob !== undefined) {
-                    if (!verifyRelayBlob(blob)) {
-                        throw new Error(`Relay ${transport.id} returned a corrupt blob`);
+                    if (
+                        blob.id !== id ||
+                        blob.bytes.length > maximumBytes ||
+                        (expectedBytes !== undefined && blob.bytes.length !== expectedBytes) ||
+                        !verifyRelayBlob(blob)
+                    ) {
+                        throw new RelayBlobIntegrityError(
+                            `Relay ${transport.id} returned a corrupt blob`,
+                        );
                     }
                     return blob;
                 }
-            } catch {
+            } catch (error) {
+                if (error instanceof RelayBlobIntegrityError) {
+                    integrityError ??= error;
+                }
                 // Try the next independently configured relay.
             }
+        }
+        if (integrityError !== undefined) {
+            throw integrityError;
         }
         return undefined;
     }
@@ -513,9 +614,10 @@ export class MurmurClient {
         key: string,
         event: SignedRelayEvent,
         previouslyPublishedRelayIds: readonly string[],
+        targetTransports: readonly RelayTransport[],
     ): Promise<PublishResult> {
         const published = new Set(previouslyPublishedRelayIds);
-        const pending = this.#transports.filter((transport) => !published.has(transport.id));
+        const pending = targetTransports.filter((transport) => !published.has(transport.id));
         const attempts = await Promise.allSettled(
             pending.map(async (transport) => ({
                 relayId: transport.id,
@@ -544,6 +646,40 @@ export class MurmurClient {
             publishedRelayIds: [...published].sort(),
             failedRelayIds: failedRelayIds.sort(),
         };
+    }
+
+    #targetTransports(relayIds: readonly string[] | undefined): readonly RelayTransport[] {
+        if (relayIds === undefined) {
+            return this.#transports;
+        }
+        if (!Array.isArray(relayIds) || relayIds.length === 0) {
+            throw new Error("Relay target identifiers must be a non-empty array");
+        }
+        const targets = new Set<string>();
+        for (const relayId of relayIds) {
+            if (typeof relayId !== "string" || !this.#transportById.has(relayId)) {
+                throw new Error(`Unknown relay transport ${String(relayId)}`);
+            }
+            if (targets.has(relayId)) {
+                throw new Error("Relay target identifiers must be unique");
+            }
+            targets.add(relayId);
+        }
+        return relayIds.map((relayId) => this.#transportById.get(relayId) as RelayTransport);
+    }
+
+    #blobMaximumBytes(expectedBytes: number | undefined): number {
+        if (
+            expectedBytes !== undefined &&
+            (!Number.isSafeInteger(expectedBytes) ||
+                expectedBytes < 0 ||
+                expectedBytes > MAX_RELAY_BLOB_BYTES)
+        ) {
+            throw new Error(
+                `Expected relay blob bytes must be from 0 through ${MAX_RELAY_BLOB_BYTES}`,
+            );
+        }
+        return expectedBytes ?? MAX_RELAY_BLOB_BYTES;
     }
 
     #cursorKey(relayId: string, topic: string): string {

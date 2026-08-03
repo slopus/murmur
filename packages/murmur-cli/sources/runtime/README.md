@@ -23,9 +23,9 @@ in one SQLite transaction. Invalid input is quarantined with that cursor in the
 same transaction. Deferred MLS values do not advance. A relay `reset` is raised
 as an explicit state-reload error rather than reported as an empty sync.
 
-The legacy attachment send path remains wire-compatible until the dedicated
-attachment-engine task; all incoming direct envelopes already use the one core
-engine acceptance path.
+All new direct messages, including attachments, use core `DirectChat`. Legacy
+CLI attachment outbox records remain readable only so an upgraded runtime can
+finish publishing messages it had already committed before this path changed.
 
 MLS publication keeps exact durable outboxes and the
 prepare → persist → publish → adopt ordering. Ambiguous publication remains

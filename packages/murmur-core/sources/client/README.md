@@ -11,6 +11,17 @@ newly signed event only when topic, author, payload, snapshot, and list
 operations are identical; only event ID, creation time, and signature may
 change.
 
+`relayIds` exposes the configured relay order. `putBlobToRelay()` and the
+optional relay target argument on `publishEvent()` and `replaceOutboundEvent()`
+let a higher-level protocol make a blob durable on one relay before publishing
+the event that references it there. Targeted publication still updates the same
+durable event outbox, so ordinary retry later covers the remaining relays.
+
+`publishEventToRelay()` instead performs one validated relay write without
+entering that generic retry queue. It is only for higher-level engines such as
+DirectChat that already persisted the exact event and per-relay progress; this
+keeps generic retries from bypassing protocol-specific prerequisites.
+
 ```text
 relay event page -> authenticate -> application transaction
                                       |             |

@@ -1,8 +1,8 @@
 import {
     DirectChat,
     FriendBook,
-    MAX_FILE_BYTES,
-    MAX_MESSAGE_ATTACHMENTS,
+    MAX_DIRECT_CHAT_ATTACHMENT_BYTES,
+    MAX_DIRECT_CHAT_ATTACHMENTS,
     MAX_RELAY_EVENT_PAYLOAD_BYTES,
     MurmurClient,
     createPrivateMessage,
@@ -12,12 +12,10 @@ import {
     createDocumentOperationId,
     decodeBase64Url,
     decryptContactProfile,
-    decryptFile,
     destroyIdentity,
     encodeBase64Url,
     encodeEncryptedPrivateMessage,
     encodeSignedRelayEventWire,
-    encryptFile,
     encryptPrivateMessageForContact,
     encryptProfileForContact,
     equalBytes,
@@ -100,7 +98,6 @@ import {
     decodeCliProfileEnvelope,
     decodeCliStoredMessage,
     encodeCliAccount,
-    encodeCliOutboundMessage,
     encodeCliProfileEnvelope,
     encodeCliStoredMessage,
     type CliOutboundMessage,
@@ -178,9 +175,9 @@ type PendingCliGroupPublication =
       };
 
 /** Maximum total plaintext attachment bytes retained for one CLI message. */
-export const MAX_CLI_ATTACHMENT_BYTES = MAX_FILE_BYTES;
+export const MAX_CLI_ATTACHMENT_BYTES = MAX_DIRECT_CHAT_ATTACHMENT_BYTES;
 /** Maximum attachment count retained for one CLI message. */
-export const MAX_CLI_ATTACHMENTS = MAX_MESSAGE_ATTACHMENTS;
+export const MAX_CLI_ATTACHMENTS = MAX_DIRECT_CHAT_ATTACHMENTS;
 
 function validateTransports(transports: readonly RelayTransport[]): void {
     if (transports.length === 0) {
@@ -324,19 +321,6 @@ function cliGroupMessageKey(
 
 function cliDocumentKey(ownerId: string, groupId: string, documentId: string): string {
     return `${DOCUMENT_PREFIX}/${ownerId}/${groupId}/${documentId}`;
-}
-
-async function persistOutboundMessage(
-    transaction: StoreTransaction,
-    key: string,
-    outbound: CliOutboundMessage,
-): Promise<void> {
-    const encoded = encodeCliOutboundMessage(outbound);
-    try {
-        await transaction.set(key, encoded.slice());
-    } finally {
-        zeroBytes(encoded);
-    }
 }
 
 async function persistCliGroupRecord(
@@ -1141,100 +1125,22 @@ export class MurmurCliRuntime {
         );
     }
 
-    /** Encrypt files and one signed private message to an authenticated contact. */
+    /** Encrypt and send one direct message to an authenticated contact. */
     async send(
         recipientValue: string,
         text: string,
         attachments: readonly CliAttachmentInput[] = [],
         now: number = Date.now(),
     ): Promise<string> {
-        const account = this.#requireAccount();
         validateAttachments(attachments);
         const contact = await this.#resolveContact(recipientValue);
-        if (attachments.length === 0) {
-            return (
-                await this.#requireDirectChat().sendText(contact.identity, text, { sentAt: now })
-            ).message.id;
-        }
-        const encryptedFiles: ReturnType<typeof encryptFile>[] = [];
-        let stored: CliStoredMessage | undefined;
-        let payload: Uint8Array | undefined;
-        try {
-            for (const attachment of attachments) {
-                encryptedFiles.push(
-                    encryptFile(attachment.bytes, {
-                        name: attachment.name,
-                        ...(attachment.mediaType === undefined
-                            ? {}
-                            : { mediaType: attachment.mediaType }),
-                    }),
-                );
-            }
-            const message = createPrivateMessage(
-                text,
-                encryptedFiles.map((file) => file.descriptor),
-                now,
-            );
-            payload = encodeEncryptedPrivateMessage(
-                encryptPrivateMessageForContact(account.identity, contact.identity, message),
-            );
-            const event = createRelayEvent(
-                account.identity,
-                cliDirectMessageTopic(account.identity, contact.identity),
-                payload,
-                {
-                    list: [
-                        {
-                            op: "append",
-                            id: privateMessageListElementId(account.identity, message),
-                            bytes: payload,
-                        },
-                    ],
-                },
-            );
-            const ownerId = identityId(account.identity);
-            let outbound: CliOutboundMessage | undefined;
-            await this.#store.transaction(async (transaction) => {
-                stored = {
-                    sequence: await nextMessageSequence(transaction, ownerId),
-                    direction: "outgoing",
-                    conversationId: identityId(contact.identity),
-                    status: "pending",
-                    message,
-                };
-                const key = messageKey(ownerId, stored);
-                outbound = {
-                    event,
-                    messageKey: key,
-                    blobIds: encryptedFiles.map((file) => file.blob.id),
-                };
-                await persistStoredMessage(transaction, key, stored);
-                await persistOutboundMessage(transaction, outboundKey(ownerId, event.id), outbound);
-                for (const file of encryptedFiles) {
-                    await transaction.set(
-                        outboundBlobKey(ownerId, event.id, file.blob.id),
-                        file.blob.bytes.slice(),
-                    );
-                }
-            });
-            if (outbound === undefined) {
-                throw new Error("CLI outbound message was not persisted");
-            }
-            await this.#flushOutboundMessage(ownerId, outbound);
-            return message.id;
-        } finally {
-            if (payload !== undefined) {
-                zeroBytes(payload);
-            }
-            if (stored !== undefined) {
-                clearMessageSecrets(stored);
-            } else {
-                for (const file of encryptedFiles) {
-                    zeroBytes(file.descriptor.key);
-                    zeroBytes(file.descriptor.nonce);
-                }
-            }
-        }
+        return (
+            await this.#requireDirectChat().sendMessage(
+                contact.identity,
+                { text, attachments },
+                { sentAt: now },
+            )
+        ).message.id;
     }
 
     /** Retry retained outbox entries and process one bounded relay batch. */
@@ -1552,11 +1458,7 @@ export class MurmurCliRuntime {
             if (descriptor === undefined) {
                 throw new Error("Attachment not found");
             }
-            const blob = await this.#requireClient().getBlob(descriptor.blobId);
-            if (blob === undefined) {
-                throw new Error("Encrypted attachment blob is unavailable");
-            }
-            return decryptFile(descriptor, blob);
+            return this.#requireDirectChat().fetchAttachment(descriptor);
         } finally {
             for (const stored of history) {
                 clearMessageSecrets(stored);

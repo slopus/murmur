@@ -34,7 +34,11 @@ export type {
     TopicSnapshot,
     TopicState,
 } from "./types.js";
-export { MAX_RELAY_EVENT_PAYLOAD_BYTES } from "./types.js";
+export {
+    MAX_RELAY_BLOB_BYTES,
+    MAX_RELAY_EVENT_PAYLOAD_BYTES,
+    RelayBlobIntegrityError,
+} from "./types.js";
 export { HttpRelayTransport } from "./impl/httpTransport.js";
 export {
     decodeEventPageWire,

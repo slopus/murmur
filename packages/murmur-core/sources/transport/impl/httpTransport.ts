@@ -10,6 +10,7 @@ import type {
     SignedRelayEvent,
     TopicState,
 } from "../types.js";
+import { MAX_RELAY_BLOB_BYTES, RelayBlobIntegrityError } from "../types.js";
 import {
     decodeEventPageWire,
     decodeListPageWire,
@@ -21,6 +22,8 @@ import {
 function requestBody(bytes: Uint8Array): ArrayBuffer {
     return bytes.slice().buffer as ArrayBuffer;
 }
+
+const MAXIMUM_RESPONSE_CHUNKS = 65_536;
 
 async function readBoundedResponse(response: Response, maximumBytes: number): Promise<Uint8Array> {
     const declaredLength = response.headers.get("content-length");
@@ -36,17 +39,25 @@ async function readBoundedResponse(response: Response, maximumBytes: number): Pr
     const reader = response.body.getReader();
     const chunks: Uint8Array[] = [];
     let total = 0;
-    for (;;) {
-        const result = await reader.read();
-        if (result.done) {
-            break;
+    try {
+        for (;;) {
+            const result = await reader.read();
+            if (result.done) {
+                break;
+            }
+            total += result.value.length;
+            if (total > maximumBytes) {
+                await reader.cancel("Relay response is too large").catch(() => undefined);
+                throw new Error("Relay response is too large");
+            }
+            chunks.push(result.value);
+            if (chunks.length > MAXIMUM_RESPONSE_CHUNKS) {
+                await reader.cancel("Relay response has too many chunks").catch(() => undefined);
+                throw new Error("Relay response has too many chunks");
+            }
         }
-        total += result.value.length;
-        if (total > maximumBytes) {
-            await reader.cancel("Relay response is too large");
-            throw new Error("Relay response is too large");
-        }
-        chunks.push(result.value);
+    } finally {
+        reader.releaseLock();
     }
     const bytes = new Uint8Array(total);
     let offset = 0;
@@ -58,7 +69,6 @@ async function readBoundedResponse(response: Response, maximumBytes: number): Pr
 }
 
 const MAXIMUM_PAGE_RESPONSE_BYTES = 32 * 1024 * 1024;
-const MAXIMUM_BLOB_RESPONSE_BYTES = 64 * 1024 * 1024;
 const MAXIMUM_ERROR_RESPONSE_BYTES = 1_024;
 const MAXIMUM_BLOB_LINK_RESPONSE_BYTES = 16 * 1024;
 
@@ -67,6 +77,39 @@ interface BlobLink {
     readonly method: "PUT" | "GET";
     readonly expiresAt: number;
     readonly headers?: Readonly<Record<string, string>>;
+}
+
+function blobMaximumBytes(expectedBytes: number | undefined): number {
+    if (
+        expectedBytes !== undefined &&
+        (!Number.isSafeInteger(expectedBytes) ||
+            expectedBytes < 0 ||
+            expectedBytes > MAX_RELAY_BLOB_BYTES)
+    ) {
+        throw new Error(`Expected relay blob bytes must be from 0 through ${MAX_RELAY_BLOB_BYTES}`);
+    }
+    return expectedBytes ?? MAX_RELAY_BLOB_BYTES;
+}
+
+async function readBlobResponse(
+    response: Response,
+    id: string,
+    expectedBytes: number | undefined,
+): Promise<Uint8Array> {
+    const maximumBytes = blobMaximumBytes(expectedBytes);
+    let bytes: Uint8Array;
+    try {
+        bytes = await readBoundedResponse(response, maximumBytes);
+    } catch (error) {
+        if (error instanceof Error && error.message.startsWith("Relay response")) {
+            throw new RelayBlobIntegrityError(`Relay blob ${id} violates response bounds`);
+        }
+        throw error;
+    }
+    if (expectedBytes !== undefined && bytes.length !== expectedBytes) {
+        throw new RelayBlobIntegrityError(`Relay blob ${id} does not match its expected size`);
+    }
+    return bytes;
 }
 
 function blobLink(bytes: Uint8Array, expectedMethod: "PUT" | "GET"): BlobLink {
@@ -124,6 +167,37 @@ function query(
     }
     const encoded = parameters.toString();
     return encoded.length === 0 ? path : `${path}?${encoded}`;
+}
+
+function isLocalHostname(value: string): boolean {
+    const hostname = value.toLowerCase().replace(/^\[|\]$/g, "");
+    if (
+        hostname === "localhost" ||
+        hostname.endsWith(".localhost") ||
+        hostname === "::" ||
+        hostname === "::1" ||
+        /^(?:fc|fd|fe[89ab])/i.test(hostname)
+    ) {
+        return true;
+    }
+    const octets = hostname.split(".").map(Number);
+    if (
+        octets.length !== 4 ||
+        octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+    ) {
+        return false;
+    }
+    const [first = -1, second = -1] = octets;
+    return (
+        first === 0 ||
+        first === 10 ||
+        first === 127 ||
+        (first === 100 && second >= 64 && second <= 127) ||
+        (first === 169 && second === 254) ||
+        (first === 172 && second >= 16 && second <= 31) ||
+        (first === 192 && second === 168) ||
+        first >= 224
+    );
 }
 
 /** Browser-safe HTTP transport for the fixed topic-state relay protocol. */
@@ -201,7 +275,7 @@ export class HttpRelayTransport implements RelayTransport {
         await this.#requireOk(response);
     }
 
-    async getBlob(id: string): Promise<RelayBlob | undefined> {
+    async getBlob(id: string, expectedBytes?: number): Promise<RelayBlob | undefined> {
         let decodedId: Uint8Array;
         try {
             decodedId = decodeBase64Url(id);
@@ -229,10 +303,10 @@ export class HttpRelayTransport implements RelayTransport {
         await this.#requireOk(response);
         const blob = {
             id,
-            bytes: await readBoundedResponse(response, MAXIMUM_BLOB_RESPONSE_BYTES),
+            bytes: await readBlobResponse(response, id, expectedBytes),
         };
         if (encodeBase64Url(hashBytes(blob.bytes)) !== id) {
-            throw new Error("Relay blob failed content-address validation");
+            throw new RelayBlobIntegrityError("Relay blob failed content-address validation");
         }
         return blob;
     }
@@ -274,7 +348,17 @@ export class HttpRelayTransport implements RelayTransport {
     }
 
     #blobLinkUrl(value: string): string {
-        return new URL(value, `${this.#baseUrl}/`).toString();
+        const base = new URL(`${this.#baseUrl}/`);
+        const resolved = new URL(value, base);
+        if (
+            resolved.username.length > 0 ||
+            resolved.password.length > 0 ||
+            (resolved.origin !== base.origin &&
+                (resolved.protocol !== "https:" || isLocalHostname(resolved.hostname)))
+        ) {
+            throw new Error("Relay returned an unsafe blob link");
+        }
+        return resolved.toString();
     }
 
     async #get(path: string, signal?: AbortSignal): Promise<Response | undefined> {

@@ -22,6 +22,8 @@ interface SerializedPrivateMessage {
 export const MAX_MESSAGE_BYTES = 1024 * 1024;
 export const MAX_MESSAGE_ATTACHMENTS = 64;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024 - 16;
+const MEDIA_TYPE_PATTERN =
+    /^[A-Za-z0-9!#$&^_.+-]+\/[A-Za-z0-9!#$&^_.+-]+(?:\s*;\s*[A-Za-z0-9!#$&^_.+-]+=(?:"[^"\r\n]*"|[A-Za-z0-9!#$&^_.+-]+))*$/;
 
 /** Validate a canonical base64url identifier encoding exactly 24 bytes. */
 export function validatePrivateMessageId(id: string): void {
@@ -60,7 +62,8 @@ export function validateFileDescriptor(descriptor: EncryptedFileDescriptor): voi
         descriptor.plaintextBytes > MAX_FILE_BYTES ||
         unsafeFileName(descriptor.name) ||
         descriptor.mediaType.length === 0 ||
-        descriptor.mediaType.length > 255
+        descriptor.mediaType.length > 255 ||
+        !MEDIA_TYPE_PATTERN.test(descriptor.mediaType)
     ) {
         throw new Error("Invalid encrypted file descriptor");
     }
@@ -117,8 +120,14 @@ function deserializeFileDescriptor(descriptor: unknown): EncryptedFileDescriptor
         mediaType: serialized.mediaType,
         plaintextBytes: serialized.plaintextBytes,
     };
-    validateFileDescriptor(result);
-    return result;
+    try {
+        validateFileDescriptor(result);
+        return result;
+    } catch (error: unknown) {
+        result.key.fill(0);
+        result.nonce.fill(0);
+        throw error;
+    }
 }
 
 /** Encode private-message application data for group encryption. */
@@ -183,16 +192,26 @@ export function decodePrivateMessage(bytes: Uint8Array): PrivateMessage {
     }
 
     const serialized = value as unknown as SerializedPrivateMessage;
+    const attachments: EncryptedFileDescriptor[] = [];
     const message: PrivateMessage = {
         version: 1,
         id: serialized.id,
         sentAt: serialized.sentAt,
         text: serialized.text,
-        attachments: serialized.attachments.map((descriptor) =>
-            deserializeFileDescriptor(descriptor),
-        ),
+        attachments,
     };
-    // Apply every encoder-side invariant to decoded data.
-    encodePrivateMessage(message);
-    return message;
+    try {
+        for (const descriptor of serialized.attachments) {
+            attachments.push(deserializeFileDescriptor(descriptor));
+        }
+        // Apply every encoder-side invariant to decoded data.
+        encodePrivateMessage(message);
+        return message;
+    } catch (error: unknown) {
+        for (const attachment of attachments) {
+            attachment.key.fill(0);
+            attachment.nonce.fill(0);
+        }
+        throw error;
+    }
 }

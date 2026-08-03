@@ -248,7 +248,7 @@ one appended permanent list element. Its list ID is:
 That stable author-scoped list ID prevents a retained publication retry from
 creating a second message history element.
 
-Text sends managed by `DirectChat` append a second version-one envelope sealed
+Messages managed by `DirectChat` append a second version-one envelope sealed
 to the sender's own long-term X25519 key. It is stored on the same pairwise
 topic, but never used as the live event payload. Its distinct list ID is:
 
@@ -269,10 +269,18 @@ copies repeated by several relays do not duplicate history. Older topics with
 only recipient-sealed elements remain readable by recipients.
 
 The direct-chat outbox remains until every configured relay accepts the logical
-send. If a pending signed event approaches the relay's timestamp window, the
-client atomically replaces it with a freshly timestamped and signed event whose
-topic, payload, and two stable list operations are byte-equivalent. Different
-relays may therefore retain different event IDs for one logical message; stable
+send. For attachment messages it transactionally retains ciphertext blobs and
+per-relay upload/event progress with the canonical message, both encrypted
+copies, and application callback state. A relay event is published only after
+that same relay has accepted every referenced blob. Ambiguous uploads are
+retried idempotently. Local outbox ciphertext is removed only after all relays
+accept blobs and event; relay blobs remain permanent opaque content-addressed
+ciphertext.
+
+If a pending signed event approaches the relay's timestamp window, the client
+atomically replaces it with a freshly timestamped and signed event whose topic,
+payload, and two stable list operations are byte-equivalent. Different relays
+may therefore retain different event IDs for one logical message; stable
 element IDs and authenticated replay records collapse them.
 
 ### Direct-message acceptance
@@ -343,6 +351,20 @@ POST /v1/blobs/:id/download-link
 The local backend's `url` is relative to the relay and contains signed expiry
 parameters. S3's is an absolute presigned URL. An ordinary unsigned
 `PUT /v1/blobs/:id` or `GET /v1/blobs/:id` is not a blob API.
+
+DirectChat allows at most 64 attachments and 64 MiB aggregate plaintext per
+logical message. A non-`image/*` document has an absolute 10 MiB plaintext
+limit; images retain the per-file maximum implied by the 64 MiB encrypted relay
+cap. Authenticated oversize document metadata remains part of message history,
+but the stateless attachment fetch reports a typed policy refusal before
+network or decryption work.
+
+Attachment downloads pass the authenticated `plaintextBytes + 16` ciphertext
+length to the relay transport. The HTTP implementation rejects a larger
+declared or streamed response before concatenating it, requires the exact final
+length, and then verifies the content address. DirectChat separately classifies
+unavailable ciphertext, policy refusal, and hash/AEAD/metadata integrity
+failure. AES-GCM remains a whole-blob operation; no resumability is claimed.
 
 ## MLS groups
 

@@ -4,16 +4,23 @@ import { hashBytes } from "../crypto/index.js";
 import { FriendBook, identityId, pairwiseTopic, type FriendRecord } from "../identity/index.js";
 import {
     DirectMessageIdCollisionError,
+    MAX_FILE_BYTES,
+    MAX_MESSAGE_ATTACHMENTS,
     acceptPrivateMessageFromContactInTransaction,
     createPrivateMessage,
     decodeEncryptedPrivateMessage,
+    decryptFile,
     decryptPrivateMessageFromContact,
     encodeEncryptedPrivateMessage,
     encodePrivateMessage,
+    encryptFile,
     encryptPrivateMessageForContact,
     privateMessageListElementId,
     privateMessageSelfListElementId,
+    validateFileDescriptor,
     validatePrivateMessageId,
+    type EncryptedFile,
+    type EncryptedFileDescriptor,
     type EncryptedPrivateMessage,
     type OpenedPrivateMessage,
     type PrivateMessage,
@@ -21,8 +28,10 @@ import {
 import type { MurmurStore, StoreTransaction } from "../storage/index.js";
 import {
     createRelayEvent,
+    verifyRelayBlob,
     type AppendListOperation,
     type ListElement,
+    type RelayBlob,
 } from "../transport/index.js";
 import {
     canonicalJsonBytes,
@@ -37,33 +46,55 @@ import {
     encodeDirectChatOutboxRecord,
     encodeDirectChatSendRecord,
     type DirectChatOutboxRecord,
+    type DirectChatRelayProgress,
     type DirectChatSendRecord,
 } from "./impl/directChatCodec.js";
-import type {
-    DirectChatCallbacks,
-    DirectChatEventResult,
-    DirectChatHistoryResult,
-    DirectChatMessage,
-    DirectChatSendOptions,
-    DirectChatSyncResult,
+import {
+    DirectChatAttachmentIntegrityError,
+    DirectChatAttachmentPolicyError,
+    DirectChatAttachmentUnavailableError,
+    type DirectChatAttachmentInput,
+    type DirectChatAttachmentPolicyState,
+    type DirectChatCallbacks,
+    type DirectChatEventResult,
+    type DirectChatHistoryResult,
+    type DirectChatMessage,
+    type DirectChatMessageInput,
+    type DirectChatSendOptions,
+    type DirectChatSyncResult,
 } from "./types.js";
 
 export type {
+    DirectChatAttachmentInput,
+    DirectChatAttachmentPolicyState,
     DirectChatCallbacks,
     DirectChatEventResult,
     DirectChatHistoryResult,
     DirectChatMessage,
+    DirectChatMessageInput,
     DirectChatOrdering,
     DirectChatSendOptions,
     DirectChatSyncResult,
 } from "./types.js";
+export {
+    DirectChatAttachmentIntegrityError,
+    DirectChatAttachmentPolicyError,
+    DirectChatAttachmentUnavailableError,
+} from "./types.js";
 
 const SEND_PREFIX = "direct-chat/v1/send";
 const OUTBOX_PREFIX = "direct-chat/v1/outbox";
+const OUTBOX_BLOB_PREFIX = "direct-chat/v2/outbox-blob";
 const QUARANTINE_PREFIX = "direct-chat/v1/quarantine";
 const MAXIMUM_QUARANTINE_RECORDS = 128;
 const MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES = 256 * 1024;
 const OUTBOUND_EVENT_REFRESH_MILLISECONDS = 4 * 60 * 1_000;
+/** Absolute plaintext limit for a non-image direct-chat attachment. */
+export const MAX_DIRECT_CHAT_DOCUMENT_BYTES = 10 * 1024 * 1024;
+/** Aggregate plaintext attachment limit for one logical direct message. */
+export const MAX_DIRECT_CHAT_ATTACHMENT_BYTES = 64 * 1024 * 1024;
+/** Maximum attachment count for one logical direct message. */
+export const MAX_DIRECT_CHAT_ATTACHMENTS = MAX_MESSAGE_ATTACHMENTS;
 
 class InvalidDirectChatEnvelopeError extends Error {}
 
@@ -90,6 +121,14 @@ function clearMessageSecrets(message: PrivateMessage): void {
     for (const attachment of message.attachments) {
         zeroBytes(attachment.key);
         zeroBytes(attachment.nonce);
+    }
+}
+
+function decodeOutboxAndZero(bytes: Uint8Array): DirectChatOutboxRecord {
+    try {
+        return decodeDirectChatOutboxRecord(bytes);
+    } finally {
+        zeroBytes(bytes);
     }
 }
 
@@ -139,6 +178,83 @@ function validateSendOptions(options: DirectChatSendOptions): void {
     ) {
         throw new Error("Direct-chat sentAt must be a non-negative safe integer");
     }
+}
+
+function validateMessageInput(input: DirectChatMessageInput): void {
+    if (
+        typeof input !== "object" ||
+        input === null ||
+        Object.keys(input).length !== 2 ||
+        Object.keys(input).some((key) => !["text", "attachments"].includes(key)) ||
+        typeof input.text !== "string" ||
+        !Array.isArray(input.attachments) ||
+        input.attachments.length > MAX_DIRECT_CHAT_ATTACHMENTS
+    ) {
+        throw new Error("Invalid direct-chat message input");
+    }
+    let aggregateBytes = 0;
+    for (const attachment of input.attachments) {
+        if (
+            typeof attachment !== "object" ||
+            attachment === null ||
+            Object.keys(attachment).some((key) => !["name", "mediaType", "bytes"].includes(key)) ||
+            typeof attachment.name !== "string" ||
+            (attachment.mediaType !== undefined && typeof attachment.mediaType !== "string") ||
+            !(attachment.bytes instanceof Uint8Array)
+        ) {
+            throw new Error("Invalid direct-chat attachment input");
+        }
+        const mediaType = attachment.mediaType ?? "application/octet-stream";
+        validateFileDescriptor({
+            version: 1,
+            blobId: "A".repeat(43),
+            key: new Uint8Array(32),
+            nonce: new Uint8Array(12),
+            name: attachment.name,
+            mediaType,
+            plaintextBytes: attachment.bytes.length,
+        });
+        if (
+            !mediaType.toLowerCase().startsWith("image/") &&
+            attachment.bytes.length > MAX_DIRECT_CHAT_DOCUMENT_BYTES
+        ) {
+            throw new DirectChatAttachmentPolicyError(
+                `Direct-chat document exceeds ${MAX_DIRECT_CHAT_DOCUMENT_BYTES} bytes`,
+            );
+        }
+        aggregateBytes += attachment.bytes.length;
+        if (
+            !Number.isSafeInteger(aggregateBytes) ||
+            aggregateBytes > MAX_DIRECT_CHAT_ATTACHMENT_BYTES
+        ) {
+            throw new DirectChatAttachmentPolicyError(
+                `Direct-chat attachments exceed ${MAX_DIRECT_CHAT_ATTACHMENT_BYTES} aggregate bytes`,
+            );
+        }
+    }
+}
+
+function attachmentDigests(attachments: readonly DirectChatAttachmentInput[]): string[] {
+    return attachments.map((attachment) => {
+        const digest = hashBytes(attachment.bytes);
+        try {
+            return encodeBase64Url(digest);
+        } finally {
+            zeroBytes(digest);
+        }
+    });
+}
+
+function sameStrings(left: readonly string[], right: readonly string[]): boolean {
+    return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function cloneDescriptor(descriptor: EncryptedFileDescriptor): EncryptedFileDescriptor {
+    return {
+        ...descriptor,
+        key: descriptor.key.slice(),
+        nonce: descriptor.nonce.slice(),
+    };
 }
 
 function sendFingerprint(friend: IdentityPublicKeys, message: PrivateMessage): string {
@@ -223,20 +339,30 @@ export class DirectChat {
         await this.#client.subscribe(topic);
     }
 
-    /**
-     * Send text with an optional caller-owned canonical ID.
-     *
-     * The API deliberately has no attachment input. Unknown option fields,
-     * including an attempted `attachments` field from untyped JavaScript, are
-     * rejected. A publication error may be thrown after the message and exact
-     * pending event commit; retrying the same caller ID resumes that send.
-     */
+    /** Send text through the canonical message path without changing its signature. */
     async sendText(
         friendIdentity: Pick<IdentityPublicKeys, "signingKey">,
         text: string,
         options: DirectChatSendOptions = {},
     ): Promise<DirectChatMessage> {
+        return this.sendMessage(friendIdentity, { text, attachments: [] }, options);
+    }
+
+    /**
+     * Send one logical message with encrypted photos or documents.
+     *
+     * The application message, both permanent encrypted copies, ciphertext
+     * blobs, callback state, and resumable per-relay progress are committed
+     * before the first upload. A publication error may therefore be retried
+     * safely with the same caller-owned ID after a crash.
+     */
+    async sendMessage(
+        friendIdentity: Pick<IdentityPublicKeys, "signingKey">,
+        input: DirectChatMessageInput,
+        options: DirectChatSendOptions = {},
+    ): Promise<DirectChatMessage> {
         validateSendOptions(options);
+        validateMessageInput(input);
         const friend = await this.#friends.get(friendIdentity, { includeRemoved: true });
         if (friend === undefined) {
             throw new Error("Direct-chat friend not found");
@@ -247,85 +373,162 @@ export class DirectChat {
         if (options.id !== undefined) {
             const retained = await this.#readSendRecord(options.id);
             if (retained !== undefined) {
-                this.#assertCanonicalRetry(retained, friend.identity, text, options.sentAt);
-                await this.#publishPending(options.id);
-                return surfacedMessage(
-                    this.#identity,
-                    retained.friend,
-                    "outgoing",
-                    retained.message,
-                    "local-send",
-                );
+                this.#assertCanonicalRetry(retained, friend.identity, input, options.sentAt);
+                try {
+                    await this.#publishPending(options.id);
+                    return surfacedMessage(
+                        this.#identity,
+                        retained.friend,
+                        "outgoing",
+                        retained.message,
+                        "local-send",
+                    );
+                } catch (error: unknown) {
+                    clearMessageSecrets(retained.message);
+                    throw error;
+                }
             }
         }
 
-        const message = createPrivateMessage(text, [], options.sentAt ?? this.#now(), options.id);
-        const recipientEnvelope = encryptPrivateMessageForContact(
-            this.#identity,
-            friend.identity,
-            message,
-        );
-        const selfEnvelope = encryptPrivateMessageForContact(
-            this.#identity,
-            this.#identity,
-            message,
-        );
-        const recipientBytes = encodeEncryptedPrivateMessage(recipientEnvelope);
-        const selfBytes = encodeEncryptedPrivateMessage(selfEnvelope);
-        if (
-            recipientBytes.length > MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES ||
-            selfBytes.length > MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES
-        ) {
+        const digests = attachmentDigests(input.attachments);
+        const encryptedFiles: EncryptedFile[] = [];
+        let message: PrivateMessage;
+        try {
+            for (const attachment of input.attachments) {
+                encryptedFiles.push(
+                    encryptFile(attachment.bytes, {
+                        name: attachment.name,
+                        ...(attachment.mediaType === undefined
+                            ? {}
+                            : { mediaType: attachment.mediaType }),
+                    }),
+                );
+            }
+            message = createPrivateMessage(
+                input.text,
+                encryptedFiles.map((file) => file.descriptor),
+                options.sentAt ?? this.#now(),
+                options.id,
+            );
+        } catch (error: unknown) {
+            for (const file of encryptedFiles) {
+                zeroBytes(file.blob.bytes);
+                zeroBytes(file.descriptor.key);
+                zeroBytes(file.descriptor.nonce);
+            }
+            throw error;
+        }
+        let recipientEnvelope: EncryptedPrivateMessage;
+        let selfEnvelope: EncryptedPrivateMessage;
+        let recipientBytes: Uint8Array | undefined;
+        let selfBytes: Uint8Array | undefined;
+        try {
+            recipientEnvelope = encryptPrivateMessageForContact(
+                this.#identity,
+                friend.identity,
+                message,
+            );
+            selfEnvelope = encryptPrivateMessageForContact(this.#identity, this.#identity, message);
+            recipientBytes = encodeEncryptedPrivateMessage(recipientEnvelope);
+            selfBytes = encodeEncryptedPrivateMessage(selfEnvelope);
+            if (
+                recipientBytes.length > MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES ||
+                selfBytes.length > MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES
+            ) {
+                throw new Error(
+                    `Direct-chat message exceeds the ${MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES}-byte relay list-element limit`,
+                );
+            }
+        } catch (error: unknown) {
+            if (recipientBytes !== undefined) {
+                zeroBytes(recipientBytes);
+            }
+            if (selfBytes !== undefined) {
+                zeroBytes(selfBytes);
+            }
+            clearMessageSecrets(message);
+            for (const file of encryptedFiles) {
+                zeroBytes(file.blob.bytes);
+            }
+            throw error;
+        }
+        if (recipientBytes === undefined || selfBytes === undefined) {
+            throw new Error("DirectChat did not prepare both encrypted message copies");
+        }
+        let sendRecord: DirectChatSendRecord;
+        let outbox: DirectChatOutboxRecord;
+        try {
+            const topic = pairwiseTopic(this.#identity, friend.identity);
+            const event = createRelayEvent(
+                this.#identity,
+                topic,
+                recipientBytes,
+                {
+                    list: [
+                        {
+                            op: "append",
+                            id: privateMessageListElementId(this.#identity, message),
+                            bytes: recipientBytes,
+                        },
+                        {
+                            op: "append",
+                            id: privateMessageSelfListElementId(
+                                this.#identity,
+                                friend.identity,
+                                message,
+                            ),
+                            bytes: selfBytes,
+                        },
+                    ],
+                },
+                this.#now(),
+            );
+            sendRecord = {
+                friend: friend.identity,
+                message,
+                fingerprint: sendFingerprint(friend.identity, message),
+                attachmentDigests: digests,
+            };
+            outbox = {
+                schemaVersion: 2,
+                event,
+                friend: friend.identity,
+                message,
+                blobIds: encryptedFiles.map((file) => file.blob.id),
+                relays: this.#client.relayIds.map((relayId) => ({
+                    relayId,
+                    uploadedBlobIds: [],
+                    eventPublished: false,
+                })),
+                published: false,
+            };
+        } catch (error: unknown) {
             zeroBytes(recipientBytes);
             zeroBytes(selfBytes);
-            throw new Error(
-                `Direct-chat text exceeds the ${MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES}-byte relay list-element limit`,
-            );
+            clearMessageSecrets(message);
+            for (const file of encryptedFiles) {
+                zeroBytes(file.blob.bytes);
+            }
+            throw error;
         }
-        const topic = pairwiseTopic(this.#identity, friend.identity);
-        const event = createRelayEvent(
-            this.#identity,
-            topic,
-            recipientBytes,
-            {
-                list: [
-                    {
-                        op: "append",
-                        id: privateMessageListElementId(this.#identity, message),
-                        bytes: recipientBytes,
-                    },
-                    {
-                        op: "append",
-                        id: privateMessageSelfListElementId(
-                            this.#identity,
-                            friend.identity,
-                            message,
-                        ),
-                        bytes: selfBytes,
-                    },
-                ],
-            },
-            this.#now(),
-        );
-        const sendRecord: DirectChatSendRecord = {
-            friend: friend.identity,
-            message,
-            fingerprint: sendFingerprint(friend.identity, message),
-        };
-        const outbox: DirectChatOutboxRecord = {
-            event,
-            friend: friend.identity,
-            message,
-            published: false,
-        };
         let retained: DirectChatSendRecord | undefined;
+        let completed = false;
         try {
             retained = await this.#store.transaction(async (transaction) => {
                 const existingBytes = await transaction.get(this.#sendKey(message.id));
                 if (existingBytes !== undefined) {
-                    const existing = decodeDirectChatSendRecord(existingBytes);
-                    this.#assertCanonicalRetry(existing, friend.identity, text, options.sentAt);
-                    return existing;
+                    try {
+                        const existing = decodeDirectChatSendRecord(existingBytes);
+                        this.#assertCanonicalRetry(
+                            existing,
+                            friend.identity,
+                            input,
+                            options.sentAt,
+                        );
+                        return existing;
+                    } finally {
+                        zeroBytes(existingBytes);
+                    }
                 }
                 const surface = surfacedMessage(
                     this.#identity,
@@ -349,23 +552,97 @@ export class DirectChat {
                     this.#outboxKey(message.id),
                     encodeDirectChatOutboxRecord(outbox),
                 );
+                for (const file of encryptedFiles) {
+                    await transaction.set(
+                        this.#outboxBlobKey(message.id, file.blob.id),
+                        file.blob.bytes.slice(),
+                    );
+                }
                 return sendRecord;
             });
             await this.#publishPending(message.id);
-            return surfacedMessage(
+            const surface = surfacedMessage(
                 this.#identity,
                 retained.friend,
                 "outgoing",
                 retained.message,
                 "local-send",
             );
+            completed = true;
+            return surface;
         } finally {
             zeroBytes(recipientBytes);
             zeroBytes(selfBytes);
-            if (retained !== sendRecord) {
+            for (const file of encryptedFiles) {
+                zeroBytes(file.blob.bytes);
+            }
+            if (!completed || retained !== sendRecord) {
                 clearMessageSecrets(message);
             }
         }
+    }
+
+    /**
+     * Download and authenticate one content-addressed attachment without
+     * adding local cache or product state.
+     */
+    async fetchAttachment(descriptorValue: EncryptedFileDescriptor): Promise<Uint8Array> {
+        const descriptor = cloneDescriptor(descriptorValue);
+        let blob: RelayBlob | undefined;
+        try {
+            validateFileDescriptor(descriptor);
+            const policy = this.attachmentPolicy(descriptor);
+            if (policy.status === "blocked") {
+                throw new DirectChatAttachmentPolicyError(
+                    `Direct-chat document exceeds ${policy.maximumBytes} bytes`,
+                );
+            }
+            const expectedCiphertextBytes = descriptor.plaintextBytes + 16;
+            if (
+                !Number.isSafeInteger(expectedCiphertextBytes) ||
+                expectedCiphertextBytes > MAX_FILE_BYTES + 16
+            ) {
+                throw new DirectChatAttachmentPolicyError(
+                    "Direct-chat attachment ciphertext exceeds the transport policy",
+                );
+            }
+            try {
+                blob = await this.#client.getBlob(descriptor.blobId, expectedCiphertextBytes);
+            } catch (error: unknown) {
+                throw new DirectChatAttachmentIntegrityError({
+                    cause: error,
+                });
+            }
+            if (blob === undefined) {
+                throw new DirectChatAttachmentUnavailableError();
+            }
+            try {
+                return decryptFile(descriptor, blob);
+            } catch (error: unknown) {
+                throw new DirectChatAttachmentIntegrityError({
+                    cause: error,
+                });
+            }
+        } finally {
+            zeroBytes(descriptor.key);
+            zeroBytes(descriptor.nonce);
+            if (blob !== undefined) {
+                zeroBytes(blob.bytes);
+            }
+        }
+    }
+
+    /** Classify authenticated attachment metadata without fetching ciphertext. */
+    attachmentPolicy(descriptor: EncryptedFileDescriptor): DirectChatAttachmentPolicyState {
+        validateFileDescriptor(descriptor);
+        return !descriptor.mediaType.toLowerCase().startsWith("image/") &&
+            descriptor.plaintextBytes > MAX_DIRECT_CHAT_DOCUMENT_BYTES
+            ? {
+                  status: "blocked",
+                  reason: "document-too-large",
+                  maximumBytes: MAX_DIRECT_CHAT_DOCUMENT_BYTES,
+              }
+            : { status: "allowed" };
     }
 
     /** Retry every exact pending event independently after a crash or outage. */
@@ -723,74 +1000,277 @@ export class DirectChat {
         if (bytes === undefined) {
             return;
         }
-        let pending = decodeDirectChatOutboxRecord(bytes);
+        let pending = decodeOutboxAndZero(bytes);
         try {
+            if (pending.schemaVersion === 1) {
+                const upgraded = await this.#upgradeLegacyOutbox(key, pending);
+                if (upgraded.message !== pending.message) {
+                    clearMessageSecrets(pending.message);
+                }
+                pending = upgraded;
+            }
             this.#validatePendingOutbox(pending);
-            let result: Awaited<ReturnType<MurmurClient["publishEvent"]>>;
+            await this.#validatePendingBlobs(id, pending);
+            const failures: Error[] = [];
+            for (const relayId of pending.relays.map((relay) => relay.relayId)) {
+                let relay = pending.relays.find((item) => item.relayId === relayId);
+                if (relay?.eventPublished === true) {
+                    continue;
+                }
+                try {
+                    for (const blobId of pending.blobIds) {
+                        relay = pending.relays.find((item) => item.relayId === relayId);
+                        if (relay?.uploadedBlobIds.includes(blobId) === true) {
+                            continue;
+                        }
+                        const blob = await this.#readOutboxBlob(id, pending, blobId);
+                        try {
+                            await this.#client.putBlobToRelay(blob, relayId);
+                        } finally {
+                            zeroBytes(blob.bytes);
+                        }
+                        const next = await this.#recordBlobUploaded(
+                            key,
+                            pending.event.id,
+                            relayId,
+                            blobId,
+                        );
+                        if (next.message !== pending.message) {
+                            clearMessageSecrets(pending.message);
+                        }
+                        pending = next;
+                    }
+                    const result = await this.#publishToRelay(key, pending, relayId);
+                    if (!result.publishedRelayIds.includes(relayId)) {
+                        throw new Error(`Relay ${relayId} rejected the direct-chat event`);
+                    }
+                    const next = await this.#recordEventPublished(key, pending.event.id, relayId);
+                    if (next.message !== pending.message) {
+                        clearMessageSecrets(pending.message);
+                    }
+                    pending = next;
+                } catch (error: unknown) {
+                    failures.push(error instanceof Error ? error : new Error(String(error)));
+                }
+            }
+            if (!pending.relays.every((relay) => relay.eventPublished) && !pending.published) {
+                const cause = failures[0];
+                throw new Error(
+                    `Every transport rejected the direct-chat event${
+                        cause === undefined ? "" : `: ${cause.message}`
+                    }`,
+                    cause === undefined ? undefined : { cause },
+                );
+            }
+        } finally {
+            zeroBytes(bytes);
+            clearMessageSecrets(pending.message);
+        }
+    }
+
+    async #publishToRelay(
+        key: string,
+        pendingValue: DirectChatOutboxRecord,
+        relayId: string,
+    ): Promise<Awaited<ReturnType<MurmurClient["publishEvent"]>>> {
+        let pending = pendingValue;
+        try {
             const stale =
                 this.#now() - pending.event.createdAt >= OUTBOUND_EVENT_REFRESH_MILLISECONDS;
+            let result: Awaited<ReturnType<MurmurClient["publishEvent"]>>;
             let refreshed = false;
             try {
-                // Exact retry first recovers relay receipts whose responses
-                // were lost, even after the timestamp window.
-                result =
-                    pending.previousEvent === undefined
-                        ? await this.#client.publishEvent(pending.event)
-                        : await this.#client.replaceOutboundEvent(
-                              pending.previousEvent,
-                              pending.event,
-                          );
+                // Exact retry first recovers a receipt whose response was lost,
+                // even after the timestamp window.
+                result = await this.#client.publishEventToRelay(pending.event, relayId);
             } catch (error: unknown) {
                 if (!stale) {
                     throw error;
                 }
                 pending = await this.#refreshPendingEvent(key, pending);
                 this.#validatePendingOutbox(pending);
-                result = await this.#publishReplacement(pending);
+                result = await this.#publishReplacement(pending, relayId);
                 refreshed = true;
             }
-            if (!refreshed && stale && result.failedRelayIds.length > 0) {
+            if (!refreshed && stale && result.failedRelayIds.includes(relayId)) {
                 pending = await this.#refreshPendingEvent(key, pending);
                 this.#validatePendingOutbox(pending);
-                result = await this.#publishReplacement(pending);
+                result = await this.#publishReplacement(pending, relayId);
             }
-            const surface = surfacedMessage(
-                this.#identity,
-                pending.friend,
-                "outgoing",
-                pending.message,
-                "local-send",
-            );
-            await this.#store.transaction(async (transaction) => {
-                const currentBytes = await transaction.get(key);
-                if (currentBytes === undefined) {
-                    return;
+            return result;
+        } finally {
+            if (pending.message !== pendingValue.message) {
+                clearMessageSecrets(pending.message);
+            }
+        }
+    }
+
+    async #upgradeLegacyOutbox(
+        key: string,
+        pending: DirectChatOutboxRecord,
+    ): Promise<DirectChatOutboxRecord> {
+        if (pending.message.attachments.length !== 0) {
+            throw new Error("Legacy direct-chat outbox unexpectedly contains attachments");
+        }
+        const upgraded: DirectChatOutboxRecord = {
+            ...pending,
+            schemaVersion: 2,
+            blobIds: [],
+            relays: this.#client.relayIds.map((relayId) => ({
+                relayId,
+                uploadedBlobIds: [],
+                eventPublished: false,
+            })),
+        };
+        return this.#store.transaction(async (transaction) => {
+            const currentBytes = await transaction.get(key);
+            if (currentBytes === undefined) {
+                return upgraded;
+            }
+            const current = decodeOutboxAndZero(currentBytes);
+            if (current.event.id !== pending.event.id || current.schemaVersion !== 1) {
+                return current;
+            }
+            try {
+                await transaction.set(key, encodeDirectChatOutboxRecord(upgraded));
+                return upgraded;
+            } finally {
+                clearMessageSecrets(current.message);
+            }
+        });
+    }
+
+    async #recordBlobUploaded(
+        key: string,
+        eventId: string,
+        relayId: string,
+        blobId: string,
+    ): Promise<DirectChatOutboxRecord> {
+        return this.#store.transaction(async (transaction) => {
+            const currentBytes = await transaction.get(key);
+            if (currentBytes === undefined) {
+                throw new Error("Direct-chat outbox disappeared during blob upload");
+            }
+            const current = decodeOutboxAndZero(currentBytes);
+            let transferred = false;
+            try {
+                if (current.event.id !== eventId && current.previousEvent?.id !== eventId) {
+                    throw new Error("Direct-chat outbox changed during blob upload");
                 }
-                const current = decodeDirectChatOutboxRecord(currentBytes);
-                if (current.event.id !== pending.event.id) {
-                    return;
+                const relays = current.relays.map((relay) =>
+                    relay.relayId !== relayId || relay.uploadedBlobIds.includes(blobId)
+                        ? relay
+                        : {
+                              ...relay,
+                              uploadedBlobIds: [...relay.uploadedBlobIds, blobId],
+                          },
+                );
+                if (!relays.some((relay) => relay.relayId === relayId)) {
+                    throw new Error("Direct-chat outbox references an unknown relay");
                 }
+                const updated = { ...current, relays };
+                await transaction.set(key, encodeDirectChatOutboxRecord(updated));
+                transferred = true;
+                return updated;
+            } finally {
+                if (!transferred) {
+                    clearMessageSecrets(current.message);
+                }
+            }
+        });
+    }
+
+    async #recordEventPublished(
+        key: string,
+        eventId: string,
+        relayId: string,
+    ): Promise<DirectChatOutboxRecord> {
+        return this.#store.transaction(async (transaction) => {
+            const currentBytes = await transaction.get(key);
+            if (currentBytes === undefined) {
+                throw new Error("Direct-chat outbox disappeared during event publication");
+            }
+            const current = decodeOutboxAndZero(currentBytes);
+            let transferred = false;
+            try {
+                if (current.event.id !== eventId && current.previousEvent?.id !== eventId) {
+                    throw new Error("Direct-chat outbox changed during event publication");
+                }
+                const relays: DirectChatRelayProgress[] = current.relays.map((relay) =>
+                    relay.relayId === relayId ? { ...relay, eventPublished: true } : relay,
+                );
+                if (!relays.some((relay) => relay.relayId === relayId)) {
+                    throw new Error("Direct-chat outbox references an unknown relay");
+                }
+                const updated: DirectChatOutboxRecord = {
+                    ...current,
+                    relays,
+                    published: true,
+                };
                 if (!current.published) {
-                    await this.#callbacks.messagePublished?.(transaction, surface);
-                }
-                if (result.failedRelayIds.length === 0) {
-                    await transaction.delete(key);
-                } else {
-                    await transaction.set(
-                        key,
-                        encodeDirectChatOutboxRecord({
-                            event: current.event,
-                            friend: current.friend,
-                            message: current.message,
-                            published: true,
-                        }),
+                    await this.#callbacks.messagePublished?.(
+                        transaction,
+                        surfacedMessage(
+                            this.#identity,
+                            current.friend,
+                            "outgoing",
+                            current.message,
+                            "local-send",
+                        ),
                     );
                 }
-            });
-        } finally {
-            zeroBytes(bytes);
-            clearMessageSecrets(pending.message);
+                if (relays.every((relay) => relay.eventPublished)) {
+                    await transaction.delete(key);
+                    for (const blobId of current.blobIds) {
+                        await transaction.delete(this.#outboxBlobKey(current.message.id, blobId));
+                    }
+                } else {
+                    await transaction.set(key, encodeDirectChatOutboxRecord(updated));
+                }
+                transferred = true;
+                return updated;
+            } finally {
+                if (!transferred) {
+                    clearMessageSecrets(current.message);
+                }
+            }
+        });
+    }
+
+    async #validatePendingBlobs(id: string, pending: DirectChatOutboxRecord): Promise<void> {
+        for (const blobId of pending.blobIds) {
+            const blob = await this.#readOutboxBlob(id, pending, blobId);
+            try {
+                if (!verifyRelayBlob(blob)) {
+                    throw new Error("Direct-chat outbox blob failed content-address validation");
+                }
+            } finally {
+                zeroBytes(blob.bytes);
+            }
         }
+    }
+
+    async #readOutboxBlob(
+        id: string,
+        pending: DirectChatOutboxRecord,
+        blobId: string,
+    ): Promise<RelayBlob> {
+        const bytes = await this.#store.get(this.#outboxBlobKey(id, blobId));
+        if (bytes === undefined) {
+            throw new Error("Direct-chat encrypted attachment outbox is incomplete");
+        }
+        const descriptor = pending.message.attachments.find(
+            (attachment) => attachment.blobId === blobId,
+        );
+        if (
+            descriptor === undefined ||
+            bytes.length !== descriptor.plaintextBytes + 16 ||
+            !verifyRelayBlob({ id: blobId, bytes })
+        ) {
+            zeroBytes(bytes);
+            throw new Error("Direct-chat encrypted attachment outbox failed validation");
+        }
+        return { id: blobId, bytes };
     }
 
     async #refreshPendingEvent(
@@ -814,10 +1294,13 @@ export class DirectChat {
             now,
         );
         const refreshed: DirectChatOutboxRecord = {
+            schemaVersion: 2,
             event: replacement,
             previousEvent: pending.event,
             friend: pending.friend,
             message: pending.message,
+            blobIds: pending.blobIds,
+            relays: pending.relays,
             published: pending.published,
         };
         return this.#store.transaction(async (transaction) => {
@@ -825,22 +1308,27 @@ export class DirectChat {
             if (currentBytes === undefined) {
                 return refreshed;
             }
-            const current = decodeDirectChatOutboxRecord(currentBytes);
+            const current = decodeOutboxAndZero(currentBytes);
             if (current.event.id !== pending.event.id) {
                 return current;
             }
-            await transaction.set(key, encodeDirectChatOutboxRecord(refreshed));
-            return refreshed;
+            try {
+                await transaction.set(key, encodeDirectChatOutboxRecord(refreshed));
+                return refreshed;
+            } finally {
+                clearMessageSecrets(current.message);
+            }
         });
     }
 
     async #publishReplacement(
         pending: DirectChatOutboxRecord,
+        relayId: string,
     ): Promise<Awaited<ReturnType<MurmurClient["publishEvent"]>>> {
         if (pending.previousEvent === undefined) {
             throw new Error("DirectChat clock did not advance a stale pending event");
         }
-        return this.#client.replaceOutboundEvent(pending.previousEvent, pending.event);
+        return this.#client.publishEventToRelay(pending.event, relayId);
     }
 
     #validatePendingOutbox(pending: DirectChatOutboxRecord): void {
@@ -856,16 +1344,41 @@ export class DirectChat {
         );
         const recipient = appends.find((operation) => operation.id === recipientId);
         const self = appends.find((operation) => operation.id === selfId);
+        const expectedBlobIds = pending.message.attachments.map((attachment) => attachment.blobId);
+        const relayIds = pending.relays.map((relay) => relay.relayId);
+        let aggregateBytes = 0;
+        for (const descriptor of pending.message.attachments) {
+            aggregateBytes += descriptor.plaintextBytes;
+            if (
+                (!descriptor.mediaType.toLowerCase().startsWith("image/") &&
+                    descriptor.plaintextBytes > MAX_DIRECT_CHAT_DOCUMENT_BYTES) ||
+                aggregateBytes > MAX_DIRECT_CHAT_ATTACHMENT_BYTES
+            ) {
+                throw new Error("Direct-chat outbox attachment policy validation failed");
+            }
+        }
         if (
-            pending.message.attachments.length !== 0 ||
+            pending.schemaVersion !== 2 ||
             pending.event.topic !== expectedTopic ||
             pending.event.list?.length !== 2 ||
             appends.length !== 2 ||
             recipient === undefined ||
             self === undefined ||
-            !equalBytes(recipient.bytes, pending.event.payload)
+            !equalBytes(recipient.bytes, pending.event.payload) ||
+            new Set(expectedBlobIds).size !== expectedBlobIds.length ||
+            !sameStrings(pending.blobIds, expectedBlobIds) ||
+            relayIds.length === 0 ||
+            new Set(relayIds).size !== relayIds.length ||
+            relayIds.some((relayId) => !this.#client.relayIds.includes(relayId)) ||
+            pending.relays.some(
+                (relay) =>
+                    new Set(relay.uploadedBlobIds).size !== relay.uploadedBlobIds.length ||
+                    relay.uploadedBlobIds.some((blobId) => !pending.blobIds.includes(blobId)) ||
+                    (relay.eventPublished &&
+                        !pending.blobIds.every((blobId) => relay.uploadedBlobIds.includes(blobId))),
+            )
         ) {
-            throw new Error("Direct-chat outbox does not match its canonical text message");
+            throw new Error("Direct-chat outbox does not match its canonical message");
         }
         const recipientEnvelope = decodeEncryptedPrivateMessage(recipient.bytes);
         if (
@@ -904,13 +1417,24 @@ export class DirectChat {
     #assertCanonicalRetry(
         retained: DirectChatSendRecord,
         friend: IdentityPublicKeys,
-        text: string,
+        input: DirectChatMessageInput,
         sentAt: number | undefined,
     ): void {
+        const digests = attachmentDigests(input.attachments);
         const matches =
             sameIdentity(retained.friend, friend) &&
-            retained.message.text === text &&
-            retained.message.attachments.length === 0 &&
+            retained.message.text === input.text &&
+            retained.message.attachments.length === input.attachments.length &&
+            retained.message.attachments.every((descriptor, index) => {
+                const attachment = input.attachments[index];
+                return (
+                    attachment !== undefined &&
+                    descriptor.name === attachment.name &&
+                    descriptor.mediaType === (attachment.mediaType ?? "application/octet-stream") &&
+                    descriptor.plaintextBytes === attachment.bytes.length
+                );
+            }) &&
+            sameStrings(retained.attachmentDigests, digests) &&
             (sentAt === undefined || retained.message.sentAt === sentAt) &&
             retained.fingerprint === sendFingerprint(retained.friend, retained.message);
         if (!matches) {
@@ -984,5 +1508,9 @@ export class DirectChat {
 
     #outboxKey(id: string): string {
         return `${OUTBOX_PREFIX}/${this.#ownerId}/${id}`;
+    }
+
+    #outboxBlobKey(id: string, blobId: string): string {
+        return `${OUTBOX_BLOB_PREFIX}/${this.#ownerId}/${id}/${blobId}`;
     }
 }

@@ -1,5 +1,15 @@
 /** Maximum opaque event payload accepted by the default protocol profile. */
 export const MAX_RELAY_EVENT_PAYLOAD_BYTES = 1024 * 1024;
+/** Maximum ciphertext blob accepted by the default relay protocol profile. */
+export const MAX_RELAY_BLOB_BYTES = 64 * 1024 * 1024;
+
+/** A relay supplied blob failed its size or content-address integrity checks. */
+export class RelayBlobIntegrityError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "RelayBlobIntegrityError";
+    }
+}
 
 /** Public signing identity attached to every relay write. */
 export interface RelayAuthor {
@@ -120,6 +130,12 @@ export interface RelayTransport {
     ): Promise<EventPage | undefined>;
     /** Request an upload link and transfer one content-addressed ciphertext blob. */
     putBlob(blob: RelayBlob): Promise<void>;
-    /** Request a download link and return one validated ciphertext blob when present. */
-    getBlob(id: string): Promise<RelayBlob | undefined>;
+    /**
+     * Request a download link and return one validated ciphertext blob when present.
+     *
+     * When provided, `expectedBytes` is an exact ciphertext length, not only
+     * an upper bound. Implementations must reject a larger response before
+     * allocating a concatenated result.
+     */
+    getBlob(id: string, expectedBytes?: number): Promise<RelayBlob | undefined>;
 }

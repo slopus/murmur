@@ -37,10 +37,12 @@ murmur messages --with <identity-id>
 murmur attachment --message <message-id> --name note.txt --out ./note.txt
 ```
 
-All command results are JSON except `help`. File bytes are encrypted before
-upload; received message history and replay state commit atomically before the
-relay delivery is acknowledged. One message may carry at most 64 attachments
-and 64 MiB of aggregate plaintext attachment data.
+All command results are JSON except `help`. DirectChat encrypts files, retains
+their ciphertext with the two-copy direct-message outbox before upload, and
+retries uploads before publishing the message event. Received message history
+and replay state commit atomically before relay delivery is acknowledged. One
+message may carry at most 64 attachments and 64 MiB of aggregate plaintext
+attachment data.
 
 ## MLS groups
 

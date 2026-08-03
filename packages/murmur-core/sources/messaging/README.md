@@ -20,4 +20,7 @@ marker, and optional relay cursor in one `MurmurStore` transaction. It returns
 leave the cursor unchanged.
 
 Files are AES-256-GCM encrypted before upload. Their secret descriptor appears
-only inside encrypted message content.
+only inside encrypted message content. Filename and MIME values are validated
+strictly, and the descriptor binds both values plus plaintext length as
+AES-GCM associated data. DirectChat adds product-neutral document, aggregate,
+and bounded-download policy without changing this version-one wire codec.

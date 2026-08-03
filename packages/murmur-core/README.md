@@ -127,12 +127,20 @@ the relay still sees event authors, timing, and ciphertext sizes.
 
 ## Messages and files
 
-`DirectChat.sendText()` publishes one event with a recipient-sealed permanent
-element and a separately domain-separated, peer-bound self-sealed element. The
-latter recovers the owner's outgoing history on a fresh device. Each
-participant opens only its authorized copy, and durable logical replay records
-collapse copies from multiple relays. Its public send surface is text-only;
-existing attachment descriptors remain wire-decodable for compatibility.
+`DirectChat.sendMessage()` encrypts photos and documents, transactionally
+retains ciphertext with the canonical two-copy message outbox, uploads each
+blob before publishing to the same relay, and records partial relay progress
+durably. `sendText()` delegates with its original signature. The peer-bound
+self-sealed element recovers identical attachment descriptors and keys with
+the owner's outgoing history on a fresh device. Each participant opens only
+its authorized copy, and durable logical replay records collapse copies from
+multiple relays.
+
+Documents are limited to 10 MiB plaintext, photos use the existing 64 MiB
+encrypted relay cap, and one logical message is limited to 64 attachments and
+64 MiB aggregate plaintext. `fetchAttachment()` uses an exact bounded download
+and reports typed unavailable, policy, or integrity failures without adding an
+application cache.
 
 `FriendBook` retains authenticated identity/profile records permanently.
 Removal changes status instead of deleting the record, and saving an updated
@@ -166,7 +174,7 @@ interface RelayTransport {
         signal?: AbortSignal,
     ): Promise<EventPage | undefined>;
     putBlob(blob: RelayBlob): Promise<void>;
-    getBlob(id: string): Promise<RelayBlob | undefined>;
+    getBlob(id: string, expectedBytes?: number): Promise<RelayBlob | undefined>;
 }
 ```
 

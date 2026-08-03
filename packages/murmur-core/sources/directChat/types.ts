@@ -3,6 +3,19 @@ import type { IdentityPublicKeys } from "../crypto/index.js";
 import type { PrivateMessage } from "../messaging/index.js";
 import type { StoreTransaction } from "../storage/index.js";
 
+/** Browser-safe plaintext attachment supplied to one logical direct message. */
+export interface DirectChatAttachmentInput {
+    readonly name: string;
+    readonly mediaType?: string;
+    readonly bytes: Uint8Array;
+}
+
+/** Complete content supplied to `DirectChat.sendMessage()`. */
+export interface DirectChatMessageInput {
+    readonly text: string;
+    readonly attachments: readonly DirectChatAttachmentInput[];
+}
+
 /**
  * Stable metadata applications can use to order surfaced logical messages.
  *
@@ -36,6 +49,39 @@ export interface DirectChatSendOptions {
     readonly id?: string;
     readonly sentAt?: number;
 }
+
+/** Attachment metadata is authenticated but violates local download policy. */
+export class DirectChatAttachmentPolicyError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "DirectChatAttachmentPolicyError";
+    }
+}
+
+/** No configured relay currently has the requested ciphertext. */
+export class DirectChatAttachmentUnavailableError extends Error {
+    constructor() {
+        super("Encrypted direct-chat attachment is unavailable");
+        this.name = "DirectChatAttachmentUnavailableError";
+    }
+}
+
+/** Downloaded attachment ciphertext failed size, hash, AEAD, or metadata checks. */
+export class DirectChatAttachmentIntegrityError extends Error {
+    constructor(options?: ErrorOptions) {
+        super("Direct-chat attachment failed integrity validation", options);
+        this.name = "DirectChatAttachmentIntegrityError";
+    }
+}
+
+/** Stateless result of applying DirectChat's authenticated attachment policy. */
+export type DirectChatAttachmentPolicyState =
+    | { readonly status: "allowed" }
+    | {
+          readonly status: "blocked";
+          readonly reason: "document-too-large";
+          readonly maximumBytes: number;
+      };
 
 /** Result of handling one event already read by an existing MurmurClient. */
 export type DirectChatEventResult =

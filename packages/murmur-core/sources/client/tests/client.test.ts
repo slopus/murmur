@@ -3,10 +3,12 @@ import { generateIdentityKeyPair } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import {
     createRelayEvent,
+    createRelayBlob,
     type EventPage,
     type ListPage,
     type PublishOutcome,
     type RelayBlob,
+    RelayBlobIntegrityError,
     type RelayTransport,
     type SignedRelayEvent,
     type TopicState,
@@ -79,7 +81,7 @@ class TestTransport implements RelayTransport {
         this.blobs.set(blob.id, blob);
     }
 
-    async getBlob(id: string): Promise<RelayBlob | undefined> {
+    async getBlob(id: string, _expectedBytes?: number): Promise<RelayBlob | undefined> {
         return this.blobs.get(id);
     }
 }
@@ -268,5 +270,72 @@ describe("MurmurClient", () => {
 
         const uploaded = await client.putBlob(utf8Encode("ciphertext"));
         expect((await client.getBlob(uploaded.id))?.bytes).toEqual(utf8Encode("ciphertext"));
+    });
+
+    it("falls back from corrupt blobs and retains the integrity error when no copy is valid", async () => {
+        const identity = generateIdentityKeyPair();
+        const corrupt = new TestTransport("corrupt");
+        const healthy = new TestTransport("healthy");
+        const blob = createRelayBlob(utf8Encode("ciphertext"));
+        corrupt.blobs.set(blob.id, { id: blob.id, bytes: utf8Encode("tampered") });
+        healthy.blobs.set(blob.id, blob);
+        const client = new MurmurClient({
+            identity,
+            store: new MemoryMurmurStore(),
+            transports: [corrupt, healthy],
+        });
+
+        await expect(client.getBlob(blob.id, blob.bytes.length)).resolves.toEqual(blob);
+
+        const onlyCorrupt = new MurmurClient({
+            identity,
+            store: new MemoryMurmurStore(),
+            transports: [corrupt],
+        });
+        await expect(onlyCorrupt.getBlob(blob.id, blob.bytes.length)).rejects.toBeInstanceOf(
+            RelayBlobIntegrityError,
+        );
+    });
+
+    it("uploads blobs and publishes retained events to explicitly targeted relays", async () => {
+        const identity = generateIdentityKeyPair();
+        const first = new TestTransport("first");
+        const second = new TestTransport("second");
+        const client = new MurmurClient({
+            identity,
+            store: new MemoryMurmurStore(),
+            transports: [first, second],
+        });
+        const blob = createRelayBlob(utf8Encode("ciphertext"));
+        const event = createRelayEvent(identity, "room", utf8Encode("message"));
+
+        expect(client.relayIds).toEqual(["first", "second"]);
+        await client.putBlobToRelay(blob, "second");
+        const publication = await client.publishEvent(event, ["second"]);
+
+        expect(first.blobs.has(blob.id)).toBe(false);
+        expect(second.blobs.get(blob.id)).toEqual(blob);
+        expect(first.events.get("room")).toBeUndefined();
+        expect(second.events.get("room")).toEqual([event]);
+        expect(publication.publishedRelayIds).toEqual(["second"]);
+        expect(publication.failedRelayIds).toEqual([]);
+
+        await client.retryOutbound();
+        expect(first.events.get("room")).toEqual([event]);
+    });
+
+    it("publishes caller-owned targeted events without retaining generic retry state", async () => {
+        const identity = generateIdentityKeyPair();
+        const first = new TestTransport("first");
+        const second = new TestTransport("second");
+        const store = new MemoryMurmurStore();
+        const client = new MurmurClient({ identity, store, transports: [first, second] });
+        const event = createRelayEvent(identity, "room", utf8Encode("owned elsewhere"));
+
+        await client.publishEventToRelay(event, "first");
+
+        expect(first.events.get("room")).toEqual([event]);
+        expect(second.events.get("room")).toBeUndefined();
+        expect((await client.retryOutboundSettled()).results).toHaveLength(0);
     });
 });

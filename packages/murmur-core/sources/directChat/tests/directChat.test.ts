@@ -5,7 +5,9 @@ import { FriendBook, pairwiseTopic } from "../../identity/index.js";
 import {
     createPrivateMessage,
     encodeEncryptedPrivateMessage,
+    encryptFile,
     encryptPrivateMessageForContact,
+    MAX_FILE_BYTES,
     privateMessageListElementId,
     privateMessageSelfListElementId,
 } from "../../messaging/index.js";
@@ -21,18 +23,28 @@ import {
     type SignedRelayEvent,
     type TopicState,
 } from "../../transport/index.js";
-import { utf8Encode } from "../../utils/index.js";
-import { DirectChat, type DirectChatCallbacks } from "../index.js";
+import { utf8Decode, utf8Encode } from "../../utils/index.js";
+import {
+    DirectChat,
+    DirectChatAttachmentIntegrityError,
+    DirectChatAttachmentPolicyError,
+    MAX_DIRECT_CHAT_ATTACHMENT_BYTES,
+    MAX_DIRECT_CHAT_ATTACHMENTS,
+    MAX_DIRECT_CHAT_DOCUMENT_BYTES,
+    type DirectChatCallbacks,
+} from "../index.js";
 
 class ChatTransport implements RelayTransport {
     readonly events = new Map<string, SignedRelayEvent[]>();
     readonly lists = new Map<string, ListElement[]>();
     readonly blobs = new Map<string, RelayBlob>();
+    readonly operations: string[] = [];
     offline = false;
     reset = false;
     now = 1_000;
     enforceFreshness = false;
     loseNextResponse = false;
+    loseNextBlobResponse = false;
 
     constructor(readonly id: string) {}
 
@@ -40,6 +52,7 @@ class ChatTransport implements RelayTransport {
         if (this.offline) {
             throw new Error(`${this.id} offline`);
         }
+        this.operations.push(`event:${event.id}`);
         const events = this.events.get(event.topic) ?? [];
         const duplicate = events.findIndex((candidate) => candidate.id === event.id);
         if (duplicate >= 0) {
@@ -112,11 +125,20 @@ class ChatTransport implements RelayTransport {
     }
 
     async putBlob(blob: RelayBlob): Promise<void> {
-        this.blobs.set(blob.id, blob);
+        if (this.offline) {
+            throw new Error(`${this.id} offline`);
+        }
+        this.operations.push(`blob:${blob.id}`);
+        this.blobs.set(blob.id, { id: blob.id, bytes: blob.bytes.slice() });
+        if (this.loseNextBlobResponse) {
+            this.loseNextBlobResponse = false;
+            throw new Error(`${this.id} lost its accepted blob response`);
+        }
     }
 
     async getBlob(id: string): Promise<RelayBlob | undefined> {
-        return this.blobs.get(id);
+        const blob = this.blobs.get(id);
+        return blob === undefined ? undefined : { id: blob.id, bytes: blob.bytes.slice() };
     }
 }
 
@@ -175,6 +197,349 @@ function chat(
 }
 
 describe("DirectChat", () => {
+    it("sends, downloads, retries, and backfills photo and document attachments", async () => {
+        const first = new ChatTransport("first");
+        const second = new ChatTransport("second");
+        second.offline = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const aliceChat = chat(alice, aliceStore, friends.left, [first, second]);
+        const bobChat = chat(bob, bobStore, friends.right, [first, second]);
+        const id = "L".repeat(32);
+
+        const sent = await aliceChat.sendMessage(
+            bob,
+            {
+                text: "two files",
+                attachments: [
+                    {
+                        name: "photo.jpg",
+                        mediaType: "image/jpeg",
+                        bytes: utf8Encode("photo"),
+                    },
+                    {
+                        name: "notes.txt",
+                        mediaType: "text/plain",
+                        bytes: utf8Encode("document"),
+                    },
+                ],
+            },
+            { id, sentAt: 50 },
+        );
+
+        expect(sent.message.attachments.map((value) => value.mediaType)).toEqual([
+            "image/jpeg",
+            "text/plain",
+        ]);
+        expect(first.operations.slice(-1)[0]).toMatch(/^event:/);
+        expect(first.operations.slice(0, 2)).toEqual([
+            `blob:${sent.message.attachments[0]?.blobId}`,
+            `blob:${sent.message.attachments[1]?.blobId}`,
+        ]);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(1);
+        expect(await aliceStore.list("client/")).toHaveLength(0);
+        const genericRetry = await new MurmurClient({
+            identity: alice,
+            store: aliceStore,
+            transports: [first, second],
+        }).retryOutboundSettled();
+        expect(genericRetry.results).toHaveLength(0);
+        expect(second.operations).toEqual([]);
+        const received = await bobChat.sync();
+        if (received.status !== "events" || received.opened[0] === undefined) {
+            throw new Error("Expected attachment message");
+        }
+        expect(
+            utf8Decode(await bobChat.fetchAttachment(received.opened[0].message.attachments[0]!)),
+        ).toBe("photo");
+        expect(
+            utf8Decode(await bobChat.fetchAttachment(received.opened[0].message.attachments[1]!)),
+        ).toBe("document");
+        await expect(
+            aliceChat.sendMessage(
+                bob,
+                {
+                    text: "two files",
+                    attachments: [
+                        {
+                            name: "photo.jpg",
+                            mediaType: "image/jpeg",
+                            bytes: utf8Encode("changed"),
+                        },
+                        {
+                            name: "notes.txt",
+                            mediaType: "text/plain",
+                            bytes: utf8Encode("document"),
+                        },
+                    ],
+                },
+                { id },
+            ),
+        ).rejects.toThrow("ID collision");
+
+        second.offline = false;
+        expect((await aliceChat.retryPending()).failures).toEqual([]);
+        expect(second.operations.slice(-1)[0]).toMatch(/^event:/);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(0);
+        expect(await aliceStore.list("direct-chat/v2/outbox-blob/")).toHaveLength(0);
+
+        const freshStore = new MemoryMurmurStore();
+        const freshFriends = new FriendBook(alice, freshStore);
+        await freshFriends.save({ identity: bob, profile: { name: "Bob" } }, 1);
+        const recovered = await chat(alice, freshStore, freshFriends, [first]).loadHistory(bob);
+        expect(recovered.opened).toHaveLength(1);
+        expect(recovered.opened[0]?.direction).toBe("outgoing");
+        expect(recovered.opened[0]?.message.attachments).toEqual(sent.message.attachments);
+    });
+
+    it("enforces exact document, photo, aggregate, count, filename, and MIME boundaries", async () => {
+        const relay = new ChatTransport("relay");
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+
+        await expect(
+            aliceChat.sendMessage(bob, {
+                text: "",
+                attachments: [
+                    {
+                        name: "too-large.pdf",
+                        mediaType: "application/pdf",
+                        bytes: new Uint8Array(MAX_DIRECT_CHAT_DOCUMENT_BYTES + 1),
+                    },
+                ],
+            }),
+        ).rejects.toBeInstanceOf(DirectChatAttachmentPolicyError);
+        await expect(
+            aliceChat.sendMessage(bob, {
+                text: "",
+                attachments: [
+                    {
+                        name: "bad/name",
+                        mediaType: "text/plain",
+                        bytes: new Uint8Array(),
+                    },
+                ],
+            }),
+        ).rejects.toThrow("descriptor");
+        await expect(
+            aliceChat.sendMessage(bob, {
+                text: "",
+                attachments: [
+                    {
+                        name: "name",
+                        mediaType: "not a mime",
+                        bytes: new Uint8Array(),
+                    },
+                ],
+            }),
+        ).rejects.toThrow("descriptor");
+        await expect(
+            aliceChat.sendMessage(bob, {
+                text: "",
+                attachments: Array.from(
+                    { length: MAX_DIRECT_CHAT_ATTACHMENTS + 1 },
+                    (_, index) => ({
+                        name: `empty-${index}`,
+                        mediaType: "image/png",
+                        bytes: new Uint8Array(),
+                    }),
+                ),
+            }),
+        ).rejects.toThrow("message input");
+        await expect(
+            aliceChat.sendMessage(bob, {
+                text: "",
+                attachments: [
+                    {
+                        name: "left.png",
+                        mediaType: "image/png",
+                        bytes: new Uint8Array(MAX_DIRECT_CHAT_ATTACHMENT_BYTES / 2),
+                    },
+                    {
+                        name: "right.png",
+                        mediaType: "image/png",
+                        bytes: new Uint8Array(MAX_DIRECT_CHAT_ATTACHMENT_BYTES / 2 + 1),
+                    },
+                ],
+            }),
+        ).rejects.toBeInstanceOf(DirectChatAttachmentPolicyError);
+
+        const exactDocument = await aliceChat.sendMessage(bob, {
+            text: "",
+            attachments: [
+                {
+                    name: "exact.pdf",
+                    mediaType: "application/pdf",
+                    bytes: new Uint8Array(MAX_DIRECT_CHAT_DOCUMENT_BYTES),
+                },
+            ],
+        });
+        expect(exactDocument.message.attachments[0]?.plaintextBytes).toBe(
+            MAX_DIRECT_CHAT_DOCUMENT_BYTES,
+        );
+        const exactPhoto = await aliceChat.sendMessage(bob, {
+            text: "",
+            attachments: [
+                {
+                    name: "maximum.jpg",
+                    mediaType: "image/jpeg",
+                    bytes: new Uint8Array(MAX_FILE_BYTES),
+                },
+            ],
+        });
+        expect(exactPhoto.message.attachments[0]?.plaintextBytes).toBe(MAX_FILE_BYTES);
+        const exactCount = await aliceChat.sendMessage(bob, {
+            text: "",
+            attachments: Array.from({ length: MAX_DIRECT_CHAT_ATTACHMENTS }, (_, index) => ({
+                name: `empty-${index}`,
+                mediaType: "image/png",
+                bytes: new Uint8Array(),
+            })),
+        });
+        expect(exactCount.message.attachments).toHaveLength(MAX_DIRECT_CHAT_ATTACHMENTS);
+    }, 30_000);
+
+    it("accepts oversize authenticated document metadata but refuses policy and tamper fetches", async () => {
+        const relay = new ChatTransport("relay");
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+        const bobClient = new MurmurClient({ identity: bob, store: bobStore, transports: [relay] });
+        const oversized = {
+            version: 1 as const,
+            blobId: "A".repeat(43),
+            key: new Uint8Array(32),
+            nonce: new Uint8Array(12),
+            name: "oversize.pdf",
+            mediaType: "application/pdf",
+            plaintextBytes: MAX_DIRECT_CHAT_DOCUMENT_BYTES + 1,
+        };
+        const message = createPrivateMessage("oversize metadata", [oversized], 1);
+        const payload = encodeEncryptedPrivateMessage(
+            encryptPrivateMessageForContact(bob, alice, message),
+        );
+        await bobClient.publishEvent(
+            createRelayEvent(bob, pairwiseTopic(alice, bob), payload, {
+                list: [
+                    {
+                        op: "append",
+                        id: privateMessageListElementId(bob, message),
+                        bytes: payload,
+                    },
+                ],
+            }),
+        );
+
+        const received = await aliceChat.sync();
+        const descriptor =
+            received.status === "events" ? received.opened[0]?.message.attachments[0] : undefined;
+        expect(descriptor).toBeDefined();
+        expect(aliceChat.attachmentPolicy(descriptor!)).toMatchObject({
+            status: "blocked",
+            reason: "document-too-large",
+        });
+        await expect(aliceChat.fetchAttachment(descriptor!)).rejects.toBeInstanceOf(
+            DirectChatAttachmentPolicyError,
+        );
+
+        const encrypted = encryptFile(utf8Encode("authentic"), {
+            name: "tamper.txt",
+            mediaType: "text/plain",
+        });
+        relay.blobs.set(encrypted.blob.id, {
+            id: encrypted.blob.id,
+            bytes: utf8Encode("tampered"),
+        });
+        await expect(aliceChat.fetchAttachment(encrypted.descriptor)).rejects.toBeInstanceOf(
+            DirectChatAttachmentIntegrityError,
+        );
+    });
+
+    it("retries an ambiguously accepted blob idempotently before publishing its event", async () => {
+        const relay = new ChatTransport("relay");
+        relay.loseNextBlobResponse = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const id = "M".repeat(32);
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+
+        await expect(
+            aliceChat.sendMessage(
+                bob,
+                {
+                    text: "ambiguous blob",
+                    attachments: [
+                        {
+                            name: "note.txt",
+                            mediaType: "text/plain",
+                            bytes: utf8Encode("once"),
+                        },
+                    ],
+                },
+                { id, sentAt: 60 },
+            ),
+        ).rejects.toThrow("lost its accepted blob response");
+        expect(relay.blobs).toHaveLength(1);
+        expect(relay.events.size).toBe(0);
+
+        const restarted = chat(alice, aliceStore, friends.left, [relay]);
+        expect((await restarted.retryPending()).failures).toEqual([]);
+        expect(relay.blobs).toHaveLength(1);
+        expect(relay.operations.filter((operation) => operation.startsWith("blob:"))).toHaveLength(
+            2,
+        );
+        expect(relay.operations.slice(-1)[0]).toMatch(/^event:/);
+    });
+
+    it("keeps a corrupt attachment outbox poisoned without exposing its event", async () => {
+        const relay = new ChatTransport("relay");
+        relay.offline = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+
+        await expect(
+            aliceChat.sendMessage(bob, {
+                text: "poison",
+                attachments: [
+                    {
+                        name: "note.txt",
+                        mediaType: "text/plain",
+                        bytes: utf8Encode("durable"),
+                    },
+                ],
+            }),
+        ).rejects.toThrow("offline");
+        const blobs = await aliceStore.list("direct-chat/v2/outbox-blob/");
+        const blobKey = [...blobs.keys()][0];
+        if (blobKey === undefined) {
+            throw new Error("Expected retained direct-chat blob");
+        }
+        await aliceStore.set(blobKey, utf8Encode("corrupt"));
+        relay.offline = false;
+
+        const report = await aliceChat.retryPending();
+        expect(report.failures[0]?.message).toContain("failed validation");
+        expect(relay.events.size).toBe(0);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(1);
+    });
+
     it("publishes separated self/recipient copies and retries one caller ID exactly once", async () => {
         const relay = new ChatTransport("relay");
         const alice = generateIdentityKeyPair();

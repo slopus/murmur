@@ -52,6 +52,7 @@ export {
     MAX_FILE_BYTES,
     MAX_MESSAGE_ATTACHMENTS,
     MAX_MESSAGE_BYTES,
+    validateFileDescriptor,
     validatePrivateMessageId,
 } from "./impl/messageCodec.js";
 export type {
