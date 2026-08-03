@@ -147,7 +147,7 @@ describe("MurmurClient topic streams", () => {
         expect(relay.connections).toBe(1);
 
         relay.endStream();
-        // Backoff floor is 250 ms; advance fake timers past it.
+        // The first backoff lands in [250, 500) ms of real time.
         await vi.waitFor(() => expect(relay.connections).toBe(2), { timeout: 2_000 });
 
         stream.close();
@@ -165,6 +165,56 @@ describe("MurmurClient topic streams", () => {
 
         expect(relay.connections).toBe(1);
         expect(stream.connected).toBe(false);
+    });
+
+    it("keeps reconnecting when a status handler throws", async () => {
+        const relay = new ScriptedStreamTransport("relay");
+        const stream = makeClient([relay]).openTopicStream("room", {
+            onStatus: (): void => {
+                throw new Error("status handler exploded");
+            },
+        });
+        await flush();
+        expect(relay.connections).toBe(1);
+
+        relay.endStream();
+        await vi.waitFor(() => expect(relay.connections).toBe(2), { timeout: 2_000 });
+
+        relay.ready();
+        await flush();
+        expect(stream.connected).toBe(true);
+
+        stream.close();
+    });
+
+    it("isolates every throwing application handler", async () => {
+        const relay = new ScriptedStreamTransport("relay");
+        const explode = (): never => {
+            throw new Error("handler exploded");
+        };
+        const stream = makeClient([relay]).openTopicStream("room", {
+            onFrame: explode,
+            onWake: explode,
+            onDrop: explode,
+            onStatus: explode,
+        });
+        await flush();
+
+        expect(() => relay.ready()).not.toThrow();
+        expect(() => relay.frame(utf8Encode("hi"))).not.toThrow();
+        expect(() => relay.wake()).not.toThrow();
+        expect(() => relay.drop(3)).not.toThrow();
+        expect(stream.connected).toBe(true);
+
+        stream.close();
+    });
+
+    it("throws when no transport supports topic streaming", () => {
+        const client = makeClient([new BaseTransport("plain")]);
+
+        expect(() => client.openTopicStream("room", {})).toThrow(
+            "No configured transport supports topic streaming",
+        );
     });
 
     it("fans out ephemeral publishes and tolerates a single relay failure", async () => {

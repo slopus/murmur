@@ -53,7 +53,11 @@ openTopicStream  -> one live stream per capable relay, each with its own backoff
 `publishEphemeral()` resolves with the total delivered count and throws only when
 every capable transport failed. `openTopicStream()` returns a `TopicStream` that
 connects to every transport implementing `openStream`, reconnects each relay with
-bounded exponential backoff plus jitter (250 ms floor, 15 s ceiling), and reports
+bounded exponential backoff plus jitter (250 ms floor, 15 s ceiling, every attempt
+spread across a real range so relays never retry in lockstep), and reports
 per-relay connection state through `onStatus`. Frames pass straight through — the
 client buffers nothing — and `close()` aborts every connection and guarantees no
-further reconnect timer is scheduled.
+further reconnect timer is scheduled. Both calls throw when no configured
+transport implements the matching optional method, so a misconfigured relay set
+fails loudly instead of yielding a stream that can never connect. A handler that
+throws is isolated: it cannot stop a relay from reconnecting.

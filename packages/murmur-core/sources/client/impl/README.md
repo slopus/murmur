@@ -7,4 +7,8 @@ history.
 stream returned by `MurmurClient.openTopicStream`. It runs one reconnect loop per
 stream-capable relay, tags every forwarded event with its relay id, and uses a
 cancellable backoff timer so `close()` stops each loop without leaving a pending
-reconnect scheduled.
+reconnect scheduled. Every application handler is invoked through `notify`, which
+swallows its failure: a throwing handler must never break the reconnect loop it
+is called from or surface as an unhandled rejection. `backoffDelay` jitters every
+attempt across a real window — `[250 * 2^n, 250 * 2^(n+1))`, capped at 15 s — so
+relays that all drop at once do not retry in lockstep.

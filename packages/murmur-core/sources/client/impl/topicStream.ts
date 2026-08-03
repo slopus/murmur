@@ -8,6 +8,21 @@ const BACKOFF_CEILING_MILLISECONDS = 15_000;
 /** Guards `2 ** attempt` against overflowing to a non-finite delay. */
 const MAXIMUM_BACKOFF_EXPONENT = 40;
 
+/**
+ * Deliver one notification to application code without letting it break us.
+ *
+ * Every handler here belongs to the library user and runs inside a
+ * fire-and-forget reconnect loop, so a throw must not stop that relay from
+ * reconnecting or surface as an unhandled rejection.
+ */
+function notify(deliver: () => void): void {
+    try {
+        deliver();
+    } catch {
+        // A failing application handler is the application's problem, not ours.
+    }
+}
+
 /** Per-relay reconnect state owned by one {@link TopicStreamController}. */
 interface RelayConnection {
     connected: boolean;
@@ -125,28 +140,30 @@ export class TopicStreamController implements TopicStream {
             },
             onFrame: (bytes: Uint8Array): void => {
                 if (!this.#closed) {
-                    this.#handlers.onFrame?.({ relayId, bytes });
+                    notify(() => this.#handlers.onFrame?.({ relayId, bytes }));
                 }
             },
             onWake: (): void => {
                 if (!this.#closed) {
-                    this.#handlers.onWake?.(relayId);
+                    notify(() => this.#handlers.onWake?.(relayId));
                 }
             },
             onDrop: (frames: number): void => {
                 if (!this.#closed) {
-                    this.#handlers.onDrop?.({ relayId, frames });
+                    notify(() => this.#handlers.onDrop?.({ relayId, frames }));
                 }
             },
         };
     }
 
     #emitStatus(relayId: string, connected: boolean, error: Error | undefined): void {
-        this.#handlers.onStatus?.({
-            relayId,
-            connected,
-            ...(error === undefined ? {} : { error }),
-        });
+        notify(() =>
+            this.#handlers.onStatus?.({
+                relayId,
+                connected,
+                ...(error === undefined ? {} : { error }),
+            }),
+        );
     }
 
     #waitBeforeReconnect(connection: RelayConnection, milliseconds: number): Promise<void> {
@@ -169,12 +186,19 @@ export class TopicStreamController implements TopicStream {
     }
 }
 
-/** Exponential reconnect delay with full jitter, clamped to the fixed bounds. */
+/**
+ * Exponential reconnect delay with equal jitter, clamped to the fixed bounds.
+ *
+ * The window for attempt `n` is `[floor * 2 ** n, floor * 2 ** (n + 1))`, capped
+ * at {@link BACKOFF_CEILING_MILLISECONDS}. Every attempt — including the first,
+ * which every relay reaches at once after a blip — spans a real range, so
+ * clients that reconnect together do not retry in lockstep.
+ */
 export function backoffDelay(attempt: number): number {
     const exponent = Math.min(Math.max(attempt, 0), MAXIMUM_BACKOFF_EXPONENT);
     const ceiling = Math.min(
         BACKOFF_CEILING_MILLISECONDS,
-        BACKOFF_FLOOR_MILLISECONDS * 2 ** exponent,
+        BACKOFF_FLOOR_MILLISECONDS * 2 ** (exponent + 1),
     );
     const jittered = ceiling / 2 + Math.random() * (ceiling / 2);
     return Math.max(BACKOFF_FLOOR_MILLISECONDS, Math.min(BACKOFF_CEILING_MILLISECONDS, jittered));

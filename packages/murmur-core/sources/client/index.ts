@@ -693,11 +693,16 @@ export class MurmurClient {
      * The returned {@link TopicStream} connects to every configured relay that
      * implements `openStream`, reconnects each with bounded exponential backoff
      * plus jitter, and reports connection state through `onStatus`. It buffers
-     * nothing and stops cleanly on `close()`.
+     * nothing and stops cleanly on `close()`. Like `publishEphemeral`, it throws
+     * when no configured transport supports the stream, rather than handing back
+     * a stream that can never connect.
      */
     openTopicStream(topic: string, handlers: TopicStreamHandlers): TopicStream {
         if (!/^[A-Za-z0-9_.:-]{1,512}$/.test(topic)) {
             throw new Error("Invalid relay topic");
+        }
+        if (!this.#transports.some((transport) => transport.openStream !== undefined)) {
+            throw new Error("No configured transport supports topic streaming");
         }
         return new TopicStreamController(topic, handlers, this.#transports);
     }

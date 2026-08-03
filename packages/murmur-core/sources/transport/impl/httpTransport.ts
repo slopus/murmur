@@ -109,14 +109,17 @@ function readCountField(text: string, field: string): number {
  *
  * Bytes arrive in arbitrary chunks that may split a line or a UTF-8 sequence.
  * Lines are separated on the `\n` byte (a byte that never appears inside a
- * multi-byte UTF-8 sequence), tolerating a trailing `\r`. Both the pending line
- * and the accumulated event data are bounded by {@link MAXIMUM_STREAM_EVENT_BYTES};
- * exceeding it throws so the stream fails rather than growing without bound.
+ * multi-byte UTF-8 sequence), tolerating a trailing `\r`. The pending line, the
+ * retained event name, and the accumulated event data are bounded together by
+ * {@link MAXIMUM_STREAM_EVENT_BYTES}: every line is measured before it is
+ * decoded or retained, so exceeding the bound throws and fails the stream
+ * instead of decoding or buffering without bound.
  */
 class EventStreamParser {
     readonly #handlers: RelayStreamHandlers;
     #line: Uint8Array = new Uint8Array(0);
     #eventName = "";
+    #eventNameBytes = 0;
     #data: string[] = [];
     #dataBytes = 0;
 
@@ -164,12 +167,17 @@ class EventStreamParser {
     }
 
     #enforceBound(pendingLineBytes: number): void {
-        if (pendingLineBytes + this.#dataBytes > MAXIMUM_STREAM_EVENT_BYTES) {
+        if (
+            pendingLineBytes + this.#eventNameBytes + this.#dataBytes >
+            MAXIMUM_STREAM_EVENT_BYTES
+        ) {
             throw new Error("Relay stream event exceeded its maximum size");
         }
     }
 
     #handleLine(line: Uint8Array): void {
+        // Measure before decoding: a whole oversized line can arrive in one chunk.
+        this.#enforceBound(line.length);
         if (line.length === 0) {
             this.#dispatch();
             return;
@@ -184,11 +192,12 @@ class EventStreamParser {
             value = value.slice(1);
         }
         if (field === "event") {
+            // The name replaces any earlier one, so its bytes replace them too.
             this.#eventName = value;
+            this.#eventNameBytes = line.length;
         } else if (field === "data") {
             this.#data.push(value);
             this.#dataBytes += line.length;
-            this.#enforceBound(0);
         }
     }
 
@@ -196,6 +205,7 @@ class EventStreamParser {
         const name = this.#eventName;
         const data = this.#data.join("\n");
         this.#eventName = "";
+        this.#eventNameBytes = 0;
         this.#data = [];
         this.#dataBytes = 0;
         if (name.length === 0 && data.length === 0) {

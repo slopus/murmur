@@ -105,6 +105,45 @@ describe("ephemeral relay transport", () => {
         expect(source.cancelled).toBe(true);
     });
 
+    it("fails before decoding an oversized line delivered whole in one chunk", async () => {
+        const source = eventStreamResponse();
+        const controller = new AbortController();
+        let dispatched = false;
+        const promise = streamingTransport(source).openStream(
+            "room",
+            {
+                onReady: (): void => {
+                    dispatched = true;
+                },
+            },
+            controller.signal,
+        );
+
+        // One complete line, terminator included, in a single chunk.
+        source.push(`event: ${"A".repeat(300 * 1024)}\n`);
+        source.push("data: {}\n\n");
+        source.close();
+
+        await expect(promise).rejects.toThrow("maximum size");
+        expect(source.cancelled).toBe(true);
+        expect(dispatched).toBe(false);
+    });
+
+    it("counts the retained event name against the per-event cap", async () => {
+        const source = eventStreamResponse();
+        const controller = new AbortController();
+        const promise = streamingTransport(source).openStream("room", {}, controller.signal);
+
+        // Neither line exceeds 256 KiB alone; the event they build does.
+        source.push(`event: ${"A".repeat(200 * 1024)}\n`);
+        source.push(`data: ${"B".repeat(100 * 1024)}\n`);
+        source.push("\n");
+        source.close();
+
+        await expect(promise).rejects.toThrow("maximum size");
+        expect(source.cancelled).toBe(true);
+    });
+
     it("stops promptly and cancels the reader when aborted", async () => {
         const source = eventStreamResponse();
         const controller = new AbortController();

@@ -47,8 +47,10 @@ stored, retried, or acknowledged. `openStream` reads `response.body`
 incrementally and parses the SSE framing itself: lines split on `\n` (tolerating
 `\r\n`), `:` comment lines and unknown event names are ignored, `data:` payloads
 carry base64url frames or one line of JSON, and events end on a blank line. The
-line buffer and per-event buffer are both bounded at 256 KiB — comfortably above
-one base64url-encoded 128 KiB frame — so a runaway event fails the stream instead
-of growing without bound. The returned promise resolves when the stream ends or
+pending line, the retained event name, and the accumulated event data are bounded
+together at 256 KiB — comfortably above one base64url-encoded 128 KiB frame. Every
+line is measured before it is decoded or retained, including one that arrives
+whole inside a single chunk, so a runaway line or event fails the stream instead
+of being decoded or buffered without bound. The returned promise resolves when the stream ends or
 its `AbortSignal` aborts, rejects on transport failure, and never leaks the
 reader. `MAX_RELAY_EPHEMERAL_FRAME_BYTES` (128 KiB) is the frame ceiling.
