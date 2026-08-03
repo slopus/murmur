@@ -8,5 +8,5 @@ vX.Y.Z tag
     `-- create the GitHub Release
 ```
 
-`release.yml` is intentionally tag-driven. The tag must exactly match the
+`publish.yml` is intentionally tag-driven. The tag must exactly match the
 version in `packages/murmur-core/package.json`.
