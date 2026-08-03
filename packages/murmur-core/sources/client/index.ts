@@ -179,6 +179,24 @@ export class MurmurClient {
         this.#topics.add(topic);
     }
 
+    /** Stop polling a topic after its durable replica has been retired. */
+    unsubscribe(topic: string): void {
+        this.#topics.delete(topic);
+    }
+
+    /**
+     * Delete every configured relay cursor inside the replica-deletion
+     * transaction. Call `unsubscribe()` after that transaction commits.
+     */
+    async retireTopicCursors(transaction: StoreTransaction, topic: string): Promise<void> {
+        if (!/^[A-Za-z0-9_.:-]{1,512}$/.test(topic)) {
+            throw new Error("Invalid relay topic");
+        }
+        for (const relayId of this.relayIds) {
+            await transaction.delete(this.#cursorKey(relayId, topic));
+        }
+    }
+
     /** Publish opaque bytes with optional atomic snapshot/list mutations. */
     async publish(
         topic: string,

@@ -177,3 +177,9 @@ Murmur does not currently protect against:
 Applications must also choose safe local storage, backups, logging, token
 exchange, TLS termination, and operational access controls. Those choices are
 outside the Murmur protocol.
+
+Shared-session revocation has the same endpoint limit. Murmur transactionally
+requests local replica deletion and retires its protocol rows, cursors, and
+epoch secrets, but cannot erase plaintext or history-page keys a member already
+copied. Revocation protects future MLS epochs and page keys; it is not remote
+data destruction.

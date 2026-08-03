@@ -11,6 +11,7 @@ export * from "./leafNode/index.js";
 export * from "./privateMessage/index.js";
 export * from "./ratchetTree/index.js";
 export * from "./secretTree/index.js";
+export * from "./sharedSession/index.js";
 export * from "./tree/index.js";
 export * from "./updatePath/index.js";
 export * from "./welcome/index.js";

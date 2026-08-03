@@ -64,6 +64,10 @@
             "types": "./dist/messaging/index.d.ts",
             "import": "./dist/messaging/index.js"
         },
+        "./sharedSession": {
+            "types": "./dist/mls/sharedSession/index.d.ts",
+            "import": "./dist/mls/sharedSession/index.js"
+        },
         "./storage": {
             "types": "./dist/storage/index.d.ts",
             "import": "./dist/storage/index.js"

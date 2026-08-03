@@ -50,16 +50,14 @@ import {
     authenticateMurmurMlsCredential,
     createMlsGroup,
     createMlsKeyPackage,
-    createMlsTreeEpochFromWelcome,
     decodeMlsKeyPackage,
     decodeMlsRatchetTree,
     deserializeMlsKeyPackageBundle,
     destroyMlsKeyPackageBundle,
-    destroyMlsEpochSecrets,
     encodeMlsKeyPackage,
     encodeMlsRatchetTree,
     mlsKeyPackageReference,
-    openMlsWelcome,
+    joinMlsGroupFromWelcome,
     serializeMlsKeyPackageBundle,
     verifyMlsKeyPackage,
     type MlsKeyPackage,
@@ -1763,7 +1761,6 @@ export class MurmurCliRuntime {
             throw new Error("MLS group invitation references an unavailable KeyPackage");
         }
         let bundle: ReturnType<typeof deserializeMlsKeyPackageBundle> | undefined;
-        let opened: ReturnType<typeof openMlsWelcome> | undefined;
         let channel: MlsGroupChannel | undefined;
         let checkpoint: Uint8Array | undefined;
         try {
@@ -1780,44 +1777,14 @@ export class MurmurCliRuntime {
                 groupId: invitation.groupId,
                 authenticateCredential: authenticateMurmurMlsCredential,
             });
-            const nodes = tree.nodes;
-            const localLeaves: number[] = [];
-            for (let leaf = 0; leaf < tree.leafCount; leaf += 1) {
-                const node = nodes[leaf * 2];
-                if (
-                    node?.type === "leaf" &&
-                    equalBytes(node.signatureKey, bundle.keyPackage.leafNode.signatureKey) &&
-                    equalBytes(node.encryptionKey, bundle.keyPackage.leafNode.encryptionKey)
-                ) {
-                    localLeaves.push(leaf);
-                }
-            }
-            if (localLeaves.length !== 1) {
-                throw new Error("MLS invitation tree does not contain exactly one joining leaf");
-            }
-            opened = openMlsWelcome({
+            const epoch = joinMlsGroupFromWelcome({
+                identity: account.identity,
+                inviter,
+                groupId: invitation.groupId,
                 welcome: invitation.welcome,
                 keyPackageBundle: bundle,
-                expectedGroupId: invitation.groupId,
-                validateExternalTree: (groupInfo) => {
-                    const signer = nodes[groupInfo.signer * 2];
-                    return equalBytes(groupInfo.context.treeHash, tree.treeHash()) &&
-                        equalBytes(groupInfo.context.groupId, invitation.groupId) &&
-                        signer?.type === "leaf" &&
-                        equalBytes(signer.signatureKey, inviter.signingKey)
-                        ? signer.signatureKey
-                        : undefined;
-                },
-            });
-            const epoch = createMlsTreeEpochFromWelcome({
-                opened,
                 tree,
-                localLeaf: localLeaves[0]!,
-                leafKeyPair: bundle.leafKeyPair,
-                localSigningSecretKey: account.identity.signingSecretKey,
-                authenticateCredential: authenticateMurmurMlsCredential,
             });
-            opened = undefined;
             channel = new MlsGroupChannel(epoch, [invitation.commitFingerprint]);
             checkpoint = channel.serializeEpoch();
             await persistCliGroupRecord(transaction, cliGroupKey(ownerId, groupId), {
@@ -1833,12 +1800,6 @@ export class MurmurCliRuntime {
             return { id: groupId, group };
         } catch (error: unknown) {
             channel?.destroy();
-            if (opened !== undefined) {
-                destroyMlsEpochSecrets(opened.epochSecrets);
-                if (opened.pathSecret !== undefined) {
-                    zeroBytes(opened.pathSecret);
-                }
-            }
             throw error;
         } finally {
             zeroBytes(encodedBundle);

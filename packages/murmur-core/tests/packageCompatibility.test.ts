@@ -16,6 +16,7 @@ const packageSpecifiers = [
     "@slopus/murmur/identity",
     "@slopus/murmur/messaging",
     "@slopus/murmur/mls",
+    "@slopus/murmur/sharedSession",
     "@slopus/murmur/storage",
     "@slopus/murmur/transport",
     "@slopus/murmur/utils",

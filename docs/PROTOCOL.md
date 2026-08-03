@@ -419,6 +419,43 @@ Groups offer forward-secret epochs after membership transitions. This is better
 than direct messages, but it does not repair an unverified identity-token
 exchange or make the relay available.
 
+## Shared agent sessions
+
+A shared agent session is an owner-controlled application protocol over one
+stable MLS group. Rig supplies the opaque bounded `shareId`; Murmur binds it
+permanently to one owner and one MLS group ID/topic.
+
+Owner entry frames contain a gapless positive `shareSequence`, owner-minted
+UUIDv7 `shareEventId`, timestamp, SHA-256 content hash, and the complete opaque
+canonical-JSON Rig payload. Murmur does not interpret roles, tool calls, or
+transcript bodies. Entry replay identity is the share, sequence, event ID, and
+matching content hash; conflicting authenticated content is a protocol error.
+
+The only non-owner application frame is a bounded text post. MLS authenticates
+its peer leaf, while the frame carries the current owner-issued `grantEpoch`
+and caller-stable post ID. The owner deduplicates
+`(share, peer, grantEpoch, postId)` and may later append the post as an ordinary
+opaque Rig entry.
+
+Owner-signed state gives each peer a stable `shareMemberId` and increments its
+`grantEpoch` on every re-add. Ended state is keyed by both values, so an old
+ended frame cannot terminate a later grant. Only the pinned owner may author
+state, entries, history offers, or MLS Commits.
+
+History is not old MLS ciphertext. Rig streams bounded pages which Murmur
+encrypts as independent file blobs. A page contains at most 256 entries and
+4 MiB of plaintext. Encrypted offers carry at most 256 page descriptors and
+chain without a lifetime byte ceiling. Members persist one page at a time,
+track the highest contiguous sequence, and keep a bounded durable live tail
+while backfilling.
+
+Revocation sends authenticated ended state before the owner Remove Commit.
+Receiving ended state or an MLS removal invokes the application's termination
+callback in the transaction which deletes protocol replica rows and transport
+cursors, then destroys epoch secrets. This is cooperative deletion: plaintext
+or blob keys already saved by a former member cannot be cryptographically
+erased. Later epoch and history-page keys remain inaccessible.
+
 ## Shared text documents
 
 A shared document is an operation-based replicated growable array. Its

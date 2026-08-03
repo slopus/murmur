@@ -6,10 +6,11 @@ import {
     type PublishResult,
     type ReceivedEvent,
 } from "@slopus/murmur";
-import { MlsLocalMemberRemovedError } from "../commit/index.js";
+import { decodeMlsTreeCommit, MlsLocalMemberRemovedError } from "../commit/index.js";
 import { MlsEpochState, type MlsEpochCommitProposal } from "../epoch/index.js";
 import type {
     MlsGroupDelivery,
+    MlsGroupCommitAuthor,
     MlsGroupMurmurClient,
     MlsGroupPublishResult,
     PreparedMlsGroupApplication,
@@ -21,6 +22,7 @@ export type {
     DeferredMlsGroupDelivery,
     AppliedMlsGroupCommitDelivery,
     MlsGroupDelivery,
+    MlsGroupCommitAuthor,
     MlsGroupCommitProposal,
     MlsGroupMurmurClient,
     MlsGroupPublishResult,
@@ -127,6 +129,31 @@ export class MlsGroupChannel {
     /** Defensive member signing-key view indexed by MLS leaf number. */
     get memberSignatureKeys(): readonly (Uint8Array | undefined)[] {
         return this.#epoch.memberSignatureKeys;
+    }
+
+    /**
+     * Resolve and validate a current-epoch Commit author without applying it.
+     *
+     * Higher-level protocols use this before `handle()` to enforce a stricter
+     * committer ACL than ordinary MLS membership.
+     */
+    inspectCommitAuthor(payload: Uint8Array): MlsGroupCommitAuthor {
+        if (!isPublicMlsMessage(payload)) {
+            throw new Error("MLS payload is not a Commit");
+        }
+        const message = decodeMlsTreeCommit(payload);
+        const signingKey = this.#epoch.memberSignatureKeys[message.sender];
+        if (
+            !equalBytes(message.groupId, this.#epoch.groupId) ||
+            message.epoch > this.#epoch.context.epoch ||
+            signingKey === undefined
+        ) {
+            throw new Error("MLS Commit does not have a current group author");
+        }
+        return {
+            sender: message.sender,
+            signingKey: signingKey.slice(),
+        };
     }
 
     /** Serialize the current epoch after an inbound delivery or adoption. */

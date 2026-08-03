@@ -127,3 +127,9 @@ export interface PreparedMlsGroupCommit {
 
 /** Full Commit proposal type exposed by the group channel. */
 export type MlsGroupCommitProposal = MlsEpochCommitProposal;
+
+/** Current-epoch MLS Commit author resolved before state mutation. */
+export interface MlsGroupCommitAuthor {
+    readonly sender: number;
+    readonly signingKey: Uint8Array;
+}

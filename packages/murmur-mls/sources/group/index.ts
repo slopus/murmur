@@ -1,5 +1,11 @@
-import { equalBytes, randomBytes, zeroBytes, type IdentityKeyPair } from "@slopus/murmur";
-import { MlsEpochState } from "../epoch/index.js";
+import {
+    equalBytes,
+    randomBytes,
+    zeroBytes,
+    type IdentityKeyPair,
+    type IdentityPublicKeys,
+} from "@slopus/murmur";
+import { MlsEpochState, createMlsTreeEpochFromWelcome } from "../epoch/index.js";
 import {
     createMlsConfirmationTag,
     updateInterimTranscriptHash,
@@ -19,11 +25,81 @@ import type { MlsLeafNode } from "../leafNode/index.js";
 import { MlsRatchetTree } from "../ratchetTree/index.js";
 import { destroyMlsTreePrivateKeys, type MlsTreePrivateKey } from "../updatePath/index.js";
 import { initialMlsRatchetTreeLeaf } from "./impl/initialLeaf.js";
+import { openMlsWelcome } from "../welcome/index.js";
 
 /** Optional deterministic inputs for RFC vector and application-controlled IDs. */
 export interface CreateMlsGroupOptions {
     readonly groupId?: Uint8Array;
     readonly epochSecret?: Uint8Array;
+}
+
+/** Inputs for the reusable authenticated Welcome/tree adoption path. */
+export interface JoinMlsGroupFromWelcomeOptions {
+    readonly identity: IdentityKeyPair;
+    readonly inviter: Pick<IdentityPublicKeys, "signingKey">;
+    readonly groupId: Uint8Array;
+    readonly welcome: Uint8Array;
+    readonly tree: MlsRatchetTree;
+    readonly keyPackageBundle: MlsKeyPackageBundle;
+}
+
+/**
+ * Authenticate and adopt a recipient-bound Welcome with an external tree.
+ *
+ * Invitation codecs remain application-specific; the cryptographic
+ * KeyPackage/tree/owner binding is shared by CLI and higher-level domains.
+ */
+export function joinMlsGroupFromWelcome(options: JoinMlsGroupFromWelcomeOptions): MlsEpochState {
+    const localLeaves: number[] = [];
+    for (let leaf = 0; leaf < options.tree.leafCount; leaf += 1) {
+        const node = options.tree.nodes[leaf * 2];
+        if (
+            node?.type === "leaf" &&
+            equalBytes(
+                node.signatureKey,
+                options.keyPackageBundle.keyPackage.leafNode.signatureKey,
+            ) &&
+            equalBytes(
+                node.encryptionKey,
+                options.keyPackageBundle.keyPackage.leafNode.encryptionKey,
+            )
+        ) {
+            localLeaves.push(leaf);
+        }
+    }
+    if (localLeaves.length !== 1) {
+        throw new Error("MLS Welcome tree does not contain exactly one local leaf");
+    }
+    const opened = openMlsWelcome({
+        welcome: options.welcome,
+        keyPackageBundle: options.keyPackageBundle,
+        expectedGroupId: options.groupId,
+        validateExternalTree: (groupInfo) => {
+            const signer = options.tree.nodes[groupInfo.signer * 2];
+            return equalBytes(groupInfo.context.treeHash, options.tree.treeHash()) &&
+                equalBytes(groupInfo.context.groupId, options.groupId) &&
+                signer?.type === "leaf" &&
+                equalBytes(signer.signatureKey, options.inviter.signingKey)
+                ? signer.signatureKey
+                : undefined;
+        },
+    });
+    try {
+        return createMlsTreeEpochFromWelcome({
+            opened,
+            tree: options.tree,
+            localLeaf: localLeaves[0]!,
+            leafKeyPair: options.keyPackageBundle.leafKeyPair,
+            localSigningSecretKey: options.identity.signingSecretKey,
+            authenticateCredential: authenticateMurmurMlsCredential,
+        });
+    } catch (error: unknown) {
+        destroyMlsEpochSecrets(opened.epochSecrets);
+        if (opened.pathSecret !== undefined) {
+            zeroBytes(opened.pathSecret);
+        }
+        throw error;
+    }
 }
 
 /** Authenticate Murmur's BasicCredential identity-to-signing-key binding. */
