@@ -34,7 +34,11 @@ Each subscriber owns a bounded, drop-oldest queue (`maximumStreamQueueFrames`,
 stalled consumer causes bounded frame drops rather than memory growth.
 Subscribers are capped twice, by `maximumConcurrentStreams` per process and
 `maximumStreamsPerTopic` per topic, so one unauthenticated client cannot hold
-every process-wide slot on a single topic. `wake` rides the same signal as long
+every process-wide slot on a single topic. Because those per-subscriber bounds
+times the subscriber cap still describe more memory than the process has,
+`maximumTotalStreamQueueBytes` caps what every subscriber retains together —
+queued frames plus the batch a reader is still holding — and evicts from the
+longest-backlogged reader when it is exceeded. `wake` rides the same signal as long
 polls, so a durable publish also nudges open streams and keeps working across
 instances through `WakeSource`.
 

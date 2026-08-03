@@ -10,6 +10,24 @@ export interface InProcessEphemeralFanoutOptions {
     readonly maximumStreamQueueFrames: number;
     /** Maximum queued frame bytes per subscriber before dropping the oldest. */
     readonly maximumStreamQueueBytes: number;
+    /** Maximum frame bytes retained across every subscriber before dropping the oldest. */
+    readonly maximumTotalStreamQueueBytes: number;
+}
+
+/** Process-wide byte accounting one subscriber reports every retention change to. */
+interface SubscriberLedger {
+    /** Frame bytes the subscriber has started holding. */
+    readonly retain: (bytes: number) => void;
+    /** Frame bytes the subscriber no longer holds. */
+    readonly release: (bytes: number) => void;
+    /** Detach the subscriber from its fan-out. */
+    readonly onClose: () => void;
+}
+
+interface InProcessEphemeralSubscriberOptions {
+    readonly maximumFrames: number;
+    readonly maximumBytes: number;
+    readonly ledger: SubscriberLedger;
 }
 
 function positiveSafeInteger(value: number, name: string): number {
@@ -27,26 +45,38 @@ function positiveSafeInteger(value: number, name: string): number {
  * consumer. When the frame count or byte bound is exceeded the oldest frames
  * are discarded and a single coalesced `drop` count is retained; a `wake` is a
  * single coalesced flag. This keeps the buffer strictly bounded.
+ *
+ * Every byte held is reported to the fan-out's ledger, including the batch a
+ * reader has already been handed but not yet come back from: {@link take}
+ * reclassifies queued bytes as in-flight rather than releasing them, and they
+ * are released on the reader's next call. The process-wide budget therefore
+ * covers what the response bodies hold as well as what the queues hold.
  */
 class InProcessEphemeralSubscriber implements EphemeralSubscription {
     readonly #maximumFrames: number;
     readonly #maximumBytes: number;
-    readonly #onClose: () => void;
+    readonly #ledger: SubscriberLedger;
     #frames: Uint8Array[] = [];
     #queuedBytes = 0;
+    #inFlightBytes = 0;
     #droppedFrames = 0;
     #wakePending = false;
     #closed = false;
     #signal: (() => void) | undefined;
 
-    constructor(maximumFrames: number, maximumBytes: number, onClose: () => void) {
-        this.#maximumFrames = maximumFrames;
-        this.#maximumBytes = maximumBytes;
-        this.#onClose = onClose;
+    constructor(options: InProcessEphemeralSubscriberOptions) {
+        this.#maximumFrames = options.maximumFrames;
+        this.#maximumBytes = options.maximumBytes;
+        this.#ledger = options.ledger;
     }
 
     get closed(): boolean {
         return this.#closed;
+    }
+
+    /** Frame bytes currently queued for this subscriber, excluding any in flight. */
+    get queuedBytes(): number {
+        return this.#queuedBytes;
     }
 
     /** Append one frame, dropping the oldest queued frames if a bound is exceeded. */
@@ -56,18 +86,32 @@ class InProcessEphemeralSubscriber implements EphemeralSubscription {
         }
         this.#frames.push(frame);
         this.#queuedBytes += frame.length;
+        this.#ledger.retain(frame.length);
         while (
             this.#frames.length > this.#maximumFrames ||
             this.#queuedBytes > this.#maximumBytes
         ) {
-            const dropped = this.#frames.shift();
-            if (dropped === undefined) {
+            if (!this.dropOldestQueuedFrame()) {
                 break;
             }
-            this.#queuedBytes -= dropped.length;
-            this.#droppedFrames += 1;
         }
         this.#notify();
+    }
+
+    /**
+     * Drop this subscriber's oldest queued frame, counting it like any other
+     * overflow drop. Returns whether a frame was there to drop.
+     */
+    dropOldestQueuedFrame(): boolean {
+        const dropped = this.#frames.shift();
+        if (dropped === undefined) {
+            return false;
+        }
+        this.#queuedBytes -= dropped.length;
+        this.#droppedFrames += 1;
+        this.#ledger.release(dropped.length);
+        this.#notify();
+        return true;
     }
 
     /** Record one coalesced wake for delivery to the reader. */
@@ -80,6 +124,9 @@ class InProcessEphemeralSubscriber implements EphemeralSubscription {
     }
 
     take(): readonly EphemeralStreamMessage[] {
+        // Coming back for more means the previous batch has left the response
+        // body, so it stops counting against the process-wide budget here.
+        this.#releaseInFlight();
         if (this.#frames.length === 0 && !this.#wakePending && this.#droppedFrames === 0) {
             return [];
         }
@@ -88,6 +135,9 @@ class InProcessEphemeralSubscriber implements EphemeralSubscription {
             messages.push({ kind: "frame", bytes });
         }
         this.#frames = [];
+        // Handing the batch to the reader moves those bytes rather than freeing
+        // them: they are still retained by this process until the next call.
+        this.#inFlightBytes = this.#queuedBytes;
         this.#queuedBytes = 0;
         if (this.#wakePending) {
             messages.push({ kind: "wake" });
@@ -123,9 +173,18 @@ class InProcessEphemeralSubscriber implements EphemeralSubscription {
         }
         this.#closed = true;
         this.#frames = [];
+        this.#ledger.release(this.#queuedBytes);
         this.#queuedBytes = 0;
-        this.#onClose();
+        this.#releaseInFlight();
+        this.#ledger.onClose();
         this.#notify();
+    }
+
+    #releaseInFlight(): void {
+        if (this.#inFlightBytes > 0) {
+            this.#ledger.release(this.#inFlightBytes);
+            this.#inFlightBytes = 0;
+        }
     }
 
     #hasQueued(): boolean {
@@ -150,9 +209,18 @@ class InProcessEphemeralSubscriber implements EphemeralSubscription {
  * Every subscriber queue is bounded by frame count and byte size, so a stalled
  * reader can only cause bounded drops. Subscribers are bounded twice, per
  * process and per topic, because the stream route is unauthenticated and one
- * client would otherwise hold every process-wide slot on a single topic. A
- * shared implementation could replace this to fan frames across instances; the
- * wake path already works across instances through the relay's
+ * client would otherwise hold every process-wide slot on a single topic.
+ *
+ * Those per-subscriber bounds multiplied by the subscriber cap still promise
+ * far more memory than a relay has, so retained frame bytes are also bounded in
+ * aggregate: every retention is counted, and exceeding
+ * `maximumTotalStreamQueueBytes` drops frames from whichever subscriber has
+ * been backlogged longest until the total fits again. Those drops are counted
+ * and reported exactly like per-subscriber overflow drops, so the path keeps
+ * degrading the same way instead of refusing service.
+ *
+ * A shared implementation could replace this to fan frames across instances;
+ * the wake path already works across instances through the relay's
  * {@link WakeSource}.
  */
 export class InProcessEphemeralFanout implements EphemeralFanout {
@@ -160,7 +228,15 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
     readonly #maximumStreamsPerTopic: number;
     readonly #maximumStreamQueueFrames: number;
     readonly #maximumStreamQueueBytes: number;
+    readonly #maximumTotalStreamQueueBytes: number;
     readonly #topics = new Map<string, Set<InProcessEphemeralSubscriber>>();
+    /**
+     * Subscribers holding queued frames, in the order they became backlogged.
+     * The front is the reader that has been behind the longest, which is what
+     * the aggregate budget evicts from first.
+     */
+    readonly #backlogged = new Set<InProcessEphemeralSubscriber>();
+    #retainedBytes = 0;
     #subscriberCount = 0;
     #closed = false;
 
@@ -181,10 +257,27 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
             options.maximumStreamQueueBytes,
             "Maximum stream queue bytes",
         );
+        this.#maximumTotalStreamQueueBytes = positiveSafeInteger(
+            options.maximumTotalStreamQueueBytes,
+            "Maximum total stream queue bytes",
+        );
+        if (this.#maximumTotalStreamQueueBytes < this.#maximumStreamQueueBytes) {
+            throw new Error(
+                "Maximum total stream queue bytes cannot be below maximum stream queue bytes",
+            );
+        }
     }
 
     get subscriberCount(): number {
         return this.#subscriberCount;
+    }
+
+    /**
+     * Frame bytes retained across every subscriber right now, queued or handed
+     * to a reader that has not come back. Exposed for diagnostics and tests.
+     */
+    get retainedBytes(): number {
+        return this.#retainedBytes;
     }
 
     subscriberCountForTopic(topic: string): number {
@@ -203,18 +296,31 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
         // subscribe never leaves an empty topic entry behind.
         const subscribers = existing ?? new Set<InProcessEphemeralSubscriber>();
         this.#topics.set(topic, subscribers);
-        const subscriber = new InProcessEphemeralSubscriber(
-            this.#maximumStreamQueueFrames,
-            this.#maximumStreamQueueBytes,
-            () => {
-                if (subscribers.delete(subscriber)) {
-                    this.#subscriberCount -= 1;
-                    if (subscribers.size === 0) {
-                        this.#topics.delete(topic);
+        const subscriber: InProcessEphemeralSubscriber = new InProcessEphemeralSubscriber({
+            maximumFrames: this.#maximumStreamQueueFrames,
+            maximumBytes: this.#maximumStreamQueueBytes,
+            ledger: {
+                retain: (bytes): void => {
+                    this.#retainedBytes += bytes;
+                    this.#backlogged.add(subscriber);
+                },
+                release: (bytes): void => {
+                    this.#retainedBytes -= bytes;
+                    if (subscriber.queuedBytes === 0) {
+                        this.#backlogged.delete(subscriber);
                     }
-                }
+                },
+                onClose: (): void => {
+                    this.#backlogged.delete(subscriber);
+                    if (subscribers.delete(subscriber)) {
+                        this.#subscriberCount -= 1;
+                        if (subscribers.size === 0) {
+                            this.#topics.delete(topic);
+                        }
+                    }
+                },
             },
-        );
+        });
         subscribers.add(subscriber);
         this.#subscriberCount += 1;
         return subscriber;
@@ -228,9 +334,31 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
         let delivered = 0;
         for (const subscriber of subscribers) {
             subscriber.enqueueFrame(frame);
+            // Enforced per enqueue rather than per publish, so the aggregate
+            // budget is never exceeded by more than the frame just accepted.
+            this.#enforceTotalBudget();
             delivered += 1;
         }
         return delivered;
+    }
+
+    /**
+     * Drop the longest-backlogged reader's oldest frames until the retained
+     * total fits the aggregate budget again.
+     *
+     * The frame just enqueued is itself queued and therefore droppable, so this
+     * always has something to release and terminates.
+     */
+    #enforceTotalBudget(): void {
+        while (this.#retainedBytes > this.#maximumTotalStreamQueueBytes) {
+            const victim = this.#backlogged.values().next().value;
+            if (victim === undefined) {
+                return;
+            }
+            if (!victim.dropOldestQueuedFrame()) {
+                this.#backlogged.delete(victim);
+            }
+        }
     }
 
     wake(topic: string): void {
@@ -257,5 +385,7 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
             subscriber.close();
         }
         this.#topics.clear();
+        this.#backlogged.clear();
+        this.#retainedBytes = 0;
     }
 }

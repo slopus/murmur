@@ -19,6 +19,7 @@ describe("InProcessEphemeralFanout", () => {
             maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const first = fanout.subscribe("t");
         const second = fanout.subscribe("t");
@@ -42,6 +43,7 @@ describe("InProcessEphemeralFanout", () => {
             maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 2,
             maximumStreamQueueBytes: 1_000_000,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const subscription = fanout.subscribe("t");
         expect(subscription).toBeDefined();
@@ -64,6 +66,7 @@ describe("InProcessEphemeralFanout", () => {
             maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 1_000,
             maximumStreamQueueBytes: 10,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const subscription = fanout.subscribe("t");
         fanout.publishFrame("t", frame("aaaaaa")); // 6 bytes
@@ -81,6 +84,7 @@ describe("InProcessEphemeralFanout", () => {
             maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const subscription = fanout.subscribe("t");
         fanout.wake("t");
@@ -97,6 +101,7 @@ describe("InProcessEphemeralFanout", () => {
             maximumStreamsPerTopic: 1,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const first = fanout.subscribe("t");
         expect(first).toBeDefined();
@@ -117,6 +122,7 @@ describe("InProcessEphemeralFanout", () => {
             maximumStreamsPerTopic: 2,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const first = fanout.subscribe("t");
         expect(fanout.subscribe("t")).toBeDefined();
@@ -140,12 +146,92 @@ describe("InProcessEphemeralFanout", () => {
         expect(fanout.subscriberCountForTopic("t")).toBe(0);
     });
 
+    it("bounds retained bytes across subscribers, evicting the longest backlogged", () => {
+        // Per subscriber this configuration allows 100 bytes each, so three
+        // subscribers could hold 300 without an aggregate bound.
+        const fanout = new InProcessEphemeralFanout({
+            maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
+            maximumStreamQueueFrames: 100,
+            maximumStreamQueueBytes: 100,
+            maximumTotalStreamQueueBytes: 100,
+        });
+        const first = fanout.subscribe("a");
+        const second = fanout.subscribe("b");
+        const third = fanout.subscribe("c");
+        if (first === undefined || second === undefined || third === undefined) {
+            throw new Error("subscriptions expected");
+        }
+
+        fanout.publishFrame("a", frame("x".repeat(60)));
+        expect(fanout.retainedBytes).toBe(60);
+        fanout.publishFrame("b", frame("y".repeat(60)));
+        // 120 > 100, so the longest-backlogged reader loses its oldest frame.
+        expect(fanout.retainedBytes).toBe(60);
+        fanout.publishFrame("c", frame("z".repeat(60)));
+        expect(fanout.retainedBytes).toBe(60);
+
+        // The eviction is reported to the evicted reader as an ordinary drop,
+        // and the newest subscriber still holds its frame.
+        expect(first.take()).toEqual([{ kind: "drop", frames: 1 }]);
+        expect(second.take()).toEqual([{ kind: "drop", frames: 1 }]);
+        expect(kinds(third.take())).toEqual(["frame"]);
+        fanout.close();
+        expect(fanout.retainedBytes).toBe(0);
+    });
+
+    it("keeps a batch handed to a reader inside the aggregate budget", () => {
+        const fanout = new InProcessEphemeralFanout({
+            maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
+            maximumStreamQueueFrames: 100,
+            maximumStreamQueueBytes: 100,
+            maximumTotalStreamQueueBytes: 100,
+        });
+        const reader = fanout.subscribe("a");
+        const other = fanout.subscribe("b");
+        if (reader === undefined || other === undefined) {
+            throw new Error("subscriptions expected");
+        }
+
+        fanout.publishFrame("a", frame("x".repeat(60)));
+        // Taking hands the batch to the response body; the bytes are still held
+        // by this process, so they keep counting until the reader returns.
+        expect(kinds(reader.take())).toEqual(["frame"]);
+        expect(fanout.retainedBytes).toBe(60);
+
+        fanout.publishFrame("b", frame("y".repeat(60)));
+        expect(fanout.retainedBytes).toBe(60);
+        expect(other.take()).toEqual([{ kind: "drop", frames: 1 }]);
+
+        // The reader coming back for more releases the batch it was handed.
+        expect(reader.take()).toEqual([]);
+        expect(fanout.retainedBytes).toBe(0);
+        fanout.publishFrame("b", frame("y".repeat(60)));
+        expect(kinds(other.take())).toEqual(["frame"]);
+        fanout.close();
+    });
+
+    it("rejects an aggregate budget below one subscriber's queue", () => {
+        expect(
+            () =>
+                new InProcessEphemeralFanout({
+                    maximumConcurrentStreams: 10,
+                    maximumStreamsPerTopic: 10,
+                    maximumStreamQueueFrames: 8,
+                    maximumStreamQueueBytes: 4096,
+                    maximumTotalStreamQueueBytes: 4095,
+                }),
+        ).toThrow("Maximum total stream queue bytes");
+    });
+
     it("resolves waitForActivity on enqueue, keepalive, and close", async () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 10,
             maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
+            maximumTotalStreamQueueBytes: 10_000_000,
         });
         const subscription = fanout.subscribe("t");
         if (subscription === undefined) {

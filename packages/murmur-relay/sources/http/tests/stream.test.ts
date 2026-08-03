@@ -217,6 +217,51 @@ describe("relay ephemeral stream handler", () => {
         await sse.cancel();
     });
 
+    it("bounds retained frame bytes across streams, not just per stream", async () => {
+        // Each stream may queue 64 bytes, but the process may retain only 64 in
+        // total, so a second stalled stream cannot add another 64.
+        service = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {
+                maximumEphemeralFrameBytes: 64,
+                maximumStreamQueueBytes: 64,
+                maximumTotalStreamQueueBytes: 64,
+            },
+            undefined,
+            () => now,
+        );
+        const handler = createRelayFetchHandler(service);
+        const first = new AbortController();
+        const second = new AbortController();
+        // Neither body is read until every frame is posted, so nothing drains.
+        const stalled = await handler(streamRequest("room", first.signal));
+        const later = await handler(streamRequest("lobby", second.signal));
+
+        expect(await (await handler(ephemeralRequest("room", new Uint8Array(40)))).json()).toEqual({
+            delivered: 1,
+        });
+        expect(await (await handler(ephemeralRequest("lobby", new Uint8Array(40)))).json()).toEqual(
+            { delivered: 1 },
+        );
+
+        // The longest-backlogged reader gives up its frame and is told so.
+        const stalledSse = new SseReader(bodyOf(stalled));
+        expect((await stalledSse.next()).event).toBe("ready");
+        const dropped = await stalledSse.next();
+        expect(dropped.event).toBe("drop");
+        expect(JSON.parse(dropped.data ?? "")).toEqual({ frames: 1 });
+
+        // The reader that arrived later keeps what it was sent.
+        const laterSse = new SseReader(bodyOf(later));
+        expect((await laterSse.next()).event).toBe("ready");
+        expect((await laterSse.next()).event).toBe("frame");
+
+        first.abort();
+        second.abort();
+        await stalledSse.cancel();
+        await laterSse.cancel();
+    });
+
     it("rejects an over-sized ephemeral frame with 413", async () => {
         service = new RelayService(
             new SqliteRelayStore(":memory:"),

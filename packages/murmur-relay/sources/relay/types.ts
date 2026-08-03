@@ -90,6 +90,18 @@ export interface RelayOptions {
      * evict every frame as it is enqueued and drop all traffic silently.
      */
     readonly maximumStreamQueueBytes?: number;
+    /**
+     * Maximum ephemeral frame bytes retained across every stream subscriber in
+     * one process, queued or handed to a reader that has not returned for more.
+     * Defaults to 64 MiB.
+     *
+     * The per-subscriber queue bound multiplied by the subscriber cap is far
+     * more memory than a relay has, so this is the ceiling that actually holds.
+     * Exceeding it drops the oldest frames of the longest-backlogged reader,
+     * counted and reported like any other overflow drop. It must be at least
+     * `maximumStreamQueueBytes`.
+     */
+    readonly maximumTotalStreamQueueBytes?: number;
     /** SSE keepalive comment interval for open streams. Defaults to 15,000 ms. */
     readonly streamKeepAliveMilliseconds?: number;
     /** HTTP rate limiting; pass `false` to disable it. Enabled by default. */
@@ -116,6 +128,7 @@ export interface ResolvedRelayOptions {
     readonly maximumStreamsPerTopic: number;
     readonly maximumStreamQueueFrames: number;
     readonly maximumStreamQueueBytes: number;
+    readonly maximumTotalStreamQueueBytes: number;
     readonly streamKeepAliveMilliseconds: number;
     readonly rateLimit: ResolvedRelayRateLimitOptions | false;
 }

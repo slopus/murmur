@@ -286,6 +286,17 @@ drains the queue and enqueues what it drained, and the producer can refill the
 queue behind it, so peak buffering per stalled subscriber is roughly twice
 `maximumStreamQueueBytes`.
 
+Those per-subscriber bounds multiplied by `maximumConcurrentStreams` promise far
+more memory than a relay has, so retention is bounded in aggregate as well.
+`maximumTotalStreamQueueBytes` (64 MiB by default) is the ceiling on ephemeral
+frame bytes one process holds at any moment, counting both queued frames and the
+batch a reader has already been handed but not yet come back from. Exceeding it
+drops the oldest frames of whichever reader has been backlogged longest, and
+that reader is told with the same coalesced `drop` event as a per-subscriber
+overflow, so the path degrades instead of refusing service. Readers that drain
+and return are the last to lose anything. The copy in flight is base64-encoded,
+so bytes on the wire are about 4/3 of the frame bytes counted here.
+
 The route returns HTTP 503 `{"error":"overloaded"}` beyond either subscriber
 ceiling: `maximumConcurrentStreams` per process and `maximumStreamsPerTopic` per
 topic. The per-topic ceiling matters because this route is unauthenticated and
@@ -404,6 +415,7 @@ controls the HTTP page budget separately.
 | Concurrent streams            | 10,000 per process | `maximumConcurrentStreams`; beyond it, the stream route returns 503.                                 |
 | Streams per topic             |    256 per process | `maximumStreamsPerTopic`; beyond it, the stream route returns 503.                                   |
 | Stream queue                  |   64 frames, 1 MiB | `maximumStreamQueueFrames`/`maximumStreamQueueBytes`, per subscriber, drop-oldest.                   |
+| Stream retention, all streams |             64 MiB | `maximumTotalStreamQueueBytes`; the hard process-wide ceiling, queued plus in flight, drop-oldest.   |
 | Stream keepalive              |               15 s | `streamKeepAliveMilliseconds`; comment written after an idle interval.                               |
 | Event retention               |             7 days | Only event bodies expire.                                                                            |
 | Topic inactivity              |            30 days | Measured from successful publish; dropping a topic removes its snapshot, list, events, and receipts. |

@@ -220,4 +220,32 @@ describe("RelayService", () => {
         ).not.toThrow();
         await store.close();
     });
+
+    it("rejects an aggregate stream budget below one subscriber's queue", async () => {
+        // The aggregate budget is the ceiling that actually holds, so it may
+        // not be configured below the per-subscriber queue it has to contain.
+        const store = new SqliteRelayStore(":memory:");
+        expect(
+            () =>
+                new RelayService(
+                    store,
+                    { maximumStreamQueueBytes: 128 * 1024 * 1024 },
+                    undefined,
+                    () => now,
+                ),
+        ).toThrow("Maximum total stream queue bytes");
+        expect(
+            () =>
+                new RelayService(
+                    store,
+                    {
+                        maximumStreamQueueBytes: 128 * 1024 * 1024,
+                        maximumTotalStreamQueueBytes: 128 * 1024 * 1024,
+                    },
+                    undefined,
+                    () => now,
+                ),
+        ).not.toThrow();
+        await store.close();
+    });
 });

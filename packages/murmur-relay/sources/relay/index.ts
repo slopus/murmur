@@ -174,6 +174,10 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
             options.maximumStreamQueueBytes ?? MEBIBYTE,
             "Maximum stream queue bytes",
         ),
+        maximumTotalStreamQueueBytes: positiveSafeInteger(
+            options.maximumTotalStreamQueueBytes ?? 64 * MEBIBYTE,
+            "Maximum total stream queue bytes",
+        ),
         streamKeepAliveMilliseconds: positiveSafeInteger(
             options.streamKeepAliveMilliseconds ?? 15_000,
             "Stream keepalive milliseconds",
@@ -187,6 +191,13 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
     // drops every ephemeral frame without a trace, so refuse the configuration.
     if (resolved.maximumStreamQueueBytes < resolved.maximumEphemeralFrameBytes) {
         throw new Error("Maximum stream queue bytes cannot be below maximum ephemeral frame bytes");
+    }
+    // An aggregate budget below one subscriber's queue would make that queue
+    // unreachable and turn the global bound into the only one that ever applies.
+    if (resolved.maximumTotalStreamQueueBytes < resolved.maximumStreamQueueBytes) {
+        throw new Error(
+            "Maximum total stream queue bytes cannot be below maximum stream queue bytes",
+        );
     }
     return resolved;
 }
@@ -223,6 +234,7 @@ export class RelayService {
                 maximumStreamsPerTopic: this.#options.maximumStreamsPerTopic,
                 maximumStreamQueueFrames: this.#options.maximumStreamQueueFrames,
                 maximumStreamQueueBytes: this.#options.maximumStreamQueueBytes,
+                maximumTotalStreamQueueBytes: this.#options.maximumTotalStreamQueueBytes,
             });
         this.#now = now;
         void this.#wakeSource
