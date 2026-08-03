@@ -22,10 +22,18 @@ packages/murmur-core/package.json version X.Y.Z
 
 ## One-time repository setup
 
-Create a GitHub Actions repository secret named `NPM_TOKEN`. Use an npm
-granular access token allowed to publish `@slopus/murmur`; if the npm account
-requires two-factor authentication, configure the token for automated
-publishing. GitHub's built-in `GITHUB_TOKEN` publishes the container to GHCR
+Configure npm Trusted Publishing for `@slopus/murmur` with these values:
+
+| Field        | Value         |
+| ------------ | ------------- |
+| Organization | `slopus`      |
+| Repository   | `murmur`      |
+| Workflow     | `publish.yml` |
+| Environment  | `npm`         |
+
+The publication job runs in the GitHub environment named `npm` and exchanges
+GitHub's short-lived OIDC identity for npm publication access. It does not use
+an npm token. GitHub's built-in `GITHUB_TOKEN` publishes the container to GHCR
 and creates the GitHub Release.
 
 The first GHCR package may require changing its visibility to public in the

@@ -69,6 +69,7 @@ jobs:
         name: Publish client library
         needs: verify
         runs-on: ubuntu-latest
+        environment: npm
         permissions:
             contents: read
             id-token: write
@@ -81,7 +82,6 @@ jobs:
               with:
                   node-version: 24
                   cache: pnpm
-                  registry-url: https://registry.npmjs.org
             - run: pnpm install --frozen-lockfile
             - name: Check whether npm version already exists
               id: npm-version
@@ -93,26 +93,13 @@ jobs:
                   else
                       echo "exists=false" >> "$GITHUB_OUTPUT"
                   fi
-            - name: Require npm token
-              if: steps.npm-version.outputs.exists != 'true'
-              env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-              shell: bash
-              run: |
-                  if [ -z "$NODE_AUTH_TOKEN" ]; then
-                      echo "Repository secret NPM_TOKEN is required to publish @slopus/murmur" >&2
-                      exit 1
-                  fi
             - name: Publish @slopus/murmur
               if: steps.npm-version.outputs.exists != 'true'
-              env:
-                  NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+              working-directory: packages/murmur-core
               run: >-
-                  pnpm --filter @slopus/murmur publish
-                  --access public
+                  pnpm publish --access public
                   --tag ${{ needs.verify.outputs.npm-tag }}
-                  --provenance
-                  --no-git-checks
+                  --provenance --no-git-checks
 
     publish-container:
         name: Publish relay container
