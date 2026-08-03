@@ -7,6 +7,7 @@ import {
     encodeEncryptedPrivateMessage,
     encryptPrivateMessageForContact,
     privateMessageListElementId,
+    privateMessageSelfListElementId,
 } from "../../messaging/index.js";
 import { MemoryMurmurStore, type MurmurStore } from "../../storage/index.js";
 import {
@@ -29,6 +30,9 @@ class ChatTransport implements RelayTransport {
     readonly blobs = new Map<string, RelayBlob>();
     offline = false;
     reset = false;
+    now = 1_000;
+    enforceFreshness = false;
+    loseNextResponse = false;
 
     constructor(readonly id: string) {}
 
@@ -40,6 +44,13 @@ class ChatTransport implements RelayTransport {
         const duplicate = events.findIndex((candidate) => candidate.id === event.id);
         if (duplicate >= 0) {
             return { seq: BigInt(duplicate + 1), duplicate: true };
+        }
+        if (
+            this.enforceFreshness &&
+            (event.createdAt < this.now - 5 * 60 * 1_000 ||
+                event.createdAt > this.now + 5 * 60 * 1_000)
+        ) {
+            throw new Error(`${this.id} rejected an expired event`);
         }
         events.push(event);
         this.events.set(event.topic, events);
@@ -57,6 +68,10 @@ class ChatTransport implements RelayTransport {
             }
         }
         this.lists.set(event.topic, elements);
+        if (this.loseNextResponse) {
+            this.loseNextResponse = false;
+            throw new Error(`${this.id} lost its accepted response`);
+        }
         return { seq: BigInt(events.length), duplicate: false };
     }
 
@@ -147,6 +162,7 @@ function chat(
     friends: FriendBook,
     transports: readonly RelayTransport[],
     applicationCallbacks: DirectChatCallbacks = callbacks(),
+    now: () => number = () => 1_000,
 ): DirectChat {
     return new DirectChat({
         identity,
@@ -154,7 +170,7 @@ function chat(
         friends,
         client: new MurmurClient({ identity, store, transports }),
         callbacks: applicationCallbacks,
-        now: () => 1_000,
+        now,
     });
 }
 
@@ -244,6 +260,7 @@ describe("DirectChat", () => {
 
     it("recovers a retained outbox after restart and keeps consumer persistence atomic", async () => {
         const relay = new ChatTransport("relay");
+        relay.enforceFreshness = true;
         relay.offline = true;
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
@@ -251,15 +268,18 @@ describe("DirectChat", () => {
         const bobStore = new MemoryMurmurStore();
         const friends = await addFriends(alice, aliceStore, bob, bobStore);
         const id = "C".repeat(32);
-        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+        let now = 1_000;
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay], callbacks(), () => now);
 
         await expect(
             aliceChat.sendText(bob, "survive restart", { id, sentAt: 30 }),
         ).rejects.toThrow("rejected");
         expect(await aliceStore.list("application/outgoing/")).toHaveLength(1);
+        now += 6 * 60 * 1_000;
+        relay.now = now;
         relay.offline = false;
 
-        const restarted = chat(alice, aliceStore, friends.left, [relay]);
+        const restarted = chat(alice, aliceStore, friends.left, [relay], callbacks(), () => now);
         expect((await restarted.retryPending()).published).toBe(1);
         expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(0);
         const bobChat = chat(bob, bobStore, friends.right, [relay]);
@@ -283,6 +303,120 @@ describe("DirectChat", () => {
 
         const recovered = chat(bob, failingStore, failingFriends, [relay]);
         expect((await recovered.loadHistory(alice)).opened).toHaveLength(1);
+    });
+
+    it("retains partial multi-relay sends until a fresh event reaches every relay", async () => {
+        const first = new ChatTransport("first");
+        const second = new ChatTransport("second");
+        first.enforceFreshness = true;
+        second.enforceFreshness = true;
+        second.offline = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        let now = 1_000;
+        const aliceChat = chat(
+            alice,
+            aliceStore,
+            friends.left,
+            [first, second],
+            callbacks(),
+            () => now,
+        );
+
+        await aliceChat.sendText(bob, "both relays", {
+            id: "H".repeat(32),
+            sentAt: 8,
+        });
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(1);
+        expect(await aliceStore.list("application/published/")).toHaveLength(1);
+
+        now += 6 * 60 * 1_000;
+        first.now = now;
+        second.now = now;
+        second.offline = false;
+        expect((await aliceChat.retryPending()).failures).toEqual([]);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(0);
+        expect(first.events.get(pairwiseTopic(alice, bob))).toHaveLength(1);
+        expect(second.events.get(pairwiseTopic(alice, bob))).toHaveLength(1);
+
+        const bobChat = chat(bob, bobStore, friends.right, [first, second], callbacks(), () => now);
+        const synced = await bobChat.sync();
+        expect(synced.status === "events" ? synced.opened : []).toHaveLength(1);
+        expect(await bobStore.list("application/incoming/")).toHaveLength(1);
+    });
+
+    it("recovers an ambiguous accepted receipt before refreshing a stale event", async () => {
+        const relay = new ChatTransport("relay");
+        relay.enforceFreshness = true;
+        relay.loseNextResponse = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        let now = 1_000;
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay], callbacks(), () => now);
+
+        await expect(
+            aliceChat.sendText(bob, "ambiguous", {
+                id: "J".repeat(32),
+                sentAt: 10,
+            }),
+        ).rejects.toThrow("rejected");
+        now += 6 * 60 * 1_000;
+        relay.now = now;
+
+        expect((await aliceChat.retryPending()).failures).toEqual([]);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(0);
+        expect(relay.events.get(pairwiseTopic(alice, bob))).toHaveLength(1);
+    });
+
+    it("keeps refreshing an unaccepted event across multiple offline windows", async () => {
+        const relay = new ChatTransport("relay");
+        relay.enforceFreshness = true;
+        relay.offline = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        let now = 1_000;
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay], callbacks(), () => now);
+
+        await expect(
+            aliceChat.sendText(bob, "long offline", {
+                id: "K".repeat(32),
+                sentAt: 11,
+            }),
+        ).rejects.toThrow("rejected");
+        for (let window = 0; window < 2; window += 1) {
+            now += 6 * 60 * 1_000;
+            relay.now = now;
+            expect((await aliceChat.retryPending()).failures).toHaveLength(1);
+        }
+        relay.offline = false;
+        expect((await aliceChat.retryPending()).failures).toEqual([]);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(0);
+        expect(relay.events.get(pairwiseTopic(alice, bob))).toHaveLength(1);
+    });
+
+    it("rejects text larger than the default relay list element before persistence", async () => {
+        const relay = new ChatTransport("relay");
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+
+        await expect(aliceChat.sendText(bob, "x".repeat(300_000))).rejects.toThrow(
+            "list-element limit",
+        );
+        expect(await aliceStore.list("application/")).toHaveLength(0);
+        expect(await aliceStore.list("direct-chat/v1/")).toHaveLength(0);
     });
 
     it("quarantines wrong-topic senders and authenticated ID collisions without cursor gaps", async () => {
@@ -346,6 +480,50 @@ describe("DirectChat", () => {
         await freshFriends.save({ identity: bob, profile: { name: "Bob" } }, 1);
         const legacyHistory = await chat(alice, freshStore, freshFriends, [relay]).loadHistory(bob);
         expect(legacyHistory.opened.map((value) => value.message.text)).toEqual(["original"]);
+    });
+
+    it("opens the valid self copy when an earlier self-prefixed element is bogus", async () => {
+        const relay = new ChatTransport("relay");
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const message = createPrivateMessage("recover self", [], 9, "I".repeat(32));
+        const recipientBytes = encodeEncryptedPrivateMessage(
+            encryptPrivateMessageForContact(alice, bob, message),
+        );
+        const selfBytes = encodeEncryptedPrivateMessage(
+            encryptPrivateMessageForContact(alice, alice, message),
+        );
+        const client = new MurmurClient({
+            identity: alice,
+            store: aliceStore,
+            transports: [relay],
+        });
+        await client.publishEvent(
+            createRelayEvent(alice, pairwiseTopic(alice, bob), recipientBytes, {
+                list: [
+                    {
+                        op: "append",
+                        id: "self-message:bogus",
+                        bytes: utf8Encode("bogus"),
+                    },
+                    {
+                        op: "append",
+                        id: privateMessageSelfListElementId(alice, bob, message),
+                        bytes: selfBytes,
+                    },
+                ],
+            }),
+        );
+
+        const result = await chat(alice, aliceStore, friends.left, [relay]).sync();
+        expect(
+            result.status === "events"
+                ? result.opened.map((value) => [value.direction, value.message.text])
+                : [],
+        ).toEqual([["outgoing", "recover self"]]);
     });
 
     it("handles removed-friend traffic gaplessly and resumes only future delivery", async () => {

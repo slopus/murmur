@@ -149,6 +149,7 @@ describe("identity profiles", () => {
         await expect(aliceContacts.get({ signingKey: new Uint8Array() })).rejects.toThrow(
             "32 bytes",
         );
+        await expect(aliceContacts.remove(generateIdentityKeyPair())).resolves.toBeUndefined();
     });
 
     it("retains removed friends and reactivates them without changing addedAt", async () => {

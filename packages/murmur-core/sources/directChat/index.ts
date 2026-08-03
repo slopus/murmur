@@ -62,6 +62,8 @@ const SEND_PREFIX = "direct-chat/v1/send";
 const OUTBOX_PREFIX = "direct-chat/v1/outbox";
 const QUARANTINE_PREFIX = "direct-chat/v1/quarantine";
 const MAXIMUM_QUARANTINE_RECORDS = 128;
+const MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES = 256 * 1024;
+const OUTBOUND_EVENT_REFRESH_MILLISECONDS = 4 * 60 * 1_000;
 
 class InvalidDirectChatEnvelopeError extends Error {}
 
@@ -226,7 +228,8 @@ export class DirectChat {
      *
      * The API deliberately has no attachment input. Unknown option fields,
      * including an attempted `attachments` field from untyped JavaScript, are
-     * rejected.
+     * rejected. A publication error may be thrown after the message and exact
+     * pending event commit; retrying the same caller ID resumes that send.
      */
     async sendText(
         friendIdentity: Pick<IdentityPublicKeys, "signingKey">,
@@ -269,6 +272,16 @@ export class DirectChat {
         );
         const recipientBytes = encodeEncryptedPrivateMessage(recipientEnvelope);
         const selfBytes = encodeEncryptedPrivateMessage(selfEnvelope);
+        if (
+            recipientBytes.length > MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES ||
+            selfBytes.length > MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES
+        ) {
+            zeroBytes(recipientBytes);
+            zeroBytes(selfBytes);
+            throw new Error(
+                `Direct-chat text exceeds the ${MAXIMUM_DIRECT_CHAT_LIST_ELEMENT_BYTES}-byte relay list-element limit`,
+            );
+        }
         const topic = pairwiseTopic(this.#identity, friend.identity);
         const event = createRelayEvent(
             this.#identity,
@@ -303,6 +316,7 @@ export class DirectChat {
             event,
             friend: friend.identity,
             message,
+            published: false,
         };
         let retained: DirectChatSendRecord | undefined;
         try {
@@ -379,23 +393,34 @@ export class DirectChat {
         if (friend === undefined) {
             return { status: "unhandled", event: delivery };
         }
-        let candidateBytes = delivery.event.payload;
-        let listId: string | undefined;
         try {
-            const payloadEnvelope = decodeEncryptedPrivateMessage(candidateBytes);
+            const payloadEnvelope = decodeEncryptedPrivateMessage(delivery.event.payload);
             if (payloadEnvelope.recipient !== this.#ownerId) {
-                const selfOperation = delivery.event.list?.find(
-                    (operation): operation is AppendListOperation =>
-                        operation.op === "append" && operation.id.startsWith("self-message:"),
-                );
-                if (selfOperation === undefined) {
+                let prepared: PreparedEnvelope | undefined;
+                for (const operation of delivery.event.list ?? []) {
+                    if (operation.op !== "append" || !operation.id.startsWith("self-message:")) {
+                        continue;
+                    }
+                    try {
+                        prepared = this.#prepareEnvelope(
+                            friend.identity,
+                            operation.bytes,
+                            operation.id,
+                        );
+                        break;
+                    } catch (error: unknown) {
+                        if (!(error instanceof InvalidDirectChatEnvelopeError)) {
+                            throw error;
+                        }
+                    }
+                }
+                if (prepared === undefined) {
                     await this.#quarantineEvent(friend, delivery, "invalid-direct-envelope");
                     return { status: "quarantined" };
                 }
-                candidateBytes = selfOperation.bytes;
-                listId = selfOperation.id;
+                return await this.#acceptEvent(friend, delivery, prepared);
             }
-            const prepared = this.#prepareEnvelope(friend.identity, candidateBytes, listId);
+            const prepared = this.#prepareEnvelope(friend.identity, delivery.event.payload);
             return await this.#acceptEvent(friend, delivery, prepared);
         } catch (error: unknown) {
             if (error instanceof DirectMessageIdCollisionError) {
@@ -651,43 +676,45 @@ export class DirectChat {
         bytes: Uint8Array,
         listId?: string,
     ): PreparedEnvelope {
+        let encrypted: EncryptedPrivateMessage;
         try {
-            const encrypted = decodeEncryptedPrivateMessage(bytes);
-            if (encrypted.recipient !== this.#ownerId) {
-                throw new InvalidDirectChatEnvelopeError();
-            }
-            const opened = decryptPrivateMessageFromContact(this.#identity, encrypted);
-            let direction: "incoming" | "outgoing";
-            if (sameIdentity(opened.identity, friend)) {
-                direction = "incoming";
-                if (
-                    listId !== undefined &&
-                    listId !== privateMessageListElementId(friend, opened.message)
-                ) {
-                    clearMessageSecrets(opened.message);
-                    throw new InvalidDirectChatEnvelopeError();
-                }
-            } else if (sameIdentity(opened.identity, this.#identity)) {
-                direction = "outgoing";
-                if (
-                    listId === undefined ||
-                    listId !==
-                        privateMessageSelfListElementId(this.#identity, friend, opened.message)
-                ) {
-                    clearMessageSecrets(opened.message);
-                    throw new InvalidDirectChatEnvelopeError();
-                }
-            } else {
+            encrypted = decodeEncryptedPrivateMessage(bytes);
+        } catch {
+            throw new InvalidDirectChatEnvelopeError();
+        }
+        if (encrypted.recipient !== this.#ownerId) {
+            throw new InvalidDirectChatEnvelopeError();
+        }
+        let opened: OpenedPrivateMessage;
+        try {
+            opened = decryptPrivateMessageFromContact(this.#identity, encrypted);
+        } catch {
+            throw new InvalidDirectChatEnvelopeError();
+        }
+        let direction: "incoming" | "outgoing";
+        if (sameIdentity(opened.identity, friend)) {
+            direction = "incoming";
+            if (
+                listId !== undefined &&
+                listId !== privateMessageListElementId(friend, opened.message)
+            ) {
                 clearMessageSecrets(opened.message);
                 throw new InvalidDirectChatEnvelopeError();
             }
-            return { encrypted, opened, direction };
-        } catch (error: unknown) {
-            if (error instanceof InvalidDirectChatEnvelopeError) {
-                throw error;
+        } else if (sameIdentity(opened.identity, this.#identity)) {
+            direction = "outgoing";
+            if (
+                listId === undefined ||
+                listId !== privateMessageSelfListElementId(this.#identity, friend, opened.message)
+            ) {
+                clearMessageSecrets(opened.message);
+                throw new InvalidDirectChatEnvelopeError();
             }
+        } else {
+            clearMessageSecrets(opened.message);
             throw new InvalidDirectChatEnvelopeError();
         }
+        return { encrypted, opened, direction };
     }
 
     async #publishPending(id: string): Promise<void> {
@@ -696,10 +723,37 @@ export class DirectChat {
         if (bytes === undefined) {
             return;
         }
-        const pending = decodeDirectChatOutboxRecord(bytes);
+        let pending = decodeDirectChatOutboxRecord(bytes);
         try {
             this.#validatePendingOutbox(pending);
-            await this.#client.publishEvent(pending.event);
+            let result: Awaited<ReturnType<MurmurClient["publishEvent"]>>;
+            const stale =
+                this.#now() - pending.event.createdAt >= OUTBOUND_EVENT_REFRESH_MILLISECONDS;
+            let refreshed = false;
+            try {
+                // Exact retry first recovers relay receipts whose responses
+                // were lost, even after the timestamp window.
+                result =
+                    pending.previousEvent === undefined
+                        ? await this.#client.publishEvent(pending.event)
+                        : await this.#client.replaceOutboundEvent(
+                              pending.previousEvent,
+                              pending.event,
+                          );
+            } catch (error: unknown) {
+                if (!stale) {
+                    throw error;
+                }
+                pending = await this.#refreshPendingEvent(key, pending);
+                this.#validatePendingOutbox(pending);
+                result = await this.#publishReplacement(pending);
+                refreshed = true;
+            }
+            if (!refreshed && stale && result.failedRelayIds.length > 0) {
+                pending = await this.#refreshPendingEvent(key, pending);
+                this.#validatePendingOutbox(pending);
+                result = await this.#publishReplacement(pending);
+            }
             const surface = surfacedMessage(
                 this.#identity,
                 pending.friend,
@@ -708,16 +762,85 @@ export class DirectChat {
                 "local-send",
             );
             await this.#store.transaction(async (transaction) => {
-                if ((await transaction.get(key)) === undefined) {
+                const currentBytes = await transaction.get(key);
+                if (currentBytes === undefined) {
                     return;
                 }
-                await this.#callbacks.messagePublished?.(transaction, surface);
-                await transaction.delete(key);
+                const current = decodeDirectChatOutboxRecord(currentBytes);
+                if (current.event.id !== pending.event.id) {
+                    return;
+                }
+                if (!current.published) {
+                    await this.#callbacks.messagePublished?.(transaction, surface);
+                }
+                if (result.failedRelayIds.length === 0) {
+                    await transaction.delete(key);
+                } else {
+                    await transaction.set(
+                        key,
+                        encodeDirectChatOutboxRecord({
+                            event: current.event,
+                            friend: current.friend,
+                            message: current.message,
+                            published: true,
+                        }),
+                    );
+                }
             });
         } finally {
             zeroBytes(bytes);
             clearMessageSecrets(pending.message);
         }
+    }
+
+    async #refreshPendingEvent(
+        key: string,
+        pending: DirectChatOutboxRecord,
+    ): Promise<DirectChatOutboxRecord> {
+        const now = this.#now();
+        if (now - pending.event.createdAt < OUTBOUND_EVENT_REFRESH_MILLISECONDS) {
+            return pending;
+        }
+        const replacement = createRelayEvent(
+            this.#identity,
+            pending.event.topic,
+            pending.event.payload,
+            {
+                ...(pending.event.snapshot === undefined
+                    ? {}
+                    : { snapshot: pending.event.snapshot }),
+                ...(pending.event.list === undefined ? {} : { list: pending.event.list }),
+            },
+            now,
+        );
+        const refreshed: DirectChatOutboxRecord = {
+            event: replacement,
+            previousEvent: pending.event,
+            friend: pending.friend,
+            message: pending.message,
+            published: pending.published,
+        };
+        return this.#store.transaction(async (transaction) => {
+            const currentBytes = await transaction.get(key);
+            if (currentBytes === undefined) {
+                return refreshed;
+            }
+            const current = decodeDirectChatOutboxRecord(currentBytes);
+            if (current.event.id !== pending.event.id) {
+                return current;
+            }
+            await transaction.set(key, encodeDirectChatOutboxRecord(refreshed));
+            return refreshed;
+        });
+    }
+
+    async #publishReplacement(
+        pending: DirectChatOutboxRecord,
+    ): Promise<Awaited<ReturnType<MurmurClient["publishEvent"]>>> {
+        if (pending.previousEvent === undefined) {
+            throw new Error("DirectChat clock did not advance a stale pending event");
+        }
+        return this.#client.replaceOutboundEvent(pending.previousEvent, pending.event);
     }
 
     #validatePendingOutbox(pending: DirectChatOutboxRecord): void {
@@ -832,7 +955,13 @@ export class DirectChat {
             }),
         );
         const prefix = `${QUARANTINE_PREFIX}/${this.#ownerId}/`;
-        const key = `${prefix}${encodeBase64Url(digest)}/${encodeBase64Url(utf8Encode(sourceId))}`;
+        const observedAt = this.#now();
+        if (!Number.isSafeInteger(observedAt) || observedAt < 0) {
+            throw new Error("DirectChat clock returned an invalid quarantine time");
+        }
+        const key = `${prefix}${observedAt.toString().padStart(16, "0")}/${encodeBase64Url(
+            digest,
+        )}/${encodeBase64Url(utf8Encode(sourceId))}`;
         try {
             await transaction.set(key, record);
             const records = await transaction.list(prefix);

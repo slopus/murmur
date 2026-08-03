@@ -25,8 +25,10 @@ export interface DirectChatSendRecord {
 
 export interface DirectChatOutboxRecord {
     readonly event: SignedRelayEvent;
+    readonly previousEvent?: SignedRelayEvent;
     readonly friend: IdentityPublicKeys;
     readonly message: PrivateMessage;
+    readonly published: boolean;
 }
 
 function record(value: unknown, fields: readonly string[], name: string): Record<string, unknown> {
@@ -131,8 +133,16 @@ export function encodeDirectChatOutboxRecord(value: DirectChatOutboxRecord): Uin
             JSON.stringify({
                 version: 1,
                 event: encodeBase64Url(event),
+                ...(value.previousEvent === undefined
+                    ? {}
+                    : {
+                          previousEvent: encodeBase64Url(
+                              encodeSignedRelayEventWire(value.previousEvent),
+                          ),
+                      }),
                 friend: encodeFriend(value.friend),
                 message: encodeBase64Url(message),
+                published: value.published,
             }),
         );
     } finally {
@@ -143,28 +153,43 @@ export function encodeDirectChatOutboxRecord(value: DirectChatOutboxRecord): Uin
 
 /** Decode one strict pending direct-chat publication. */
 export function decodeDirectChatOutboxRecord(bytes: Uint8Array): DirectChatOutboxRecord {
-    const value = record(
-        JSON.parse(utf8Decode(bytes)) as unknown,
-        ["version", "event", "friend", "message"],
-        "direct-chat outbox",
-    );
+    const parsed = JSON.parse(utf8Decode(bytes)) as unknown;
+    const fields =
+        typeof parsed === "object" &&
+        parsed !== null &&
+        !Array.isArray(parsed) &&
+        Object.hasOwn(parsed, "previousEvent")
+            ? ["version", "event", "previousEvent", "friend", "message", "published"]
+            : ["version", "event", "friend", "message", "published"];
+    const value = record(parsed, fields, "direct-chat outbox");
     if (
         value.version !== 1 ||
         typeof value.event !== "string" ||
-        typeof value.message !== "string"
+        (value.previousEvent !== undefined && typeof value.previousEvent !== "string") ||
+        typeof value.message !== "string" ||
+        typeof value.published !== "boolean"
     ) {
         throw new Error("Invalid direct-chat outbox");
     }
     const event = decodeBase64Url(value.event);
+    const previousEvent =
+        value.previousEvent === undefined ? undefined : decodeBase64Url(value.previousEvent);
     const message = decodeBase64Url(value.message);
     try {
         return {
             event: decodeSignedRelayEventWire(event),
+            ...(previousEvent === undefined
+                ? {}
+                : { previousEvent: decodeSignedRelayEventWire(previousEvent) }),
             friend: decodeFriend(value.friend),
             message: decodePrivateMessage(message),
+            published: value.published,
         };
     } finally {
         zeroBytes(event);
+        if (previousEvent !== undefined) {
+            zeroBytes(previousEvent);
+        }
         zeroBytes(message);
     }
 }

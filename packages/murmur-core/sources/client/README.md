@@ -5,6 +5,12 @@ relays. Publishing succeeds after at least one relay accepts the signed event.
 The durable outbox remembers remaining relays; identical retries use the
 relay's original sequence and `duplicate` outcome.
 
+`replaceOutboundEvent()` is the narrow freshness escape hatch for higher-level
+protocols with stable logical IDs. It atomically swaps a retained event for a
+newly signed event only when topic, author, payload, snapshot, and list
+operations are identical; only event ID, creation time, and signature may
+change.
+
 ```text
 relay event page -> authenticate -> application transaction
                                       |             |

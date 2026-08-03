@@ -2460,10 +2460,12 @@ export class MurmurCliRuntime {
         };
         const key = messageKey(ownerId, stored);
         await persistStoredMessage(transaction, key, stored);
-        await transaction.set(
-            directMessageIndexKey(ownerId, conversationId, surfaced.message.id),
-            utf8Encode(key),
-        );
+        if (surfaced.direction === "outgoing" && surfaced.source === "local-send") {
+            await transaction.set(
+                directMessageIndexKey(ownerId, conversationId, surfaced.message.id),
+                utf8Encode(key),
+            );
+        }
     }
 
     async #markDirectChatMessagePublished(

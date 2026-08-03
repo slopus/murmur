@@ -42,6 +42,9 @@ export class ContactBook {
 
     /** Remove one local contact. */
     async remove(identity: Pick<IdentityPublicKeys, "signingKey">): Promise<void> {
+        if ((await this.#friends.get(identity, { includeRemoved: true })) === undefined) {
+            return;
+        }
         await this.#friends.remove(identity);
     }
 }

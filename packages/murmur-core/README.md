@@ -77,6 +77,7 @@ client.subscribe(topic): Promise<void>;
 client.publish(topic, payload, { snapshot?, list? }?): Promise<PublishResult>;
 client.publishUnlinkable(topic, payload, mutations?): Promise<PublishResult>;
 client.publishEvent(event): Promise<PublishResult>;
+client.replaceOutboundEvent(previous, replacement): Promise<PublishResult>;
 client.retryOutboundSettled(): Promise<RetryOutboundReport>;
 client.sync(waitMilliseconds?, signal?): Promise<SyncResult>;
 client.loadTopic(topic, applicationTransaction, relayId?): Promise<Result>;
@@ -86,7 +87,10 @@ client.getBlob(id): Promise<RelayBlob | undefined>;
 
 Publishing succeeds when at least one relay accepts the event. The outbox keeps
 the exact signed event until every configured relay accepts it. Relay retries
-return their original `seq` and `duplicate: true`.
+return their original `seq` and `duplicate: true`. A higher-level protocol with
+stable logical IDs may atomically replace a stale event with freshly signed,
+content-equivalent bytes while preserving the prior event's per-relay
+acceptance receipts.
 
 ## Cursor and reset contract
 

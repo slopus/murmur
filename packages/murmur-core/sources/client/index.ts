@@ -58,6 +58,49 @@ function parseCursor(value: Uint8Array | undefined): bigint {
     return BigInt(text);
 }
 
+function equalOptionalBytes(left: Uint8Array | undefined, right: Uint8Array | undefined): boolean {
+    return (
+        (left === undefined && right === undefined) ||
+        (left !== undefined && right !== undefined && equalBytes(left, right))
+    );
+}
+
+function equalListOperation(left: ListOperation, right: ListOperation): boolean {
+    if (left.op !== right.op || left.id !== right.id) {
+        return false;
+    }
+    if (left.op === "append" && right.op === "append") {
+        return equalBytes(left.bytes, right.bytes);
+    }
+    if (left.op === "replace" && right.op === "replace") {
+        return (
+            left.expectedVersion === right.expectedVersion && equalBytes(left.bytes, right.bytes)
+        );
+    }
+    return (
+        left.op === "delete" &&
+        right.op === "delete" &&
+        left.expectedVersion === right.expectedVersion
+    );
+}
+
+function equalEventApplication(left: SignedRelayEvent, right: SignedRelayEvent): boolean {
+    const leftList = left.list ?? [];
+    const rightList = right.list ?? [];
+    return (
+        left.topic === right.topic &&
+        equalBytes(left.author.signingKey, right.author.signingKey) &&
+        equalBytes(left.payload, right.payload) &&
+        left.snapshot?.expectedVersion === right.snapshot?.expectedVersion &&
+        equalOptionalBytes(left.snapshot?.bytes, right.snapshot?.bytes) &&
+        leftList.length === rightList.length &&
+        leftList.every((operation, index) => {
+            const candidate = rightList[index];
+            return candidate !== undefined && equalListOperation(operation, candidate);
+        })
+    );
+}
+
 /** Durable topic client over one or more fixed-contract relays. */
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
@@ -158,6 +201,69 @@ export class MurmurClient {
         return this.#publishPreparedEvent(event, true);
     }
 
+    /**
+     * Atomically supersede one retained event with freshly signed,
+     * content-equivalent bytes, then publish the replacement.
+     *
+     * Stable application/list IDs must provide logical idempotency because a
+     * relay which accepted the prior event may also accept the replacement.
+     */
+    async replaceOutboundEvent(
+        previous: SignedRelayEvent,
+        replacement: SignedRelayEvent,
+    ): Promise<PublishResult> {
+        if (
+            !verifyRelayEvent(previous) ||
+            !verifyRelayEvent(replacement) ||
+            !equalBytes(previous.author.signingKey, this.#identity.signingKey) ||
+            !equalBytes(replacement.author.signingKey, this.#identity.signingKey) ||
+            previous.id === replacement.id ||
+            replacement.createdAt < previous.createdAt ||
+            !equalEventApplication(previous, replacement)
+        ) {
+            throw new Error("Replacement relay event does not match retained application state");
+        }
+        const previousKey = this.#outboundKey(previous);
+        const replacementKey = this.#outboundKey(replacement);
+        const publishedRelayIds = await this.#store.transaction(async (transaction) => {
+            const previousBytes = await transaction.get(previousKey);
+            let published = new Set<string>();
+            if (previousBytes !== undefined) {
+                const record = decodeOutboundRecord(previousBytes);
+                if (!equalRelayEvents(record.event, previous)) {
+                    throw new Error("Previous relay event collides with retained outbound state");
+                }
+                published = new Set(record.publishedRelayIds);
+            }
+            const replacementBytes = await transaction.get(replacementKey);
+            if (replacementBytes === undefined) {
+                await transaction.set(
+                    replacementKey,
+                    encodeOutboundRecord(replacement, [...published]),
+                );
+            } else {
+                const record = decodeOutboundRecord(replacementBytes);
+                if (!equalRelayEvents(record.event, replacement)) {
+                    throw new Error(
+                        "Replacement relay event collides with retained outbound state",
+                    );
+                }
+                for (const relayId of record.publishedRelayIds) {
+                    published.add(relayId);
+                }
+                await transaction.set(
+                    replacementKey,
+                    encodeOutboundRecord(replacement, [...published]),
+                );
+            }
+            await transaction.delete(previousKey);
+            return [...published];
+        });
+        const result = await this.#publishRecord(replacementKey, replacement, publishedRelayIds);
+        await this.#pruneOutboundHistory();
+        return result;
+    }
+
     async #publishPreparedEvent(
         event: SignedRelayEvent,
         requireClientAuthor: boolean,
@@ -168,9 +274,7 @@ export class MurmurClient {
         ) {
             throw new Error("Prepared relay event is not owned by this Murmur client");
         }
-        const key = `${this.#outboundPrefix}${event.createdAt
-            .toString()
-            .padStart(16, "0")}/${event.id}`;
+        const key = this.#outboundKey(event);
         const existing = await this.#store.get(key);
         let publishedRelayIds: readonly string[] = [];
         if (existing === undefined) {
@@ -444,6 +548,10 @@ export class MurmurClient {
 
     #cursorKey(relayId: string, topic: string): string {
         return `${this.#cursorPrefix}${encodeBase64Url(utf8Encode(relayId))}/${topic}`;
+    }
+
+    #outboundKey(event: SignedRelayEvent): string {
+        return `${this.#outboundPrefix}${event.createdAt.toString().padStart(16, "0")}/${event.id}`;
     }
 
     async #readCursor(relayId: string, topic: string): Promise<bigint> {

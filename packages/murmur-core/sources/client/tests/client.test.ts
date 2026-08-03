@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import {
+    createRelayEvent,
     type EventPage,
     type ListPage,
     type PublishOutcome,
@@ -199,6 +200,43 @@ describe("MurmurClient", () => {
         expect(duplicate).toEqual({ seq: 1n, duplicate: true });
         expect(retry.results).toHaveLength(1);
         expect(retry.failures).toHaveLength(0);
+    });
+
+    it("atomically replaces a stale outbound event with equivalent fresh content", async () => {
+        const identity = generateIdentityKeyPair();
+        const relay = new TestTransport("relay");
+        const store = new MemoryMurmurStore();
+        const client = new MurmurClient({ identity, store, transports: [relay] });
+        const previous = createRelayEvent(
+            identity,
+            "room",
+            utf8Encode("hello"),
+            {
+                list: [{ op: "append", id: "message:stable", bytes: utf8Encode("ciphertext") }],
+            },
+            1,
+        );
+        const replacement = createRelayEvent(
+            identity,
+            "room",
+            previous.payload,
+            {
+                list: previous.list ?? [],
+            },
+            400_000,
+        );
+
+        await client.publishEvent(previous);
+        await client.replaceOutboundEvent(previous, replacement);
+
+        expect(relay.events.get("room")).toHaveLength(1);
+        expect((await client.retryOutboundSettled()).failures).toEqual([]);
+        await expect(
+            client.replaceOutboundEvent(
+                previous,
+                createRelayEvent(identity, "different", previous.payload, {}, 400_001),
+            ),
+        ).rejects.toThrow("does not match");
     });
 
     it("uses a one-use relay author for public first-contact traffic", async () => {

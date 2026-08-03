@@ -23,6 +23,12 @@ ID, and an optional `sentAt`. Existing version-one attachment descriptors remain
 decodable for history compatibility, but this engine cannot create attachment
 messages.
 
+`sendText()` persists the logical message and pending event before publication,
+so a thrown publication error can still mean "durably queued." Retrying the
+same caller ID resumes it. Pending events older than the relay timestamp window
+are atomically replaced with freshly signed, content-equivalent events; stable
+list IDs preserve logical idempotency across that replacement.
+
 Removed friends remain subscribed so relay cursors stay gapless. New traffic
 from them is authenticated, replay-marked, quarantined, and advanced without
 reaching the application callback. Re-adding the authenticated profile

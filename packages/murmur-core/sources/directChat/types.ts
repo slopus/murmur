@@ -3,7 +3,11 @@ import type { IdentityPublicKeys } from "../crypto/index.js";
 import type { PrivateMessage } from "../messaging/index.js";
 import type { StoreTransaction } from "../storage/index.js";
 
-/** Stable metadata applications can use to order surfaced logical messages. */
+/**
+ * Stable metadata applications can use to order surfaced logical messages.
+ *
+ * `sentAt` is authenticated as the sender's claim, not trusted relay time.
+ */
 export interface DirectChatOrdering {
     readonly sentAt: number;
     readonly senderId: string;

@@ -268,6 +268,13 @@ participants collapse their authorized copy to the same logical message ID, so
 copies repeated by several relays do not duplicate history. Older topics with
 only recipient-sealed elements remain readable by recipients.
 
+The direct-chat outbox remains until every configured relay accepts the logical
+send. If a pending signed event approaches the relay's timestamp window, the
+client atomically replaces it with a freshly timestamped and signed event whose
+topic, payload, and two stable list operations are byte-equivalent. Different
+relays may therefore retain different event IDs for one logical message; stable
+element IDs and authenticated replay records collapse them.
+
 ### Direct-message acceptance
 
 `acceptPrivateMessageFromContact()` uses a local replay key scoped to recipient,
