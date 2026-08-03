@@ -5,6 +5,7 @@ describe("@murmur/relay public API", () => {
     it("exports only the supported runtime entry points", () => {
         expect(Object.keys(relay).sort()).toEqual([
             "InMemoryTokenBucketRateLimiter",
+            "InProcessEphemeralFanout",
             "InProcessWakeSource",
             "LocalBlobBackend",
             "PgPoolDatabase",

@@ -132,6 +132,11 @@ async function writeResponse(response: Response, outgoing: ServerResponse): Prom
         await endResponse(outgoing);
         return;
     }
+    // Flush status and headers before the first body chunk so an SSE client sees
+    // the stream open (and receives its `ready` event) without buffering delay.
+    if (response.headers.get("content-type")?.startsWith("text/event-stream") === true) {
+        outgoing.flushHeaders();
+    }
     await pipeline(Readable.fromWeb(response.body as ReadableStream<Uint8Array>), outgoing);
 }
 

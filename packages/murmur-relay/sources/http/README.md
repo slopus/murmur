@@ -19,3 +19,13 @@ The root route returns a plain-text welcome. An optional injected logger records
 only named routes, methods, status codes, and durations; it never records topic
 IDs, blob IDs, client IPs, payloads, or keys. Successful health probes are
 suppressed.
+
+Two routes serve the non-durable ephemeral path. `POST /v1/topics/:topic/ephemeral`
+reads raw `application/octet-stream` bytes (bounded by `maximumEphemeralFrameBytes`,
+413 on excess), fans them to local stream subscribers, stores nothing, and returns
+`{"delivered":n}`; it carries the `costs.ephemeral` rate-limit class.
+`GET /v1/topics/:topic/stream` returns a `text/event-stream` `ReadableStream`
+emitting `ready`, `frame`, `wake`, and `drop` events plus `: keepalive` comments,
+and returns 503 `overloaded` past `maximumConcurrentStreams`. Both are covered by
+the shared CORS wrapping and the `POST`/`GET` methods already advertised on
+`OPTIONS`; they are classified as `topic-ephemeral` and `topic-stream` for logging.

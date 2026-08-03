@@ -19,6 +19,7 @@ import { encodeBase64Url } from "../utils/base64Url.js";
 import { encodeListCursor } from "../utils/cursor.js";
 import { resolveClientIp, type TrustedProxyPolicy } from "./impl/clientIp.js";
 import { readBoundedRequestBody } from "./impl/requestReadBody.js";
+import { createEphemeralStreamResponse } from "./impl/streamResponse.js";
 
 const decoder = new TextDecoder("utf-8", { fatal: true });
 const DEFAULT_MAXIMUM_PAGE_RESPONSE_BYTES = 8 * 1024 * 1024;
@@ -337,6 +338,12 @@ async function routeRequest(
             segments.length === 3 &&
             segments[0] === "v1" &&
             segments[1] === "blobs");
+    const isEphemeral =
+        request.method === "POST" &&
+        segments.length === 4 &&
+        segments[0] === "v1" &&
+        segments[1] === "topics" &&
+        segments[3] === "ephemeral";
     const rateLimit = service.options.rateLimit;
     const cost =
         rateLimit === false
@@ -345,7 +352,9 @@ async function routeRequest(
               ? rateLimit.costs.publish
               : isUpload
                 ? rateLimit.costs.upload
-                : rateLimit.costs.read;
+                : isEphemeral
+                  ? rateLimit.costs.ephemeral
+                  : rateLimit.costs.read;
     if (options.rateLimiter !== undefined && cost > 0) {
         const clientIp = resolveClientIp(request, context.remoteAddress, options.trustedProxies);
         await consumeRateLimit(options.rateLimiter, `ip:${clientIp}`, cost, now);
@@ -403,6 +412,36 @@ async function routeRequest(
                 ? jsonResponse({ error: "not_found" }, 404)
                 : jsonTextResponse(eventPageText(page, options.maximumPageResponseBytes));
         }
+    }
+    if (
+        request.method === "POST" &&
+        segments.length === 4 &&
+        segments[0] === "v1" &&
+        segments[1] === "topics" &&
+        segments[3] === "ephemeral"
+    ) {
+        const topic = segments[2];
+        if (topic === undefined) {
+            throw new RelayError(400, "Missing topic", { error: "malformed" });
+        }
+        const frame = await readBoundedRequestBody(
+            request,
+            service.options.maximumEphemeralFrameBytes,
+        );
+        return jsonResponse({ delivered: service.publishEphemeral(topic, frame) });
+    }
+    if (
+        request.method === "GET" &&
+        segments.length === 4 &&
+        segments[0] === "v1" &&
+        segments[1] === "topics" &&
+        segments[3] === "stream"
+    ) {
+        const topic = segments[2];
+        if (topic === undefined) {
+            throw new RelayError(400, "Missing topic", { error: "malformed" });
+        }
+        return createEphemeralStreamResponse(service, topic, request.signal);
     }
     if (
         request.method === "GET" &&
@@ -494,6 +533,8 @@ type RequestRoute =
     | "root"
     | "health"
     | "topic-events"
+    | "topic-ephemeral"
+    | "topic-stream"
     | "topic-state"
     | "topic-list"
     | "blob-upload-link"
@@ -514,6 +555,12 @@ function requestRoute(request: Request): RequestRoute {
     if (segments.length === 4 && segments[0] === "v1" && segments[1] === "topics") {
         if (segments[3] === "events") {
             return "topic-events";
+        }
+        if (segments[3] === "ephemeral") {
+            return "topic-ephemeral";
+        }
+        if (segments[3] === "stream") {
+            return "topic-stream";
         }
         if (segments[3] === "state") {
             return "topic-state";

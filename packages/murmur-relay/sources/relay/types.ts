@@ -6,6 +6,8 @@ export interface RelayRateLimitCosts {
     readonly upload?: number;
     /** State, event, health, download-link, and signed download cost. Defaults to 1. */
     readonly read?: number;
+    /** Ephemeral frame publication cost, charged to the request IP. Defaults to 1. */
+    readonly ephemeral?: number;
 }
 
 /** Token-bucket configuration for the relay HTTP boundary. */
@@ -29,6 +31,7 @@ export interface ResolvedRelayRateLimitOptions {
         readonly publish: number;
         readonly upload: number;
         readonly read: number;
+        readonly ephemeral: number;
     };
 }
 
@@ -60,6 +63,16 @@ export interface RelayOptions {
     readonly eventRetentionMilliseconds?: number;
     /** Topic inactivity window. Defaults to thirty days. */
     readonly topicInactivityMilliseconds?: number;
+    /** Maximum opaque ephemeral frame accepted for fan-out. Defaults to 128 KiB. */
+    readonly maximumEphemeralFrameBytes?: number;
+    /** Maximum simultaneous ephemeral streams in one process. Defaults to 10,000. */
+    readonly maximumConcurrentStreams?: number;
+    /** Maximum queued frames buffered per stream subscriber. Defaults to 64. */
+    readonly maximumStreamQueueFrames?: number;
+    /** Maximum queued frame bytes buffered per stream subscriber. Defaults to 1 MiB. */
+    readonly maximumStreamQueueBytes?: number;
+    /** SSE keepalive comment interval for open streams. Defaults to 15,000 ms. */
+    readonly streamKeepAliveMilliseconds?: number;
     /** HTTP rate limiting; pass `false` to disable it. Enabled by default. */
     readonly rateLimit?: RelayRateLimitOptions | false;
 }
@@ -79,6 +92,11 @@ export interface ResolvedRelayOptions {
     readonly maximumConcurrentLongPolls: number;
     readonly eventRetentionMilliseconds: number;
     readonly topicInactivityMilliseconds: number;
+    readonly maximumEphemeralFrameBytes: number;
+    readonly maximumConcurrentStreams: number;
+    readonly maximumStreamQueueFrames: number;
+    readonly maximumStreamQueueBytes: number;
+    readonly streamKeepAliveMilliseconds: number;
     readonly rateLimit: ResolvedRelayRateLimitOptions | false;
 }
 
@@ -93,4 +111,50 @@ export interface WakeSource {
     notify(topic: string): Promise<void>;
     subscribe(listener: (topic: string) => void): Promise<void>;
     close(): Promise<void>;
+}
+
+/** One item drained from a stream subscriber's bounded queue. */
+export type EphemeralStreamMessage =
+    | { readonly kind: "frame"; readonly bytes: Uint8Array }
+    | { readonly kind: "wake" }
+    | { readonly kind: "drop"; readonly frames: number };
+
+/**
+ * One live SSE stream subscriber's read side.
+ *
+ * The producer (frame fan-out and wake delivery) enqueues into a bounded
+ * buffer and never awaits this reader, so a stalled consumer can only cause
+ * bounded frame drops, never unbounded memory growth. The SSE encoder repeatedly
+ * drains {@link take} and parks on {@link waitForActivity} between batches.
+ */
+export interface EphemeralSubscription {
+    /** Remove and return every currently queued message; empty when idle. */
+    take(): readonly EphemeralStreamMessage[];
+    /** Resolve when a message is queued, the subscription closes, or the keepalive interval elapses. */
+    waitForActivity(keepAliveMilliseconds: number): Promise<void>;
+    /** Whether the subscription has been closed by the service or the reader. */
+    readonly closed: boolean;
+    /** Detach the subscriber from its fan-out and release the reader. */
+    close(): void;
+}
+
+/**
+ * In-process fan-out of opaque ephemeral frames to local stream subscribers.
+ *
+ * This interface is deliberately shaped like {@link WakeSource} and the
+ * rate limiter so a shared, cross-instance implementation can be substituted.
+ * Frame fan-out is in-process only; cross-instance promptness rides
+ * {@link WakeSource} through the `wake` event instead.
+ */
+export interface EphemeralFanout {
+    /** Register a subscriber for a topic, or `undefined` when at capacity. */
+    subscribe(topic: string): EphemeralSubscription | undefined;
+    /** Enqueue one frame to every local subscriber, returning how many were enqueued. */
+    publishFrame(topic: string, frame: Uint8Array): number;
+    /** Enqueue one coalesced wake to every local subscriber of a topic. */
+    wake(topic: string): void;
+    /** Current count of live local subscribers across all topics. */
+    readonly subscriberCount: number;
+    /** Close every subscriber and stop accepting new ones. */
+    close(): void;
 }

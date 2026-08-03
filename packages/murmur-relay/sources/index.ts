@@ -15,10 +15,15 @@ export type {
     SignedRelayEvent,
     SnapshotMutation,
 } from "./protocol/types.js";
+export { InProcessEphemeralFanout } from "./relay/impl/ephemeralFanout.js";
+export type { InProcessEphemeralFanoutOptions } from "./relay/impl/ephemeralFanout.js";
 export { InProcessWakeSource } from "./relay/impl/wakeInProcess.js";
 export { PostgresWakeSource } from "./relay/impl/wakePostgres.js";
 export { RelayService } from "./relay/index.js";
 export type {
+    EphemeralFanout,
+    EphemeralStreamMessage,
+    EphemeralSubscription,
     RelayOptions,
     RelayRateLimitCosts,
     RelayRateLimitOptions,

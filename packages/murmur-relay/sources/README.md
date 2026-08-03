@@ -9,7 +9,8 @@ HTTP request -> rate limit -> relay policy -> storage transaction
 ```
 
 - `protocol` defines and authenticates the relay's own opaque wire format.
-- `relay` applies limits, timestamp policy, retention, and long-poll behavior.
+- `relay` applies limits, timestamp policy, retention, long-poll behavior, and
+  the in-process ephemeral (SSE) frame fan-out.
 - `storage` contains the single persistence contract and its two implementations.
 - `blobs` issues direct transfer links and owns local/S3 blob mechanics.
 - `rate-limit` defines the replaceable limiter and bounded in-memory default.

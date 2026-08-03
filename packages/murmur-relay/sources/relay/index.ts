@@ -16,8 +16,11 @@ import type {
     TopicState,
 } from "../storage/index.js";
 import { equalBytes } from "../utils/bytes.js";
+import { InProcessEphemeralFanout } from "./impl/ephemeralFanout.js";
 import { InProcessWakeSource } from "./impl/wakeInProcess.js";
 import type {
+    EphemeralFanout,
+    EphemeralSubscription,
     RelayOptions,
     RelayPruneOutcome,
     ResolvedRelayOptions,
@@ -25,9 +28,14 @@ import type {
     WakeSource,
 } from "./types.js";
 
+export { InProcessEphemeralFanout } from "./impl/ephemeralFanout.js";
+export type { InProcessEphemeralFanoutOptions } from "./impl/ephemeralFanout.js";
 export { InProcessWakeSource } from "./impl/wakeInProcess.js";
 export { PostgresWakeSource } from "./impl/wakePostgres.js";
 export type {
+    EphemeralFanout,
+    EphemeralStreamMessage,
+    EphemeralSubscription,
     RelayOptions,
     RelayPruneOutcome,
     RelayRateLimitCosts,
@@ -73,6 +81,7 @@ function resolveRateLimit(
         publish: positiveFinite(options?.costs?.publish ?? 25, "Publish rate-limit cost"),
         upload: positiveFinite(options?.costs?.upload ?? 10, "Upload rate-limit cost"),
         read: positiveFinite(options?.costs?.read ?? 1, "Read rate-limit cost"),
+        ephemeral: positiveFinite(options?.costs?.ephemeral ?? 1, "Ephemeral rate-limit cost"),
     };
     if (Object.values(costs).some((cost) => cost > capacity)) {
         throw new Error("Rate-limit costs cannot exceed bucket capacity");
@@ -145,6 +154,26 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
             options.topicInactivityMilliseconds ?? THIRTY_DAYS,
             "Topic inactivity milliseconds",
         ),
+        maximumEphemeralFrameBytes: positiveSafeInteger(
+            options.maximumEphemeralFrameBytes ?? 128 * 1024,
+            "Maximum ephemeral frame bytes",
+        ),
+        maximumConcurrentStreams: positiveSafeInteger(
+            options.maximumConcurrentStreams ?? 10_000,
+            "Maximum concurrent streams",
+        ),
+        maximumStreamQueueFrames: positiveSafeInteger(
+            options.maximumStreamQueueFrames ?? 64,
+            "Maximum stream queue frames",
+        ),
+        maximumStreamQueueBytes: positiveSafeInteger(
+            options.maximumStreamQueueBytes ?? MEBIBYTE,
+            "Maximum stream queue bytes",
+        ),
+        streamKeepAliveMilliseconds: positiveSafeInteger(
+            options.streamKeepAliveMilliseconds ?? 15_000,
+            "Stream keepalive milliseconds",
+        ),
         rateLimit: resolveRateLimit(options.rateLimit),
     };
     if (resolved.maximumLongPollMilliseconds > HARD_MAXIMUM_LONG_POLL_MILLISECONDS) {
@@ -161,6 +190,7 @@ function abortError(signal: AbortSignal): Error {
 export class RelayService {
     readonly #store: RelayStore;
     readonly #wakeSource: WakeSource;
+    readonly #fanout: EphemeralFanout;
     readonly #now: () => number;
     readonly #options: ResolvedRelayOptions;
     readonly #waiters = new Map<string, Set<Waiter>>();
@@ -172,10 +202,18 @@ export class RelayService {
         options: RelayOptions = {},
         wakeSource: WakeSource = new InProcessWakeSource(),
         now: () => number = Date.now,
+        fanout?: EphemeralFanout,
     ) {
         this.#store = store;
         this.#options = resolveOptions(options);
         this.#wakeSource = wakeSource;
+        this.#fanout =
+            fanout ??
+            new InProcessEphemeralFanout({
+                maximumConcurrentStreams: this.#options.maximumConcurrentStreams,
+                maximumStreamQueueFrames: this.#options.maximumStreamQueueFrames,
+                maximumStreamQueueBytes: this.#options.maximumStreamQueueBytes,
+            });
         this.#now = now;
         void this.#wakeSource
             .subscribe((topic) => {
@@ -366,6 +404,40 @@ export class RelayService {
         return this.#store.readEvents(topic, since, boundedLimit, constraints);
     }
 
+    /**
+     * Fan one opaque ephemeral frame to every local stream subscriber of a topic.
+     *
+     * Nothing is stored: no receipt, sequence, signature check, topic-existence
+     * check, or activity refresh. The returned count is the number of local
+     * subscribers enqueued and is informational, never a delivery guarantee.
+     */
+    publishEphemeral(topic: string, frame: Uint8Array): number {
+        this.#assertOpen();
+        this.#validateTopic(topic);
+        if (!(frame instanceof Uint8Array)) {
+            throw new RelayError(400, "Invalid ephemeral frame", { error: "malformed" });
+        }
+        if (frame.length > this.#options.maximumEphemeralFrameBytes) {
+            throw new RelayError(413, "Ephemeral frame exceeds relay limit", { error: "limit" });
+        }
+        return this.#fanout.publishFrame(topic, frame);
+    }
+
+    /**
+     * Register one local ephemeral stream subscriber, or `undefined` when the
+     * per-process concurrent-stream cap is reached.
+     */
+    openStream(topic: string): EphemeralSubscription | undefined {
+        this.#assertOpen();
+        this.#validateTopic(topic);
+        return this.#fanout.subscribe(topic);
+    }
+
+    /** Count of live local ephemeral stream subscribers, exposed for diagnostics and tests. */
+    get ephemeralSubscriberCount(): number {
+        return this.#fanout.subscriberCount;
+    }
+
     /** Run both configured retention policies using relay-observed time. */
     async prune(): Promise<RelayPruneOutcome> {
         this.#assertOpen();
@@ -396,6 +468,7 @@ export class RelayService {
                 waiter.reject(new Error("Relay service closed"));
             }
         }
+        this.#fanout.close();
         try {
             await this.#wakeSource.close();
         } finally {
@@ -477,6 +550,7 @@ export class RelayService {
         for (const waiter of this.#waiters.get(topic) ?? []) {
             waiter.resolve();
         }
+        this.#fanout.wake(topic);
     }
 
     #pageLimit(limit: number | undefined): number {
