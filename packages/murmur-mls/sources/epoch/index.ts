@@ -1,7 +1,9 @@
-import { equalBytes, zeroBytes } from "@slopus/murmur";
+import { equalBytes, hashBytes, zeroBytes } from "@slopus/murmur";
 import {
     canonicalizeHpkePublicKey,
     isHpkeKeyPair,
+    mlsDeriveSecret,
+    mlsExpandWithLabel,
     mlsSignWithLabel,
     mlsVerifyWithLabel,
 } from "../cipherSuite/index.js";
@@ -547,6 +549,35 @@ export class MlsEpochState {
     get memberSignatureKeys(): readonly (Uint8Array | undefined)[] {
         this.#ensureActive();
         return this.#members.map((member) => member?.signatureKey.slice());
+    }
+
+    /** MLS leaf index of the local member inside this epoch. */
+    get localLeaf(): number {
+        this.#ensureActive();
+        return this.#localLeaf;
+    }
+
+    /**
+     * RFC 9420 section 8.5 MLS-Exporter for this epoch.
+     *
+     * Exported material keys an application-defined protocol from the epoch's
+     * exporter secret. It deliberately reads no Secret Tree ratchet and does
+     * not advance the persistence generation, so an exporter user needs no
+     * durable checkpoint and can be entirely ephemeral. Every epoch produces
+     * unrelated material, which is what makes a membership Commit an effective
+     * revocation for exporter-keyed traffic as well.
+     */
+    exportSecret(label: string, context: Uint8Array, length: number): Uint8Array {
+        this.#ensureActive();
+        if (this.#transitionState !== "idle") {
+            throw new Error("MLS epoch has a pending transition");
+        }
+        const derived = mlsDeriveSecret(this.#secrets.exporterSecret, label);
+        try {
+            return mlsExpandWithLabel(derived, "exported", hashBytes(context), length);
+        } finally {
+            zeroBytes(derived);
+        }
     }
 
     /**

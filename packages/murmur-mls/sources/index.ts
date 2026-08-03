@@ -1,6 +1,7 @@
 export * from "./cipherSuite/index.js";
 export * from "./commit/index.js";
 export * from "./encoding/index.js";
+export * from "./ephemeral/index.js";
 export * from "./epoch/index.js";
 export * from "./groupContext/index.js";
 export * from "./group/index.js";

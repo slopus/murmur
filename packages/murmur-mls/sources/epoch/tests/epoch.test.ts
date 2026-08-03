@@ -131,6 +131,57 @@ describe("MLS epoch application state", () => {
         expect(() => aliceEpoch.seal(utf8Encode("after"))).toThrow("destroyed");
     });
 
+    it("exports matching, ratchet-free secrets on both sides of one epoch", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const secrets = deriveMlsEpochSecretsFromJoiner(
+            hashBytes(utf8Encode("exporter-joiner")),
+            encodeMlsGroupContext(context()),
+        );
+        const shared = deriveMlsEpochSecretsFromJoiner(
+            hashBytes(utf8Encode("exporter-joiner")),
+            encodeMlsGroupContext(context()),
+        );
+        const members = [{ signatureKey: alice.signingKey }, { signatureKey: bob.signingKey }];
+        const aliceEpoch = new MlsEpochState({
+            context: context(),
+            secrets,
+            members,
+            localLeaf: 0,
+            localSigningSecretKey: alice.signingSecretKey,
+        });
+        const bobEpoch = new MlsEpochState({
+            context: context(),
+            secrets: shared,
+            members,
+            localLeaf: 1,
+            localSigningSecretKey: bob.signingSecretKey,
+        });
+
+        const generationBefore = aliceEpoch.persistenceGeneration;
+        const checkpointBefore = aliceEpoch.serialize();
+        const aliceExport = aliceEpoch.exportSecret("murmur test", utf8Encode("ctx"), 32);
+        const bobExport = bobEpoch.exportSecret("murmur test", utf8Encode("ctx"), 32);
+
+        expect(encodeBase64Url(aliceExport)).toBe(encodeBase64Url(bobExport));
+        expect(aliceEpoch.localLeaf).toBe(0);
+        expect(bobEpoch.localLeaf).toBe(1);
+        // The exporter must not advance the ratchet or oblige a checkpoint.
+        expect(aliceEpoch.persistenceGeneration).toBe(generationBefore);
+        expect(encodeBase64Url(aliceEpoch.serialize())).toBe(encodeBase64Url(checkpointBefore));
+
+        const otherLabel = aliceEpoch.exportSecret("murmur other", utf8Encode("ctx"), 32);
+        const otherContext = aliceEpoch.exportSecret("murmur test", utf8Encode("ctx2"), 32);
+        expect(encodeBase64Url(otherLabel)).not.toBe(encodeBase64Url(aliceExport));
+        expect(encodeBase64Url(otherContext)).not.toBe(encodeBase64Url(aliceExport));
+
+        aliceEpoch.destroy();
+        bobEpoch.destroy();
+        expect(() => aliceEpoch.exportSecret("murmur test", utf8Encode("ctx"), 32)).toThrow(
+            "destroyed",
+        );
+    });
+
     it("rejects a local signing key which does not own the configured leaf", () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();

@@ -131,6 +131,21 @@ export class MlsGroupChannel {
         return this.#epoch.memberSignatureKeys;
     }
 
+    /** MLS leaf index of the local member in the current epoch. */
+    get localLeaf(): number {
+        return this.#epoch.localLeaf;
+    }
+
+    /**
+     * Derive RFC 9420 exporter material from the current epoch.
+     *
+     * The exporter does not touch the application ratchet, so material derived
+     * here carries no durability obligation. It changes with every Commit.
+     */
+    exportSecret(label: string, context: Uint8Array, length: number): Uint8Array {
+        return this.#epoch.exportSecret(label, context, length);
+    }
+
     /**
      * Parse a Commit's claimed author without authenticating the Commit.
      *
