@@ -66,4 +66,4 @@ export {
     createNodeRelayServer,
     listenNodeRelayServer,
 } from "./server/index.js";
-export type { NodeRelayServerOptions } from "./server/index.js";
+export type { NodeRelayCloseOptions, NodeRelayServerOptions } from "./server/index.js";

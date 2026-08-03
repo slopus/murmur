@@ -224,8 +224,10 @@ returns HTTP 503 with `{"error":"overloaded"}`.
 Delivers opaque bytes to the topic's current stream subscribers **without
 storing anything**. There is no receipt, sequence, idempotency, signature
 check, or topic-existence check, the relay does not parse the body, and topic
-activity is not refreshed. The request body is raw bytes with
-`content-type: application/octet-stream`.
+activity is not refreshed. The request body is raw bytes.
+`content-type: application/octet-stream` is the convention; the relay never
+inspects the header and treats the body as opaque bytes whatever it says or
+omits.
 
 HTTP 200:
 
@@ -242,7 +244,15 @@ interface, and the default `InProcessEphemeralFanout` does not reach other
 instances.
 
 A body above `maximumEphemeralFrameBytes` returns HTTP 413 `{"error":"limit"}`.
-The route costs `rateLimit.costs.ephemeral`, charged to the request IP only.
+
+The route is charged to the request IP only, and its cost scales with the
+fan-out it causes: `rateLimit.costs.ephemeral` for the request, plus
+`rateLimit.costs.ephemeral` for each stream subscriber of the topic. One cheap
+POST therefore cannot buy an unbounded number of enqueues. The fan-out share is
+charged from the subscriber count read immediately before delivery, so an
+over-budget publisher receives HTTP 429 **instead of** the fan-out rather than
+after it, and it is clamped to the bucket capacity so `Retry-After` stays
+finite. Nothing is charged when the topic has no subscribers.
 
 ### `GET /v1/topics/:topic/stream`
 
@@ -271,9 +281,17 @@ Each subscriber has a bounded, drop-oldest queue of at most
 `maximumStreamQueueFrames` frames and `maximumStreamQueueBytes` bytes; overflow
 drops the **oldest** frames and emits one coalesced `drop`. At most one `wake`
 is pending per subscriber. The body is pull-driven, so a reader that stops
-reading cannot make the relay accumulate memory beyond that queue. Beyond
-`maximumConcurrentStreams`, the route returns HTTP 503
-`{"error":"overloaded"}`.
+reading cannot make the relay accumulate memory without bound: one `pull`
+drains the queue and enqueues what it drained, and the producer can refill the
+queue behind it, so peak buffering per stalled subscriber is roughly twice
+`maximumStreamQueueBytes`.
+
+The route returns HTTP 503 `{"error":"overloaded"}` beyond either subscriber
+ceiling: `maximumConcurrentStreams` per process and `maximumStreamsPerTopic` per
+topic. The per-topic ceiling matters because this route is unauthenticated and
+billed as an ordinary read; without it one client could hold every process-wide
+slot on a single topic. Streams have no server-imposed lifetime, so a client
+that wants to release a slot must close the connection.
 
 ### `POST /v1/blobs/:id/upload-link`
 
@@ -361,7 +379,7 @@ Returns HTTP 204 with the configured CORS headers. The allowed methods are
 | 413    | `{"error":"limit"}` when a configured request, event, state mutation, list, or blob bound is exceeded.                                                                                 |
 | 429    | `{"error":"rate_limited","retryAfterMilliseconds":number}` plus `Retry-After` in seconds.                                                                                              |
 | 500    | `{"error":"internal"}` for unexpected handler or backend errors.                                                                                                                       |
-| 503    | `{"error":"overloaded"}` when the long-poll cap is reached, or `{"error":"blob_unavailable"}` when links are requested without a backend.                                              |
+| 503    | `{"error":"overloaded"}` when the long-poll or a stream-subscriber cap is reached, or `{"error":"blob_unavailable"}` when links are requested without a backend.                       |
 
 ## Default limits
 
@@ -384,6 +402,7 @@ controls the HTTP page budget separately.
 | Concurrent long polls         | 10,000 per process | Beyond it, reads return 503.                                                                         |
 | Ephemeral frame               |            128 KiB | `maximumEphemeralFrameBytes`; nothing is stored.                                                     |
 | Concurrent streams            | 10,000 per process | `maximumConcurrentStreams`; beyond it, the stream route returns 503.                                 |
+| Streams per topic             |    256 per process | `maximumStreamsPerTopic`; beyond it, the stream route returns 503.                                   |
 | Stream queue                  |   64 frames, 1 MiB | `maximumStreamQueueFrames`/`maximumStreamQueueBytes`, per subscriber, drop-oldest.                   |
 | Stream keepalive              |               15 s | `streamKeepAliveMilliseconds`; comment written after an idle interval.                               |
 | Event retention               |             7 days | Only event bodies expire.                                                                            |
@@ -395,7 +414,7 @@ controls the HTTP page budget separately.
 | Token refill                  |        50 tokens/s | Per key, per process.                                                                                |
 | Token-bucket count            |             50,000 | LRU-bounded map, per process.                                                                        |
 | Publish cost                  |                 25 | Charged to IP and valid event author.                                                                |
-| Ephemeral cost                |                  1 | Charged to IP for one ephemeral frame.                                                               |
+| Ephemeral cost                |                  1 | Charged to IP once for the request and once per subscriber fanned out to.                            |
 | Upload cost                   |                 10 | Upload-link and local signed upload, charged to IP.                                                  |
 | Read cost                     |                  1 | All other routes, charged to IP.                                                                     |
 
@@ -493,18 +512,22 @@ bucket with a shared implementation.
 
 ```ts
 interface EphemeralFanout {
-    publish(topic: string, frame: Uint8Array): number;
     subscribe(topic: string): EphemeralSubscription | undefined;
+    publishFrame(topic: string, frame: Uint8Array): number;
     wake(topic: string): void;
+    readonly subscriberCount: number;
+    subscriberCountForTopic(topic: string): number;
     close(): void;
 }
 ```
 
-`subscribe()` returns `undefined` once `maximumConcurrentStreams` is reached.
-The interface is synchronous because frame fan-out is in-process by design,
-which keeps `delivered` exact. Pass an implementation as the fifth
-`RelayService` constructor argument to substitute a shared bus later; `wake`
-already crosses instances through `WakeSource`.
+`subscribe()` returns `undefined` once `maximumConcurrentStreams` or
+`maximumStreamsPerTopic` is reached. `subscriberCountForTopic()` is what the
+HTTP boundary prices a fan-out from before publishing it. The interface is
+synchronous because frame fan-out is in-process by design, which keeps
+`delivered` exact. Pass an implementation as the fifth `RelayService`
+constructor argument to substitute a shared bus later; `wake` already crosses
+instances through `WakeSource`.
 
 ### `WakeSource`
 

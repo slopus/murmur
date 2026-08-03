@@ -29,8 +29,15 @@ publish/WakeSource ─> #wake(topic) ─┬─> long-poll waiters resolve
 ```
 
 Each subscriber owns a bounded, drop-oldest queue (`maximumStreamQueueFrames`,
-`maximumStreamQueueBytes`); the enqueue side never awaits the reader, so a
-stalled consumer causes bounded frame drops rather than memory growth. The total
-subscriber count is capped by `maximumConcurrentStreams`. `wake` rides the same
-signal as long polls, so a durable publish also nudges open streams and keeps
-working across instances through `WakeSource`.
+`maximumStreamQueueBytes`, which may not be configured below
+`maximumEphemeralFrameBytes`); the enqueue side never awaits the reader, so a
+stalled consumer causes bounded frame drops rather than memory growth.
+Subscribers are capped twice, by `maximumConcurrentStreams` per process and
+`maximumStreamsPerTopic` per topic, so one unauthenticated client cannot hold
+every process-wide slot on a single topic. `wake` rides the same signal as long
+polls, so a durable publish also nudges open streams and keeps working across
+instances through `WakeSource`.
+
+`closeStreams()` closes every live subscriber without closing the service. A
+graceful shutdown needs it: an SSE body ends only when its subscription closes,
+so waiting for open responses to drain first would never finish.

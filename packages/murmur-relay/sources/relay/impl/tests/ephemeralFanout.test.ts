@@ -16,6 +16,7 @@ describe("InProcessEphemeralFanout", () => {
     it("fans a frame to every subscriber of a topic and counts deliveries", () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
         });
@@ -38,6 +39,7 @@ describe("InProcessEphemeralFanout", () => {
     it("drops the oldest frames past the frame-count bound and coalesces one drop", () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 2,
             maximumStreamQueueBytes: 1_000_000,
         });
@@ -59,6 +61,7 @@ describe("InProcessEphemeralFanout", () => {
     it("drops the oldest frames past the byte bound", () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 1_000,
             maximumStreamQueueBytes: 10,
         });
@@ -75,6 +78,7 @@ describe("InProcessEphemeralFanout", () => {
     it("coalesces wake into a single pending event", () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
         });
@@ -90,6 +94,7 @@ describe("InProcessEphemeralFanout", () => {
     it("returns undefined once the concurrent-stream cap is reached", () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 1,
+            maximumStreamsPerTopic: 1,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
         });
@@ -106,9 +111,39 @@ describe("InProcessEphemeralFanout", () => {
         expect(fanout.subscriberCount).toBe(0);
     });
 
+    it("returns undefined once one topic reaches the per-topic cap", () => {
+        const fanout = new InProcessEphemeralFanout({
+            maximumConcurrentStreams: 100,
+            maximumStreamsPerTopic: 2,
+            maximumStreamQueueFrames: 8,
+            maximumStreamQueueBytes: 4096,
+        });
+        const first = fanout.subscribe("t");
+        expect(fanout.subscribe("t")).toBeDefined();
+        // The process-wide cap is nowhere near reached, so only the per-topic
+        // ceiling can reject this: without it one client holds every slot.
+        expect(fanout.subscribe("t")).toBeUndefined();
+        expect(fanout.subscriberCountForTopic("t")).toBe(2);
+        expect(fanout.subscriberCount).toBe(2);
+
+        // A different topic is unaffected, and a rejected subscribe leaves no
+        // empty topic entry behind.
+        expect(fanout.subscribe("u")).toBeDefined();
+        expect(fanout.subscriberCountForTopic("u")).toBe(1);
+        expect(fanout.subscriberCountForTopic("rejected-only")).toBe(0);
+
+        first?.close();
+        expect(fanout.subscriberCountForTopic("t")).toBe(1);
+        expect(fanout.subscribe("t")).toBeDefined();
+        expect(fanout.subscriberCountForTopic("t")).toBe(2);
+        fanout.close();
+        expect(fanout.subscriberCountForTopic("t")).toBe(0);
+    });
+
     it("resolves waitForActivity on enqueue, keepalive, and close", async () => {
         const fanout = new InProcessEphemeralFanout({
             maximumConcurrentStreams: 10,
+            maximumStreamsPerTopic: 10,
             maximumStreamQueueFrames: 8,
             maximumStreamQueueBytes: 4096,
         });

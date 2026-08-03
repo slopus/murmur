@@ -107,6 +107,15 @@ function ephemeralRequest(topic: string, frame: Uint8Array): Request {
     });
 }
 
+/** An ephemeral POST whose `content-type` is wrong on purpose. */
+function untypedEphemeralRequest(topic: string, frame: Uint8Array): Request {
+    return new Request(`https://relay.test/v1/topics/${topic}/ephemeral`, {
+        method: "POST",
+        headers: { "content-type": "text/plain;charset=UTF-8" },
+        body: frame,
+    });
+}
+
 async function tick(): Promise<void> {
     await new Promise<void>((resolve) => setImmediate(resolve));
 }
@@ -242,6 +251,126 @@ describe("relay ephemeral stream handler", () => {
         await bodyOf(opened)
             .cancel()
             .catch(() => undefined);
+    });
+
+    it("returns 503 once one topic reaches the per-topic stream cap", async () => {
+        service = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            { maximumConcurrentStreams: 100, maximumStreamsPerTopic: 1 },
+            undefined,
+            () => now,
+        );
+        const handler = createRelayFetchHandler(service);
+        const first = new AbortController();
+        const second = new AbortController();
+        const third = new AbortController();
+        const opened = await handler(streamRequest("room", first.signal));
+        expect(opened.status).toBe(200);
+        const rejected = await handler(streamRequest("room", second.signal));
+        expect(rejected.status).toBe(503);
+        expect(await rejected.json()).toEqual({ error: "overloaded" });
+        // The process-wide cap is untouched, so another topic still opens.
+        const other = await handler(streamRequest("lobby", third.signal));
+        expect(other.status).toBe(200);
+
+        first.abort();
+        second.abort();
+        third.abort();
+        await bodyOf(opened)
+            .cancel()
+            .catch(() => undefined);
+        await bodyOf(other)
+            .cancel()
+            .catch(() => undefined);
+    });
+
+    it("charges an ephemeral publish for the fan-out it causes", async () => {
+        // Capacity 10 with a frozen clock: no refill, so every token spent is
+        // visible. Opening a stream costs `read` (1); an ephemeral POST costs
+        // `ephemeral` (1) plus one per subscriber it is about to reach.
+        service = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {
+                rateLimit: {
+                    capacity: 10,
+                    refillTokensPerSecond: 1,
+                    costs: { publish: 1, upload: 1, read: 1, ephemeral: 1 },
+                },
+            },
+            undefined,
+            () => now,
+        );
+        const handler = createRelayFetchHandler(service, { now: () => now });
+        const controllers = [new AbortController(), new AbortController()];
+        const streams: Response[] = [];
+        for (const controller of controllers) {
+            const response = await handler(streamRequest("room", controller.signal));
+            expect(response.status).toBe(200);
+            streams.push(response);
+        }
+        expect(service.ephemeralSubscriberCountForTopic("room")).toBe(2);
+
+        // 10 - 2 reads = 8 tokens. Each POST now costs 1 + 2 = 3.
+        const first = await handler(ephemeralRequest("room", new Uint8Array([1])));
+        expect(first.status).toBe(200);
+        expect(await first.json()).toEqual({ delivered: 2 });
+        const second = await handler(ephemeralRequest("room", new Uint8Array([2])));
+        expect(second.status).toBe(200);
+
+        // Two tokens left and the third POST needs three: flat pricing would
+        // have spent only three tokens in total and still allowed this.
+        const third = await handler(ephemeralRequest("room", new Uint8Array([3])));
+        expect(third.status).toBe(429);
+        expect(await third.json()).toMatchObject({ error: "rate_limited" });
+
+        for (const controller of controllers) {
+            controller.abort();
+        }
+        for (const stream of streams) {
+            await bodyOf(stream)
+                .cancel()
+                .catch(() => undefined);
+        }
+    });
+
+    it("charges only the flat cost when a topic has no subscribers", async () => {
+        service = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {
+                rateLimit: {
+                    capacity: 4,
+                    refillTokensPerSecond: 1,
+                    costs: { publish: 1, upload: 1, read: 1, ephemeral: 1 },
+                },
+            },
+            undefined,
+            () => now,
+        );
+        const handler = createRelayFetchHandler(service, { now: () => now });
+        for (let index = 0; index < 4; index += 1) {
+            const response = await handler(ephemeralRequest("room", new Uint8Array([index])));
+            expect(response.status).toBe(200);
+            expect(await response.json()).toEqual({ delivered: 0 });
+        }
+        expect((await handler(ephemeralRequest("room", new Uint8Array([9])))).status).toBe(429);
+    });
+
+    it("accepts an ephemeral frame whatever the content-type claims", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const handler = createRelayFetchHandler(service);
+        const controller = new AbortController();
+        const response = await handler(streamRequest("room", controller.signal));
+        const sse = new SseReader(bodyOf(response));
+        expect((await sse.next()).event).toBe("ready");
+
+        const post = await handler(untypedEphemeralRequest("room", new Uint8Array([4, 5])));
+        expect(post.status).toBe(200);
+        expect(await post.json()).toEqual({ delivered: 1 });
+        const frame = await sse.next();
+        expect(decodeBase64Url(frame.data ?? "")).toEqual(new Uint8Array([4, 5]));
+
+        controller.abort();
+        await sse.cancel();
     });
 
     it("emits a wake promptly on a durable publish", async () => {

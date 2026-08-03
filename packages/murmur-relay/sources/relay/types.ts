@@ -6,7 +6,13 @@ export interface RelayRateLimitCosts {
     readonly upload?: number;
     /** State, event, health, download-link, and signed download cost. Defaults to 1. */
     readonly read?: number;
-    /** Ephemeral frame publication cost, charged to the request IP. Defaults to 1. */
+    /**
+     * Ephemeral frame publication cost, charged to the request IP. Defaults to 1.
+     *
+     * It is charged once for the request and once more per stream subscriber the
+     * frame is about to be fanned out to, so a cheap POST cannot buy an
+     * arbitrarily large fan-out.
+     */
     readonly ephemeral?: number;
 }
 
@@ -67,9 +73,22 @@ export interface RelayOptions {
     readonly maximumEphemeralFrameBytes?: number;
     /** Maximum simultaneous ephemeral streams in one process. Defaults to 10,000. */
     readonly maximumConcurrentStreams?: number;
+    /**
+     * Maximum simultaneous ephemeral streams on one topic. Defaults to 256.
+     *
+     * The stream route is unauthenticated, so without a per-topic ceiling a
+     * single client can walk the whole process-wide cap on one topic and hold
+     * every slot open.
+     */
+    readonly maximumStreamsPerTopic?: number;
     /** Maximum queued frames buffered per stream subscriber. Defaults to 64. */
     readonly maximumStreamQueueFrames?: number;
-    /** Maximum queued frame bytes buffered per stream subscriber. Defaults to 1 MiB. */
+    /**
+     * Maximum queued frame bytes buffered per stream subscriber. Defaults to 1 MiB.
+     *
+     * It must be at least `maximumEphemeralFrameBytes`; a smaller queue would
+     * evict every frame as it is enqueued and drop all traffic silently.
+     */
     readonly maximumStreamQueueBytes?: number;
     /** SSE keepalive comment interval for open streams. Defaults to 15,000 ms. */
     readonly streamKeepAliveMilliseconds?: number;
@@ -94,6 +113,7 @@ export interface ResolvedRelayOptions {
     readonly topicInactivityMilliseconds: number;
     readonly maximumEphemeralFrameBytes: number;
     readonly maximumConcurrentStreams: number;
+    readonly maximumStreamsPerTopic: number;
     readonly maximumStreamQueueFrames: number;
     readonly maximumStreamQueueBytes: number;
     readonly streamKeepAliveMilliseconds: number;
@@ -147,7 +167,7 @@ export interface EphemeralSubscription {
  * {@link WakeSource} through the `wake` event instead.
  */
 export interface EphemeralFanout {
-    /** Register a subscriber for a topic, or `undefined` when at capacity. */
+    /** Register a subscriber for a topic, or `undefined` when at process or topic capacity. */
     subscribe(topic: string): EphemeralSubscription | undefined;
     /** Enqueue one frame to every local subscriber, returning how many were enqueued. */
     publishFrame(topic: string, frame: Uint8Array): number;
@@ -155,6 +175,8 @@ export interface EphemeralFanout {
     wake(topic: string): void;
     /** Current count of live local subscribers across all topics. */
     readonly subscriberCount: number;
+    /** Current count of live local subscribers of one topic. */
+    subscriberCountForTopic(topic: string): number;
     /** Close every subscriber and stop accepting new ones. */
     close(): void;
 }

@@ -4,6 +4,8 @@ import type { EphemeralFanout, EphemeralStreamMessage, EphemeralSubscription } f
 export interface InProcessEphemeralFanoutOptions {
     /** Maximum simultaneous subscribers across all topics. */
     readonly maximumConcurrentStreams: number;
+    /** Maximum simultaneous subscribers on one topic. */
+    readonly maximumStreamsPerTopic: number;
     /** Maximum queued frames per subscriber before dropping the oldest. */
     readonly maximumStreamQueueFrames: number;
     /** Maximum queued frame bytes per subscriber before dropping the oldest. */
@@ -146,12 +148,16 @@ class InProcessEphemeralSubscriber implements EphemeralSubscription {
  * ```
  *
  * Every subscriber queue is bounded by frame count and byte size, so a stalled
- * reader can only cause bounded drops. A shared implementation could replace
- * this to fan frames across instances; the wake path already works across
- * instances through the relay's {@link WakeSource}.
+ * reader can only cause bounded drops. Subscribers are bounded twice, per
+ * process and per topic, because the stream route is unauthenticated and one
+ * client would otherwise hold every process-wide slot on a single topic. A
+ * shared implementation could replace this to fan frames across instances; the
+ * wake path already works across instances through the relay's
+ * {@link WakeSource}.
  */
 export class InProcessEphemeralFanout implements EphemeralFanout {
     readonly #maximumConcurrentStreams: number;
+    readonly #maximumStreamsPerTopic: number;
     readonly #maximumStreamQueueFrames: number;
     readonly #maximumStreamQueueBytes: number;
     readonly #topics = new Map<string, Set<InProcessEphemeralSubscriber>>();
@@ -162,6 +168,10 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
         this.#maximumConcurrentStreams = positiveSafeInteger(
             options.maximumConcurrentStreams,
             "Maximum concurrent streams",
+        );
+        this.#maximumStreamsPerTopic = positiveSafeInteger(
+            options.maximumStreamsPerTopic,
+            "Maximum streams per topic",
         );
         this.#maximumStreamQueueFrames = positiveSafeInteger(
             options.maximumStreamQueueFrames,
@@ -177,11 +187,21 @@ export class InProcessEphemeralFanout implements EphemeralFanout {
         return this.#subscriberCount;
     }
 
+    subscriberCountForTopic(topic: string): number {
+        return this.#topics.get(topic)?.size ?? 0;
+    }
+
     subscribe(topic: string): EphemeralSubscription | undefined {
         if (this.#closed || this.#subscriberCount >= this.#maximumConcurrentStreams) {
             return undefined;
         }
-        const subscribers = this.#topics.get(topic) ?? new Set<InProcessEphemeralSubscriber>();
+        const existing = this.#topics.get(topic);
+        if (existing !== undefined && existing.size >= this.#maximumStreamsPerTopic) {
+            return undefined;
+        }
+        // Only reached when the subscriber will be admitted, so a rejected
+        // subscribe never leaves an empty topic entry behind.
+        const subscribers = existing ?? new Set<InProcessEphemeralSubscriber>();
         this.#topics.set(topic, subscribers);
         const subscriber = new InProcessEphemeralSubscriber(
             this.#maximumStreamQueueFrames,

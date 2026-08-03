@@ -26,6 +26,7 @@ import {
 import { createHumanLogger, safeErrorSummary } from "./utils/logger.js";
 
 const PRUNE_INTERVAL_MILLISECONDS = 60 * 60 * 1_000;
+const STOP_GRACE_MILLISECONDS = 10_000;
 const logger = createHumanLogger("RELAY");
 
 function oneLine(value: string): string {
@@ -225,7 +226,14 @@ export async function main(): Promise<void> {
         stopping = true;
         logger.info(`relay:stop signal=${signal}`);
         clearInterval(pruneTimer);
-        void closeNodeRelayServer(server)
+        // Stop accepting first, then end every open SSE body. Draining before
+        // closing the streams would hang: an ephemeral stream only ends when its
+        // subscription closes, and that used to happen after the drain.
+        const drained = closeNodeRelayServer(server, {
+            graceMilliseconds: STOP_GRACE_MILLISECONDS,
+        });
+        service.closeStreams();
+        void drained
             .then(() => Promise.all([blobBackend.close(), service.close()]))
             .then(
                 () => {

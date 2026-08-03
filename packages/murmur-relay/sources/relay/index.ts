@@ -162,6 +162,10 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
             options.maximumConcurrentStreams ?? 10_000,
             "Maximum concurrent streams",
         ),
+        maximumStreamsPerTopic: positiveSafeInteger(
+            options.maximumStreamsPerTopic ?? 256,
+            "Maximum streams per topic",
+        ),
         maximumStreamQueueFrames: positiveSafeInteger(
             options.maximumStreamQueueFrames ?? 64,
             "Maximum stream queue frames",
@@ -178,6 +182,11 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
     };
     if (resolved.maximumLongPollMilliseconds > HARD_MAXIMUM_LONG_POLL_MILLISECONDS) {
         throw new Error("Maximum long poll cannot exceed 30 seconds");
+    }
+    // A queue smaller than one accepted frame evicts the frame it just took and
+    // drops every ephemeral frame without a trace, so refuse the configuration.
+    if (resolved.maximumStreamQueueBytes < resolved.maximumEphemeralFrameBytes) {
+        throw new Error("Maximum stream queue bytes cannot be below maximum ephemeral frame bytes");
     }
     return resolved;
 }
@@ -211,6 +220,7 @@ export class RelayService {
             fanout ??
             new InProcessEphemeralFanout({
                 maximumConcurrentStreams: this.#options.maximumConcurrentStreams,
+                maximumStreamsPerTopic: this.#options.maximumStreamsPerTopic,
                 maximumStreamQueueFrames: this.#options.maximumStreamQueueFrames,
                 maximumStreamQueueBytes: this.#options.maximumStreamQueueBytes,
             });
@@ -424,8 +434,8 @@ export class RelayService {
     }
 
     /**
-     * Register one local ephemeral stream subscriber, or `undefined` when the
-     * per-process concurrent-stream cap is reached.
+     * Register one local ephemeral stream subscriber, or `undefined` when either
+     * the per-process or the per-topic concurrent-stream cap is reached.
      */
     openStream(topic: string): EphemeralSubscription | undefined {
         this.#assertOpen();
@@ -436,6 +446,29 @@ export class RelayService {
     /** Count of live local ephemeral stream subscribers, exposed for diagnostics and tests. */
     get ephemeralSubscriberCount(): number {
         return this.#fanout.subscriberCount;
+    }
+
+    /**
+     * Count of live local ephemeral stream subscribers of one topic.
+     *
+     * The HTTP boundary reads this immediately before {@link publishEphemeral}
+     * to price a fan-out, so the cost of one ephemeral POST tracks the work it
+     * actually causes.
+     */
+    ephemeralSubscriberCountForTopic(topic: string): number {
+        this.#assertOpen();
+        this.#validateTopic(topic);
+        return this.#fanout.subscriberCountForTopic(topic);
+    }
+
+    /**
+     * Close every live ephemeral stream subscriber without closing the service.
+     *
+     * An SSE body only ends when its subscription closes, so a graceful
+     * shutdown must call this before waiting for open responses to drain.
+     */
+    closeStreams(): void {
+        this.#fanout.close();
     }
 
     /** Run both configured retention policies using relay-observed time. */

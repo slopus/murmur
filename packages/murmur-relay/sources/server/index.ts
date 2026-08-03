@@ -9,6 +9,18 @@ export interface NodeRelayServerOptions {
     readonly port: number;
 }
 
+/** Shutdown bounds for {@link closeNodeRelayServer}. */
+export interface NodeRelayCloseOptions {
+    /**
+     * How long active responses may take to finish before every remaining
+     * connection is destroyed. Defaults to 10,000 ms.
+     */
+    readonly graceMilliseconds?: number;
+}
+
+const DEFAULT_CLOSE_GRACE_MILLISECONDS = 10_000;
+const CLOSE_IDLE_SWEEP_MILLISECONDS = 50;
+
 interface StreamingRequestInit extends RequestInit {
     readonly duplex: "half";
 }
@@ -192,13 +204,40 @@ export async function listenNodeRelayServer(
     });
 }
 
-/** Stop accepting requests and resolve after active responses finish. */
-export async function closeNodeRelayServer(server: Server): Promise<void> {
+/**
+ * Stop accepting requests and resolve after active responses finish.
+ *
+ * The listener stops accepting synchronously, before the returned promise, so a
+ * caller can end its own long-lived responses (an open SSE body never finishes
+ * on its own) immediately afterwards and still have them counted in this drain.
+ * Keep-alive connections that fall idle after that are swept, because Node only
+ * closes the ones already idle when `close()` is called, and anything still open
+ * once `graceMilliseconds` elapses is destroyed. Shutdown therefore cannot be
+ * held open indefinitely by one client.
+ */
+export function closeNodeRelayServer(
+    server: Server,
+    options: NodeRelayCloseOptions = {},
+): Promise<void> {
     if (!server.listening) {
-        return;
+        return Promise.resolve();
     }
-    await new Promise<void>((resolve, reject) => {
+    const graceMilliseconds = options.graceMilliseconds ?? DEFAULT_CLOSE_GRACE_MILLISECONDS;
+    if (!Number.isSafeInteger(graceMilliseconds) || graceMilliseconds < 0) {
+        throw new Error("Close grace milliseconds must be a non-negative safe integer");
+    }
+    return new Promise<void>((resolve, reject) => {
+        const idleSweep = setInterval(() => {
+            server.closeIdleConnections();
+        }, CLOSE_IDLE_SWEEP_MILLISECONDS);
+        idleSweep.unref();
+        const forceTimer = setTimeout(() => {
+            server.closeAllConnections();
+        }, graceMilliseconds);
+        forceTimer.unref();
         server.close((error) => {
+            clearInterval(idleSweep);
+            clearTimeout(forceTimer);
             if (error === undefined) {
                 resolve();
             } else {

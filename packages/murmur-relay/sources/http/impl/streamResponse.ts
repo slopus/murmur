@@ -25,9 +25,11 @@ function encodeMessage(message: EphemeralStreamMessage): Uint8Array {
 /**
  * Build the `text/event-stream` body for one topic subscription.
  *
- * The stream is strictly pull-driven so runtime backpressure is honoured: the
- * only unread bytes ever held are the single chunk enqueued per `pull`, while
- * every other frame stays in the subscriber's bounded, drop-oldest queue. A
+ * The stream is strictly pull-driven so runtime backpressure is honoured: one
+ * `pull` drains the subscriber's queue and enqueues each drained message, so a
+ * stalled reader holds at most one drained queue plus the bounded, drop-oldest
+ * queue the producer can refill behind it — roughly twice
+ * `maximumStreamQueueBytes`, and bounded either way. A
  * `ready` event is emitted at construction, `: keepalive` comments are written
  * whenever the keepalive interval elapses without traffic, and the stream ends
  * when the request aborts or the service closes the subscription.
@@ -93,7 +95,7 @@ function buildStreamBody(
 
 /**
  * Create the `GET /v1/topics/:topic/stream` SSE response, or throw a 503 when
- * the per-process concurrent-stream cap is reached.
+ * the per-process or the per-topic concurrent-stream cap is reached.
  */
 export function createEphemeralStreamResponse(
     service: RelayService,

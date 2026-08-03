@@ -15,7 +15,10 @@ missing-topic response without publishing state.
 handler with a small incremental SSE parser: a frame posted after connect is
 delivered, a frame is never persisted (state/list/events stay 404), a stalled
 consumer receives bounded drops with a coalesced count, over-sized frames are
-rejected with 413, the concurrent-stream cap returns 503, a durable publish
-emits `wake`, an aborted request returns the subscriber count to zero, and an
-idle stream writes keepalive comments. Timing uses short injected keepalive
-intervals rather than long sleeps.
+rejected with 413, both the process-wide and the per-topic stream cap return
+503, an ephemeral publish is charged for the fan-out it causes while a topic
+with no subscribers stays flat-priced, the body is accepted whatever its
+`content-type` claims, a durable publish emits `wake`, an aborted request
+returns the subscriber count to zero, and an idle stream writes keepalive
+comments. Timing uses short injected keepalive intervals rather than long
+sleeps, and the rate-limit cases freeze the clock so no token refills.

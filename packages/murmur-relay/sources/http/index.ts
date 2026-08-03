@@ -424,10 +424,32 @@ async function routeRequest(
         if (topic === undefined) {
             throw new RelayError(400, "Missing topic", { error: "malformed" });
         }
+        // `content-type` is deliberately not inspected: the body is opaque bytes
+        // and the relay stays dumb about what a client sends.
         const frame = await readBoundedRequestBody(
             request,
             service.options.maximumEphemeralFrameBytes,
         );
+        // One cheap POST fans out to every subscriber of the topic, so the
+        // fan-out is priced before it happens: a rejected publisher never gets
+        // the amplification. The count is read immediately before the
+        // synchronous publish below, so it is the count the frame is delivered
+        // to except for a stream opening or closing while the limiter answers.
+        const subscribers = service.ephemeralSubscriberCountForTopic(topic);
+        if (options.rateLimiter !== undefined && rateLimit !== false && subscribers > 0) {
+            const clientIp = resolveClientIp(
+                request,
+                context.remoteAddress,
+                options.trustedProxies,
+            );
+            await consumeRateLimit(
+                options.rateLimiter,
+                `ip:${clientIp}`,
+                // Clamped because a bucket can never pay a cost above its capacity.
+                Math.min(subscribers * rateLimit.costs.ephemeral, rateLimit.capacity),
+                now,
+            );
+        }
         return jsonResponse({ delivered: service.publishEphemeral(topic, frame) });
     }
     if (

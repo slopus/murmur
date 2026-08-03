@@ -14,3 +14,9 @@ Node exempts a fully received request (a bodyless `GET`) from `requestTimeout`,
 `headersTimeout`, and `keepAliveTimeout`, so a minutes-long response is not
 aborted. Streaming response headers are flushed before the first chunk so the
 client observes `ready` without buffering delay.
+
+`closeNodeRelayServer` stops the listener synchronously, before the promise it
+returns, so a caller can end its own never-ending responses — for the relay,
+`RelayService.closeStreams()` — immediately afterwards and still have them
+counted in the drain. Anything still open when `graceMilliseconds` expires is
+destroyed, so one open stream cannot hold shutdown open forever.

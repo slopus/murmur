@@ -195,4 +195,29 @@ describe("RelayService", () => {
         expect(receivedConstraints).toEqual({ maximumElementsPerTopic: 1 });
         expect((await service.readState("capacity"))?.seq).toBe(1n);
     });
+
+    it("rejects a stream queue smaller than one accepted ephemeral frame", async () => {
+        // Such a queue evicts the frame it has just accepted, so every frame
+        // would be dropped silently instead of delivered.
+        const store = new SqliteRelayStore(":memory:");
+        expect(
+            () =>
+                new RelayService(
+                    store,
+                    { maximumEphemeralFrameBytes: 4096, maximumStreamQueueBytes: 4095 },
+                    undefined,
+                    () => now,
+                ),
+        ).toThrow("Maximum stream queue bytes");
+        expect(
+            () =>
+                new RelayService(
+                    store,
+                    { maximumEphemeralFrameBytes: 4096, maximumStreamQueueBytes: 4096 },
+                    undefined,
+                    () => now,
+                ),
+        ).not.toThrow();
+        await store.close();
+    });
 });
