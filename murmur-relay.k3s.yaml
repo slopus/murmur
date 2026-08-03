@@ -1,0 +1,146 @@
+# Create murmur-relay-secrets in this namespace before applying this manifest.
+# See docs/DEPLOYMENT.md#k3s for the one-time command.
+apiVersion: v1
+kind: Namespace
+metadata:
+    name: murmur
+    labels:
+        pod-security.kubernetes.io/audit: restricted
+        pod-security.kubernetes.io/enforce: restricted
+        pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+    name: murmur-relay-data
+    namespace: murmur
+    labels:
+        app.kubernetes.io/name: murmur-relay
+spec:
+    accessModes:
+        - ReadWriteOnce
+    resources:
+        requests:
+            storage: 10Gi
+    storageClassName: local-path
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: murmur-relay
+    namespace: murmur
+    labels:
+        app.kubernetes.io/name: murmur-relay
+        app.kubernetes.io/version: 0.1.9
+spec:
+    replicas: 1
+    revisionHistoryLimit: 2
+    strategy:
+        type: Recreate
+    selector:
+        matchLabels:
+            app.kubernetes.io/name: murmur-relay
+    template:
+        metadata:
+            labels:
+                app.kubernetes.io/name: murmur-relay
+                app.kubernetes.io/version: 0.1.9
+        spec:
+            automountServiceAccountToken: false
+            enableServiceLinks: false
+            terminationGracePeriodSeconds: 30
+            securityContext:
+                fsGroup: 65532
+                fsGroupChangePolicy: OnRootMismatch
+                runAsGroup: 65532
+                runAsNonRoot: true
+                runAsUser: 65532
+                seccompProfile:
+                    type: RuntimeDefault
+            containers:
+                - name: relay
+                  image: ghcr.io/slopus/murmur-relay:0.1.9@sha256:7c049d2ca1c71930be671e5bbf94954bf86f4bbb1b5e6715e8992d9375a92c12
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                      allowPrivilegeEscalation: false
+                      capabilities:
+                          drop:
+                              - ALL
+                      readOnlyRootFilesystem: true
+                  ports:
+                      - name: http
+                        containerPort: 8787
+                        protocol: TCP
+                  env:
+                      - name: HOST
+                        value: 0.0.0.0
+                      - name: PORT
+                        value: "8787"
+                      - name: MURMUR_RELAY_STORE
+                        value: sqlite
+                      - name: MURMUR_RELAY_DB
+                        value: /data/murmur-relay.sqlite
+                      - name: MURMUR_RELAY_BLOB_BACKEND
+                        value: local
+                      - name: MURMUR_RELAY_BLOB_DIR
+                        value: /data/blobs
+                      - name: MURMUR_RELAY_BLOB_SECRET
+                        valueFrom:
+                            secretKeyRef:
+                                name: murmur-relay-secrets
+                                key: blob-secret
+                  startupProbe:
+                      httpGet:
+                          path: /health
+                          port: http
+                      failureThreshold: 30
+                      periodSeconds: 2
+                  readinessProbe:
+                      httpGet:
+                          path: /health
+                          port: http
+                      failureThreshold: 3
+                      periodSeconds: 5
+                  livenessProbe:
+                      httpGet:
+                          path: /health
+                          port: http
+                      failureThreshold: 3
+                      periodSeconds: 10
+                  resources:
+                      requests:
+                          cpu: 50m
+                          memory: 128Mi
+                      limits:
+                          cpu: "1"
+                          memory: 512Mi
+                  volumeMounts:
+                      - name: data
+                        mountPath: /data
+                      - name: temporary
+                        mountPath: /tmp
+            volumes:
+                - name: data
+                  persistentVolumeClaim:
+                      claimName: murmur-relay-data
+                - name: temporary
+                  emptyDir:
+                      sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+    name: murmur-relay
+    namespace: murmur
+    labels:
+        app.kubernetes.io/name: murmur-relay
+spec:
+    type: ClusterIP
+    selector:
+        app.kubernetes.io/name: murmur-relay
+    ports:
+        - name: http
+          port: 8787
+          targetPort: http
+          protocol: TCP
+          appProtocol: http

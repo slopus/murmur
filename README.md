@@ -400,7 +400,8 @@ location.
 
 ## Run a relay
 
-The relay is Node-only. Build and start the `@murmur/relay` package:
+For local source development, build and start the `@murmur/relay` package with
+Node:
 
 ```bash
 pnpm --filter @murmur/relay build
@@ -420,7 +421,8 @@ pnpm --filter @murmur/relay start
 ```
 
 See [Deployment](docs/DEPLOYMENT.md) for all environment variables, blob
-backends, proxy configuration, and production caveats.
+backends, the standalone Bun executable, Docker and
+[k3s](murmur-relay.k3s.yaml), proxy configuration, and production caveats.
 
 ## Repository
 

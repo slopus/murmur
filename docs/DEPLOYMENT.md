@@ -1,10 +1,12 @@
 # Deployment
 
-The Murmur relay is a Node-only service. It stores opaque signed topic state and
-serves or issues links for ciphertext blobs. It does not hold client identity
-secrets or plaintext, but it remains an availability and metadata boundary.
+The Murmur relay stores opaque signed topic state and serves or issues links for
+ciphertext blobs. It does not hold client identity secrets or plaintext, but it
+remains an availability and metadata boundary. Run it as a Node process, a
+standalone Bun executable, or the published Linux container.
 
-Node 22.5 or later is required.
+Node 22.5 or later is required for the source build. Bun is embedded in the
+standalone executable and release container.
 
 ## Local run
 
@@ -84,6 +86,54 @@ The image runs as UID/GID 65532 and writes the SQLite database and local blobs
 under `/data`. A bind mount must be writable by that identity. The image does
 not terminate TLS; put it behind an HTTPS reverse proxy for public access.
 
+## k3s
+
+[`murmur-relay.k3s.yaml`](../murmur-relay.k3s.yaml) deploys the released
+multi-architecture image in the `murmur` namespace. It uses k3s's default
+`local-path` StorageClass, one 10 GiB persistent volume, one SQLite relay
+replica, health probes, resource bounds, and the restricted Pod Security
+profile.
+
+Create the namespace and stable blob-link secret once:
+
+```bash
+kubectl create namespace murmur --dry-run=client --output=yaml | kubectl apply --filename=-
+
+MURMUR_K3S_BLOB_SECRET="$(openssl rand -base64 48)"
+kubectl --namespace murmur create secret generic murmur-relay-secrets \
+    --from-literal=blob-secret="$MURMUR_K3S_BLOB_SECRET"
+unset MURMUR_K3S_BLOB_SECRET
+```
+
+Do not recreate that secret during ordinary upgrades: rotating it immediately
+invalidates every outstanding local blob-transfer link. Deploy and wait for
+readiness:
+
+```bash
+kubectl apply --filename=murmur-relay.k3s.yaml
+kubectl --namespace murmur rollout status deployment/murmur-relay
+kubectl --namespace murmur get pods,persistentvolumeclaims,services
+```
+
+The manifest intentionally creates a ClusterIP service. For a quick local
+check:
+
+```bash
+kubectl --namespace murmur port-forward service/murmur-relay 8787:8787
+curl http://127.0.0.1:8787/health
+```
+
+For public browser or CLI traffic, create a TLS-enabled Ingress resource in the
+`murmur` namespace and point it at the `murmur-relay` Service on port 8787.
+The Traefik controller may run in any namespace, but a standard Kubernetes
+Ingress cannot reference a Service in a different namespace. Use the
+deployment's real hostname and certificate, and do not expose the relay
+publicly over plaintext HTTP.
+
+SQLite and `local-path` require exactly one replica. Use Postgres plus S3 and a
+storage-specific manifest before scaling horizontally. Deleting the `murmur`
+namespace or its persistent volume claim deletes relay state.
+
 ## Environment
 
 The standalone executable reads these variables from
@@ -125,7 +175,7 @@ SQLite is the intended single-instance setup:
 TLS reverse proxy
         |
         v
-one Node relay process
+one relay process
         |
         +-- SQLite database in WAL mode
         `-- local blob tree, or S3
@@ -216,7 +266,8 @@ The code can run a relay, but these gaps remain material:
   must be supplied through `RateLimiter` to change that.
 - The SigV4 backend lacks a live S3/MinIO integration test.
 - There is no identity key rotation.
-- There is no CI configured in this repository.
+- Release automation validates tests, types, lint, formatting, npm packaging,
+  and the multi-architecture container build before publication.
 
 Before exposing a public service, also decide how to manage backups, database
 credentials, S3 credentials, TLS, reverse-proxy limits, monitoring, incident
