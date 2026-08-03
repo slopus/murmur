@@ -510,9 +510,13 @@ export function decodeSharedSessionFrame(
             timestamp: value.timestamp,
             text: value.text,
         };
-        if (
-            !equalBytes(encodeSharedSessionPostFrame(decodeBase64Url(frame.groupId), frame), bytes)
-        ) {
+        let canonical: Uint8Array;
+        try {
+            canonical = encodeSharedSessionPostFrame(decodeBase64Url(frame.groupId), frame);
+        } catch (error: unknown) {
+            throw protocolError("Invalid shared-session post frame", { cause: error });
+        }
+        if (!equalBytes(canonical, bytes)) {
             throw protocolError("Non-canonical shared-session post frame");
         }
         return frame;
@@ -553,8 +557,13 @@ export function decodeSharedSessionFrame(
                   shareId: value.shareId,
                   state: sharedSessionStateFromJson(value.state),
               } satisfies Omit<SharedSessionStateFrame, "signature">);
+    const inner = unsigned.kind === "entry" ? unsigned.entry : unsigned.state;
     if (
         value.ownerId !== identityId(owner) ||
+        inner.shareId !== unsigned.shareId ||
+        (unsigned.kind === "state" &&
+            (unsigned.state.groupId !== unsigned.groupId ||
+                unsigned.state.ownerId !== unsigned.ownerId)) ||
         !verifyBytes(owner, canonicalJsonBytes(ownerSigningValue(unsigned)), signature) ||
         canonicalJson(parsed as JsonValue) !== utf8Decode(bytes)
     ) {
@@ -773,6 +782,7 @@ export function encodeSharedSessionInvitation(
         invitation.grant.peerId !== invitation.recipientId ||
         invitation.state.ownerId !== invitation.ownerId ||
         invitation.state.shareId !== invitation.shareId ||
+        invitation.state.groupId !== encodeBase64Url(invitation.groupId) ||
         invitation.keyPackageReference.length !== 32 ||
         invitation.commitFingerprint.length !== 32 ||
         invitation.welcome.length === 0 ||
@@ -860,6 +870,14 @@ export function decodeSharedSessionInvitation(
             : { historyOffer: sharedSessionFileFromJson(value.historyOffer) }),
         signature,
     };
+    if (
+        result.state.ownerId !== result.ownerId ||
+        result.state.shareId !== result.shareId ||
+        result.state.groupId !== encodeBase64Url(result.groupId) ||
+        result.grant.peerId !== result.recipientId
+    ) {
+        throw protocolError("Shared-session invitation binding mismatch");
+    }
     invitationUnsignedValue(result);
     return result;
 }

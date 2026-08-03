@@ -1,9 +1,11 @@
 import {
     MemoryMurmurStore,
     MurmurClient,
+    canonicalJsonBytes,
     createRelayBlob,
     createRelayEvent,
     decodeBase64Url,
+    encodeBase64Url,
     equalRelayEvents,
     generateIdentityKeyPair,
     identityId,
@@ -23,6 +25,7 @@ import { mlsGroupTopic } from "../../groupChannel/index.js";
 import {
     SharedSessionMember,
     SharedSessionOwner,
+    SharedSessionProtocolError,
     type SessionEntrySource,
     type SharedSessionCallbacks,
     type SharedSessionEntry,
@@ -30,6 +33,7 @@ import {
     type SharedSessionPost,
     type SharedSessionState,
 } from "../index.js";
+import { decodeSharedSessionFrame } from "../impl/frameCodec.js";
 
 class MemoryRelayTransport implements RelayTransport {
     readonly id = "memory";
@@ -169,6 +173,23 @@ const entryOne = {
 } as const;
 
 describe("shared agent sessions", () => {
+    it("classifies malformed authenticated post frames as typed protocol faults", () => {
+        const ownerIdentity = generateIdentityKeyPair();
+        const malformed = canonicalJsonBytes({
+            grantEpoch: 0,
+            groupId: encodeBase64Url(ownerIdentity.signingKey),
+            kind: "post",
+            postId: "caller-post-invalid",
+            shareId: "share_invalid_post",
+            text: "peer controlled",
+            timestamp: 1,
+            version: 1,
+        });
+        expect(() => decodeSharedSessionFrame(malformed, ownerIdentity)).toThrowError(
+            SharedSessionProtocolError,
+        );
+    });
+
     it("starts two friends in one batch and carries opaque owner entries", async () => {
         const relay = new MemoryRelayTransport();
         const ownerIdentity = generateIdentityKeyPair();
@@ -347,6 +368,8 @@ describe("shared agent sessions", () => {
             expectedOwner: ownerIdentity,
         });
         await drain(friendClient, friend);
+        const joinedRetry = await friend.retry();
+        expect(joinedRetry.failures).toEqual([]);
         friend.destroy();
 
         friend = await SharedSessionMember.load("share_cuid2_history", friendOptions);

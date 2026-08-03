@@ -19,6 +19,8 @@ export const MAX_SHARED_SESSION_HISTORY_PAGE_BYTES = 4 * 1024 * 1024;
 export const MAX_SHARED_SESSION_HISTORY_PAGE_ENTRIES = 256;
 /** Maximum page descriptors carried by one chained history offer. */
 export const MAX_SHARED_SESSION_OFFER_PAGES = 256;
+/** Maximum chained offer manifests retained while discovering history. */
+export const MAX_SHARED_SESSION_HISTORY_OFFERS = 100_000;
 /** Maximum active and ended member records retained for one share. */
 export const MAX_SHARED_SESSION_MEMBERS = 256;
 /** Maximum live entries retained durably while a member backfills history. */

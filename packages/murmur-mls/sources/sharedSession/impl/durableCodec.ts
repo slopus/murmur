@@ -12,7 +12,12 @@ import {
     type SignedRelayEvent,
 } from "@slopus/murmur";
 import type { SharedSessionEntry, SharedSessionInvitation, SharedSessionState } from "../types.js";
-import { MAX_SHARED_SESSION_PENDING_ENTRIES, SharedSessionProtocolError } from "../types.js";
+import {
+    MAX_SHARED_SESSION_HISTORY_OFFERS,
+    MAX_SHARED_SESSION_OFFER_PAGES,
+    MAX_SHARED_SESSION_PENDING_ENTRIES,
+    SharedSessionProtocolError,
+} from "../types.js";
 import {
     sharedSessionEntryFromJson,
     sharedSessionEntryToJson,
@@ -129,12 +134,14 @@ function encodeHistory(history: DurableSharedSessionHistory): JsonValue {
     if (
         !Number.isSafeInteger(history.offerCount) ||
         history.offerCount < 0 ||
+        history.offerCount > MAX_SHARED_SESSION_HISTORY_OFFERS ||
         (history.processOffer !== undefined &&
             (!Number.isSafeInteger(history.processOffer) ||
                 history.processOffer < 0 ||
                 history.processOffer >= history.offerCount)) ||
         !Number.isSafeInteger(history.pageIndex) ||
         history.pageIndex < 0 ||
+        history.pageIndex > MAX_SHARED_SESSION_OFFER_PAGES ||
         !Number.isSafeInteger(history.highestSequence) ||
         history.highestSequence < 0 ||
         history.pendingEntries.length > MAX_SHARED_SESSION_PENDING_ENTRIES
@@ -204,7 +211,16 @@ export function encodeDurableSharedSessionRecord(
         !Number.isSafeInteger(recordValue.maximumSequence) ||
         recordValue.maximumSequence < 0 ||
         recordValue.pendingRemovePeerIds.length > 256 ||
-        new Set(recordValue.pendingRemovePeerIds).size !== recordValue.pendingRemovePeerIds.length
+        new Set(recordValue.pendingRemovePeerIds).size !==
+            recordValue.pendingRemovePeerIds.length ||
+        (recordValue.history !== undefined &&
+            (recordValue.history.highestSequence > recordValue.maximumSequence ||
+                recordValue.history.pendingEntries.some(
+                    (entry) =>
+                        entry.shareId !== recordValue.state.shareId ||
+                        entry.shareSequence <= recordValue.history!.highestSequence ||
+                        entry.shareSequence > recordValue.maximumSequence,
+                )))
     ) {
         throw new Error("Invalid shared-session durable record");
     }

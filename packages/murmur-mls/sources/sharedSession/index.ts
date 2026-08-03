@@ -62,6 +62,7 @@ import {
     type SharedSessionHistoryOffer,
 } from "./impl/frameCodec.js";
 import {
+    MAX_SHARED_SESSION_HISTORY_OFFERS,
     MAX_SHARED_SESSION_HISTORY_PAGE_BYTES,
     MAX_SHARED_SESSION_HISTORY_PAGE_ENTRIES,
     MAX_SHARED_SESSION_MEMBERS,
@@ -114,6 +115,7 @@ export type {
 } from "./types.js";
 export {
     MAX_SHARED_SESSION_ENTRY_BYTES,
+    MAX_SHARED_SESSION_HISTORY_OFFERS,
     MAX_SHARED_SESSION_HISTORY_PAGE_BYTES,
     MAX_SHARED_SESSION_HISTORY_PAGE_ENTRIES,
     MAX_SHARED_SESSION_MEMBERS,
@@ -133,8 +135,6 @@ export {
 } from "./impl/frameCodec.js";
 
 const SESSION_PREFIX = "shared-session/v1";
-const MAXIMUM_HISTORY_OFFERS = 100_000;
-
 type PendingPrepared =
     | {
           readonly kind: "application";
@@ -500,7 +500,7 @@ abstract class SharedSessionBase {
             const next = await this.#store.transaction(async (transaction) => {
                 const base: DurableSharedSessionRecord = {
                     ...this.record,
-                    epochState: checkpoint!,
+                    epochState: checkpoint!.slice(),
                     persistenceGeneration: prepared.persistenceGeneration,
                     appliedApplicationFingerprints: includeFingerprint(
                         this.channel.appliedApplicationFingerprints,
@@ -562,7 +562,7 @@ abstract class SharedSessionBase {
             const next = await this.#store.transaction(async (transaction) => {
                 const base: DurableSharedSessionRecord = {
                     ...this.record,
-                    epochState: checkpoint!,
+                    epochState: checkpoint!.slice(),
                     persistenceGeneration: prepared.persistenceGeneration,
                     appliedCommitFingerprints: includeFingerprint(
                         this.channel.appliedCommitFingerprints,
@@ -686,7 +686,7 @@ abstract class SharedSessionBase {
             return 0;
         }
         if (history.discovery !== undefined) {
-            if (history.offerCount >= MAXIMUM_HISTORY_OFFERS) {
+            if (history.offerCount >= MAX_SHARED_SESSION_HISTORY_OFFERS) {
                 throw new SharedSessionProtocolError(
                     "buffer-exhausted",
                     "Shared-session history offer chain is too long",
@@ -934,6 +934,7 @@ abstract class SharedSessionBase {
             });
             handled.markPersisted();
             this.#client.unsubscribe(this.channel.topic);
+            zeroBytes(this.record.epochState);
             this.#destroyed = true;
             return { status: "removed" };
         }
@@ -950,7 +951,7 @@ abstract class SharedSessionBase {
             const checkpoint = handled.serializeNextEpoch();
             const next: DurableSharedSessionRecord = {
                 ...this.record,
-                epochState: checkpoint,
+                epochState: checkpoint.slice(),
                 persistenceGeneration: handled.persistenceGeneration,
                 appliedCommitFingerprints: includeFingerprint(
                     this.channel.appliedCommitFingerprints,
@@ -990,13 +991,10 @@ abstract class SharedSessionBase {
                     this.record.owner,
                 );
             } catch (error: unknown) {
-                if (
-                    error instanceof SharedSessionProtocolError &&
-                    !equalBytes(senderKey, this.record.owner.signingKey)
-                ) {
+                if (!ownerAuthored) {
                     const next: DurableSharedSessionRecord = {
                         ...this.record,
-                        epochState: checkpoint,
+                        epochState: checkpoint.slice(),
                         persistenceGeneration: handled.persistenceGeneration,
                         appliedApplicationFingerprints: includeFingerprint(
                             this.channel.appliedApplicationFingerprints,
@@ -1011,7 +1009,13 @@ abstract class SharedSessionBase {
                     handled.markPersisted();
                     return { status: "quarantined" };
                 }
-                throw error;
+                throw error instanceof SharedSessionProtocolError
+                    ? error
+                    : new SharedSessionProtocolError(
+                          "invalid-frame",
+                          "Invalid owner-authored shared-session frame",
+                          { cause: error },
+                      );
             }
             if (!sameGroupAndShare(this.record, frame)) {
                 throw new SharedSessionProtocolError(
@@ -1021,7 +1025,7 @@ abstract class SharedSessionBase {
             }
             let next: DurableSharedSessionRecord = {
                 ...this.record,
-                epochState: checkpoint,
+                epochState: checkpoint.slice(),
                 persistenceGeneration: handled.persistenceGeneration,
                 appliedApplicationFingerprints: includeFingerprint(
                     this.channel.appliedApplicationFingerprints,
@@ -1189,6 +1193,7 @@ abstract class SharedSessionBase {
             if (terminateAfter) {
                 this.#client.unsubscribe(this.channel.topic);
                 this.channel.destroy();
+                zeroBytes(this.record.epochState);
                 this.#destroyed = true;
             }
             return { status: resultStatus };
@@ -1197,7 +1202,7 @@ abstract class SharedSessionBase {
                 if (!ownerAuthored) {
                     const next: DurableSharedSessionRecord = {
                         ...this.record,
-                        epochState: checkpoint,
+                        epochState: checkpoint.slice(),
                         persistenceGeneration: handled.persistenceGeneration,
                         appliedApplicationFingerprints: includeFingerprint(
                             this.channel.appliedApplicationFingerprints,
@@ -1254,12 +1259,14 @@ abstract class SharedSessionBase {
         opened?.markPersisted();
         this.#client.unsubscribe(this.channel.topic);
         this.channel.destroy();
+        zeroBytes(this.record.epochState);
         this.#destroyed = true;
     }
 
     protected retireInMemory(): void {
         this.#client.unsubscribe(this.channel.topic);
         this.channel.destroy();
+        zeroBytes(this.record.epochState);
         this.#destroyed = true;
     }
 
@@ -1280,6 +1287,7 @@ abstract class SharedSessionBase {
         }
         this.#pending.clear();
         this.channel.destroy();
+        zeroBytes(this.record.epochState);
         this.#destroyed = true;
     }
 }
@@ -1329,7 +1337,7 @@ export class SharedSessionOwner extends SharedSessionBase {
             role: "owner",
             state,
             owner: copyIdentity(options.identity),
-            epochState,
+            epochState: epochState.slice(),
             persistenceGeneration: channel.persistenceGeneration,
             appliedCommitFingerprints: [],
             appliedApplicationFingerprints: [],
@@ -1808,11 +1816,18 @@ export class SharedSessionOwner extends SharedSessionBase {
         if (stopping) {
             this.record = { ...this.record, internalStatus: "active" };
         }
-        await this.prepareCommit(removals, async (_transaction, _prepared, record) => ({
-            ...record,
-            internalStatus: stopping ? "stopping" : "active",
-            pendingRemovePeerIds: [],
-        }));
+        try {
+            await this.prepareCommit(removals, async (_transaction, _prepared, record) => ({
+                ...record,
+                internalStatus: stopping ? "stopping" : "active",
+                pendingRemovePeerIds: [],
+            }));
+        } catch (error: unknown) {
+            if (stopping) {
+                this.record = { ...this.record, internalStatus: "stopping" };
+            }
+            throw error;
+        }
     }
 
     private async buildHistoryOffer(): Promise<{
@@ -1963,7 +1978,7 @@ export class SharedSessionMember extends SharedSessionBase {
             role: "member",
             state: copyState(invitation.state),
             owner: copyIdentity(options.expectedOwner),
-            epochState,
+            epochState: epochState.slice(),
             persistenceGeneration: channel.persistenceGeneration,
             appliedCommitFingerprints: channel.appliedCommitFingerprints,
             appliedApplicationFingerprints: [],
