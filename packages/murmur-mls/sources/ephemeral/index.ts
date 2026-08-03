@@ -21,12 +21,13 @@ import {
     encodeMlsEphemeralHeader,
     type MlsEphemeralHeader,
 } from "./impl/frameHeaderCodec.js";
-import type { MlsEphemeralFrameType, MlsEphemeralOpenResult } from "./types.js";
+import type { MlsEphemeralOpenResult } from "./types.js";
 import {
     MAX_MLS_EPHEMERAL_FRAME_BYTES,
     MAX_MLS_EPHEMERAL_PAYLOAD_BYTES,
     MAX_MLS_EPHEMERAL_SENDERS,
     MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER,
+    MAX_MLS_EPHEMERAL_TOMBSTONES_PER_SENDER,
     MLS_EPHEMERAL_HEADER_BYTES,
     MLS_EPHEMERAL_SIGNATURE_BYTES,
     MLS_EPHEMERAL_STREAM_ID_BYTES,
@@ -44,6 +45,7 @@ export {
     MAX_MLS_EPHEMERAL_PAYLOAD_BYTES,
     MAX_MLS_EPHEMERAL_SENDERS,
     MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER,
+    MAX_MLS_EPHEMERAL_TOMBSTONES_PER_SENDER,
     MLS_EPHEMERAL_FRAME_VERSION,
     MLS_EPHEMERAL_HEADER_BYTES,
     MLS_EPHEMERAL_SIGNATURE_BYTES,
@@ -68,6 +70,13 @@ interface StreamKeys {
 
 interface InboundStream extends StreamKeys {
     lastCounter: bigint;
+}
+
+interface InboundSender {
+    /** Live streams with derived keys, least recently used first. */
+    readonly streams: Map<string, InboundStream>;
+    /** High-water counters of evicted streams, least recently used first. */
+    readonly retired: Map<string, bigint>;
 }
 
 function streamContext(senderLeaf: number, streamId: Uint8Array): Uint8Array {
@@ -154,7 +163,7 @@ export class MlsEphemeralCipher {
     readonly #identity: IdentityKeyPair;
     readonly #channelSecret: Uint8Array;
     readonly #signatureKeyFor: (leaf: number) => Uint8Array | undefined;
-    readonly #inbound = new Map<number, Map<string, InboundStream>>();
+    readonly #inbound = new Map<number, InboundSender>();
     #streamId: Uint8Array;
     #outbound: StreamKeys;
     #counter = 0n;
@@ -192,7 +201,7 @@ export class MlsEphemeralCipher {
     }
 
     /** Seal one bounded payload as the local member of the current epoch. */
-    seal(payload: Uint8Array, type: MlsEphemeralFrameType = "data"): Uint8Array {
+    seal(payload: Uint8Array): Uint8Array {
         this.#ensureActive();
         if (payload.length > MAX_MLS_EPHEMERAL_PAYLOAD_BYTES) {
             throw new Error(
@@ -203,7 +212,7 @@ export class MlsEphemeralCipher {
             this.#rotateStream();
         }
         const header = encodeMlsEphemeralHeader({
-            type,
+            type: "data",
             epoch: this.#epoch,
             senderLeaf: this.#localLeaf,
             streamId: this.#streamId,
@@ -246,9 +255,6 @@ export class MlsEphemeralCipher {
         if (header === undefined) {
             return { status: "dropped", reason: "malformed" };
         }
-        if (header.epoch !== this.#epoch) {
-            return { status: "dropped", reason: "foreign-epoch", epoch: header.epoch };
-        }
         if (header.senderLeaf === this.#localLeaf) {
             return { status: "dropped", reason: "self" };
         }
@@ -272,6 +278,13 @@ export class MlsEphemeralCipher {
             )
         ) {
             return { status: "dropped", reason: "authentication" };
+        }
+        // The epoch is checked only after the signature, because a foreign
+        // epoch is reported to the application as evidence that membership
+        // moved. Reporting it on an unverified header would let anyone who can
+        // reach the relay name an arbitrary epoch and drive that reaction.
+        if (header.epoch !== this.#epoch) {
+            return { status: "dropped", reason: "foreign-epoch", epoch: header.epoch };
         }
         const stream = this.#inboundStream(header);
         if (stream === undefined) {
@@ -317,11 +330,12 @@ export class MlsEphemeralCipher {
         }
         this.#destroyed = true;
         destroyStreamKeys(this.#outbound);
-        for (const streams of this.#inbound.values()) {
-            for (const stream of streams.values()) {
+        for (const sender of this.#inbound.values()) {
+            for (const stream of sender.streams.values()) {
                 destroyStreamKeys(stream);
             }
-            streams.clear();
+            sender.streams.clear();
+            sender.retired.clear();
         }
         this.#inbound.clear();
         zeroBytes(this.#channelSecret);
@@ -329,39 +343,63 @@ export class MlsEphemeralCipher {
     }
 
     #inboundStream(header: MlsEphemeralHeader): InboundStream | undefined {
-        let streams = this.#inbound.get(header.senderLeaf);
-        if (streams === undefined) {
+        let sender = this.#inbound.get(header.senderLeaf);
+        if (sender === undefined) {
             if (this.#inbound.size >= MAX_MLS_EPHEMERAL_SENDERS) {
                 return undefined;
             }
-            streams = new Map<string, InboundStream>();
-            this.#inbound.set(header.senderLeaf, streams);
+            sender = {
+                streams: new Map<string, InboundStream>(),
+                retired: new Map<string, bigint>(),
+            };
+            this.#inbound.set(header.senderLeaf, sender);
         }
         const identifier = encodeBase64Url(header.streamId);
-        const existing = streams.get(identifier);
+        const existing = sender.streams.get(identifier);
         if (existing !== undefined) {
             // Refresh least-recently-used order without changing the state.
-            streams.delete(identifier);
-            streams.set(identifier, existing);
+            sender.streams.delete(identifier);
+            sender.streams.set(identifier, existing);
             return existing;
         }
-        while (streams.size >= MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER) {
-            const oldest = streams.keys().next();
+        while (sender.streams.size >= MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER) {
+            const oldest = sender.streams.keys().next();
             if (oldest.done === true) {
                 break;
             }
-            const evicted = streams.get(oldest.value);
-            streams.delete(oldest.value);
+            const evicted = sender.streams.get(oldest.value);
+            sender.streams.delete(oldest.value);
             if (evicted !== undefined) {
+                this.#retire(sender, oldest.value, evicted.lastCounter);
                 destroyStreamKeys(evicted);
             }
         }
+        // A stream reappearing after eviction resumes from its remembered
+        // high-water mark, so replaying its old frames stays a replay.
+        const resumed = sender.retired.get(identifier);
+        sender.retired.delete(identifier);
         const created: InboundStream = {
             ...deriveStreamKeys(this.#channelSecret, header.senderLeaf, header.streamId),
-            lastCounter: -1n,
+            lastCounter: resumed ?? -1n,
         };
-        streams.set(identifier, created);
+        sender.streams.set(identifier, created);
         return created;
+    }
+
+    #retire(sender: InboundSender, identifier: string, lastCounter: bigint): void {
+        const previous = sender.retired.get(identifier);
+        sender.retired.delete(identifier);
+        sender.retired.set(
+            identifier,
+            previous !== undefined && previous > lastCounter ? previous : lastCounter,
+        );
+        while (sender.retired.size > MAX_MLS_EPHEMERAL_TOMBSTONES_PER_SENDER) {
+            const oldest = sender.retired.keys().next();
+            if (oldest.done === true) {
+                break;
+            }
+            sender.retired.delete(oldest.value);
+        }
     }
 
     #rotateStream(): void {

@@ -136,9 +136,11 @@ export interface SharedSessionEphemeralDrop {
  * Observed change in the epoch that keys the ephemeral channel.
  *
  * `local-commit` means this replica adopted a new epoch and rekeyed. The two
- * peer reasons mean an authenticated-looking frame named a different epoch,
- * which is the earliest possible warning that a membership Commit happened and
- * that in-flight ephemeral traffic is already void.
+ * peer reasons mean a frame whose signature verified under a known leaf key
+ * named a different epoch, which is the earliest possible warning that a
+ * membership Commit happened and that in-flight ephemeral traffic is already
+ * void. Nothing unauthenticated can raise this, because a frame's epoch is
+ * only read after its signature checks out.
  */
 export interface SharedSessionEphemeralEpochChange {
     readonly reason: "local-commit" | "peer-ahead" | "peer-behind";

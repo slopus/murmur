@@ -337,6 +337,62 @@ describe("shared session ephemeral channel", () => {
         destroyMlsKeyPackageBundle(secondBundle);
     });
 
+    it("survives hostile bytes injected into the topic", async () => {
+        const relay = new MemoryRelayTransport();
+        const fanout = new LoopbackEphemeralRelay();
+        const ownerParty = party(relay);
+        const friendParty = party(relay);
+        const { owner, friend, bundle } = await share({
+            shareId: "share_ephemeral_hostile",
+            relay,
+            owner: ownerParty,
+            friend: friendParty,
+        });
+        const ownerChannel = owner.openEphemeralChannel({ transport: fanout.transportFor() });
+        const friendChannel = friend.openEphemeralChannel({ transport: fanout.transportFor() });
+        const ownerSeen = collect(ownerChannel);
+        const topic = mlsGroupTopic(decodeBase64Url(owner.state.groupId));
+
+        // Anyone who learns the topic can publish: the relay authenticates
+        // nothing. None of this may surface, and none of it may fault the
+        // stream that carries real frames.
+        const wellFormedHeader = new Uint8Array(36);
+        wellFormedHeader[0] = 1;
+        wellFormedHeader[1] = 1;
+        wellFormedHeader.fill(0xff, 2, 10);
+        // Claim the friend's leaf, whose signature key the owner does know.
+        wellFormedHeader[11] = 1;
+        const hostile = [
+            new Uint8Array(0),
+            new Uint8Array(7).fill(0xff),
+            new Uint8Array(36 + 64).fill(0xaa),
+            wellFormedHeader,
+            new Uint8Array([...wellFormedHeader, ...new Uint8Array(64).fill(3)]),
+            new Uint8Array(MAX_SHARED_SESSION_EPHEMERAL_BYTES * 2).fill(0x5a),
+        ];
+        for (const bytes of hostile) {
+            fanout.inject(topic, bytes);
+        }
+        await settle();
+
+        expect(ownerSeen.frames).toHaveLength(0);
+        // Nothing unauthenticated is allowed to claim an epoch.
+        expect(ownerSeen.epochChanges).toHaveLength(0);
+        expect(ownerSeen.drops.length).toBeGreaterThanOrEqual(hostile.length);
+
+        // The channel is still live and still carries a real frame.
+        friendChannel.send(utf8Encode("still here"));
+        await settle();
+        expect(ownerSeen.frames).toHaveLength(1);
+        expect(utf8Decode(ownerSeen.frames[0]!.bytes)).toBe("still here");
+
+        ownerChannel.close();
+        friendChannel.close();
+        owner.destroy();
+        friend.destroy();
+        destroyMlsKeyPackageBundle(bundle);
+    });
+
     it("closes in-flight ephemeral traffic on a revoke commit", async () => {
         const relay = new MemoryRelayTransport();
         const fanout = new LoopbackEphemeralRelay();
@@ -373,7 +429,9 @@ describe("shared session ephemeral channel", () => {
         ownerChannel.send(utf8Encode("owner-after"));
         await settle();
         expect(ownerSeen.frames).toHaveLength(1);
-        expect(ownerSeen.drops.some((drop) => drop.reason === "foreign-epoch")).toBe(true);
+        // The Commit blanked the friend's leaf, so the owner rejects what it
+        // sends on identity, before the epoch is ever considered.
+        expect(ownerSeen.drops.some((drop) => drop.reason === "unknown-sender")).toBe(true);
         expect(friendSeen.frames).toHaveLength(0);
         expect(friendSeen.epochChanges.some((change) => change.reason === "peer-ahead")).toBe(true);
 

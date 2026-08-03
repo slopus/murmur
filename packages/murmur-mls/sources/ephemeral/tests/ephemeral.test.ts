@@ -17,6 +17,8 @@ import {
     decodeMlsEphemeralHeader,
     encodeMlsEphemeralHeader,
     MAX_MLS_EPHEMERAL_PAYLOAD_BYTES,
+    MAX_MLS_EPHEMERAL_SENDERS,
+    MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER,
     MLS_EPHEMERAL_CHANNEL_SECRET_BYTES,
     MlsEphemeralCipher,
 } from "../index.js";
@@ -150,6 +152,33 @@ describe("MLS ephemeral frames", () => {
         });
     });
 
+    it("never reports an epoch it has not authenticated", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const members = [alice, bob];
+        const sender = cipher({ identity: alice, localLeaf: 0, members });
+        const receiver = cipher({ identity: bob, localLeaf: 1, members });
+
+        // Anyone who learns the topic can rewrite the cleartext header. The
+        // epoch it names must not reach the application ahead of the signature.
+        const tampered = sender.seal(utf8Encode("keystroke"));
+        tampered.fill(0xff, 2, 10);
+
+        expect(receiver.open(tampered)).toEqual({ status: "dropped", reason: "authentication" });
+
+        const unsigned = encodeMlsEphemeralHeader({
+            type: "data",
+            epoch: 0xffff_ffff_ffff_ffffn,
+            senderLeaf: 0,
+            streamId: new Uint8Array(16).fill(7),
+            counter: 0n,
+        });
+        expect(receiver.open(concatBytes(unsigned, new Uint8Array(64)))).toEqual({
+            status: "dropped",
+            reason: "authentication",
+        });
+    });
+
     it("drops a member's own echo and an unknown leaf", () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
@@ -169,7 +198,7 @@ describe("MLS ephemeral frames", () => {
         const receiver = cipher({ identity: bob, localLeaf: 1, members });
 
         // Every restarted sender instance picks a fresh random stream id.
-        const streams = Array.from({ length: 9 }, () =>
+        const streams = Array.from({ length: MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER + 1 }, () =>
             cipher({ identity: alice, localLeaf: 0, members }),
         );
         const identifiers = new Set(
@@ -178,11 +207,54 @@ describe("MLS ephemeral frames", () => {
                 return header === undefined ? "" : header.streamId.join(",");
             }),
         );
-        expect(identifiers.size).toBe(9);
+        expect(identifiers.size).toBe(streams.length);
 
         for (const instance of streams) {
             expect(receiver.open(instance.seal(utf8Encode("bounded"))).status).toBe("opened");
         }
+    });
+
+    it("remembers an evicted stream's counter so its frames cannot be replayed", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const members = [alice, bob];
+        const receiver = cipher({ identity: bob, localLeaf: 1, members });
+
+        const retired = cipher({ identity: alice, localLeaf: 0, members });
+        const captured = retired.seal(utf8Encode("sudo"));
+        expect(receiver.open(captured.slice()).status).toBe("opened");
+
+        // Flush the active table with genuine frames from other streams, which
+        // is the only way a relay could evict the stream it wants to replay.
+        for (let index = 0; index < MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER; index += 1) {
+            const other = cipher({ identity: alice, localLeaf: 0, members });
+            expect(receiver.open(other.seal(utf8Encode("flush"))).status).toBe("opened");
+        }
+
+        expect(receiver.open(captured)).toEqual({ status: "dropped", reason: "replay" });
+    });
+
+    it("bounds tracked senders and reports the frames it cannot track", () => {
+        const members = Array.from({ length: MAX_MLS_EPHEMERAL_SENDERS + 1 }, () =>
+            generateIdentityKeyPair(),
+        );
+        const receiver = new MlsEphemeralCipher({
+            groupId,
+            epoch: 3n,
+            localLeaf: MAX_MLS_EPHEMERAL_SENDERS + 1,
+            identity: generateIdentityKeyPair(),
+            channelSecret,
+            signatureKeyFor: (leaf) => members[leaf]?.signingKey,
+        });
+
+        const results = members.map((identity, leaf) =>
+            receiver.open(cipher({ identity, localLeaf: leaf, members }).seal(utf8Encode("hi"))),
+        );
+
+        expect(
+            results.slice(0, MAX_MLS_EPHEMERAL_SENDERS).every((r) => r.status === "opened"),
+        ).toBe(true);
+        expect(results.at(-1)).toEqual({ status: "dropped", reason: "stream-limit" });
     });
 
     it("refuses to seal more than one bounded payload's worth of bytes", () => {

@@ -16,7 +16,6 @@ export interface MlsEphemeralHeader {
 }
 
 const DATA_TYPE = 1;
-const NOTICE_TYPE = 2;
 
 /**
  * Encode the fixed 36-byte header.
@@ -45,7 +44,7 @@ export function encodeMlsEphemeralHeader(header: MlsEphemeralHeader): Uint8Array
     }
     const bytes = new Uint8Array(MLS_EPHEMERAL_HEADER_BYTES);
     bytes[0] = MLS_EPHEMERAL_FRAME_VERSION;
-    bytes[1] = header.type === "data" ? DATA_TYPE : NOTICE_TYPE;
+    bytes[1] = DATA_TYPE;
     bytes.set(encodeUint64(header.epoch), 2);
     bytes.set(encodeUint16(header.senderLeaf), 10);
     bytes.set(header.streamId, 12);
@@ -66,12 +65,12 @@ export function decodeMlsEphemeralHeader(bytes: Uint8Array): MlsEphemeralHeader 
     if (
         bytes.length < MLS_EPHEMERAL_HEADER_BYTES ||
         bytes[0] !== MLS_EPHEMERAL_FRAME_VERSION ||
-        (bytes[1] !== DATA_TYPE && bytes[1] !== NOTICE_TYPE)
+        bytes[1] !== DATA_TYPE
     ) {
         return undefined;
     }
     return {
-        type: bytes[1] === DATA_TYPE ? "data" : "notice",
+        type: "data",
         epoch: decodeUint64(bytes, 2),
         senderLeaf: ((bytes[10] ?? 0) << 8) | (bytes[11] ?? 0),
         streamId: bytes.slice(12, 12 + MLS_EPHEMERAL_STREAM_ID_BYTES),

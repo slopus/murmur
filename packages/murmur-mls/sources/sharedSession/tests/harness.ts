@@ -188,6 +188,20 @@ export class LoopbackEphemeralRelay {
         return this.#subscribers.get(topic)?.size ?? 0;
     }
 
+    /**
+     * Deliver arbitrary bytes to every subscriber of a topic.
+     *
+     * The relay's ephemeral publish is unauthenticated by design, so anyone who
+     * learns a topic can do exactly this.
+     */
+    inject(topic: string, bytes: Uint8Array): void {
+        // Snapshot first: a listener may close its stream while notified.
+        const listeners = [...(this.#subscribers.get(topic) ?? [])];
+        for (const listener of listeners) {
+            listener(bytes.slice());
+        }
+    }
+
     transportFor(): SharedSessionEphemeralTransport {
         return {
             publishEphemeral: async (topic, frame): Promise<number> => {

@@ -476,14 +476,26 @@ random per-instance `streamId` is what lets the counter live in memory — a
 restarted sender picks a new stream and therefore a new key, so no nonce is
 reused and no counter is ever stored.
 
+The header is cleartext, so nothing it says is trusted until the signature
+verifies. A receiver resolves the sender's leaf key and checks the signature
+_before_ it looks at the epoch, because a foreign epoch is reported to the
+application as evidence that membership moved: acting on an unverified header
+would let anyone who can reach the relay name an arbitrary epoch and drive that
+reaction. A frame that fails to verify is an `authentication` drop and reports
+no epoch at all. Inbound stream state is bounded at 8 live streams per sending
+leaf and 256 leaves; an evicted stream leaves behind its high-water counter, so
+flushing the table does not reopen its frames to replay.
+
 Payloads are bounded at 64 KiB, well under the relay's 1 MiB event payload
 limit. The channel is lossy on purpose: a sender's queue is bounded in both
 frames and bytes and drops its oldest entries under pressure rather than
 growing, and a forged, stale, replayed, or malformed frame is a counted drop
-rather than an error. Ordering holds per sender only. A frame naming a
-different epoch is reported as an epoch change, which is the earliest available
-warning that membership moved; adopting a Commit locally rekeys the channel at
-once and discards anything still queued under the old epoch.
+rather than an error. Ordering holds per sender only. An authenticated frame
+naming a different epoch is reported as an epoch change, which is the earliest
+available warning that membership moved; adopting a Commit locally rekeys the
+channel at once and discards anything still queued under the old epoch. Only
+application data travels here: every other header type byte is rejected, so no
+frame is ever accepted and then silently discarded.
 
 Ephemeral frames are carried by `POST /v1/topics/{topic}/ephemeral` and
 `GET /v1/topics/{topic}/stream`, which store nothing at the relay.

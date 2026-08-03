@@ -37,9 +37,19 @@ interface QueuedFrame {
     readonly epoch: bigint;
 }
 
+/**
+ * Narrow an epoch for the application.
+ *
+ * An observed epoch arrives inside a frame header, so it is a full uint64 that
+ * this process did not choose. It is clamped rather than rejected: no value a
+ * peer can put on the wire may fault the receive path.
+ */
 function safeEpoch(epoch: bigint): number {
     if (epoch > BigInt(Number.MAX_SAFE_INTEGER)) {
-        throw new Error("MLS epoch exceeds the safe integer range");
+        return Number.MAX_SAFE_INTEGER;
+    }
+    if (epoch < 0n) {
+        return 0;
     }
     return Number(epoch);
 }
@@ -115,7 +125,13 @@ export class SharedSessionEphemeralChannelImpl implements SharedSessionEphemeral
         this.#cipher = this.#createCipher(options.groupChannel);
         this.#stream = this.#transport.openTopicStream(this.#topic, {
             onFrame: (frame) => {
-                this.#receive(frame.bytes);
+                // Relay bytes are untrusted and the transport is shared: a
+                // frame must never be able to fault the stream it arrived on.
+                try {
+                    this.#receive(frame.bytes);
+                } catch {
+                    this.#report({ direction: "inbound", reason: "malformed", frames: 1 });
+                }
             },
             onWake: () => {
                 this.#onWake?.();
@@ -336,9 +352,6 @@ export class SharedSessionEphemeralChannelImpl implements SharedSessionEphemeral
         }
         const frame = opened.frame;
         try {
-            if (frame.type !== "data") {
-                return;
-            }
             const context = this.#context();
             const senderKey = this.#groupChannel.memberSignatureKeys[frame.senderLeaf];
             if (senderKey === undefined) {

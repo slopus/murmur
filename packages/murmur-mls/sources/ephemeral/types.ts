@@ -16,13 +16,28 @@ export const MAX_MLS_EPHEMERAL_FRAME_BYTES =
     16;
 /** Maximum concurrently tracked inbound streams for one sending leaf. */
 export const MAX_MLS_EPHEMERAL_STREAMS_PER_SENDER = 8;
+/**
+ * Retired stream counters remembered per sending leaf.
+ *
+ * Evicting a stream must not forget how far its counter had advanced, or a
+ * peer able to replay a member's own frames could flush the active table and
+ * then replay the retired stream from the beginning. A tombstone keeps the
+ * high-water mark long after the keys are gone, at eight bytes per entry.
+ */
+export const MAX_MLS_EPHEMERAL_TOMBSTONES_PER_SENDER = 64;
 /** Maximum sending leaves tracked at once, matching the MLS member bound. */
 export const MAX_MLS_EPHEMERAL_SENDERS = 256;
 /** Frames sent on one stream identifier before it rotates automatically. */
 export const MLS_EPHEMERAL_STREAM_ROTATION_FRAMES = 0xffff_ffffn;
 
-/** Frame classes distinguished inside the authenticated header. */
-export type MlsEphemeralFrameType = "data" | "notice";
+/**
+ * Frame classes distinguished inside the authenticated header.
+ *
+ * Only application data travels on this channel. Every other type byte is
+ * reserved and rejected outright, so no frame can be accepted and then
+ * silently discarded for having a class nothing consumes.
+ */
+export type MlsEphemeralFrameType = "data";
 
 /** One authenticated ephemeral frame from another member of this epoch. */
 export interface MlsEphemeralFrame {
