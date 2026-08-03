@@ -39,6 +39,15 @@ export interface RelayHttpOptions {
     readonly trustedProxies?: TrustedProxyPolicy;
     /** Clock used for link expiry and rate-limit accounting. */
     readonly now?: () => number;
+    /** Optional request-summary logger. The reusable handler is silent by default. */
+    readonly logger?: RelayHttpLogger;
+}
+
+/** Minimal logger accepted by the HTTP boundary. */
+export interface RelayHttpLogger {
+    readonly info: (message: string) => void;
+    readonly warn: (message: string) => void;
+    readonly error: (message: string) => void;
 }
 
 /** Socket metadata supplied by the Node adapter rather than caller headers. */
@@ -59,6 +68,7 @@ interface ResolvedRelayHttpOptions {
     readonly rateLimiter: RateLimiter | undefined;
     readonly trustedProxies: TrustedProxyPolicy | undefined;
     readonly now: () => number;
+    readonly logger: RelayHttpLogger | undefined;
 }
 
 class HttpRateLimitError extends Error {
@@ -82,6 +92,13 @@ function jsonTextResponse(value: string, status: number = 200): Response {
 
 function jsonResponse(value: unknown, status: number = 200): Response {
     return jsonTextResponse(jsonStringify(value), status);
+}
+
+function textResponse(value: string, status: number = 200): Response {
+    return new Response(value, {
+        status,
+        headers: { "content-type": "text/plain; charset=utf-8" },
+    });
 }
 
 function rateLimitResponse(error: HttpRateLimitError): Response {
@@ -333,6 +350,9 @@ async function routeRequest(
         const clientIp = resolveClientIp(request, context.remoteAddress, options.trustedProxies);
         await consumeRateLimit(options.rateLimiter, `ip:${clientIp}`, cost, now);
     }
+    if (request.method === "GET" && segments.length === 0) {
+        return textResponse("Welcome to Murmur Relay!");
+    }
     if (request.method === "GET" && segments.length === 1 && segments[0] === "health") {
         await service.health();
         return jsonResponse({ ok: true });
@@ -470,6 +490,78 @@ async function routeRequest(
     return jsonResponse({ error: "not_found" }, 404);
 }
 
+type RequestRoute =
+    | "root"
+    | "health"
+    | "topic-events"
+    | "topic-state"
+    | "topic-list"
+    | "blob-upload-link"
+    | "blob-download-link"
+    | "blob-transfer"
+    | "unknown";
+
+function requestRoute(request: Request): RequestRoute {
+    const segments = new URL(request.url).pathname
+        .split("/")
+        .filter((segment) => segment.length > 0);
+    if (segments.length === 0) {
+        return "root";
+    }
+    if (segments.length === 1 && segments[0] === "health") {
+        return "health";
+    }
+    if (segments.length === 4 && segments[0] === "v1" && segments[1] === "topics") {
+        if (segments[3] === "events") {
+            return "topic-events";
+        }
+        if (segments[3] === "state") {
+            return "topic-state";
+        }
+        if (segments[3] === "list") {
+            return "topic-list";
+        }
+    }
+    if (segments.length === 4 && segments[0] === "v1" && segments[1] === "blobs") {
+        if (segments[3] === "upload-link") {
+            return "blob-upload-link";
+        }
+        if (segments[3] === "download-link") {
+            return "blob-download-link";
+        }
+    }
+    if (segments.length === 3 && segments[0] === "v1" && segments[1] === "blobs") {
+        return "blob-transfer";
+    }
+    return "unknown";
+}
+
+function logRequest(
+    logger: RelayHttpLogger | undefined,
+    request: Request,
+    response: Response,
+    startedAt: number,
+): void {
+    if (logger === undefined) {
+        return;
+    }
+    const route = requestRoute(request);
+    if (route === "health" && response.status < 500) {
+        return;
+    }
+    const durationMilliseconds = Math.max(0, Date.now() - startedAt);
+    const message =
+        `http:request method=${request.method} route=${route} ` +
+        `status=${response.status.toString()} durationMs=${durationMilliseconds.toString()}`;
+    if (response.status >= 500) {
+        logger.error(message);
+    } else if (response.status >= 400) {
+        logger.warn(message);
+    } else {
+        logger.info(message);
+    }
+}
+
 async function consumeRateLimit(
     limiter: RateLimiter,
     key: string,
@@ -515,6 +607,7 @@ function resolveHttpOptions(
         rateLimiter,
         trustedProxies,
         now: options.now ?? Date.now,
+        logger: options.logger,
     };
 }
 
@@ -525,20 +618,32 @@ export function createRelayFetchHandler(
 ): RelayFetchHandler {
     const resolvedOptions = resolveHttpOptions(service, options);
     return async (request, context = {}): Promise<Response> => {
+        const startedAt = Date.now();
+        let response: Response;
         try {
-            return withCors(
+            response = withCors(
                 await routeRequest(service, request, resolvedOptions, context),
                 request,
                 resolvedOptions,
             );
         } catch (error) {
             if (error instanceof HttpRateLimitError) {
-                return withCors(rateLimitResponse(error), request, resolvedOptions);
+                response = withCors(rateLimitResponse(error), request, resolvedOptions);
+            } else if (error instanceof RelayError) {
+                response = withCors(
+                    jsonResponse(error.body, error.status),
+                    request,
+                    resolvedOptions,
+                );
+            } else {
+                response = withCors(
+                    jsonResponse({ error: "internal" }, 500),
+                    request,
+                    resolvedOptions,
+                );
             }
-            if (error instanceof RelayError) {
-                return withCors(jsonResponse(error.body, error.status), request, resolvedOptions);
-            }
-            return withCors(jsonResponse({ error: "internal" }, 500), request, resolvedOptions);
         }
+        logRequest(resolvedOptions.logger, request, response, startedAt);
+        return response;
     };
 }

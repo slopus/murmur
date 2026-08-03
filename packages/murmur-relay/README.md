@@ -157,6 +157,7 @@ bigints are decimal strings.
 
 | Method and route                                       | Behavior                                                      |
 | ------------------------------------------------------ | ------------------------------------------------------------- |
+| `GET /`                                                | Show the human-readable relay welcome                         |
 | `GET /health`                                          | Check backing-store health                                    |
 | `POST /v1/topics/:topic/events`                        | Validate, authenticate, and atomically publish a signed event |
 | `GET /v1/topics/:topic/state?limit=N`                  | Read the topic head, snapshot, and first list page            |
@@ -170,6 +171,11 @@ With the local backend, those links point to signed `PUT`/`GET
 /v1/blobs/:sha256?expires=...&signature=...` routes. They are not unsigned blob
 API routes. Local transfers stream through Node into sharded filesystem files;
 S3 presigned links transfer directly between the client and S3.
+
+The standalone runtime logs startup, shutdown, retention, and request summaries
+as `HH:mm:ss MODULE  message`. Request summaries contain only method, named
+route, status, and duration; topic IDs, blob IDs, IPs, payloads, keys, and
+successful health probes are not logged.
 
 JSON request bodies, individual payloads, snapshots, list elements, operation
 counts, blobs, list capacity, page counts, page response bytes, and concurrent

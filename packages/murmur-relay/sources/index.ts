@@ -51,6 +51,7 @@ export type {
 export { createRelayFetchHandler } from "./http/index.js";
 export type {
     RelayFetchHandler,
+    RelayHttpLogger,
     RelayHttpOptions,
     RelayRequestContext,
     TrustedProxyPolicy,

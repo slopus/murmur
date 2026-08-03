@@ -21,6 +21,7 @@ audit; the bundled MLS profile is an RFC 9420 subset.
 
 ```ts
 import {
+    DEFAULT_RELAY_URL,
     HttpRelayTransport,
     MemoryMurmurStore,
     MurmurClient,
@@ -33,7 +34,7 @@ const store = new MemoryMurmurStore();
 const client = new MurmurClient({
     identity,
     store,
-    transports: [new HttpRelayTransport("primary", "https://relay.example")],
+    transports: [new HttpRelayTransport("primary", DEFAULT_RELAY_URL)],
 });
 
 await client.subscribe(identityInboxTopic(identity));

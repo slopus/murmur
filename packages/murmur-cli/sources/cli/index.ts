@@ -125,7 +125,7 @@ function help(): string {
         "  murmur documents insert --document <id-or-name> --text <text> [--after <actor>:<sequence>]",
         "  murmur documents delete --document <id-or-name> --target <actor>:<sequence>",
         "",
-        "Global: --relay <url> (repeatable), --db <sqlite-path>",
+        "Global: --relay <url> (repeatable; defaults to https://murmur.cluster-fluster.com), --db <sqlite-path>",
     ].join("\n");
 }
 

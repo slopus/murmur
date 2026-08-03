@@ -14,3 +14,8 @@ list encoders accumulate UTF-8 sizes and stop at the configured response budget,
 while preserving the topic head or next list cursor needed to continue.
 `X-Forwarded-For` is ignored by default; only an explicit hop-count or exact
 proxy-address policy enables it.
+
+The root route returns a plain-text welcome. An optional injected logger records
+only named routes, methods, status codes, and durations; it never records topic
+IDs, blob IDs, client IPs, payloads, or keys. Successful health probes are
+suppressed.

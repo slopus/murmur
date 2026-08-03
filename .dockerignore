@@ -1,4 +1,5 @@
 .context
+**/.context
 .env
 .git
 .pnpm-store

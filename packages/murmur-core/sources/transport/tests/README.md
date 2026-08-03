@@ -2,4 +2,5 @@
 
 Tests cover byte-identical client/relay signature verification, fixed HTTP
 routes and response codecs, injected Fetch, response bounds, and blob
-integrity.
+integrity. The canonical public relay URL is pinned as part of the package
+contract.

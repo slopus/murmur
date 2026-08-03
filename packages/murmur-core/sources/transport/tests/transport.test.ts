@@ -4,6 +4,7 @@ import { utf8Decode, utf8Encode } from "../../utils/index.js";
 import {
     createRelayBlob,
     createRelayEvent,
+    DEFAULT_RELAY_URL,
     decodeSignedRelayEventWire,
     deriveNestedTopic,
     encodeSignedRelayEventWire,
@@ -14,6 +15,10 @@ import {
 } from "../index.js";
 
 describe("relay protocol", () => {
+    it("exports the canonical public relay URL", () => {
+        expect(DEFAULT_RELAY_URL).toBe("https://murmur.cluster-fluster.com");
+    });
+
     it("signs the relay's exact canonical event preimage", async () => {
         const alice = generateIdentityKeyPair();
         const event = createRelayEvent(

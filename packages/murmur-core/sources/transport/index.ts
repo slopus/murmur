@@ -48,6 +48,8 @@ export {
 
 export const MAX_RELAY_TOPIC_CHARACTERS = 512;
 export const MAX_NESTED_TOPIC_COMPONENT_BYTES = 1_024;
+/** Public Murmur relay used when an application explicitly chooses the project default. */
+export const DEFAULT_RELAY_URL = "https://murmur.cluster-fluster.com";
 
 /** Derive an opaque child topic which can itself be nested without a depth limit. */
 export function deriveNestedTopic(parentTopic: string, component: Uint8Array): string {

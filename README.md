@@ -1,7 +1,7 @@
 # Murmur
 
 End-to-end encrypted messaging and shared state over deliberately dumb,
-Node-hosted relays.
+self-hosted relays.
 
 Murmur ships one public, browser-safe ESM library,
 [`@slopus/murmur`](packages/murmur-core), plus the `murmur-chat` CLI. The
@@ -334,6 +334,7 @@ pnpm add @slopus/murmur
 
 ```ts
 import {
+    DEFAULT_RELAY_URL,
     HttpRelayTransport,
     MemoryMurmurStore,
     MurmurClient,
@@ -346,7 +347,7 @@ const store = new MemoryMurmurStore();
 const client = new MurmurClient({
     identity,
     store,
-    transports: [new HttpRelayTransport("primary", "https://relay.example")],
+    transports: [new HttpRelayTransport("primary", DEFAULT_RELAY_URL)],
 });
 
 await client.subscribe(identityInboxTopic(identity));
@@ -363,7 +364,7 @@ requires Node 22.5 or later. Results are JSON except for `help`.
 ```bash
 pnpm add --global murmur-chat
 
-murmur sign-in --first-name Alice --relay http://127.0.0.1:8787
+murmur sign-in --first-name Alice
 murmur me
 murmur contacts add <identity-token>
 murmur send --to <identity-id-or-token> --message "hello"
@@ -394,9 +395,10 @@ murmur documents delete --document <id-or-name> --target <actor>:<sequence>
 ```
 
 Global relay selection is repeatable `--relay <url>` or the comma-separated
-`MURMUR_RELAYS` environment variable. Local state is `~/.murmur/murmur.sqlite`
-by default; use `--db <sqlite-path>` or `MURMUR_HOME` to choose another
-location.
+`MURMUR_RELAYS` environment variable. With neither set, the CLI uses
+`https://murmur.cluster-fluster.com`. Local state is
+`~/.murmur/murmur.sqlite` by default; use `--db <sqlite-path>` or
+`MURMUR_HOME` to choose another location.
 
 ## Run a relay
 

@@ -223,6 +223,10 @@ describe("relay Fetch handler", () => {
         );
         expect(unsignedUpload.status).toBe(404);
 
+        const root = await handler(new Request("https://relay.test/"));
+        expect(root.status).toBe(200);
+        expect(root.headers.get("content-type")).toBe("text/plain; charset=utf-8");
+        await expect(root.text()).resolves.toBe("Welcome to Murmur Relay!");
         const health = await handler(new Request("https://relay.test/health"));
         expect(await health.json()).toEqual({ ok: true });
         const malformed = await handler(
@@ -234,5 +238,29 @@ describe("relay Fetch handler", () => {
         expect(malformed.status).toBe(400);
         const missing = await handler(new Request("https://relay.test/nope"));
         expect(missing.status).toBe(404);
+    });
+
+    it("logs safe route summaries while suppressing successful health probes", async () => {
+        service = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const messages: string[] = [];
+        const handler = createRelayFetchHandler(service, {
+            logger: {
+                info: (message) => messages.push(`info ${message}`),
+                warn: (message) => messages.push(`warn ${message}`),
+                error: (message) => messages.push(`error ${message}`),
+            },
+        });
+        await handler(new Request("https://relay.test/"));
+        await handler(new Request("https://relay.test/health"));
+        await handler(new Request("https://relay.test/v1/topics/private-topic/state"));
+
+        expect(messages).toHaveLength(2);
+        expect(messages[0]).toMatch(
+            /^info http:request method=GET route=root status=200 durationMs=\d+$/,
+        );
+        expect(messages[1]).toMatch(
+            /^warn http:request method=GET route=topic-state status=404 durationMs=\d+$/,
+        );
+        expect(messages.join("\n")).not.toContain("private-topic");
     });
 });

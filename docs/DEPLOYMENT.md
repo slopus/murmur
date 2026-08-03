@@ -128,6 +128,17 @@ Ingress cannot reference a Service in a different namespace. Use the
 deployment's real hostname and certificate, and do not expose the relay
 publicly over plaintext HTTP.
 
+After publishing and deploying a new relay version, run the opt-in external
+smoke test:
+
+```bash
+pnpm --filter @murmur/relay test:live
+```
+
+It targets `https://murmur.cluster-fluster.com` by default and performs only
+read-only welcome, health/CORS, and missing-topic checks. Set
+`MURMUR_LIVE_RELAY_URL` to exercise another deployment.
+
 SQLite and `local-path` require exactly one replica. Use Postgres plus S3 and a
 storage-specific manifest before scaling horizontally. Deleting the
 `murmur-relay-data` persistent volume claim deletes relay state.

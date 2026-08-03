@@ -23,8 +23,14 @@ import {
     SqliteRelayStore,
     type RelayStore,
 } from "./storage/index.js";
+import { createHumanLogger, safeErrorSummary } from "./utils/logger.js";
 
 const PRUNE_INTERVAL_MILLISECONDS = 60 * 60 * 1_000;
+const logger = createHumanLogger("RELAY");
+
+function oneLine(value: string): string {
+    return value.replace(/\s+/g, " ").trim();
+}
 
 function portFromEnvironment(value: string | undefined): number {
     const port = value === undefined ? 8787 : Number(value);
@@ -95,8 +101,8 @@ function createBlobBackend(): BlobBackend {
         let secret: Uint8Array;
         if (configuredSecret === undefined) {
             secret = randomBytes(32);
-            console.warn(
-                "MURMUR_RELAY_BLOB_SECRET is unset; blob links use an ephemeral secret and will not survive a restart or work across relay instances",
+            logger.warn(
+                "blob:secret-missing MURMUR_RELAY_BLOB_SECRET is unset; links will not survive restart or work across instances",
             );
         } else {
             secret = new TextEncoder().encode(configuredSecret);
@@ -179,6 +185,7 @@ export async function main(): Promise<void> {
     const handler = createRelayFetchHandler(service, {
         origins,
         blobBackend,
+        logger,
         ...(trustedProxies === undefined ? {} : { trustedProxies }),
     });
     const server = createNodeRelayServer(handler);
@@ -188,40 +195,54 @@ export async function main(): Promise<void> {
         await Promise.allSettled([blobBackend.close(), service.close()]);
         throw error;
     }
+    logger.info(
+        `relay:listen host=${oneLine(serverOptions.host)} port=${serverOptions.port.toString()} ` +
+            `store=${oneLine(process.env.MURMUR_RELAY_STORE ?? "sqlite")} ` +
+            `blobs=${oneLine(process.env.MURMUR_RELAY_BLOB_BACKEND ?? "local")}`,
+    );
 
     const prune = (): void => {
-        void service.prune().catch(() => {
-            console.error("Murmur relay retention sweep failed");
-        });
+        void service.prune().then(
+            (outcome) => {
+                logger.info(
+                    `retention:complete events=${outcome.events.toString()} topics=${outcome.topics.toString()}`,
+                );
+            },
+            (error: unknown) => {
+                logger.error(`retention:failed ${safeErrorSummary(error)}`);
+            },
+        );
     };
     prune();
     const pruneTimer = setInterval(prune, PRUNE_INTERVAL_MILLISECONDS);
     pruneTimer.unref();
 
     let stopping = false;
-    const stop = (): void => {
+    const stop = (signal: "SIGINT" | "SIGTERM"): void => {
         if (stopping) {
             return;
         }
         stopping = true;
+        logger.info(`relay:stop signal=${signal}`);
         clearInterval(pruneTimer);
         void closeNodeRelayServer(server)
             .then(() => Promise.all([blobBackend.close(), service.close()]))
             .then(
                 () => {
+                    logger.info(`relay:stopped signal=${signal}`);
                     process.exitCode = 0;
                 },
-                () => {
+                (error: unknown) => {
+                    logger.error(`relay:stop-failed signal=${signal} ${safeErrorSummary(error)}`);
                     process.exitCode = 1;
                 },
             );
     };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+    process.once("SIGINT", () => stop("SIGINT"));
+    process.once("SIGTERM", () => stop("SIGTERM"));
 }
 
 void main().catch((error: unknown) => {
-    const reason = error instanceof Error ? (error.stack ?? error.message) : String(error);
-    console.error(`Murmur relay failed to start: ${reason}`);
+    logger.error(`relay:start-failed ${safeErrorSummary(error)}`);
     process.exitCode = 1;
 });

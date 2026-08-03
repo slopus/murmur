@@ -30,6 +30,14 @@ the `signature` member omitted. The full event shape is in
 
 ## Endpoints
 
+### `GET /`
+
+Returns a human-readable relay identity with HTTP 200:
+
+```text
+Welcome to Murmur Relay!
+```
+
 ### `GET /health`
 
 Checks whether the backing `RelayStore` can run its health query.

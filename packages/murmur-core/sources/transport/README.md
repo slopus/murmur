@@ -17,3 +17,7 @@ workers, and in-process test relays use the same code without a TCP socket.
 Blob IDs remain SHA-256 hashes of ciphertext. `putBlob` and `getBlob` hide the
 two-step transfer: request a short-lived link from the relay, then use the
 returned method and headers to transfer bytes directly.
+
+`DEFAULT_RELAY_URL` names the public Murmur deployment. Applications still
+construct transports explicitly, so choosing a private relay remains a
+deliberate one-line change.

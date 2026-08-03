@@ -9,12 +9,12 @@ Node 22.5 or later is required because durable local state uses `node:sqlite`.
 
 ## Relay and storage
 
-Start a relay with `murmur-relay`, then select it with `--relay` or
-`MURMUR_RELAYS`. State defaults to `~/.murmur/murmur.sqlite`; use `--db` or
-`MURMUR_HOME` to isolate identities.
+The CLI uses `https://murmur.cluster-fluster.com` by default. Select another
+relay with repeatable `--relay` options or `MURMUR_RELAYS`. State defaults to
+`~/.murmur/murmur.sqlite`; use `--db` or `MURMUR_HOME` to isolate identities.
 
 ```bash
-murmur --relay http://127.0.0.1:8787 sign-in --first-name Alice
+murmur sign-in --first-name Alice
 murmur me
 ```
 
