@@ -268,14 +268,14 @@ participants collapse their authorized copy to the same logical message ID, so
 copies repeated by several relays do not duplicate history. Older topics with
 only recipient-sealed elements remain readable by recipients.
 
-The direct-chat outbox remains until every configured relay accepts the logical
-send. For attachment messages it transactionally retains ciphertext blobs and
-per-relay upload/event progress with the canonical message, both encrypted
-copies, and application callback state. A relay event is published only after
-that same relay has accepted every referenced blob. Ambiguous uploads are
-retried idempotently. Local outbox ciphertext is removed only after all relays
-accept blobs and event; relay blobs remain permanent opaque content-addressed
-ciphertext.
+The direct-chat outbox remains until every still-configured relay accepts the
+logical send. For attachment messages it transactionally retains ciphertext
+blobs and per-relay upload/event progress with the canonical message, both
+encrypted copies, and application callback state. A relay event is published
+only after that same relay has accepted every referenced blob. Ambiguous
+uploads are retried idempotently. Local outbox ciphertext is removed after all
+still-configured relays accept blobs and event; removed relays do not poison
+retention. Relay blobs remain permanent opaque content-addressed ciphertext.
 
 If a pending signed event approaches the relay's timestamp window, the client
 atomically replaces it with a freshly timestamped and signed event whose topic,

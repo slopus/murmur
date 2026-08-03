@@ -713,6 +713,42 @@ describe("DirectChat", () => {
         expect(await bobStore.list("application/incoming/")).toHaveLength(1);
     });
 
+    it("cleans attachment outbox state when a pending relay is no longer configured", async () => {
+        const first = new ChatTransport("first");
+        const removed = new ChatTransport("removed");
+        removed.offline = true;
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const original = chat(alice, aliceStore, friends.left, [first, removed]);
+
+        await original.sendMessage(
+            bob,
+            {
+                text: "relay shrink",
+                attachments: [
+                    {
+                        name: "note.txt",
+                        mediaType: "text/plain",
+                        bytes: utf8Encode("durable"),
+                    },
+                ],
+            },
+            { id: "N".repeat(32), sentAt: 70 },
+        );
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(1);
+        expect(await aliceStore.list("direct-chat/v2/outbox-blob/")).toHaveLength(1);
+        expect(first.events.get(pairwiseTopic(alice, bob))).toHaveLength(1);
+        expect(removed.events.get(pairwiseTopic(alice, bob))).toBeUndefined();
+
+        const rebuilt = chat(alice, aliceStore, friends.left, [first]);
+        expect((await rebuilt.retryPending()).failures).toEqual([]);
+        expect(await aliceStore.list("direct-chat/v1/outbox/")).toHaveLength(0);
+        expect(await aliceStore.list("direct-chat/v2/outbox-blob/")).toHaveLength(0);
+    });
+
     it("recovers an ambiguous accepted receipt before refreshing a stale event", async () => {
         const relay = new ChatTransport("relay");
         relay.enforceFreshness = true;

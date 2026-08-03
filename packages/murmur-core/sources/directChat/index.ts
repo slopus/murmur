@@ -1014,7 +1014,7 @@ export class DirectChat {
             const failures: Error[] = [];
             for (const relayId of pending.relays.map((relay) => relay.relayId)) {
                 let relay = pending.relays.find((item) => item.relayId === relayId);
-                if (relay?.eventPublished === true) {
+                if (relay !== undefined && this.#relayProgressSatisfied(relay)) {
                     continue;
                 }
                 try {
@@ -1053,7 +1053,9 @@ export class DirectChat {
                     failures.push(error instanceof Error ? error : new Error(String(error)));
                 }
             }
-            if (!pending.relays.every((relay) => relay.eventPublished) && !pending.published) {
+            if (pending.relays.every((relay) => this.#relayProgressSatisfied(relay))) {
+                await this.#cleanupSatisfiedOutbox(key, pending.event.id);
+            } else if (!pending.published) {
                 const cause = failures[0];
                 throw new Error(
                     `Every transport rejected the direct-chat event${
@@ -1219,7 +1221,7 @@ export class DirectChat {
                         ),
                     );
                 }
-                if (relays.every((relay) => relay.eventPublished)) {
+                if (relays.every((relay) => this.#relayProgressSatisfied(relay))) {
                     await transaction.delete(key);
                     for (const blobId of current.blobIds) {
                         await transaction.delete(this.#outboxBlobKey(current.message.id, blobId));
@@ -1235,6 +1237,34 @@ export class DirectChat {
                 }
             }
         });
+    }
+
+    async #cleanupSatisfiedOutbox(key: string, eventId: string): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const currentBytes = await transaction.get(key);
+            if (currentBytes === undefined) {
+                return;
+            }
+            const current = decodeOutboxAndZero(currentBytes);
+            try {
+                if (current.event.id !== eventId && current.previousEvent?.id !== eventId) {
+                    return;
+                }
+                if (!current.relays.every((relay) => this.#relayProgressSatisfied(relay))) {
+                    return;
+                }
+                await transaction.delete(key);
+                for (const blobId of current.blobIds) {
+                    await transaction.delete(this.#outboxBlobKey(current.message.id, blobId));
+                }
+            } finally {
+                clearMessageSecrets(current.message);
+            }
+        });
+    }
+
+    #relayProgressSatisfied(relay: DirectChatRelayProgress): boolean {
+        return relay.eventPublished || !this.#client.relayIds.includes(relay.relayId);
     }
 
     async #validatePendingBlobs(id: string, pending: DirectChatOutboxRecord): Promise<void> {
@@ -1369,7 +1399,6 @@ export class DirectChat {
             !sameStrings(pending.blobIds, expectedBlobIds) ||
             relayIds.length === 0 ||
             new Set(relayIds).size !== relayIds.length ||
-            relayIds.some((relayId) => !this.#client.relayIds.includes(relayId)) ||
             pending.relays.some(
                 (relay) =>
                     new Set(relay.uploadedBlobIds).size !== relay.uploadedBlobIds.length ||

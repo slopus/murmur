@@ -34,10 +34,11 @@ The outbox retains exact ciphertext and per-relay blob/event progress in the
 same transaction as consumer callback state. A thrown publication error can
 therefore still mean "durably queued." Retries re-upload idempotently after an
 ambiguous response, never expose an event on a relay before all of its blobs
-exist there, and delete local ciphertext only after every configured relay
-accepts both blobs and event. Stale events are atomically replaced with freshly
-signed, content-equivalent events; stable list IDs preserve logical
-idempotency.
+exist there, and delete local ciphertext only after every still-configured
+relay accepts both blobs and event. Relays removed from configuration no longer
+poison or retain an otherwise completed outbox. Stale events are atomically
+replaced with freshly signed, content-equivalent events; stable list IDs
+preserve logical idempotency.
 
 `fetchAttachment()` is stateless and content-addressed. It applies document
 policy before network work, asks the client for the exact expected ciphertext
