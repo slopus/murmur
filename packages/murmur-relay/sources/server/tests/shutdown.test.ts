@@ -1,5 +1,5 @@
 import { createServer, type AddressInfo } from "node:net";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { createRelayFetchHandler } from "../../http/index.js";
 import { RelayService } from "../../relay/index.js";
 import { SqliteRelayStore } from "../../storage/sqlite/index.js";
@@ -53,7 +53,9 @@ async function pending(promise: Promise<void>): Promise<boolean> {
  * Whether this machine lets a test bind a loopback port.
  *
  * These tests need a real listener, which a sandboxed developer shell may
- * refuse. CI binds normally, so the coverage is not lost where it matters.
+ * refuse. The probe therefore skips them locally, but CI must never skip
+ * silently: a runner that cannot bind would turn this whole file green while
+ * testing nothing, and the shutdown hang it covers would return unnoticed.
  */
 async function canBindLoopback(): Promise<boolean> {
     return await new Promise<boolean>((resolve) => {
@@ -69,9 +71,15 @@ async function canBindLoopback(): Promise<boolean> {
     });
 }
 
-const describeBound = (await canBindLoopback()) ? describe : describe.skip;
+describe("Node relay graceful shutdown", () => {
+    let bindable = false;
 
-describeBound("Node relay graceful shutdown", () => {
+    beforeAll(async () => {
+        bindable = await canBindLoopback();
+        if (!bindable && process.env.CI !== undefined) {
+            throw new Error("CI must be able to bind a loopback port for the shutdown tests");
+        }
+    });
     let service: RelayService | undefined;
     let server: ReturnType<typeof createNodeRelayServer> | undefined;
 
@@ -108,7 +116,10 @@ describeBound("Node relay graceful shutdown", () => {
         };
     }
 
-    it("finishes promptly when the service closes its streams after the listener stops", async () => {
+    it("finishes promptly when the service closes its streams after the listener stops", async (context) => {
+        if (!bindable) {
+            context.skip();
+        }
         const { reader, stopped } = await startWithOpenStream();
         // A generous grace so only the ordering, never the forced-close
         // backstop, can be what lets this finish.
@@ -126,7 +137,10 @@ describeBound("Node relay graceful shutdown", () => {
         expect(done).toBe(true);
     });
 
-    it("destroys a stream that outlives the shutdown grace period", async () => {
+    it("destroys a stream that outlives the shutdown grace period", async (context) => {
+        if (!bindable) {
+            context.skip();
+        }
         const { reader, stopped } = await startWithOpenStream();
         // Nothing closes the subscription here, so only the grace deadline can
         // end this shutdown.
