@@ -45,6 +45,15 @@ least recently used, and rejects a counter it has already accepted. A sender
 rotates to a fresh random stream identifier — and therefore a fresh key — long
 before its counter could wrap.
 
+Evicting a stream keeps its high-water counter as a tombstone, bounded at 64
+per sender, so flushing the live table does not reopen a retired stream's
+frames to replay. The residual is deliberate and worth knowing: replaying one
+stream requires first evicting its tombstone, which takes 8 live plus 64
+retired — 73 validly signed stream identifiers from that same authenticated
+sender. Tombstones are keyed by the authenticated leaf, so no other member can
+flush them. That is bounded memory bought at a much higher replay bar, not
+replay protection that never expires.
+
 The random per-instance stream identifier is what makes an in-memory counter
 safe. A restarted sender picks a new identifier and a new key, so a nonce is
 never reused across restarts, and no counter is ever written to disk.
@@ -53,5 +62,11 @@ never reused across restarts, and no counter is ever written to disk.
 
 `open()` returns a drop reason rather than throwing. This channel is lossy by
 construction, so a forged, stale, replayed, or malformed frame is a routine
-event that the caller counts. A frame naming a different epoch reports that
-epoch, which is the earliest warning available that membership changed.
+event that the caller counts.
+
+The signature is checked before the epoch is read. A frame naming a different
+epoch reports that epoch, which is the earliest warning available that
+membership changed — and precisely because an application reacts to it, it is
+only ever reported for a frame that verified under a leaf key of the current
+epoch. Nothing reachable before the signature check allocates keyed state or
+names an epoch.

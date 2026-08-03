@@ -362,23 +362,35 @@ describe("shared session ephemeral channel", () => {
         wellFormedHeader.fill(0xff, 2, 10);
         // Claim the friend's leaf, whose signature key the owner does know.
         wellFormedHeader[11] = 1;
-        const hostile = [
-            new Uint8Array(0),
-            new Uint8Array(7).fill(0xff),
-            new Uint8Array(36 + 64).fill(0xaa),
-            wellFormedHeader,
-            new Uint8Array([...wellFormedHeader, ...new Uint8Array(64).fill(3)]),
-            new Uint8Array(MAX_SHARED_SESSION_EPHEMERAL_BYTES * 2).fill(0x5a),
+        const hostile: readonly { readonly bytes: Uint8Array; readonly reason: string }[] = [
+            { bytes: new Uint8Array(0), reason: "malformed" },
+            { bytes: new Uint8Array(7).fill(0xff), reason: "malformed" },
+            { bytes: new Uint8Array(36 + 64).fill(0xaa), reason: "malformed" },
+            // A valid header with no room for a signature is short, not signed.
+            { bytes: wellFormedHeader, reason: "malformed" },
+            // The vector that matters: a syntactically perfect header naming a
+            // known leaf and an absurd epoch, with a garbage signature. It must
+            // fail on authentication, never on its epoch.
+            {
+                bytes: new Uint8Array([...wellFormedHeader, ...new Uint8Array(64).fill(3)]),
+                reason: "authentication",
+            },
+            {
+                bytes: new Uint8Array(MAX_SHARED_SESSION_EPHEMERAL_BYTES * 2).fill(0x5a),
+                reason: "malformed",
+            },
         ];
-        for (const bytes of hostile) {
-            fanout.inject(topic, bytes);
+        for (const vector of hostile) {
+            fanout.inject(topic, vector.bytes);
         }
         await settle();
 
         expect(ownerSeen.frames).toHaveLength(0);
         // Nothing unauthenticated is allowed to claim an epoch.
         expect(ownerSeen.epochChanges).toHaveLength(0);
-        expect(ownerSeen.drops.length).toBeGreaterThanOrEqual(hostile.length);
+        expect(ownerSeen.drops.map((drop) => drop.reason).sort()).toEqual(
+            hostile.map((vector) => vector.reason).sort(),
+        );
 
         // The channel is still live and still carries a real frame.
         friendChannel.send(utf8Encode("still here"));

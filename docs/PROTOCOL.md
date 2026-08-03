@@ -493,7 +493,10 @@ growing, and a forged, stale, replayed, or malformed frame is a counted drop
 rather than an error. Ordering holds per sender only. An authenticated frame
 naming a different epoch is reported as an epoch change, which is the earliest
 available warning that membership moved; adopting a Commit locally rekeys the
-channel at once and discards anything still queued under the old epoch. Only
+channel at once and discards anything still queued under the old epoch. That
+warning is an optimization rather than a guarantee — a Commit which blanks a
+peer's leaf silences it outright instead of reporting an epoch, so durable
+sync remains the backstop. Only
 application data travels here: every other header type byte is rejected, so no
 frame is ever accepted and then silently discarded.
 

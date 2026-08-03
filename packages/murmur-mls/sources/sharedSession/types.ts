@@ -141,6 +141,11 @@ export interface SharedSessionEphemeralDrop {
  * membership Commit happened and that in-flight ephemeral traffic is already
  * void. Nothing unauthenticated can raise this, because a frame's epoch is
  * only read after its signature checks out.
+ *
+ * The signal is an optimization, not a guarantee. It requires the peer to
+ * still hold the same leaf and signature key in the local epoch, so a Commit
+ * that blanks that leaf silences the peer entirely rather than reporting its
+ * epoch. That failure is closed, and a durable sync remains the backstop.
  */
 export interface SharedSessionEphemeralEpochChange {
     readonly reason: "local-commit" | "peer-ahead" | "peer-behind";
