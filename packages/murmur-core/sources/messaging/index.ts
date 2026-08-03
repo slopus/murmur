@@ -52,6 +52,7 @@ export {
     MAX_FILE_BYTES,
     MAX_MESSAGE_ATTACHMENTS,
     MAX_MESSAGE_BYTES,
+    validatePrivateMessageId,
 } from "./impl/messageCodec.js";
 export type {
     AcceptedPrivateMessage,
@@ -97,6 +98,30 @@ export function privateMessageListElementId(
     });
     try {
         return `message:${encodeBase64Url(hashBytes(preimage))}`;
+    } finally {
+        zeroBytes(preimage);
+    }
+}
+
+/**
+ * Derive the distinct retained self-copy ID for sender history recovery.
+ *
+ * Binding the peer identity prevents a valid self-sealed copy from being
+ * attributed to another pairwise topic during permanent-list backfill.
+ */
+export function privateMessageSelfListElementId(
+    sender: Pick<IdentityPublicKeys, "signingKey">,
+    peer: Pick<IdentityPublicKeys, "signingKey">,
+    message: Pick<PrivateMessage, "id">,
+): string {
+    const preimage = canonicalJsonBytes({
+        context: "murmur/private-message-self-list-element/v1",
+        id: message.id,
+        peer: encodeBase64Url(peer.signingKey),
+        sender: encodeBase64Url(sender.signingKey),
+    });
+    try {
+        return `self-message:${encodeBase64Url(hashBytes(preimage))}`;
     } finally {
         zeroBytes(preimage);
     }
@@ -358,6 +383,45 @@ export async function acceptPrivateMessageFromContact(
     advanceCursor?: (transaction: StoreTransaction) => Promise<void>,
 ): Promise<AcceptedPrivateMessage> {
     const opened = decryptPrivateMessageFromContact(recipient, encrypted);
+    return store.transaction(async (transaction) =>
+        acceptOpenedPrivateMessageInTransaction(
+            transaction,
+            recipient,
+            opened,
+            persist,
+            advanceCursor,
+        ),
+    );
+}
+
+/**
+ * Authenticate a direct message, then apply its replay decision inside an
+ * existing transaction such as `MurmurClient.loadTopic()`.
+ */
+export async function acceptPrivateMessageFromContactInTransaction(
+    transaction: StoreTransaction,
+    recipient: IdentityKeyPair,
+    encrypted: EncryptedPrivateMessage,
+    persist: (transaction: StoreTransaction, opened: OpenedPrivateMessage) => Promise<void>,
+    advanceCursor?: (transaction: StoreTransaction) => Promise<void>,
+): Promise<AcceptedPrivateMessage> {
+    const opened = decryptPrivateMessageFromContact(recipient, encrypted);
+    return acceptOpenedPrivateMessageInTransaction(
+        transaction,
+        recipient,
+        opened,
+        persist,
+        advanceCursor,
+    );
+}
+
+async function acceptOpenedPrivateMessageInTransaction(
+    transaction: StoreTransaction,
+    recipient: IdentityKeyPair,
+    opened: OpenedPrivateMessage,
+    persist: (transaction: StoreTransaction, opened: OpenedPrivateMessage) => Promise<void>,
+    advanceCursor?: (transaction: StoreTransaction) => Promise<void>,
+): Promise<AcceptedPrivateMessage> {
     let messageBytes: Uint8Array | undefined;
     let messageIdBytes: Uint8Array | undefined;
     let messageIdDigest: Uint8Array | undefined;
@@ -379,21 +443,18 @@ export async function acceptPrivateMessageFromContact(
             version: 1,
         });
         replayRecord = record;
-        const status = await store.transaction(async (transaction) => {
-            const existing = await transaction.get(replayKey);
-            let decision: "opened" | "duplicate";
-            if (existing === undefined) {
-                await persist(transaction, opened);
-                await transaction.set(replayKey, record.slice());
-                decision = "opened";
-            } else if (equalBytes(existing, record)) {
-                decision = "duplicate";
-            } else {
-                throw new DirectMessageIdCollisionError();
-            }
-            await advanceCursor?.(transaction);
-            return decision;
-        });
+        const existing = await transaction.get(replayKey);
+        let status: "opened" | "duplicate";
+        if (existing === undefined) {
+            await persist(transaction, opened);
+            await transaction.set(replayKey, record.slice());
+            status = "opened";
+        } else if (equalBytes(existing, record)) {
+            status = "duplicate";
+        } else {
+            throw new DirectMessageIdCollisionError();
+        }
+        await advanceCursor?.(transaction);
         const accepted: AcceptedPrivateMessage = {
             ...opened,
             status,
@@ -489,10 +550,11 @@ export function createPrivateMessage(
     text: string,
     attachments: readonly EncryptedFileDescriptor[] = [],
     now: number = Date.now(),
+    id: string = encodeBase64Url(randomBytes(24)),
 ): PrivateMessage {
     const message: PrivateMessage = {
         version: 1,
-        id: encodeBase64Url(randomBytes(24)),
+        id,
         sentAt: now,
         text,
         attachments: [...attachments],

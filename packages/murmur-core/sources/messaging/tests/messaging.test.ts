@@ -15,6 +15,7 @@ import {
     encryptFile,
     encryptPrivateMessageForContact,
     privateMessageListElementId,
+    privateMessageSelfListElementId,
     type OpenedPrivateMessage,
 } from "../index.js";
 
@@ -58,6 +59,16 @@ describe("private message content", () => {
         expect(decodePrivateMessage(encodePrivateMessage(message))).toEqual(message);
     });
 
+    it("accepts a caller-owned canonical ID and strictly rejects malformed IDs", () => {
+        const id = "A".repeat(32);
+        expect(createPrivateMessage("retry", [], 42, id).id).toBe(id);
+        for (const invalid of ["short", `${"A".repeat(31)}=`, "A".repeat(33)]) {
+            expect(() => createPrivateMessage("invalid", [], 42, invalid)).toThrow(
+                "private message",
+            );
+        }
+    });
+
     it("rejects more than 64 attachments", () => {
         const file = encryptFile(new Uint8Array(), { name: "empty" });
 
@@ -99,6 +110,12 @@ describe("direct private messages", () => {
         );
         expect(privateMessageListElementId(bob, message)).not.toBe(
             privateMessageListElementId(alice, message),
+        );
+        expect(privateMessageSelfListElementId(alice, bob, message)).not.toBe(
+            privateMessageListElementId(alice, message),
+        );
+        expect(privateMessageSelfListElementId(alice, bob, message)).not.toBe(
+            privateMessageSelfListElementId(alice, generateIdentityKeyPair(), message),
         );
     });
 

@@ -58,16 +58,17 @@ subscription or recipient queue state.
 
 Domain APIs are exported from the package root and matching subpaths:
 
-| Import                     | Main API                                                                                  |
-| -------------------------- | ----------------------------------------------------------------------------------------- |
-| `@slopus/murmur/client`    | `MurmurClient`, `SyncResult`, `ReceivedEvent`, `PublishResult`, retained outbox retries   |
-| `@slopus/murmur/crypto`    | Ed25519/X25519 identities, sealed boxes, signing, hashing, secret destruction             |
-| `@slopus/murmur/identity`  | identity tokens, public first-contact inbox, `pairwiseTopic`, profiles, `ContactBook`     |
-| `@slopus/murmur/messaging` | direct-message/file encryption, stable list IDs, atomic replay/cursor acceptance          |
-| `@slopus/murmur/mls`       | epochs, KeyPackages, Welcome, TreeKEM Commits, applications, and `MlsGroupChannel`        |
-| `@slopus/murmur/transport` | fixed relay types, canonical signed events, `HttpRelayTransport`, snapshot/list/log reads |
-| `@slopus/murmur/storage`   | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                    |
-| `@slopus/murmur/document`  | convergent shared-text operations                                                         |
+| Import                      | Main API                                                                                  |
+| --------------------------- | ----------------------------------------------------------------------------------------- |
+| `@slopus/murmur/client`     | `MurmurClient`, `SyncResult`, `ReceivedEvent`, `PublishResult`, retained outbox retries   |
+| `@slopus/murmur/crypto`     | Ed25519/X25519 identities, sealed boxes, signing, hashing, secret destruction             |
+| `@slopus/murmur/identity`   | identity tokens, first-contact inbox, `pairwiseTopic`, profiles, `FriendBook`             |
+| `@slopus/murmur/messaging`  | direct-message/file encryption, stable list IDs, atomic replay/cursor acceptance          |
+| `@slopus/murmur/mls`        | epochs, KeyPackages, Welcome, TreeKEM Commits, applications, and `MlsGroupChannel`        |
+| `@slopus/murmur/transport`  | fixed relay types, canonical signed events, `HttpRelayTransport`, snapshot/list/log reads |
+| `@slopus/murmur/storage`    | `MurmurStore`, `StoreTransaction`, `MemoryMurmurStore`                                    |
+| `@slopus/murmur/document`   | convergent shared-text operations                                                         |
+| `@slopus/murmur/directChat` | text DM engine, two-copy history, retry, backfill, replay, and quarantine                 |
 
 The core client surface is:
 
@@ -122,10 +123,17 @@ the relay still sees event authors, timing, and ciphertext sizes.
 
 ## Messages and files
 
-Sending a chat message publishes one event with an `append` list operation
-whose bytes are the same end-to-end encrypted envelope. The stable element ID
-is author-scoped and derived from the application message ID. Full history is
-the permanent list; the event log is only for incremental updates.
+`DirectChat.sendText()` publishes one event with a recipient-sealed permanent
+element and a separately domain-separated, peer-bound self-sealed element. The
+latter recovers the owner's outgoing history on a fresh device. Each
+participant opens only its authorized copy, and durable logical replay records
+collapse copies from multiple relays. Its public send surface is text-only;
+existing attachment descriptors remain wire-decodable for compatibility.
+
+`FriendBook` retains authenticated identity/profile records permanently.
+Removal changes status instead of deleting the record, and saving an updated
+authenticated profile reactivates it without changing `addedAt`. `ContactBook`
+remains as a compatibility view for existing callers.
 
 `acceptPrivateMessageFromContact()` authenticates and decrypts the envelope,
 then commits the application record, message replay marker, and optional cursor

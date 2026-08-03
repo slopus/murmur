@@ -3,6 +3,7 @@ import { generateIdentityKeyPair, hashBytes } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import {
     ContactBook,
+    FriendBook,
     decryptContactProfile,
     encryptProfileForContact,
     identityInboxTopic,
@@ -147,6 +148,66 @@ describe("identity profiles", () => {
         ).rejects.toThrow("32 bytes");
         await expect(aliceContacts.get({ signingKey: new Uint8Array() })).rejects.toThrow(
             "32 bytes",
+        );
+    });
+
+    it("retains removed friends and reactivates them without changing addedAt", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        const friends = new FriendBook(alice, store);
+        const opened = {
+            identity: bob,
+            profile: { name: "Bob" },
+        };
+
+        const added = await friends.save(opened, 10);
+        const removed = await friends.remove(bob, 20);
+
+        expect(added).toMatchObject({
+            addedAt: 10,
+            updatedAt: 10,
+            status: "active",
+            statusUpdatedAt: 10,
+        });
+        expect(removed).toMatchObject({
+            addedAt: 10,
+            updatedAt: 10,
+            status: "removed",
+            statusUpdatedAt: 20,
+        });
+        expect(await friends.get(bob)).toBeUndefined();
+        expect(await friends.list()).toEqual([]);
+        expect((await friends.get(bob, { includeRemoved: true }))?.profile.name).toBe("Bob");
+
+        const reactivated = await friends.save({ ...opened, profile: { name: "Bobby" } }, 30);
+        expect(reactivated).toMatchObject({
+            addedAt: 10,
+            updatedAt: 30,
+            status: "active",
+            statusUpdatedAt: 30,
+        });
+        expect((await friends.list())[0]?.profile.name).toBe("Bobby");
+        await expect(friends.remove(bob, 29)).rejects.toThrow("backwards");
+    });
+
+    it("strictly rejects corrupt durable friend lifecycle values", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        const friends = new FriendBook(alice, store);
+        await friends.save({ identity: bob, profile: { name: "Bob" } }, 10);
+        const key = [...(await store.list("identity/")).keys()][0];
+        if (key === undefined) {
+            throw new Error("Expected one durable friend");
+        }
+        const value = (await store.get(key)) ?? new Uint8Array();
+        const corrupt = JSON.parse(new TextDecoder().decode(value)) as Record<string, unknown>;
+        corrupt.unexpected = true;
+        await store.set(key, new TextEncoder().encode(JSON.stringify(corrupt)));
+
+        await expect(friends.get(bob, { includeRemoved: true })).rejects.toThrow(
+            "persisted friend",
         );
     });
 });

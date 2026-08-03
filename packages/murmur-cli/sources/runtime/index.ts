@@ -1,21 +1,18 @@
 import {
-    ContactBook,
-    DirectMessageIdCollisionError,
+    DirectChat,
+    FriendBook,
     MAX_FILE_BYTES,
     MAX_MESSAGE_ATTACHMENTS,
     MAX_RELAY_EVENT_PAYLOAD_BYTES,
     MurmurClient,
-    acceptPrivateMessageFromContact,
     createPrivateMessage,
     createRelayEvent,
     createDocumentDelete,
     createDocumentInsert,
     createDocumentOperationId,
     decodeBase64Url,
-    decodeEncryptedPrivateMessage,
     decryptContactProfile,
     decryptFile,
-    decryptPrivateMessageFromContact,
     destroyIdentity,
     encodeBase64Url,
     encodeEncryptedPrivateMessage,
@@ -36,6 +33,8 @@ import {
     validateIdentityProfile,
     zeroBytes,
     type Contact,
+    type DirectChatMessage,
+    type FriendRecord,
     type DocumentOperation,
     type DocumentOperationId,
     type IdentityProfile,
@@ -134,6 +133,7 @@ export type {
 const ACCOUNT_KEY = "cli/account/v1";
 const MESSAGE_PREFIX = "cli/messages/v1";
 const MESSAGE_SEQUENCE_PREFIX = "cli/message-sequence/v1";
+const DIRECT_MESSAGE_INDEX_PREFIX = "cli/direct-message-index/v1";
 const OUTBOUND_PREFIX = "cli/outbound/v1";
 const OUTBOUND_BLOB_PREFIX = "cli/outbound-blobs/v1";
 const QUARANTINE_PREFIX = "cli/quarantine/v1";
@@ -225,6 +225,10 @@ function messageKey(ownerId: string, stored: CliStoredMessage): string {
     return `${MESSAGE_PREFIX}/${ownerId}/${stored.sequence
         .toString()
         .padStart(16, "0")}/${stored.conversationId}/${stored.message.id}/${stored.direction}`;
+}
+
+function directMessageIndexKey(ownerId: string, conversationId: string, id: string): string {
+    return `${DIRECT_MESSAGE_INDEX_PREFIX}/${ownerId}/${conversationId}/${id}`;
 }
 
 async function persistStoredMessage(
@@ -492,7 +496,9 @@ export class MurmurCliRuntime {
     readonly #transports: readonly RelayTransport[];
     #account: CliAccount | undefined;
     #client: MurmurClient | undefined;
-    #contacts: ContactBook | undefined;
+    #contacts: FriendBook | undefined;
+    #directChat: DirectChat | undefined;
+    #stagedDirectGroups: { readonly id: string; readonly group: LoadedCliGroup }[] = [];
     readonly #groups = new Map<string, LoadedCliGroup>();
     readonly #removedGroups = new Set<string>();
     readonly #pendingGroupPublications = new Map<string, PendingCliGroupPublication>();
@@ -511,6 +517,7 @@ export class MurmurCliRuntime {
             const services = this.#createAccountServices(account);
             this.#client = services.client;
             this.#contacts = services.contacts;
+            this.#directChat = services.directChat;
         }
     }
 
@@ -577,6 +584,7 @@ export class MurmurCliRuntime {
             this.#account = account;
             this.#client = services.client;
             this.#contacts = services.contacts;
+            this.#directChat = services.directChat;
             return this.publicIdentity();
         } catch (error: unknown) {
             destroyIdentity(account.identity);
@@ -1143,6 +1151,11 @@ export class MurmurCliRuntime {
         const account = this.#requireAccount();
         validateAttachments(attachments);
         const contact = await this.#resolveContact(recipientValue);
+        if (attachments.length === 0) {
+            return (
+                await this.#requireDirectChat().sendText(contact.identity, text, { sentAt: now })
+            ).message.id;
+        }
         const encryptedFiles: ReturnType<typeof encryptFile>[] = [];
         let stored: CliStoredMessage | undefined;
         let payload: Uint8Array | undefined;
@@ -1230,15 +1243,12 @@ export class MurmurCliRuntime {
         const client = this.#requireClient();
         const ownerId = identityId(account.identity);
         await client.subscribe(identityInboxTopic(account.identity));
-        const knownContacts = [...(await this.#requireContacts().list())];
-        await Promise.all(
-            knownContacts.map(async (contact) =>
-                client.subscribe(cliDirectMessageTopic(account.identity, contact.identity)),
-            ),
-        );
+        const knownContacts = [...(await this.#requireContacts().list({ includeRemoved: true }))];
+        await this.#requireDirectChat().subscribe();
         await Promise.all(
             [...this.#groups.values()].map(async (group) => group.channel.subscribe(client)),
         );
+        const directRetry = await this.#requireDirectChat().retryPending();
         const retryReport = await client.retryOutboundSettled();
         for (const result of retryReport.results) {
             await this.#completeOutboundMessage(ownerId, result.event.id);
@@ -1248,7 +1258,10 @@ export class MurmurCliRuntime {
         const groupRetryFailures = await this.#flushGroupOutbound(ownerId);
         const retriedOutbound = retryReport.results.length;
         const retryFailures =
-            retryReport.failures.length + applicationRetryFailures + groupRetryFailures;
+            retryReport.failures.length +
+            directRetry.failures.length +
+            applicationRetryFailures +
+            groupRetryFailures;
         let profiles = 0;
         let messages = 0;
         let duplicates = 0;
@@ -1262,12 +1275,36 @@ export class MurmurCliRuntime {
         for (let batch = 0; batch < 625; batch += 1) {
             const syncResult = await client.sync(batch === 0 ? waitMilliseconds : 0, signal);
             if (syncResult.status === "reset") {
-                const reset = syncResult.resets[0];
-                throw new Error(
-                    reset === undefined
-                        ? "Relay topic reset requires a state reload"
-                        : `Relay topic ${reset.topic} on ${reset.relayId} requires a state reload`,
-                );
+                for (const reset of syncResult.resets) {
+                    const friend = knownContacts.find(
+                        (candidate) =>
+                            cliDirectMessageTopic(account.identity, candidate.identity) ===
+                            reset.topic,
+                    );
+                    if (friend === undefined) {
+                        throw new Error(
+                            `Relay topic ${reset.topic} on ${reset.relayId} requires a state reload`,
+                        );
+                    }
+                    this.#stagedDirectGroups = [];
+                    try {
+                        const recovered = await this.#requireDirectChat().recoverReset(reset);
+                        messages += recovered.opened.length;
+                        duplicates += recovered.duplicates;
+                        quarantined += recovered.quarantined;
+                        for (const acceptedGroup of this.#takeStagedDirectGroups()) {
+                            this.#groups.set(acceptedGroup.id, acceptedGroup.group);
+                            await acceptedGroup.group.channel.subscribe(client);
+                            invitations += 1;
+                        }
+                    } catch (error: unknown) {
+                        for (const staged of this.#takeStagedDirectGroups()) {
+                            staged.group.channel.destroy();
+                        }
+                        throw error;
+                    }
+                }
+                continue;
             }
             const deliveries = syncResult.events;
             if (deliveries.length === 0) {
@@ -1302,12 +1339,13 @@ export class MurmurCliRuntime {
                         continue;
                     }
                     try {
+                        let saved: FriendRecord | undefined;
                         let encodedKeyPackage: Uint8Array | undefined;
                         if (keyPackage !== undefined) {
                             encodedKeyPackage = encodeMlsKeyPackage(keyPackage);
                         }
                         try {
-                            const saved = await this.#store.transaction(async (transaction) => {
+                            saved = await this.#store.transaction(async (transaction) => {
                                 const contact = await this.#requireContacts().saveInTransaction(
                                     transaction,
                                     opened,
@@ -1321,24 +1359,26 @@ export class MurmurCliRuntime {
                                 await delivery.advanceCursor(transaction);
                                 return contact;
                             });
-                            if (
-                                !knownContacts.some((contact) =>
-                                    equalBytes(
-                                        contact.identity.signingKey,
-                                        saved.identity.signingKey,
-                                    ),
-                                )
-                            ) {
-                                knownContacts.push(saved);
-                            }
                         } finally {
                             if (encodedKeyPackage !== undefined) {
                                 zeroBytes(encodedKeyPackage);
                             }
                         }
-                        await client.subscribe(
-                            cliDirectMessageTopic(account.identity, opened.identity),
-                        );
+                        if (saved === undefined) {
+                            throw new Error("Authenticated friend was not persisted");
+                        }
+                        const persistedFriend = saved;
+                        if (
+                            !knownContacts.some((contact) =>
+                                equalBytes(
+                                    contact.identity.signingKey,
+                                    persistedFriend.identity.signingKey,
+                                ),
+                            )
+                        ) {
+                            knownContacts.push(persistedFriend);
+                        }
+                        await this.#requireDirectChat().subscribeFriend(persistedFriend);
                         profiles += 1;
                     } catch {
                         deferred += 1;
@@ -1358,79 +1398,29 @@ export class MurmurCliRuntime {
                         cliDirectMessageTopic(account.identity, contact.identity),
                 );
                 if (directContact !== undefined) {
+                    this.#stagedDirectGroups = [];
                     try {
-                        const encrypted = decodeEncryptedPrivateMessage(delivery.event.payload);
-                        const validated = decryptPrivateMessageFromContact(
-                            account.identity,
-                            encrypted,
-                        );
-                        clearMessageSecrets(validated);
-                    } catch {
-                        await this.#quarantine(ownerId, delivery, "invalid-private-message");
-                        quarantined += 1;
-                        continue;
-                    }
-                    let accepted:
-                        | Awaited<ReturnType<typeof acceptPrivateMessageFromContact>>
-                        | undefined;
-                    let acceptedGroup:
-                        | { readonly id: string; readonly group: LoadedCliGroup }
-                        | undefined;
-                    try {
-                        accepted = await acceptPrivateMessageFromContact(
-                            this.#store,
-                            account.identity,
-                            decodeEncryptedPrivateMessage(delivery.event.payload),
-                            async (transaction, opened): Promise<void> => {
-                                const invitation = decodeCliGroupInvitation(opened.message.text);
-                                if (invitation !== undefined) {
-                                    acceptedGroup = await this.#acceptGroupInvitation(
-                                        transaction,
-                                        opened.identity,
-                                        invitation,
-                                    );
-                                }
-                                const stored: CliStoredMessage = {
-                                    sequence: await nextMessageSequence(transaction, ownerId),
-                                    direction: "incoming",
-                                    conversationId: identityId(opened.identity),
-                                    status: "received",
-                                    message: opened.message,
-                                };
-                                await persistStoredMessage(
-                                    transaction,
-                                    messageKey(identityId(account.identity), stored),
-                                    stored,
-                                );
-                            },
-                            delivery.advanceCursor,
-                        );
-                        if (acceptedGroup !== undefined) {
+                        const accepted = await this.#requireDirectChat().handleEvent(delivery);
+                        if (accepted.status === "unhandled") {
+                            throw new Error("DirectChat did not recognize a known pairwise topic");
+                        }
+                        for (const acceptedGroup of this.#takeStagedDirectGroups()) {
                             this.#groups.set(acceptedGroup.id, acceptedGroup.group);
                             await acceptedGroup.group.channel.subscribe(client);
+                            invitations += 1;
                         }
                         if (accepted.status === "opened") {
                             messages += 1;
-                            if (acceptedGroup !== undefined) {
-                                invitations += 1;
-                            }
-                        } else {
+                        } else if (accepted.status === "duplicate") {
                             duplicates += 1;
-                        }
-                    } catch (error: unknown) {
-                        if (error instanceof DirectMessageIdCollisionError) {
-                            await this.#quarantine(ownerId, delivery, "private-message-collision");
-                            quarantined += 1;
                         } else {
-                            deferred += 1;
+                            quarantined += 1;
                         }
-                        if (acceptedGroup !== undefined && !this.#groups.has(acceptedGroup.id)) {
-                            acceptedGroup.group.channel.destroy();
+                    } catch {
+                        for (const staged of this.#takeStagedDirectGroups()) {
+                            staged.group.channel.destroy();
                         }
-                    } finally {
-                        if (accepted !== undefined) {
-                            clearMessageSecrets(accepted);
-                        }
+                        deferred += 1;
                     }
                     continue;
                 }
@@ -2441,6 +2431,78 @@ export class MurmurCliRuntime {
         });
     }
 
+    async #persistDirectChatMessage(
+        transaction: StoreTransaction,
+        surfaced: DirectChatMessage,
+    ): Promise<void> {
+        const account = this.#requireAccount();
+        const ownerId = identityId(account.identity);
+        const conversationId = identityId(surfaced.friend);
+        if (surfaced.direction === "incoming") {
+            const invitation = decodeCliGroupInvitation(surfaced.message.text);
+            if (invitation !== undefined) {
+                this.#stagedDirectGroups.push(
+                    await this.#acceptGroupInvitation(transaction, surfaced.sender, invitation),
+                );
+            }
+        }
+        const stored: CliStoredMessage = {
+            sequence: await nextMessageSequence(transaction, ownerId),
+            direction: surfaced.direction,
+            conversationId,
+            status:
+                surfaced.direction === "incoming"
+                    ? "received"
+                    : surfaced.source === "local-send"
+                      ? "pending"
+                      : "sent",
+            message: surfaced.message,
+        };
+        const key = messageKey(ownerId, stored);
+        await persistStoredMessage(transaction, key, stored);
+        await transaction.set(
+            directMessageIndexKey(ownerId, conversationId, surfaced.message.id),
+            utf8Encode(key),
+        );
+    }
+
+    async #markDirectChatMessagePublished(
+        transaction: StoreTransaction,
+        surfaced: DirectChatMessage,
+    ): Promise<void> {
+        const ownerId = identityId(this.#requireAccount().identity);
+        const conversationId = identityId(surfaced.friend);
+        const index = await transaction.get(
+            directMessageIndexKey(ownerId, conversationId, surfaced.message.id),
+        );
+        if (index === undefined) {
+            throw new Error("CLI direct-chat history index is missing");
+        }
+        const key = utf8Decode(index);
+        if (!key.startsWith(`${MESSAGE_PREFIX}/${ownerId}/`)) {
+            throw new Error("Invalid CLI direct-chat history index");
+        }
+        const encoded = await transaction.get(key);
+        if (encoded === undefined) {
+            throw new Error("CLI direct-chat history record is missing");
+        }
+        const stored = decodeCliStoredMessage(encoded);
+        try {
+            if (
+                stored.direction !== "outgoing" ||
+                stored.conversationId !== conversationId ||
+                stored.message.id !== surfaced.message.id
+            ) {
+                throw new Error("CLI direct-chat history index does not match its message");
+            }
+            await persistStoredMessage(transaction, key, { ...stored, status: "sent" });
+        } finally {
+            clearMessageSecrets(stored);
+            zeroBytes(index);
+            zeroBytes(encoded);
+        }
+    }
+
     async #quarantine(ownerId: string, delivery: ReceivedEvent, reason: string): Promise<void> {
         const eventBytes = encodeSignedRelayEventWire(delivery.event);
         const fingerprint = encodeBase64Url(hashBytes(eventBytes));
@@ -2493,6 +2555,7 @@ export class MurmurCliRuntime {
         this.#account = undefined;
         this.#client = undefined;
         this.#contacts = undefined;
+        this.#directChat = undefined;
     }
 
     async #resolveContact(value: string): Promise<Contact> {
@@ -2510,15 +2573,30 @@ export class MurmurCliRuntime {
 
     #createAccountServices(account: CliAccount): {
         readonly client: MurmurClient;
-        readonly contacts: ContactBook;
+        readonly contacts: FriendBook;
+        readonly directChat: DirectChat;
     } {
+        const client = new MurmurClient({
+            identity: account.identity,
+            store: this.#store,
+            transports: this.#transports,
+        });
+        const contacts = new FriendBook(account.identity, this.#store);
         return {
-            client: new MurmurClient({
+            client,
+            contacts,
+            directChat: new DirectChat({
                 identity: account.identity,
+                client,
+                friends: contacts,
                 store: this.#store,
-                transports: this.#transports,
+                callbacks: {
+                    persistMessage: async (transaction, surfaced) =>
+                        this.#persistDirectChatMessage(transaction, surfaced),
+                    messagePublished: async (transaction, surfaced) =>
+                        this.#markDirectChatMessagePublished(transaction, surfaced),
+                },
             }),
-            contacts: new ContactBook(account.identity, this.#store),
         };
     }
 
@@ -2536,10 +2614,26 @@ export class MurmurCliRuntime {
         return this.#client;
     }
 
-    #requireContacts(): ContactBook {
+    #requireContacts(): FriendBook {
         if (this.#contacts === undefined) {
             throw new Error("No Murmur identity; run `murmur sign-in` first");
         }
         return this.#contacts;
+    }
+
+    #requireDirectChat(): DirectChat {
+        if (this.#directChat === undefined) {
+            throw new Error("No Murmur identity; run `murmur sign-in` first");
+        }
+        return this.#directChat;
+    }
+
+    #takeStagedDirectGroups(): readonly {
+        readonly id: string;
+        readonly group: LoadedCliGroup;
+    }[] {
+        const staged = this.#stagedDirectGroups;
+        this.#stagedDirectGroups = [];
+        return staged;
     }
 }

@@ -10,6 +10,10 @@ application message ID, so retained publication retries cannot append a second
 copy. New devices load `readState` and every `readList` page before following
 the bounded event log.
 
+The higher-level `directChat` module adds a peer-bound self-sealed element with
+a separate domain and prefix. This messaging module keeps the version-one
+envelope and attachment descriptor codecs unchanged.
+
 `acceptPrivateMessageFromContact()` commits the application record, replay
 marker, and optional relay cursor in one `MurmurStore` transaction. It returns
 `"opened"` or `"duplicate"`; authenticated same-ID content collisions throw and

@@ -248,6 +248,26 @@ one appended permanent list element. Its list ID is:
 That stable author-scoped list ID prevents a retained publication retry from
 creating a second message history element.
 
+Text sends managed by `DirectChat` append a second version-one envelope sealed
+to the sender's own long-term X25519 key. It is stored on the same pairwise
+topic, but never used as the live event payload. Its distinct list ID is:
+
+```text
+"self-message:" + base64url(SHA-256(canonical JSON {
+    context: "murmur/private-message-self-list-element/v1",
+    sender: base64url(sender signing key),
+    peer: base64url(recipient signing key),
+    id: message ID,
+}))
+```
+
+The peer binding prevents a retained self copy from being attributed to a
+different pairwise conversation. The recipient cannot open this copy. A fresh
+sender device can open it, while ignoring the recipient-sealed element. Both
+participants collapse their authorized copy to the same logical message ID, so
+copies repeated by several relays do not duplicate history. Older topics with
+only recipient-sealed elements remain readable by recipients.
+
 ### Direct-message acceptance
 
 `acceptPrivateMessageFromContact()` uses a local replay key scoped to recipient,
@@ -266,6 +286,13 @@ same-ID message whose authenticated content differs raises
 Direct messages do **not** have post-compromise security. A stolen long-term
 recipient X25519 encryption key can open previously recorded direct-message
 sealed boxes and future ones addressed to that key.
+
+`DirectChat` additionally requires the authenticated envelope sender to match
+the friend identity that derives the pairwise topic. Invalid envelopes,
+same-ID/different-content collisions, and messages received while that friend
+is removed are replay-marked and quarantined while the relay cursor advances
+atomically. Applications persist their message row in that same transaction,
+but own all chat, UI, read-state, and presentation semantics.
 
 ## Files and blobs
 

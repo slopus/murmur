@@ -28,7 +28,13 @@ describe("CLI runtime over the fixed relay protocol", () => {
 
     it("exchanges profiles, direct files, groups, removal, and a convergent document", async () => {
         const relayStore = new SqliteRelayStore(":memory:");
-        const service = new RelayService(relayStore, {}, new InProcessWakeSource());
+        let relayNow = Date.now();
+        const service = new RelayService(
+            relayStore,
+            { eventRetentionMilliseconds: 1 },
+            new InProcessWakeSource(),
+            () => relayNow,
+        );
         closeables.push(service);
         const blobRoot = await mkdtemp(join(tmpdir(), "murmur-cli-blobs-"));
         const blobBackend = new LocalBlobBackend({
@@ -46,13 +52,23 @@ describe("CLI runtime over the fixed relay protocol", () => {
             input: RequestInfo | URL,
             init?: RequestInit,
         ): Promise<Response> => handler(new Request(input, init));
+        let aliceOnline = true;
+        const fetchForAlice = async (
+            input: RequestInfo | URL,
+            init?: RequestInit,
+        ): Promise<Response> => {
+            if (!aliceOnline) {
+                throw new Error("Alice relay connection is offline");
+            }
+            return fetchRelay(input, init);
+        };
 
         const aliceStore = new SqliteMurmurStore(":memory:");
         const bobStore = new SqliteMurmurStore(":memory:");
         closeables.push(aliceStore, bobStore);
-        const alice = await MurmurCliRuntime.open({
+        let alice = await MurmurCliRuntime.open({
             store: aliceStore,
-            transports: [new HttpRelayTransport("shared", "https://relay.test", fetchRelay)],
+            transports: [new HttpRelayTransport("shared", "https://relay.test", fetchForAlice)],
         });
         const bob = await MurmurCliRuntime.open({
             store: bobStore,
@@ -78,6 +94,86 @@ describe("CLI runtime over the fixed relay protocol", () => {
         await bob.sync();
         expect((await bob.messages(aliceIdentity.id))[0]?.message.id).toBe(messageId);
         expect(utf8Decode(await bob.attachment(messageId, "note.txt"))).toBe("secret");
+
+        aliceOnline = false;
+        await expect(alice.send(bobIdentity.id, "pending across restart", [], 110)).rejects.toThrow(
+            "rejected",
+        );
+        const pendingId = (await alice.messages(bobIdentity.id)).find(
+            (stored) => stored.message.text === "pending across restart",
+        )?.message.id;
+        expect(pendingId).toBeDefined();
+        runtimes.splice(runtimes.indexOf(alice), 1);
+        alice.destroy();
+        aliceOnline = true;
+        alice = await MurmurCliRuntime.open({
+            store: aliceStore,
+            transports: [new HttpRelayTransport("shared", "https://relay.test", fetchForAlice)],
+        });
+        runtimes.push(alice);
+        await alice.sync();
+        await bob.sync();
+        expect(
+            (await bob.messages(aliceIdentity.id)).filter(
+                (stored) => stored.message.id === pendingId,
+            ),
+        ).toHaveLength(1);
+
+        const replyId = await bob.send(aliceIdentity.id, "reply while Alice is offline", [], 120);
+        await alice.sync();
+        expect(
+            (await alice.messages(bobIdentity.id)).filter(
+                (stored) => stored.message.id === replyId,
+            ),
+        ).toHaveLength(1);
+
+        relayNow += 10;
+        expect((await service.prune()).events).toBeGreaterThan(0);
+        const freshAliceStore = new SqliteMurmurStore(":memory:");
+        const freshBobStore = new SqliteMurmurStore(":memory:");
+        closeables.push(freshAliceStore, freshBobStore);
+        for (const [source, target] of [
+            [aliceStore, freshAliceStore],
+            [bobStore, freshBobStore],
+        ] as const) {
+            for (const [key, value] of await source.list("")) {
+                if (
+                    key === "cli/account/v1" ||
+                    key.startsWith("identity/") ||
+                    (key.startsWith("client/") && key.includes("/identity:"))
+                ) {
+                    await target.set(key, value);
+                }
+            }
+        }
+        const freshAlice = await MurmurCliRuntime.open({
+            store: freshAliceStore,
+            transports: [new HttpRelayTransport("shared", "https://relay.test", fetchRelay)],
+        });
+        const freshBob = await MurmurCliRuntime.open({
+            store: freshBobStore,
+            transports: [new HttpRelayTransport("shared", "https://relay.test", fetchRelay)],
+        });
+        runtimes.push(freshAlice, freshBob);
+        await freshAlice.sync();
+        await freshBob.sync();
+        expect(
+            (await freshAlice.messages(bobIdentity.id))
+                .filter((stored) => stored.message.attachments.length === 0)
+                .map((stored) => [stored.direction, stored.status, stored.message.text]),
+        ).toEqual([
+            ["outgoing", "sent", "pending across restart"],
+            ["incoming", "received", "reply while Alice is offline"],
+        ]);
+        expect(
+            (await freshBob.messages(aliceIdentity.id))
+                .filter((stored) => stored.message.attachments.length === 0)
+                .map((stored) => [stored.direction, stored.status, stored.message.text]),
+        ).toEqual([
+            ["incoming", "received", "pending across restart"],
+            ["outgoing", "sent", "reply while Alice is offline"],
+        ]);
+        relayNow = Date.now();
 
         const groupId = await alice.createGroup("room");
         await alice.inviteToGroup(groupId, bobIdentity.id);

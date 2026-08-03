@@ -48,6 +48,10 @@
             "types": "./dist/document/index.d.ts",
             "import": "./dist/document/index.js"
         },
+        "./directChat": {
+            "types": "./dist/directChat/index.d.ts",
+            "import": "./dist/directChat/index.js"
+        },
         "./identity": {
             "types": "./dist/identity/index.d.ts",
             "import": "./dist/identity/index.js"

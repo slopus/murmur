@@ -22,3 +22,9 @@ ongoing chat:  X25519 shared secret -> pairwise capability topic
 `pairwiseTopic(self, peer)` hashes an X25519 shared secret with a fixed domain
 and both encryption public keys in canonical order. Alice and Bob derive the
 same topic; public identity tokens alone do not reveal it.
+
+`FriendBook` never deletes an authenticated identity/profile record:
+`remove()` changes its status to `removed`, ordinary `get()`/`list()` hide it,
+and `{ includeRemoved: true }` reveals it for gapless protocol handling. Saving
+a later authenticated profile reactivates the friend while preserving
+`addedAt`. `ContactBook` remains the release-compatible active-only adapter.

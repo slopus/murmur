@@ -23,6 +23,17 @@ export const MAX_MESSAGE_BYTES = 1024 * 1024;
 export const MAX_MESSAGE_ATTACHMENTS = 64;
 export const MAX_FILE_BYTES = 64 * 1024 * 1024 - 16;
 
+/** Validate a canonical base64url identifier encoding exactly 24 bytes. */
+export function validatePrivateMessageId(id: string): void {
+    if (!/^[A-Za-z0-9_-]{32}$/.test(id)) {
+        throw new Error("Invalid private message ID");
+    }
+    const decoded = decodeBase64Url(id);
+    if (decoded.length !== 24 || encodeBase64Url(decoded) !== id) {
+        throw new Error("Invalid private message ID");
+    }
+}
+
 function unsafeFileName(name: string): boolean {
     const windowsBaseName = name.split(".")[0]?.toUpperCase() ?? "";
     return (
@@ -114,7 +125,14 @@ function deserializeFileDescriptor(descriptor: unknown): EncryptedFileDescriptor
 export function encodePrivateMessage(message: PrivateMessage): Uint8Array {
     if (
         message.version !== 1 ||
-        !/^[A-Za-z0-9_-]{32}$/.test(message.id) ||
+        (() => {
+            try {
+                validatePrivateMessageId(message.id);
+                return false;
+            } catch {
+                return true;
+            }
+        })() ||
         !Number.isSafeInteger(message.sentAt) ||
         message.sentAt < 0 ||
         message.text.length > MAX_MESSAGE_BYTES ||

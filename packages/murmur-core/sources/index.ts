@@ -1,6 +1,7 @@
 export * from "./client/index.js";
 export * from "./crypto/index.js";
 export * from "./document/index.js";
+export * from "./directChat/index.js";
 export * from "./identity/index.js";
 export * from "./messaging/index.js";
 export * from "./storage/index.js";

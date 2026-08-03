@@ -12,6 +12,7 @@ const packageSpecifiers = [
     "@slopus/murmur/client",
     "@slopus/murmur/crypto",
     "@slopus/murmur/document",
+    "@slopus/murmur/directChat",
     "@slopus/murmur/identity",
     "@slopus/murmur/messaging",
     "@slopus/murmur/mls",

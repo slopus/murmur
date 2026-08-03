@@ -7,6 +7,7 @@ encoding and cryptographic mechanics live below that domain in `impl`.
 index.ts
   |-- client
   |-- crypto
+  |-- directChat
   |-- identity
   |-- storage
   `-- transport

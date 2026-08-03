@@ -36,3 +36,17 @@ export interface Contact {
     readonly addedAt: number;
     readonly updatedAt: number;
 }
+
+/** Durable friend lifecycle state. Records are retained after removal. */
+export type FriendStatus = "active" | "removed";
+
+/** Authenticated identity/profile record retained for the owner's lifetime. */
+export interface FriendRecord extends Contact {
+    readonly status: FriendStatus;
+    readonly statusUpdatedAt: number;
+}
+
+/** Visibility options for friend lookups. Removed records are hidden by default. */
+export interface FriendQuery {
+    readonly includeRemoved?: boolean;
+}

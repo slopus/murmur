@@ -24,8 +24,12 @@ export type {
     IdentityProfile,
     OpenedProfile,
     SerializedPublicIdentity,
+    FriendQuery,
+    FriendRecord,
+    FriendStatus,
 } from "./types.js";
 export { ContactBook } from "./contactBook.js";
+export { FriendBook } from "./friendBook.js";
 
 const MAX_PROFILE_BYTES = 1024 * 1024;
 const MAX_PROFILE_PRIVATE_DATA_BYTES = 256 * 1024;
