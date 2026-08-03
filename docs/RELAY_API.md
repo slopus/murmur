@@ -8,6 +8,10 @@ implementation.
 There are no subscription, recipient, queue-pull, or acknowledgement routes.
 Clients read topics directly using their locally stored cursors.
 
+Two routes carry traffic the relay never stores: `POST .../ephemeral` and
+`GET .../stream`. They add no durable state and no message semantics — the
+relay still cannot tell an ephemeral frame from any other opaque bytes.
+
 ## Conventions
 
 - JSON requests and responses use UTF-8.
@@ -215,6 +219,62 @@ available at the time of the read. With `wait`, the relay may park until a
 publish wake or the timeout, then re-read. Long-poll capacity exhaustion
 returns HTTP 503 with `{"error":"overloaded"}`.
 
+### `POST /v1/topics/:topic/ephemeral`
+
+Delivers opaque bytes to the topic's current stream subscribers **without
+storing anything**. There is no receipt, sequence, idempotency, signature
+check, or topic-existence check, the relay does not parse the body, and topic
+activity is not refreshed. The request body is raw bytes with
+`content-type: application/octet-stream`.
+
+HTTP 200:
+
+```ts
+{
+    delivered: number,
+}
+```
+
+`delivered` counts the stream subscribers on **this relay instance** that the
+frame was enqueued for. It is informational and never a delivery guarantee.
+Frame fan-out is deliberately in-process: `EphemeralFanout` is an extension
+interface, and the default `InProcessEphemeralFanout` does not reach other
+instances.
+
+A body above `maximumEphemeralFrameBytes` returns HTTP 413 `{"error":"limit"}`.
+The route costs `rateLimit.costs.ephemeral`, charged to the request IP only.
+
+### `GET /v1/topics/:topic/stream`
+
+Opens a `text/event-stream` for prompt delivery. This is the low-latency
+counterpart to the 30-second long poll: it exists so a client does not have to
+choose between a stored event and a timely one.
+
+Named events, each carrying one line of `data`:
+
+| event   | data                          | meaning                                      |
+| ------- | ----------------------------- | -------------------------------------------- |
+| `ready` | `{"topic":"<topic>"}`         | the stream is live; always sent first        |
+| `frame` | base64url of the opaque bytes | one ephemeral frame                          |
+| `wake`  | `{}`                          | durable events may be available; sync now    |
+| `drop`  | `{"frames":<n>}`              | the relay dropped `n` frames for this reader |
+
+A `: keepalive` comment is written whenever
+`streamKeepAliveMilliseconds` elapses without traffic. The stream ends when the
+client aborts the request or the service closes.
+
+`wake` is driven by the same signals that already wake long polls — a local
+publish plus `WakeSource.subscribe` — so it keeps working across instances and
+makes durable publishes prompt too.
+
+Each subscriber has a bounded, drop-oldest queue of at most
+`maximumStreamQueueFrames` frames and `maximumStreamQueueBytes` bytes; overflow
+drops the **oldest** frames and emits one coalesced `drop`. At most one `wake`
+is pending per subscriber. The body is pull-driven, so a reader that stops
+reading cannot make the relay accumulate memory beyond that queue. Beyond
+`maximumConcurrentStreams`, the route returns HTTP 503
+`{"error":"overloaded"}`.
+
 ### `POST /v1/blobs/:id/upload-link`
 
 Requests a short-lived upload link for a content-addressed ciphertext blob.
@@ -322,6 +382,10 @@ controls the HTTP page budget separately.
 | Event/list HTTP page response |              8 MiB | An available oversized first item is still returned so pagination cannot stall.                      |
 | Long-poll wait                |               30 s | Hard maximum; lower configuration is allowed.                                                        |
 | Concurrent long polls         | 10,000 per process | Beyond it, reads return 503.                                                                         |
+| Ephemeral frame               |            128 KiB | `maximumEphemeralFrameBytes`; nothing is stored.                                                     |
+| Concurrent streams            | 10,000 per process | `maximumConcurrentStreams`; beyond it, the stream route returns 503.                                 |
+| Stream queue                  |   64 frames, 1 MiB | `maximumStreamQueueFrames`/`maximumStreamQueueBytes`, per subscriber, drop-oldest.                   |
+| Stream keepalive              |               15 s | `streamKeepAliveMilliseconds`; comment written after an idle interval.                               |
 | Event retention               |             7 days | Only event bodies expire.                                                                            |
 | Topic inactivity              |            30 days | Measured from successful publish; dropping a topic removes its snapshot, list, events, and receipts. |
 | Event clock skew              |         ±5 minutes | Validated after signature and receipt lookup.                                                        |
@@ -331,6 +395,7 @@ controls the HTTP page budget separately.
 | Token refill                  |        50 tokens/s | Per key, per process.                                                                                |
 | Token-bucket count            |             50,000 | LRU-bounded map, per process.                                                                        |
 | Publish cost                  |                 25 | Charged to IP and valid event author.                                                                |
+| Ephemeral cost                |                  1 | Charged to IP for one ephemeral frame.                                                               |
 | Upload cost                   |                 10 | Upload-link and local signed upload, charged to IP.                                                  |
 | Read cost                     |                  1 | All other routes, charged to IP.                                                                     |
 
@@ -423,6 +488,23 @@ interface RateLimiter {
 
 Pass one through `RelayHttpOptions.rateLimiter` to replace the in-memory token
 bucket with a shared implementation.
+
+### `EphemeralFanout`
+
+```ts
+interface EphemeralFanout {
+    publish(topic: string, frame: Uint8Array): number;
+    subscribe(topic: string): EphemeralSubscription | undefined;
+    wake(topic: string): void;
+    close(): void;
+}
+```
+
+`subscribe()` returns `undefined` once `maximumConcurrentStreams` is reached.
+The interface is synchronous because frame fan-out is in-process by design,
+which keeps `delivered` exact. Pass an implementation as the fifth
+`RelayService` constructor argument to substitute a shared bus later; `wake`
+already crosses instances through `WakeSource`.
 
 ### `WakeSource`
 

@@ -431,11 +431,15 @@ canonical-JSON Rig payload. Murmur does not interpret roles, tool calls, or
 transcript bodies. Entry replay identity is the share, sequence, event ID, and
 matching content hash; conflicting authenticated content is a protocol error.
 
-The only non-owner application frame is a bounded text post. MLS authenticates
-its peer leaf, while the frame carries the current owner-issued `grantEpoch`
-and caller-stable post ID. The owner deduplicates
-`(share, peer, grantEpoch, postId)` and may later append the post as an ordinary
-opaque Rig entry.
+Non-owner application frames come in two kinds, both authenticated by MLS at
+the peer leaf and both carrying the current owner-issued `grantEpoch` with a
+caller-stable identifier. A **post** is bounded text. A **control** frame is
+bounded opaque canonical JSON, for negotiation that is durable-appropriate but
+is not conversation; the owner deduplicates `(share, peer, grantEpoch, id)` for
+each kind independently. An application which supplies no `persistControl`
+callback accepts no control at all: inbound control is quarantined rather than
+surfaced anywhere. Keeping the two apart is what stops attacker-controlled
+structured data from having to travel as chat text on its way to a model.
 
 Owner-signed state gives each peer a stable `shareMemberId` and increments its
 `grantEpoch` on every re-add. Ended state is keyed by both values, so an old
@@ -449,12 +453,49 @@ chain without a lifetime byte ceiling. Members persist one page at a time,
 track the highest contiguous sequence, and keep a bounded durable live tail
 while backfilling.
 
+### Ephemeral frames
+
+Terminal bytes are wrong to write down: they must not be durable, must not be
+sequenced against transcript entries, and must not wait for a long poll. They
+travel on a separate, non-durable channel over the **same** MLS group.
+
+Key material comes from the RFC 9420 exporter of the group's current epoch
+(`MLS-Exporter("murmur ephemeral channel v1", shareId, 32)`), not from the
+application ratchet, so a frame creates no checkpoint obligation and nothing is
+written to `MurmurStore`. Membership, the owner-only-committer rule, and
+epoch-based revocation therefore apply unchanged, with no second group and no
+second trust root.
+
+One frame is `version(1) | type(1) | epoch(8) | senderLeaf(2) | streamId(16) |
+counter(8)`, then a 64-byte Ed25519 signature by the sender's MLS leaf key,
+then AES-128-GCM ciphertext. The header and the group ID are the AEAD
+associated data. The signature is not redundant: every member of an epoch holds
+the same exported secret, so without it one member could forge another's
+frames. Per-stream keys are derived from `senderLeaf || streamId`, and the
+random per-instance `streamId` is what lets the counter live in memory — a
+restarted sender picks a new stream and therefore a new key, so no nonce is
+reused and no counter is ever stored.
+
+Payloads are bounded at 64 KiB, well under the relay's 1 MiB event payload
+limit. The channel is lossy on purpose: a sender's queue is bounded in both
+frames and bytes and drops its oldest entries under pressure rather than
+growing, and a forged, stale, replayed, or malformed frame is a counted drop
+rather than an error. Ordering holds per sender only. A frame naming a
+different epoch is reported as an epoch change, which is the earliest available
+warning that membership moved; adopting a Commit locally rekeys the channel at
+once and discards anything still queued under the old epoch.
+
+Ephemeral frames are carried by `POST /v1/topics/{topic}/ephemeral` and
+`GET /v1/topics/{topic}/stream`, which store nothing at the relay.
+
 Revocation sends authenticated ended state before the owner Remove Commit.
 Receiving ended state or an MLS removal invokes the application's termination
 callback in the transaction which deletes protocol replica rows and transport
 cursors, then destroys epoch secrets. This is cooperative deletion: plaintext
 or blob keys already saved by a former member cannot be cryptographically
-erased. Later epoch and history-page keys remain inaccessible.
+erased. Later epoch and history-page keys remain inaccessible. Because the
+ephemeral channel is keyed from the same epoch, the Remove Commit also voids
+in-flight ephemeral traffic immediately, without waiting for a durable sync.
 
 ## Shared text documents
 

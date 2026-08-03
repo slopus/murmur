@@ -13,7 +13,7 @@ state and validate the signed event envelope around it.
 ├──────────────────────────────────────────────────────────────────┤
 │ @slopus/murmur                                                   │
 │ identity · contacts · direct messages · files · client cursors   │
-│ shared documents                                                 │
+│ shared documents · topic streams · ephemeral frames              │
 ├──────────────────────────────────────────────────────────────────┤
 │ @slopus/murmur/mls                                               │
 │ MLS epochs · TreeKEM · KeyPackages · Commits · group channel     │
@@ -239,3 +239,31 @@ only reduce latency: a timeout and re-read preserve correctness if a wake is
 lost. SQLite uses in-process wakes. Postgres publishes an in-transaction
 notification and uses a dedicated reconnecting `LISTEN` connection to wake
 waiters on other instances.
+
+## The ephemeral path
+
+A 30-second long poll is correct for a transcript and useless for a keystroke,
+so the relay also offers a path that stores nothing:
+
+```text
+POST /v1/topics/:topic/ephemeral ──► EphemeralFanout ──► GET .../stream
+        opaque bytes, no receipt          bounded            text/event-stream
+        no sequence, no retention         drop-oldest        ready/frame/wake/drop
+```
+
+This does not make the relay less dumb. It allocates no sequence, writes no
+receipt, refreshes no activity timer, and still cannot tell one opaque frame
+from another. Frame fan-out is in-process, behind the substitutable
+`EphemeralFanout` interface; the `wake` event rides the existing `WakeSource`,
+so it crosses instances and makes durable publishes prompt as well.
+
+Every buffer on this path is bounded. A subscriber's queue drops its oldest
+frames and reports the count rather than growing, and the response body is
+pull-driven, so a reader that stalls cannot cost the relay memory beyond that
+queue.
+
+`@slopus/murmur/sharedSession` uses this path for the non-durable side channel
+of a shared agent session. Those frames are keyed from the RFC 9420 exporter of
+the group's _current_ epoch, so they share the group's membership and
+revocation exactly while creating no durability obligation. Confidentiality is
+unchanged: the relay sees opaque bytes here as everywhere else.
