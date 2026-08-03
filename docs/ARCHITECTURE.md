@@ -259,8 +259,12 @@ so it crosses instances and makes durable publishes prompt as well.
 
 Every buffer on this path is bounded. A subscriber's queue drops its oldest
 frames and reports the count rather than growing, and the response body is
-pull-driven, so a reader that stalls cannot cost the relay memory beyond that
-queue.
+pull-driven, so a reader that stalls costs the relay a small constant multiple
+of that queue and never more: a pull drains what is queued while the producer
+refills it, so the true ceiling is about twice the queue bound, not once.
+Subscribers are capped per topic as well as globally, and an ephemeral publish
+is priced by the fan-out it causes, so neither an open stream nor a cheap POST
+is a way to make the relay do unbounded work.
 
 `@slopus/murmur/sharedSession` uses this path for the non-durable side channel
 of a shared agent session. Those frames are keyed from the RFC 9420 exporter of
