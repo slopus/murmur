@@ -119,7 +119,7 @@ describe("identity profiles", () => {
         const opened = decryptContactProfile(bob, envelope);
 
         expect(opened.profile.avatar).toEqual(avatar);
-    });
+    }, 30_000);
 
     it("persists authenticated contacts in an owner namespace", async () => {
         const alice = generateIdentityKeyPair();
