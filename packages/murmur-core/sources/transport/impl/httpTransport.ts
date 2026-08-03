@@ -6,11 +6,16 @@ import type {
     PublishOutcome,
     RelayBlob,
     RelayFetch,
+    RelayStreamHandlers,
     RelayTransport,
     SignedRelayEvent,
     TopicState,
 } from "../types.js";
-import { MAX_RELAY_BLOB_BYTES, RelayBlobIntegrityError } from "../types.js";
+import {
+    MAX_RELAY_BLOB_BYTES,
+    MAX_RELAY_EPHEMERAL_FRAME_BYTES,
+    RelayBlobIntegrityError,
+} from "../types.js";
 import {
     decodeEventPageWire,
     decodeListPageWire,
@@ -71,6 +76,149 @@ async function readBoundedResponse(response: Response, maximumBytes: number): Pr
 const MAXIMUM_PAGE_RESPONSE_BYTES = 32 * 1024 * 1024;
 const MAXIMUM_ERROR_RESPONSE_BYTES = 1_024;
 const MAXIMUM_BLOB_LINK_RESPONSE_BYTES = 16 * 1024;
+const MAXIMUM_EPHEMERAL_RESPONSE_BYTES = 1_024;
+
+/**
+ * Hard cap on the bytes buffered for a single SSE event.
+ *
+ * Comfortably above one base64url-encoded {@link MAX_RELAY_EPHEMERAL_FRAME_BYTES}
+ * frame (~174 KiB) so a legitimate `frame` event fits, while any line or event
+ * that grows past it fails the stream instead of buffering without bound.
+ */
+const MAXIMUM_STREAM_EVENT_BYTES = 256 * 1024;
+
+const LINE_FEED = 0x0a;
+const CARRIAGE_RETURN = 0x0d;
+const COLON = 0x3a;
+
+/** Read one non-negative safe-integer field from a small JSON relay body. */
+function readCountField(text: string, field: string): number {
+    const parsed = JSON.parse(text) as unknown;
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        throw new Error(`Relay returned an invalid ${field} response`);
+    }
+    const value = (parsed as Record<string, unknown>)[field];
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error(`Relay returned an invalid ${field} response`);
+    }
+    return value;
+}
+
+/**
+ * Incremental parser for the relay's `text/event-stream` framing.
+ *
+ * Bytes arrive in arbitrary chunks that may split a line or a UTF-8 sequence.
+ * Lines are separated on the `\n` byte (a byte that never appears inside a
+ * multi-byte UTF-8 sequence), tolerating a trailing `\r`. Both the pending line
+ * and the accumulated event data are bounded by {@link MAXIMUM_STREAM_EVENT_BYTES};
+ * exceeding it throws so the stream fails rather than growing without bound.
+ */
+class EventStreamParser {
+    readonly #handlers: RelayStreamHandlers;
+    #line: Uint8Array = new Uint8Array(0);
+    #eventName = "";
+    #data: string[] = [];
+    #dataBytes = 0;
+
+    constructor(handlers: RelayStreamHandlers) {
+        this.#handlers = handlers;
+    }
+
+    /** Feed one received chunk, dispatching every complete event it contains. */
+    push(chunk: Uint8Array): void {
+        let start = 0;
+        for (let index = 0; index < chunk.length; index += 1) {
+            if (chunk[index] === LINE_FEED) {
+                this.#handleLine(this.#takeLine(chunk.subarray(start, index)));
+                start = index + 1;
+            }
+        }
+        if (start < chunk.length) {
+            this.#appendPending(chunk.subarray(start));
+        }
+    }
+
+    #takeLine(tail: Uint8Array): Uint8Array {
+        const pending = this.#line;
+        this.#line = new Uint8Array(0);
+        let line: Uint8Array;
+        if (pending.length === 0) {
+            line = tail;
+        } else {
+            line = new Uint8Array(pending.length + tail.length);
+            line.set(pending, 0);
+            line.set(tail, pending.length);
+        }
+        if (line.length > 0 && line[line.length - 1] === CARRIAGE_RETURN) {
+            return line.subarray(0, line.length - 1);
+        }
+        return line;
+    }
+
+    #appendPending(tail: Uint8Array): void {
+        const combined = new Uint8Array(this.#line.length + tail.length);
+        combined.set(this.#line, 0);
+        combined.set(tail, this.#line.length);
+        this.#line = combined;
+        this.#enforceBound(this.#line.length);
+    }
+
+    #enforceBound(pendingLineBytes: number): void {
+        if (pendingLineBytes + this.#dataBytes > MAXIMUM_STREAM_EVENT_BYTES) {
+            throw new Error("Relay stream event exceeded its maximum size");
+        }
+    }
+
+    #handleLine(line: Uint8Array): void {
+        if (line.length === 0) {
+            this.#dispatch();
+            return;
+        }
+        if (line[0] === COLON) {
+            return;
+        }
+        const separator = line.indexOf(COLON);
+        const field = utf8Decode(separator === -1 ? line : line.subarray(0, separator));
+        let value = separator === -1 ? "" : utf8Decode(line.subarray(separator + 1));
+        if (value.startsWith(" ")) {
+            value = value.slice(1);
+        }
+        if (field === "event") {
+            this.#eventName = value;
+        } else if (field === "data") {
+            this.#data.push(value);
+            this.#dataBytes += line.length;
+            this.#enforceBound(0);
+        }
+    }
+
+    #dispatch(): void {
+        const name = this.#eventName;
+        const data = this.#data.join("\n");
+        this.#eventName = "";
+        this.#data = [];
+        this.#dataBytes = 0;
+        if (name.length === 0 && data.length === 0) {
+            return;
+        }
+        switch (name) {
+            case "ready":
+                this.#handlers.onReady?.();
+                return;
+            case "frame":
+                this.#handlers.onFrame?.(decodeBase64Url(data));
+                return;
+            case "wake":
+                this.#handlers.onWake?.();
+                return;
+            case "drop":
+                this.#handlers.onDrop?.(readCountField(data, "frames"));
+                return;
+            default:
+                return;
+        }
+    }
+}
 
 interface BlobLink {
     readonly url: string;
@@ -311,7 +459,85 @@ export class HttpRelayTransport implements RelayTransport {
         return blob;
     }
 
-    #topicPath(topic: string, resource: "events" | "list" | "state"): string {
+    async publishEphemeral(
+        topic: string,
+        frame: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<number> {
+        if (!(frame instanceof Uint8Array) || frame.length > MAX_RELAY_EPHEMERAL_FRAME_BYTES) {
+            throw new Error(`Ephemeral frame exceeds ${MAX_RELAY_EPHEMERAL_FRAME_BYTES} bytes`);
+        }
+        const response = await this.#fetch(
+            `${this.#baseUrl}${this.#topicPath(topic, "ephemeral")}`,
+            {
+                method: "POST",
+                headers: { "content-type": "application/octet-stream" },
+                body: requestBody(frame),
+                ...(signal === undefined ? {} : { signal }),
+            },
+        );
+        await this.#requireOk(response);
+        return readCountField(
+            utf8Decode(await readBoundedResponse(response, MAXIMUM_EPHEMERAL_RESPONSE_BYTES)),
+            "delivered",
+        );
+    }
+
+    async openStream(
+        topic: string,
+        handlers: RelayStreamHandlers,
+        signal: AbortSignal,
+    ): Promise<void> {
+        if (signal.aborted) {
+            return;
+        }
+        const response = await this.#fetch(`${this.#baseUrl}${this.#topicPath(topic, "stream")}`, {
+            method: "GET",
+            headers: { accept: "text/event-stream" },
+            signal,
+        });
+        await this.#requireOk(response);
+        if (response.body === null) {
+            return;
+        }
+        const reader = response.body.getReader();
+        const parser = new EventStreamParser(handlers);
+        const abort = (): void => {
+            reader.cancel("Relay stream aborted").catch(() => undefined);
+        };
+        signal.addEventListener("abort", abort, { once: true });
+        try {
+            for (;;) {
+                let result: ReadableStreamReadResult<Uint8Array>;
+                try {
+                    result = await reader.read();
+                } catch (error) {
+                    if (signal.aborted) {
+                        return;
+                    }
+                    throw error;
+                }
+                if (result.done) {
+                    return;
+                }
+                parser.push(result.value);
+            }
+        } catch (error) {
+            reader.cancel("Relay stream failed").catch(() => undefined);
+            if (signal.aborted) {
+                return;
+            }
+            throw error;
+        } finally {
+            signal.removeEventListener("abort", abort);
+            reader.releaseLock();
+        }
+    }
+
+    #topicPath(
+        topic: string,
+        resource: "ephemeral" | "events" | "list" | "state" | "stream",
+    ): string {
         return `/v1/topics/${encodeURIComponent(topic)}/${resource}`;
     }
 

@@ -38,3 +38,22 @@ the result is `status: "reset"` and contains no events. The caller must use
 `loadTopic()` to apply the permanent snapshot and fully paginated list and
 install their head cursor atomically. Reset can therefore never look like
 "caught up."
+
+## Ephemeral streams
+
+`publishEphemeral()` and `openTopicStream()` ride the relay's non-durable
+low-latency path. Neither touches the store: no outbox, no cursors, no retention.
+
+```text
+publishEphemeral -> fan out to every stream-capable relay -> sum of delivered
+openTopicStream  -> one live stream per capable relay, each with its own backoff
+                      onFrame / onWake / onDrop / onStatus  (tagged by relayId)
+```
+
+`publishEphemeral()` resolves with the total delivered count and throws only when
+every capable transport failed. `openTopicStream()` returns a `TopicStream` that
+connects to every transport implementing `openStream`, reconnects each relay with
+bounded exponential backoff plus jitter (250 ms floor, 15 s ceiling), and reports
+per-relay connection state through `onStatus`. Frames pass straight through — the
+client buffers nothing — and `close()` aborts every connection and guarantees no
+further reconnect timer is scheduled.

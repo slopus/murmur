@@ -2,6 +2,8 @@
 export const MAX_RELAY_EVENT_PAYLOAD_BYTES = 1024 * 1024;
 /** Maximum ciphertext blob accepted by the default relay protocol profile. */
 export const MAX_RELAY_BLOB_BYTES = 64 * 1024 * 1024;
+/** Maximum opaque ephemeral frame accepted by the default relay profile. */
+export const MAX_RELAY_EPHEMERAL_FRAME_BYTES = 128 * 1024;
 
 /** A relay supplied blob failed its size or content-address integrity checks. */
 export class RelayBlobIntegrityError extends Error {
@@ -115,6 +117,24 @@ export interface EventPage {
 /** Browser-safe fetch signature accepted by the HTTP transport. */
 export type RelayFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+/**
+ * Callbacks for one live topic stream.
+ *
+ * Every handler is optional so a caller can observe only the ephemeral signals
+ * it cares about. The transport never buffers frames on the caller's behalf:
+ * each callback runs synchronously as its named SSE event is parsed.
+ */
+export interface RelayStreamHandlers {
+    /** The stream is live; emitted once before any other event. */
+    readonly onReady?: () => void;
+    /** One decoded opaque ephemeral frame. */
+    readonly onFrame?: (bytes: Uint8Array) => void;
+    /** Durable events may be available; the caller should synchronize now. */
+    readonly onWake?: () => void;
+    /** The relay dropped `frames` queued frames for this subscriber. */
+    readonly onDrop?: (frames: number) => void;
+}
+
 /** Relay boundary for signed topic state and link-mediated blob transfers. */
 export interface RelayTransport {
     readonly id: string;
@@ -138,4 +158,20 @@ export interface RelayTransport {
      * allocating a concatenated result.
      */
     getBlob(id: string, expectedBytes?: number): Promise<RelayBlob | undefined>;
+    /**
+     * Publish one opaque ephemeral frame to a topic's live stream subscribers.
+     *
+     * Optional so existing transports keep compiling. Nothing is stored: the
+     * returned number is the relay's informational count of local subscribers
+     * enqueued, never a delivery guarantee.
+     */
+    publishEphemeral?(topic: string, frame: Uint8Array, signal?: AbortSignal): Promise<number>;
+    /**
+     * Open one live topic stream and dispatch its events until it ends.
+     *
+     * Optional so existing transports keep compiling. The returned promise
+     * resolves when the stream ends (including a prompt `signal` abort) and
+     * rejects on transport failure.
+     */
+    openStream?(topic: string, handlers: RelayStreamHandlers, signal: AbortSignal): Promise<void>;
 }

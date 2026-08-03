@@ -68,6 +68,32 @@ export interface RetryOutboundFailure {
     readonly error: Error;
 }
 
+/**
+ * Callbacks for one multi-relay topic stream.
+ *
+ * Every signal is tagged with the originating `relayId` so an application can
+ * deduplicate frames that several relays deliver. Nothing here is durable: the
+ * client never persists a frame, a cursor, or a retry.
+ */
+export interface TopicStreamHandlers {
+    /** One opaque ephemeral frame decoded from a specific relay. */
+    readonly onFrame?: (frame: { relayId: string; bytes: Uint8Array }) => void;
+    /** A relay signalled that durable events may be available; synchronize now. */
+    readonly onWake?: (relayId: string) => void;
+    /** A relay dropped queued frames for this subscriber. */
+    readonly onDrop?: (drop: { relayId: string; frames: number }) => void;
+    /** One relay connected, disconnected, or failed to connect. */
+    readonly onStatus?: (status: { relayId: string; connected: boolean; error?: Error }) => void;
+}
+
+/** Handle to one running multi-relay topic stream. */
+export interface TopicStream {
+    /** Whether at least one configured relay currently has a live stream. */
+    readonly connected: boolean;
+    /** Stop every relay connection and prevent any further reconnect. */
+    close(): void;
+}
+
 /** Isolated retry results which never hide later records or incoming sync. */
 export interface RetryOutboundReport {
     readonly results: readonly PublishResult[];

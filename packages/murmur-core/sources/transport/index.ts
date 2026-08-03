@@ -26,6 +26,7 @@ export type {
     RelayAuthor,
     RelayBlob,
     RelayFetch,
+    RelayStreamHandlers,
     RelayTransport,
     ReplaceListOperation,
     RetainedRelayEvent,
@@ -36,6 +37,7 @@ export type {
 } from "./types.js";
 export {
     MAX_RELAY_BLOB_BYTES,
+    MAX_RELAY_EPHEMERAL_FRAME_BYTES,
     MAX_RELAY_EVENT_PAYLOAD_BYTES,
     RelayBlobIntegrityError,
 } from "./types.js";

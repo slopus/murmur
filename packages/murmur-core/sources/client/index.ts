@@ -7,6 +7,7 @@ import {
     createRelayEvent,
     equalRelayEvents,
     MAX_RELAY_BLOB_BYTES,
+    MAX_RELAY_EPHEMERAL_FRAME_BYTES,
     RelayBlobIntegrityError,
     verifyRelayBlob,
     verifyRelayEvent,
@@ -24,6 +25,7 @@ import {
     utf8Encode,
 } from "../utils/index.js";
 import { decodeOutboundRecord, encodeOutboundRecord } from "./impl/eventCodec.js";
+import { TopicStreamController } from "./impl/topicStream.js";
 import type {
     LoadedTopicState,
     PublishResult,
@@ -31,6 +33,8 @@ import type {
     RetryOutboundReport,
     SyncResult,
     TopicResetRequired,
+    TopicStream,
+    TopicStreamHandlers,
 } from "./types.js";
 
 export type {
@@ -42,6 +46,8 @@ export type {
     RetryOutboundReport,
     SyncResult,
     TopicResetRequired,
+    TopicStream,
+    TopicStreamHandlers,
 } from "./types.js";
 
 const DEFAULT_OUTBOUND_HISTORY = 256;
@@ -629,6 +635,71 @@ export class MurmurClient {
             throw integrityError;
         }
         return undefined;
+    }
+
+    /**
+     * Publish one opaque ephemeral frame to every stream-capable relay.
+     *
+     * Nothing is stored or retried: the frame is fanned out to each relay that
+     * implements `publishEphemeral`, and the resolved value is the sum of the
+     * relays' informational delivered counts. It throws only when every capable
+     * transport failed; a single surviving relay still resolves.
+     */
+    async publishEphemeral(topic: string, frame: Uint8Array): Promise<number> {
+        if (!/^[A-Za-z0-9_.:-]{1,512}$/.test(topic)) {
+            throw new Error("Invalid relay topic");
+        }
+        if (!(frame instanceof Uint8Array) || frame.length > MAX_RELAY_EPHEMERAL_FRAME_BYTES) {
+            throw new Error(`Ephemeral frame exceeds ${MAX_RELAY_EPHEMERAL_FRAME_BYTES} bytes`);
+        }
+        const capable = this.#transports.filter(
+            (
+                transport,
+            ): transport is RelayTransport & {
+                publishEphemeral: NonNullable<RelayTransport["publishEphemeral"]>;
+            } => transport.publishEphemeral !== undefined,
+        );
+        if (capable.length === 0) {
+            throw new Error("No configured transport supports ephemeral publishing");
+        }
+        const attempts = await Promise.allSettled(
+            capable.map(async (transport) => transport.publishEphemeral(topic, frame)),
+        );
+        let delivered = 0;
+        const failures: Error[] = [];
+        for (const attempt of attempts) {
+            if (attempt.status === "fulfilled") {
+                delivered += attempt.value;
+            } else {
+                failures.push(
+                    attempt.reason instanceof Error
+                        ? attempt.reason
+                        : new Error(String(attempt.reason)),
+                );
+            }
+        }
+        if (failures.length === capable.length) {
+            throw new AggregateError(
+                failures,
+                "Every transport failed to publish the ephemeral frame",
+            );
+        }
+        return delivered;
+    }
+
+    /**
+     * Open one live multi-relay stream for a topic.
+     *
+     * The returned {@link TopicStream} connects to every configured relay that
+     * implements `openStream`, reconnects each with bounded exponential backoff
+     * plus jitter, and reports connection state through `onStatus`. It buffers
+     * nothing and stops cleanly on `close()`.
+     */
+    openTopicStream(topic: string, handlers: TopicStreamHandlers): TopicStream {
+        if (!/^[A-Za-z0-9_.:-]{1,512}$/.test(topic)) {
+            throw new Error("Invalid relay topic");
+        }
+        return new TopicStreamController(topic, handlers, this.#transports);
     }
 
     async #publishRecord(
