@@ -15,6 +15,7 @@ import {
     type DirectChat,
     type IdentityKeyPair,
     type IdentityPublicKeys,
+    type JsonValue,
     type MurmurClient,
     type MurmurStore,
     type PublishResult,
@@ -47,8 +48,13 @@ import {
     type DurableSharedSessionRecord,
 } from "./impl/durableCodec.js";
 import {
+    SharedSessionEphemeralChannelImpl,
+    type SharedSessionEphemeralContext,
+} from "./impl/ephemeralChannel.js";
+import {
     createSharedSessionEntry,
     decodeSharedSessionFrame,
+    encodeSharedSessionControlFrame,
     decodeSharedSessionHistoryOffer,
     decodeSharedSessionHistoryPage,
     decodeSharedSessionInvitation,
@@ -74,6 +80,10 @@ import {
     type SessionEntrySource,
     type SharedSessionCallbacks,
     type SharedSessionAppendInput,
+    type SharedSessionControl,
+    type SharedSessionEphemeralChannel,
+    type SharedSessionEphemeralOptions,
+    type SharedSessionEphemeralTransport,
     type SharedSessionEntry,
     type SharedSessionEntryInput,
     type SharedSessionEventResult,
@@ -96,6 +106,14 @@ export type {
     SessionEntrySourcePage,
     SharedSessionCallbacks,
     SharedSessionAppendInput,
+    SharedSessionControl,
+    SharedSessionEphemeralChannel,
+    SharedSessionEphemeralDrop,
+    SharedSessionEphemeralEpochChange,
+    SharedSessionEphemeralFrame,
+    SharedSessionEphemeralOptions,
+    SharedSessionEphemeralTransport,
+    SharedSessionTopicStream,
     SharedSessionEntry,
     SharedSessionEntryInput,
     SharedSessionEventResult,
@@ -114,6 +132,10 @@ export type {
     SharedSessionTermination,
 } from "./types.js";
 export {
+    MAX_SHARED_SESSION_CONTROL_BYTES,
+    MAX_SHARED_SESSION_EPHEMERAL_BYTES,
+    MAX_SHARED_SESSION_EPHEMERAL_QUEUE_BYTES,
+    MAX_SHARED_SESSION_EPHEMERAL_QUEUE_FRAMES,
     MAX_SHARED_SESSION_ENTRY_BYTES,
     MAX_SHARED_SESSION_HISTORY_OFFERS,
     MAX_SHARED_SESSION_HISTORY_PAGE_BYTES,
@@ -123,6 +145,7 @@ export {
     MAX_SHARED_SESSION_PENDING_ENTRIES,
     MAX_SHARED_SESSION_POST_BYTES,
     MAX_SHARED_SESSION_SHARE_ID_BYTES,
+    SHARED_SESSION_OWNER_MEMBER_ID,
     SharedSessionEntryCollisionError,
     SharedSessionIdentityCollisionError,
     SharedSessionProtocolError,
@@ -245,6 +268,25 @@ function postKey(
     return `${SESSION_PREFIX}/${localId}/${shareKeyId(shareId)}/post/${encodeBase64Url(digest)}`;
 }
 
+function controlKey(
+    localId: string,
+    shareId: string,
+    peerId: string,
+    grantEpoch: number,
+    controlId: string,
+): string {
+    const digest = hashBytes(
+        canonicalJsonBytes({
+            context: "murmur/shared-session/control-replay/v1",
+            controlId,
+            grantEpoch,
+            peerId,
+            shareId,
+        }),
+    );
+    return `${SESSION_PREFIX}/${localId}/${shareKeyId(shareId)}/control/${encodeBase64Url(digest)}`;
+}
+
 function includeFingerprint(
     values: readonly Uint8Array[],
     fingerprint: Uint8Array,
@@ -312,6 +354,24 @@ function exactPublisher(
         },
         subscribe: async (topic) => client.subscribe(topic),
     };
+}
+
+/**
+ * Narrow the application's existing client to the ephemeral relay boundary.
+ *
+ * A client built against an older relay transport simply does not have the
+ * low-latency path, and saying so is better than silently degrading a keystroke
+ * to a twenty-five second long poll.
+ */
+function ephemeralTransport(client: MurmurClient): SharedSessionEphemeralTransport {
+    const candidate = client as unknown as Partial<SharedSessionEphemeralTransport>;
+    if (
+        typeof candidate.publishEphemeral !== "function" ||
+        typeof candidate.openTopicStream !== "function"
+    ) {
+        throw new Error("This Murmur client does not support the ephemeral relay path");
+    }
+    return candidate as SharedSessionEphemeralTransport;
 }
 
 function eventMarker(entry: SharedSessionEntry): Uint8Array {
@@ -388,6 +448,7 @@ abstract class SharedSessionBase {
     readonly #pending = new Map<string, PendingPrepared>();
     protected channel: MlsGroupChannel;
     protected record: DurableSharedSessionRecord;
+    #ephemeral: SharedSessionEphemeralChannelImpl | undefined;
     #destroyed = false;
 
     protected constructor(
@@ -471,6 +532,7 @@ abstract class SharedSessionBase {
             const result = await pending.prepared.publish(exactPublisher(this.#client, event));
             if (pending.kind === "commit") {
                 pending.prepared.adopt();
+                this.syncEphemeral();
             }
             await this.#store.delete(key);
             this.#pending.delete(event.id);
@@ -618,6 +680,71 @@ abstract class SharedSessionBase {
     }
 
     /**
+     * Open the non-durable side channel of this share.
+     *
+     * Frames are encrypted with material exported from the group's current MLS
+     * epoch, so membership and revocation are exactly the transcript's. Nothing
+     * sent or received here is written to `MurmurStore`, ordered against
+     * transcript entries, or replayed after a restart, and a slow peer loses
+     * frames instead of accumulating a queue.
+     *
+     * One channel exists per session; a second call returns the same channel.
+     */
+    openEphemeralChannel(
+        options: SharedSessionEphemeralOptions & {
+            readonly transport?: SharedSessionEphemeralTransport;
+        } = {},
+    ): SharedSessionEphemeralChannel {
+        this.ensureActive();
+        const existing = this.#ephemeral;
+        if (existing !== undefined && existing.open) {
+            return existing;
+        }
+        const { transport, ...bounds } = options;
+        const channel = new SharedSessionEphemeralChannelImpl({
+            transport: transport ?? ephemeralTransport(this.#client),
+            groupChannel: this.channel,
+            identity: this.#identity,
+            context: (): SharedSessionEphemeralContext => ({
+                shareId: this.record.state.shareId,
+                role: this.record.role,
+                localId: this.#localId,
+                ownerSigningKey: this.record.owner.signingKey,
+                members: this.record.state.members,
+            }),
+            options: bounds,
+        });
+        this.#ephemeral = channel;
+        return channel;
+    }
+
+    /**
+     * Re-key or close the ephemeral channel after the epoch or replica changed.
+     *
+     * Rekeying immediately after a Commit is what makes a revoke close
+     * in-flight ephemeral traffic without waiting for a durable sync.
+     */
+    protected syncEphemeral(): void {
+        const channel = this.#ephemeral;
+        if (channel === undefined) {
+            return;
+        }
+        if (this.#destroyed || this.record.internalStatus !== "active") {
+            channel.close();
+            this.#ephemeral = undefined;
+            return;
+        }
+        try {
+            channel.rekey(this.channel);
+        } catch {
+            // A channel which cannot follow the current epoch is closed rather
+            // than left keyed to an epoch this replica no longer holds.
+            channel.close();
+            this.#ephemeral = undefined;
+        }
+    }
+
+    /**
      * Retry exact invitation/application/Commit outboxes and one history blob.
      *
      * Records are ordered so every invitation is delivered before its batch
@@ -654,6 +781,7 @@ abstract class SharedSessionBase {
                     }
                     if (pending.kind === "commit") {
                         pending.prepared.adopt();
+                        this.syncEphemeral();
                     }
                     this.#pending.delete(outbox.event.id);
                 } else {
@@ -859,6 +987,14 @@ abstract class SharedSessionBase {
 
     /** Apply one event already read by the application's existing client. */
     async handleEvent(received: ReceivedEvent): Promise<SharedSessionEventResult> {
+        try {
+            return await this.#handleEvent(received);
+        } finally {
+            this.syncEphemeral();
+        }
+    }
+
+    async #handleEvent(received: ReceivedEvent): Promise<SharedSessionEventResult> {
         if (received.event.topic !== this.channel.topic) {
             return { status: "unhandled", event: received };
         }
@@ -1147,9 +1283,9 @@ abstract class SharedSessionBase {
                                 member.status === "active" &&
                                 member.grantEpoch === frame.grantEpoch,
                         );
-                        if (grant === undefined) {
-                            resultStatus = "quarantined";
-                        } else if (next.role === "owner") {
+                        if (grant === undefined || next.role !== "owner") {
+                            resultStatus = grant === undefined ? "quarantined" : resultStatus;
+                        } else if (frame.kind === "post") {
                             const post: SharedSessionPost = {
                                 shareId: this.shareId,
                                 authenticatedPeerId: peerId,
@@ -1175,6 +1311,36 @@ abstract class SharedSessionBase {
                                 await transaction.set(key, fingerprint);
                                 resultStatus = "post";
                             }
+                        } else if (this.#callbacks.persistControl !== undefined) {
+                            const control: SharedSessionControl = {
+                                shareId: this.shareId,
+                                authenticatedPeerId: peerId,
+                                shareMemberId: grant.shareMemberId,
+                                grantEpoch: grant.grantEpoch,
+                                controlId: frame.controlId,
+                                timestamp: frame.timestamp,
+                                payload: frame.payload,
+                            };
+                            const key = controlKey(
+                                this.#localId,
+                                this.shareId,
+                                peerId,
+                                grant.grantEpoch,
+                                frame.controlId,
+                            );
+                            const fingerprint = hashBytes(handled.message.applicationData);
+                            const existing = await transaction.get(key);
+                            if (existing !== undefined && !equalBytes(existing, fingerprint)) {
+                                resultStatus = "quarantined";
+                            } else if (existing === undefined) {
+                                await this.#callbacks.persistControl(transaction, control);
+                                await transaction.set(key, fingerprint);
+                                resultStatus = "control";
+                            }
+                        } else {
+                            // An application which supplies no control hook
+                            // never sees friend control at all.
+                            resultStatus = "quarantined";
                         }
                     }
                 }
@@ -1264,6 +1430,8 @@ abstract class SharedSessionBase {
     }
 
     protected retireInMemory(): void {
+        this.#ephemeral?.close();
+        this.#ephemeral = undefined;
         this.#client.unsubscribe(this.channel.topic);
         this.channel.destroy();
         zeroBytes(this.record.epochState);
@@ -1282,6 +1450,8 @@ abstract class SharedSessionBase {
         if (this.#destroyed) {
             return;
         }
+        this.#ephemeral?.close();
+        this.#ephemeral = undefined;
         for (const pending of this.#pending.values()) {
             pending.prepared.abandonPersisted();
         }
@@ -2099,6 +2269,47 @@ export class SharedSessionMember extends SharedSessionBase {
                 return record;
             });
             return post;
+        } finally {
+            zeroBytes(frame);
+        }
+    }
+
+    /**
+     * Publish one authenticated friend control frame to the owner.
+     *
+     * Control is durable, totally ordered against the transcript, and opaque
+     * canonical JSON, which is what capability negotiation wants and what a
+     * keystroke does not. It is a separate frame kind from `post`, so
+     * structured friend data never has to travel as chat text.
+     */
+    async sendControl(
+        controlId: string,
+        payload: JsonValue,
+        timestamp: number = this.now(),
+    ): Promise<SharedSessionControl> {
+        this.ensureActive();
+        const grant = this.record.state.members.find(
+            (member) => member.peerId === this.localId && member.status === "active",
+        );
+        if (grant === undefined) {
+            throw new Error("Local identity has no active shared-session grant");
+        }
+        const control: SharedSessionControl = {
+            shareId: this.shareId,
+            authenticatedPeerId: this.localId,
+            shareMemberId: grant.shareMemberId,
+            grantEpoch: grant.grantEpoch,
+            controlId,
+            timestamp,
+            payload,
+        };
+        const frame = encodeSharedSessionControlFrame(this.channel.groupId, control);
+        try {
+            await this.prepareApplication(frame, async (transaction, record) => {
+                await this.callbacks.persistControl?.(transaction, control);
+                return record;
+            });
+            return control;
         } finally {
             zeroBytes(frame);
         }

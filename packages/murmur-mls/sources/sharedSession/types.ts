@@ -25,6 +25,14 @@ export const MAX_SHARED_SESSION_HISTORY_OFFERS = 100_000;
 export const MAX_SHARED_SESSION_MEMBERS = 256;
 /** Maximum live entries retained durably while a member backfills history. */
 export const MAX_SHARED_SESSION_PENDING_ENTRIES = 512;
+/** Maximum canonical JSON bytes accepted for one friend control frame. */
+export const MAX_SHARED_SESSION_CONTROL_BYTES = 64 * 1024;
+/** Maximum plaintext bytes carried by one ephemeral frame. */
+export const MAX_SHARED_SESSION_EPHEMERAL_BYTES = 64 * 1024;
+/** Maximum frames queued for publication before the oldest are dropped. */
+export const MAX_SHARED_SESSION_EPHEMERAL_QUEUE_FRAMES = 64;
+/** Maximum queued outbound bytes before the oldest frames are dropped. */
+export const MAX_SHARED_SESSION_EPHEMERAL_QUEUE_BYTES = 1024 * 1024;
 
 /** Caller-supplied opaque owner transcript projection. */
 export interface SharedSessionEntryInput {
@@ -77,6 +85,135 @@ export interface SharedSessionPost {
     readonly text: string;
 }
 
+/**
+ * Authenticated friend control record carried on the durable channel.
+ *
+ * Control is opaque canonical JSON, exactly like an owner transcript entry, so
+ * capability negotiation never has to be encoded into, or filtered back out of,
+ * conversational text. It is durable, ordered, and replay-protected, and it is
+ * deliberately not a post.
+ */
+export interface SharedSessionControl {
+    readonly shareId: string;
+    readonly authenticatedPeerId: string;
+    readonly shareMemberId: string;
+    readonly grantEpoch: number;
+    readonly controlId: string;
+    readonly timestamp: number;
+    readonly payload: JsonValue;
+}
+
+/** Sentinel `shareMemberId` reported for an owner-authored ephemeral frame. */
+export const SHARED_SESSION_OWNER_MEMBER_ID = "owner";
+
+/** One authenticated ephemeral frame delivered to the application. */
+export interface SharedSessionEphemeralFrame {
+    readonly authenticatedPeerId: string;
+    readonly shareMemberId: string;
+    readonly grantEpoch: number;
+    readonly bytes: Uint8Array;
+}
+
+/** Why one or more ephemeral frames were discarded. */
+export interface SharedSessionEphemeralDrop {
+    readonly direction: "outbound" | "inbound";
+    readonly reason:
+        | "queue-overflow"
+        | "epoch-change"
+        | "relay"
+        | "not-granted"
+        | "authentication"
+        | "replay"
+        | "malformed"
+        | "foreign-epoch"
+        | "stream-limit"
+        | "unknown-sender"
+        | "closed";
+    readonly frames: number;
+}
+
+/**
+ * Observed change in the epoch that keys the ephemeral channel.
+ *
+ * `local-commit` means this replica adopted a new epoch and rekeyed. The two
+ * peer reasons mean an authenticated-looking frame named a different epoch,
+ * which is the earliest possible warning that a membership Commit happened and
+ * that in-flight ephemeral traffic is already void.
+ */
+export interface SharedSessionEphemeralEpochChange {
+    readonly reason: "local-commit" | "peer-ahead" | "peer-behind";
+    readonly localEpoch: number;
+    readonly observedEpoch: number;
+}
+
+/**
+ * Non-durable, epoch-keyed, lossy channel over the existing shared MLS group.
+ *
+ * Frames are encrypted under the current epoch of the same group that carries
+ * the transcript, so membership, the owner-only-committer rule, and epoch-based
+ * revocation apply unchanged. Nothing here reaches `MurmurStore`: there is no
+ * entry log, no history page, no cursor, no replay, and no ordering against
+ * transcript entries. Ordering holds per sender only, and the channel drops
+ * frames rather than growing a queue.
+ */
+export interface SharedSessionEphemeralChannel {
+    /** Queue one bounded payload for the group's current epoch. */
+    send(bytes: Uint8Array): void;
+    /** Subscribe to authenticated inbound frames; returns an unsubscribe. */
+    readonly onReceived: (handler: (frame: SharedSessionEphemeralFrame) => void) => () => void;
+    /** Subscribe to bounded loss reports in both directions. */
+    readonly onDropped: (handler: (drop: SharedSessionEphemeralDrop) => void) => () => void;
+    /** Subscribe to epoch changes which void in-flight ephemeral traffic. */
+    readonly onEpochChanged: (
+        handler: (change: SharedSessionEphemeralEpochChange) => void,
+    ) => () => void;
+    /** RFC epoch currently keying the channel. */
+    readonly epoch: number;
+    /** False once `close()` ran or the replica was retired. */
+    readonly open: boolean;
+    /** Stop the relay stream and zero every derived ephemeral key. */
+    close(): void;
+}
+
+/** One relay stream owned by the application's existing Murmur client. */
+export interface SharedSessionTopicStream {
+    readonly connected: boolean;
+    close(): void;
+}
+
+/**
+ * Transport boundary satisfied structurally by `MurmurClient`.
+ *
+ * The ephemeral channel needs exactly two operations, neither of which touches
+ * durable client state.
+ */
+export interface SharedSessionEphemeralTransport {
+    publishEphemeral(topic: string, frame: Uint8Array): Promise<number>;
+    openTopicStream(
+        topic: string,
+        handlers: {
+            readonly onFrame?: (frame: { relayId: string; bytes: Uint8Array }) => void;
+            readonly onWake?: (relayId: string) => void;
+            readonly onDrop?: (drop: { relayId: string; frames: number }) => void;
+            readonly onStatus?: (status: {
+                relayId: string;
+                connected: boolean;
+                error?: Error;
+            }) => void;
+        },
+    ): SharedSessionTopicStream;
+}
+
+/** Optional bounds for one ephemeral channel. */
+export interface SharedSessionEphemeralOptions {
+    /** Maximum queued outbound frames. Defaults to 64. */
+    readonly maximumQueuedFrames?: number;
+    /** Maximum queued outbound bytes. Defaults to 1 MiB. */
+    readonly maximumQueuedBytes?: number;
+    /** Called when the relay reports newly available durable events. */
+    readonly onWake?: () => void;
+}
+
 /** Reason all local replica rows and protocol secrets must be retired. */
 export interface SharedSessionTermination {
     readonly shareId: string;
@@ -94,6 +231,14 @@ export interface SharedSessionCallbacks {
     persistEntry(transaction: StoreTransaction, entry: SharedSessionEntry): Promise<void>;
     persistState(transaction: StoreTransaction, state: SharedSessionState): Promise<void>;
     persistPost(transaction: StoreTransaction, post: SharedSessionPost): Promise<void>;
+    /**
+     * Commit one authenticated friend control frame.
+     *
+     * Omitting the hook is a statement that this application does not accept
+     * control from friends: an inbound control frame is then quarantined and
+     * never surfaces anywhere, rather than being folded into posts.
+     */
+    persistControl?(transaction: StoreTransaction, control: SharedSessionControl): Promise<void>;
     terminate(transaction: StoreTransaction, termination: SharedSessionTermination): Promise<void>;
 }
 
@@ -176,6 +321,7 @@ export type SharedSessionEventResult =
           readonly status:
               | "entry"
               | "post"
+              | "control"
               | "state"
               | "duplicate"
               | "commit"

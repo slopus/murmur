@@ -31,3 +31,31 @@ Revocation prevents access to later epochs and later page keys. It cannot erase
 plaintext or keys a member already saved. Applications must implement the
 transactional `terminate` callback to cooperatively delete replica rows when an
 authenticated end or MLS removal is received.
+
+## The non-durable channel
+
+`openEphemeralChannel()` adds a second surface over the _same_ MLS group, for
+traffic that must not be written down. It is deliberately the opposite of a
+post in every respect that matters:
+
+|                      | `post()` / `sendControl()`    | ephemeral channel           |
+| -------------------- | ----------------------------- | --------------------------- |
+| durability           | committed to `MurmurStore`    | never stored                |
+| ordering             | total, against the transcript | per sender only             |
+| replay after restart | yes                           | no                          |
+| loss                 | never                         | expected, bounded, reported |
+| latency              | one durable sync              | one relay hop               |
+| keying               | MLS application ratchet       | MLS exporter, same epoch    |
+
+Because the frames are keyed from the current epoch of the existing group,
+membership, the owner-only-committer rule, and epoch-based revocation apply
+unchanged: there is no second group and no second trust root. A revoke Commit
+rekeys the owner's channel immediately, so in-flight ephemeral traffic closes
+without waiting for the next durable sync, and the revoked member's frames stop
+opening at once.
+
+`sendControl()` is the other half of the same problem. Capability negotiation
+is low-volume and durable-appropriate, but it is not chat: it travels as its
+own frame kind carrying opaque canonical JSON, exactly as an owner entry does,
+so structured friend data never has to be encoded into conversational text and
+filtered back out.

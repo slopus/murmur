@@ -17,6 +17,7 @@ import {
     type JsonValue,
 } from "@slopus/murmur";
 import type {
+    SharedSessionControl,
     SharedSessionEntry,
     SharedSessionEntryInput,
     SharedSessionHistoryPageDescriptor,
@@ -25,6 +26,7 @@ import type {
     SharedSessionState,
 } from "../types.js";
 import {
+    MAX_SHARED_SESSION_CONTROL_BYTES,
     MAX_SHARED_SESSION_ENTRY_BYTES,
     MAX_SHARED_SESSION_HISTORY_PAGE_BYTES,
     MAX_SHARED_SESSION_HISTORY_PAGE_ENTRIES,
@@ -71,10 +73,22 @@ export interface SharedSessionPostFrame {
     readonly text: string;
 }
 
+export interface SharedSessionControlFrame {
+    readonly version: 1;
+    readonly kind: "control";
+    readonly shareId: string;
+    readonly groupId: string;
+    readonly controlId: string;
+    readonly grantEpoch: number;
+    readonly timestamp: number;
+    readonly payload: JsonValue;
+}
+
 export type SharedSessionFrame =
     | SharedSessionEntryFrame
     | SharedSessionStateFrame
-    | SharedSessionPostFrame;
+    | SharedSessionPostFrame
+    | SharedSessionControlFrame;
 
 type UnsignedOwnerFrame =
     | Omit<SharedSessionEntryFrame, "signature">
@@ -467,6 +481,43 @@ export function encodeSharedSessionPostFrame(
     });
 }
 
+/**
+ * Encode one friend control frame.
+ *
+ * Control carries opaque canonical JSON exactly as an owner transcript entry
+ * does, so an application never has to smuggle structured negotiation through
+ * conversational text and filter it back out again.
+ */
+export function encodeSharedSessionControlFrame(
+    groupId: Uint8Array,
+    control: Omit<SharedSessionControl, "authenticatedPeerId" | "shareMemberId">,
+): Uint8Array {
+    validateSharedSessionShareId(control.shareId);
+    if (
+        !OPAQUE_ID_PATTERN.test(control.controlId) ||
+        !Number.isSafeInteger(control.grantEpoch) ||
+        control.grantEpoch < 1 ||
+        !isJsonValue(control.payload)
+    ) {
+        throw new Error("Invalid shared-session friend control");
+    }
+    validateTimestamp(control.timestamp);
+    const payload = canonicalJsonBytes(control.payload);
+    if (payload.length > MAX_SHARED_SESSION_CONTROL_BYTES) {
+        throw new Error("Shared-session control payload exceeds its canonical JSON bound");
+    }
+    return canonicalJsonBytes({
+        controlId: control.controlId,
+        grantEpoch: control.grantEpoch,
+        groupId: encodeBase64Url(groupId),
+        kind: "control",
+        payload: control.payload,
+        shareId: control.shareId,
+        timestamp: control.timestamp,
+        version: 1,
+    });
+}
+
 export function decodeSharedSessionFrame(
     bytes: Uint8Array,
     owner: IdentityPublicKeys,
@@ -518,6 +569,53 @@ export function decodeSharedSessionFrame(
         }
         if (!equalBytes(canonical, bytes)) {
             throw protocolError("Non-canonical shared-session post frame");
+        }
+        return frame;
+    }
+    if (kind === "control") {
+        const value = exactRecord(
+            parsed,
+            [
+                "controlId",
+                "grantEpoch",
+                "groupId",
+                "kind",
+                "payload",
+                "shareId",
+                "timestamp",
+                "version",
+            ],
+            "shared-session control frame",
+        );
+        if (
+            value.version !== 1 ||
+            typeof value.groupId !== "string" ||
+            typeof value.shareId !== "string" ||
+            typeof value.controlId !== "string" ||
+            typeof value.grantEpoch !== "number" ||
+            typeof value.timestamp !== "number" ||
+            !isJsonValue(value.payload)
+        ) {
+            throw protocolError("Invalid shared-session control frame");
+        }
+        const frame: SharedSessionControlFrame = {
+            version: 1,
+            kind: "control",
+            groupId: value.groupId,
+            shareId: value.shareId,
+            controlId: value.controlId,
+            grantEpoch: value.grantEpoch,
+            timestamp: value.timestamp,
+            payload: value.payload,
+        };
+        let canonical: Uint8Array;
+        try {
+            canonical = encodeSharedSessionControlFrame(decodeBase64Url(frame.groupId), frame);
+        } catch (error: unknown) {
+            throw protocolError("Invalid shared-session control frame", { cause: error });
+        }
+        if (!equalBytes(canonical, bytes)) {
+            throw protocolError("Non-canonical shared-session control frame");
         }
         return frame;
     }

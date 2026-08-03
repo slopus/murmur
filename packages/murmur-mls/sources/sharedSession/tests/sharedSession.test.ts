@@ -1,22 +1,11 @@
 import {
     MemoryMurmurStore,
-    MurmurClient,
     canonicalJsonBytes,
-    createRelayBlob,
     createRelayEvent,
     decodeBase64Url,
     encodeBase64Url,
-    equalRelayEvents,
     generateIdentityKeyPair,
     identityId,
-    verifyRelayBlob,
-    type EventPage,
-    type ListPage,
-    type PublishOutcome,
-    type RelayBlob,
-    type RelayTransport,
-    type SignedRelayEvent,
-    type TopicState,
 } from "@slopus/murmur";
 import { describe, expect, it } from "vitest";
 import { createMlsKeyPackage, destroyMlsKeyPackageBundle } from "../../keyPackage/index.js";
@@ -27,139 +16,17 @@ import {
     SharedSessionOwner,
     SharedSessionProtocolError,
     type SessionEntrySource,
-    type SharedSessionCallbacks,
-    type SharedSessionEntry,
     type SharedSessionInvitation,
-    type SharedSessionPost,
-    type SharedSessionState,
 } from "../index.js";
 import { decodeSharedSessionFrame } from "../impl/frameCodec.js";
-
-class MemoryRelayTransport implements RelayTransport {
-    readonly id = "memory";
-    readonly #events = new Map<string, SignedRelayEvent[]>();
-    readonly #blobs = new Map<string, Uint8Array>();
-
-    async publish(event: SignedRelayEvent): Promise<PublishOutcome> {
-        const events = this.#events.get(event.topic) ?? [];
-        const prior = events.find((candidate) => candidate.id === event.id);
-        if (prior !== undefined) {
-            if (!equalRelayEvents(prior, event)) {
-                throw new Error("event collision");
-            }
-            return {
-                seq: BigInt(events.indexOf(prior) + 1),
-                duplicate: true,
-            };
-        }
-        events.push(event);
-        this.#events.set(event.topic, events);
-        return { seq: BigInt(events.length), duplicate: false };
-    }
-
-    async readState(topic: string): Promise<TopicState | undefined> {
-        const events = this.#events.get(topic) ?? [];
-        return {
-            seq: BigInt(events.length),
-            snapshot: null,
-            list: { elements: [], nextCursor: null },
-        };
-    }
-
-    async readList(): Promise<ListPage | undefined> {
-        return { elements: [], nextCursor: null };
-    }
-
-    async readEvents(topic: string, since: bigint, limit: number = 100): Promise<EventPage> {
-        const events = this.#events.get(topic) ?? [];
-        const start = Number(since);
-        return {
-            events: events.slice(start, start + limit).map((event, index) => ({
-                seq: BigInt(start + index + 1),
-                event,
-            })),
-            reset: false,
-            seq: BigInt(events.length),
-        };
-    }
-
-    async putBlob(blob: RelayBlob): Promise<void> {
-        if (!verifyRelayBlob(blob)) {
-            throw new Error("invalid blob");
-        }
-        this.#blobs.set(blob.id, blob.bytes.slice());
-    }
-
-    async getBlob(id: string, expectedBytes?: number): Promise<RelayBlob | undefined> {
-        const bytes = this.#blobs.get(id);
-        if (bytes === undefined) {
-            return undefined;
-        }
-        if (expectedBytes !== undefined && bytes.length !== expectedBytes) {
-            throw new Error("blob size mismatch");
-        }
-        return createRelayBlob(bytes);
-    }
-
-    events(topic: string): readonly SignedRelayEvent[] {
-        return [...(this.#events.get(topic) ?? [])];
-    }
-}
-
-interface Captured {
-    readonly entries: SharedSessionEntry[];
-    readonly states: SharedSessionState[];
-    readonly posts: SharedSessionPost[];
-    readonly terminations: string[];
-}
-
-function callbacks(captured: Captured): SharedSessionCallbacks {
-    return {
-        persistEntry: async (_transaction, entry) => {
-            captured.entries.push(entry);
-        },
-        persistState: async (_transaction, state) => {
-            captured.states.push(state);
-        },
-        persistPost: async (_transaction, post) => {
-            captured.posts.push(post);
-        },
-        terminate: async (_transaction, termination) => {
-            captured.terminations.push(termination.reason);
-        },
-    };
-}
-
-function captured(): Captured {
-    return { entries: [], states: [], posts: [], terminations: [] };
-}
-
-function emptySource(): SessionEntrySource {
-    return {
-        readPage: async () => ({ entries: [], done: true }),
-    };
-}
-
-function client(
-    identity: ReturnType<typeof generateIdentityKeyPair>,
-    store: MemoryMurmurStore,
-    relay: RelayTransport,
-): MurmurClient {
-    return new MurmurClient({ identity, store, transports: [relay] });
-}
-
-async function drain(
-    murmur: MurmurClient,
-    session: Pick<SharedSessionMember | SharedSessionOwner, "handleEvent">,
-): Promise<void> {
-    const sync = await murmur.sync();
-    if (sync.status !== "events") {
-        throw new Error("unexpected reset");
-    }
-    for (const event of sync.events) {
-        await session.handleEvent(event);
-    }
-}
+import {
+    MemoryRelayTransport,
+    callbacks,
+    captured,
+    client,
+    drain,
+    emptySource,
+} from "./harness.js";
 
 const entryOne = {
     shareSequence: 1,
