@@ -1,19 +1,10 @@
-# Create murmur-relay-secrets in this namespace before applying this manifest.
+# Create murmur-relay-secrets in the default namespace before applying this manifest.
 # See docs/DEPLOYMENT.md#k3s for the one-time command.
-apiVersion: v1
-kind: Namespace
-metadata:
-    name: murmur
-    labels:
-        pod-security.kubernetes.io/audit: restricted
-        pod-security.kubernetes.io/enforce: restricted
-        pod-security.kubernetes.io/warn: restricted
----
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
     name: murmur-relay-data
-    namespace: murmur
+    namespace: default
     labels:
         app.kubernetes.io/name: murmur-relay
 spec:
@@ -28,7 +19,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
     name: murmur-relay
-    namespace: murmur
+    namespace: default
     labels:
         app.kubernetes.io/name: murmur-relay
         app.kubernetes.io/version: 0.1.9
@@ -131,7 +122,7 @@ apiVersion: v1
 kind: Service
 metadata:
     name: murmur-relay
-    namespace: murmur
+    namespace: default
     labels:
         app.kubernetes.io/name: murmur-relay
 spec:

@@ -89,18 +89,16 @@ not terminate TLS; put it behind an HTTPS reverse proxy for public access.
 ## k3s
 
 [`murmur-relay.k3s.yaml`](../murmur-relay.k3s.yaml) deploys the released
-multi-architecture image in the `murmur` namespace. It uses k3s's default
-`local-path` StorageClass, one 10 GiB persistent volume, one SQLite relay
-replica, health probes, resource bounds, and the restricted Pod Security
-profile.
+multi-architecture image in Kubernetes' `default` namespace. It uses k3s's
+default `local-path` StorageClass, one 10 GiB persistent volume, one SQLite
+relay replica, health probes, resource bounds, and a restricted container
+security context.
 
-Create the namespace and stable blob-link secret once:
+Create the stable blob-link secret once in the `default` namespace:
 
 ```bash
-kubectl create namespace murmur --dry-run=client --output=yaml | kubectl apply --filename=-
-
 MURMUR_K3S_BLOB_SECRET="$(openssl rand -base64 48)"
-kubectl --namespace murmur create secret generic murmur-relay-secrets \
+kubectl --namespace default create secret generic murmur-relay-secrets \
     --from-literal=blob-secret="$MURMUR_K3S_BLOB_SECRET"
 unset MURMUR_K3S_BLOB_SECRET
 ```
@@ -111,28 +109,28 @@ readiness:
 
 ```bash
 kubectl apply --filename=murmur-relay.k3s.yaml
-kubectl --namespace murmur rollout status deployment/murmur-relay
-kubectl --namespace murmur get pods,persistentvolumeclaims,services
+kubectl --namespace default rollout status deployment/murmur-relay
+kubectl --namespace default get pods,persistentvolumeclaims,services
 ```
 
 The manifest intentionally creates a ClusterIP service. For a quick local
 check:
 
 ```bash
-kubectl --namespace murmur port-forward service/murmur-relay 8787:8787
+kubectl --namespace default port-forward service/murmur-relay 8787:8787
 curl http://127.0.0.1:8787/health
 ```
 
 For public browser or CLI traffic, create a TLS-enabled Ingress resource in the
-`murmur` namespace and point it at the `murmur-relay` Service on port 8787.
+`default` namespace and point it at the `murmur-relay` Service on port 8787.
 The Traefik controller may run in any namespace, but a standard Kubernetes
 Ingress cannot reference a Service in a different namespace. Use the
 deployment's real hostname and certificate, and do not expose the relay
 publicly over plaintext HTTP.
 
 SQLite and `local-path` require exactly one replica. Use Postgres plus S3 and a
-storage-specific manifest before scaling horizontally. Deleting the `murmur`
-namespace or its persistent volume claim deletes relay state.
+storage-specific manifest before scaling horizontally. Deleting the
+`murmur-relay-data` persistent volume claim deletes relay state.
 
 ## Environment
 
