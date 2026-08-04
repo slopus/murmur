@@ -13,8 +13,10 @@ interface and it does not tell you what your messages mean.
 
 The current codebase is dead. We are reusing the name and a little of the
 concept, and writing the thing again, properly. Because every interesting object
-is group-shaped, the group layer should be MLS rather than a homegrown scheme,
-and pairwise chat is just the smallest case of it.
+is group-shaped, chats and group application interactions go through MLS rather
+than a homegrown scheme. Pairwise chat is just the smallest group. The friend
+channel remains outside MLS as a bootstrap and control path, including for
+private group invitations.
 
 ## The relay
 
@@ -109,15 +111,16 @@ humans to live in — that belongs in Happy.
    through a relay, or handed over directly.
 
 2. **Private messaging.** Roughly what Murmur does today: people write to each
-   other and send files. Every file is encrypted, always; the client decrypts on
-   the fly, and that is how it knows the relay did not touch it. Files sit for
-   about 30 days until delivered. People expect no photo to ever be lost, and
-   the answer for now is that the relays we host are simply more accommodating
-   and lose nothing.
+   other and send files through a two-member MLS group. Every file is encrypted,
+   always; the client decrypts on the fly, and that is how it knows the relay did
+   not touch it. Files sit for about 30 days until delivered. People expect no
+   photo to ever be lost, and the answer for now is that the relays we host are
+   simply more accommodating and lose nothing.
 
 3. **Groups.** Rooms, channels, group chats. You create a room and invite
    friends and agents into it, and they interact there. The unit that gets shared
-   is the room itself. This is where MLS is needed.
+   is the room itself. It uses the same MLS group machinery as pairwise
+   interaction.
 
 4. **Other shared objects.** A shared document that several people edit
    collaboratively, encrypted, shareable once you are contacts. Todo lists.
@@ -128,11 +131,11 @@ humans to live in — that belongs in Happy.
 
 1. Identity: two processes, each with only the other's public key, exchange
    profiles through a relay and end up as contacts.
-2. Private messaging: two contacts exchange messages and an encrypted file with
-   one side offline for part of it, and nothing is lost, duplicated, or
-   reordered.
-3. Groups: a room with three or more members, where adding and removing a member
-   is enforced by the crypto and not by the relay.
+2. Private messaging: two contacts exchange messages and an encrypted file
+   through a two-member MLS group, with one side offline for part of it, and
+   nothing is lost, duplicated, or reordered.
+3. Groups: MLS-protected groups work from two members upward, with adding and
+   removing a member enforced by the crypto and not by the relay.
 4. Shared objects: a document edited by two people at once converges, over the
    same topic machinery, with no code in the relay that knows it is a document.
 
