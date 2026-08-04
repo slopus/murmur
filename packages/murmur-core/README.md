@@ -63,10 +63,11 @@ destinations in the same transaction. Applications publish `listOutbox()`
 items and call `confirmOutbox()` only after an accepted or duplicate outcome.
 Crossed requests converge through one canonical contender.
 
-Requests after ended state carry a signed causal predecessor. `end()` retires
-stale request/accept publications and durably queues either an exact rejection
-or a transport-neutral friend-channel termination intent, depending on the
-current lifecycle state.
+Requests after ended state carry a signed, nullable, mutually-known causal
+predecessor. Canceling an unpublished request does not advance that
+predecessor. `end()` retires stale request/accept publications and durably
+queues either an exact rejection or a transport-neutral friend-channel
+termination intent, depending on the current lifecycle state.
 
 ## Friend control channel
 

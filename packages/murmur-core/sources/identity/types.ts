@@ -97,6 +97,7 @@ export interface FriendRecord {
     readonly status: FriendStatus;
     readonly requestId: string;
     readonly previousRequestId: string | null;
+    readonly nextRequestPredecessorId: string | null;
     readonly profile?: IdentityProfile;
     readonly peerResponseAddress?: string;
     readonly localResponseAddress?: string;

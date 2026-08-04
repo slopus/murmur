@@ -10,6 +10,7 @@ interface StoredFriendRecord {
     readonly status: FriendStatus;
     readonly requestId: string;
     readonly previousRequestId: string | null;
+    readonly nextRequestPredecessorId: string | null;
     readonly profile: string | null;
     readonly peerResponseAddress: string | null;
     readonly localResponseAddress: string | null;
@@ -48,6 +49,7 @@ export function copyFriendRecord(record: FriendRecord): FriendRecord {
         status: record.status,
         requestId: record.requestId,
         previousRequestId: record.previousRequestId,
+        nextRequestPredecessorId: record.nextRequestPredecessorId,
         ...(record.profile === undefined
             ? {}
             : {
@@ -85,6 +87,7 @@ export function encodeFriendRecord(record: FriendRecord): Uint8Array {
             status: record.status,
             requestId: record.requestId,
             previousRequestId: record.previousRequestId,
+            nextRequestPredecessorId: record.nextRequestPredecessorId,
             profile: profileBytes === undefined ? null : encodeBase64Url(profileBytes),
             peerResponseAddress: record.peerResponseAddress ?? null,
             localResponseAddress: record.localResponseAddress ?? null,
@@ -116,6 +119,7 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
         "status",
         "requestId",
         "previousRequestId",
+        "nextRequestPredecessorId",
         "profile",
         "peerResponseAddress",
         "localResponseAddress",
@@ -136,6 +140,9 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
         (value.previousRequestId !== null &&
             (typeof value.previousRequestId !== "string" ||
                 !validExchangeId(value.previousRequestId))) ||
+        (value.nextRequestPredecessorId !== null &&
+            (typeof value.nextRequestPredecessorId !== "string" ||
+                !validExchangeId(value.nextRequestPredecessorId))) ||
         (value.profile !== null && typeof value.profile !== "string") ||
         (typeof value.profile === "string" && value.profile.length > MAX_PROFILE_CHARACTERS) ||
         (value.peerResponseAddress !== null && typeof value.peerResponseAddress !== "string") ||
@@ -213,6 +220,7 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
             status: value.status,
             requestId: value.requestId,
             previousRequestId: value.previousRequestId,
+            nextRequestPredecessorId: value.nextRequestPredecessorId,
             ...(profile === undefined ? {} : { profile }),
             ...(typeof value.peerResponseAddress === "string"
                 ? { peerResponseAddress: value.peerResponseAddress }

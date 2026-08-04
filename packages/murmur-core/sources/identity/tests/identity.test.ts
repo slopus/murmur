@@ -419,7 +419,10 @@ describe("durable friendship lifecycle and outbox", () => {
         });
         await expect(friends.receiveResponse(bob, late, 12)).resolves.toMatchObject({
             status: "superseded",
-            record: { status: "ended" },
+            record: {
+                status: "ended",
+                nextRequestPredecessorId: pending.requestId,
+            },
         });
         await expect(
             new FriendBook(alice, store).receiveResponse(bob, late, 13),
@@ -501,6 +504,95 @@ describe("durable friendship lifecycle and outbox", () => {
             status: "opened",
             record: { status: "pending-incoming" },
         });
+        await bobFriends.end(alice, 4);
+        const olderGeneration = createFriendRequest(alice, bob, {
+            id: fixedId(33),
+            previousRequestId: initial.id,
+            responseAddress: "older-generation-response",
+            profile: { name: "Delayed older Alice" },
+        });
+        await expect(bobFriends.receiveRequest(olderGeneration, 5)).rejects.toThrow(
+            "causal predecessor",
+        );
+    });
+
+    it("does not treat a canceled unpublished request as mutually-known history", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const aliceFriends = new FriendBook(alice, aliceStore);
+        await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        await aliceFriends.end(bob, 2);
+        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBeNull();
+
+        const bobRequest = await new FriendBook(bob, bobStore).createRequest(alice, {
+            profile: { name: "Bob" },
+            destination: "alice-inbox",
+            responseAddress: "bob-response",
+            now: 3,
+        });
+        await expect(
+            new FriendBook(alice, aliceStore).receiveRequest(requestEnvelope(bobRequest), 3),
+        ).resolves.toMatchObject({
+            status: "opened",
+            record: {
+                status: "pending-incoming",
+                previousRequestId: null,
+                nextRequestPredecessorId: bobRequest.id,
+            },
+        });
+    });
+
+    it("lets both peers cancel unseen requests and later retry as a crossed pair", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const aliceFriends = new FriendBook(alice, aliceStore);
+        const bobFriends = new FriendBook(bob, bobStore);
+        await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        await bobFriends.createRequest(alice, {
+            profile: { name: "Bob" },
+            destination: "alice-inbox",
+            responseAddress: "bob-response",
+            now: 1,
+        });
+        await aliceFriends.end(bob, 2);
+        await bobFriends.end(alice, 2);
+
+        const restoredAlice = new FriendBook(alice, aliceStore);
+        const restoredBob = new FriendBook(bob, bobStore);
+        const aliceRetry = await restoredAlice.createRequest(bob, {
+            profile: { name: "Alice retry" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response-2",
+            now: 3,
+        });
+        const bobRetry = await restoredBob.createRequest(alice, {
+            profile: { name: "Bob retry" },
+            destination: "alice-inbox",
+            responseAddress: "bob-response-2",
+            now: 3,
+        });
+        const aliceResult = await restoredAlice.receiveRequest(requestEnvelope(bobRetry), 4);
+        const bobResult = await restoredBob.receiveRequest(requestEnvelope(aliceRetry), 4);
+
+        expect([aliceResult.status, bobResult.status].sort()).toEqual(["opened", "superseded"]);
+        expect([aliceResult.record.previousRequestId, bobResult.record.previousRequestId]).toEqual([
+            null,
+            null,
+        ]);
     });
 
     it("fails closed on forced same-kind, cross-kind, and termination outbox IDs", async () => {

@@ -35,8 +35,15 @@ retire the losing local request/outbox.
 
 Every request authenticates `previousRequestId`. An initial request uses
 `null`; a request after an ended relationship must name the durable tombstone's
-request ID. This causal predecessor, rather than wall-clock ordering, prevents
-delayed old requests from reopening ended state.
+`nextRequestPredecessorId`. This causal predecessor, rather than wall-clock
+ordering, prevents delayed old requests from reopening ended state.
+
+The tombstone stores this separately as nullable
+`nextRequestPredecessorId`. Only a request known by both peers advances it.
+Canceling an unpublished outgoing request preserves the prior predecessor, so
+the other peer can still initiate with `null` (or the last mutually-known
+generation) without deadlocking. The canceled `requestId` remains available
+independently for late-response replay correlation.
 
 `end()` is state-specific: it retires a pending outgoing request, queues an
 exact rejection for pending incoming, or replaces stale active request/accept

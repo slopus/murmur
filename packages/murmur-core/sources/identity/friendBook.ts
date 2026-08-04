@@ -137,7 +137,8 @@ export class FriendBook {
             if (existing !== undefined && now < existing.updatedAt) {
                 throw new Error("Friend state must not move backwards in time");
             }
-            const previousRequestId = existing?.status === "ended" ? existing.requestId : null;
+            const previousRequestId =
+                existing?.status === "ended" ? existing.nextRequestPredecessorId : null;
             const envelope = createFriendRequest(this.#owner, recipient, {
                 id: requestId,
                 previousRequestId,
@@ -159,6 +160,7 @@ export class FriendBook {
                 status: "pending-outgoing",
                 requestId,
                 previousRequestId,
+                nextRequestPredecessorId: previousRequestId,
                 localResponseAddress: options.responseAddress,
                 createdAt: existing?.createdAt ?? now,
                 updatedAt: now,
@@ -210,7 +212,7 @@ export class FriendBook {
                 if (
                     (existing === undefined && opened.previousRequestId !== null) ||
                     (existing?.status === "ended" &&
-                        opened.previousRequestId !== existing.requestId) ||
+                        opened.previousRequestId !== existing.nextRequestPredecessorId) ||
                     (existing?.status === "pending-outgoing" &&
                         opened.previousRequestId !== existing.previousRequestId)
                 ) {
@@ -249,6 +251,7 @@ export class FriendBook {
                     status: "pending-incoming",
                     requestId: opened.id,
                     previousRequestId: opened.previousRequestId,
+                    nextRequestPredecessorId: opened.id,
                     profile: opened.profile,
                     peerResponseAddress: opened.responseAddress,
                     ...(existing?.localResponseAddress === undefined
@@ -375,9 +378,22 @@ export class FriendBook {
                         existing !== undefined &&
                         (outgoingState === "retired" || outgoingState === "answered")
                     ) {
+                        const terminal =
+                            existing.status === "ended" &&
+                            existing.requestId === opened.requestId &&
+                            existing.nextRequestPredecessorId !== opened.requestId
+                                ? {
+                                      ...existing,
+                                      nextRequestPredecessorId: opened.requestId,
+                                      updatedAt: now,
+                                  }
+                                : existing;
+                        if (terminal !== existing) {
+                            await transaction.set(key, encodeFriendRecord(terminal));
+                        }
                         return {
                             status: "superseded",
-                            record: copyFriendRecord(existing),
+                            record: copyFriendRecord(terminal),
                         };
                     }
                     throw new Error(
@@ -395,6 +411,7 @@ export class FriendBook {
                         ? {
                               ...existing,
                               status: "active",
+                              nextRequestPredecessorId: existing.requestId,
                               profile: opened.profile,
                               peerResponseAddress: opened.responseAddress,
                               ...(opened.privateData === undefined
@@ -402,7 +419,12 @@ export class FriendBook {
                                   : { privateData: opened.privateData.slice() }),
                               updatedAt: now,
                           }
-                        : { ...existing, status: "ended", updatedAt: now };
+                        : {
+                              ...existing,
+                              status: "ended",
+                              nextRequestPredecessorId: existing.requestId,
+                              updatedAt: now,
+                          };
                 await this.#deleteRequestOutbox(transaction, existing.identity, existing.requestId);
                 await this.#setOutgoingTracker(
                     transaction,
