@@ -2,10 +2,9 @@
 
 ## Destination
 
-The relay does one simple job: it stores key-bound topics. A topic has a chain
-of events, stored state, and snapshots. The relay retains messages and history
-so that clients holding the same keys can come back later and download
-everything they need.
+The relay does one simple job: it stores key-bound topics. A topic has one
+ordered store of events. The relay retains messages and history so that clients
+holding the same keys can come back later and download everything they need.
 
 Nothing else belongs in the relay. It does not understand what the stored data
 means and does not link Murmur identities.
@@ -29,7 +28,7 @@ Topics are named, but their identity and address include the exact topic type,
 the relevant authorization public key or keys, and the topic name. The same
 name under different keys or a different type is a different topic. Different
 names under the same type and authorization key or keys are also different
-topics. Each has its own events, state, history, and snapshots.
+topics. Each has its own ordered events and history.
 
 One authorization key may deliberately scope and authorize several separately
 named topic streams. This key reuse is the intended namespace model. The relay
@@ -42,16 +41,19 @@ derivation, signature exchange, and wire mechanics remain unspecified.
 
 ## Topic state and retention
 
-A topic may have an optional snapshot, a bounded history of events, and an
-optional ordered list of elements.
+Each topic has exactly one ordered event store. There are no snapshots and no
+separate lists.
 
-Expiration or a timeout may be specified independently for the snapshot, an
-individual event, the list as a whole, and an individual list element. Each
-timeout is permitted but not required. When no component-specific timeout is
-supplied, this plan imposes none. Event history remains bounded by relay policy.
+Each event may optionally specify an expiration. An event without an expiration
+is durable. Clients recover by reading the retained events in order.
 
-This plan does not choose default durations, expiration cleanup timing,
-conflict behavior, or wire fields.
+The client may supply an opaque `collapse key` on an event. When a new event is
+written, all older events in that same topic carrying the same collapse key are
+removed atomically. Recovery therefore sees only the newest event for that key.
+The relay does not interpret the collapse key or the event contents.
+
+For example, an edited message carries the complete replacement message with
+the same collapse key, so the earlier version does not need to remain.
 
 ## The first version
 
@@ -76,20 +78,18 @@ if a fully anonymous relay is too open.
 
 ## How we know it is done
 
-- Clients holding a topic's required read capability can retrieve the stored
-  messages, history, and snapshots they need, including after coming back
-  later.
+- Clients holding a topic's required read capability can retrieve its retained
+  ordered events, including after coming back later.
 - Every durable write is signed, and read and write capabilities are enforced
   independently.
 - A `Write Topic`, `Read Topic`, and `Read and Write Topic` enforce their
   designated capabilities independently.
 - A topic is identified by its exact type, relevant authorization public key or
   keys, and name. One key may authorize several names, and every name has
-  separate topic state.
-- A topic supports an optional snapshot, a relay-bounded event history, and an
-  optional ordered list.
-- Snapshot, event, whole-list, and list-element timeouts can be specified
-  independently, while none is required.
+  a separate ordered event store.
+- An event is durable unless it specifies an expiration.
+- A new event with a collapse key atomically removes older events in the same
+  topic with that key.
 - An inbox uses a `Read Topic`: it accepts any correctly signed write but
   exposes its contents only to the designated read capability.
 - The relay stores and serves topic state without understanding its contents or

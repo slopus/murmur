@@ -34,29 +34,22 @@ Durable Objects.
 
 ### What a topic holds
 
-Every topic has three things: a snapshot, a list of elements, and a log of
-events. The snapshot and the list are the permanent state. The list is
-essentially the list of messages.
+Every topic has exactly one ordered store of events. There are no snapshots and
+no separate lists.
 
-Clients write state by generating an event. The same event can also replace the
-snapshot, or change one element of the list — delete, add, replace. Most often
-it appends.
+Each event may specify an expiration. An event without an expiration is durable.
+Clients recover by reading the retained events in order, then follow new events.
 
-The snapshot and the list are each optional, and a topic uses what it needs. A
-chat needs the list, because the list is its messages. A document probably does
-not: it needs only the snapshot plus events.
+An event may also carry an optional opaque `collapse key` supplied by the
+client. When a new event is written, the relay atomically removes every older
+event in the same topic with the same collapse key. The relay does not interpret
+the key or the event contents.
 
-The event log is always bounded — a few days, maybe less. The snapshot and the
-list are not: the relay stores them permanently, along with the blobs
-themselves, so a client can ask for the state instead of replaying history it
-can no longer see.
+For example, an edited message is a complete replacement message carrying the
+same collapse key. The earlier version does not need to remain.
 
-The API follows from that: load the snapshot, load the list, and subscribe to
+The API follows from that: read the retained ordered events and subscribe to new
 events.
-
-Retention, simplified: assume for now that a relay never deletes state. A topic
-has to see activity at least once every 30 days or it is dropped; clients can
-always recreate it and start syncing again, and that is not a hard case.
 
 Relays promise nothing about delivery. Relays could talk to each other — a
 client subscribed through several of them would let them agree on what was
@@ -92,8 +85,8 @@ library user's job. Identity, finding people, and sharing entities is the
 library's job.
 
 A topic is a descriptor — itself encrypted — and it carries its own type. A
-client catches up by loading the snapshot and the list, then following events
-from there. It cannot replay the whole log, because the log does not go back far.
+client catches up by reading the retained ordered events, then following new
+events from there.
 
 Adding somebody to a topic is cryptographically protected. When you create a
 chat and add someone, they get a notification about the topic, and from then on
@@ -149,8 +142,6 @@ loads in a browser.
 
 ## Open questions
 
-- How long the event log actually keeps events, and whether one window fits
-  chats and documents both.
 - Can we actually promise that a file is never lost, or only that our own relays
   try hard?
 - When, if ever, relays should coordinate deliveries with each other.
