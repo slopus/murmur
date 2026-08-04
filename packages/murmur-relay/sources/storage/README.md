@@ -7,9 +7,12 @@ contiguous sequences; the permanent topic head preserves cursor progress.
 Every page reports whether all retained candidates were exhausted after both
 count and encoded-byte limits. Reads select at most one lookahead beyond the
 count limit instead of scanning and window-counting the whole retained suffix.
-Both stores persist the exact same compact event JSON byte length and share page
-materialization, so budget boundaries cannot drift between SQLite text and
-Postgres JSONB representations.
+The first query returns only sequence and encoded-length metadata. Both stores
+then hydrate exactly the selected sequences with an indexed second query inside
+the same SQLite or repeatable-read Postgres transaction. They persist the exact
+same compact event JSON byte length and share page selection, so budget
+boundaries cannot drift between SQLite text and Postgres JSONB representations
+or force hydration of every large candidate.
 
 Collapse identity is `(topic, author signing key, collapse key)`. This matters
 for public-write `Read Topic` streams, where independent writers must not erase

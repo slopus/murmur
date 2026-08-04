@@ -25,6 +25,11 @@ export interface PageReadConstraints {
     readonly maximumEncodedBytes: number;
 }
 
+/** Optional store-boundary instrumentation, primarily for deterministic tests. */
+export interface RelayStoreInstrumentation {
+    readonly eventJsonHydrated: (seq: bigint) => void;
+}
+
 /** One retained event associated with its never-reused topic sequence. */
 export interface RetainedRelayEvent {
     readonly seq: bigint;

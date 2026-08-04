@@ -11,11 +11,18 @@ import {
     type SignedRelayEvent,
 } from "../../protocol/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
-import { PGliteDatabase, PostgresRelayStore, SqliteRelayStore, type RelayStore } from "../index.js";
-import { POSTGRES_READ_EVENTS_QUERY } from "../postgres/index.js";
-import { SQLITE_READ_EVENTS_QUERY } from "../sqlite/index.js";
+import {
+    parseRelayStoreBackend,
+    PGliteDatabase,
+    PostgresRelayStore,
+    SqliteRelayStore,
+    type RelayStore,
+} from "../index.js";
+import { postgresHydrateEventsQuery, POSTGRES_READ_EVENTS_QUERY } from "../postgres/index.js";
+import { sqliteHydrateEventsQuery, SQLITE_READ_EVENTS_QUERY } from "../sqlite/index.js";
 
 const NOW = 5_000;
+const MAXIMUM_PAGE_BYTES = 2 * 1024 * 1024;
 
 function signed(
     secretKey: Uint8Array,
@@ -44,6 +51,25 @@ async function stores(): Promise<readonly RelayStore[]> {
 }
 
 describe("relay store conformance", () => {
+    test("strictly parses the standalone relay store backend", () => {
+        expect(parseRelayStoreBackend(undefined)).toBe("sqlite");
+        expect(parseRelayStoreBackend("sqlite")).toBe("sqlite");
+        expect(parseRelayStoreBackend("postgres")).toBe("postgres");
+        for (const invalid of [
+            "",
+            "SQLite",
+            "POSTGRES",
+            " postgres",
+            "postgres ",
+            "pglite",
+            "postgresql",
+        ]) {
+            expect(() => parseRelayStoreBackend(invalid)).toThrow(
+                "MURMUR_RELAY_STORE must be exactly sqlite or postgres",
+            );
+        }
+    });
+
     test("rejects a legacy SQLite schema before adding clean tables", () => {
         const database = new DatabaseSync(":memory:");
         database.exec("CREATE TABLE murmur_relay_topics (id TEXT PRIMARY KEY)");
@@ -221,6 +247,100 @@ describe("relay store conformance", () => {
         }
     });
 
+    test("SQLite hydrates only the selected event from 256 maximum-size candidates", async () => {
+        const database = new DatabaseSync(":memory:");
+        const hydrated: bigint[] = [];
+        const store = new SqliteRelayStore(":memory:", {
+            database,
+            instrumentation: {
+                eventJsonHydrated: (seq) => hydrated.push(seq),
+            },
+        });
+        const secretKey = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "bounded-sqlite-hydration",
+            writeKey: ed25519.getPublicKey(secretKey),
+        };
+        const topicId = relayTopicId(topic);
+        const event = signed(secretKey, topic, 1);
+        const eventJson = JSON.stringify(signedRelayEventToJson(event));
+        try {
+            database.exec("BEGIN IMMEDIATE");
+            database
+                .prepare("INSERT INTO murmur_relay_topics (id, head) VALUES (?, 256)")
+                .run(topicId);
+            const insert = database.prepare(
+                `INSERT INTO murmur_relay_events
+                    (topic_id, seq, event_json, encoded_bytes, expires_at,
+                     author_signing_key, collapse_key)
+                 VALUES (?, ?, ?, ?, NULL, ?, NULL)`,
+            );
+            for (let seq = 1; seq <= 256; seq += 1) {
+                insert.run(
+                    topicId,
+                    BigInt(seq),
+                    eventJson,
+                    BigInt(MAXIMUM_PAGE_BYTES),
+                    event.author.signingKey,
+                );
+            }
+            database.exec("COMMIT");
+
+            const page = await store.readEvents(topicId, 0n, 256, NOW, {
+                maximumEncodedBytes: MAXIMUM_PAGE_BYTES,
+            });
+            expect(page.events.map(({ seq }) => seq)).toEqual([1n]);
+            expect(page.head).toBe(256n);
+            expect(page.exhausted).toBe(false);
+            expect(hydrated).toEqual([1n]);
+        } finally {
+            await store.close();
+        }
+    });
+
+    test("Postgres hydrates only the selected event from 256 maximum-size candidates", async () => {
+        const database = new PGliteDatabase(new PGlite());
+        const hydrated: bigint[] = [];
+        const store = await PostgresRelayStore.create(database, {
+            instrumentation: {
+                eventJsonHydrated: (seq) => hydrated.push(seq),
+            },
+        });
+        const secretKey = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "bounded-postgres-hydration",
+            writeKey: ed25519.getPublicKey(secretKey),
+        };
+        const topicId = relayTopicId(topic);
+        const event = signed(secretKey, topic, 1);
+        const eventJson = JSON.stringify(signedRelayEventToJson(event));
+        try {
+            await database.query("INSERT INTO murmur_relay_topics (id, head) VALUES ($1, 256)", [
+                topicId,
+            ]);
+            await database.query(
+                `INSERT INTO murmur_relay_events
+                    (topic_id, seq, event_json, encoded_bytes, expires_at,
+                     author_signing_key, collapse_key)
+                 SELECT $1, generated.seq, $2::jsonb, $3, NULL, $4, NULL
+                 FROM generate_series(1, 256) AS generated(seq)`,
+                [topicId, eventJson, MAXIMUM_PAGE_BYTES, event.author.signingKey],
+            );
+
+            const page = await store.readEvents(topicId, 0n, 256, NOW, {
+                maximumEncodedBytes: MAXIMUM_PAGE_BYTES,
+            });
+            expect(page.events.map(({ seq }) => seq)).toEqual([1n]);
+            expect(page.head).toBe(256n);
+            expect(page.exhausted).toBe(false);
+            expect(hydrated).toEqual([1n]);
+        } finally {
+            await store.close();
+        }
+    });
+
     test("large SQLite catch-up stays on a bounded ordered index plan", async () => {
         const database = new DatabaseSync(":memory:");
         const store = new SqliteRelayStore(":memory:", { database });
@@ -265,6 +385,13 @@ describe("relay store conformance", () => {
                 /SEARCH murmur_relay_events USING INDEX .* \(topic_id=\? AND seq>\?\)/,
             );
             expect(details).not.toMatch(/USE TEMP B-TREE|MATERIALIZE|CO-ROUTINE/);
+            expect(SQLITE_READ_EVENTS_QUERY).not.toContain("event_json");
+            const hydrationPlan = database
+                .prepare(`EXPLAIN QUERY PLAN ${sqliteHydrateEventsQuery(2)}`)
+                .all(topicId, 1n, 2n) as readonly Record<string, unknown>[];
+            expect(hydrationPlan.map((row) => String(row["detail"])).join("\n")).toMatch(
+                /SEARCH murmur_relay_events USING INDEX .* \(topic_id=\? AND seq=\?\)/,
+            );
 
             let since = 0n;
             let read = 0;
@@ -318,6 +445,14 @@ describe("relay store conformance", () => {
             expect(plan).toContain('"Node Type":"Limit"');
             expect(plan).toMatch(/"Node Type":"Index(?: Only)? Scan"/);
             expect(plan).not.toMatch(/"Node Type":"(?:WindowAgg|Aggregate|Sort)"/);
+            expect(POSTGRES_READ_EVENTS_QUERY).not.toContain("event_json");
+            const hydration = await database.query<Record<string, unknown>>(
+                `EXPLAIN (FORMAT JSON) ${postgresHydrateEventsQuery(2)}`,
+                [topicId, "1", "2"],
+            );
+            expect(JSON.stringify(hydration.rows)).toMatch(
+                /"Node Type":"(?:Index|Bitmap Index)(?: Only)? Scan"/,
+            );
         } finally {
             await store.close();
         }

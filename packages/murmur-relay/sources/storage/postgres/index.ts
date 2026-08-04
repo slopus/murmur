@@ -5,13 +5,19 @@ import {
     type SignedRelayEvent,
 } from "../../protocol/index.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
-import { encodeStoredRelayEvent, selectEventPage, type StoredPageCandidate } from "../page.js";
+import {
+    encodeStoredRelayEvent,
+    selectEventPageMetadata,
+    type StoredPageCandidate,
+} from "../page.js";
 import type {
     EventPage,
     PageReadConstraints,
     PublishOutcome,
     PublishReceipt,
     RelayStore,
+    RelayStoreInstrumentation,
+    RetainedRelayEvent,
     StoredReadChallenge,
 } from "../types.js";
 import type { PostgresDatabase } from "./database.js";
@@ -33,30 +39,53 @@ export const POSTGRES_WAKE_CHANNEL = "murmur_relay_wake_v2";
 
 /** Bounded retained-candidate query kept visible for query-plan regression tests. */
 export const POSTGRES_READ_EVENTS_QUERY = `
-    SELECT seq, event_json, encoded_bytes
+    SELECT seq, encoded_bytes
     FROM murmur_relay_events
     WHERE topic_id = $1 AND seq > $2
       AND (expires_at IS NULL OR expires_at > $3)
     ORDER BY seq
     LIMIT $4`;
 
+/** Build the exact selected-sequence hydration query for tests and store reads. */
+export function postgresHydrateEventsQuery(count: number): string {
+    if (!Number.isSafeInteger(count) || count < 1) {
+        throw new Error("Postgres hydration count must be a positive safe integer");
+    }
+    const sequences = Array.from({ length: count }, (_, index) => `$${index + 2}`).join(", ");
+    return `
+        SELECT seq, event_json
+        FROM murmur_relay_events
+        WHERE topic_id = $1 AND seq IN (${sequences})
+        ORDER BY seq`;
+}
+
 function jsonValue(value: unknown): unknown {
     return typeof value === "string" ? (JSON.parse(value) as unknown) : value;
+}
+
+/** Postgres store construction options for embedding and instrumentation. */
+export interface PostgresRelayStoreOptions {
+    readonly instrumentation?: RelayStoreInstrumentation;
 }
 
 /** Fresh-schema Postgres/PGlite ordered event store. */
 export class PostgresRelayStore implements RelayStore {
     readonly #database: PostgresDatabase;
+    readonly #instrumentation: RelayStoreInstrumentation | undefined;
     #closed = false;
 
-    private constructor(database: PostgresDatabase) {
+    private constructor(database: PostgresDatabase, options: PostgresRelayStoreOptions) {
         this.#database = database;
+        this.#instrumentation = options.instrumentation;
     }
 
     /** Create the clean schema and store. */
-    static async create(database: PostgresDatabase): Promise<PostgresRelayStore> {
+    static async create(
+        database: PostgresDatabase,
+        options: PostgresRelayStoreOptions = {},
+    ): Promise<PostgresRelayStore> {
         await createPostgresRelaySchema(database);
-        return new PostgresRelayStore(database);
+        return new PostgresRelayStore(database, options);
     }
 
     async issueReadChallenge(
@@ -240,16 +269,14 @@ export class PostgresRelayStore implements RelayStore {
             if (topic === undefined) {
                 return { events: [], head: 0n, exhausted: true };
             }
-            const result = await transaction.query<{
+            const metadata = await transaction.query<{
                 seq: unknown;
-                event_json: unknown;
                 encoded_bytes: unknown;
             }>(POSTGRES_READ_EVENTS_QUERY, [topicId, since.toString(), now.toString(), limit + 1]);
-            return selectEventPage(
-                result.rows.map(
+            const selection = selectEventPageMetadata(
+                metadata.rows.map(
                     (row): StoredPageCandidate => ({
                         seq: bigintColumn(row.seq),
-                        event: parseSignedRelayEvent(jsonValue(row.event_json)),
                         encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
@@ -257,6 +284,32 @@ export class PostgresRelayStore implements RelayStore {
                 limit,
                 constraints,
             );
+            const hydrated =
+                selection.candidates.length === 0
+                    ? { rows: [] }
+                    : await transaction.query<{ seq: unknown; event_json: unknown }>(
+                          postgresHydrateEventsQuery(selection.candidates.length),
+                          [topicId, ...selection.candidates.map(({ seq }) => seq.toString())],
+                      );
+            if (hydrated.rows.length !== selection.candidates.length) {
+                throw new Error("Postgres relay hydration did not match selected events");
+            }
+            const events = hydrated.rows.map((row, index): RetainedRelayEvent => {
+                const seq = bigintColumn(row.seq);
+                if (seq !== selection.candidates[index]!.seq) {
+                    throw new Error("Postgres relay hydration order is inconsistent");
+                }
+                this.#instrumentation?.eventJsonHydrated(seq);
+                return {
+                    seq,
+                    event: parseSignedRelayEvent(jsonValue(row.event_json)),
+                };
+            });
+            return {
+                events,
+                head: selection.head,
+                exhausted: selection.exhausted,
+            };
         }, "repeatable read");
     }
 

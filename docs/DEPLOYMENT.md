@@ -182,6 +182,10 @@ whitespace after commas. Paths, queries, fragments, credentials, trailing
 slashes, non-HTTP(S) URLs, empty entries, duplicates, and combining `*` with
 another entry are startup errors.
 
+`MURMUR_RELAY_STORE` accepts exactly `sqlite` or `postgres` in lowercase. Any
+other value is a startup error; it is not treated as an implicit Postgres
+selection.
+
 ## Single-instance production
 
 SQLite is the intended single-instance setup:

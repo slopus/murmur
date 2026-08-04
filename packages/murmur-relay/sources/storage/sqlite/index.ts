@@ -11,19 +11,26 @@ import {
     type SignedRelayEvent,
 } from "../../protocol/index.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
-import { encodeStoredRelayEvent, selectEventPage, type StoredPageCandidate } from "../page.js";
+import {
+    encodeStoredRelayEvent,
+    selectEventPageMetadata,
+    type StoredPageCandidate,
+} from "../page.js";
 import type {
     EventPage,
     PageReadConstraints,
     PublishOutcome,
     PublishReceipt,
     RelayStore,
+    RelayStoreInstrumentation,
+    RetainedRelayEvent,
     StoredReadChallenge,
 } from "../types.js";
 
 /** SQLite store construction options for embedding. */
 export interface SqliteRelayStoreOptions {
     readonly database?: DatabaseSync;
+    readonly instrumentation?: RelayStoreInstrumentation;
 }
 
 function record(value: unknown): Record<string, unknown> {
@@ -42,19 +49,33 @@ function textColumn(value: unknown, name: string): string {
 
 /** Bounded retained-candidate query kept visible for query-plan regression tests. */
 export const SQLITE_READ_EVENTS_QUERY = `
-    SELECT seq, event_json, encoded_bytes
+    SELECT seq, encoded_bytes
     FROM murmur_relay_events
     WHERE topic_id = ? AND seq > ? AND (expires_at IS NULL OR expires_at > ?)
     ORDER BY seq
     LIMIT ?`;
 
+/** Build the exact selected-sequence hydration query for tests and store reads. */
+export function sqliteHydrateEventsQuery(count: number): string {
+    if (!Number.isSafeInteger(count) || count < 1) {
+        throw new Error("SQLite hydration count must be a positive safe integer");
+    }
+    return `
+        SELECT seq, event_json
+        FROM murmur_relay_events
+        WHERE topic_id = ? AND seq IN (${Array.from({ length: count }, () => "?").join(", ")})
+        ORDER BY seq`;
+}
+
 /** Fresh-schema SQLite ordered event store. */
 export class SqliteRelayStore implements RelayStore {
     readonly #database: DatabaseSync;
+    readonly #instrumentation: RelayStoreInstrumentation | undefined;
     #closed = false;
 
     constructor(path: string, options: SqliteRelayStoreOptions = {}) {
         this.#database = options.database ?? new DatabaseSync(path);
+        this.#instrumentation = options.instrumentation;
         this.#database.exec("PRAGMA journal_mode = WAL");
         this.#database.exec("PRAGMA foreign_keys = ON");
         this.#initializeSchema();
@@ -324,13 +345,10 @@ export class SqliteRelayStore implements RelayStore {
                 BigInt(now),
                 BigInt(limit + 1),
             );
-            const page = selectEventPage(
+            const selection = selectEventPageMetadata(
                 rows.map(
                     (row): StoredPageCandidate => ({
                         seq: bigintColumn(row.seq),
-                        event: parseSignedRelayEvent(
-                            JSON.parse(textColumn(row.event_json, "event JSON")) as unknown,
-                        ),
                         encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
@@ -338,6 +356,34 @@ export class SqliteRelayStore implements RelayStore {
                 limit,
                 constraints,
             );
+            const hydrated =
+                selection.candidates.length === 0
+                    ? []
+                    : this.#all(
+                          sqliteHydrateEventsQuery(selection.candidates.length),
+                          topicId,
+                          ...selection.candidates.map(({ seq }) => seq),
+                      );
+            if (hydrated.length !== selection.candidates.length) {
+                throw new Error("SQLite relay hydration did not match selected events");
+            }
+            const events = hydrated.map((row, index): RetainedRelayEvent => {
+                const seq = bigintColumn(row.seq);
+                if (seq !== selection.candidates[index]!.seq) {
+                    throw new Error("SQLite relay hydration order is inconsistent");
+                }
+                const eventJson = textColumn(row.event_json, "event JSON");
+                this.#instrumentation?.eventJsonHydrated(seq);
+                return {
+                    seq,
+                    event: parseSignedRelayEvent(JSON.parse(eventJson) as unknown),
+                };
+            });
+            const page: EventPage = {
+                events,
+                head: selection.head,
+                exhausted: selection.exhausted,
+            };
             this.#database.exec("COMMIT");
             return page;
         } catch (error) {

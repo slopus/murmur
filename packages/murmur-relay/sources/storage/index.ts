@@ -6,6 +6,7 @@ export {
     PostgresRelayStore,
     POSTGRES_WAKE_CHANNEL,
 } from "./postgres/index.js";
+export type { PostgresRelayStoreOptions } from "./postgres/index.js";
 export type {
     PGliteDatabaseLike,
     PGliteQueryLike,
@@ -20,6 +21,19 @@ export type {
     PublishOutcome,
     PublishReceipt,
     RelayStore,
+    RelayStoreInstrumentation,
     RetainedRelayEvent,
     StoredReadChallenge,
 } from "./types.js";
+
+/** Storage backend names accepted by the standalone relay. */
+export type RelayStoreBackend = "sqlite" | "postgres";
+
+/** Strictly parse the standalone relay's storage backend environment value. */
+export function parseRelayStoreBackend(value: string | undefined): RelayStoreBackend {
+    const backend = value ?? "sqlite";
+    if (backend !== "sqlite" && backend !== "postgres") {
+        throw new Error("MURMUR_RELAY_STORE must be exactly sqlite or postgres");
+    }
+    return backend;
+}

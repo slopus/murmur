@@ -27,6 +27,7 @@ export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./relay/ind
 export {
     PgPoolDatabase,
     PGliteDatabase,
+    parseRelayStoreBackend,
     PostgresRelayStore,
     SqliteRelayStore,
 } from "./storage/index.js";
@@ -35,7 +36,10 @@ export type {
     PageReadConstraints,
     PublishOutcome,
     PublishReceipt,
+    PostgresRelayStoreOptions,
     RelayStore,
+    RelayStoreBackend,
+    RelayStoreInstrumentation,
     RetainedRelayEvent,
     SqliteRelayStoreOptions,
 } from "./storage/index.js";

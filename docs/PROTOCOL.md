@@ -125,10 +125,12 @@ Events are ordered by sequence and strictly greater than the requested cursor.
 page limits. It is false whenever another retained event follows the page, even
 if the returned page is shorter than the requested count.
 
-Stores fetch at most `limit + 1` retained candidates under the same snapshot.
-They persist the compact encoded event byte length at publish time and use that
-identical value for SQLite and Postgres page budgeting. The first retained event
-is always returned, even when it alone exceeds a caller-supplied page budget.
+Stores first fetch at most `limit + 1` retained `(sequence, encoded length)`
+metadata candidates under one snapshot. After exact page selection, a second
+indexed query in the same transaction hydrates only the selected event JSON
+rows. SQLite and Postgres therefore share page-budget semantics without
+materializing every maximum-sized candidate. The first retained event is always
+selected and hydrated, even when it alone exceeds a caller-supplied page budget.
 
 Clients advance the last returned event to `head` only when `exhausted` is true.
 Otherwise they advance to that event's sequence and request the next page.

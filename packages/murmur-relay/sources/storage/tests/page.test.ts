@@ -1,20 +1,5 @@
 import { describe, expect, test } from "vitest";
-import type { SignedRelayEvent } from "../../protocol/index.js";
-import { selectEventPage, type StoredPageCandidate } from "../page.js";
-
-const event: SignedRelayEvent = {
-    version: 1,
-    id: "A".repeat(43),
-    topic: {
-        type: "write",
-        name: "linear-page",
-        writeKey: new Uint8Array(32),
-    },
-    author: { signingKey: new Uint8Array(32) },
-    createdAt: 0,
-    payload: new Uint8Array(),
-    signature: new Uint8Array(64),
-};
+import { selectEventPageMetadata, type StoredPageCandidate } from "../page.js";
 
 function selectionWork(limit: number): {
     readonly candidateEncodings: number;
@@ -23,11 +8,10 @@ function selectionWork(limit: number): {
 } {
     const candidates: StoredPageCandidate[] = Array.from({ length: limit + 1 }, (_, index) => ({
         seq: BigInt(index + 1),
-        event,
         encodedBytes: 512,
     }));
     let candidateEncodings = 0;
-    const page = selectEventPage(
+    const page = selectEventPageMetadata(
         candidates,
         BigInt(candidates.length),
         limit,
@@ -40,7 +24,7 @@ function selectionWork(limit: number): {
     );
     return {
         candidateEncodings,
-        selected: page.events.length,
+        selected: page.candidates.length,
         exhausted: page.exhausted,
     };
 }

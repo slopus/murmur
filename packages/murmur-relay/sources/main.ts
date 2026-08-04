@@ -15,6 +15,7 @@ import {
 } from "./server/index.js";
 import {
     PgPoolDatabase,
+    parseRelayStoreBackend,
     PostgresRelayStore,
     SqliteRelayStore,
     type RelayStore,
@@ -33,7 +34,8 @@ function port(value: string | undefined): number {
 }
 
 async function createStore(): Promise<{ store: RelayStore; wakeSource: WakeSource }> {
-    if ((process.env.MURMUR_RELAY_STORE ?? "sqlite") === "sqlite") {
+    const backend = parseRelayStoreBackend(process.env.MURMUR_RELAY_STORE);
+    if (backend === "sqlite") {
         const path = process.env.MURMUR_RELAY_DB ?? "./data/murmur-relay.sqlite";
         if (path !== ":memory:") await mkdir(dirname(resolve(path)), { recursive: true });
         return { store: new SqliteRelayStore(path), wakeSource: new InProcessWakeSource() };

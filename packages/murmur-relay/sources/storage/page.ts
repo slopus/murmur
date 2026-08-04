@@ -1,5 +1,5 @@
 import { signedRelayEventToJson, type SignedRelayEvent } from "../protocol/index.js";
-import type { EventPage, PageReadConstraints, RetainedRelayEvent } from "./types.js";
+import type { PageReadConstraints } from "./types.js";
 
 const textEncoder = new TextEncoder();
 
@@ -12,9 +12,17 @@ export function encodeStoredRelayEvent(event: SignedRelayEvent): {
     return { json, encodedBytes: textEncoder.encode(json).length };
 }
 
-/** A retained row plus the persisted compact event JSON byte length. */
-export interface StoredPageCandidate extends RetainedRelayEvent {
+/** Bounded retained-row metadata used before any event JSON is hydrated. */
+export interface StoredPageCandidate {
+    readonly seq: bigint;
     readonly encodedBytes: number;
+}
+
+/** Selected retained metadata and snapshot state ready for exact hydration. */
+export interface StoredPageSelection {
+    readonly candidates: readonly StoredPageCandidate[];
+    readonly head: bigint;
+    readonly exhausted: boolean;
 }
 
 /** Optional deterministic accounting hook used by complexity regressions. */
@@ -45,15 +53,15 @@ function encodedCandidateBytes(
  * cannot permanently strand a large valid event. Later events must fit the
  * exact compact HTTP response byte budget.
  */
-export function selectEventPage(
+export function selectEventPageMetadata(
     candidates: readonly StoredPageCandidate[],
     head: bigint,
     limit: number,
     constraints: PageReadConstraints,
     instrumentation?: PageSelectionInstrumentation,
-): EventPage {
+): StoredPageSelection {
     if (candidates.length === 0) {
-        return { events: [], head, exhausted: true };
+        return { candidates: [], head, exhausted: true };
     }
     const available = candidates.slice(0, limit);
     let exhaustedBytes = encodedEmptyPageBytes(head, true);
@@ -71,10 +79,10 @@ export function selectEventPage(
         candidates.length <= limit &&
         (available.length === 1 || exhaustedBytes <= constraints.maximumEncodedBytes)
     ) {
-        return { events: available, head, exhausted: true };
+        return { candidates: available, head, exhausted: true };
     }
     return {
-        events: available.slice(0, selectedCount),
+        candidates: available.slice(0, selectedCount),
         head,
         exhausted: false,
     };
