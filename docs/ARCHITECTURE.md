@@ -112,15 +112,16 @@ MurmurClient.publish(access, payload)
                 |
                 +-- relay verifies shape/signature/write key
                 +-- exact receipt retry returns original sequence
-                +-- new event passes freshness/expiration policy
+                +-- new event passes future-skew/expiration policy
                 `-- store commits atomically
 ```
 
 The clean client has no relay arrays, failover ordering, or generic hidden retry
 loop. A higher-level durable protocol may retain an exact signed event in its
-own state and retry it. Exact retries remain idempotent after the event's
-timestamp window or explicit expiration because the durable receipt is checked
-before freshness for already-authenticated content.
+own state and retry it. A first publish has no maximum past age, so offline
+outbox work does not expire implicitly. Exact retries remain idempotent after
+explicit expiration because the durable receipt is checked before lifecycle
+policy for already-authenticated content.
 
 ## Reading and cursors
 

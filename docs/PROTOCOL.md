@@ -76,14 +76,19 @@ For a new event the relay:
 2. verifies the Ed25519 signature;
 3. enforces the topic's write capability;
 4. checks for an existing `(topic, id)` receipt;
-5. validates `createdAt` within five minutes and requires `expiresAt` to remain
-   in the future;
+5. rejects `createdAt` more than five minutes in the future and requires
+   `expiresAt` to remain in the future;
 6. atomically allocates a sequence, applies collapse, stores the event, and
    stores its receipt.
 
+There is no maximum past age for `createdAt`. A correctly signed event that the
+relay has never accepted remains publishable after offline time or backward
+client clock drift; durable outbox work must not become invalid merely because
+delivery was delayed. `expiresAt` is the explicit author-selected deadline.
+
 For an existing receipt, steps 1–4 still apply. Equal authenticated content
-returns the original sequence even after the timestamp window or explicit
-expiration. Different content returns `id_collision`.
+returns the original sequence even after future-skew or expiration policy would
+reject a new event. Different content returns `id_collision`.
 
 ## Expiration and collapse
 

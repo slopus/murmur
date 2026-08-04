@@ -37,7 +37,7 @@ encryption.
 | Direct-message confidentiality and authenticity | Direct message contents are signed by the sender and sealed to the recipient's X25519 key.                                           | Does not provide post-compromise security; see below.                                                                        |
 | File confidentiality and integrity              | Files are AES-GCM encrypted before upload; the descriptor is encrypted with the message; blob IDs verify SHA-256 ciphertext content. | Anyone with the descriptor can decrypt. Blob IDs and ciphertext sizes remain visible.                                        |
 | Local blob transfer authorization               | A local transfer needs an HMAC-SHA256 link bound to version, method, ID, and expiry; comparison is constant time.                    | The local HMAC secret must be stable and private. Links are bearer capabilities until expiry.                                |
-| Relay-event integrity                           | The relay accepts only strictly parsed, Ed25519-signed events within its time window.                                                | This validates the outer relay mutation, not application meaning.                                                            |
+| Relay-event integrity                           | The relay accepts only strictly parsed, Ed25519-signed events, rejects excessive future skew, and enforces explicit expiration.      | Past `createdAt` is not anti-replay policy; durable receipts and IDs provide idempotency.                                    |
 | Atomic relay state mutation                     | One accepted event atomically gets a topic sequence, durable receipt, and all snapshot/list mutations.                               | Storage backend correctness is required.                                                                                     |
 | Crash-safe application consumption              | An application can commit its effect and `ReceivedEvent.advanceCursor(transaction)` in one `MurmurStore` transaction.                | The application must use a genuinely atomic store transaction and advance only after its own writes.                         |
 | Reset safety                                    | A cursor outside retained history is reported as `reset`, and `sync()` cannot return it as ordinary caught-up events.                | The application must call `loadTopic()` and apply the snapshot/list before resuming incremental sync.                        |
@@ -45,7 +45,21 @@ encryption.
 | Group forward secrecy                           | Group application state advances through MLS epochs and sends ratchet state forward.                                                 | Durable prepare → persist → publish discipline is mandatory for recoverability.                                              |
 | Shared-document attribution                     | An operation's actor ID must equal the MLS-authenticated sender leaf supplied to `SharedTextDocument.apply()`.                       | This authenticates only after MLS delivery has been authenticated.                                                           |
 
-## The two current design properties that need care
+## The three current design properties that need care
+
+### Signed event age is not replay protection
+
+A valid event that was never accepted remains publishable regardless of how old
+its `createdAt` is. This is deliberate: offline durable outboxes and clients
+whose clocks are behind the relay must not lose signed work merely because time
+passed before connectivity returned.
+
+The relay still rejects timestamps more than five minutes in its future and
+rejects an `expiresAt` deadline that has elapsed. Durable `(topic, id)` receipts
+provide idempotency for accepted content and collision detection for changed
+authenticated content. Applications that need a business-level freshness limit
+must encode and authenticate that policy inside the opaque payload; relay event
+age is not a revocation or anti-replay boundary.
 
 ### Pairwise topics are capability addresses
 

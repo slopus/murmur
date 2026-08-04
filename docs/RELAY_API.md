@@ -84,9 +84,9 @@ reused. The topic head is the greatest sequence ever allocated.
 
 Exact `(topic, id)` retries are idempotent indefinitely. The relay validates
 shape, signature, and write authorization, then checks the durable receipt
-before rejecting a stale `createdAt` or elapsed `expiresAt`. A matching retry
-returns its original sequence. Different authenticated content under the same
-ID returns HTTP 409 `id_collision`.
+before applying future-skew or elapsed-expiration policy. A matching retry
+returns its original sequence. Different authenticated content under the same ID
+returns HTTP 409 `id_collision`.
 
 ## Protected reads
 
@@ -125,9 +125,11 @@ Success:
 }
 ```
 
-New events must be within five minutes of relay time and must not already be
-expired. Exact durable retries bypass only these freshness checks, never shape,
-signature, topic authorization, or collision checks.
+New events must not have `createdAt` more than five minutes ahead of relay time
+and must not already be expired. Past `createdAt` values have no age limit:
+offline durable events and clients with clocks behind the relay remain
+publishable. Exact durable retries bypass only future-skew and expiration checks,
+never shape, signature, topic authorization, or collision checks.
 
 ### `POST /v1/read-challenges`
 
@@ -216,17 +218,17 @@ Returns the configured CORS policy. CORS defaults to `*`.
 
 ## Default limits
 
-| Limit                   |    Default |
-| ----------------------- | ---------: |
-| Event payload           |      1 MiB |
-| Collapse key            |  256 bytes |
-| JSON request            |      2 MiB |
-| Events per read         |        256 |
-| Long poll               | 30 seconds |
-| Concurrent long polls   |     10,000 |
-| Read challenge lifetime | 30 seconds |
-| Outstanding challenges  |     50,000 |
-| New-event clock skew    | ±5 minutes |
+| Limit                           |    Default |
+| ------------------------------- | ---------: |
+| Event payload                   |      1 MiB |
+| Collapse key                    |  256 bytes |
+| JSON request                    |      2 MiB |
+| Events per read                 |        256 |
+| Long poll                       | 30 seconds |
+| Concurrent long polls           |     10,000 |
+| Read challenge lifetime         | 30 seconds |
+| Outstanding challenges          |     50,000 |
+| Maximum future `createdAt` skew |  5 minutes |
 
 ## Storage contract
 

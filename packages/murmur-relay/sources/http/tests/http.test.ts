@@ -35,6 +35,67 @@ describe("relay HTTP read authorization", () => {
         }
     });
 
+    test("accepts offline signed events while enforcing future skew and expiration", async () => {
+        let relayNow = 30 * 24 * 60 * 60 * 1_000;
+        const secretKey = new Uint8Array(32).fill(5);
+        const topic = {
+            type: "write" as const,
+            name: "offline-http",
+            writeKey: ed25519.getPublicKey(secretKey),
+        };
+        const signed = (createdAt: number, expiresAt?: number): SignedRelayEvent => {
+            const unsigned: SignedRelayEvent = {
+                version: 1,
+                id: encodeBase64Url(randomBytes(32)),
+                topic,
+                author: { signingKey: topic.writeKey },
+                createdAt,
+                ...(expiresAt === undefined ? {} : { expiresAt }),
+                payload: new Uint8Array([1]),
+                signature: new Uint8Array(64),
+            };
+            return {
+                ...unsigned,
+                signature: ed25519.sign(relayEventSigningBytes(unsigned), secretKey),
+            };
+        };
+        const relay = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {},
+            undefined,
+            () => relayNow,
+        );
+        const handler = createRelayFetchHandler(relay);
+        const publish = (event: SignedRelayEvent): Promise<Response> =>
+            handler(
+                new Request("https://relay.test/v1/events", {
+                    method: "POST",
+                    body: JSON.stringify(signedRelayEventToJson(event)),
+                }),
+            );
+        try {
+            const delayed = signed(relayNow - 7 * 24 * 60 * 60 * 1_000);
+            const delayedResponse = await publish(delayed);
+            expect(delayedResponse.status).toBe(200);
+            await expect(delayedResponse.json()).resolves.toEqual({
+                seq: "1",
+                duplicate: false,
+            });
+            expect((await publish(signed(relayNow - 6 * 60 * 1_000))).status).toBe(200);
+            expect((await publish(signed(relayNow + 5 * 60 * 1_000 + 1))).status).toBe(401);
+            expect((await publish(signed(relayNow - 24 * 60 * 60 * 1_000, relayNow))).status).toBe(
+                401,
+            );
+
+            relayNow += 30 * 24 * 60 * 60 * 1_000;
+            const retry = await publish(delayed);
+            expect(retry.status).toBe(200);
+            await expect(retry.json()).resolves.toEqual({ seq: "1", duplicate: true });
+        } finally {
+            await relay.close();
+        }
+    });
+
     test("issues and consumes a challenge without receiving a secret key", async () => {
         const readSecretKey = new Uint8Array(32).fill(9);
         const writeSecretKey = new Uint8Array(32).fill(8);

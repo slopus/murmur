@@ -1,3 +1,4 @@
+import { PGlite } from "@electric-sql/pglite";
 import { ed25519 } from "@noble/curves/ed25519";
 import { randomBytes } from "@noble/hashes/utils";
 import { afterEach, describe, expect, test } from "vitest";
@@ -9,7 +10,13 @@ import {
     type RelayTopic,
     type SignedRelayEvent,
 } from "../../protocol/index.js";
-import { SqliteRelayStore, type EventPage, type PageReadConstraints } from "../../storage/index.js";
+import {
+    PGliteDatabase,
+    PostgresRelayStore,
+    SqliteRelayStore,
+    type EventPage,
+    type PageReadConstraints,
+} from "../../storage/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { RelayService } from "../index.js";
 
@@ -20,14 +27,14 @@ function event(
     secretKey: Uint8Array,
     topic: RelayTopic,
     payload: string,
-    options: { expiresAt?: number; collapseKey?: Uint8Array } = {},
+    options: { createdAt?: number; expiresAt?: number; collapseKey?: Uint8Array } = {},
 ): SignedRelayEvent {
     const unsigned: SignedRelayEvent = {
         version: 1,
         id: encodeBase64Url(randomBytes(32)),
         topic,
         author: { signingKey: ed25519.getPublicKey(secretKey) },
-        createdAt: now,
+        createdAt: options.createdAt ?? now,
         ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
         ...(options.collapseKey === undefined ? {} : { collapseKey: options.collapseKey }),
         payload: new TextEncoder().encode(payload),
@@ -205,6 +212,66 @@ describe("ordered relay", () => {
             status: 409,
             body: { error: "id_collision" },
         });
+    });
+
+    test("accepts delayed first publishes on SQLite and PGlite but rejects future or expired events", async () => {
+        const stores = [
+            new SqliteRelayStore(":memory:"),
+            await PostgresRelayStore.create(new PGliteDatabase(new PGlite())),
+        ];
+        for (const store of stores) {
+            let relayNow = 30 * 24 * 60 * 60 * 1_000;
+            const relay = new RelayService(store, {}, undefined, () => relayNow);
+            services.push(relay);
+            const owner = randomBytes(32);
+            const topic = {
+                type: "write" as const,
+                name: "offline-lifecycle",
+                writeKey: ed25519.getPublicKey(owner),
+            };
+            const delayedTenMinutes = event(owner, topic, "ten-minutes-offline", {
+                createdAt: relayNow - 10 * 60 * 1_000,
+            });
+            await expect(relay.publish(delayedTenMinutes)).resolves.toEqual({
+                seq: 1n,
+                duplicate: false,
+            });
+            const delayedDays = event(owner, topic, "days-offline", {
+                createdAt: relayNow - 7 * 24 * 60 * 60 * 1_000,
+            });
+            await expect(relay.publish(delayedDays)).resolves.toEqual({
+                seq: 2n,
+                duplicate: false,
+            });
+            await expect(
+                relay.publish(
+                    event(owner, topic, "clock-behind", {
+                        createdAt: relayNow - 6 * 60 * 1_000,
+                    }),
+                ),
+            ).resolves.toEqual({ seq: 3n, duplicate: false });
+            await expect(
+                relay.publish(
+                    event(owner, topic, "future", {
+                        createdAt: relayNow + 5 * 60 * 1_000 + 1,
+                    }),
+                ),
+            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
+            await expect(
+                relay.publish(
+                    event(owner, topic, "expired", {
+                        createdAt: relayNow - 24 * 60 * 60 * 1_000,
+                        expiresAt: relayNow,
+                    }),
+                ),
+            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
+
+            relayNow += 30 * 24 * 60 * 60 * 1_000;
+            await expect(relay.publish(delayedDays)).resolves.toEqual({
+                seq: 2n,
+                duplicate: true,
+            });
+        }
     });
 
     test("returns head-only progress without parking a long poll", async () => {

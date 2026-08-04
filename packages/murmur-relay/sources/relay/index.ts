@@ -30,7 +30,7 @@ export { PostgresWakeSource } from "./impl/wakePostgres.js";
 export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./types.js";
 
 const MEBIBYTE = 1024 * 1024;
-const FIVE_MINUTES = 5 * 60 * 1_000;
+const MAXIMUM_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 const HARD_MAXIMUM_LONG_POLL_MILLISECONDS = 30_000;
 const MAXIMUM_SEQUENCE = 9_223_372_036_854_775_807n;
 
@@ -200,11 +200,12 @@ export class RelayService {
         }
         const now = this.#now();
         if (
-            event.createdAt < now - FIVE_MINUTES ||
-            event.createdAt > now + FIVE_MINUTES ||
+            event.createdAt > now + MAXIMUM_FUTURE_SKEW_MILLISECONDS ||
             (event.expiresAt !== undefined && event.expiresAt <= now)
         ) {
-            throw new RelayError(401, "Expired relay event", { error: "unauthorized" });
+            throw new RelayError(401, "Relay event violates time policy", {
+                error: "unauthorized",
+            });
         }
         const outcome = await this.#store.publish(event, topicId, now);
         if (!outcome.duplicate) {
