@@ -270,9 +270,16 @@ export class RelayService {
         await this.#park(
             topicId,
             waitMilliseconds,
-            async () =>
-                (await this.#store.readEvents(topicId, since, limit, this.#now(), constraints))
-                    .events.length > 0,
+            async () => {
+                const page = await this.#store.readEvents(
+                    topicId,
+                    since,
+                    limit,
+                    this.#now(),
+                    constraints,
+                );
+                return page.events.length > 0 || page.head > since;
+            },
             signal,
         );
         const result = await this.#store.readEvents(

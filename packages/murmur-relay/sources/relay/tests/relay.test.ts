@@ -9,7 +9,7 @@ import {
     type RelayTopic,
     type SignedRelayEvent,
 } from "../../protocol/index.js";
-import { SqliteRelayStore } from "../../storage/index.js";
+import { SqliteRelayStore, type EventPage, type PageReadConstraints } from "../../storage/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { RelayService } from "../index.js";
 
@@ -221,6 +221,38 @@ describe("ordered relay", () => {
             events: [],
             head: 1n,
             exhausted: true,
+        });
+    });
+
+    test("register recheck wakes when only the topic head raced forward", async () => {
+        class RacingHeadStore extends SqliteRelayStore {
+            #reads = 0;
+
+            override async readEvents(
+                _topicId: string,
+                _since: bigint,
+                _limit: number,
+                _observedAt: number,
+                _constraints: PageReadConstraints,
+            ): Promise<EventPage> {
+                this.#reads += 1;
+                return {
+                    events: [],
+                    head: this.#reads === 1 ? 0n : 1n,
+                    exhausted: true,
+                };
+            }
+        }
+        const relay = new RelayService(new RacingHeadStore(":memory:"));
+        services.push(relay);
+        const topic = {
+            type: "write" as const,
+            name: "racing-head",
+            writeKey: ed25519.getPublicKey(randomBytes(32)),
+        };
+        await expect(relay.readEvents(topic, 0n, 256, 1_000)).resolves.toMatchObject({
+            events: [],
+            head: 1n,
         });
     });
 
