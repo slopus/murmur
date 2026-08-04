@@ -321,6 +321,10 @@ describe("durable friendship lifecycle and outbox", () => {
         expect(await book.confirmOutbox(request, "accepted")).toBe(true);
 
         const recordJson = JSON.parse(utf8Decode(record[1])) as Record<string, unknown>;
+        recordJson.requester = { publicKey: identityId(bob) };
+        await store.set(record[0], utf8Encode(JSON.stringify(recordJson)));
+        await expect(book.get(bob)).rejects.toThrow("disagrees with pending status");
+
         recordJson.requester = { publicKey: identityId(mallory) };
         await store.set(record[0], utf8Encode(JSON.stringify(recordJson)));
         await expect(book.get(bob)).rejects.toThrow("neither owner nor peer");

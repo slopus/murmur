@@ -21,7 +21,13 @@ import {
 } from "../../transport/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
 import { decodeFriendControlFrame, encodeFriendControlFrame } from "../impl/controlCodec.js";
-import { decodeGroup, encodeGroupEvent } from "../impl/stateCodec.js";
+import {
+    decodeGroup,
+    decodeRelayOutbox,
+    decodeStagedCommit,
+    encodeGroupEvent,
+    encodeRelayOutbox,
+} from "../impl/stateCodec.js";
 import { createCapabilityEvent, friendControlAccess, groupAccess } from "../impl/topics.js";
 import { Murmur } from "../index.js";
 
@@ -757,6 +763,229 @@ describe("stateful Murmur facade", () => {
             await relay.close();
         }
     }, 90_000);
+
+    it("retires staged Adds when a competing removal removes the local member", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const handler = createRelayFetchHandler(relay);
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const charlieStore = new MemoryMurmurStore();
+        let blockAliceGroups = false;
+        const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+            const request = new Request(input, init);
+            if (
+                blockAliceGroups &&
+                request.method === "POST" &&
+                new URL(request.url).pathname === "/v1/events"
+            ) {
+                const event = decodeSignedRelayEventWire(utf8Encode(await request.clone().text()));
+                if (event.topic.name === "group-events") {
+                    throw new Error("blocked staged Add publication");
+                }
+            }
+            return handler(request);
+        };
+        const sharedFetch = inProcessFetch(relay);
+        let alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: aliceStore,
+            initialProfile: { name: "Alice" },
+            fetch: aliceFetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: bobStore,
+            initialProfile: { name: "Bob" },
+            fetch: sharedFetch,
+        });
+        let charlie = await Murmur.open({
+            relay: "https://relay.test",
+            store: charlieStore,
+            initialProfile: { name: "Charlie" },
+            fetch: sharedFetch,
+        });
+        const aliceIdentity = alice.identityKey;
+        const charlieIdentity = charlie.identityKey;
+        try {
+            await alice.friends.request(bob.identityKey);
+            await alice.friends.request(charlie.identityKey);
+            await converge([alice, bob, charlie], 4);
+            await bob.friends.accept(alice.identityKey);
+            await charlie.friends.accept(alice.identityKey);
+            await converge([bob, charlie, alice], 8);
+
+            for (let iteration = 0; iteration < 9; iteration += 1) {
+                blockAliceGroups = false;
+                const groupId = await alice.groups.create(
+                    utf8Encode(`local-removal-race-${iteration}`),
+                    [bob.identityKey],
+                );
+                await converge([alice, bob, charlie], 7);
+                expect((await bob.groups.get(groupId))?.group.members).toHaveLength(2);
+
+                blockAliceGroups = true;
+                await alice.groups.add(groupId, charlie.identityKey);
+                const encodedGroupId = encodeBase64Url(groupId);
+                const stagedKey = `murmur/v1/groups/${encodedGroupId}/staged`;
+                await waitFor(async () => {
+                    try {
+                        await alice.sync();
+                    } catch (error: unknown) {
+                        if (
+                            !(error instanceof Error) ||
+                            error.message !== "blocked staged Add publication"
+                        ) {
+                            throw error;
+                        }
+                    }
+                    const checkpoint = await aliceStore.get(stagedKey);
+                    if (checkpoint === undefined) {
+                        return false;
+                    }
+                    checkpoint.fill(0);
+                    return true;
+                }, 30_000);
+                const stagedBytes = await aliceStore.get(stagedKey);
+                if (stagedBytes === undefined) {
+                    throw new Error("Expected a staged Add");
+                }
+                const staged = decodeStagedCommit(stagedBytes);
+                stagedBytes.fill(0);
+                if (staged.keyPackageReference === undefined) {
+                    throw new Error("Staged Add lost its KeyPackage reference");
+                }
+                const reference = staged.keyPackageReference.slice();
+                staged.nextEpoch.fill(0);
+                staged.fingerprint.fill(0);
+                staged.peer.fill(0);
+                staged.keyPackageReference.fill(0);
+                staged.welcome?.fill(0);
+                staged.tree?.fill(0);
+                const encodedReference = encodeBase64Url(reference);
+                const charlieBundleKey = `murmur/v1/key-packages/local/${identityId({
+                    publicKey: aliceIdentity,
+                })}/${encodedReference}`;
+                const charlieBundle = await charlieStore.get(charlieBundleKey);
+                expect(charlieBundle).toBeDefined();
+                charlieBundle?.fill(0);
+
+                await alice.groups.send(groupId, utf8Encode(`orphan-${iteration}`));
+                const metadataBytes = await aliceStore.get(
+                    `murmur/v1/groups/${encodedGroupId}/meta`,
+                );
+                if (metadataBytes === undefined) {
+                    throw new Error("Expected group metadata");
+                }
+                const metadata = decodeGroup(metadataBytes);
+                metadataBytes.fill(0);
+                const access = groupAccess(metadata.topicSecret);
+                const syntheticPayload = utf8Encode(`synthetic-${iteration}`);
+                try {
+                    const synthetic = createCapabilityEvent(access, syntheticPayload);
+                    const operationId = encodeBase64Url(new Uint8Array(24).fill(iteration + 1));
+                    const encodedOutbox = encodeRelayOutbox({
+                        event: synthetic,
+                        purpose: {
+                            type: "group-application",
+                            groupId: encodedGroupId,
+                            operationId,
+                        },
+                        attempted: false,
+                    });
+                    try {
+                        await aliceStore.set(
+                            `murmur/v1/relay-outbox/${synthetic.id}`,
+                            encodedOutbox,
+                        );
+                    } finally {
+                        encodedOutbox.fill(0);
+                    }
+                } finally {
+                    syntheticPayload.fill(0);
+                    metadata.topicSecret.fill(0);
+                    access.readSecretKey?.fill(0);
+                    access.writeSecretKey?.fill(0);
+                }
+
+                await bob.groups.remove(groupId, alice.identityKey);
+                await converge([bob], 4);
+                if (iteration === 0 || iteration === 8) {
+                    await Promise.all([alice.close(), charlie.close()]);
+                    blockAliceGroups = false;
+                    alice = await Murmur.open({
+                        relay: "https://relay.test",
+                        store: aliceStore,
+                        fetch: aliceFetch,
+                    });
+                    charlie = await Murmur.open({
+                        relay: "https://relay.test",
+                        store: charlieStore,
+                        fetch: sharedFetch,
+                    });
+                } else {
+                    blockAliceGroups = false;
+                }
+                await converge([alice, charlie, bob], 6);
+
+                expect((await alice.groups.get(groupId))?.group.status).toBe("removed");
+                expect(await aliceStore.get(stagedKey)).toBeUndefined();
+                expect(
+                    await aliceStore.get(`murmur/v1/groups/${encodedGroupId}/epoch`),
+                ).toBeUndefined();
+                const operations = await aliceStore.list(
+                    `murmur/v1/groups/${encodedGroupId}/operations/`,
+                );
+                expect(operations.size).toBe(0);
+                for (const bytes of operations.values()) {
+                    bytes.fill(0);
+                }
+                expect(
+                    await aliceStore.get(
+                        `murmur/v1/key-packages/remote-consumed/${identityId({
+                            publicKey: charlieIdentity,
+                        })}/${encodedReference}`,
+                    ),
+                ).toBeUndefined();
+                expect(await charlieStore.get(charlieBundleKey)).toBeUndefined();
+
+                const outboxes = await aliceStore.list("murmur/v1/relay-outbox/");
+                try {
+                    const decodedOutboxes = [...outboxes.values()].map(decodeRelayOutbox);
+                    const groupOutboxes = decodedOutboxes.filter(
+                        (record) =>
+                            (record.purpose.type === "group-application" ||
+                                record.purpose.type === "group-commit") &&
+                            record.purpose.groupId === encodedGroupId,
+                    );
+                    expect(groupOutboxes).toHaveLength(0);
+                    for (const record of decodedOutboxes) {
+                        record.event.author.signingKey.fill(0);
+                        record.event.payload.fill(0);
+                        record.event.signature.fill(0);
+                        record.event.collapseKey?.fill(0);
+                    }
+                } finally {
+                    for (const bytes of outboxes.values()) {
+                        bytes.fill(0);
+                    }
+                }
+                const localPackages = await charlieStore.list(
+                    `murmur/v1/key-packages/local/${identityId({
+                        publicKey: aliceIdentity,
+                    })}/`,
+                );
+                expect(localPackages.size).toBeLessThanOrEqual(8);
+                for (const bytes of localPackages.values()) {
+                    bytes.fill(0);
+                }
+                reference.fill(0);
+            }
+        } finally {
+            blockAliceGroups = false;
+            await Promise.all([alice.close(), bob.close(), charlie.close()]);
+            await relay.close();
+        }
+    }, 600_000);
 
     it("opens from a metadata index and paginates O(limit) retained events", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"));

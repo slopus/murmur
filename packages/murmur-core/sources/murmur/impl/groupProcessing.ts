@@ -3,7 +3,12 @@ import { hashBytes } from "../../crypto/index.js";
 import { createMlsKeyPackage, type MlsEpochState } from "../../mls/index.js";
 import { concatBytes, decodeBase64Url, utf8Encode, zeroBytes } from "../../utils/index.js";
 import type { MurmurGroup } from "../types.js";
-import type { GroupOperation, StagedGroupCommit, StoredGroup } from "./stateCodec.js";
+import type {
+    GroupOperation,
+    RelayOutboxRecord,
+    StagedGroupCommit,
+    StoredGroup,
+} from "./stateCodec.js";
 
 const MLS_PROTOCOL_VERSION = 1;
 const MLS_PUBLIC_MESSAGE = 1;
@@ -62,6 +67,8 @@ export function destroyStagedCommit(staged: StagedGroupCommit | undefined): void
     zeroBytes(staged.fingerprint);
     zeroBytes(staged.peer);
     staged.keyPackageReference?.fill(0);
+    staged.welcome?.fill(0);
+    staged.tree?.fill(0);
 }
 
 /** Zero decoded retained plaintext operations and their attempt fingerprints. */
@@ -72,4 +79,20 @@ export function destroyGroupOperation(operation: GroupOperation): void {
         return;
     }
     zeroBytes(operation.peer);
+}
+
+/** Zero decoded exact relay-event copies after reconciliation scans. */
+export function destroyRelayOutboxRecord(record: RelayOutboxRecord): void {
+    zeroBytes(record.event.author.signingKey);
+    zeroBytes(record.event.payload);
+    zeroBytes(record.event.signature);
+    record.event.collapseKey?.fill(0);
+    if (record.event.topic.type === "write") {
+        zeroBytes(record.event.topic.writeKey);
+    } else if (record.event.topic.type === "read") {
+        zeroBytes(record.event.topic.readKey);
+    } else {
+        zeroBytes(record.event.topic.readKey);
+        zeroBytes(record.event.topic.writeKey);
+    }
 }

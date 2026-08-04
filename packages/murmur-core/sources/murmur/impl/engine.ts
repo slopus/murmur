@@ -20,7 +20,7 @@ import {
     type FriendResponseEnvelope,
     type IdentityProfile,
 } from "../../identity/index.js";
-import { decodeFriendRecord, encodeFriendRecord } from "../../identity/impl/friendCodec.js";
+import { encodeFriendRecord } from "../../identity/impl/friendCodec.js";
 import { decodeProfilePayload, encodeProfilePayload } from "../../identity/impl/profileCodec.js";
 import {
     authenticateMurmurMlsCredential,
@@ -128,6 +128,7 @@ import {
     createMurmurKeyPackage,
     descriptorBinding,
     destroyGroupOperation,
+    destroyRelayOutboxRecord,
     destroyStagedCommit,
     groupView,
     isCommit,
@@ -1023,8 +1024,15 @@ export class MurmurEngine {
         if (stagedBytes === undefined) {
             return false;
         }
-        const staged = decodeStagedCommit(stagedBytes);
-        zeroBytes(stagedBytes);
+        let staged: StagedGroupCommit | undefined;
+        try {
+            staged = decodeStagedCommit(stagedBytes);
+        } finally {
+            zeroBytes(stagedBytes);
+        }
+        if (staged === undefined) {
+            return false;
+        }
         const operation = await this.#store.get(
             groupOperationKey(record.purpose.groupId, record.purpose.operationId),
         );
@@ -1051,7 +1059,21 @@ export class MurmurEngine {
         const purpose = record.purpose;
         await this.#store.transaction(async (transaction) => {
             const current = await transaction.get(key);
-            if (current === undefined || decodeRelayOutbox(current).event.id !== record.event.id) {
+            if (current === undefined) {
+                return;
+            }
+            let currentRecord: RelayOutboxRecord | undefined;
+            let currentMatches = false;
+            try {
+                currentRecord = decodeRelayOutbox(current);
+                currentMatches = currentRecord.event.id === record.event.id;
+            } finally {
+                zeroBytes(current);
+                if (currentRecord !== undefined) {
+                    destroyRelayOutboxRecord(currentRecord);
+                }
+            }
+            if (!currentMatches) {
                 return;
             }
             if (purpose.type === "group-application") {
@@ -1081,11 +1103,16 @@ export class MurmurEngine {
                 }
             } else {
                 const stagedBytes = await transaction.get(groupStagedKey(purpose.groupId));
-                if (
-                    stagedBytes !== undefined &&
-                    decodeStagedCommit(stagedBytes).eventId === record.event.id
-                ) {
-                    await transaction.delete(groupStagedKey(purpose.groupId));
+                let staged: StagedGroupCommit | undefined;
+                try {
+                    staged =
+                        stagedBytes === undefined ? undefined : decodeStagedCommit(stagedBytes);
+                    if (staged?.eventId === record.event.id) {
+                        await transaction.delete(groupStagedKey(purpose.groupId));
+                    }
+                } finally {
+                    stagedBytes?.fill(0);
+                    destroyStagedCommit(staged);
                 }
             }
             await transaction.delete(key);
@@ -1486,11 +1513,11 @@ export class MurmurEngine {
         }
         try {
             await this.#store.transaction(async (transaction) => {
-                const recordBytes = await transaction.get(friendRecordKey(this.#identity, peer));
-                if (recordBytes === undefined) {
+                const scoped = new FriendBook(this.#identity, new TransactionStore(transaction));
+                const record = await scoped.get(peer);
+                if (record === undefined) {
                     throw new Error("Friend-control sender is unknown");
                 }
-                const record = decodeFriendRecord(recordBytes);
                 if (frame.type === "profile-update") {
                     if (record.status === "active") {
                         await transaction.set(
@@ -1872,9 +1899,13 @@ export class MurmurEngine {
         try {
             const replay = await this.#store.get(groupReplayKey(groupId, fingerprint));
             if (replay !== undefined) {
-                await this.#store.transaction(async (transaction) => {
-                    await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
-                });
+                try {
+                    await this.#store.transaction(async (transaction) => {
+                        await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                    });
+                } finally {
+                    zeroBytes(replay);
+                }
                 return;
             }
             if (group.record.status !== "active" || group.epoch === undefined) {
@@ -1943,7 +1974,12 @@ export class MurmurEngine {
             return;
         }
         const stagedBytes = await this.#store.get(groupStagedKey(group.record.id));
-        const staged = stagedBytes === undefined ? undefined : decodeStagedCommit(stagedBytes);
+        let staged: StagedGroupCommit | undefined;
+        try {
+            staged = stagedBytes === undefined ? undefined : decodeStagedCommit(stagedBytes);
+        } finally {
+            stagedBytes?.fill(0);
+        }
         if (
             staged !== undefined &&
             staged.eventId === event.id &&
@@ -1970,19 +2006,24 @@ export class MurmurEngine {
         try {
             transition = clone.applyCommit(event.payload);
         } catch (error: unknown) {
-            destroyStagedCommit(staged);
             if (error instanceof MlsLocalMemberRemovedError) {
                 clone.destroy();
-                await this.#adoptLocalRemoval(
-                    group,
-                    event,
-                    fingerprint,
-                    sequence,
-                    expectedCursor,
-                    cursorKey,
-                );
+                try {
+                    await this.#adoptLocalRemoval(
+                        group,
+                        staged,
+                        event,
+                        fingerprint,
+                        sequence,
+                        expectedCursor,
+                        cursorKey,
+                    );
+                } finally {
+                    destroyStagedCommit(staged);
+                }
                 return;
             }
+            destroyStagedCommit(staged);
             clone.destroy();
             await this.#quarantine(
                 relayTopicId(event.topic),
@@ -2066,11 +2107,15 @@ export class MurmurEngine {
         try {
             await this.#store.transaction(async (transaction) => {
                 const current = await transaction.get(groupStagedKey(group.record.id));
-                if (
-                    current === undefined ||
-                    decodeStagedCommit(current).eventId !== staged.eventId
-                ) {
-                    throw new Error("Staged MLS candidate changed before adoption");
+                let currentStaged: StagedGroupCommit | undefined;
+                try {
+                    currentStaged = current === undefined ? undefined : decodeStagedCommit(current);
+                    if (currentStaged?.eventId !== staged.eventId) {
+                        throw new Error("Staged MLS candidate changed before adoption");
+                    }
+                } finally {
+                    current?.fill(0);
+                    destroyStagedCommit(currentStaged);
                 }
                 await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
                 await transaction.set(groupEpochKey(group.record.id), staged.nextEpoch);
@@ -2117,6 +2162,7 @@ export class MurmurEngine {
 
     async #adoptLocalRemoval(
         group: RuntimeGroup,
+        staged: StagedGroupCommit | undefined,
         event: SignedRelayEvent,
         fingerprint: Uint8Array,
         sequence: bigint,
@@ -2137,13 +2183,74 @@ export class MurmurEngine {
         await this.#store.transaction(async (transaction) => {
             await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
             await transaction.delete(groupEpochKey(group.record.id));
-            await transaction.delete(groupStagedKey(group.record.id));
+            await this.#clearRemovedGroupPendingState(transaction, group.record.id, staged);
             await transaction.set(groupReplayKey(group.record.id, fingerprint), fingerprint);
             await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
         });
         epoch.destroy();
         delete group.epoch;
         group.record = nextRecord;
+    }
+
+    async #clearRemovedGroupPendingState(
+        transaction: StoreTransaction,
+        groupId: string,
+        staged: StagedGroupCommit | undefined,
+    ): Promise<void> {
+        if (staged?.type === "add" && staged.keyPackageReference !== undefined) {
+            const peer = { publicKey: staged.peer };
+            await this.#queueControl(
+                transaction,
+                peer,
+                {
+                    type: "key-package-retire",
+                    consumedReferences: [staged.keyPackageReference],
+                },
+                { type: "friend-control" },
+            );
+            await transaction.delete(
+                `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
+                    peer,
+                )}/${encodeBase64Url(staged.keyPackageReference)}`,
+            );
+        }
+
+        const operations = await transaction.list(groupOperationPrefix(groupId));
+        try {
+            for (const key of operations.keys()) {
+                await transaction.delete(key);
+            }
+        } finally {
+            for (const encoded of operations.values()) {
+                zeroBytes(encoded);
+            }
+        }
+
+        const outboxes = await transaction.list(OUTBOX_PREFIX);
+        try {
+            for (const [key, encoded] of outboxes) {
+                let record: RelayOutboxRecord | undefined;
+                try {
+                    record = decodeRelayOutbox(encoded);
+                    if (
+                        (record.purpose.type === "group-application" ||
+                            record.purpose.type === "group-commit") &&
+                        record.purpose.groupId === groupId
+                    ) {
+                        await transaction.delete(key);
+                    }
+                } finally {
+                    if (record !== undefined) {
+                        destroyRelayOutboxRecord(record);
+                    }
+                }
+            }
+        } finally {
+            for (const encoded of outboxes.values()) {
+                zeroBytes(encoded);
+            }
+        }
+        await transaction.delete(groupStagedKey(groupId));
     }
 
     #membersAfterCommit(epoch: MlsEpochState, payload: Uint8Array): readonly Uint8Array[] {
@@ -2530,6 +2637,7 @@ export class MurmurEngine {
         let keyPackageReference: Uint8Array | undefined;
         let addition: MlsKeyPackage | undefined;
         let prepared: ReturnType<MlsEpochState["prepareCommit"]> | undefined;
+        let staged: StagedGroupCommit | undefined;
         try {
             if (operation.type === "add") {
                 if (remoteKey === undefined || remoteBytes === undefined) {
@@ -2564,7 +2672,7 @@ export class MurmurEngine {
                 throw new Error("Remote KeyPackage expired before Commit creation");
             }
             const fingerprint = hashBytes(prepared.commit);
-            const staged: StagedGroupCommit = {
+            staged = {
                 operationId: operation.id,
                 eventId: event.id,
                 fingerprint,
@@ -2579,19 +2687,29 @@ export class MurmurEngine {
                     : { tree: encodeMlsRatchetTree(prepared.tree) }),
             };
             await this.#store.transaction(async (transaction) => {
-                if ((await transaction.get(groupStagedKey(group.record.id))) !== undefined) {
+                const existingStage = await transaction.get(groupStagedKey(group.record.id));
+                if (existingStage !== undefined) {
+                    zeroBytes(existingStage);
                     throw new Error("Group already has a staged membership transition");
                 }
-                if (
-                    (await transaction.get(groupOperationKey(group.record.id, operation.id))) ===
-                    undefined
-                ) {
+                const currentOperation = await transaction.get(
+                    groupOperationKey(group.record.id, operation.id),
+                );
+                if (currentOperation === undefined) {
                     throw new Error("Group membership operation disappeared");
                 }
+                zeroBytes(currentOperation);
                 if (operation.type === "add") {
                     const currentRemote = await transaction.get(remoteKey!);
-                    if (currentRemote === undefined || !equalBytes(currentRemote, remoteBytes!)) {
-                        throw new Error("Remote KeyPackage was already reserved");
+                    try {
+                        if (
+                            currentRemote === undefined ||
+                            !equalBytes(currentRemote, remoteBytes!)
+                        ) {
+                            throw new Error("Remote KeyPackage was already reserved");
+                        }
+                    } finally {
+                        currentRemote?.fill(0);
                     }
                     await transaction.delete(remoteKey!);
                     await transaction.set(
@@ -2606,7 +2724,7 @@ export class MurmurEngine {
                         })}`,
                     );
                 }
-                await transaction.set(groupStagedKey(group.record.id), encodeStagedCommit(staged));
+                await transaction.set(groupStagedKey(group.record.id), encodeStagedCommit(staged!));
                 await transaction.set(
                     `${OUTBOX_PREFIX}${event.id}`,
                     encodeRelayOutbox({
@@ -2634,6 +2752,7 @@ export class MurmurEngine {
             }
             nextEpoch?.fill(0);
             keyPackageReference?.fill(0);
+            destroyStagedCommit(staged);
         }
     }
 
@@ -2840,10 +2959,14 @@ export class MurmurEngine {
         expiresAt?: number,
     ): Promise<void> {
         const event = this.#createControlEvent(peer, frame, expiresAt);
-        await transaction.set(
-            `${OUTBOX_PREFIX}${event.id}`,
-            encodeRelayOutbox({ event, purpose, attempted: false }),
-        );
+        const record: RelayOutboxRecord = { event, purpose, attempted: false };
+        const encoded = encodeRelayOutbox(record);
+        try {
+            await transaction.set(`${OUTBOX_PREFIX}${event.id}`, encoded);
+        } finally {
+            zeroBytes(encoded);
+            destroyRelayOutboxRecord(record);
+        }
     }
 
     #cloneEpoch(group: RuntimeGroup & { epoch: MlsEpochState }): MlsEpochState {

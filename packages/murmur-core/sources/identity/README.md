@@ -40,10 +40,9 @@ ordering, prevents delayed old requests from reopening ended state.
 
 The tombstone stores this separately as nullable
 `nextRequestPredecessorId`. Only a request known by both peers advances it.
-Canceling an unpublished outgoing request preserves the prior predecessor, so
-the other peer can still initiate with `null` (or the last mutually-known
-generation) without deadlocking. The canceled `requestId` remains available
-independently for late-response replay correlation. Each outgoing tracker also
+Ending a pending outgoing request retains its exact publication and advances
+the local predecessor to that request ID; its causally bound terminal intent is
+published after the shared generation can exist. Each outgoing tracker also
 stores the request's signed predecessor. A late authenticated response may
 advance the tombstone only when that predecessor is still current, preventing
 an older response from regressing a newer mutually-known generation.
@@ -60,15 +59,16 @@ inside the signed encrypted payload.
 
 ## Friend channel
 
-After acceptance, `FriendChannel` derives one shared encryption key and one
-opaque topic authorization key from X25519 agreement over the peers' single
-identity keys. It carries only opaque durable or expiring control bytes, such
-as profile changes, friendship termination, or a later MLS Welcome.
+After acceptance, `FriendChannel` derives identity-ordered directional send and
+receive encryption keys plus a separate opaque topic authorization key from
+X25519 agreement over the peers' single identity keys. It carries only opaque
+durable or expiring control bytes, such as profile changes, friendship
+termination, or a later MLS Welcome.
 
-Control payloads are AES-GCM encrypted with the shared channel key and also
-Ed25519-signed by their individual sender. `acceptFriendControl` commits an
-application effect and replay marker atomically. Normal two-person and
-multi-person conversation data belongs to MLS, not this channel.
+Control payloads are AES-GCM encrypted in independent directional key spaces
+and also Ed25519-signed by their individual sender. `acceptFriendControl`
+commits an application effect and replay marker atomically. Normal two-person
+and multi-person conversation data belongs to MLS, not this channel.
 
 The relay-visible control envelope contains no identity. Both peers derive the
 same topic public key and secret; `exportTopicSecretKey()` returns a defensive

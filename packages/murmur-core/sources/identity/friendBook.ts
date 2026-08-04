@@ -641,11 +641,16 @@ export class FriendBook {
     }
 
     #validateRecordRequester(record: FriendRecord): void {
-        if (
-            !equalBytes(record.requester.publicKey, this.#owner.publicKey) &&
-            !equalBytes(record.requester.publicKey, record.identity.publicKey)
-        ) {
+        const requesterIsOwner = equalBytes(record.requester.publicKey, this.#owner.publicKey);
+        const requesterIsPeer = equalBytes(record.requester.publicKey, record.identity.publicKey);
+        if (!requesterIsOwner && !requesterIsPeer) {
             throw new Error("Persisted friend requester is neither owner nor peer");
+        }
+        if (
+            (record.status === "pending-outgoing" && !requesterIsOwner) ||
+            (record.status === "pending-incoming" && !requesterIsPeer)
+        ) {
+            throw new Error("Persisted friend requester disagrees with pending status");
         }
     }
 
