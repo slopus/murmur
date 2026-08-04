@@ -27,3 +27,26 @@ export class ChatFrameTooLargeError extends Error {
 export class ChatClosedError extends Error {
     override readonly name = "ChatClosedError";
 }
+
+/** Public options or method input failed runtime validation. */
+export class ChatValidationError extends Error {
+    override readonly name = "ChatValidationError";
+}
+
+/** Another live service already owns this store namespace in this realm. */
+export class ChatAlreadyOpenError extends Error {
+    override readonly name = "ChatAlreadyOpenError";
+}
+
+/** A durable send cannot proceed until explicitly retried or dropped. */
+export class ChatOutboxFailedError extends Error {
+    override readonly name = "ChatOutboxFailedError";
+
+    /** Stable machine-readable failure code. */
+    readonly code: string;
+
+    constructor(code: string, message: string) {
+        super(message);
+        this.code = code;
+    }
+}

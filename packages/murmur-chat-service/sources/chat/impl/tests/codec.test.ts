@@ -50,12 +50,14 @@ describe("strict chat codecs", () => {
     it("roundtrips strict durable outbox records and fails corruption closed", () => {
         const record: OutboxRecord = {
             status: "preparing",
+            enqueueSequence: 1n,
             conversationId: new Uint8Array(32).fill(1),
             messageId: new Uint8Array(16).fill(2),
             claimedAt: 100,
             body: new Uint8Array([3]),
             attachments: [
                 {
+                    stageState: "new",
                     sourceId: "stable",
                     metadata: new Uint8Array([4]),
                     fileId: new Uint8Array(16).fill(5),
@@ -69,5 +71,36 @@ describe("strict chat codecs", () => {
         const corrupt = encodeOutbox(record);
         corrupt[3] = 9;
         expect(() => decodeOutbox(corrupt)).toThrow(/Corrupt chat outbox/);
+
+        const failed = decodeOutbox(
+            encodeOutbox({
+                ...record,
+                status: "failed",
+                lastError: { code: "source-changed", message: "source changed" },
+            }),
+        );
+        expect(failed.lastError).toEqual({
+            code: "source-changed",
+            message: "source changed",
+        });
+    });
+
+    it("keeps claimedAt encode/decode bounds consistent", () => {
+        expect(() =>
+            encodeFrame({
+                messageId: new Uint8Array(16),
+                claimedAt: Number.MAX_SAFE_INTEGER + 1,
+                body: new Uint8Array(),
+                attachments: [],
+            }),
+        ).toThrow(/u64/);
+        expect(() =>
+            encodeFrame({
+                messageId: new Uint8Array(16),
+                claimedAt: 1.5,
+                body: new Uint8Array(),
+                attachments: [],
+            }),
+        ).toThrow(/u64/);
     });
 });

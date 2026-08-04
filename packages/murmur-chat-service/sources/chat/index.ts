@@ -1,5 +1,5 @@
 export { MemoryBlobStore } from "./impl/memoryBlobStore.js";
-export { ChatService } from "./impl/service.js";
+export { ChatService, destroyAttachment } from "./impl/service.js";
 export type {
     AttachmentSource,
     BlobHead,
@@ -10,8 +10,10 @@ export type {
     ChatConversation,
     ChatDownloadOptions,
     ChatHistoryPage,
+    ChatHistoryItem,
     ChatMessage,
     ChatOutboxEntry,
     ChatServiceOptions,
     ChatSyncOptions,
+    ChatUnknownMessage,
 } from "./types.js";

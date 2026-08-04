@@ -39,6 +39,9 @@ importers:
       '@murmur/relay':
         specifier: workspace:*
         version: link:../murmur-relay
+      esbuild:
+        specifier: ^0.28.1
+        version: 0.28.1
       typescript:
         specifier: ^5.9.3
         version: 5.9.3

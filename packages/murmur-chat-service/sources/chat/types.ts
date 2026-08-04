@@ -10,7 +10,8 @@ export interface BlobHead {
 export interface BlobStore {
     /**
      * Idempotently store exactly `byteLength` bytes under their 32-byte
-     * SHA-256 content identifier.
+     * SHA-256 content identifier. Buffers yielded to `put` are borrowed for
+     * one iteration; copy retained bytes and never mutate yielded arrays.
      */
     put(
         blobId: Uint8Array,
@@ -40,7 +41,10 @@ export interface AttachmentSource {
     readonly sourceId: string;
     /** Exact plaintext length, at most 100 MiB. */
     readonly byteLength: number;
-    /** Return exactly the requested bounded plaintext range. */
+    /**
+     * Return exactly the requested bounded plaintext range. Ownership remains
+     * with the source; the service defensively copies and never mutates it.
+     */
     read(offset: number, byteLength: number, signal: AbortSignal): Promise<Uint8Array>;
 }
 
@@ -72,6 +76,9 @@ export interface ChatAttachment<TAttachmentMetadata> {
 
 /** One exactly-once projected logical chat message. */
 export interface ChatMessage<TMessage, TAttachmentMetadata> {
+    readonly kind: "message";
+    /** Stable canonical identity scoped to conversation relay sequence. */
+    readonly eventId: string;
     readonly conversationId: Uint8Array;
     readonly sequence: bigint;
     readonly sender: Uint8Array;
@@ -81,6 +88,23 @@ export interface ChatMessage<TMessage, TAttachmentMetadata> {
     readonly message: TMessage;
     readonly attachments: readonly ChatAttachment<TAttachmentMetadata>[];
 }
+
+/** A projected event whose application codec is no longer understood. */
+export interface ChatUnknownMessage {
+    readonly kind: "unknown";
+    readonly eventId: string;
+    readonly conversationId: Uint8Array;
+    readonly sequence: bigint;
+    /** Exact stored authenticated frame or corrupt cache bytes. */
+    readonly rawFrame: Uint8Array;
+    /** Stable bounded reason string; it contains no secret key material. */
+    readonly reason: string;
+}
+
+/** One sequence-ordered known or unknown projected event. */
+export type ChatHistoryItem<TMessage, TAttachmentMetadata> =
+    | ChatMessage<TMessage, TAttachmentMetadata>
+    | ChatUnknownMessage;
 
 /** Durable chat group summary. */
 export interface ChatConversation {
@@ -92,17 +116,21 @@ export interface ChatConversation {
 
 /** Bounded relay-sequence history page. */
 export interface ChatHistoryPage<TMessage, TAttachmentMetadata> {
-    readonly messages: readonly ChatMessage<TMessage, TAttachmentMetadata>[];
+    readonly messages: readonly ChatHistoryItem<TMessage, TAttachmentMetadata>[];
     readonly nextAfter?: bigint;
 }
 
 /** Durable send lifecycle. */
 export interface ChatOutboxEntry {
+    readonly enqueueSequence: bigint;
     readonly conversationId: Uint8Array;
     readonly messageId: Uint8Array;
-    readonly status: "preparing" | "ready" | "handed-off";
+    readonly status: "preparing" | "ready" | "handed-off" | "failed";
     readonly attachmentCount: number;
-    readonly lastError?: Error;
+    readonly lastError?: {
+        readonly code: string;
+        readonly message: string;
+    };
 }
 
 /** Observable service mutation. */
@@ -134,6 +162,8 @@ export interface ChatServiceOptions<TMessage, TAttachmentMetadata> {
     ) => Promise<AttachmentSource>;
     /** Background idle polling floor, default 250 ms. */
     readonly idlePollMilliseconds?: number;
+    /** Per blob/source operation deadline, default and maximum 30 seconds. */
+    readonly operationTimeoutMilliseconds?: number;
 }
 
 /** Explicit convergence options. */

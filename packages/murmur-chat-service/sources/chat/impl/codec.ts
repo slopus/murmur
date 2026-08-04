@@ -12,15 +12,18 @@ export const FILE_ID_BYTES = 16;
 export const KEY_BYTES = 32;
 export const HASH_BYTES = 32;
 export const TAG_BYTES = 16;
+export const MAXIMUM_ERROR_BYTES = 1024;
+export const MAXIMUM_METADATA_BYTES = MAXIMUM_FRAME_BYTES;
 
 const DESCRIPTOR = new Uint8Array([0x4d, 0x55, 0x52, 0x4d, 0x43, 0x48, 0x41, 0x54, 1]);
 const FRAME_MAGIC = new Uint8Array([0x4d, 0x43, 0x48, 1]);
-const OUTBOX_MAGIC = new Uint8Array([0x4d, 0x43, 0x4f, 1]);
+const OUTBOX_MAGIC = new Uint8Array([0x4d, 0x43, 0x4f, 2]);
 const PROJECTION_MAGIC = new Uint8Array([0x4d, 0x43, 0x50, 1]);
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
 
 export interface EncodedAttachmentIntent {
+    stageState: "new" | "staging" | "staged" | "uploaded";
     sourceId: string;
     metadata: Uint8Array;
     fileId: Uint8Array;
@@ -31,12 +34,15 @@ export interface EncodedAttachmentIntent {
 }
 
 export interface OutboxRecord {
-    status: "preparing" | "ready" | "handed-off";
+    status: "preparing" | "ready" | "handed-off" | "failed";
+    enqueueSequence: bigint;
     conversationId: Uint8Array;
     messageId: Uint8Array;
     claimedAt: number;
     body: Uint8Array;
     attachments: EncodedAttachmentIntent[];
+    frameDigest?: Uint8Array;
+    lastError?: { code: string; message: string };
 }
 
 export interface EncodedManifest {
@@ -85,6 +91,9 @@ class Writer {
     }
 
     u64(value: number | bigint): void {
+        if (typeof value === "number" && (!Number.isSafeInteger(value) || value < 0)) {
+            throw new ChatCodecError("Invalid u64 number");
+        }
         const integer = typeof value === "number" ? BigInt(value) : value;
         if (integer < 0n || integer > 0xffff_ffff_ffff_ffffn) {
             throw new ChatCodecError("Integer is outside u64");
@@ -250,10 +259,7 @@ function readManifest(reader: Reader): EncodedManifest {
         chunkCount: reader.u32(),
         metadata: reader.variable32(MAXIMUM_FRAME_BYTES),
     };
-    const expectedCount =
-        manifest.plaintextLength === 0
-            ? 0
-            : Math.ceil(manifest.plaintextLength / ATTACHMENT_CHUNK_BYTES);
+    const expectedCount = Math.max(1, Math.ceil(manifest.plaintextLength / ATTACHMENT_CHUNK_BYTES));
     if (
         manifest.plaintextLength > MAXIMUM_ATTACHMENT_BYTES ||
         manifest.chunkSize !== ATTACHMENT_CHUNK_BYTES ||
@@ -298,13 +304,31 @@ export function encodeOutbox(record: OutboxRecord): Uint8Array {
     }
     const writer = new Writer();
     writer.bytes(OUTBOX_MAGIC);
-    writer.u8(record.status === "preparing" ? 0 : record.status === "ready" ? 1 : 2);
+    writer.u8(
+        record.status === "preparing"
+            ? 0
+            : record.status === "ready"
+              ? 1
+              : record.status === "handed-off"
+                ? 2
+                : 3,
+    );
+    writer.u64(record.enqueueSequence);
     writer.bytes(record.conversationId, GROUP_ID_BYTES);
     writer.bytes(record.messageId, MESSAGE_ID_BYTES);
     writer.u64(record.claimedAt);
     writer.variable32(record.body);
     writer.u8(record.attachments.length);
     for (const attachment of record.attachments) {
+        writer.u8(
+            attachment.stageState === "new"
+                ? 0
+                : attachment.stageState === "staging"
+                  ? 1
+                  : attachment.stageState === "staged"
+                    ? 2
+                    : 3,
+        );
         writer.variable16(encoder.encode(attachment.sourceId));
         writer.variable32(attachment.metadata);
         writer.bytes(attachment.fileId, FILE_ID_BYTES);
@@ -314,6 +338,10 @@ export function encodeOutbox(record: OutboxRecord): Uint8Array {
         writer.u8(attachment.manifest === undefined ? 0 : 1);
         if (attachment.manifest !== undefined) writeManifest(writer, attachment.manifest);
     }
+    writer.u8(record.frameDigest === undefined ? 0 : 1);
+    if (record.frameDigest !== undefined) writer.bytes(record.frameDigest, HASH_BYTES);
+    writer.variable16(encoder.encode(record.lastError?.code ?? ""));
+    writer.variable16(encoder.encode(record.lastError?.message ?? ""));
     return writer.finish(3 * 1024 * 1024);
 }
 
@@ -322,9 +350,17 @@ export function decodeOutbox(bytes: Uint8Array): OutboxRecord {
         const reader = new Reader(bytes, 3 * 1024 * 1024);
         reader.expect(OUTBOX_MAGIC);
         const state = reader.u8();
-        if (state > 2) throw new ChatCodecError("Unknown outbox state");
+        if (state > 3) throw new ChatCodecError("Unknown outbox state");
         const record: OutboxRecord = {
-            status: state === 0 ? "preparing" : state === 1 ? "ready" : "handed-off",
+            status:
+                state === 0
+                    ? "preparing"
+                    : state === 1
+                      ? "ready"
+                      : state === 2
+                        ? "handed-off"
+                        : "failed",
+            enqueueSequence: reader.u64Bigint(),
             conversationId: reader.bytes(GROUP_ID_BYTES),
             messageId: reader.bytes(MESSAGE_ID_BYTES),
             claimedAt: reader.u64Number(),
@@ -334,6 +370,8 @@ export function decodeOutbox(bytes: Uint8Array): OutboxRecord {
         const count = reader.u8();
         if (count > MAXIMUM_ATTACHMENTS) throw new ChatCodecError("Too many attachment intents");
         for (let index = 0; index < count; index += 1) {
+            const stage = reader.u8();
+            if (stage > 3) throw new ChatCodecError("Unknown attachment stage");
             let sourceId: string;
             try {
                 sourceId = decoder.decode(reader.variable16(4096));
@@ -341,6 +379,14 @@ export function decodeOutbox(bytes: Uint8Array): OutboxRecord {
                 throw new ChatCodecError("Invalid attachment source identifier");
             }
             const attachment: EncodedAttachmentIntent = {
+                stageState:
+                    stage === 0
+                        ? "new"
+                        : stage === 1
+                          ? "staging"
+                          : stage === 2
+                            ? "staged"
+                            : "uploaded",
                 sourceId,
                 metadata: reader.variable32(MAXIMUM_FRAME_BYTES),
                 fileId: reader.bytes(FILE_ID_BYTES),
@@ -366,12 +412,36 @@ export function decodeOutbox(bytes: Uint8Array): OutboxRecord {
             }
             record.attachments.push(attachment);
         }
+        const hasFrameDigest = reader.u8();
+        if (hasFrameDigest > 1) throw new ChatCodecError("Invalid frame digest flag");
+        if (hasFrameDigest === 1) record.frameDigest = reader.bytes(HASH_BYTES);
+        let errorCode: string;
+        let errorMessage: string;
+        try {
+            errorCode = decoder.decode(reader.variable16(MAXIMUM_ERROR_BYTES));
+            errorMessage = decoder.decode(reader.variable16(MAXIMUM_ERROR_BYTES));
+        } catch {
+            throw new ChatCodecError("Invalid outbox error");
+        }
+        if ((errorCode.length === 0) !== (errorMessage.length === 0)) {
+            throw new ChatCodecError("Incomplete outbox error");
+        }
+        if (errorCode.length > 0) record.lastError = { code: errorCode, message: errorMessage };
         reader.end();
         if (
-            record.status !== "preparing" &&
+            (record.status === "ready" || record.status === "handed-off") &&
             record.attachments.some((attachment) => attachment.manifest === undefined)
         ) {
             throw new ChatCodecError("Ready outbox lacks manifest");
+        }
+        if (
+            (record.status === "ready" || record.status === "handed-off") &&
+            record.frameDigest === undefined
+        ) {
+            throw new ChatCodecError("Ready outbox lacks frame digest");
+        }
+        if (record.status === "failed" && record.lastError === undefined) {
+            throw new ChatCodecError("Failed outbox lacks durable error");
         }
         validateOutboxFrameBounds(record);
         return record;
@@ -387,10 +457,10 @@ export function decodeOutbox(bytes: Uint8Array): OutboxRecord {
 function validateOutboxFrameBounds(record: OutboxRecord): void {
     const manifests: EncodedManifest[] = record.attachments.map((attachment) => {
         if (attachment.manifest !== undefined) return attachment.manifest;
-        const chunkCount =
-            attachment.plaintextLength === 0
-                ? 0
-                : Math.ceil(attachment.plaintextLength / ATTACHMENT_CHUNK_BYTES);
+        const chunkCount = Math.max(
+            1,
+            Math.ceil(attachment.plaintextLength / ATTACHMENT_CHUNK_BYTES),
+        );
         return {
             metadata: attachment.metadata,
             fileId: attachment.fileId,

@@ -1,12 +1,16 @@
-import { randomBytes } from "@noble/hashes/utils";
 import { sha256 } from "@noble/hashes/sha256";
-import type { MurmurGroup, MurmurGroupEvent } from "@slopus/murmur";
+import { randomBytes } from "@noble/hashes/utils";
+import type { MurmurGroup, MurmurGroupEvent, MurmurStore } from "@slopus/murmur";
 import {
+    ChatAlreadyOpenError,
+    ChatAttachmentAuthenticationError,
     ChatAttachmentSourceChangedError,
     ChatClosedError,
     ChatCodecError,
     ChatFrameTooLargeError,
+    ChatOutboxFailedError,
     ChatStoreCorruptionError,
+    ChatValidationError,
 } from "../errors.js";
 import type {
     ChatAttachment,
@@ -14,6 +18,7 @@ import type {
     ChatChange,
     ChatConversation,
     ChatDownloadOptions,
+    ChatHistoryItem,
     ChatHistoryPage,
     ChatMessage,
     ChatOutboxEntry,
@@ -21,13 +26,16 @@ import type {
     ChatSyncOptions,
 } from "../types.js";
 import {
+    clearAttachmentStage,
     hashAttachmentSource,
     openVerifiedAttachment,
-    prepareAndUploadAttachment,
+    stageAttachment,
+    uploadStagedAttachment,
     verifyManifestShape,
 } from "./attachmentCrypto.js";
-import { encodeBase64Url, ensureNotAborted, equalBytes, sequenceKey } from "./bytes.js";
+import { abortError, encodeBase64Url, ensureNotAborted, equalBytes, sequenceKey } from "./bytes.js";
 import {
+    ATTACHMENT_CHUNK_BYTES,
     CHAT_PREFIX,
     chatDescriptor,
     decodeCursor,
@@ -59,24 +67,31 @@ const CURSOR_PREFIX = `${CHAT_PREFIX}cursor/`;
 const DEDUPE_PREFIX = `${CHAT_PREFIX}dedupe/`;
 const DELIVERED_PREFIX = `${CHAT_PREFIX}delivered/`;
 const QUARANTINE_PREFIX = `${CHAT_PREFIX}quarantine/`;
-const STORE_PAGE = 256;
-const GROUP_PAGE = 1_000;
+const DIAGNOSTIC_PREFIX = `${CHAT_PREFIX}diagnostics/`;
+const REBUILD_PREFIX = `${CHAT_PREFIX}rebuild/`;
+const STAGING_PREFIX = `${CHAT_PREFIX}staging/`;
+const ENQUEUE_COUNTER_KEY = `${CHAT_PREFIX}meta/enqueue-sequence`;
+const STORE_PAGE = 64;
+const GROUP_PAGE = 100;
 const QUARANTINE_SLOTS = 64n;
 const DEFAULT_DOWNLOAD_MAXIMUM = 16 * 1024 * 1024;
+const DEFAULT_OPERATION_TIMEOUT = 30_000;
+const CONSTRUCTOR_TOKEN = Symbol("ChatService");
+const activeStores = new WeakSet<object>();
 
 /**
  * Durable generic chat semantics over opaque Murmur MLS group streams.
  *
- * `ChatService` does not own the supplied Murmur instance. Closing chat aborts
- * only chat/blob work; callers close Murmur separately.
+ * The service does not own or close the supplied Murmur. One live service per
+ * store object is allowed in the current JavaScript realm.
  */
 export class ChatService<TMessage, TAttachmentMetadata> {
     readonly #options: ChatServiceOptions<TMessage, TAttachmentMetadata>;
     readonly #abort = new AbortController();
     readonly #listeners = new Set<(change: ChatChange) => void>();
-    readonly #outboxErrors = new Map<string, Error>();
     readonly #idlePollMilliseconds: number;
-    #tail: Promise<void> = Promise.resolve();
+    readonly #operationTimeoutMilliseconds: number;
+    #workTail: Promise<void> = Promise.resolve();
     #workerPromise: Promise<void> | undefined;
     #timer: ReturnType<typeof setTimeout> | undefined;
     #wakeRequested = false;
@@ -86,28 +101,37 @@ export class ChatService<TMessage, TAttachmentMetadata> {
     #convergenceError: Error | undefined;
     #backoffMilliseconds = 100;
 
-    private constructor(options: ChatServiceOptions<TMessage, TAttachmentMetadata>) {
+    private constructor(token: symbol, options: ChatServiceOptions<TMessage, TAttachmentMetadata>) {
+        if (token !== CONSTRUCTOR_TOKEN) {
+            throw new ChatValidationError("Use ChatService.open()");
+        }
         this.#options = options;
         this.#idlePollMilliseconds = options.idlePollMilliseconds ?? 250;
+        this.#operationTimeoutMilliseconds =
+            options.operationTimeoutMilliseconds ?? DEFAULT_OPERATION_TIMEOUT;
     }
 
-    /** Open durable chat state and start its single adaptive convergence worker. */
+    /** Validate options, detect duplicate instances, and start convergence. */
     static async open<TMessage, TAttachmentMetadata>(
         options: ChatServiceOptions<TMessage, TAttachmentMetadata>,
     ): Promise<ChatService<TMessage, TAttachmentMetadata>> {
-        if (
-            options === null ||
-            typeof options !== "object" ||
-            !Number.isSafeInteger(options.idlePollMilliseconds ?? 250) ||
-            (options.idlePollMilliseconds ?? 250) < 25 ||
-            (options.idlePollMilliseconds ?? 250) > 30_000
-        ) {
-            throw new Error("Invalid chat service options");
+        validateOptions(options);
+        const storeObject = options.store as object;
+        if (activeStores.has(storeObject)) {
+            throw new ChatAlreadyOpenError("A ChatService already owns this store namespace");
         }
-        const service = new ChatService(options);
-        await service.#validateStore();
-        service.#schedule(0);
-        return service;
+        activeStores.add(storeObject);
+        try {
+            const counter = await options.store.get(ENQUEUE_COUNTER_KEY);
+            if (counter !== undefined) decodeCursor(counter);
+            const service = new ChatService(CONSTRUCTOR_TOKEN, options);
+            service.#schedule(0);
+            return service;
+        } catch (error: unknown) {
+            activeStores.delete(storeObject);
+            if (error instanceof ChatStoreCorruptionError) throw error;
+            throw error;
+        }
     }
 
     /** Defensive copy of the local authenticated Murmur identity key. */
@@ -116,71 +140,65 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         return this.#options.murmur.identityKey;
     }
 
-    /** Last background convergence error, retained until a successful `sync`. */
+    /** Last infrastructure convergence error; per-intent errors live in outbox state. */
     get convergenceError(): Error | undefined {
         this.#ensureOpen();
         return this.#convergenceError;
     }
 
-    /** Create a new opaque chat group every time, with no DM uniqueness rule. */
+    /** Create a fresh opaque chat group. */
     async createConversation(members: readonly Uint8Array[] = []): Promise<Uint8Array> {
-        return this.#exclusive(async () => {
-            validateMembers(members);
-            const id = await this.#options.murmur.groups.create(chatDescriptor(), members);
-            this.#emit({ kind: "conversation", conversationId: id });
-            this.#wake();
-            return id.slice();
-        });
+        this.#ensureOpen();
+        validateMembers(members);
+        const id = await this.#options.murmur.groups.create(chatDescriptor(), members);
+        this.#emit({ kind: "conversation", conversationId: id });
+        this.#wake();
+        return id.slice();
     }
 
-    /** List only groups whose strict descriptor identifies this chat protocol. */
+    /** List only strict version-one chat descriptors. */
     async listConversations(): Promise<readonly ChatConversation[]> {
-        return this.#exclusive(async () => {
-            const groups = await this.#options.murmur.groups.list();
-            return groups
-                .filter((group) => isChatDescriptor(group.descriptor))
-                .map(conversationView);
-        });
+        this.#ensureOpen();
+        const groups = await this.#options.murmur.groups.list();
+        return groups.filter((group) => isChatDescriptor(group.descriptor)).map(conversationView);
     }
 
-    /** Read one chat conversation, or undefined for unknown/non-chat groups. */
+    /** Read one chat conversation. */
     async getConversation(conversationId: Uint8Array): Promise<ChatConversation | undefined> {
-        return this.#exclusive(async () => {
-            validateConversationId(conversationId);
-            const page = await this.#options.murmur.groups.get(conversationId, { limit: 1 });
-            return page === undefined || !isChatDescriptor(page.group.descriptor)
-                ? undefined
-                : conversationView(page.group);
-        });
+        this.#ensureOpen();
+        validateConversationId(conversationId);
+        const page = await this.#options.murmur.groups.get(conversationId, { limit: 1 });
+        return page === undefined || !isChatDescriptor(page.group.descriptor)
+            ? undefined
+            : conversationView(page.group);
     }
 
-    /** Queue an MLS member addition through Murmur. */
+    /** Add a member only while the local conversation is active. */
     async addMember(conversationId: Uint8Array, identityKey: Uint8Array): Promise<void> {
-        await this.#exclusive(async () => {
-            validateConversationId(conversationId);
-            validateIdentity(identityKey);
-            await this.#requireConversation(conversationId);
-            await this.#options.murmur.groups.add(conversationId, identityKey);
-            this.#emit({ kind: "conversation", conversationId });
-            this.#wake();
-        });
+        this.#ensureOpen();
+        validateConversationId(conversationId);
+        validateIdentity(identityKey);
+        await this.#requireActiveConversation(conversationId);
+        await this.#options.murmur.groups.add(conversationId, identityKey);
+        this.#emit({ kind: "conversation", conversationId });
+        this.#wake();
     }
 
-    /** Queue an MLS member removal through Murmur. */
+    /** Remove a member only while the local conversation is active. */
     async removeMember(conversationId: Uint8Array, identityKey: Uint8Array): Promise<void> {
-        await this.#exclusive(async () => {
-            validateConversationId(conversationId);
-            validateIdentity(identityKey);
-            await this.#requireConversation(conversationId);
-            await this.#options.murmur.groups.remove(conversationId, identityKey);
-            this.#emit({ kind: "conversation", conversationId });
-            this.#wake();
-        });
+        this.#ensureOpen();
+        validateConversationId(conversationId);
+        validateIdentity(identityKey);
+        await this.#requireActiveConversation(conversationId);
+        await this.#options.murmur.groups.remove(conversationId, identityKey);
+        this.#emit({ kind: "conversation", conversationId });
+        this.#wake();
     }
 
     /**
-     * Persist a stable 16-byte message ID and exact upload/send intent before
-     * any blob upload or Murmur group handoff.
+     * Durably enqueue in a transactionally allocated monotonic order.
+     *
+     * `messageId` is retry/dedupe material, not globally unique event identity.
      */
     async send(
         conversationId: Uint8Array,
@@ -190,196 +208,346 @@ export class ChatService<TMessage, TAttachmentMetadata> {
             readonly claimedAt?: number;
         },
     ): Promise<Uint8Array> {
-        return this.#exclusive(async () => {
-            validateConversationId(conversationId);
-            await this.#requireConversation(conversationId);
-            const attachments = input.attachments ?? [];
-            if (attachments.length > MAXIMUM_ATTACHMENTS) {
-                throw new ChatCodecError(
-                    `A message may contain at most ${MAXIMUM_ATTACHMENTS} attachments`,
-                );
-            }
-            const body = this.#encodeMessage(input.message);
-            const messageId = randomBytes(MESSAGE_ID_BYTES);
-            const claimedAt = input.claimedAt ?? Date.now();
-            if (!Number.isSafeInteger(claimedAt) || claimedAt < 0) {
-                body.fill(0);
-                messageId.fill(0);
-                throw new ChatCodecError("claimedAt must be a non-negative safe integer");
-            }
-            const intents: EncodedAttachmentIntent[] = [];
-            const preparationAbort = new AbortController();
-            const forwardAbort = (): void => preparationAbort.abort(this.#abort.signal.reason);
-            this.#abort.signal.addEventListener("abort", forwardAbort, { once: true });
-            try {
-                for (const attachment of attachments) {
-                    if (
-                        typeof attachment.sourceId !== "string" ||
-                        attachment.sourceId.length === 0 ||
-                        new TextEncoder().encode(attachment.sourceId).length > 4096
-                    ) {
-                        throw new ChatCodecError("Attachment sourceId must be non-empty");
-                    }
-                    const metadata = this.#encodeMetadata(attachment.metadata);
-                    const source = await this.#options.resolveAttachmentSource(
+        this.#ensureOpen();
+        validateConversationId(conversationId);
+        await this.#requireActiveConversation(conversationId);
+        const attachments = input.attachments ?? [];
+        if (!Array.isArray(attachments) || attachments.length > MAXIMUM_ATTACHMENTS) {
+            throw new ChatValidationError(
+                `A message may contain at most ${MAXIMUM_ATTACHMENTS} attachments`,
+            );
+        }
+        const body = this.#encodeMessage(input.message);
+        const messageId = randomBytes(MESSAGE_ID_BYTES);
+        const claimedAt = input.claimedAt ?? Date.now();
+        if (!Number.isSafeInteger(claimedAt) || claimedAt < 0) {
+            body.fill(0);
+            messageId.fill(0);
+            throw new ChatValidationError("claimedAt must be a non-negative safe integer");
+        }
+        const intents: EncodedAttachmentIntent[] = [];
+        const operation = this.#operation(this.#abort.signal);
+        try {
+            for (const attachment of attachments) {
+                validateAttachmentInput(attachment);
+                const metadata = this.#encodeMetadata(attachment.metadata);
+                let source;
+                try {
+                    source = await this.#options.resolveAttachmentSource(
                         attachment.sourceId,
-                        preparationAbort.signal,
+                        operation.signal,
                     );
-                    if (
-                        source.sourceId !== attachment.sourceId ||
-                        !Number.isSafeInteger(source.byteLength) ||
-                        source.byteLength < 0 ||
-                        source.byteLength > MAXIMUM_ATTACHMENT_BYTES
-                    ) {
-                        metadata.fill(0);
-                        throw new ChatCodecError("Invalid attachment source");
-                    }
-                    const sourceHash = await hashAttachmentSource(source, preparationAbort.signal);
-                    intents.push({
-                        sourceId: attachment.sourceId,
-                        metadata,
-                        fileId: randomBytes(FILE_ID_BYTES),
-                        fileKey: randomBytes(KEY_BYTES),
-                        sourceHash,
-                        plaintextLength: source.byteLength,
-                    });
+                } catch (error: unknown) {
+                    metadata.fill(0);
+                    throw outboxFailure("source-unavailable", error);
                 }
-                preflightFrame(messageId, claimedAt, body, intents);
+                if (
+                    source.sourceId !== attachment.sourceId ||
+                    !Number.isSafeInteger(source.byteLength) ||
+                    source.byteLength < 0 ||
+                    source.byteLength > MAXIMUM_ATTACHMENT_BYTES
+                ) {
+                    metadata.fill(0);
+                    throw new ChatValidationError("Invalid attachment source");
+                }
+                const sourceHash = await hashAttachmentSource(source, operation.signal);
+                intents.push({
+                    stageState: "new",
+                    sourceId: attachment.sourceId,
+                    metadata,
+                    fileId: randomBytes(FILE_ID_BYTES),
+                    fileKey: randomBytes(KEY_BYTES),
+                    sourceHash,
+                    plaintextLength: source.byteLength,
+                });
+            }
+            preflightFrame(messageId, claimedAt, body, intents);
+            let enqueueSequence = 0n;
+            await this.#options.store.transaction(async (transaction) => {
+                const counter = await transaction.get(ENQUEUE_COUNTER_KEY);
+                const current = counter === undefined ? 0n : decodeCursor(counter);
+                enqueueSequence = current + 1n;
                 const record: OutboxRecord = {
                     status: intents.length === 0 ? "ready" : "preparing",
+                    enqueueSequence,
                     conversationId: conversationId.slice(),
                     messageId: messageId.slice(),
                     claimedAt,
                     body: body.slice(),
                     attachments: intents,
                 };
+                if (record.status === "ready") {
+                    record.frameDigest = frameDigest(record);
+                }
                 const encoded = encodeOutbox(record);
                 try {
-                    await this.#options.store.set(outboxKey(messageId), encoded);
+                    await transaction.set(ENQUEUE_COUNTER_KEY, encodeCursor(enqueueSequence));
+                    await transaction.set(outboxKey(enqueueSequence, messageId), encoded);
                 } finally {
                     encoded.fill(0);
+                    zeroOutbox(record);
                 }
-                this.#emit({ kind: "outbox", conversationId });
-                this.#wake();
-                const result = messageId.slice();
-                zeroOutbox(record);
-                messageId.fill(0);
-                return result;
-            } catch (error: unknown) {
-                for (const intent of intents) zeroIntent(intent);
-                messageId.fill(0);
-                throw error instanceof ChatCodecError ||
-                    error instanceof ChatFrameTooLargeError ||
-                    error instanceof ChatAttachmentSourceChangedError
-                    ? error
-                    : new ChatCodecError(
-                          error instanceof Error ? error.message : "Attachment preparation failed",
-                      );
-            } finally {
-                this.#abort.signal.removeEventListener("abort", forwardAbort);
-                body.fill(0);
-            }
-        });
+            });
+            this.#emit({ kind: "outbox", conversationId });
+            this.#wake();
+            return messageId.slice();
+        } finally {
+            operation.dispose();
+            body.fill(0);
+            messageId.fill(0);
+            for (const intent of intents) zeroIntent(intent);
+        }
     }
 
-    /** Read exactly-once projected messages in canonical relay-sequence order. */
+    /** Canonical relay-sequence history, including explicit unknown variants. */
     async history(
         conversationId: Uint8Array,
         options: { readonly after?: bigint; readonly limit?: number } = {},
     ): Promise<ChatHistoryPage<TMessage, TAttachmentMetadata>> {
-        return this.#exclusive(async () => {
-            validateConversationId(conversationId);
-            await this.#requireConversation(conversationId);
-            const after = options.after ?? 0n;
-            const limit = options.limit ?? 100;
-            if (after < 0n || !Number.isSafeInteger(limit) || limit < 1 || limit > 1_000) {
-                throw new Error("Invalid history page");
+        this.#ensureOpen();
+        validateConversationId(conversationId);
+        await this.#requireConversation(conversationId);
+        const after = options.after ?? 0n;
+        const limit = options.limit ?? 64;
+        if (after < 0n || !Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+            throw new ChatValidationError("Invalid history page");
+        }
+        const prefix = projectionPrefix(conversationId);
+        const entries = await this.#options.store.scan(
+            prefix,
+            after === 0n
+                ? { limit: limit + 1 }
+                : { after: `${prefix}${sequenceKey(after)}`, limit: limit + 1 },
+        );
+        const messages: ChatHistoryItem<TMessage, TAttachmentMetadata>[] = [];
+        for (const [key, encoded] of [...entries].slice(0, limit)) {
+            const sequence = BigInt(`0x${key.slice(prefix.length)}`);
+            try {
+                messages.push(this.#decodeProjected(conversationId, sequence, encoded));
+            } catch (error: unknown) {
+                messages.push({
+                    kind: "unknown",
+                    eventId: eventId(conversationId, sequence),
+                    conversationId: conversationId.slice(),
+                    sequence,
+                    rawFrame: encoded.slice(),
+                    reason: boundedErrorMessage(error),
+                });
+                if (error instanceof ChatStoreCorruptionError) {
+                    await this.#options.store.set(rebuildKey(conversationId), encodeCursor(1n));
+                    this.#wake();
+                }
             }
-            const prefix = projectionPrefix(conversationId);
-            const entries = await this.#options.store.scan(
-                prefix,
-                after === 0n
-                    ? { limit: limit + 1 }
-                    : { after: `${prefix}${sequenceKey(after)}`, limit: limit + 1 },
-            );
-            const selected = [...entries].slice(0, limit);
-            const messages = selected.map(([key, encoded]) => {
-                const sequence = BigInt(`0x${key.slice(prefix.length)}`);
-                return this.#decodeProjected(conversationId, sequence, encoded);
-            });
-            const last = messages.at(-1);
-            return {
-                messages,
-                ...(entries.size > limit && last !== undefined ? { nextAfter: last.sequence } : {}),
-            };
-        });
+        }
+        const last = messages.at(-1);
+        return {
+            messages,
+            ...(entries.size > limit && last !== undefined ? { nextAfter: last.sequence } : {}),
+        };
     }
 
-    /** List durable upload/message intents that have not yet echoed into projection. */
+    /** Page every durable intent in monotonic enqueue order. */
     async outbox(): Promise<readonly ChatOutboxEntry[]> {
-        return this.#exclusive(async () => {
-            const result: ChatOutboxEntry[] = [];
-            let after: string | undefined;
-            for (;;) {
-                const page = await this.#options.store.scan(OUTBOX_PREFIX, {
-                    ...(after === undefined ? {} : { after }),
-                    limit: STORE_PAGE,
-                });
-                for (const [key, bytes] of page) {
+        this.#ensureOpen();
+        const result: ChatOutboxEntry[] = [];
+        let after: string | undefined;
+        for (;;) {
+            const page = await this.#options.store.scan(OUTBOX_PREFIX, {
+                ...(after === undefined ? {} : { after }),
+                limit: STORE_PAGE,
+            });
+            for (const [key, bytes] of page) {
+                after = key;
+                try {
                     const record = decodeOutbox(bytes);
-                    result.push({
-                        conversationId: record.conversationId.slice(),
-                        messageId: record.messageId.slice(),
-                        status: record.status,
-                        attachmentCount: record.attachments.length,
-                        ...(this.#outboxErrors.get(key) === undefined
-                            ? {}
-                            : { lastError: this.#outboxErrors.get(key)! }),
-                    });
-                    after = key;
+                    result.push(outboxView(record));
+                    zeroOutbox(record);
+                } catch {
+                    await this.#isolateCorruptOutbox(key, bytes);
                 }
-                if (page.size < STORE_PAGE) break;
             }
-            return result;
-        });
+            if (page.size < STORE_PAGE) break;
+        }
+        return result;
+    }
+
+    /** Retry one failed intent; unsafe partial staging rotates key and file ID. */
+    async retry(messageId: Uint8Array): Promise<void> {
+        await this.#workExclusive(() => this.#retry(messageId));
+    }
+
+    async #retry(messageId: Uint8Array): Promise<void> {
+        this.#ensureOpen();
+        validateMessageId(messageId);
+        const found = await this.#findOutbox(messageId);
+        if (found === undefined) throw new ChatValidationError("Outbox message not found");
+        const { key, record } = found;
+        try {
+            if (record.status !== "failed") {
+                throw new ChatValidationError("Only failed outbox entries can be retried");
+            }
+            await this.#requireActiveConversation(record.conversationId);
+            const needsFreshSource = record.attachments.some(
+                (attachment) =>
+                    attachment.stageState === "staging" ||
+                    record.lastError?.code === "source-changed" ||
+                    record.lastError?.code === "source-unavailable" ||
+                    record.lastError?.code === "operation-timeout",
+            );
+            if (needsFreshSource) {
+                const operation = this.#operation(this.#abort.signal);
+                try {
+                    for (let index = 0; index < record.attachments.length; index += 1) {
+                        const attachment = record.attachments[index]!;
+                        if (attachment.stageState === "uploaded") continue;
+                        const source = await this.#options.resolveAttachmentSource(
+                            attachment.sourceId,
+                            operation.signal,
+                        );
+                        if (
+                            source.sourceId !== attachment.sourceId ||
+                            source.byteLength > MAXIMUM_ATTACHMENT_BYTES
+                        ) {
+                            throw new ChatAttachmentSourceChangedError(
+                                "Resolved attachment source identity or length is invalid",
+                            );
+                        }
+                        const digest = await hashAttachmentSource(source, operation.signal);
+                        await clearAttachmentStage(
+                            this.#options.store,
+                            attachmentStagePrefix(record, index),
+                        );
+                        attachment.fileId.fill(0);
+                        attachment.fileKey.fill(0);
+                        attachment.sourceHash.fill(0);
+                        if (attachment.manifest !== undefined) {
+                            zeroManifest(attachment.manifest);
+                        }
+                        attachment.fileId = randomBytes(FILE_ID_BYTES);
+                        attachment.fileKey = randomBytes(KEY_BYTES);
+                        attachment.sourceHash = digest;
+                        attachment.plaintextLength = source.byteLength;
+                        delete attachment.manifest;
+                        attachment.stageState = "new";
+                    }
+                } finally {
+                    operation.dispose();
+                }
+            }
+            record.status = record.attachments.length === 0 ? "ready" : "preparing";
+            delete record.lastError;
+            if (record.status === "ready") record.frameDigest = frameDigest(record);
+            await this.#persistOutbox(key, record);
+            this.#emit({ kind: "outbox", conversationId: record.conversationId });
+            this.#wake();
+        } finally {
+            zeroOutbox(record);
+        }
+    }
+
+    /** Cancel and durably drop one unsent or failed intent. */
+    async cancel(messageId: Uint8Array): Promise<void> {
+        await this.#workExclusive(() => this.#cancel(messageId));
+    }
+
+    async #cancel(messageId: Uint8Array): Promise<void> {
+        this.#ensureOpen();
+        validateMessageId(messageId);
+        const found = await this.#findOutbox(messageId);
+        if (found === undefined) return;
+        try {
+            if (found.record.status === "handed-off") {
+                throw new ChatValidationError(
+                    "A handed-off Murmur event can no longer be cancelled",
+                );
+            }
+            for (let index = 0; index < found.record.attachments.length; index += 1) {
+                await clearAttachmentStage(
+                    this.#options.store,
+                    attachmentStagePrefix(found.record, index),
+                );
+            }
+            await this.#options.store.delete(found.key);
+            this.#emit({ kind: "outbox", conversationId: found.record.conversationId });
+        } finally {
+            zeroOutbox(found.record);
+        }
+    }
+
+    /** Alias for `cancel`. */
+    async drop(messageId: Uint8Array): Promise<void> {
+        await this.cancel(messageId);
     }
 
     /**
-     * Stream independently authenticated plaintext chunks. No chunk is yielded
-     * until its AEAD tag and all manifest bindings have verified.
+     * Atomically mark derived state for reset, page-delete it, then refold.
+     * Interrupted rebuild markers are resumed by the worker.
      */
+    async rebuild(conversationId?: Uint8Array): Promise<void> {
+        await this.#workExclusive(() => this.#rebuild(conversationId));
+        await this.sync();
+    }
+
+    async #rebuild(conversationId?: Uint8Array): Promise<void> {
+        this.#ensureOpen();
+        const ids =
+            conversationId === undefined
+                ? (await this.listConversations()).map((conversation) => conversation.id)
+                : [conversationId.slice()];
+        for (const id of ids) {
+            validateConversationId(id);
+            await this.#requireConversation(id);
+            await this.#options.store.set(rebuildKey(id), encodeCursor(1n));
+            await this.#finishRebuild(id);
+        }
+    }
+
+    /** Stream verified plaintext chunks under the operation deadline. */
     openAttachment(
         attachment: ChatAttachment<TAttachmentMetadata>,
         options: { readonly signal?: AbortSignal } = {},
     ): AsyncIterable<Uint8Array> {
         this.#ensureOpen();
-        const signal = options.signal ?? this.#abort.signal;
-        const manifest = publicAttachmentManifest(
-            attachment,
-            this.#encodeMetadata(attachment.metadata),
-        );
-        const stream = openVerifiedAttachment(
-            manifest,
-            attachment.conversationId,
-            attachment.sender,
-            this.#options.blobStore,
-            signal,
-        );
+        validateAttachmentObject(attachment);
+        const metadata = this.#encodeMetadata(attachment.metadata);
+        const createOperation = (): { signal: AbortSignal; dispose: () => void } =>
+            this.#operation(options.signal ?? this.#abort.signal);
+        const blobStore = this.#options.blobStore;
         return (async function* (): AsyncIterable<Uint8Array> {
+            let manifest: EncodedManifest | undefined;
+            let operation: { signal: AbortSignal; dispose: () => void } | undefined;
+            let iterator: AsyncIterator<Uint8Array> | undefined;
             try {
-                yield* stream;
+                manifest = publicAttachmentManifest(attachment, metadata);
+                operation = createOperation();
+                iterator = openVerifiedAttachment(
+                    manifest,
+                    attachment.conversationId,
+                    attachment.sender,
+                    blobStore,
+                    operation.signal,
+                )[Symbol.asyncIterator]();
+                for (;;) {
+                    const next = await iterator.next();
+                    if (next.done === true) break;
+                    yield next.value;
+                }
             } finally {
-                zeroManifest(manifest);
+                await iterator?.return?.();
+                operation?.dispose();
+                if (manifest !== undefined) zeroManifest(manifest);
+                else metadata.fill(0);
             }
         })();
     }
 
-    /** Download a whole attachment under an explicit conservative allocation cap. */
+    /** Download a whole attachment under an explicit bounded allocation cap. */
     async downloadAttachment(
         attachment: ChatAttachment<TAttachmentMetadata>,
         options: ChatDownloadOptions = {},
     ): Promise<Uint8Array> {
         this.#ensureOpen();
+        validateAttachmentObject(attachment);
         const maximumBytes = options.maximumBytes ?? DEFAULT_DOWNLOAD_MAXIMUM;
         if (
             !Number.isSafeInteger(maximumBytes) ||
@@ -387,7 +555,7 @@ export class ChatService<TMessage, TAttachmentMetadata> {
             maximumBytes > MAXIMUM_ATTACHMENT_BYTES ||
             attachment.plaintextLength > maximumBytes
         ) {
-            throw new Error("Attachment exceeds bounded download maximum");
+            throw new ChatValidationError("Attachment exceeds bounded download maximum");
         }
         const result = new Uint8Array(attachment.plaintextLength);
         let offset = 0;
@@ -398,13 +566,17 @@ export class ChatService<TMessage, TAttachmentMetadata> {
             )) {
                 if (chunk.length > result.length - offset) {
                     chunk.fill(0);
-                    throw new Error("Authenticated stream exceeded plaintext length");
+                    throw new ChatAttachmentAuthenticationError(
+                        "Authenticated stream exceeded plaintext length",
+                    );
                 }
                 result.set(chunk, offset);
                 offset += chunk.length;
                 chunk.fill(0);
             }
-            if (offset !== result.length) throw new Error("Authenticated stream was truncated");
+            if (offset !== result.length) {
+                throw new ChatAttachmentAuthenticationError("Authenticated stream was truncated");
+            }
             return result;
         } catch (error: unknown) {
             result.fill(0);
@@ -412,18 +584,20 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         }
     }
 
-    /** Subscribe to coalescible chat changes; returns an idempotent unsubscribe. */
+    /** Subscribe to coalescible changes. */
     onChange(listener: (change: ChatChange) => void): () => void {
         this.#ensureOpen();
+        if (typeof listener !== "function") throw new ChatValidationError("Invalid listener");
         this.#listeners.add(listener);
         return (): void => {
             this.#listeners.delete(listener);
         };
     }
 
-    /** Run an explicit Murmur and chat convergence boundary. */
+    /** Run a serialized worker boundary without blocking read APIs. */
     async sync(options: ChatSyncOptions = {}): Promise<void> {
-        await this.#exclusive(async () => {
+        this.#ensureOpen();
+        await this.#workExclusive(async () => {
             const signal = options.signal ?? this.#abort.signal;
             ensureNotAborted(signal);
             await this.#options.murmur.sync({ signal });
@@ -438,7 +612,7 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         });
     }
 
-    /** Abort chat work and await the worker; the supplied Murmur remains open. */
+    /** Abort chat/blob work; the supplied Murmur remains open. */
     async close(): Promise<void> {
         if (this.#closePromise !== undefined) return this.#closePromise;
         this.#closing = true;
@@ -446,45 +620,16 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         this.#abort.abort(new ChatClosedError("Chat service is closing"));
         this.#closePromise = (async (): Promise<void> => {
             await this.#workerPromise;
-            await this.#tail;
+            await this.#workTail;
             this.#listeners.clear();
+            activeStores.delete(this.#options.store as object);
             this.#closed = true;
         })();
         return this.#closePromise;
     }
 
-    async #validateStore(): Promise<void> {
-        let after: string | undefined;
-        for (;;) {
-            const page = await this.#options.store.scan(CHAT_PREFIX, {
-                ...(after === undefined ? {} : { after }),
-                limit: STORE_PAGE,
-            });
-            for (const [key, bytes] of page) {
-                if (key.startsWith(OUTBOX_PREFIX)) decodeOutbox(bytes);
-                else if (key.startsWith(PROJECTION_PREFIX)) decodeProjection(bytes);
-                else if (
-                    key.startsWith(CURSOR_PREFIX) ||
-                    key.startsWith(DEDUPE_PREFIX) ||
-                    key.startsWith(DELIVERED_PREFIX)
-                ) {
-                    decodeCursor(bytes);
-                } else if (key.startsWith(QUARANTINE_PREFIX)) {
-                    if (bytes.length !== HASH_BYTES) {
-                        throw new ChatStoreCorruptionError("Corrupt chat quarantine record");
-                    }
-                } else {
-                    throw new ChatStoreCorruptionError(`Unknown durable chat record: ${key}`);
-                }
-                after = key;
-            }
-            if (page.size < STORE_PAGE) break;
-        }
-    }
-
     async #converge(signal: AbortSignal): Promise<boolean> {
         let changed = false;
-        const failures: Error[] = [];
         let after: string | undefined;
         for (;;) {
             ensureNotAborted(signal);
@@ -494,36 +639,33 @@ export class ChatService<TMessage, TAttachmentMetadata> {
             });
             for (const [key, bytes] of page) {
                 after = key;
-                const record = decodeOutbox(bytes);
+                let record: OutboxRecord;
                 try {
+                    record = decodeOutbox(bytes);
+                } catch {
+                    await this.#isolateCorruptOutbox(key, bytes);
+                    changed = true;
+                    continue;
+                }
+                try {
+                    if (record.status === "failed") continue;
+                    const conversation = await this.#requireConversation(record.conversationId);
+                    if (conversation.status !== "active") {
+                        await this.#failOutbox(
+                            key,
+                            record,
+                            "group-removed",
+                            "Conversation is removed",
+                        );
+                        changed = true;
+                        continue;
+                    }
                     if (record.status === "preparing") {
-                        for (const attachment of record.attachments) {
-                            if (attachment.manifest !== undefined) continue;
-                            attachment.manifest = await prepareAndUploadAttachment(
-                                attachment,
-                                record.conversationId,
-                                this.#options.murmur.identityKey,
-                                this.#options.resolveAttachmentSource,
-                                this.#options.blobStore,
-                                signal,
-                            );
-                            await this.#persistOutbox(key, record);
-                            changed = true;
-                        }
-                        record.status = "ready";
-                        await this.#persistOutbox(key, record);
-                        this.#emit({ kind: "outbox", conversationId: record.conversationId });
+                        await this.#prepareRecord(key, record, signal);
                         changed = true;
                     }
                     if (record.status === "ready") {
-                        const frame = encodeFrame({
-                            messageId: record.messageId,
-                            claimedAt: record.claimedAt,
-                            body: record.body,
-                            attachments: record.attachments.map(
-                                (attachment) => attachment.manifest!,
-                            ),
-                        });
+                        const frame = encodeRecordFrame(record);
                         try {
                             await this.#options.murmur.groups.send(record.conversationId, frame);
                         } finally {
@@ -531,25 +673,28 @@ export class ChatService<TMessage, TAttachmentMetadata> {
                         }
                         record.status = "handed-off";
                         await this.#persistOutbox(key, record);
-                        this.#emit({ kind: "outbox", conversationId: record.conversationId });
                         changed = true;
                     }
-                    if (
-                        record.status === "handed-off" &&
-                        (await this.#options.store.get(deliveredKey(record.messageId))) !==
-                            undefined
-                    ) {
-                        await this.#options.store.delete(key);
-                        changed = true;
+                    if (record.status === "handed-off" && record.frameDigest !== undefined) {
+                        const delivered = deliveredKey(
+                            record.conversationId,
+                            record.messageId,
+                            record.frameDigest,
+                        );
+                        if ((await this.#options.store.get(delivered)) !== undefined) {
+                            await this.#options.store.transaction(async (transaction) => {
+                                await transaction.delete(key);
+                                await transaction.delete(delivered);
+                            });
+                            changed = true;
+                        }
                     }
-                    this.#outboxErrors.delete(key);
+                    this.#emit({ kind: "outbox", conversationId: record.conversationId });
                 } catch (error: unknown) {
-                    const failure =
-                        error instanceof Error
-                            ? error
-                            : new Error("Unknown outbox convergence error");
-                    this.#outboxErrors.set(key, failure);
-                    failures.push(failure);
+                    if (signal.aborted) throw abortError(signal);
+                    const failure = classifyOutboxFailure(error);
+                    await this.#failOutbox(key, record, failure.code, failure.message);
+                    changed = true;
                 } finally {
                     zeroOutbox(record);
                 }
@@ -557,10 +702,82 @@ export class ChatService<TMessage, TAttachmentMetadata> {
             if (page.size < STORE_PAGE) break;
         }
         if (await this.#project(signal)) changed = true;
-        if (failures.length > 0) {
-            throw new AggregateError(failures, "One or more chat outbox intents failed");
-        }
         return changed;
+    }
+
+    async #prepareRecord(
+        key: string,
+        record: OutboxRecord,
+        parentSignal: AbortSignal,
+    ): Promise<void> {
+        for (let index = 0; index < record.attachments.length; index += 1) {
+            const attachment = record.attachments[index]!;
+            const prefix = attachmentStagePrefix(record, index);
+            if (attachment.stageState === "staging") {
+                await clearAttachmentStage(this.#options.store, prefix);
+                attachment.fileId.fill(0);
+                attachment.fileKey.fill(0);
+                attachment.fileId = randomBytes(FILE_ID_BYTES);
+                attachment.fileKey = randomBytes(KEY_BYTES);
+                if (attachment.manifest !== undefined) {
+                    zeroManifest(attachment.manifest);
+                }
+                delete attachment.manifest;
+                attachment.stageState = "new";
+                await this.#persistOutbox(key, record);
+            }
+            if (attachment.stageState === "new") {
+                const operation = this.#operation(parentSignal);
+                try {
+                    let source;
+                    try {
+                        source = await this.#options.resolveAttachmentSource(
+                            attachment.sourceId,
+                            operation.signal,
+                        );
+                    } catch (error: unknown) {
+                        throw outboxFailure("source-unavailable", error);
+                    }
+                    await clearAttachmentStage(this.#options.store, prefix);
+                    attachment.stageState = "staging";
+                    await this.#persistOutbox(key, record);
+                    attachment.manifest = await stageAttachment(
+                        source,
+                        attachment,
+                        record.conversationId,
+                        this.#options.murmur.identityKey,
+                        this.#options.store,
+                        prefix,
+                        operation.signal,
+                    );
+                    attachment.stageState = "staged";
+                    await this.#persistOutbox(key, record);
+                } finally {
+                    operation.dispose();
+                }
+            }
+            if (attachment.stageState === "staged") {
+                const operation = this.#operation(parentSignal);
+                try {
+                    await uploadStagedAttachment(
+                        attachment.manifest!,
+                        this.#options.store,
+                        prefix,
+                        this.#options.blobStore,
+                        operation.signal,
+                    );
+                    attachment.stageState = "uploaded";
+                    await this.#persistOutbox(key, record);
+                    await clearAttachmentStage(this.#options.store, prefix);
+                } finally {
+                    operation.dispose();
+                }
+            }
+        }
+        record.status = "ready";
+        delete record.lastError;
+        record.frameDigest = frameDigest(record);
+        await this.#persistOutbox(key, record);
     }
 
     async #project(signal: AbortSignal): Promise<boolean> {
@@ -569,35 +786,58 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         for (const group of groups) {
             ensureNotAborted(signal);
             if (!isChatDescriptor(group.descriptor)) continue;
-            const cursorKey = groupCursorKey(group.id);
-            const cursorBytes = await this.#options.store.get(cursorKey);
-            let after = cursorBytes === undefined ? 0n : decodeCursor(cursorBytes);
-            for (;;) {
-                const page = await this.#options.murmur.groups.get(group.id, {
-                    after,
-                    limit: GROUP_PAGE,
-                });
-                if (page === undefined || page.events.length === 0) break;
-                for (const event of page.events) {
-                    ensureNotAborted(signal);
-                    const accepted = await this.#projectEvent(group.id, event);
-                    after = event.sequence;
-                    changed = true;
-                    if (accepted) {
-                        this.#emit({ kind: "message", conversationId: group.id });
+            try {
+                if ((await this.#options.store.get(rebuildKey(group.id))) !== undefined) {
+                    await this.#finishRebuild(group.id);
+                }
+                const cursorKey = groupCursorKey(group.id);
+                const cursorBytes = await this.#options.store.get(cursorKey);
+                let after = cursorBytes === undefined ? 0n : decodeCursor(cursorBytes);
+                if (after > 0n) {
+                    const projection = await this.#options.store.scan(projectionPrefix(group.id), {
+                        limit: 1,
+                    });
+                    const quarantine = await this.#options.store.scan(quarantinePrefix(group.id), {
+                        limit: 1,
+                    });
+                    if (projection.size === 0 && quarantine.size === 0) {
+                        await this.#resetDerivedGroup(group.id);
+                        after = 0n;
                     }
                 }
-                if (page.nextAfter === undefined) break;
+                for (;;) {
+                    const page = await this.#options.murmur.groups.get(group.id, {
+                        after,
+                        limit: GROUP_PAGE,
+                    });
+                    if (page === undefined || page.events.length === 0) break;
+                    for (const event of page.events) {
+                        ensureNotAborted(signal);
+                        const accepted = await this.#projectEvent(group.id, event);
+                        after = event.sequence;
+                        changed = true;
+                        if (accepted) {
+                            this.#emit({ kind: "message", conversationId: group.id });
+                        }
+                    }
+                    if (page.nextAfter === undefined) break;
+                }
+            } catch (error: unknown) {
+                if (signal.aborted) throw error;
+                await this.#diagnose("projection", sha256(group.id));
+                if (error instanceof ChatStoreCorruptionError) {
+                    await this.#resetDerivedGroup(group.id);
+                    changed = true;
+                }
             }
         }
         return changed;
     }
 
     async #projectEvent(conversationId: Uint8Array, event: MurmurGroupEvent): Promise<boolean> {
-        let frame: ReturnType<typeof decodeFrame> | undefined;
+        let frame: ReturnType<typeof decodeFrame>;
         try {
             frame = decodeFrame(event.bytes);
-            this.#decodeApplication(frame);
             for (const manifest of frame.attachments) verifyManifestShape(manifest);
         } catch {
             const digest = sha256(event.bytes);
@@ -612,31 +852,30 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         }
         const digest = sha256(event.bytes);
         const dedupe = dedupeKey(conversationId, event.sender, frame.messageId, digest);
+        const projection = projectionKey(conversationId, event.sequence);
         const ownEvent = equalBytes(event.sender, this.#options.murmur.identityKey);
         let accepted = false;
         await this.#options.store.transaction(async (transaction) => {
-            const prior = await transaction.get(dedupe);
-            if (prior === undefined) {
-                await transaction.set(
-                    projectionKey(conversationId, event.sequence),
-                    encodeProjection(event.sender, event.bytes),
-                );
-                await transaction.set(dedupe, encodeCursor(event.sequence));
-                if (ownEvent) {
-                    await transaction.set(
-                        deliveredKey(frame.messageId),
-                        encodeCursor(event.sequence),
-                    );
+            const priorBytes = await transaction.get(dedupe);
+            const priorSequence = priorBytes === undefined ? undefined : decodeCursor(priorBytes);
+            const projected = await transaction.get(projection);
+            if (priorSequence === undefined || priorSequence === event.sequence) {
+                if (projected === undefined) {
+                    await transaction.set(projection, encodeProjection(event.sender, event.bytes));
+                    accepted = true;
+                } else {
+                    decodeProjection(projected);
                 }
-                accepted = true;
-            } else {
-                decodeCursor(prior);
+                await transaction.set(dedupe, encodeCursor(event.sequence));
+            }
+            if (ownEvent) {
+                await transaction.set(
+                    deliveredKey(conversationId, frame.messageId, digest),
+                    encodeCursor(event.sequence),
+                );
             }
             await transaction.set(groupCursorKey(conversationId), encodeCursor(event.sequence));
         });
-        if (accepted && ownEvent) {
-            await this.#options.store.delete(outboxKey(frame.messageId));
-        }
         return accepted;
     }
 
@@ -649,6 +888,8 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         const frame = decodeFrame(projection.frame);
         const application = this.#decodeApplication(frame);
         return {
+            kind: "message",
+            eventId: eventId(conversationId, sequence),
             conversationId: conversationId.slice(),
             sequence,
             sender: projection.sender.slice(),
@@ -692,13 +933,17 @@ export class ChatService<TMessage, TAttachmentMetadata> {
     #encodeMessage(message: TMessage): Uint8Array {
         try {
             const bytes = this.#options.encodeMessage(message);
-            if (!(bytes instanceof Uint8Array))
-                throw new Error("encoder did not return Uint8Array");
-            if (bytes.length > MAXIMUM_FRAME_BYTES)
+            if (!(bytes instanceof Uint8Array)) {
+                throw new ChatValidationError("Message encoder did not return Uint8Array");
+            }
+            if (bytes.length > MAXIMUM_FRAME_BYTES) {
                 throw new ChatFrameTooLargeError("Message body exceeds Murmur's frame bound");
+            }
             return bytes.slice();
         } catch (error: unknown) {
-            if (error instanceof ChatFrameTooLargeError) throw error;
+            if (error instanceof ChatFrameTooLargeError || error instanceof ChatValidationError) {
+                throw error;
+            }
             throw new ChatCodecError(
                 error instanceof Error ? error.message : "Message encoding failed",
             );
@@ -708,15 +953,53 @@ export class ChatService<TMessage, TAttachmentMetadata> {
     #encodeMetadata(metadata: TAttachmentMetadata): Uint8Array {
         try {
             const bytes = this.#options.encodeAttachmentMetadata(metadata);
-            if (!(bytes instanceof Uint8Array))
-                throw new Error("encoder did not return Uint8Array");
-            if (bytes.length > MAXIMUM_FRAME_BYTES) throw new Error("metadata is oversized");
+            if (!(bytes instanceof Uint8Array) || bytes.length > MAXIMUM_FRAME_BYTES) {
+                throw new ChatValidationError("Invalid encoded attachment metadata");
+            }
             return bytes.slice();
         } catch (error: unknown) {
+            if (error instanceof ChatValidationError) throw error;
             throw new ChatCodecError(
                 error instanceof Error ? error.message : "Metadata encoding failed",
             );
         }
+    }
+
+    async #findOutbox(
+        messageId: Uint8Array,
+    ): Promise<{ key: string; record: OutboxRecord } | undefined> {
+        let after: string | undefined;
+        for (;;) {
+            const page = await this.#options.store.scan(OUTBOX_PREFIX, {
+                ...(after === undefined ? {} : { after }),
+                limit: STORE_PAGE,
+            });
+            for (const [key, encoded] of page) {
+                after = key;
+                let record: OutboxRecord;
+                try {
+                    record = decodeOutbox(encoded);
+                } catch {
+                    await this.#isolateCorruptOutbox(key, encoded);
+                    continue;
+                }
+                if (equalBytes(record.messageId, messageId)) return { key, record };
+                zeroOutbox(record);
+            }
+            if (page.size < STORE_PAGE) return undefined;
+        }
+    }
+
+    async #failOutbox(
+        key: string,
+        record: OutboxRecord,
+        code: string,
+        message: string,
+    ): Promise<void> {
+        record.status = "failed";
+        record.lastError = { code: code.slice(0, 128), message: message.slice(0, 1024) };
+        await this.#persistOutbox(key, record);
+        this.#emit({ kind: "outbox", conversationId: record.conversationId });
     }
 
     async #persistOutbox(key: string, record: OutboxRecord): Promise<void> {
@@ -731,9 +1014,79 @@ export class ChatService<TMessage, TAttachmentMetadata> {
     async #requireConversation(conversationId: Uint8Array): Promise<MurmurGroup> {
         const page = await this.#options.murmur.groups.get(conversationId, { limit: 1 });
         if (page === undefined || !isChatDescriptor(page.group.descriptor)) {
-            throw new Error("Chat conversation not found");
+            throw new ChatValidationError("Chat conversation not found");
         }
         return page.group;
+    }
+
+    async #requireActiveConversation(conversationId: Uint8Array): Promise<MurmurGroup> {
+        const group = await this.#requireConversation(conversationId);
+        if (group.status !== "active") {
+            throw new ChatValidationError("Chat conversation is not active");
+        }
+        return group;
+    }
+
+    async #finishRebuild(conversationId: Uint8Array): Promise<void> {
+        for (const prefix of [
+            projectionPrefix(conversationId),
+            dedupePrefix(conversationId),
+            deliveredPrefix(conversationId),
+            quarantinePrefix(conversationId),
+        ]) {
+            await deletePrefix(this.#options.store, prefix);
+        }
+        await this.#options.store.transaction(async (transaction) => {
+            await transaction.delete(groupCursorKey(conversationId));
+            await transaction.delete(rebuildKey(conversationId));
+        });
+    }
+
+    async #resetDerivedGroup(conversationId: Uint8Array): Promise<void> {
+        await this.#options.store.set(rebuildKey(conversationId), encodeCursor(1n));
+        await this.#finishRebuild(conversationId);
+    }
+
+    async #isolateCorruptOutbox(key: string, bytes: Uint8Array): Promise<void> {
+        const digest = sha256(bytes);
+        await this.#diagnose("outbox", digest);
+        const suffix = key.slice(OUTBOX_PREFIX.length);
+        if (/^[0-9a-f]{16}\/[A-Za-z0-9_-]{22}$/.test(suffix)) {
+            await clearAttachmentStage(this.#options.store, `${STAGING_PREFIX}${suffix}/`);
+        }
+        await this.#options.store.delete(key);
+    }
+
+    async #diagnose(kind: string, digest: Uint8Array): Promise<void> {
+        const slot = digest[0] ?? 0;
+        await this.#options.store.set(
+            `${DIAGNOSTIC_PREFIX}${kind}/${slot.toString(16).padStart(2, "0")}`,
+            digest,
+        );
+    }
+
+    #operation(parent: AbortSignal): { signal: AbortSignal; dispose: () => void } {
+        const controller = new AbortController();
+        const forward = (): void => controller.abort(parent.reason);
+        if (parent.aborted) controller.abort(parent.reason);
+        else parent.addEventListener("abort", forward, { once: true });
+        const timer = setTimeout(
+            () =>
+                controller.abort(
+                    new ChatOutboxFailedError(
+                        "operation-timeout",
+                        `Operation exceeded ${this.#operationTimeoutMilliseconds}ms`,
+                    ),
+                ),
+            this.#operationTimeoutMilliseconds,
+        );
+        return {
+            signal: controller.signal,
+            dispose: (): void => {
+                clearTimeout(timer);
+                parent.removeEventListener("abort", forward);
+            },
+        };
     }
 
     #emit(change: ChatChange): void {
@@ -747,7 +1100,7 @@ export class ChatService<TMessage, TAttachmentMetadata> {
             try {
                 listener(safe);
             } catch {
-                // Listener failures do not affect durable convergence.
+                // Listener failures cannot affect durable convergence.
             }
         }
     }
@@ -762,7 +1115,7 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         if (this.#timer !== undefined) clearTimeout(this.#timer);
         this.#timer = setTimeout(() => {
             this.#timer = undefined;
-            this.#workerPromise = this.#exclusive(async () => {
+            this.#workerPromise = this.#workExclusive(async () => {
                 this.#wakeRequested = false;
                 try {
                     await this.#options.murmur.sync({ signal: this.#abort.signal });
@@ -782,7 +1135,6 @@ export class ChatService<TMessage, TAttachmentMetadata> {
                     if (!this.#closing) {
                         this.#convergenceError =
                             error instanceof Error ? error : new Error("Chat worker failed");
-                        this.#emit({ kind: "error" });
                     }
                 })
                 .finally(() => {
@@ -800,10 +1152,10 @@ export class ChatService<TMessage, TAttachmentMetadata> {
         }, delay);
     }
 
-    async #exclusive<Result>(operation: () => Promise<Result>): Promise<Result> {
+    async #workExclusive<Result>(operation: () => Promise<Result>): Promise<Result> {
         let release: (() => void) | undefined;
-        const prior = this.#tail;
-        this.#tail = new Promise<void>((resolve) => {
+        const prior = this.#workTail;
+        this.#workTail = new Promise<void>((resolve) => {
             release = resolve;
         });
         await prior;
@@ -820,6 +1172,17 @@ export class ChatService<TMessage, TAttachmentMetadata> {
     }
 }
 
+/** Explicitly zero a caller-owned attachment capability after use. */
+export function destroyAttachment<TMetadata>(attachment: ChatAttachment<TMetadata>): void {
+    validateAttachmentObject(attachment);
+    attachment.fileKey.fill(0);
+    attachment.fileId.fill(0);
+    attachment.blobId.fill(0);
+    attachment.keyCommitment.fill(0);
+    attachment.conversationId.fill(0);
+    attachment.sender.fill(0);
+}
+
 function preflightFrame(
     messageId: Uint8Array,
     claimedAt: number,
@@ -833,11 +1196,8 @@ function preflightFrame(
         commitment: new Uint8Array(HASH_BYTES),
         blobId: new Uint8Array(HASH_BYTES),
         plaintextLength: attachment.plaintextLength,
-        chunkSize: 256 * 1024,
-        chunkCount:
-            attachment.plaintextLength === 0
-                ? 0
-                : Math.ceil(attachment.plaintextLength / (256 * 1024)),
+        chunkSize: ATTACHMENT_CHUNK_BYTES,
+        chunkCount: Math.max(1, Math.ceil(attachment.plaintextLength / ATTACHMENT_CHUNK_BYTES)),
     }));
     try {
         encodeFrame({ messageId, claimedAt, body, attachments: placeholders });
@@ -851,6 +1211,42 @@ function preflightFrame(
     }
 }
 
+function frameDigest(record: OutboxRecord): Uint8Array {
+    const frame = encodeRecordFrame(record);
+    try {
+        return sha256(frame);
+    } finally {
+        frame.fill(0);
+    }
+}
+
+function encodeRecordFrame(record: OutboxRecord): Uint8Array {
+    return encodeFrame({
+        messageId: record.messageId,
+        claimedAt: record.claimedAt,
+        body: record.body,
+        attachments: record.attachments.map((attachment) => attachment.manifest!),
+    });
+}
+
+function outboxView(record: OutboxRecord): ChatOutboxEntry {
+    return {
+        enqueueSequence: record.enqueueSequence,
+        conversationId: record.conversationId.slice(),
+        messageId: record.messageId.slice(),
+        status: record.status,
+        attachmentCount: record.attachments.length,
+        ...(record.lastError === undefined
+            ? {}
+            : {
+                  lastError: {
+                      code: record.lastError.code,
+                      message: record.lastError.message,
+                  },
+              }),
+    };
+}
+
 function conversationView(group: MurmurGroup): ChatConversation {
     return {
         id: group.id.slice(),
@@ -860,24 +1256,82 @@ function conversationView(group: MurmurGroup): ChatConversation {
     };
 }
 
+function validateOptions<TMessage, TMetadata>(
+    options: ChatServiceOptions<TMessage, TMetadata>,
+): void {
+    if (
+        options === null ||
+        typeof options !== "object" ||
+        options.murmur === null ||
+        typeof options.murmur !== "object" ||
+        options.store === null ||
+        typeof options.store !== "object" ||
+        options.blobStore === null ||
+        typeof options.blobStore !== "object" ||
+        typeof options.encodeMessage !== "function" ||
+        typeof options.decodeMessage !== "function" ||
+        typeof options.encodeAttachmentMetadata !== "function" ||
+        typeof options.decodeAttachmentMetadata !== "function" ||
+        typeof options.resolveAttachmentSource !== "function" ||
+        typeof options.store.transaction !== "function" ||
+        typeof options.store.scan !== "function" ||
+        typeof options.blobStore.put !== "function" ||
+        typeof options.blobStore.head !== "function" ||
+        typeof options.blobStore.get !== "function"
+    ) {
+        throw new ChatValidationError("Invalid ChatService options");
+    }
+    const idle = options.idlePollMilliseconds ?? 250;
+    const timeout = options.operationTimeoutMilliseconds ?? DEFAULT_OPERATION_TIMEOUT;
+    if (
+        !Number.isSafeInteger(idle) ||
+        idle < 25 ||
+        idle > 30_000 ||
+        !Number.isSafeInteger(timeout) ||
+        timeout < 25 ||
+        timeout > 30_000
+    ) {
+        throw new ChatValidationError("Invalid chat worker timing options");
+    }
+}
+
 function validateConversationId(value: Uint8Array): void {
     if (!(value instanceof Uint8Array) || value.length !== GROUP_ID_BYTES) {
-        throw new Error("Conversation ID must contain 32 bytes");
+        throw new ChatValidationError("Conversation ID must contain 32 bytes");
     }
 }
 
 function validateIdentity(value: Uint8Array): void {
     if (!(value instanceof Uint8Array) || value.length !== IDENTITY_BYTES) {
-        throw new Error("Identity key must contain 32 bytes");
+        throw new ChatValidationError("Identity key must contain 32 bytes");
+    }
+}
+
+function validateMessageId(value: Uint8Array): void {
+    if (!(value instanceof Uint8Array) || value.length !== MESSAGE_ID_BYTES) {
+        throw new ChatValidationError("Message ID must contain 16 bytes");
     }
 }
 
 function validateMembers(members: readonly Uint8Array[]): void {
+    if (!Array.isArray(members)) throw new ChatValidationError("Members must be an array");
     for (const member of members) validateIdentity(member);
 }
 
-function outboxKey(messageId: Uint8Array): string {
-    return `${OUTBOX_PREFIX}${encodeBase64Url(messageId)}`;
+function validateAttachmentInput<TMetadata>(attachment: ChatAttachmentInput<TMetadata>): void {
+    if (
+        attachment === null ||
+        typeof attachment !== "object" ||
+        typeof attachment.sourceId !== "string" ||
+        attachment.sourceId.length === 0 ||
+        new TextEncoder().encode(attachment.sourceId).length > 4096
+    ) {
+        throw new ChatValidationError("Attachment sourceId must be non-empty and bounded");
+    }
+}
+
+function outboxKey(sequence: bigint, messageId: Uint8Array): string {
+    return `${OUTBOX_PREFIX}${sequenceKey(sequence)}/${encodeBase64Url(messageId)}`;
 }
 
 function projectionPrefix(conversationId: Uint8Array): string {
@@ -892,39 +1346,130 @@ function groupCursorKey(conversationId: Uint8Array): string {
     return `${CURSOR_PREFIX}${encodeBase64Url(conversationId)}`;
 }
 
+function dedupePrefix(conversationId: Uint8Array): string {
+    return `${DEDUPE_PREFIX}${encodeBase64Url(conversationId)}/`;
+}
+
 function dedupeKey(
     conversationId: Uint8Array,
     sender: Uint8Array,
     messageId: Uint8Array,
     digest: Uint8Array,
 ): string {
-    return `${DEDUPE_PREFIX}${encodeBase64Url(conversationId)}/${encodeBase64Url(sender)}/${encodeBase64Url(messageId)}/${encodeBase64Url(digest)}`;
+    return `${dedupePrefix(conversationId)}${encodeBase64Url(sender)}/${encodeBase64Url(messageId)}/${encodeBase64Url(digest)}`;
 }
 
-function deliveredKey(messageId: Uint8Array): string {
-    return `${DELIVERED_PREFIX}${encodeBase64Url(messageId)}`;
+function deliveredPrefix(conversationId: Uint8Array): string {
+    return `${DELIVERED_PREFIX}${encodeBase64Url(conversationId)}/`;
+}
+
+function deliveredKey(
+    conversationId: Uint8Array,
+    messageId: Uint8Array,
+    digest: Uint8Array,
+): string {
+    return `${deliveredPrefix(conversationId)}${encodeBase64Url(messageId)}/${encodeBase64Url(digest)}`;
+}
+
+function quarantinePrefix(conversationId: Uint8Array): string {
+    return `${QUARANTINE_PREFIX}${encodeBase64Url(conversationId)}/`;
 }
 
 function quarantineKey(conversationId: Uint8Array, slot: bigint): string {
-    return `${QUARANTINE_PREFIX}${encodeBase64Url(conversationId)}/${sequenceKey(slot)}`;
+    return `${quarantinePrefix(conversationId)}${sequenceKey(slot)}`;
+}
+
+function rebuildKey(conversationId: Uint8Array): string {
+    return `${REBUILD_PREFIX}${encodeBase64Url(conversationId)}`;
+}
+
+function attachmentStagePrefix(record: OutboxRecord, index: number): string {
+    return `${STAGING_PREFIX}${sequenceKey(record.enqueueSequence)}/${encodeBase64Url(record.messageId)}/${index.toString(16).padStart(2, "0")}/`;
+}
+
+function eventId(conversationId: Uint8Array, sequence: bigint): string {
+    return `${encodeBase64Url(conversationId)}:${sequenceKey(sequence)}`;
 }
 
 function publicAttachmentManifest<TMetadata>(
     attachment: ChatAttachment<TMetadata>,
     metadata: Uint8Array,
 ): EncodedManifest {
-    const manifest: EncodedManifest = {
+    validateAttachmentObject(attachment);
+    const borrowed: EncodedManifest = {
         metadata,
-        fileId: attachment.fileId.slice(),
-        fileKey: attachment.fileKey.slice(),
-        commitment: attachment.keyCommitment.slice(),
-        blobId: attachment.blobId.slice(),
+        fileId: attachment.fileId,
+        fileKey: attachment.fileKey,
+        commitment: attachment.keyCommitment,
+        blobId: attachment.blobId,
         plaintextLength: attachment.plaintextLength,
         chunkSize: attachment.chunkSize,
         chunkCount: attachment.chunkCount,
     };
-    verifyManifestShape(manifest);
-    return manifest;
+    verifyManifestShape(borrowed);
+    return {
+        ...borrowed,
+        metadata,
+        fileId: borrowed.fileId.slice(),
+        fileKey: borrowed.fileKey.slice(),
+        commitment: borrowed.commitment.slice(),
+        blobId: borrowed.blobId.slice(),
+    };
+}
+
+function validateAttachmentObject<TMetadata>(attachment: ChatAttachment<TMetadata>): void {
+    if (
+        attachment === null ||
+        typeof attachment !== "object" ||
+        !(attachment.fileId instanceof Uint8Array) ||
+        !(attachment.fileKey instanceof Uint8Array) ||
+        !(attachment.blobId instanceof Uint8Array) ||
+        !(attachment.keyCommitment instanceof Uint8Array) ||
+        !(attachment.conversationId instanceof Uint8Array) ||
+        !(attachment.sender instanceof Uint8Array) ||
+        !Number.isSafeInteger(attachment.plaintextLength) ||
+        !Number.isSafeInteger(attachment.chunkSize) ||
+        !Number.isSafeInteger(attachment.chunkCount)
+    ) {
+        throw new ChatValidationError("Invalid attachment capability");
+    }
+}
+
+async function deletePrefix(store: MurmurStore, prefix: string): Promise<void> {
+    for (;;) {
+        const page = await store.scan(prefix, { limit: STORE_PAGE });
+        if (page.size === 0) return;
+        await store.transaction(async (transaction) => {
+            for (const key of page.keys()) await transaction.delete(key);
+        });
+    }
+}
+
+function classifyOutboxFailure(error: unknown): { code: string; message: string } {
+    if (error instanceof ChatOutboxFailedError) {
+        return { code: error.code, message: error.message };
+    }
+    if (error instanceof ChatAttachmentSourceChangedError) {
+        return { code: "source-changed", message: error.message };
+    }
+    if (error instanceof ChatAttachmentAuthenticationError) {
+        return { code: "blob-verification", message: error.message };
+    }
+    return {
+        code: "operation-failed",
+        message: error instanceof Error ? error.message : "Unknown outbox failure",
+    };
+}
+
+function outboxFailure(code: string, error: unknown): ChatOutboxFailedError {
+    return new ChatOutboxFailedError(
+        code,
+        error instanceof Error ? error.message : "Outbox operation failed",
+    );
+}
+
+function boundedErrorMessage(error: unknown): string {
+    return (error instanceof Error ? error.message : "Unknown projected frame").slice(0, 1024);
 }
 
 function zeroIntent(intent: EncodedAttachmentIntent): void {
@@ -932,9 +1477,7 @@ function zeroIntent(intent: EncodedAttachmentIntent): void {
     intent.fileId.fill(0);
     intent.fileKey.fill(0);
     intent.sourceHash.fill(0);
-    if (intent.manifest !== undefined) {
-        zeroManifest(intent.manifest);
-    }
+    if (intent.manifest !== undefined) zeroManifest(intent.manifest);
 }
 
 function zeroManifest(manifest: EncodedManifest): void {
@@ -949,5 +1492,6 @@ function zeroOutbox(record: OutboxRecord): void {
     record.conversationId.fill(0);
     record.messageId.fill(0);
     record.body.fill(0);
+    record.frameDigest?.fill(0);
     for (const intent of record.attachments) zeroIntent(intent);
 }

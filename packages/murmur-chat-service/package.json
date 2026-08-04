@@ -3,6 +3,13 @@
     "version": "0.1.0",
     "private": true,
     "description": "Durable generic chat and encrypted attachment service above Murmur groups",
+    "license": "MIT",
+    "files": [
+        "dist",
+        "LICENSE",
+        "README.md",
+        "package.json"
+    ],
     "type": "module",
     "sideEffects": false,
     "main": "./dist/index.js",
@@ -11,12 +18,14 @@
         ".": {
             "types": "./dist/index.d.ts",
             "import": "./dist/index.js"
-        }
+        },
+        "./package.json": "./package.json"
     },
     "scripts": {
         "build": "tsc -p tsconfig.build.json",
         "check": "tsc --noEmit -p tsconfig.json",
-        "test": "vitest run"
+        "test": "vitest run",
+        "test:browser": "esbuild sources/index.ts --bundle --platform=browser --format=esm --outfile=dist/browser-smoke.js"
     },
     "dependencies": {
         "@noble/ciphers": "^1.2.1",
@@ -25,7 +34,11 @@
     },
     "devDependencies": {
         "@murmur/relay": "workspace:*",
+        "esbuild": "^0.28.1",
         "typescript": "^5.9.3",
         "vitest": "^3.2.7"
+    },
+    "engines": {
+        "node": ">=20"
     }
 }
