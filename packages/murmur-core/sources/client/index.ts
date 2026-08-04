@@ -274,8 +274,8 @@ export class MurmurClient {
             throw new Error("Write secret key does not match the topic capability");
         }
         return {
-            signingKey: access.topic.writeKey,
-            signingSecretKey: secretKey,
+            publicKey: access.topic.writeKey,
+            secretKey,
         };
     }
 

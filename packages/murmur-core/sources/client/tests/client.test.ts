@@ -64,7 +64,7 @@ describe("single-relay stateful client", () => {
         const topic = {
             type: "write" as const,
             name: "group",
-            writeKey: identity.signingKey,
+            writeKey: identity.publicKey,
         };
         const firstEvent = createRelayEvent(identity, topic, new Uint8Array([1]), {}, 1);
         const secondEvent = createRelayEvent(identity, topic, new Uint8Array([2]), {}, 2);
@@ -103,8 +103,8 @@ describe("single-relay stateful client", () => {
         });
         const result = await client.publish(
             {
-                topic: { type: "write", name: "out", writeKey: identity.signingKey },
-                writeSecretKey: identity.signingSecretKey,
+                topic: { type: "write", name: "out", writeKey: identity.publicKey },
+                writeSecretKey: identity.secretKey,
             },
             new Uint8Array([9]),
         );
@@ -143,7 +143,7 @@ describe("single-relay stateful client", () => {
             access.topic.writeKey,
             access.topic.writeKey,
         ]);
-        expect(transport.published[0]!.author.signingKey).not.toEqual(firstIdentity.signingKey);
+        expect(transport.published[0]!.author.signingKey).not.toEqual(firstIdentity.publicKey);
         const sharedPage = {
             events: transport.published.map((event, index) => ({
                 seq: BigInt(index + 1),
@@ -168,7 +168,7 @@ describe("single-relay stateful client", () => {
         const topic = {
             type: "write" as const,
             name: "paged",
-            writeKey: identity.signingKey,
+            writeKey: identity.publicKey,
         };
         const firstEvent = createRelayEvent(identity, topic, new Uint8Array([1]), {}, 1);
         const secondEvent = createRelayEvent(identity, topic, new Uint8Array([2]), {}, 2);
@@ -191,7 +191,7 @@ describe("single-relay stateful client", () => {
         const topic = {
             type: "write" as const,
             name: "concurrent",
-            writeKey: identity.signingKey,
+            writeKey: identity.publicKey,
         };
         const event = createRelayEvent(identity, topic, new Uint8Array([1]), {}, 1);
         const transport = new OrderedTransport([
@@ -214,7 +214,7 @@ describe("single-relay stateful client", () => {
         const topic = {
             type: "write" as const,
             name: "monotonic",
-            writeKey: identity.signingKey,
+            writeKey: identity.publicKey,
         };
         const store = new MemoryMurmurStore();
         const cursorKey = `client/${identityId(identity)}/cursor/${relayTopicId(topic)}`;
@@ -232,7 +232,7 @@ describe("single-relay stateful client", () => {
         const topic = {
             type: "write" as const,
             name: "adversarial",
-            writeKey: owner.signingKey,
+            writeKey: owner.publicKey,
         };
         const malicious = createRelayEvent(attacker, topic, new Uint8Array([1]), {}, 1);
         const client = new MurmurClient({
@@ -252,12 +252,12 @@ describe("single-relay stateful client", () => {
         const firstTopic = {
             type: "write" as const,
             name: "first-valid",
-            writeKey: identity.signingKey,
+            writeKey: identity.publicKey,
         };
         const secondTopic = {
             type: "write" as const,
             name: "second-malicious",
-            writeKey: identity.signingKey,
+            writeKey: identity.publicKey,
         };
         const firstEvent = createRelayEvent(identity, firstTopic, new Uint8Array([1]), {}, 1);
         const malicious = createRelayEvent(attacker, secondTopic, new Uint8Array([2]), {}, 1);

@@ -67,7 +67,7 @@ export function createRelayEvent(
             version: 1,
             id: encodeBase64Url(randomBytes(32)),
             topic,
-            author: { signingKey: author.signingKey.slice() },
+            author: { signingKey: author.publicKey.slice() },
             createdAt: now,
             ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
             ...(options.collapseKey === undefined
@@ -78,15 +78,15 @@ export function createRelayEvent(
         }),
     );
     if (
-        author.signingKey.length !== 32 ||
-        author.signingSecretKey.length !== 32 ||
-        !equalBytes(ed25519.getPublicKey(author.signingSecretKey), author.signingKey)
+        author.publicKey.length !== 32 ||
+        author.secretKey.length !== 32 ||
+        !equalBytes(ed25519.getPublicKey(author.secretKey), author.publicKey)
     ) {
         throw new Error("Invalid relay signing key");
     }
     return {
         ...unsigned,
-        signature: ed25519.sign(relayEventSigningBytes(unsigned), author.signingSecretKey),
+        signature: ed25519.sign(relayEventSigningBytes(unsigned), author.secretKey),
     };
 }
 
@@ -94,7 +94,11 @@ export function createRelayEvent(
 export function verifyRelayEvent(event: SignedRelayEvent): boolean {
     try {
         decodeSignedRelayEventWire(encodeSignedRelayEventWire(event));
-        return verifyBytes(event.author, relayEventSigningBytes(event), event.signature);
+        return verifyBytes(
+            { publicKey: event.author.signingKey },
+            relayEventSigningBytes(event),
+            event.signature,
+        );
     } catch {
         return false;
     }

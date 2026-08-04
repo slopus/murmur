@@ -32,8 +32,8 @@ export interface TopicAccess {
 
 /** Minimal Ed25519 signing material accepted when constructing an event. */
 export interface RelaySigningKey {
-    readonly signingKey: Uint8Array;
-    readonly signingSecretKey: Uint8Array;
+    readonly publicKey: Uint8Array;
+    readonly secretKey: Uint8Array;
 }
 
 /** Complete signed durable relay event. */
