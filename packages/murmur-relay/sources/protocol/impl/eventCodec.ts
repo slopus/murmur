@@ -58,34 +58,76 @@ export function parseRelayTopic(value: unknown): RelayTopic {
     }
     if (topic.type === "write") {
         exactKeys(topic, ["type", "name", "writeKey"], [], "topic");
-        return {
+        const parsed: RelayTopic = {
             type: "write",
             name: topic.name,
             writeKey: bytesValue(topic.writeKey, "write key", 32),
         };
+        validateRelayTopic(parsed);
+        return parsed;
     }
     if (topic.type === "read") {
         exactKeys(topic, ["type", "name", "readKey"], [], "topic");
-        return {
+        const parsed: RelayTopic = {
             type: "read",
             name: topic.name,
             readKey: bytesValue(topic.readKey, "read key", 32),
         };
+        validateRelayTopic(parsed);
+        return parsed;
     }
     if (topic.type === "read-write") {
         exactKeys(topic, ["type", "name", "readKey", "writeKey"], [], "topic");
-        return {
+        const parsed: RelayTopic = {
             type: "read-write",
             name: topic.name,
             readKey: bytesValue(topic.readKey, "read key", 32),
             writeKey: bytesValue(topic.writeKey, "write key", 32),
         };
+        validateRelayTopic(parsed);
+        return parsed;
+    }
+    throw new RelayError(400, "Invalid topic type", { error: "malformed" });
+}
+
+/** Strictly validate an in-memory topic descriptor, including exact fields. */
+export function validateRelayTopic(topic: RelayTopic): void {
+    const value = objectValue(topic, "topic");
+    if (typeof topic.name !== "string" || !NAME_PATTERN.test(topic.name)) {
+        throw new RelayError(400, "Invalid topic name", { error: "malformed" });
+    }
+    if (topic.type === "write") {
+        exactKeys(value, ["type", "name", "writeKey"], [], "topic");
+        if (!(topic.writeKey instanceof Uint8Array) || topic.writeKey.length !== 32) {
+            throw new RelayError(400, "Invalid write key", { error: "malformed" });
+        }
+        return;
+    }
+    if (topic.type === "read") {
+        exactKeys(value, ["type", "name", "readKey"], [], "topic");
+        if (!(topic.readKey instanceof Uint8Array) || topic.readKey.length !== 32) {
+            throw new RelayError(400, "Invalid read key", { error: "malformed" });
+        }
+        return;
+    }
+    if (topic.type === "read-write") {
+        exactKeys(value, ["type", "name", "readKey", "writeKey"], [], "topic");
+        if (
+            !(topic.readKey instanceof Uint8Array) ||
+            topic.readKey.length !== 32 ||
+            !(topic.writeKey instanceof Uint8Array) ||
+            topic.writeKey.length !== 32
+        ) {
+            throw new RelayError(400, "Invalid topic keys", { error: "malformed" });
+        }
+        return;
     }
     throw new RelayError(400, "Invalid topic type", { error: "malformed" });
 }
 
 /** Convert a topic descriptor to its canonical JSON representation. */
 export function relayTopicToJson(topic: RelayTopic): RelayTopicJson {
+    validateRelayTopic(topic);
     if (topic.type === "write") {
         return { type: topic.type, name: topic.name, writeKey: encodeBase64Url(topic.writeKey) };
     }
@@ -103,6 +145,36 @@ export function relayTopicToJson(topic: RelayTopic): RelayTopicJson {
 /** Return whether an event identifier encodes exactly 32 bytes. */
 export function isEventId(value: string): boolean {
     return EVENT_ID_PATTERN.test(value) && isBase64Url(value, 32);
+}
+
+/** Strictly validate the exact in-memory event envelope shape. */
+export function validateSignedRelayEventShape(event: SignedRelayEvent): void {
+    const value = objectValue(event, "relay event");
+    exactKeys(
+        value,
+        ["version", "id", "topic", "author", "createdAt", "payload", "signature"],
+        ["expiresAt", "collapseKey"],
+        "relay event",
+    );
+    const author = objectValue(event.author, "event author");
+    exactKeys(author, ["signingKey"], [], "event author");
+    validateRelayTopic(event.topic);
+    if (
+        event.version !== 1 ||
+        !isEventId(event.id) ||
+        !(event.author.signingKey instanceof Uint8Array) ||
+        event.author.signingKey.length !== 32 ||
+        !Number.isSafeInteger(event.createdAt) ||
+        event.createdAt < 0 ||
+        !(event.payload instanceof Uint8Array) ||
+        !(event.signature instanceof Uint8Array) ||
+        event.signature.length !== 64 ||
+        (event.expiresAt !== undefined &&
+            (!Number.isSafeInteger(event.expiresAt) || event.expiresAt < 0)) ||
+        (event.collapseKey !== undefined && !(event.collapseKey instanceof Uint8Array))
+    ) {
+        throw new RelayError(400, "Invalid relay event", { error: "malformed" });
+    }
 }
 
 /** Strictly decode one signed relay event without applying policy or cryptography. */
@@ -149,6 +221,7 @@ export function parseSignedRelayEvent(value: unknown): SignedRelayEvent {
 
 /** Convert an internal event to its exact JSON wire representation. */
 export function signedRelayEventToJson(event: SignedRelayEvent): SignedRelayEventJson {
+    validateSignedRelayEventShape(event);
     return {
         version: 1,
         id: event.id,

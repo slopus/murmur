@@ -153,7 +153,8 @@ The client signs canonical JSON:
 
 The relay removes the challenge before signature verification. Consequently a
 successful proof, an invalid attempt, or a replay consumes it. The challenge is
-also bound to the topic descriptor and expiration.
+also bound to the topic descriptor and expiration. Issuance and atomic
+consumption use shared relay storage rather than process memory.
 
 ## Stateful client contract
 
@@ -175,3 +176,8 @@ identity signer is a valid relay author.
 
 There is exactly one `RelayTransport` per stateful client. Multi-relay ordering,
 failover, and relay-specific cursors are not protocol concepts.
+
+Clients independently validate descriptor shape, event signature, topic
+identity, sequence range, and designated write author on received pages. Sync
+passes are serialized, and a pending delivery must advance transactionally
+before that topic is read again.

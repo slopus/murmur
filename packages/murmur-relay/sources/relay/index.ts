@@ -6,6 +6,8 @@ import {
     readProofSigningBytes,
     relayEventFingerprint,
     relayTopicId,
+    validateRelayTopic,
+    validateSignedRelayEventShape,
     verifyRelayEventSignature,
     type ReadChallenge,
     type ReadProof,
@@ -30,15 +32,11 @@ export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./types.js"
 const MEBIBYTE = 1024 * 1024;
 const FIVE_MINUTES = 5 * 60 * 1_000;
 const HARD_MAXIMUM_LONG_POLL_MILLISECONDS = 30_000;
+const MAXIMUM_SEQUENCE = 9_223_372_036_854_775_807n;
 
 interface Waiter {
     readonly resolve: () => void;
     readonly reject: (error: Error) => void;
-}
-
-interface StoredChallenge {
-    readonly challenge: ReadChallenge;
-    readonly topicId: string;
 }
 
 function positiveInteger(value: number, name: string): number {
@@ -86,6 +84,13 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
     if (resolved.maximumLongPollMilliseconds > HARD_MAXIMUM_LONG_POLL_MILLISECONDS) {
         throw new Error("Maximum long poll cannot exceed 30 seconds");
     }
+    const minimumJsonBytes =
+        Math.ceil(resolved.maximumEventPayloadBytes / 3) * 4 +
+        Math.ceil(resolved.maximumCollapseKeyBytes / 3) * 4 +
+        4_096;
+    if (resolved.maximumJsonBodyBytes < minimumJsonBytes) {
+        throw new Error("Maximum JSON body bytes must fit one maximum-sized encoded relay event");
+    }
     return resolved;
 }
 
@@ -96,7 +101,6 @@ export class RelayService {
     readonly #now: () => number;
     readonly #options: ResolvedRelayOptions;
     readonly #waiters = new Map<string, Set<Waiter>>();
-    readonly #challenges = new Map<string, StoredChallenge>();
     #waiterCount = 0;
     #closed = false;
 
@@ -121,6 +125,7 @@ export class RelayService {
     /** Validate authorization and atomically append one durable signed event. */
     async publish(event: SignedRelayEvent): Promise<PublishOutcome> {
         this.#assertOpen();
+        validateSignedRelayEventShape(event);
         if (
             event.version !== 1 ||
             !isEventId(event.id) ||
@@ -188,26 +193,34 @@ export class RelayService {
     }
 
     /** Issue a short-lived one-use challenge for a protected read topic. */
-    issueReadChallenge(topic: RelayTopic): ReadChallenge {
+    async issueReadChallenge(topic: RelayTopic): Promise<ReadChallenge> {
         this.#assertOpen();
+        validateRelayTopic(topic);
         if (topic.type === "write") {
             throw new RelayError(400, "Publicly readable topics need no challenge", {
                 error: "malformed",
             });
         }
         const now = this.#now();
-        this.#discardExpiredChallenges(now);
-        if (this.#challenges.size >= this.#options.maximumOutstandingReadChallenges) {
-            throw new RelayError(503, "Too many outstanding read challenges", {
-                error: "overloaded",
-            });
-        }
         const challenge: ReadChallenge = {
             id: encodeBase64Url(randomBytes(32)),
             nonce: randomBytes(32),
             expiresAt: now + this.#options.readChallengeLifetimeMilliseconds,
         };
-        this.#challenges.set(challenge.id, { challenge, topicId: relayTopicId(topic) });
+        if (
+            !(await this.#store.issueReadChallenge(
+                {
+                    ...challenge,
+                    topicId: relayTopicId(topic),
+                },
+                now,
+                this.#options.maximumOutstandingReadChallenges,
+            ))
+        ) {
+            throw new RelayError(503, "Too many outstanding read challenges", {
+                error: "overloaded",
+            });
+        }
         return challenge;
     }
 
@@ -224,6 +237,7 @@ export class RelayService {
         this.#assertOpen();
         if (
             since < 0n ||
+            since > MAXIMUM_SEQUENCE ||
             !Number.isSafeInteger(limit) ||
             limit < 1 ||
             limit > this.#options.maximumEventsPerRead ||
@@ -235,7 +249,7 @@ export class RelayService {
         ) {
             throw new RelayError(400, "Invalid event read", { error: "malformed" });
         }
-        this.#authorizeRead(topic, since, limit, waitMilliseconds, proof);
+        await this.#authorizeRead(topic, since, limit, waitMilliseconds, proof);
         const topicId = relayTopicId(topic);
         const constraints: PageReadConstraints = { maximumEncodedBytes };
         const current = await this.#store.readEvents(
@@ -295,7 +309,6 @@ export class RelayService {
         for (const waiters of this.#waiters.values()) {
             for (const waiter of waiters) waiter.reject(new Error("Relay service closed"));
         }
-        this.#challenges.clear();
         try {
             await this.#wakeSource.close();
         } finally {
@@ -303,13 +316,13 @@ export class RelayService {
         }
     }
 
-    #authorizeRead(
+    async #authorizeRead(
         topic: RelayTopic,
         since: bigint,
         limit: number,
         waitMilliseconds: number,
         proof: ReadProof | undefined,
-    ): void {
+    ): Promise<void> {
         if (topic.type === "write") {
             if (proof !== undefined) {
                 throw new RelayError(400, "Public read must not include a proof", {
@@ -321,13 +334,8 @@ export class RelayService {
         if (proof === undefined || proof.signature.length !== 64) {
             throw new RelayError(401, "Read proof required", { error: "unauthorized" });
         }
-        const stored = this.#challenges.get(proof.challengeId);
-        this.#challenges.delete(proof.challengeId);
-        if (
-            stored === undefined ||
-            stored.challenge.expiresAt <= this.#now() ||
-            stored.topicId !== relayTopicId(topic)
-        ) {
+        const stored = await this.#store.consumeReadChallenge(proof.challengeId, this.#now());
+        if (stored === undefined || stored.topicId !== relayTopicId(topic)) {
             throw new RelayError(401, "Invalid or expired read challenge", {
                 error: "unauthorized",
             });
@@ -336,7 +344,17 @@ export class RelayService {
             if (
                 !ed25519.verify(
                     proof.signature,
-                    readProofSigningBytes(stored.challenge, topic, since, limit, waitMilliseconds),
+                    readProofSigningBytes(
+                        {
+                            id: stored.id,
+                            nonce: stored.nonce,
+                            expiresAt: stored.expiresAt,
+                        },
+                        topic,
+                        since,
+                        limit,
+                        waitMilliseconds,
+                    ),
                     topic.readKey,
                     { zip215: false },
                 )
@@ -401,12 +419,6 @@ export class RelayService {
 
     #wake(topicId: string): void {
         for (const waiter of this.#waiters.get(topicId) ?? []) waiter.resolve();
-    }
-
-    #discardExpiredChallenges(now: number): void {
-        for (const [id, stored] of this.#challenges) {
-            if (stored.challenge.expiresAt <= now) this.#challenges.delete(id);
-        }
     }
 
     #assertOpen(): void {

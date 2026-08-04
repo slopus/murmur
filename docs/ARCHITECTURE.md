@@ -73,6 +73,9 @@ topic intentionally accepts any valid signing author.
 
 For protected reads, `HttpRelayTransport` verifies the local read secret,
 obtains a one-use challenge, and signs the exact topic and read parameters.
+Challenge records live in `RelayStore`, so issuance and consumption may happen
+on different Postgres relay instances without sticky routing. Consumption is an
+atomic delete; expiration is indexed and outstanding counts are transactional.
 
 ## Ordered event storage
 
@@ -142,6 +145,10 @@ read events after C
 `ReceivedEvent.advanceCursor(transaction)` must commit with the application
 effect. It rejects skipping an earlier retained event but accepts holes that the
 relay has already removed.
+
+Sync passes are serialized and pending deliveries block the same topic from
+being returned again. Empty head-only progress re-reads the cursor inside a
+transaction and can only increase it.
 
 Pages carry `exhausted`. Count and encoded-byte limits can make a short page
 non-exhausted, so the last event advances only to its own sequence in that case.

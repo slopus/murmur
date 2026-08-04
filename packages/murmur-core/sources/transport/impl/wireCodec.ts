@@ -23,11 +23,29 @@ export interface SignedRelayEventJson {
     readonly signature: string;
 }
 
+const TOPIC_NAME = /^[\x20-\x7e]{1,128}$/;
+const MAXIMUM_SEQUENCE = 9_223_372_036_854_775_807n;
+
 function object(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new Error(`Invalid ${name}`);
     }
     return value as Record<string, unknown>;
+}
+
+function exact(
+    value: Record<string, unknown>,
+    required: readonly string[],
+    optional: readonly string[],
+    name: string,
+): void {
+    const allowed = new Set([...required, ...optional]);
+    if (
+        required.some((key) => !Object.hasOwn(value, key)) ||
+        Object.keys(value).some((key) => !allowed.has(key))
+    ) {
+        throw new Error(`Invalid ${name}`);
+    }
 }
 
 function bytes(value: unknown, name: string, length?: number): Uint8Array {
@@ -48,6 +66,7 @@ function integer(value: unknown, name: string): number {
 
 /** Convert a topic to its canonical JSON representation. */
 export function relayTopicToJson(topic: RelayTopic): RelayTopicJson {
+    validateRelayTopic(topic);
     if (topic.type === "write") {
         return { type: topic.type, name: topic.name, writeKey: encodeBase64Url(topic.writeKey) };
     }
@@ -62,34 +81,105 @@ export function relayTopicToJson(topic: RelayTopic): RelayTopicJson {
     };
 }
 
+/** Strictly validate an in-memory relay topic descriptor. */
+export function validateRelayTopic(topicValue: RelayTopic): void {
+    const input = object(topicValue, "topic");
+    if (typeof topicValue.name !== "string" || !TOPIC_NAME.test(topicValue.name)) {
+        throw new Error("Invalid topic name");
+    }
+    if (topicValue.type === "write") {
+        exact(input, ["type", "name", "writeKey"], [], "topic");
+        if (!(topicValue.writeKey instanceof Uint8Array) || topicValue.writeKey.length !== 32) {
+            throw new Error("Invalid write key");
+        }
+        return;
+    }
+    if (topicValue.type === "read") {
+        exact(input, ["type", "name", "readKey"], [], "topic");
+        if (!(topicValue.readKey instanceof Uint8Array) || topicValue.readKey.length !== 32) {
+            throw new Error("Invalid read key");
+        }
+        return;
+    }
+    if (topicValue.type === "read-write") {
+        exact(input, ["type", "name", "readKey", "writeKey"], [], "topic");
+        if (
+            !(topicValue.readKey instanceof Uint8Array) ||
+            topicValue.readKey.length !== 32 ||
+            !(topicValue.writeKey instanceof Uint8Array) ||
+            topicValue.writeKey.length !== 32
+        ) {
+            throw new Error("Invalid topic keys");
+        }
+        return;
+    }
+    throw new Error("Invalid topic type");
+}
+
 function topic(value: unknown): RelayTopic {
     const input = object(value, "topic");
-    if (typeof input.name !== "string" || input.name.length < 1 || input.name.length > 128) {
+    if (typeof input.name !== "string" || !TOPIC_NAME.test(input.name)) {
         throw new Error("Invalid topic");
     }
     if (input.type === "write") {
-        return {
+        exact(input, ["type", "name", "writeKey"], [], "topic");
+        const parsed: RelayTopic = {
             type: "write",
             name: input.name,
             writeKey: bytes(input.writeKey, "write key", 32),
         };
+        validateRelayTopic(parsed);
+        return parsed;
     }
     if (input.type === "read") {
-        return { type: "read", name: input.name, readKey: bytes(input.readKey, "read key", 32) };
+        exact(input, ["type", "name", "readKey"], [], "topic");
+        const parsed: RelayTopic = {
+            type: "read",
+            name: input.name,
+            readKey: bytes(input.readKey, "read key", 32),
+        };
+        validateRelayTopic(parsed);
+        return parsed;
     }
     if (input.type === "read-write") {
-        return {
+        exact(input, ["type", "name", "readKey", "writeKey"], [], "topic");
+        const parsed: RelayTopic = {
             type: "read-write",
             name: input.name,
             readKey: bytes(input.readKey, "read key", 32),
             writeKey: bytes(input.writeKey, "write key", 32),
         };
+        validateRelayTopic(parsed);
+        return parsed;
     }
     throw new Error("Invalid topic");
 }
 
 /** Convert an event to exact relay JSON. */
 export function signedRelayEventToJson(event: SignedRelayEvent): SignedRelayEventJson {
+    const value = object(event, "relay event");
+    exact(
+        value,
+        ["version", "id", "topic", "author", "createdAt", "payload", "signature"],
+        ["expiresAt", "collapseKey"],
+        "relay event",
+    );
+    const author = object(event.author, "event author");
+    exact(author, ["signingKey"], [], "event author");
+    validateRelayTopic(event.topic);
+    if (
+        event.version !== 1 ||
+        bytes(event.id, "event id", 32).length !== 32 ||
+        !(event.author.signingKey instanceof Uint8Array) ||
+        event.author.signingKey.length !== 32 ||
+        !Number.isSafeInteger(event.createdAt) ||
+        event.createdAt < 0 ||
+        !(event.payload instanceof Uint8Array) ||
+        !(event.signature instanceof Uint8Array) ||
+        event.signature.length !== 64
+    ) {
+        throw new Error("Invalid relay event");
+    }
     return {
         version: 1,
         id: event.id,
@@ -107,7 +197,14 @@ export function signedRelayEventToJson(event: SignedRelayEvent): SignedRelayEven
 
 function event(value: unknown): SignedRelayEvent {
     const input = object(value, "relay event");
+    exact(
+        input,
+        ["version", "id", "topic", "author", "createdAt", "payload", "signature"],
+        ["expiresAt", "collapseKey"],
+        "relay event",
+    );
     const author = object(input.author, "event author");
+    exact(author, ["signingKey"], [], "event author");
     if (
         input.version !== 1 ||
         typeof input.id !== "string" ||
@@ -153,6 +250,7 @@ export function decodeSignedRelayEventWire(value: Uint8Array): SignedRelayEvent 
 /** Decode one event page response. */
 export function decodeEventPageWire(value: Uint8Array): EventPage {
     const input = object(JSON.parse(utf8Decode(value)) as unknown, "event page");
+    exact(input, ["events", "head", "exhausted"], [], "event page");
     if (
         !Array.isArray(input.events) ||
         typeof input.head !== "string" ||
@@ -160,13 +258,20 @@ export function decodeEventPageWire(value: Uint8Array): EventPage {
     ) {
         throw new Error("Invalid event page");
     }
+    const head = BigInt(input.head);
+    if (head < 0n || head > MAXIMUM_SEQUENCE) throw new Error("Invalid event page head");
     return {
         events: input.events.map((item) => {
             const retained = object(item, "retained event");
-            if (typeof retained.seq !== "string") throw new Error("Invalid event sequence");
-            return { seq: BigInt(retained.seq), event: event(retained.event) };
+            exact(retained, ["seq", "event"], [], "retained event");
+            if (typeof retained.seq !== "string" || !/^(0|[1-9]\d*)$/.test(retained.seq)) {
+                throw new Error("Invalid event sequence");
+            }
+            const seq = BigInt(retained.seq);
+            if (seq < 1n || seq > MAXIMUM_SEQUENCE) throw new Error("Invalid event sequence");
+            return { seq, event: event(retained.event) };
         }),
-        head: BigInt(input.head),
+        head,
         exhausted: input.exhausted,
     };
 }

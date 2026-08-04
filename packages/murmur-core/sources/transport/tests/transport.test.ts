@@ -1,10 +1,38 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { describe, expect, test } from "vitest";
-import { canonicalJsonBytes, decodeBase64Url, encodeBase64Url } from "../../utils/index.js";
-import { HttpRelayTransport } from "../index.js";
+import {
+    canonicalJsonBytes,
+    decodeBase64Url,
+    encodeBase64Url,
+    utf8Encode,
+} from "../../utils/index.js";
+import { HttpRelayTransport, decodeSignedRelayEventWire } from "../index.js";
 import { relayTopicToJson } from "../impl/wireCodec.js";
 
 describe("HTTP relay transport", () => {
+    test("rejects descriptor fields and names rejected by the relay codec", () => {
+        const key = encodeBase64Url(new Uint8Array(32));
+        const base = {
+            version: 1,
+            id: encodeBase64Url(new Uint8Array(32)),
+            topic: { type: "write", name: "ok", writeKey: key },
+            author: { signingKey: key },
+            createdAt: 0,
+            payload: "",
+            signature: encodeBase64Url(new Uint8Array(64)),
+        };
+        expect(() =>
+            decodeSignedRelayEventWire(
+                utf8Encode(JSON.stringify({ ...base, topic: { ...base.topic, extra: true } })),
+            ),
+        ).toThrow("Invalid topic");
+        expect(() =>
+            decodeSignedRelayEventWire(
+                utf8Encode(JSON.stringify({ ...base, topic: { ...base.topic, name: "é" } })),
+            ),
+        ).toThrow("Invalid topic");
+    });
+
     test("acquires and signs a read challenge for exact request parameters", async () => {
         const secretKey = new Uint8Array(32).fill(7);
         const topic = {

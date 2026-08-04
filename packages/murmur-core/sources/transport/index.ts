@@ -1,6 +1,6 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { hashBytes, randomBytes, verifyBytes } from "../crypto/index.js";
-import { canonicalJsonBytes, encodeBase64Url, equalBytes } from "../utils/index.js";
+import { canonicalJsonBytes, encodeBase64Url, equalBytes, type JsonValue } from "../utils/index.js";
 import {
     decodeSignedRelayEventWire,
     encodeSignedRelayEventWire,
@@ -30,6 +30,7 @@ export {
     encodeSignedRelayEventWire,
     relayTopicToJson,
     signedRelayEventToJson,
+    validateRelayTopic,
 } from "./impl/wireCodec.js";
 
 /** Maximum event payload accepted by the default relay profile. */
@@ -101,8 +102,8 @@ export function verifyRelayEvent(event: SignedRelayEvent): boolean {
 
 /** Return whether two events have identical authenticated content. */
 export function equalRelayEvents(left: SignedRelayEvent, right: SignedRelayEvent): boolean {
-    return (
-        equalBytes(relayEventSigningBytes(left), relayEventSigningBytes(right)) &&
-        equalBytes(left.signature, right.signature)
+    return equalBytes(
+        canonicalJsonBytes(signedRelayEventToJson(left) as unknown as JsonValue),
+        canonicalJsonBytes(signedRelayEventToJson(right) as unknown as JsonValue),
     );
 }

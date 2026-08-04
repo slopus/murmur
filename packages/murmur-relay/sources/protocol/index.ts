@@ -5,6 +5,8 @@ export {
     parseSignedRelayEvent,
     relayTopicToJson,
     signedRelayEventToJson,
+    validateRelayTopic,
+    validateSignedRelayEventShape,
 } from "./impl/eventCodec.js";
 export {
     readProofSigningBytes,

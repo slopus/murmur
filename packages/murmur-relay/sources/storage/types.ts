@@ -12,6 +12,14 @@ export interface PublishReceipt {
     readonly fingerprint: Uint8Array;
 }
 
+/** Shared one-use protected-read challenge record. */
+export interface StoredReadChallenge {
+    readonly id: string;
+    readonly topicId: string;
+    readonly nonce: Uint8Array;
+    readonly expiresAt: number;
+}
+
 /** Allocation bound applied while materializing one event page. */
 export interface PageReadConstraints {
     readonly maximumEncodedBytes: number;
@@ -38,6 +46,12 @@ export interface EventPage {
 
 /** Atomic persistence operations required by the relay service. */
 export interface RelayStore {
+    issueReadChallenge(
+        challenge: StoredReadChallenge,
+        now: number,
+        maximumOutstanding: number,
+    ): Promise<boolean>;
+    consumeReadChallenge(id: string, now: number): Promise<StoredReadChallenge | undefined>;
     readPublishReceipt(topicId: string, id: string): Promise<PublishReceipt | undefined>;
     publish(event: SignedRelayEvent, topicId: string, now: number): Promise<PublishOutcome>;
     readEvents(

@@ -18,6 +18,7 @@ import type { PublishResult, ReceivedEvent, Subscription, SyncResult } from "./t
 export type { PublishResult, ReceivedEvent, Subscription, SyncResult } from "./types.js";
 
 const DEFAULT_EVENT_PAGE_LIMIT = 100;
+const MAXIMUM_SEQUENCE = 9_223_372_036_854_775_807n;
 
 function isAborted(signal: AbortSignal | undefined): boolean {
     return signal?.aborted === true;
@@ -31,7 +32,9 @@ function parseCursor(value: Uint8Array | undefined): bigint {
     if (value === undefined) return 0n;
     const text = utf8Decode(value);
     if (!/^(0|[1-9]\d*)$/.test(text)) throw new Error("Invalid persisted topic cursor");
-    return BigInt(text);
+    const cursor = BigInt(text);
+    if (cursor > MAXIMUM_SEQUENCE) throw new Error("Persisted topic cursor exceeds int64");
+    return cursor;
 }
 
 /**
@@ -46,7 +49,9 @@ export class MurmurClient {
     readonly #store: MurmurStore;
     readonly #transport: RelayTransport;
     readonly #subscriptions = new Map<string, Subscription>();
+    readonly #pending = new Map<string, Set<bigint>>();
     readonly #cursorPrefix: string;
+    #syncTail: Promise<void> = Promise.resolve();
 
     constructor(options: {
         readonly identity: IdentityKeyPair;
@@ -107,11 +112,15 @@ export class MurmurClient {
      * application state to commit for absent events.
      */
     async sync(waitMilliseconds: number = 0, signal?: AbortSignal): Promise<SyncResult> {
+        return this.#exclusiveSync(() => this.#sync(waitMilliseconds, signal));
+    }
+
+    async #sync(waitMilliseconds: number, signal?: AbortSignal): Promise<SyncResult> {
         const events: ReceivedEvent[] = [];
-        const subscriptions = [...this.#subscriptions].sort(([left], [right]) =>
-            left.localeCompare(right),
-        );
-        const reads = await Promise.all(
+        const subscriptions = [...this.#subscriptions]
+            .filter(([topicId]) => !this.#pending.has(topicId))
+            .sort(([left], [right]) => left.localeCompare(right));
+        const contexts = await Promise.all(
             subscriptions.map(async ([topicId, access]) => {
                 const cursorKey = `${this.#cursorPrefix}${topicId}`;
                 const cursor = parseCursor(await this.#store.get(cursorKey));
@@ -119,16 +128,54 @@ export class MurmurClient {
                     topicId,
                     cursorKey,
                     cursor,
-                    page: await this.#transport.readEvents(
-                        access,
-                        cursor,
-                        DEFAULT_EVENT_PAGE_LIMIT,
-                        waitMilliseconds,
-                        signal,
-                    ),
+                    access,
                 };
             }),
         );
+        const readAll = async (wait: number, readSignal?: AbortSignal) =>
+            Promise.all(
+                contexts.map(async (context) => ({
+                    ...context,
+                    page: await this.#transport.readEvents(
+                        context.access,
+                        context.cursor,
+                        DEFAULT_EVENT_PAGE_LIMIT,
+                        wait,
+                        readSignal,
+                    ),
+                })),
+            );
+        let reads = await readAll(0, signal);
+        if (
+            waitMilliseconds > 0 &&
+            contexts.length > 0 &&
+            !reads.some(({ cursor, page }) => page.events.length > 0 || page.head > cursor)
+        ) {
+            const controller = new AbortController();
+            const onAbort = (): void => controller.abort(signal?.reason);
+            signal?.addEventListener("abort", onAbort, { once: true });
+            try {
+                const waits = contexts.map((context) =>
+                    this.#transport.readEvents(
+                        context.access,
+                        context.cursor,
+                        DEFAULT_EVENT_PAGE_LIMIT,
+                        waitMilliseconds,
+                        controller.signal,
+                    ),
+                );
+                try {
+                    await Promise.race(waits);
+                } finally {
+                    controller.abort();
+                    await Promise.allSettled(waits);
+                }
+                reads = await readAll(0, signal);
+            } finally {
+                signal?.removeEventListener("abort", onAbort);
+                controller.abort();
+            }
+        }
         for (const { topicId, cursorKey, cursor, page } of reads) {
             if (page.head < cursor) {
                 throw new Error("Relay returned a topic head behind the durable cursor");
@@ -137,9 +184,16 @@ export class MurmurClient {
                 if (!page.exhausted) {
                     throw new Error("Relay returned an empty non-exhausted event page");
                 }
-                if (page.head > cursor) await this.#store.set(cursorKey, cursorBytes(page.head));
+                await this.#store.transaction(async (transaction) => {
+                    const current = parseCursor(await transaction.get(cursorKey));
+                    if (page.head > current) {
+                        await transaction.set(cursorKey, cursorBytes(page.head));
+                    }
+                });
                 continue;
             }
+            const pending = new Set(page.events.map(({ seq }) => seq));
+            this.#pending.set(topicId, pending);
             let previousSequence = cursor;
             for (let index = 0; index < page.events.length; index += 1) {
                 const retained = page.events[index];
@@ -148,8 +202,14 @@ export class MurmurClient {
                     retained.seq <= previousSequence ||
                     retained.seq > page.head ||
                     relayTopicId(retained.event.topic) !== topicId ||
-                    !verifyRelayEvent(retained.event)
+                    !verifyRelayEvent(retained.event) ||
+                    (retained.event.topic.type !== "read" &&
+                        !equalBytes(
+                            retained.event.author.signingKey,
+                            retained.event.topic.writeKey,
+                        ))
                 ) {
+                    this.#pending.delete(topicId);
                     throw new Error("Relay returned an invalid ordered event page");
                 }
                 const isLast = index === page.events.length - 1;
@@ -160,11 +220,14 @@ export class MurmurClient {
                     event: retained.event,
                     advanceCursor: async (transaction): Promise<void> => {
                         const current = parseCursor(await transaction.get(cursorKey));
-                        if (current >= target) return;
                         if (current !== expectedCursor) {
+                            pending.delete(retained.seq);
+                            if (pending.size === 0) this.#pending.delete(topicId);
                             throw new Error("Cannot skip an earlier retained relay event");
                         }
                         await transaction.set(cursorKey, cursorBytes(target));
+                        pending.delete(retained.seq);
+                        if (pending.size === 0) this.#pending.delete(topicId);
                     },
                 });
                 previousSequence = retained.seq;
@@ -207,5 +270,19 @@ export class MurmurClient {
             signingKey: access.topic.writeKey,
             signingSecretKey: secretKey,
         };
+    }
+
+    async #exclusiveSync<Result>(operation: () => Promise<Result>): Promise<Result> {
+        let release: (() => void) | undefined;
+        const prior = this.#syncTail;
+        this.#syncTail = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        await prior;
+        try {
+            return await operation();
+        } finally {
+            release?.();
+        }
     }
 }

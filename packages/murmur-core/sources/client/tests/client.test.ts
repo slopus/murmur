@@ -1,6 +1,7 @@
 import { ed25519 } from "@noble/curves/ed25519";
 import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair, randomBytes } from "../../crypto/index.js";
+import { identityId } from "../../identity/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import {
     createRelayEvent,
@@ -8,12 +9,15 @@ import {
     type RelayTransport,
     type SignedRelayEvent,
     type TopicAccess,
+    relayTopicId,
 } from "../../transport/index.js";
+import { utf8Decode, utf8Encode } from "../../utils/index.js";
 import { MurmurClient } from "../index.js";
 
 class OrderedTransport implements RelayTransport {
     readonly reads: bigint[] = [];
     readonly published: SignedRelayEvent[] = [];
+    beforeRead?: () => Promise<void>;
     readonly #pages: EventPage[];
 
     constructor(pages: EventPage[]) {
@@ -31,6 +35,7 @@ class OrderedTransport implements RelayTransport {
 
     async readEvents(_access: TopicAccess, since: bigint): Promise<EventPage> {
         this.reads.push(since);
+        await this.beforeRead?.();
         return this.#pages.shift() ?? { events: [], head: since, exhausted: true };
     }
 }
@@ -161,5 +166,65 @@ describe("single-relay stateful client", () => {
         const secondPage = await client.sync();
         expect(transport.reads).toEqual([0n, 1n]);
         expect(secondPage.events.map(({ seq }) => seq)).toEqual([2n]);
+    });
+
+    test("serializes concurrent sync and rejects a stale delivery advance", async () => {
+        const identity = generateIdentityKeyPair();
+        const topic = {
+            type: "write" as const,
+            name: "concurrent",
+            writeKey: identity.signingKey,
+        };
+        const event = createRelayEvent(identity, topic, new Uint8Array([1]), {}, 1);
+        const transport = new OrderedTransport([
+            { events: [{ seq: 1n, event }], head: 1n, exhausted: true },
+        ]);
+        const store = new MemoryMurmurStore();
+        const client = new MurmurClient({ identity, store, transport });
+        client.subscribe({ topic });
+        const results = await Promise.all([client.sync(), client.sync()]);
+        expect(results.flatMap(({ events }) => events)).toHaveLength(1);
+        const delivery = results.flatMap(({ events }) => events)[0]!;
+        await store.transaction((transaction) => delivery.advanceCursor(transaction));
+        await expect(
+            store.transaction((transaction) => delivery.advanceCursor(transaction)),
+        ).rejects.toThrow("Cannot skip");
+    });
+
+    test("never lowers an empty-page cursor advanced by a concurrent transaction", async () => {
+        const identity = generateIdentityKeyPair();
+        const topic = {
+            type: "write" as const,
+            name: "monotonic",
+            writeKey: identity.signingKey,
+        };
+        const store = new MemoryMurmurStore();
+        const cursorKey = `client/${identityId(identity)}/cursor/${relayTopicId(topic)}`;
+        const transport = new OrderedTransport([{ events: [], head: 3n, exhausted: true }]);
+        transport.beforeRead = async () => store.set(cursorKey, utf8Encode("5"));
+        const client = new MurmurClient({ identity, store, transport });
+        client.subscribe({ topic });
+        await client.sync();
+        expect(utf8Decode((await store.get(cursorKey))!)).toBe("5");
+    });
+
+    test("rejects a validly signed event from an unauthorized write author", async () => {
+        const owner = generateIdentityKeyPair();
+        const attacker = generateIdentityKeyPair();
+        const topic = {
+            type: "write" as const,
+            name: "adversarial",
+            writeKey: owner.signingKey,
+        };
+        const malicious = createRelayEvent(attacker, topic, new Uint8Array([1]), {}, 1);
+        const client = new MurmurClient({
+            identity: owner,
+            store: new MemoryMurmurStore(),
+            transport: new OrderedTransport([
+                { events: [{ seq: 1n, event: malicious }], head: 1n, exhausted: true },
+            ]),
+        });
+        client.subscribe({ topic });
+        await expect(client.sync()).rejects.toThrow("invalid ordered event page");
     });
 });

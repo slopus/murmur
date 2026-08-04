@@ -100,6 +100,10 @@ secret key.
 Reusing a proof, changing any read parameter, using another topic, or presenting
 an expired challenge fails.
 
+Challenges are stored by `RelayStore` and atomically deleted on consumption.
+Postgres supports cross-instance issue/consume without sticky routing. Indexed
+expiration and a transactional outstanding count bound cleanup and admission.
+
 ## Endpoints
 
 ### `GET /health`
@@ -191,6 +195,10 @@ An empty non-exhausted page is invalid.
 registers a waiter, rechecks to close the park/publish race, then waits for a
 wake or timeout and reads again.
 
+The final serialized response is measured against `maximumJsonBodyBytes`.
+Configuration must fit one maximum-sized event; a larger multi-event response
+returns HTTP 413 and can be continued with a lower `limit`.
+
 ### `OPTIONS`
 
 Returns the configured CORS policy. CORS defaults to `*`.
@@ -230,6 +238,7 @@ interface RelayStore {
 
 SQLite and Postgres/PGlite implement the same fresh schema. There are no schema
 migrations or compatibility readers for the superseded relay model.
+An explicit version marker rejects legacy layouts before adding clean tables.
 
 `WakeSource` notifications only reduce long-poll latency. Reads and timeout
 rechecks preserve correctness if notifications are lost.

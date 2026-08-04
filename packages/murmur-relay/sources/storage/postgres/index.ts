@@ -13,6 +13,7 @@ import type {
     PublishReceipt,
     RelayStore,
     RetainedRelayEvent,
+    StoredReadChallenge,
 } from "../types.js";
 import type { PostgresDatabase } from "./database.js";
 import { createPostgresRelaySchema } from "./migrations.js";
@@ -48,6 +49,85 @@ export class PostgresRelayStore implements RelayStore {
     static async create(database: PostgresDatabase): Promise<PostgresRelayStore> {
         await createPostgresRelaySchema(database);
         return new PostgresRelayStore(database);
+    }
+
+    async issueReadChallenge(
+        challenge: StoredReadChallenge,
+        now: number,
+        maximumOutstanding: number,
+    ): Promise<boolean> {
+        this.#assertOpen();
+        return this.#database.transaction(async (transaction) => {
+            const stateResult = await transaction.query<{ outstanding: unknown }>(
+                `SELECT outstanding FROM murmur_relay_challenge_state
+                 WHERE singleton = 1 FOR UPDATE`,
+            );
+            const state = stateResult.rows[0];
+            if (state === undefined) throw new Error("Missing challenge state");
+            const deleted = await transaction.query<{ id: unknown }>(
+                `DELETE FROM murmur_relay_read_challenges
+                 WHERE expires_at <= $1 RETURNING id`,
+                [now.toString()],
+            );
+            const outstanding = bigintColumn(state.outstanding) - BigInt(deleted.rows.length);
+            const normalized = outstanding < 0n ? 0n : outstanding;
+            await transaction.query(
+                `UPDATE murmur_relay_challenge_state
+                 SET outstanding = $1 WHERE singleton = 1`,
+                [normalized.toString()],
+            );
+            if (normalized >= BigInt(maximumOutstanding)) return false;
+            await transaction.query(
+                `INSERT INTO murmur_relay_read_challenges
+                    (id, topic_id, nonce, expires_at)
+                 VALUES ($1, $2, $3, $4)`,
+                [challenge.id, challenge.topicId, challenge.nonce, challenge.expiresAt.toString()],
+            );
+            await transaction.query(
+                `UPDATE murmur_relay_challenge_state
+                 SET outstanding = outstanding + 1 WHERE singleton = 1`,
+            );
+            return true;
+        });
+    }
+
+    async consumeReadChallenge(id: string, now: number): Promise<StoredReadChallenge | undefined> {
+        this.#assertOpen();
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                `SELECT outstanding FROM murmur_relay_challenge_state
+                 WHERE singleton = 1 FOR UPDATE`,
+            );
+            const result = await transaction.query<{
+                id: unknown;
+                topic_id: unknown;
+                nonce: unknown;
+                expires_at: unknown;
+            }>(
+                `DELETE FROM murmur_relay_read_challenges
+                 WHERE id = $1
+                 RETURNING id, topic_id, nonce, expires_at`,
+                [id],
+            );
+            const row = result.rows[0];
+            if (row === undefined) return undefined;
+            await transaction.query(
+                `UPDATE murmur_relay_challenge_state
+                 SET outstanding = GREATEST(0, outstanding - 1)
+                 WHERE singleton = 1`,
+            );
+            const expiresAt = safeNumberColumn(row.expires_at);
+            if (expiresAt <= now) return undefined;
+            if (typeof row.id !== "string" || typeof row.topic_id !== "string") {
+                throw new Error("Invalid stored read challenge");
+            }
+            return {
+                id: row.id,
+                topicId: row.topic_id,
+                nonce: copyBytes(row.nonce, "challenge nonce"),
+                expiresAt,
+            };
+        });
     }
 
     async readPublishReceipt(topicId: string, id: string): Promise<PublishReceipt | undefined> {

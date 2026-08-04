@@ -39,6 +39,25 @@ function json(
     });
 }
 
+function boundedJson(
+    body: unknown,
+    maximumBytes: number,
+    headers: Readonly<Record<string, string>>,
+): Response {
+    const encoded = JSON.stringify(body);
+    if (new TextEncoder().encode(encoded).length > maximumBytes) {
+        throw new RelayError(413, "Response exceeds relay limit", { error: "limit" });
+    }
+    return new Response(encoded, {
+        status: 200,
+        headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+            ...headers,
+        },
+    });
+}
+
 function object(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
         throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
@@ -128,7 +147,12 @@ export function createRelayFetchHandler(
     return async (request): Promise<Response> => {
         const origin = corsOrigin(request, options);
         const corsHeaders: Record<string, string> =
-            origin === undefined ? {} : { "access-control-allow-origin": origin };
+            origin === undefined
+                ? {}
+                : {
+                      "access-control-allow-origin": origin,
+                      ...(origin === "*" ? {} : { vary: "Origin" }),
+                  };
         try {
             const url = new URL(request.url);
             if (request.method === "OPTIONS") {
@@ -150,9 +174,9 @@ export function createRelayFetchHandler(
                     await readJson(request, relay.options.maximumJsonBodyBytes),
                 );
                 const outcome = await relay.publish(event);
-                return json(
+                return boundedJson(
                     { seq: outcome.seq.toString(), duplicate: outcome.duplicate },
-                    200,
+                    relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );
             }
@@ -161,14 +185,14 @@ export function createRelayFetchHandler(
                     await readJson(request, relay.options.maximumJsonBodyBytes),
                     "challenge request",
                 );
-                const challenge = relay.issueReadChallenge(parseRelayTopic(body.topic));
-                return json(
+                const challenge = await relay.issueReadChallenge(parseRelayTopic(body.topic));
+                return boundedJson(
                     {
                         id: challenge.id,
                         nonce: encodeBase64Url(challenge.nonce),
                         expiresAt: challenge.expiresAt,
                     },
-                    200,
+                    relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );
             }
@@ -189,7 +213,7 @@ export function createRelayFetchHandler(
                     request.signal,
                     relay.options.maximumJsonBodyBytes,
                 );
-                return json(
+                return boundedJson(
                     {
                         events: page.events.map((retained) => ({
                             seq: retained.seq.toString(),
@@ -198,7 +222,7 @@ export function createRelayFetchHandler(
                         head: page.head.toString(),
                         exhausted: page.exhausted,
                     },
-                    200,
+                    relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );
             }

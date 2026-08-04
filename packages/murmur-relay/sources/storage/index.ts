@@ -21,4 +21,5 @@ export type {
     PublishReceipt,
     RelayStore,
     RetainedRelayEvent,
+    StoredReadChallenge,
 } from "./types.js";

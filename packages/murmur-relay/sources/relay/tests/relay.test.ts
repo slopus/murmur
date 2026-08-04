@@ -3,6 +3,7 @@ import { randomBytes } from "@noble/hashes/utils";
 import { afterEach, describe, expect, test } from "vitest";
 import {
     readProofSigningBytes,
+    relayEventFingerprint,
     relayEventSigningBytes,
     type ReadProof,
     type RelayTopic,
@@ -41,15 +42,15 @@ function service(): RelayService {
     return value;
 }
 
-function readProof(
+async function readProof(
     relay: RelayService,
     topic: Exclude<RelayTopic, { type: "write" }>,
     secretKey: Uint8Array,
     since: bigint = 0n,
     limit: number = 256,
     wait: number = 0,
-): ReadProof {
-    const challenge = relay.issueReadChallenge(topic);
+): Promise<ReadProof> {
+    const challenge = await relay.issueReadChallenge(topic);
     return {
         challengeId: challenge.id,
         signature: ed25519.sign(
@@ -65,6 +66,49 @@ afterEach(async () => {
 });
 
 describe("ordered relay", () => {
+    test("fingerprints the complete signed event including its signature", () => {
+        const owner = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "fingerprint",
+            writeKey: ed25519.getPublicKey(owner),
+        };
+        const original = event(owner, topic, "body");
+        const signature = original.signature.slice();
+        signature[0] = signature[0]! ^ 1;
+        const changedSignature = {
+            ...original,
+            signature,
+        };
+        expect(relayEventFingerprint(changedSignature)).not.toEqual(
+            relayEventFingerprint(original),
+        );
+    });
+
+    test("rejects malformed direct-service descriptors before hashing or storage", async () => {
+        const relay = service();
+        const owner = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "strict",
+            writeKey: ed25519.getPublicKey(owner),
+        };
+        const valid = event(owner, topic, "body");
+        await expect(
+            relay.publish({
+                ...valid,
+                topic: { ...topic, extra: true } as unknown as RelayTopic,
+            }),
+        ).rejects.toMatchObject({ status: 400 });
+        await expect(
+            relay.issueReadChallenge({
+                type: "read",
+                name: "é",
+                readKey: topic.writeKey,
+            }),
+        ).rejects.toMatchObject({ status: 400 });
+    });
+
     test("enforces typed read/write capabilities and one-use read proofs", async () => {
         const relay = service();
         const owner = randomBytes(32);
@@ -80,7 +124,7 @@ describe("ordered relay", () => {
         });
         await relay.publish(event(owner, topic, "yes"));
         await expect(relay.readEvents(topic, 0n)).rejects.toMatchObject({ status: 401 });
-        const proof = readProof(relay, topic, owner);
+        const proof = await readProof(relay, topic, owner);
         await expect(relay.readEvents(topic, 0n, 256, 0, proof)).resolves.toMatchObject({
             head: 1n,
         });
@@ -97,7 +141,7 @@ describe("ordered relay", () => {
             seq: 1n,
         });
         await expect(
-            relay.readEvents(inbox, 0n, 256, 0, readProof(relay, inbox, owner)),
+            relay.readEvents(inbox, 0n, 256, 0, await readProof(relay, inbox, owner)),
         ).resolves.toMatchObject({ head: 1n });
     });
 
@@ -161,5 +205,44 @@ describe("ordered relay", () => {
             status: 409,
             body: { error: "id_collision" },
         });
+    });
+
+    test("returns head-only progress without parking a long poll", async () => {
+        const relay = service();
+        const owner = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "head-only",
+            writeKey: ed25519.getPublicKey(owner),
+        };
+        await relay.publish(event(owner, topic, "gone", { expiresAt: now + 1 }));
+        now += 2;
+        await expect(relay.readEvents(topic, 0n, 256, 1_000)).resolves.toMatchObject({
+            events: [],
+            head: 1n,
+            exhausted: true,
+        });
+    });
+
+    test("bounds outstanding challenges and admits after indexed expiration cleanup", async () => {
+        const relay = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {
+                maximumOutstandingReadChallenges: 1,
+                readChallengeLifetimeMilliseconds: 1,
+            },
+            undefined,
+            () => now,
+        );
+        services.push(relay);
+        const topic = {
+            type: "read" as const,
+            name: "bounded-challenges",
+            readKey: ed25519.getPublicKey(randomBytes(32)),
+        };
+        await relay.issueReadChallenge(topic);
+        await expect(relay.issueReadChallenge(topic)).rejects.toMatchObject({ status: 503 });
+        now += 2;
+        await expect(relay.issueReadChallenge(topic)).resolves.toBeDefined();
     });
 });

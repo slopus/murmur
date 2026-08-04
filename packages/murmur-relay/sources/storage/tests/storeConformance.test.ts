@@ -1,6 +1,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { ed25519 } from "@noble/curves/ed25519";
 import { randomBytes } from "@noble/hashes/utils";
+import { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vitest";
 import {
     relayEventSigningBytes,
@@ -40,6 +41,13 @@ async function stores(): Promise<readonly RelayStore[]> {
 }
 
 describe("relay store conformance", () => {
+    test("rejects a legacy SQLite schema before adding clean tables", () => {
+        const database = new DatabaseSync(":memory:");
+        database.exec("CREATE TABLE murmur_relay_topics (id TEXT PRIMARY KEY)");
+        expect(() => new SqliteRelayStore(":memory:", { database })).toThrow("Incompatible legacy");
+        database.close();
+    });
+
     test("SQLite and PGlite preserve heads while collapse removes older rows", async () => {
         const secretKey = randomBytes(32);
         const topic = {
@@ -81,6 +89,28 @@ describe("relay store conformance", () => {
             } finally {
                 await store.close();
             }
+        }
+    });
+
+    test("PGlite challenges are shared and consumed exactly once across stores", async () => {
+        const database = new PGliteDatabase(new PGlite());
+        const first = await PostgresRelayStore.create(database);
+        const second = await PostgresRelayStore.create(database);
+        try {
+            const challenge = {
+                id: encodeBase64Url(randomBytes(32)),
+                topicId: encodeBase64Url(randomBytes(32)),
+                nonce: randomBytes(32),
+                expiresAt: NOW + 1_000,
+            };
+            expect(await first.issueReadChallenge(challenge, NOW, 10)).toBe(true);
+            const consumed = await Promise.all([
+                first.consumeReadChallenge(challenge.id, NOW),
+                second.consumeReadChallenge(challenge.id, NOW),
+            ]);
+            expect(consumed.filter((value) => value !== undefined)).toHaveLength(1);
+        } finally {
+            await first.close();
         }
     });
 });
