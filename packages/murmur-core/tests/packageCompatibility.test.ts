@@ -51,7 +51,11 @@ describe("published package compatibility", () => {
         const script = `
 const loaded = await import("@slopus/murmur");
 const names = Object.keys(loaded).sort();
-if (JSON.stringify(names) !== JSON.stringify(["MemoryMurmurStore", "Murmur"])) {
+if (JSON.stringify(names) !== JSON.stringify([
+    "MemoryMurmurStore",
+    "Murmur",
+    "MurmurKeyPackagePoolExhaustedError",
+])) {
     throw new Error(\`Unexpected runtime exports: \${names.join(", ")}\`);
 }
 `;
@@ -122,6 +126,7 @@ for (const specifier of blocked) {
 import {
     MemoryMurmurStore,
     Murmur,
+    MurmurKeyPackagePoolExhaustedError,
     type IdentityProfile,
     type MurmurGroupPage,
     type MurmurOpenOptions,
@@ -140,8 +145,10 @@ const options: MurmurOpenOptions = {
 };
 const opening: Promise<Murmur> = Murmur.open(options);
 const page: MurmurGroupPage | undefined = undefined;
+const exhaustion: Error = new MurmurKeyPackagePoolExhaustedError(new Uint8Array(32));
 void opening;
 void page;
+void exhaustion;
 `,
                 "utf8",
             );

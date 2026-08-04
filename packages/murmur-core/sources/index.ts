@@ -1,4 +1,4 @@
-export { Murmur } from "./murmur/index.js";
+export { Murmur, MurmurKeyPackagePoolExhaustedError } from "./murmur/index.js";
 export type {
     MurmurFriend,
     MurmurFriends,

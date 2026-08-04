@@ -1,6 +1,12 @@
 import type { IdentityProfile } from "../../identity/index.js";
 import { decodeProfilePayload, encodeProfilePayload } from "../../identity/impl/profileCodec.js";
-import { decodeBase64Url, encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
+import {
+    decodeBase64Url,
+    encodeBase64Url,
+    utf8Decode,
+    utf8Encode,
+    zeroBytes,
+} from "../../utils/index.js";
 
 const MAXIMUM_CONTROL_FRAME_BYTES = 1024 * 1024;
 const MAXIMUM_DESCRIPTOR_BYTES = 256 * 1024;
@@ -40,6 +46,43 @@ export type FriendControlFrame =
           readonly commitEventId: string;
           readonly commitFingerprint: Uint8Array;
       };
+
+/** Zero every byte array owned by one decoded friend-control frame. */
+export function destroyFriendControlFrame(frame: FriendControlFrame | undefined): void {
+    if (frame === undefined) {
+        return;
+    }
+    if (frame.type === "profile-update") {
+        frame.profile.avatar?.fill(0);
+        return;
+    }
+    if (frame.type === "key-package-announce") {
+        zeroBytes(frame.reference);
+        zeroBytes(frame.keyPackage);
+        return;
+    }
+    if (
+        frame.type === "key-package-request" ||
+        frame.type === "key-package-consumed-ack" ||
+        frame.type === "key-package-retire"
+    ) {
+        for (const reference of frame.consumedReferences) {
+            zeroBytes(reference);
+        }
+        return;
+    }
+    if (frame.type === "group-invitation") {
+        zeroBytes(frame.groupId);
+        zeroBytes(frame.descriptor);
+        zeroBytes(frame.descriptorNonce);
+        zeroBytes(frame.descriptorBinding);
+        zeroBytes(frame.topicSecret);
+        zeroBytes(frame.keyPackageReference);
+        zeroBytes(frame.welcome);
+        zeroBytes(frame.tree);
+        zeroBytes(frame.commitFingerprint);
+    }
+}
 
 function nullable(value: Uint8Array | undefined): string | null {
     return value === undefined ? null : encodeBase64Url(value);
@@ -182,90 +225,118 @@ export function decodeFriendControlFrame(encoded: Uint8Array): FriendControlFram
     if (encoded.length > MAXIMUM_CONTROL_FRAME_BYTES) {
         throw new Error("Friend-control frame is too large");
     }
-    const value = object(JSON.parse(utf8Decode(encoded)) as unknown);
-    if (value.version !== 1 || typeof value.type !== "string") {
-        throw new Error("Invalid friend-control frame");
-    }
-    if (value.type === "profile-update" && allNull(value, ["profile"])) {
-        const profileBytes = bytes(value.profile, MAXIMUM_DESCRIPTOR_BYTES);
-        try {
-            return { type: "profile-update", profile: decodeProfilePayload(profileBytes) };
-        } finally {
-            profileBytes.fill(0);
+    const decoded: Uint8Array[] = [];
+    let completed = false;
+    const ownedBytes = (value: unknown, maximum: number, exact?: number): Uint8Array => {
+        const result = bytes(value, maximum, exact);
+        decoded.push(result);
+        return result;
+    };
+    const complete = <Frame extends FriendControlFrame>(frame: Frame): Frame => {
+        completed = true;
+        return frame;
+    };
+    try {
+        const value = object(JSON.parse(utf8Decode(encoded)) as unknown);
+        if (value.version !== 1 || typeof value.type !== "string") {
+            throw new Error("Invalid friend-control frame");
+        }
+        if (value.type === "profile-update" && allNull(value, ["profile"])) {
+            const profileBytes = ownedBytes(value.profile, MAXIMUM_DESCRIPTOR_BYTES);
+            try {
+                return complete({
+                    type: "profile-update",
+                    profile: decodeProfilePayload(profileBytes),
+                });
+            } finally {
+                profileBytes.fill(0);
+            }
+        }
+        if (
+            value.type === "friendship-ended" &&
+            allNull(value, ["requestId"]) &&
+            typeof value.requestId === "string" &&
+            value.requestId.length === 32
+        ) {
+            const requestIdBytes = ownedBytes(value.requestId, 24, 24);
+            zeroBytes(requestIdBytes);
+            return complete({ type: "friendship-ended", requestId: value.requestId });
+        }
+        if (value.type === "key-package-announce" && allNull(value, ["reference", "keyPackage"])) {
+            return complete({
+                type: "key-package-announce",
+                reference: ownedBytes(value.reference, 32, 32),
+                keyPackage: ownedBytes(value.keyPackage, MAXIMUM_MLS_MATERIAL_BYTES),
+            });
+        }
+        if (
+            (value.type === "key-package-request" ||
+                value.type === "key-package-consumed-ack" ||
+                value.type === "key-package-retire") &&
+            allNull(value, ["consumedReferences"]) &&
+            Array.isArray(value.consumedReferences) &&
+            value.consumedReferences.length <= 64
+        ) {
+            const consumedReferences = value.consumedReferences.map((reference) =>
+                ownedBytes(reference, 32, 32),
+            );
+            if (
+                new Set(consumedReferences.map(encodeBase64Url)).size !== consumedReferences.length
+            ) {
+                throw new Error("Duplicate consumed KeyPackage reference");
+            }
+            return complete({
+                type: value.type,
+                consumedReferences,
+            });
+        }
+        if (
+            value.type === "group-invitation" &&
+            allNull(value, [
+                "groupId",
+                "descriptor",
+                "descriptorNonce",
+                "descriptorBinding",
+                "topicSecret",
+                "keyPackageReference",
+                "welcome",
+                "tree",
+                "commitSequence",
+                "commitEventId",
+                "commitFingerprint",
+            ]) &&
+            typeof value.commitSequence === "string" &&
+            /^[1-9]\d*$/.test(value.commitSequence) &&
+            typeof value.commitEventId === "string"
+        ) {
+            const commitSequence = BigInt(value.commitSequence);
+            if (commitSequence > 0xffff_ffff_ffff_ffffn) {
+                throw new Error("Invalid invitation Commit sequence");
+            }
+            const commitEventIdBytes = ownedBytes(value.commitEventId, 32, 32);
+            const commitEventId = encodeBase64Url(commitEventIdBytes);
+            zeroBytes(commitEventIdBytes);
+            return complete({
+                type: "group-invitation",
+                groupId: ownedBytes(value.groupId, 32, 32),
+                descriptor: ownedBytes(value.descriptor, MAXIMUM_DESCRIPTOR_BYTES),
+                descriptorNonce: ownedBytes(value.descriptorNonce, 32, 32),
+                descriptorBinding: ownedBytes(value.descriptorBinding, 32, 32),
+                topicSecret: ownedBytes(value.topicSecret, 32, 32),
+                keyPackageReference: ownedBytes(value.keyPackageReference, 32, 32),
+                welcome: ownedBytes(value.welcome, MAXIMUM_MLS_MATERIAL_BYTES),
+                tree: ownedBytes(value.tree, MAXIMUM_MLS_MATERIAL_BYTES),
+                commitSequence,
+                commitEventId,
+                commitFingerprint: ownedBytes(value.commitFingerprint, 32, 32),
+            });
+        }
+        throw new Error("Unsupported friend-control frame");
+    } finally {
+        if (!completed) {
+            for (const value of decoded) {
+                zeroBytes(value);
+            }
         }
     }
-    if (
-        value.type === "friendship-ended" &&
-        allNull(value, ["requestId"]) &&
-        typeof value.requestId === "string" &&
-        value.requestId.length === 32
-    ) {
-        bytes(value.requestId, 24, 24);
-        return { type: "friendship-ended", requestId: value.requestId };
-    }
-    if (value.type === "key-package-announce" && allNull(value, ["reference", "keyPackage"])) {
-        return {
-            type: "key-package-announce",
-            reference: bytes(value.reference, 32, 32),
-            keyPackage: bytes(value.keyPackage, MAXIMUM_MLS_MATERIAL_BYTES),
-        };
-    }
-    if (
-        (value.type === "key-package-request" ||
-            value.type === "key-package-consumed-ack" ||
-            value.type === "key-package-retire") &&
-        allNull(value, ["consumedReferences"]) &&
-        Array.isArray(value.consumedReferences) &&
-        value.consumedReferences.length <= 64
-    ) {
-        const consumedReferences = value.consumedReferences.map((reference) =>
-            bytes(reference, 32, 32),
-        );
-        if (new Set(consumedReferences.map(encodeBase64Url)).size !== consumedReferences.length) {
-            throw new Error("Duplicate consumed KeyPackage reference");
-        }
-        return {
-            type: value.type,
-            consumedReferences,
-        };
-    }
-    if (
-        value.type === "group-invitation" &&
-        allNull(value, [
-            "groupId",
-            "descriptor",
-            "descriptorNonce",
-            "descriptorBinding",
-            "topicSecret",
-            "keyPackageReference",
-            "welcome",
-            "tree",
-            "commitSequence",
-            "commitEventId",
-            "commitFingerprint",
-        ]) &&
-        typeof value.commitSequence === "string" &&
-        /^[1-9]\d*$/.test(value.commitSequence) &&
-        typeof value.commitEventId === "string"
-    ) {
-        const commitSequence = BigInt(value.commitSequence);
-        if (commitSequence > 0xffff_ffff_ffff_ffffn) {
-            throw new Error("Invalid invitation Commit sequence");
-        }
-        return {
-            type: "group-invitation",
-            groupId: bytes(value.groupId, 32, 32),
-            descriptor: bytes(value.descriptor, MAXIMUM_DESCRIPTOR_BYTES),
-            descriptorNonce: bytes(value.descriptorNonce, 32, 32),
-            descriptorBinding: bytes(value.descriptorBinding, 32, 32),
-            topicSecret: bytes(value.topicSecret, 32, 32),
-            keyPackageReference: bytes(value.keyPackageReference, 32, 32),
-            welcome: bytes(value.welcome, MAXIMUM_MLS_MATERIAL_BYTES),
-            tree: bytes(value.tree, MAXIMUM_MLS_MATERIAL_BYTES),
-            commitSequence,
-            commitEventId: encodeBase64Url(bytes(value.commitEventId, 32, 32)),
-            commitFingerprint: bytes(value.commitFingerprint, 32, 32),
-        };
-    }
-    throw new Error("Unsupported friend-control frame");
 }

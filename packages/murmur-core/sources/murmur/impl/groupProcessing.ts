@@ -81,8 +81,25 @@ export function destroyGroupOperation(operation: GroupOperation): void {
     zeroBytes(operation.peer);
 }
 
+/** Zero byte arrays owned by one decoded durable group record. */
+export function destroyStoredGroup(group: StoredGroup | undefined): void {
+    if (group === undefined) {
+        return;
+    }
+    zeroBytes(group.descriptor);
+    zeroBytes(group.descriptorNonce);
+    zeroBytes(group.descriptorBinding);
+    zeroBytes(group.topicSecret);
+    for (const member of group.members) {
+        zeroBytes(member);
+    }
+}
+
 /** Zero decoded exact relay-event copies after reconciliation scans. */
-export function destroyRelayOutboxRecord(record: RelayOutboxRecord): void {
+export function destroyRelayOutboxRecord(record: RelayOutboxRecord | undefined): void {
+    if (record === undefined) {
+        return;
+    }
     zeroBytes(record.event.author.signingKey);
     zeroBytes(record.event.payload);
     zeroBytes(record.event.signature);

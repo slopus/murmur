@@ -45,7 +45,11 @@ explicit observation/test boundary, not required caller choreography.
 
 Relay cursors advance in the same application-store transaction as the effect
 of an inbound event. Invalid, stale, unsupported, removed-member, and
-future-without-Commit payloads are durably quarantined and advanced.
+future-without-Commit payloads advance into a fixed 32-entry per-topic
+quarantine metadata ring; attacker-controlled payload bodies are not retained.
+Removed groups are not polled. An explicitly fresh relay whose head is behind a
+stored cursor is probed from zero and reset per topic, without blocking other
+topics.
 
 ## MLS ordering
 
@@ -69,6 +73,10 @@ group sequence and matches its confirmation tag to the authenticated Welcome
 GroupInfo, then atomically consumes the matching private KeyPackage bundle,
 installs the Welcome epoch and stable topic capability, records the invitation
 replay marker, and starts its group cursor after that exact Commit.
+
+A removed member can be added again only with a fresh KeyPackage and a new
+authenticated Welcome. Reinstallation resets that group's cursor to the
+winning Add Commit while retaining previously authenticated opaque events.
 
 ## Relay storage
 

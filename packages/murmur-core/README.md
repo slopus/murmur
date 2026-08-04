@@ -12,6 +12,7 @@ runtime dependencies beyond Noble cryptography.
 - autonomous durable convergence, plus optional `sync()` observation boundaries
 - async `close()` / `destroy()` to await active work and zero in-memory secrets
 - `MurmurStore`, `MemoryMurmurStore`, `RelayFetch`, and compact data types
+- `MurmurKeyPackagePoolExhaustedError` for a bounded peer-reservation stall
 
 There are no constructible sub-clients and no package subpath exports.
 

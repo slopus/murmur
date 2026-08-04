@@ -18,6 +18,7 @@ export const KEY_PACKAGE_NEEDED_PREFIX = "murmur/v1/key-packages/needed/";
 export const CONTROL_REPLAY_PREFIX = "murmur/v1/control-replay/";
 export const CONTROL_SELF_PREFIX = "murmur/v1/control-self/";
 export const QUARANTINE_PREFIX = "murmur/v1/quarantine/";
+export const DEFERRED_INVITATION_PREFIX = "murmur/v1/deferred-invitations/";
 
 /** Adapt an existing transaction without opening a nested transaction. */
 export class TransactionStore implements MurmurStore {
@@ -127,6 +128,11 @@ export function groupEventKey(groupId: string, sequence: bigint): string {
 /** Replay marker key for one authenticated group payload. */
 export function groupReplayKey(groupId: string, fingerprint: Uint8Array): string {
     return `${groupBase(groupId)}replay/${encodeBase64Url(fingerprint)}`;
+}
+
+/** Durable sequence-order index used to bound authenticated replay markers. */
+export function groupReplayOrderKey(groupId: string, sequence: bigint): string {
+    return `${groupBase(groupId)}replay-order/${sequenceKey(sequence)}`;
 }
 
 function friendBookPrefix(owner: IdentityKeyPair): string {

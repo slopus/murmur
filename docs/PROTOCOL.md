@@ -47,6 +47,9 @@ Each friend has at most eight local private bundles and eight remote public
 packages, with a target of two immediately available packages. Consumption
 reports are chunked at 64 references and acknowledged; every chunk is a durable
 control event, so a list longer than 64 cannot strand later references.
+Exact retirement releases a private reservation. Eight abandoned authenticated
+reservations surface a typed terminal convergence error rather than causing
+silent starvation, package reuse, or unbounded allocation.
 Reported local bundles stay reserved for a delayed winning invitation. A
 competing Commit sends retirement after it wins, while successful invitation
 adoption consumes the reserved bundle. Expired or excess remote announcements
@@ -87,6 +90,12 @@ next epoch + membership + replay marker + cursor
 Removed members keep the relay topic capability but not newer MLS epoch
 secrets. Their later injections cannot authenticate as current MLS content and
 are quarantined.
+
+Quarantine is bounded to 32 minimal metadata records per topic and never stores
+the rejected payload. Group replay fingerprints are bounded to 128 entries;
+after eviction, the persisted Secret Tree ratchet still rejects replayed
+application ciphertext. Control replay state is retained when pruning could
+reapply a semantic control effect.
 
 ## Relay envelope
 

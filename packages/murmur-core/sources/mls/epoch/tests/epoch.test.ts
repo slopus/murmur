@@ -109,6 +109,22 @@ describe("MLS TreeKEM epoch application state", () => {
             minimumPersistenceGeneration: prepared.transition.persistenceGeneration,
         });
         expect(restoredStaged.context.epoch).toBe(currentContext.epoch + 1n);
+        const stagedGeneration = restoredStaged.persistenceGeneration;
+        restoredStaged.rebasePersistenceGeneration(stagedGeneration + 7n);
+        expect(restoredStaged.persistenceGeneration).toBe(stagedGeneration + 7n);
+        expect(() => restoredStaged.rebasePersistenceGeneration(stagedGeneration)).toThrow(
+            "generation rebase",
+        );
+        const rebasedCheckpoint = restoredStaged.serialize();
+        const rebasedStaged = MlsEpochState.deserialize(rebasedCheckpoint, {
+            localSigningSecretKey: identities[0]!.secretKey,
+            authenticateCredential,
+            minimumPersistenceGeneration: stagedGeneration + 7n,
+        });
+        expect(rebasedStaged.context.epoch).toBe(currentContext.epoch + 1n);
+        expect(rebasedStaged.persistenceGeneration).toBe(stagedGeneration + 7n);
+        rebasedStaged.destroy();
+        rebasedCheckpoint.fill(0);
         restoredStaged.destroy();
         expect(prepared.removedLeaves).toEqual([1]);
         expect(prepared.addedLeaves).toEqual([1]);

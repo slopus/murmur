@@ -74,7 +74,7 @@ export type RelayFetch = (input: RequestInfo | URL, init?: RequestInit) => Promi
 
 /** The single relay boundary used by a stateful Murmur client. */
 export interface RelayTransport {
-    publish(event: SignedRelayEvent): Promise<PublishOutcome>;
+    publish(event: SignedRelayEvent, signal?: AbortSignal): Promise<PublishOutcome>;
     readEvents(
         access: TopicAccess,
         since: bigint,

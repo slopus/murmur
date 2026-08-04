@@ -43,26 +43,36 @@ import {
 import type { MurmurStore, StoreTransaction } from "../../storage/index.js";
 import {
     HttpRelayTransport,
-    encodeSignedRelayEventWire,
     relayTopicId,
     verifyRelayEvent,
     type RelayTransport,
     type SignedRelayEvent,
     type TopicAccess,
 } from "../../transport/index.js";
-import { decodeBase64Url, encodeBase64Url, equalBytes, zeroBytes } from "../../utils/index.js";
+import {
+    decodeBase64Url,
+    encodeBase64Url,
+    equalBytes,
+    utf8Encode,
+    zeroBytes,
+} from "../../utils/index.js";
 import {
     decodeFriendControlFrame,
+    destroyFriendControlFrame,
     encodeFriendControlFrame,
     type FriendControlFrame,
 } from "./controlCodec.js";
 import {
     decodeGroup,
+    decodeControlSelfMarker,
+    decodeDeferredInvitation,
     decodeGroupEvent,
     decodeGroupOperation,
     decodeRelayOutbox,
     decodeStagedCommit,
     encodeGroup,
+    encodeControlSelfMarker,
+    encodeDeferredInvitation,
     encodeGroupEvent,
     encodeGroupOperation,
     encodeRelayOutbox,
@@ -87,6 +97,7 @@ import {
     CONTROL_REPLAY_PREFIX,
     CONTROL_SELF_PREFIX,
     CURSOR_PREFIX,
+    DEFERRED_INVITATION_PREFIX,
     GROUP_INDEX_PREFIX,
     KEY_PACKAGE_NEEDED_PREFIX,
     KEY_PACKAGE_REQUEST_PREFIX,
@@ -110,6 +121,7 @@ import {
     groupOperationKey,
     groupOperationPrefix,
     groupReplayKey,
+    groupReplayOrderKey,
     groupStagedKey,
     localKeyPackageKey,
     parseCursor,
@@ -130,6 +142,7 @@ import {
     destroyGroupOperation,
     destroyRelayOutboxRecord,
     destroyStagedCommit,
+    destroyStoredGroup,
     groupView,
     isCommit,
     type RuntimeGroup,
@@ -143,6 +156,7 @@ import type {
     MurmurOpenOptions,
     MurmurSyncOptions,
 } from "../types.js";
+import { MurmurKeyPackagePoolExhaustedError } from "../errors.js";
 
 export type {
     MurmurFriend,
@@ -163,6 +177,9 @@ const LOCAL_KEY_PACKAGE_TARGET = 2;
 const MAXIMUM_LOCAL_KEY_PACKAGES = 8;
 const MAXIMUM_REMOTE_KEY_PACKAGES = 8;
 const MAXIMUM_REPORTED_KEY_PACKAGES = 64;
+const MAXIMUM_GROUP_REPLAY_MARKERS = 128n;
+const MAXIMUM_QUARANTINE_RECORDS_PER_TOPIC = 32n;
+const MAXIMUM_DEFERRED_INVITATIONS_PER_FRIEND = 16;
 const MAXIMUM_DESCRIPTOR_BYTES = 256 * 1024;
 const MAXIMUM_APPLICATION_BYTES = 256 * 1024;
 const MAXIMUM_GROUP_PAGE = 1_000;
@@ -170,6 +187,27 @@ class InvitationVerificationDeferredError extends Error {
     constructor(cause: unknown) {
         super("Invitation Commit verification could not reach the relay", { cause });
         this.name = "InvitationVerificationDeferredError";
+    }
+}
+
+class MurmurPersistenceError extends Error {
+    constructor(cause: unknown) {
+        super("Murmur persistence transaction failed", { cause });
+        this.name = "MurmurPersistenceError";
+    }
+}
+
+class InvalidFriendControlError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = "InvalidFriendControlError";
+    }
+}
+
+class MurmurConvergenceError extends AggregateError {
+    constructor(errors: readonly Error[], fallback: string) {
+        super(errors, errors[0]?.message ?? fallback);
+        this.name = "MurmurConvergenceError";
     }
 }
 
@@ -224,6 +262,8 @@ export class MurmurEngine {
     #closing = false;
     #closed = false;
     #closePromise: Promise<void> | undefined;
+    #operationClock = 0;
+    #eventClock = 0;
 
     /** Friend bootstrap and relationship operations bound to this instance. */
     readonly friends: MurmurFriends;
@@ -423,6 +463,7 @@ export class MurmurEngine {
                 new HttpRelayTransport(relay.toString(), options.fetch ?? globalThis.fetch),
                 groups,
             );
+            await murmur.#restoreOrderingClocks();
             murmur.#worker.start();
             return murmur;
         } catch (error: unknown) {
@@ -562,7 +603,75 @@ export class MurmurEngine {
     }
 
     async #endFriend(identityKey: Uint8Array): Promise<void> {
-        await this.#friendBook.end(publicIdentity(identityKey));
+        const peer = publicIdentity(identityKey);
+        await this.#store.transaction(async (transaction) => {
+            const scoped = new FriendBook(this.#identity, new TransactionStore(transaction));
+            await scoped.end(peer);
+            await this.#clearFriendKeyPackageState(transaction, peer);
+        });
+    }
+
+    async #clearFriendKeyPackageState(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+    ): Promise<void> {
+        const peerId = identityId(peer);
+        for (const prefix of [
+            `${LOCAL_KEY_PACKAGE_PREFIX}${peerId}/`,
+            `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${peerId}/`,
+            `${REMOTE_KEY_PACKAGE_PREFIX}${peerId}/`,
+            `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${peerId}/`,
+            `${DEFERRED_INVITATION_PREFIX}${peerId}/`,
+        ]) {
+            const records = await transaction.list(prefix);
+            try {
+                for (const key of records.keys()) {
+                    await transaction.delete(key);
+                }
+            } finally {
+                for (const bytes of records.values()) {
+                    zeroBytes(bytes);
+                }
+            }
+        }
+        for (const key of [
+            `${KEY_PACKAGE_REQUEST_PREFIX}${peerId}`,
+            `${KEY_PACKAGE_NEEDED_PREFIX}${peerId}`,
+        ]) {
+            const marker = await transaction.get(key);
+            try {
+                await transaction.delete(key);
+            } finally {
+                marker?.fill(0);
+            }
+        }
+
+        const channel = new FriendChannel(this.#identity, peer);
+        const access = friendControlAccess(channel);
+        channel.destroy();
+        const topicId = relayTopicId(access.topic);
+        destroyAccess(access);
+        const outboxes = await transaction.list(OUTBOX_PREFIX);
+        try {
+            for (const [key, encoded] of outboxes) {
+                let record: RelayOutboxRecord | undefined;
+                try {
+                    record = decodeRelayOutbox(encoded);
+                    if (
+                        record.purpose.type === "friend-control" &&
+                        relayTopicId(record.event.topic) === topicId
+                    ) {
+                        await transaction.delete(key);
+                    }
+                } finally {
+                    destroyRelayOutboxRecord(record);
+                }
+            }
+        } finally {
+            for (const encoded of outboxes.values()) {
+                zeroBytes(encoded);
+            }
+        }
     }
 
     async #listFriends(): Promise<readonly MurmurFriend[]> {
@@ -646,7 +755,7 @@ export class MurmurEngine {
             id: encodeBase64Url(randomBytes(24)),
             type: "send",
             payload: bytes.slice(),
-            createdAt: Date.now(),
+            createdAt: this.#nextOperationTime(),
         };
         await this.#store.set(
             groupOperationKey(group.record.id, operation.id),
@@ -693,8 +802,57 @@ export class MurmurEngine {
             id: encodeBase64Url(randomBytes(24)),
             type,
             peer: peer.slice(),
-            createdAt: Date.now(),
+            createdAt: this.#nextOperationTime(),
         };
+    }
+
+    #nextOperationTime(): number {
+        this.#operationClock = Math.max(Date.now(), this.#operationClock + 1);
+        return this.#operationClock;
+    }
+
+    #nextEventTime(): number {
+        this.#eventClock = Math.max(Date.now(), this.#eventClock + 1);
+        return this.#eventClock;
+    }
+
+    async #restoreOrderingClocks(): Promise<void> {
+        const outboxes = await this.#store.list(OUTBOX_PREFIX);
+        try {
+            for (const encoded of outboxes.values()) {
+                let record: RelayOutboxRecord | undefined;
+                try {
+                    record = decodeRelayOutbox(encoded);
+                    this.#eventClock = Math.max(this.#eventClock, record.event.createdAt);
+                } finally {
+                    destroyRelayOutboxRecord(record);
+                }
+            }
+        } finally {
+            for (const encoded of outboxes.values()) {
+                zeroBytes(encoded);
+            }
+        }
+        for (const group of this.#groups.values()) {
+            const operations = await this.#store.list(groupOperationPrefix(group.record.id));
+            try {
+                for (const encoded of operations.values()) {
+                    let operation: GroupOperation | undefined;
+                    try {
+                        operation = decodeGroupOperation(encoded);
+                        this.#operationClock = Math.max(this.#operationClock, operation.createdAt);
+                    } finally {
+                        if (operation !== undefined) {
+                            destroyGroupOperation(operation);
+                        }
+                    }
+                }
+            } finally {
+                for (const encoded of operations.values()) {
+                    zeroBytes(encoded);
+                }
+            }
+        }
     }
 
     async #listGroups(): Promise<readonly MurmurGroup[]> {
@@ -788,6 +946,7 @@ export class MurmurEngine {
         }
         const attempted = new Set<string>();
         const publishErrors: Error[] = [];
+        const convergenceErrors: Error[] = [];
         let waited = false;
         for (let pass = 0; pass < MAXIMUM_SYNC_PASSES; pass += 1) {
             if (options.signal?.aborted === true) {
@@ -795,15 +954,22 @@ export class MurmurEngine {
             }
             let changed = false;
             changed = (await this.#materializeFriendOutbox()) || changed;
-            const friendFlush = await this.#flushOutboxes(attempted, "non-group");
+            const friendFlush = await this.#flushOutboxes(attempted, "non-group", options.signal);
             changed = friendFlush.changed || changed;
             publishErrors.push(...friendFlush.errors);
-            changed = (await this.#readAllTopics(options.signal)) || changed;
+            const firstRead = await this.#readAllTopics(options.signal);
+            changed = firstRead.changed || changed;
+            convergenceErrors.push(...firstRead.errors);
             changed = (await this.#reconcileGroupOutboxes()) || changed;
-            const groupFlush = await this.#flushOutboxes(attempted, "group");
+            const groupFlush = await this.#flushOutboxes(attempted, "group", options.signal);
             changed = groupFlush.changed || changed;
             publishErrors.push(...groupFlush.errors);
-            changed = (await this.#readAllTopics(options.signal)) || changed;
+            const secondRead = await this.#readAllTopics(options.signal);
+            changed = secondRead.changed || changed;
+            convergenceErrors.push(...secondRead.errors);
+            const deferred = await this.#processDeferredInvitations(options.signal);
+            changed = deferred.changed || changed;
+            convergenceErrors.push(...deferred.errors);
             changed = (await this.#ensureKeyPackages()) || changed;
             changed = (await this.#prepareGroupOperations()) || changed;
             if (changed) {
@@ -815,7 +981,13 @@ export class MurmurEngine {
                 continue;
             }
             if (publishErrors.length > 0) {
-                throw publishErrors[0]!;
+                throw new MurmurConvergenceError(publishErrors, "Murmur publication failed");
+            }
+            if (convergenceErrors.length > 0) {
+                throw new MurmurConvergenceError(
+                    convergenceErrors,
+                    "Murmur topic convergence failed",
+                );
             }
             return;
         }
@@ -827,65 +999,90 @@ export class MurmurEngine {
         if (semantic.length === 0) {
             return false;
         }
-        const exact = [...(await this.#store.list(OUTBOX_PREFIX)).values()].map(decodeRelayOutbox);
+        const exactValues = await this.#store.list(OUTBOX_PREFIX);
+        const exact = [...exactValues.values()].map(decodeRelayOutbox);
         const materialized = new Set(
             exact.flatMap((record) =>
                 record.purpose.type === "friend-exchange" ? [record.purpose.sourceId] : [],
             ),
         );
         let changed = false;
-        for (const item of semantic) {
-            if (materialized.has(item.id)) {
-                continue;
-            }
-            let event: SignedRelayEvent;
-            if (item.kind === "request") {
-                const payload = encodeEnvelope(item.envelope);
-                try {
-                    event = createUnlinkableEvent(parseInboxAddress(item.destination), payload);
-                } finally {
-                    zeroBytes(payload);
+        try {
+            for (const item of semantic) {
+                if (materialized.has(item.id)) {
+                    continue;
                 }
-            } else if (item.kind === "response") {
-                const access = parseResponseAddress(item.destination);
-                const payload = encodeEnvelope(item.envelope);
-                try {
-                    if (access.topic.type !== "read") {
-                        throw new Error("Friend response requires a Read Topic");
+                let event: SignedRelayEvent;
+                if (item.kind === "request") {
+                    const payload = encodeEnvelope(item.envelope);
+                    try {
+                        event = createUnlinkableEvent(parseInboxAddress(item.destination), payload);
+                    } finally {
+                        zeroBytes(payload);
                     }
-                    event = createUnlinkableEvent(access.topic, payload);
+                } else if (item.kind === "response") {
+                    const access = parseResponseAddress(item.destination);
+                    const payload = encodeEnvelope(item.envelope);
+                    try {
+                        if (access.topic.type !== "read") {
+                            throw new Error("Friend response requires a Read Topic");
+                        }
+                        event = createUnlinkableEvent(access.topic, payload);
+                    } finally {
+                        destroyAccess(access);
+                        zeroBytes(payload);
+                    }
+                } else {
+                    event = this.#createControlEvent(item.peer, {
+                        type: "friendship-ended",
+                        requestId: item.intent.requestId,
+                    });
+                }
+                const record: RelayOutboxRecord = {
+                    event,
+                    purpose: { type: "friend-exchange", sourceId: item.id },
+                    attempted: false,
+                };
+                try {
+                    await this.#store.transaction(async (transaction) => {
+                        const semanticBytes = await transaction.get(
+                            friendOutboxKey(this.#identity, item.id),
+                        );
+                        try {
+                            if (semanticBytes === undefined) {
+                                return;
+                            }
+                            const encoded = encodeRelayOutbox(record);
+                            try {
+                                await transaction.set(`${OUTBOX_PREFIX}${event.id}`, encoded);
+                            } finally {
+                                zeroBytes(encoded);
+                            }
+                        } finally {
+                            semanticBytes?.fill(0);
+                        }
+                    });
                 } finally {
-                    destroyAccess(access);
-                    zeroBytes(payload);
+                    destroyRelayOutboxRecord(record);
                 }
-            } else {
-                event = this.#createControlEvent(item.peer, {
-                    type: "friendship-ended",
-                    requestId: item.intent.requestId,
-                });
+                materialized.add(item.id);
+                changed = true;
             }
-            const record: RelayOutboxRecord = {
-                event,
-                purpose: { type: "friend-exchange", sourceId: item.id },
-                attempted: false,
-            };
-            await this.#store.transaction(async (transaction) => {
-                if (
-                    (await transaction.get(friendOutboxKey(this.#identity, item.id))) === undefined
-                ) {
-                    return;
-                }
-                await transaction.set(`${OUTBOX_PREFIX}${event.id}`, encodeRelayOutbox(record));
-            });
-            materialized.add(item.id);
-            changed = true;
+            return changed;
+        } finally {
+            for (const record of exact) {
+                destroyRelayOutboxRecord(record);
+            }
+            for (const value of exactValues.values()) {
+                zeroBytes(value);
+            }
         }
-        return changed;
     }
 
     async #flushOutboxes(
         attempted: Set<string>,
         phase: "non-group" | "group",
+        signal?: AbortSignal,
     ): Promise<{ readonly changed: boolean; readonly errors: readonly Error[] }> {
         const values = await this.#store.list(OUTBOX_PREFIX);
         const records = [...values]
@@ -899,85 +1096,123 @@ export class MurmurEngine {
             );
         let changed = false;
         const errors: Error[] = [];
-        for (const { key, record } of records) {
-            const groupPublication =
-                record.purpose.type === "group-application" ||
-                record.purpose.type === "group-commit";
-            if ((phase === "group") !== groupPublication) {
-                continue;
-            }
-            if (attempted.has(record.event.id)) {
-                continue;
-            }
-            if (groupPublication && !(await this.#groupOutboxIsCurrent(record))) {
-                await this.#dropStaleGroupOutbox(key, record);
-                changed = true;
-                continue;
-            }
-            attempted.add(record.event.id);
-            const attemptedRecord = { ...record, attempted: true };
-            await this.#store.transaction(async (transaction) => {
-                if ((await transaction.get(key)) !== undefined) {
-                    await transaction.set(key, encodeRelayOutbox(attemptedRecord));
+        try {
+            for (const { key, record } of records) {
+                const groupPublication =
+                    record.purpose.type === "group-application" ||
+                    record.purpose.type === "group-commit";
+                if ((phase === "group") !== groupPublication) {
+                    continue;
                 }
-            });
-            try {
-                const outcome = await this.#transport.publish(record.event);
-                if (outcome.seq < 1n) {
-                    throw new Error("Relay returned an invalid publication sequence");
+                if (attempted.has(record.event.id)) {
+                    continue;
                 }
-                await this.#store.transaction(async (transaction) => {
-                    if (record.purpose.type === "friend-exchange") {
-                        const sourceId = record.purpose.sourceId;
-                        const scoped = new FriendBook(
-                            this.#identity,
-                            new TransactionStore(transaction),
-                        );
-                        const pending = (await scoped.listOutbox()).find(
-                            (item) => item.id === sourceId,
-                        );
-                        if (pending !== undefined) {
-                            await scoped.confirmOutbox(
-                                pending,
-                                outcome.duplicate ? "duplicate" : "accepted",
+                if (groupPublication && !(await this.#groupOutboxIsCurrent(record))) {
+                    await this.#dropStaleGroupOutbox(key, record);
+                    changed = true;
+                    continue;
+                }
+                attempted.add(record.event.id);
+                try {
+                    const outcome = await this.#transport.publish(record.event, signal);
+                    if (outcome.seq < 1n) {
+                        throw new Error("Relay returned an invalid publication sequence");
+                    }
+                    await this.#store.transaction(async (transaction) => {
+                        if (record.purpose.type === "friend-exchange") {
+                            const sourceId = record.purpose.sourceId;
+                            const scoped = new FriendBook(
+                                this.#identity,
+                                new TransactionStore(transaction),
                             );
+                            const pending = (await scoped.listOutbox()).find(
+                                (item) => item.id === sourceId,
+                            );
+                            if (pending !== undefined) {
+                                await scoped.confirmOutbox(
+                                    pending,
+                                    outcome.duplicate ? "duplicate" : "accepted",
+                                );
+                            }
                         }
-                    }
-                    if (
-                        record.event.topic.type === "read-write" &&
-                        record.event.topic.name === "control"
-                    ) {
-                        await transaction.set(
-                            `${CONTROL_SELF_PREFIX}${record.event.id}`,
-                            hashBytes(record.event.payload),
-                        );
-                    }
-                    await transaction.delete(key);
-                });
-                changed = true;
-            } catch (error: unknown) {
-                errors.push(error instanceof Error ? error : new Error("Relay publication failed"));
+                        if (
+                            record.event.topic.type === "read-write" &&
+                            record.event.topic.name === "control"
+                        ) {
+                            const topicId = relayTopicId(record.event.topic);
+                            const cursorValue = await transaction.get(`${CURSOR_PREFIX}${topicId}`);
+                            let cursor: bigint;
+                            try {
+                                cursor = parseCursor(cursorValue);
+                            } finally {
+                                cursorValue?.fill(0);
+                            }
+                            if (cursor < outcome.seq) {
+                                const fingerprint = hashBytes(record.event.payload);
+                                const markerBytes = encodeControlSelfMarker({
+                                    topicId,
+                                    sequence: outcome.seq,
+                                    fingerprint,
+                                });
+                                try {
+                                    await transaction.set(
+                                        `${CONTROL_SELF_PREFIX}${record.event.id}`,
+                                        markerBytes,
+                                    );
+                                } finally {
+                                    zeroBytes(fingerprint);
+                                    zeroBytes(markerBytes);
+                                }
+                            }
+                        }
+                        await transaction.delete(key);
+                    });
+                    changed = true;
+                } catch (error: unknown) {
+                    errors.push(
+                        error instanceof Error ? error : new Error("Relay publication failed"),
+                    );
+                }
+            }
+            return { changed, errors };
+        } finally {
+            for (const { record } of records) {
+                destroyRelayOutboxRecord(record);
+            }
+            for (const value of values.values()) {
+                zeroBytes(value);
             }
         }
-        return { changed, errors };
     }
 
     async #reconcileGroupOutboxes(): Promise<boolean> {
-        const records = [...(await this.#store.list(OUTBOX_PREFIX))]
-            .map(([key, value]) => ({ key, record: decodeRelayOutbox(value) }))
-            .filter(
-                ({ record }) =>
-                    record.purpose.type === "group-application" ||
-                    record.purpose.type === "group-commit",
-            );
+        const values = await this.#store.list(OUTBOX_PREFIX);
+        const decoded = [...values].map(([key, value]) => ({
+            key,
+            record: decodeRelayOutbox(value),
+        }));
+        const records = decoded.filter(
+            ({ record }) =>
+                record.purpose.type === "group-application" ||
+                record.purpose.type === "group-commit",
+        );
         let changed = false;
-        for (const { key, record } of records) {
-            if (!(await this.#groupOutboxIsCurrent(record))) {
-                await this.#dropStaleGroupOutbox(key, record);
-                changed = true;
+        try {
+            for (const { key, record } of records) {
+                if (!(await this.#groupOutboxIsCurrent(record))) {
+                    await this.#dropStaleGroupOutbox(key, record);
+                    changed = true;
+                }
+            }
+            return changed;
+        } finally {
+            for (const { record } of decoded) {
+                destroyRelayOutboxRecord(record);
+            }
+            for (const value of values.values()) {
+                zeroBytes(value);
             }
         }
-        return changed;
     }
 
     async #groupOutboxIsCurrent(record: RelayOutboxRecord): Promise<boolean> {
@@ -994,61 +1229,68 @@ export class MurmurEngine {
         } finally {
             zeroBytes(metadata);
         }
-        if (group.status !== "active") {
-            return false;
-        }
-        if (record.purpose.type === "group-application") {
-            const operationBytes = await this.#store.get(
-                groupOperationKey(record.purpose.groupId, record.purpose.operationId),
-            );
-            if (operationBytes === undefined) {
+        try {
+            if (group.status !== "active") {
                 return false;
             }
-            const operation = decodeGroupOperation(operationBytes);
-            zeroBytes(operationBytes);
+            if (record.purpose.type === "group-application") {
+                const operationBytes = await this.#store.get(
+                    groupOperationKey(record.purpose.groupId, record.purpose.operationId),
+                );
+                if (operationBytes === undefined) {
+                    return false;
+                }
+                let operation: GroupOperation | undefined;
+                const fingerprint = hashBytes(record.event.payload);
+                try {
+                    operation = decodeGroupOperation(operationBytes);
+                    return (
+                        operation.type === "send" &&
+                        operation.attempt !== undefined &&
+                        operation.attempt.eventId === record.event.id &&
+                        operation.attempt.epoch === group.epoch &&
+                        equalBytes(operation.attempt.fingerprint, fingerprint)
+                    );
+                } finally {
+                    zeroBytes(operationBytes);
+                    zeroBytes(fingerprint);
+                    if (operation !== undefined) {
+                        destroyGroupOperation(operation);
+                    }
+                }
+            }
+            const stagedBytes = await this.#store.get(groupStagedKey(record.purpose.groupId));
+            if (stagedBytes === undefined) {
+                return false;
+            }
+            let staged: StagedGroupCommit | undefined;
+            try {
+                staged = decodeStagedCommit(stagedBytes);
+            } finally {
+                zeroBytes(stagedBytes);
+            }
+            if (staged === undefined) {
+                return false;
+            }
+            const operation = await this.#store.get(
+                groupOperationKey(record.purpose.groupId, record.purpose.operationId),
+            );
             const fingerprint = hashBytes(record.event.payload);
             try {
                 return (
-                    operation.type === "send" &&
-                    operation.attempt !== undefined &&
-                    operation.attempt.eventId === record.event.id &&
-                    operation.attempt.epoch === group.epoch &&
-                    equalBytes(operation.attempt.fingerprint, fingerprint)
+                    operation !== undefined &&
+                    staged.operationId === record.purpose.operationId &&
+                    staged.eventId === record.event.id &&
+                    staged.currentEpoch === group.epoch &&
+                    equalBytes(staged.fingerprint, fingerprint)
                 );
             } finally {
+                operation?.fill(0);
                 zeroBytes(fingerprint);
-                destroyGroupOperation(operation);
+                destroyStagedCommit(staged);
             }
-        }
-        const stagedBytes = await this.#store.get(groupStagedKey(record.purpose.groupId));
-        if (stagedBytes === undefined) {
-            return false;
-        }
-        let staged: StagedGroupCommit | undefined;
-        try {
-            staged = decodeStagedCommit(stagedBytes);
         } finally {
-            zeroBytes(stagedBytes);
-        }
-        if (staged === undefined) {
-            return false;
-        }
-        const operation = await this.#store.get(
-            groupOperationKey(record.purpose.groupId, record.purpose.operationId),
-        );
-        const fingerprint = hashBytes(record.event.payload);
-        try {
-            return (
-                operation !== undefined &&
-                staged.operationId === record.purpose.operationId &&
-                staged.eventId === record.event.id &&
-                staged.currentEpoch === group.epoch &&
-                equalBytes(staged.fingerprint, fingerprint)
-            );
-        } finally {
-            operation?.fill(0);
-            zeroBytes(fingerprint);
-            destroyStagedCommit(staged);
+            destroyStoredGroup(group);
         }
     }
 
@@ -1154,6 +1396,9 @@ export class MurmurEngine {
             }
         }
         for (const group of this.#groups.values()) {
+            if (group.record.status !== "active") {
+                continue;
+            }
             const access = groupAccess(group.record.topicSecret);
             const topicId = relayTopicId(access.topic);
             if (!seen.has(topicId)) {
@@ -1174,14 +1419,28 @@ export class MurmurEngine {
         });
     }
 
-    async #readAllTopics(signal?: AbortSignal): Promise<boolean> {
+    async #readAllTopics(
+        signal?: AbortSignal,
+    ): Promise<{ readonly changed: boolean; readonly errors: readonly Error[] }> {
         const contexts = await this.#discoverTopics();
         let changed = false;
+        const errors: Error[] = [];
         try {
             for (const context of contexts) {
-                changed = (await this.#readTopic(context, signal)) || changed;
+                try {
+                    changed = (await this.#readTopic(context, signal)) || changed;
+                } catch (error: unknown) {
+                    if (signal?.aborted === true) {
+                        throw signal.reason ?? error;
+                    }
+                    errors.push(
+                        error instanceof Error
+                            ? error
+                            : new Error("Murmur topic convergence failed"),
+                    );
+                }
             }
-            return changed;
+            return { changed, errors };
         } finally {
             for (const context of contexts) {
                 destroyAccess(context.access);
@@ -1192,18 +1451,47 @@ export class MurmurEngine {
     async #readTopic(context: TopicContext, signal?: AbortSignal): Promise<boolean> {
         const topicId = relayTopicId(context.access.topic);
         const cursorKey = `${CURSOR_PREFIX}${topicId}`;
-        let cursor = parseCursor(await this.#store.get(cursorKey));
+        const cursorValue = await this.#store.get(cursorKey);
+        let cursor: bigint;
+        try {
+            cursor = parseCursor(cursorValue);
+        } finally {
+            cursorValue?.fill(0);
+        }
         let changed = false;
         for (;;) {
-            const page = await this.#transport.readEvents(
-                context.access,
-                cursor,
-                EVENT_PAGE_LIMIT,
-                0,
-                signal,
-            );
+            let page: Awaited<ReturnType<RelayTransport["readEvents"]>>;
+            try {
+                page = await this.#transport.readEvents(
+                    context.access,
+                    cursor,
+                    EVENT_PAGE_LIMIT,
+                    0,
+                    signal,
+                );
+            } catch (error: unknown) {
+                if (cursor === 0n || signal?.aborted === true) {
+                    throw error;
+                }
+                let probe: Awaited<ReturnType<RelayTransport["readEvents"]>>;
+                try {
+                    probe = await this.#transport.readEvents(context.access, 0n, 1, 0, signal);
+                } catch {
+                    throw error;
+                }
+                if (probe.head >= cursor) {
+                    throw error;
+                }
+                await this.#resetCursorForRelay({ topicId, cursorKey }, cursor);
+                cursor = 0n;
+                changed = true;
+                continue;
+            }
             if (page.head < cursor) {
-                throw new Error("Relay returned a head behind the Murmur cursor");
+                await this.#resetCursorForRelay({ topicId, cursorKey }, cursor);
+                cursor = 0n;
+                changed = true;
+                continue;
             }
             let previous = cursor;
             for (const retained of page.events) {
@@ -1216,6 +1504,7 @@ export class MurmurEngine {
                     retained.seq,
                     previous,
                     cursorKey,
+                    signal,
                 );
                 previous = retained.seq;
                 changed = true;
@@ -1225,6 +1514,7 @@ export class MurmurEngine {
                 if (page.head > cursor) {
                     await this.#store.transaction(async (transaction) => {
                         await this.#advanceCursor(transaction, cursorKey, cursor, page.head);
+                        await this.#cleanupControlSelfMarkers(transaction, topicId, page.head);
                     });
                     cursor = page.head;
                     changed = true;
@@ -1243,6 +1533,7 @@ export class MurmurEngine {
         sequence: bigint,
         expectedCursor: bigint,
         cursorKey: string,
+        signal?: AbortSignal,
     ): Promise<void> {
         const expectedTopicId = relayTopicId(context.access.topic);
         const validOuter =
@@ -1263,7 +1554,14 @@ export class MurmurEngine {
             return;
         }
         if (context.kind === "control") {
-            await this.#processControl(context.peer, event, sequence, expectedCursor, cursorKey);
+            await this.#processControl(
+                context.peer,
+                event,
+                sequence,
+                expectedCursor,
+                cursorKey,
+                signal,
+            );
             return;
         }
         await this.#processGroupEvent(context.groupId, event, sequence, expectedCursor, cursorKey);
@@ -1360,31 +1658,39 @@ export class MurmurEngine {
         sequence: bigint,
         expectedCursor: bigint,
         cursorKey: string,
+        signal?: AbortSignal,
     ): Promise<void> {
         const selfFingerprint = hashBytes(event.payload);
-        const exactOutbox = await this.#store.get(`${OUTBOX_PREFIX}${event.id}`);
-        const selfMarker = await this.#store.get(`${CONTROL_SELF_PREFIX}${event.id}`);
-        if (
-            (selfMarker !== undefined && equalBytes(selfMarker, selfFingerprint)) ||
-            (exactOutbox !== undefined &&
-                equalBytes(decodeRelayOutbox(exactOutbox).event.payload, event.payload))
-        ) {
-            try {
+        const exactOutboxBytes = await this.#store.get(`${OUTBOX_PREFIX}${event.id}`);
+        const selfMarkerBytes = await this.#store.get(`${CONTROL_SELF_PREFIX}${event.id}`);
+        let exactOutbox: RelayOutboxRecord | undefined;
+        let selfMarker: ReturnType<typeof decodeControlSelfMarker> | undefined;
+        try {
+            exactOutbox =
+                exactOutboxBytes === undefined ? undefined : decodeRelayOutbox(exactOutboxBytes);
+            selfMarker =
+                selfMarkerBytes === undefined
+                    ? undefined
+                    : decodeControlSelfMarker(selfMarkerBytes);
+            const ownEcho =
+                (selfMarker !== undefined &&
+                    selfMarker.topicId === relayTopicId(event.topic) &&
+                    selfMarker.sequence === sequence &&
+                    equalBytes(selfMarker.fingerprint, selfFingerprint)) ||
+                (exactOutbox !== undefined && equalBytes(exactOutbox.event.payload, event.payload));
+            if (ownEcho) {
                 await this.#store.transaction(async (transaction) => {
-                    if (exactOutbox !== undefined) {
-                        const record = decodeRelayOutbox(exactOutbox);
-                        if (record.purpose.type === "friend-exchange") {
-                            const sourceId = record.purpose.sourceId;
-                            const scoped = new FriendBook(
-                                this.#identity,
-                                new TransactionStore(transaction),
-                            );
-                            const pending = (await scoped.listOutbox()).find(
-                                (item) => item.id === sourceId,
-                            );
-                            if (pending !== undefined) {
-                                await scoped.confirmOutbox(pending, "accepted");
-                            }
+                    if (exactOutbox?.purpose.type === "friend-exchange") {
+                        const sourceId = exactOutbox.purpose.sourceId;
+                        const scoped = new FriendBook(
+                            this.#identity,
+                            new TransactionStore(transaction),
+                        );
+                        const pending = (await scoped.listOutbox()).find(
+                            (item) => item.id === sourceId,
+                        );
+                        if (pending !== undefined) {
+                            await scoped.confirmOutbox(pending, "accepted");
                         }
                     }
                     await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
@@ -1392,21 +1698,27 @@ export class MurmurEngine {
                     await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
                 });
                 return;
-            } finally {
-                zeroBytes(selfFingerprint);
             }
+        } finally {
+            zeroBytes(selfFingerprint);
+            exactOutboxBytes?.fill(0);
+            selfMarkerBytes?.fill(0);
+            destroyRelayOutboxRecord(exactOutbox);
+            selfMarker?.fingerprint.fill(0);
         }
-        zeroBytes(selfFingerprint);
+
         const channel = new FriendChannel(this.#identity, peer);
-        let frame: FriendControlFrame;
+        let frame: FriendControlFrame | undefined;
         let messageId: string;
         let fingerprint: Uint8Array;
+        let openedPayload: Uint8Array | undefined;
         try {
             const envelope = decodeEnvelope(
                 event.payload,
                 "friend-control",
             ) as FriendControlEnvelope;
             const opened = channel.open(envelope);
+            openedPayload = opened.message.payload;
             const exactRetention =
                 (opened.message.retention.kind === "durable" && event.expiresAt === undefined) ||
                 (opened.message.retention.kind === "temporary" &&
@@ -1414,12 +1726,13 @@ export class MurmurEngine {
             if (!exactRetention) {
                 throw new Error("Friend-control relay retention mismatch");
             }
-            frame = decodeFriendControlFrame(opened.message.payload);
+            frame = decodeFriendControlFrame(openedPayload);
             messageId = opened.message.id;
             fingerprint = hashBytes(event.payload);
-            zeroBytes(opened.message.payload);
         } catch {
             channel.destroy();
+            openedPayload?.fill(0);
+            destroyFriendControlFrame(frame);
             await this.#quarantine(
                 relayTopicId(event.topic),
                 sequence,
@@ -1430,29 +1743,41 @@ export class MurmurEngine {
             return;
         }
         channel.destroy();
+        openedPayload.fill(0);
         const replayKey = `${CONTROL_REPLAY_PREFIX}${identityId(peer)}/${messageId}`;
         const existing = await this.#store.get(replayKey);
-        if (existing !== undefined) {
-            if (!equalBytes(existing, fingerprint)) {
-                zeroBytes(fingerprint);
-                await this.#quarantine(
-                    relayTopicId(event.topic),
-                    sequence,
-                    event,
-                    expectedCursor,
-                    cursorKey,
-                );
+        try {
+            if (existing !== undefined) {
+                if (!equalBytes(existing, fingerprint)) {
+                    await this.#quarantine(
+                        relayTopicId(event.topic),
+                        sequence,
+                        event,
+                        expectedCursor,
+                        cursorKey,
+                    );
+                    return;
+                }
+                await this.#store.transaction(async (transaction) => {
+                    await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                });
                 return;
             }
-            zeroBytes(fingerprint);
-            await this.#store.transaction(async (transaction) => {
-                await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
-            });
-            return;
-        }
-        try {
-            if (frame.type === "group-invitation") {
-                await this.#adoptInvitation(
+            try {
+                if (frame.type === "group-invitation") {
+                    await this.#adoptInvitation(
+                        peer,
+                        frame,
+                        replayKey,
+                        fingerprint,
+                        sequence,
+                        expectedCursor,
+                        cursorKey,
+                        signal,
+                    );
+                    return;
+                }
+                await this.#applyControlFrame(
                     peer,
                     frame,
                     replayKey,
@@ -1461,33 +1786,37 @@ export class MurmurEngine {
                     expectedCursor,
                     cursorKey,
                 );
-                return;
+            } catch (error: unknown) {
+                if (error instanceof InvitationVerificationDeferredError) {
+                    if (frame.type !== "group-invitation") {
+                        throw error;
+                    }
+                    await this.#deferInvitation(
+                        peer,
+                        messageId,
+                        frame,
+                        fingerprint,
+                        sequence,
+                        expectedCursor,
+                        cursorKey,
+                    );
+                    return;
+                }
+                if (error instanceof MurmurPersistenceError) {
+                    throw error;
+                }
+                await this.#quarantine(
+                    relayTopicId(event.topic),
+                    sequence,
+                    event,
+                    expectedCursor,
+                    cursorKey,
+                );
             }
-            await this.#applyControlFrame(
-                peer,
-                frame,
-                replayKey,
-                fingerprint,
-                sequence,
-                expectedCursor,
-                cursorKey,
-            );
-        } catch (error: unknown) {
-            if (
-                error instanceof InvitationVerificationDeferredError ||
-                (error instanceof Error && error.message.startsWith("Murmur persistence"))
-            ) {
-                throw error;
-            }
-            await this.#quarantine(
-                relayTopicId(event.topic),
-                sequence,
-                event,
-                expectedCursor,
-                cursorKey,
-            );
         } finally {
+            existing?.fill(0);
             zeroBytes(fingerprint);
+            destroyFriendControlFrame(frame);
         }
     }
 
@@ -1508,7 +1837,7 @@ export class MurmurEngine {
                 !equalBytes(keyPackage.leafNode.signatureKey, peer.publicKey) ||
                 !equalBytes(mlsKeyPackageReference(keyPackage), frame.reference)
             ) {
-                throw new Error("Invalid announced KeyPackage");
+                throw new InvalidFriendControlError("Invalid announced KeyPackage");
             }
         }
         try {
@@ -1516,7 +1845,7 @@ export class MurmurEngine {
                 const scoped = new FriendBook(this.#identity, new TransactionStore(transaction));
                 const record = await scoped.get(peer);
                 if (record === undefined) {
-                    throw new Error("Friend-control sender is unknown");
+                    throw new InvalidFriendControlError("Friend-control sender is unknown");
                 }
                 if (frame.type === "profile-update") {
                     if (record.status === "active") {
@@ -1532,7 +1861,9 @@ export class MurmurEngine {
                 } else if (frame.type === "friendship-ended") {
                     if (record.requestId !== frame.requestId) {
                         if (record.previousRequestId !== frame.requestId) {
-                            throw new Error("Friendship end does not match its exchange");
+                            throw new InvalidFriendControlError(
+                                "Friendship end does not match its exchange",
+                            );
                         }
                     } else if (record.status !== "ended") {
                         await transaction.set(
@@ -1544,6 +1875,7 @@ export class MurmurEngine {
                                 updatedAt: Math.max(record.updatedAt, Date.now()),
                             }),
                         );
+                        await this.#clearFriendKeyPackageState(transaction, peer);
                     }
                 } else if (frame.type === "key-package-request") {
                     if (record.status === "active") {
@@ -1612,7 +1944,9 @@ export class MurmurEngine {
                                 existing !== undefined && !equalBytes(existing, frame.keyPackage);
                             existing?.fill(0);
                             if (collision) {
-                                throw new Error("KeyPackage reference collision");
+                                throw new InvalidFriendControlError(
+                                    "KeyPackage reference collision",
+                                );
                             }
                             if (existing === undefined) {
                                 const remote = await transaction.list(
@@ -1650,16 +1984,158 @@ export class MurmurEngine {
                 await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
             });
         } catch (error: unknown) {
-            if (
-                error instanceof Error &&
-                (error.message.includes("active friend") ||
-                    error.message.includes("does not match") ||
-                    error.message.includes("unknown") ||
-                    error.message.includes("collision"))
-            ) {
+            if (error instanceof InvalidFriendControlError) {
                 throw error;
             }
-            throw new Error("Murmur persistence transaction failed", { cause: error });
+            throw new MurmurPersistenceError(error);
+        }
+    }
+
+    async #deferInvitation(
+        peer: IdentityPublicKey,
+        messageId: string,
+        frame: Extract<FriendControlFrame, { type: "group-invitation" }>,
+        fingerprint: Uint8Array,
+        sequence: bigint,
+        expectedCursor: bigint,
+        cursorKey: string,
+    ): Promise<void> {
+        const peerId = identityId(peer);
+        const key = `${DEFERRED_INVITATION_PREFIX}${peerId}/${messageId}`;
+        const frameBytes = encodeFriendControlFrame(frame);
+        const encoded = encodeDeferredInvitation({
+            peer: peer.publicKey,
+            messageId,
+            fingerprint,
+            frame: frameBytes,
+        });
+        try {
+            await this.#store.transaction(async (transaction) => {
+                const existing = await transaction.get(key);
+                if (existing !== undefined) {
+                    try {
+                        if (!equalBytes(existing, encoded)) {
+                            throw new InvalidFriendControlError(
+                                "Deferred invitation identifier collision",
+                            );
+                        }
+                    } finally {
+                        zeroBytes(existing);
+                    }
+                } else {
+                    const pending = await transaction.list(
+                        `${DEFERRED_INVITATION_PREFIX}${peerId}/`,
+                    );
+                    try {
+                        if (pending.size >= MAXIMUM_DEFERRED_INVITATIONS_PER_FRIEND) {
+                            throw new Error("Murmur deferred invitation capacity is exhausted");
+                        }
+                    } finally {
+                        for (const value of pending.values()) {
+                            zeroBytes(value);
+                        }
+                    }
+                    await transaction.set(key, encoded);
+                }
+                await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+            });
+        } catch (error: unknown) {
+            if (error instanceof InvalidFriendControlError) {
+                throw error;
+            }
+            throw new MurmurPersistenceError(error);
+        } finally {
+            zeroBytes(frameBytes);
+            zeroBytes(encoded);
+        }
+    }
+
+    async #completeInvitationControl(
+        transaction: StoreTransaction,
+        replayKey: string,
+        fingerprint: Uint8Array,
+        sequence: bigint,
+        expectedCursor: bigint,
+        cursorKey: string,
+        deferredKey?: string,
+    ): Promise<void> {
+        await transaction.set(replayKey, fingerprint);
+        if (deferredKey === undefined) {
+            await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+        } else {
+            await transaction.delete(deferredKey);
+        }
+    }
+
+    async #processDeferredInvitations(
+        signal?: AbortSignal,
+    ): Promise<{ readonly changed: boolean; readonly errors: readonly Error[] }> {
+        const records = await this.#store.list(DEFERRED_INVITATION_PREFIX);
+        let changed = false;
+        const errors: Error[] = [];
+        try {
+            for (const [key, encoded] of records) {
+                let record: ReturnType<typeof decodeDeferredInvitation> | undefined;
+                let frame: FriendControlFrame | undefined;
+                try {
+                    record = decodeDeferredInvitation(encoded);
+                    frame = decodeFriendControlFrame(record.frame);
+                    if (frame.type !== "group-invitation") {
+                        throw new InvalidFriendControlError(
+                            "Deferred control frame is not an invitation",
+                        );
+                    }
+                    const peer = { publicKey: record.peer };
+                    const replayKey = `${CONTROL_REPLAY_PREFIX}${identityId(peer)}/${
+                        record.messageId
+                    }`;
+                    try {
+                        await this.#adoptInvitation(
+                            peer,
+                            frame,
+                            replayKey,
+                            record.fingerprint,
+                            0n,
+                            0n,
+                            "",
+                            signal,
+                            key,
+                        );
+                        changed = true;
+                    } catch (error: unknown) {
+                        if (error instanceof InvitationVerificationDeferredError) {
+                            continue;
+                        }
+                        if (error instanceof MurmurPersistenceError) {
+                            errors.push(error);
+                            continue;
+                        }
+                        await this.#store.transaction(async (transaction) => {
+                            await transaction.set(replayKey, record!.fingerprint);
+                            await transaction.delete(key);
+                        });
+                        changed = true;
+                    }
+                } catch (error: unknown) {
+                    errors.push(
+                        error instanceof Error
+                            ? error
+                            : new Error("Deferred invitation processing failed"),
+                    );
+                } finally {
+                    destroyFriendControlFrame(frame);
+                    if (record !== undefined) {
+                        zeroBytes(record.peer);
+                        zeroBytes(record.fingerprint);
+                        zeroBytes(record.frame);
+                    }
+                }
+            }
+            return { changed, errors };
+        } finally {
+            for (const encoded of records.values()) {
+                zeroBytes(encoded);
+            }
         }
     }
 
@@ -1671,7 +2147,18 @@ export class MurmurEngine {
         sequence: bigint,
         expectedCursor: bigint,
         cursorKey: string,
+        signal?: AbortSignal,
+        deferredKey?: string,
     ): Promise<void> {
+        let friend;
+        try {
+            friend = await this.#friendBook.get(peer);
+        } catch (error: unknown) {
+            throw new MurmurPersistenceError(error);
+        }
+        if (friend?.status !== "active") {
+            throw new InvalidFriendControlError("Group invitations require an active friend");
+        }
         const id = encodeBase64Url(frame.groupId);
         const calculatedBinding = descriptorBinding(
             frame.groupId,
@@ -1685,9 +2172,18 @@ export class MurmurEngine {
         } finally {
             zeroBytes(calculatedBinding);
         }
-        const committed = await this.#verifyInvitationCommit(frame);
+        const committed = await this.#verifyInvitationCommit(frame, signal);
         const existingGroup = this.#groups.get(id);
-        if (existingGroup !== undefined) {
+        if (
+            existingGroup?.record.status === "removed" &&
+            committed.epoch !== existingGroup.record.epoch
+        ) {
+            zeroBytes(committed.confirmationTag);
+            throw new InvalidFriendControlError(
+                "Re-add invitation does not follow the removed group epoch",
+            );
+        }
+        if (existingGroup?.record.status === "active") {
             try {
                 if (
                     !equalBytes(existingGroup.record.descriptorBinding, frame.descriptorBinding) ||
@@ -1697,13 +2193,18 @@ export class MurmurEngine {
                 }
                 try {
                     await this.#store.transaction(async (transaction) => {
-                        await transaction.set(replayKey, fingerprint);
-                        await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                        await this.#completeInvitationControl(
+                            transaction,
+                            replayKey,
+                            fingerprint,
+                            sequence,
+                            expectedCursor,
+                            cursorKey,
+                            deferredKey,
+                        );
                     });
                 } catch (error: unknown) {
-                    throw new Error("Murmur persistence transaction failed", {
-                        cause: error,
-                    });
+                    throw new MurmurPersistenceError(error);
                 }
             } finally {
                 zeroBytes(committed.confirmationTag);
@@ -1750,7 +2251,7 @@ export class MurmurEngine {
                 members: epoch.memberSignatureKeys.flatMap((member) =>
                     member === undefined ? [] : [member],
                 ),
-                createdAt: Date.now(),
+                createdAt: existingGroup?.record.createdAt ?? Date.now(),
                 epoch: epoch.context.epoch,
                 persistenceGeneration: epoch.persistenceGeneration,
                 status: "active",
@@ -1760,29 +2261,82 @@ export class MurmurEngine {
             try {
                 await this.#store.transaction(async (transaction) => {
                     const currentBundle = await transaction.get(bundleKey);
-                    if (currentBundle === undefined || !equalBytes(currentBundle, bundleBytes)) {
-                        throw new Error("Invitation KeyPackage was already consumed");
-                    }
-                    if ((await transaction.get(groupMetaKey(id))) !== undefined) {
-                        throw new Error("Invitation group was concurrently installed");
+                    const currentMetadata = await transaction.get(groupMetaKey(id));
+                    try {
+                        if (
+                            currentBundle === undefined ||
+                            !equalBytes(currentBundle, bundleBytes)
+                        ) {
+                            throw new InvalidFriendControlError(
+                                "Invitation KeyPackage was already consumed",
+                            );
+                        }
+                        if (existingGroup === undefined) {
+                            if (currentMetadata !== undefined) {
+                                throw new InvalidFriendControlError(
+                                    "Invitation group was concurrently installed",
+                                );
+                            }
+                        } else {
+                            if (currentMetadata === undefined) {
+                                throw new InvalidFriendControlError(
+                                    "Removed invitation group disappeared",
+                                );
+                            }
+                            const currentGroup = decodeGroup(currentMetadata);
+                            try {
+                                if (
+                                    currentGroup.status !== "removed" ||
+                                    !equalBytes(
+                                        currentGroup.descriptorBinding,
+                                        frame.descriptorBinding,
+                                    ) ||
+                                    !equalBytes(currentGroup.topicSecret, frame.topicSecret)
+                                ) {
+                                    throw new InvalidFriendControlError(
+                                        "Removed invitation group changed before re-add",
+                                    );
+                                }
+                            } finally {
+                                destroyStoredGroup(currentGroup);
+                            }
+                        }
+                    } finally {
+                        currentBundle?.fill(0);
+                        currentMetadata?.fill(0);
                     }
                     await transaction.set(groupIndexKey(id), new Uint8Array([1]));
                     await transaction.set(groupMetaKey(id), encodeGroup(record));
                     await transaction.set(groupEpochKey(id), epochBytes!);
                     await transaction.set(groupCursorKey, cursorBytes(frame.commitSequence));
+                    await this.#clearQuarantineTopic(
+                        transaction,
+                        relayTopicId(groupTopicAccess!.topic),
+                    );
                     await transaction.delete(bundleKey);
                     await transaction.delete(
                         `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
                             peer,
                         )}/${encodeBase64Url(frame.keyPackageReference)}`,
                     );
-                    await transaction.set(replayKey, fingerprint);
-                    await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                    await this.#completeInvitationControl(
+                        transaction,
+                        replayKey,
+                        fingerprint,
+                        sequence,
+                        expectedCursor,
+                        cursorKey,
+                        deferredKey,
+                    );
                 });
             } catch (error: unknown) {
-                throw new Error("Murmur persistence transaction failed", {
-                    cause: error,
-                });
+                if (error instanceof InvalidFriendControlError) {
+                    throw error;
+                }
+                throw new MurmurPersistenceError(error);
+            }
+            if (existingGroup !== undefined) {
+                destroyStoredGroup(existingGroup.record);
             }
             this.#groups.set(id, { record, epoch });
             epoch = undefined;
@@ -1800,24 +2354,30 @@ export class MurmurEngine {
 
     async #verifyInvitationCommit(
         frame: Extract<FriendControlFrame, { type: "group-invitation" }>,
+        signal?: AbortSignal,
     ): Promise<{ readonly epoch: bigint; readonly confirmationTag: Uint8Array }> {
         const access = groupAccess(frame.topicSecret);
         try {
             let page: Awaited<ReturnType<RelayTransport["readEvents"]>>;
             try {
-                const headProbe = await this.#transport.readEvents(access, 0n, 1);
+                const headProbe = await this.#transport.readEvents(access, 0n, 1, 0, signal);
                 if (headProbe.head < frame.commitSequence) {
-                    throw new Error("Invitation winning Commit is above the relay head");
+                    throw new InvitationVerificationDeferredError(
+                        new Error("Invitation winning Commit is above the relay head"),
+                    );
                 }
                 page =
                     frame.commitSequence === 1n && headProbe.events[0]?.seq === frame.commitSequence
                         ? headProbe
-                        : await this.#transport.readEvents(access, frame.commitSequence - 1n, 1);
+                        : await this.#transport.readEvents(
+                              access,
+                              frame.commitSequence - 1n,
+                              1,
+                              0,
+                              signal,
+                          );
             } catch (error: unknown) {
-                if (
-                    error instanceof Error &&
-                    error.message === "Invitation winning Commit is above the relay head"
-                ) {
+                if (error instanceof InvitationVerificationDeferredError) {
                     throw error;
                 }
                 throw new InvitationVerificationDeferredError(error);
@@ -2046,7 +2606,7 @@ export class MurmurEngine {
             await this.#store.transaction(async (transaction) => {
                 await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
                 await transaction.set(groupEpochKey(group.record.id), nextEpochBytes);
-                await transaction.set(groupReplayKey(group.record.id, fingerprint), fingerprint);
+                await this.#recordGroupReplay(transaction, group.record.id, fingerprint, sequence);
                 await transaction.delete(groupStagedKey(group.record.id));
                 if (staged?.type === "add" && staged.keyPackageReference !== undefined) {
                     await this.#queueControl(
@@ -2087,24 +2647,28 @@ export class MurmurEngine {
         const next = MlsEpochState.deserialize(staged.nextEpoch, {
             localSigningSecretKey: this.#identity.secretKey,
             authenticateCredential: authenticateMurmurMlsCredential,
-            minimumPersistenceGeneration: group.record.persistenceGeneration + 1n,
+            minimumPersistenceGeneration: staged.currentGeneration + 1n,
         });
-        if (
-            next.context.epoch !== group.record.epoch + 1n ||
-            next.persistenceGeneration !== group.record.persistenceGeneration + 1n
-        ) {
-            next.destroy();
-            throw new Error("Staged MLS candidate does not advance the active epoch");
-        }
-        const nextRecord: StoredGroup = {
-            ...group.record,
-            members: next.memberSignatureKeys.flatMap((member) =>
-                member === undefined ? [] : [member],
-            ),
-            epoch: next.context.epoch,
-            persistenceGeneration: next.persistenceGeneration,
-        };
+        let rebasedBytes: Uint8Array | undefined;
+        let nextRecord: StoredGroup;
         try {
+            if (
+                next.context.epoch !== group.record.epoch + 1n ||
+                next.persistenceGeneration !== staged.currentGeneration + 1n ||
+                group.record.persistenceGeneration < staged.currentGeneration
+            ) {
+                throw new Error("Staged MLS candidate does not advance the active epoch");
+            }
+            next.rebasePersistenceGeneration(group.record.persistenceGeneration + 1n);
+            rebasedBytes = next.serialize();
+            nextRecord = {
+                ...group.record,
+                members: next.memberSignatureKeys.flatMap((member) =>
+                    member === undefined ? [] : [member],
+                ),
+                epoch: next.context.epoch,
+                persistenceGeneration: next.persistenceGeneration,
+            };
             await this.#store.transaction(async (transaction) => {
                 const current = await transaction.get(groupStagedKey(group.record.id));
                 let currentStaged: StagedGroupCommit | undefined;
@@ -2118,8 +2682,8 @@ export class MurmurEngine {
                     destroyStagedCommit(currentStaged);
                 }
                 await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
-                await transaction.set(groupEpochKey(group.record.id), staged.nextEpoch);
-                await transaction.set(groupReplayKey(group.record.id, fingerprint), fingerprint);
+                await transaction.set(groupEpochKey(group.record.id), rebasedBytes!);
+                await this.#recordGroupReplay(transaction, group.record.id, fingerprint, sequence);
                 await transaction.delete(groupStagedKey(group.record.id));
                 await transaction.delete(groupOperationKey(group.record.id, staged.operationId));
                 await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
@@ -2154,10 +2718,12 @@ export class MurmurEngine {
         } catch (error: unknown) {
             next.destroy();
             throw error;
+        } finally {
+            rebasedBytes?.fill(0);
         }
         group.epoch.destroy();
         group.epoch = next;
-        group.record = nextRecord;
+        group.record = nextRecord!;
     }
 
     async #adoptLocalRemoval(
@@ -2184,7 +2750,7 @@ export class MurmurEngine {
             await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
             await transaction.delete(groupEpochKey(group.record.id));
             await this.#clearRemovedGroupPendingState(transaction, group.record.id, staged);
-            await transaction.set(groupReplayKey(group.record.id, fingerprint), fingerprint);
+            await this.#recordGroupReplay(transaction, group.record.id, fingerprint, sequence);
             await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
         });
         epoch.destroy();
@@ -2285,14 +2851,13 @@ export class MurmurEngine {
         cursorKey: string,
     ): Promise<void> {
         const operationRecords = await this.#store.list(groupOperationPrefix(group.record.id));
-        const operations = [...operationRecords.values()]
-            .map(decodeGroupOperation)
-            .filter(
-                (operation): operation is Extract<GroupOperation, { type: "send" }> =>
-                    operation.type === "send" &&
-                    operation.attempt !== undefined &&
-                    equalBytes(operation.attempt.fingerprint, fingerprint),
-            );
+        const decodedOperations = [...operationRecords.values()].map(decodeGroupOperation);
+        const operations = decodedOperations.filter(
+            (operation): operation is Extract<GroupOperation, { type: "send" }> =>
+                operation.type === "send" &&
+                operation.attempt !== undefined &&
+                equalBytes(operation.attempt.fingerprint, fingerprint),
+        );
         try {
             const own = operations[0];
             if (own?.attempt !== undefined) {
@@ -2306,9 +2871,11 @@ export class MurmurEngine {
                                 bytes: own.payload,
                             }),
                         );
-                        await transaction.set(
-                            groupReplayKey(group.record.id, fingerprint),
+                        await this.#recordGroupReplay(
+                            transaction,
+                            group.record.id,
                             fingerprint,
+                            sequence,
                         );
                         await transaction.delete(groupOperationKey(group.record.id, own.id));
                         await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
@@ -2385,9 +2952,11 @@ export class MurmurEngine {
                             bytes: opened.message.applicationData,
                         }),
                     );
-                    await transaction.set(
-                        groupReplayKey(group.record.id, fingerprint),
+                    await this.#recordGroupReplay(
+                        transaction,
+                        group.record.id,
                         fingerprint,
+                        sequence,
                     );
                     await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
                 });
@@ -2406,7 +2975,7 @@ export class MurmurEngine {
             for (const encoded of operationRecords.values()) {
                 zeroBytes(encoded);
             }
-            for (const operation of operations) {
+            for (const operation of decodedOperations) {
                 destroyGroupOperation(operation);
             }
         }
@@ -2438,16 +3007,24 @@ export class MurmurEngine {
                           : 1,
                 );
             try {
-                const operation = operations[0];
+                let operationIndex = 0;
+                while (operations[operationIndex]?.type === "send") {
+                    const send = operations[operationIndex] as Extract<
+                        GroupOperation,
+                        { type: "send" }
+                    >;
+                    if (send.attempt === undefined) {
+                        await this.#prepareGroupSend(activeGroup, send);
+                        changed = true;
+                    }
+                    operationIndex += 1;
+                }
+                const operation = operations[operationIndex];
                 if (operation === undefined) {
                     continue;
                 }
                 if (operation.type === "send") {
-                    if (operation.attempt === undefined) {
-                        await this.#prepareGroupSend(activeGroup, operation);
-                        changed = true;
-                    }
-                    continue;
+                    throw new Error("Group send batching invariant failed");
                 }
                 const present = group.record.members.some((member) =>
                     equalBytes(member, operation.peer),
@@ -2546,7 +3123,9 @@ export class MurmurEngine {
             const payload = clone.seal(operation.payload);
             checkpoint = clone.serialize();
             access = groupAccess(group.record.topicSecret);
-            const event = createCapabilityEvent(access, payload);
+            const event = createCapabilityEvent(access, payload, {
+                createdAt: this.#nextEventTime(),
+            });
             fingerprint = hashBytes(payload);
             const attempted: GroupOperation = {
                 ...operation,
@@ -2664,7 +3243,9 @@ export class MurmurEngine {
             }
             nextEpoch = prepared.transition.serialize();
             access = groupAccess(group.record.topicSecret);
-            const event = createCapabilityEvent(access, prepared.commit);
+            const event = createCapabilityEvent(access, prepared.commit, {
+                createdAt: this.#nextEventTime(),
+            });
             if (
                 addition !== undefined &&
                 !verifyMlsKeyPackage(addition, Math.floor(event.createdAt / 1_000))
@@ -2677,6 +3258,7 @@ export class MurmurEngine {
                 eventId: event.id,
                 fingerprint,
                 currentEpoch: group.record.epoch,
+                currentGeneration: group.record.persistenceGeneration,
                 nextEpoch,
                 type: operation.type,
                 peer: operation.peer,
@@ -2890,6 +3472,16 @@ export class MurmurEngine {
                     destroyMlsKeyPackageBundle(bundle);
                 }
             }
+            if (
+                available.length === 0 &&
+                localCount >= MAXIMUM_LOCAL_KEY_PACKAGES &&
+                consumedRecords.size > 0
+            ) {
+                for (const marker of consumedRecords.values()) {
+                    zeroBytes(marker);
+                }
+                throw new MurmurKeyPackagePoolExhaustedError(peer.publicKey);
+            }
             const requestKey = `${KEY_PACKAGE_REQUEST_PREFIX}${identityId(peer)}`;
             const requestMarker = await this.#store.get(requestKey);
             if (requestMarker !== undefined) {
@@ -3028,11 +3620,94 @@ export class MurmurEngine {
         expected: bigint,
         next: bigint,
     ): Promise<void> {
-        const current = parseCursor(await transaction.get(cursorKey));
+        const currentValue = await transaction.get(cursorKey);
+        let current: bigint;
+        try {
+            current = parseCursor(currentValue);
+        } finally {
+            currentValue?.fill(0);
+        }
         if (current !== expected || next < current) {
             throw new Error("Murmur cursor cannot skip an unprocessed event");
         }
         await transaction.set(cursorKey, cursorBytes(next));
+    }
+
+    async #resetCursorForRelay(
+        context: { readonly topicId: string; readonly cursorKey: string },
+        expected: bigint,
+    ): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const currentValue = await transaction.get(context.cursorKey);
+            let current: bigint;
+            try {
+                current = parseCursor(currentValue);
+            } finally {
+                currentValue?.fill(0);
+            }
+            if (current !== expected) {
+                throw new Error("Murmur cursor changed during relay reset");
+            }
+            await transaction.set(context.cursorKey, cursorBytes(0n));
+            await this.#cleanupControlSelfMarkers(transaction, context.topicId, current);
+        });
+    }
+
+    async #cleanupControlSelfMarkers(
+        transaction: StoreTransaction,
+        topicId: string,
+        through: bigint,
+    ): Promise<void> {
+        const markers = await transaction.list(CONTROL_SELF_PREFIX);
+        try {
+            for (const [key, encoded] of markers) {
+                let marker: ReturnType<typeof decodeControlSelfMarker> | undefined;
+                try {
+                    marker = decodeControlSelfMarker(encoded);
+                    if (marker.topicId === topicId && marker.sequence <= through) {
+                        await transaction.delete(key);
+                    }
+                } finally {
+                    marker?.fingerprint.fill(0);
+                }
+            }
+        } finally {
+            for (const encoded of markers.values()) {
+                zeroBytes(encoded);
+            }
+        }
+    }
+
+    async #clearQuarantineTopic(transaction: StoreTransaction, topicId: string): Promise<void> {
+        const records = await transaction.list(`${QUARANTINE_PREFIX}${topicId}/`);
+        try {
+            for (const key of records.keys()) {
+                await transaction.delete(key);
+            }
+        } finally {
+            for (const encoded of records.values()) {
+                zeroBytes(encoded);
+            }
+        }
+    }
+
+    async #recordGroupReplay(
+        transaction: StoreTransaction,
+        groupId: string,
+        fingerprint: Uint8Array,
+        sequence: bigint,
+    ): Promise<void> {
+        const orderKey = groupReplayOrderKey(groupId, sequence % MAXIMUM_GROUP_REPLAY_MARKERS);
+        const expiredFingerprint = await transaction.get(orderKey);
+        if (expiredFingerprint !== undefined) {
+            try {
+                await transaction.delete(groupReplayKey(groupId, expiredFingerprint));
+            } finally {
+                zeroBytes(expiredFingerprint);
+            }
+        }
+        await transaction.set(groupReplayKey(groupId, fingerprint), fingerprint);
+        await transaction.set(orderKey, fingerprint);
     }
 
     async #quarantine(
@@ -3054,13 +3729,24 @@ export class MurmurEngine {
         sequence: bigint,
         event: SignedRelayEvent,
     ): Promise<void> {
-        const key = `${QUARANTINE_PREFIX}${topicId}/${sequenceKey(sequence)}`;
-        const encoded = encodeSignedRelayEventWire(event);
-        const existing = await transaction.get(key);
-        if (existing !== undefined && !equalBytes(existing, encoded)) {
-            throw new Error("Quarantine sequence collision");
+        const slot = sequence % MAXIMUM_QUARANTINE_RECORDS_PER_TOPIC;
+        const key = `${QUARANTINE_PREFIX}${topicId}/${sequenceKey(slot)}`;
+        const fingerprint = hashBytes(event.payload);
+        const encoded = utf8Encode(
+            JSON.stringify({
+                version: 1,
+                sequence: sequence.toString(),
+                eventId: event.id,
+                fingerprint: encodeBase64Url(fingerprint),
+                reason: "invalid-event",
+            }),
+        );
+        try {
+            await transaction.set(key, encoded);
+        } finally {
+            zeroBytes(fingerprint);
+            zeroBytes(encoded);
         }
-        await transaction.set(key, encoded);
     }
 
     async #mutation<Result>(operation: () => Promise<Result>): Promise<Result> {

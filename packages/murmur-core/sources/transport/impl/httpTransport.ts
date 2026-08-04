@@ -115,11 +115,12 @@ export class HttpRelayTransport implements RelayTransport {
     }
 
     /** Publish one signed durable event. */
-    async publish(event: SignedRelayEvent): Promise<PublishOutcome> {
+    async publish(event: SignedRelayEvent, signal?: AbortSignal): Promise<PublishOutcome> {
         const response = await this.#fetch(`${this.#baseUrl}/v1/events`, {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: body(encodeSignedRelayEventWire(event)),
+            ...(signal === undefined ? {} : { signal }),
         });
         const input = object(
             JSON.parse(utf8Decode(await responseBytes(response, 4096))) as unknown,

@@ -1,4 +1,5 @@
 import type { IdentityProfile } from "../identity/index.js";
+export { MurmurKeyPackagePoolExhaustedError } from "./errors.js";
 import { MurmurEngine } from "./impl/engine.js";
 import type { MurmurFriends, MurmurGroups, MurmurOpenOptions, MurmurSyncOptions } from "./types.js";
 

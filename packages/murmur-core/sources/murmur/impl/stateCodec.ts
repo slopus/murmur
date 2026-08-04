@@ -25,6 +25,19 @@ export interface RelayOutboxRecord {
     readonly attempted: boolean;
 }
 
+export interface ControlSelfMarker {
+    readonly topicId: string;
+    readonly sequence: bigint;
+    readonly fingerprint: Uint8Array;
+}
+
+export interface DeferredInvitationRecord {
+    readonly peer: Uint8Array;
+    readonly messageId: string;
+    readonly fingerprint: Uint8Array;
+    readonly frame: Uint8Array;
+}
+
 export interface StoredGroup {
     readonly id: string;
     readonly descriptor: Uint8Array;
@@ -64,6 +77,7 @@ export interface StagedGroupCommit {
     readonly eventId: string;
     readonly fingerprint: Uint8Array;
     readonly currentEpoch: bigint;
+    readonly currentGeneration: bigint;
     readonly nextEpoch: Uint8Array;
     readonly type: "add" | "remove";
     readonly peer: Uint8Array;
@@ -246,13 +260,85 @@ export function decodeRelayOutbox(encoded: Uint8Array): RelayOutboxRecord {
     } else {
         throw new Error("Invalid relay outbox purpose");
     }
+    const eventBytes = bytes(value.event, "relay outbox event", 4 * 1024 * 1024);
+    try {
+        return {
+            event: decodeSignedRelayEventWire(eventBytes),
+            purpose: decodedPurpose,
+            attempted: value.attempted,
+        };
+    } finally {
+        eventBytes.fill(0);
+    }
+}
+
+/** Encode the bounded cursor consequence for one published control echo. */
+export function encodeControlSelfMarker(marker: ControlSelfMarker): Uint8Array {
+    return utf8Encode(
+        JSON.stringify({
+            version: 1,
+            topicId: marker.topicId,
+            sequence: marker.sequence.toString(),
+            fingerprint: encodeBase64Url(marker.fingerprint),
+        }),
+    );
+}
+
+/** Decode one pending control-echo cursor consequence. */
+export function decodeControlSelfMarker(encoded: Uint8Array): ControlSelfMarker {
+    const value = exactParsed(
+        encoded,
+        ["version", "topicId", "sequence", "fingerprint"],
+        "control self marker",
+    );
+    if (value.version !== 1) {
+        throw new Error("Invalid control self marker");
+    }
     return {
-        event: decodeSignedRelayEventWire(
-            bytes(value.event, "relay outbox event", 4 * 1024 * 1024),
-        ),
-        purpose: decodedPurpose,
-        attempted: value.attempted,
+        topicId: id(value.topicId, "control topic ID", 32),
+        sequence: uint64(value.sequence, "control sequence"),
+        fingerprint: bytes(value.fingerprint, "control fingerprint", 32, 32),
     };
+}
+
+/** Encode one bounded deferred group invitation. */
+export function encodeDeferredInvitation(record: DeferredInvitationRecord): Uint8Array {
+    return utf8Encode(
+        JSON.stringify({
+            version: 1,
+            peer: encodeBase64Url(record.peer),
+            messageId: record.messageId,
+            fingerprint: encodeBase64Url(record.fingerprint),
+            frame: encodeBase64Url(record.frame),
+        }),
+    );
+}
+
+/** Decode one deferred group invitation. */
+export function decodeDeferredInvitation(encoded: Uint8Array): DeferredInvitationRecord {
+    const value = exactParsed(
+        encoded,
+        ["version", "peer", "messageId", "fingerprint", "frame"],
+        "deferred invitation",
+    );
+    if (value.version !== 1) {
+        throw new Error("Invalid deferred invitation");
+    }
+    let peer: Uint8Array | undefined;
+    let fingerprint: Uint8Array | undefined;
+    let frame: Uint8Array | undefined;
+    try {
+        peer = bytes(value.peer, "deferred invitation peer", 32, 32);
+        const messageId = id(value.messageId, "deferred invitation message ID", 24);
+        fingerprint = bytes(value.fingerprint, "deferred invitation fingerprint", 32, 32);
+        frame = bytes(value.frame, "deferred invitation frame", 1024 * 1024);
+        return { peer, messageId, fingerprint, frame };
+    } catch (error: unknown) {
+        peer?.fill(0);
+        fingerprint?.fill(0);
+        frame?.fill(0);
+        throw error;
+    }
 }
 
 /** Encode one durable group metadata record. */
@@ -405,6 +491,7 @@ export function encodeStagedCommit(staged: StagedGroupCommit): Uint8Array {
             eventId: staged.eventId,
             fingerprint: encodeBase64Url(staged.fingerprint),
             currentEpoch: staged.currentEpoch.toString(),
+            currentGeneration: staged.currentGeneration.toString(),
             nextEpoch: encodeBase64Url(staged.nextEpoch),
             type: staged.type,
             peer: encodeBase64Url(staged.peer),
@@ -428,6 +515,7 @@ export function decodeStagedCommit(encoded: Uint8Array): StagedGroupCommit {
             "eventId",
             "fingerprint",
             "currentEpoch",
+            "currentGeneration",
             "nextEpoch",
             "type",
             "peer",
@@ -440,34 +528,63 @@ export function decodeStagedCommit(encoded: Uint8Array): StagedGroupCommit {
     if (value.version !== 1 || (value.type !== "add" && value.type !== "remove")) {
         throw new Error("Invalid staged group Commit");
     }
-    const keyPackageReference = nullableBytes(
-        value.keyPackageReference,
-        "staged KeyPackage reference",
-        32,
-        32,
-    );
-    const welcome = nullableBytes(value.welcome, "staged Welcome", 16 * 1024 * 1024);
-    const tree = nullableBytes(value.tree, "staged ratchet tree", 16 * 1024 * 1024);
-    if (
-        (value.type === "add" &&
-            (keyPackageReference === undefined || welcome === undefined || tree === undefined)) ||
-        (value.type === "remove" &&
-            (keyPackageReference !== undefined || welcome !== undefined || tree !== undefined))
-    ) {
-        throw new Error("Invalid staged group Commit material");
+    let keyPackageReference: Uint8Array | undefined;
+    let welcome: Uint8Array | undefined;
+    let tree: Uint8Array | undefined;
+    let fingerprint: Uint8Array | undefined;
+    let nextEpoch: Uint8Array | undefined;
+    let peer: Uint8Array | undefined;
+    try {
+        keyPackageReference = nullableBytes(
+            value.keyPackageReference,
+            "staged KeyPackage reference",
+            32,
+            32,
+        );
+        welcome = nullableBytes(value.welcome, "staged Welcome", 16 * 1024 * 1024);
+        tree = nullableBytes(value.tree, "staged ratchet tree", 16 * 1024 * 1024);
+        if (
+            (value.type === "add" &&
+                (keyPackageReference === undefined ||
+                    welcome === undefined ||
+                    tree === undefined)) ||
+            (value.type === "remove" &&
+                (keyPackageReference !== undefined || welcome !== undefined || tree !== undefined))
+        ) {
+            throw new Error("Invalid staged group Commit material");
+        }
+        const operationId = id(value.operationId, "group operation ID", 24);
+        const eventId = id(value.eventId, "relay event ID", 32);
+        fingerprint = bytes(value.fingerprint, "Commit fingerprint", 32, 32);
+        const currentEpoch = uint64(value.currentEpoch, "staged current epoch");
+        const currentGeneration = uint64(
+            value.currentGeneration,
+            "staged current persistence generation",
+        );
+        nextEpoch = bytes(value.nextEpoch, "staged next epoch", 64 * 1024 * 1024);
+        peer = bytes(value.peer, "staged peer", 32, 32);
+        return {
+            operationId,
+            eventId,
+            fingerprint,
+            currentEpoch,
+            currentGeneration,
+            nextEpoch,
+            type: value.type,
+            peer,
+            ...(keyPackageReference === undefined ? {} : { keyPackageReference }),
+            ...(welcome === undefined ? {} : { welcome }),
+            ...(tree === undefined ? {} : { tree }),
+        };
+    } catch (error: unknown) {
+        keyPackageReference?.fill(0);
+        welcome?.fill(0);
+        tree?.fill(0);
+        fingerprint?.fill(0);
+        nextEpoch?.fill(0);
+        peer?.fill(0);
+        throw error;
     }
-    return {
-        operationId: id(value.operationId, "group operation ID", 24),
-        eventId: id(value.eventId, "relay event ID", 32),
-        fingerprint: bytes(value.fingerprint, "Commit fingerprint", 32, 32),
-        currentEpoch: uint64(value.currentEpoch, "staged current epoch"),
-        nextEpoch: bytes(value.nextEpoch, "staged next epoch", 64 * 1024 * 1024),
-        type: value.type,
-        peer: bytes(value.peer, "staged peer", 32, 32),
-        ...(keyPackageReference === undefined ? {} : { keyPackageReference }),
-        ...(welcome === undefined ? {} : { welcome }),
-        ...(tree === undefined ? {} : { tree }),
-    };
 }
 
 /** Encode one authenticated retained group application event. */

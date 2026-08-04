@@ -139,7 +139,7 @@ export function createUnlinkableEvent(topic: ReadTopic, payload: Uint8Array): Si
 export function createCapabilityEvent(
     access: TopicAccess,
     payload: Uint8Array,
-    options: { readonly expiresAt?: number } = {},
+    options: { readonly expiresAt?: number; readonly createdAt?: number } = {},
 ): SignedRelayEvent {
     if (
         access.topic.type !== "read-write" ||
@@ -156,6 +156,7 @@ export function createCapabilityEvent(
         },
         access.topic,
         payload,
-        options,
+        options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt },
+        options.createdAt,
     );
 }

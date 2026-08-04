@@ -34,6 +34,12 @@ minimum generation to reject stale checkpoints. Whole-storage rollback requires
 an external rollback-resistant counter; no local serialization format can
 detect an attacker reverting both the checkpoint and its metadata.
 
+`rebasePersistenceGeneration()` may only raise that local counter. It leaves
+the authenticated MLS context, transcript, TreeKEM state, epoch secrets, and
+Secret Tree frontier unchanged. The stateful facade uses it when
+current-epoch applications arrive after a next epoch was staged but before its
+Commit echo.
+
 Durable inbound processing uses `openWithCheckpoint()`. It rolls the Secret Tree
 and generation back if authentication or checkpoint serialization fails, so a
 valid delivery is never hidden after its one-time key was consumed.
@@ -41,9 +47,10 @@ valid delivery is never hidden after its one-time key was consumed.
 For an outbound Commit, persist the Commit bytes plus
 `transition.serialize()` and `transition.persistenceGeneration` in the same
 transaction before publication. Adopt the already-checkpointed transition only
-after publication is confirmed. Both inbound opens and outbound seals are
-blocked while a transition is staged so the staged checkpoint cannot lose a
-later current-epoch ratchet mutation.
+when that exact Commit wins relay order; a publication result never adopts it.
+The facade stages from a clone, so the live current epoch can still process
+earlier relay-ordered applications. Echo adoption rebases the staged
+checkpoint's local generation above those application mutations.
 
 ```text
 active epoch E

@@ -542,6 +542,26 @@ export class MlsEpochState {
         }
     }
 
+    /**
+     * Raise only the local rollback-protection generation.
+     *
+     * This does not alter the authenticated MLS context, epoch secrets, tree,
+     * transcript, or Secret Tree frontier. It is used when a separately
+     * staged next epoch is adopted after the live current epoch has consumed
+     * additional application ratchets.
+     */
+    rebasePersistenceGeneration(generation: bigint): void {
+        this.#ensureActive();
+        if (
+            this.#transitionState !== "idle" ||
+            generation < this.#persistenceGeneration ||
+            generation > MAXIMUM_PERSISTENCE_GENERATION
+        ) {
+            throw new Error("Invalid MLS persistence generation rebase");
+        }
+        this.#persistenceGeneration = generation;
+    }
+
     /** Sign and encrypt application bytes as the local member. */
     seal(
         applicationData: Uint8Array,
