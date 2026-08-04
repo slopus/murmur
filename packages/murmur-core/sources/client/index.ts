@@ -176,7 +176,7 @@ export class MurmurClient {
                 controller.abort();
             }
         }
-        for (const { topicId, cursorKey, cursor, page } of reads) {
+        for (const { topicId, cursor, page } of reads) {
             if (page.head < cursor) {
                 throw new Error("Relay returned a topic head behind the durable cursor");
             }
@@ -184,6 +184,28 @@ export class MurmurClient {
                 if (!page.exhausted) {
                     throw new Error("Relay returned an empty non-exhausted event page");
                 }
+                continue;
+            }
+            let previousSequence = cursor;
+            for (const retained of page.events) {
+                if (
+                    retained.seq <= previousSequence ||
+                    retained.seq > page.head ||
+                    relayTopicId(retained.event.topic) !== topicId ||
+                    !verifyRelayEvent(retained.event) ||
+                    (retained.event.topic.type !== "read" &&
+                        !equalBytes(
+                            retained.event.author.signingKey,
+                            retained.event.topic.writeKey,
+                        ))
+                ) {
+                    throw new Error("Relay returned an invalid ordered event page");
+                }
+                previousSequence = retained.seq;
+            }
+        }
+        for (const { topicId, cursorKey, cursor, page } of reads) {
+            if (page.events.length === 0) {
                 await this.#store.transaction(async (transaction) => {
                     const current = parseCursor(await transaction.get(cursorKey));
                     if (page.head > current) {
@@ -196,22 +218,7 @@ export class MurmurClient {
             this.#pending.set(topicId, pending);
             let previousSequence = cursor;
             for (let index = 0; index < page.events.length; index += 1) {
-                const retained = page.events[index];
-                if (
-                    retained === undefined ||
-                    retained.seq <= previousSequence ||
-                    retained.seq > page.head ||
-                    relayTopicId(retained.event.topic) !== topicId ||
-                    !verifyRelayEvent(retained.event) ||
-                    (retained.event.topic.type !== "read" &&
-                        !equalBytes(
-                            retained.event.author.signingKey,
-                            retained.event.topic.writeKey,
-                        ))
-                ) {
-                    this.#pending.delete(topicId);
-                    throw new Error("Relay returned an invalid ordered event page");
-                }
+                const retained = page.events[index]!;
                 const isLast = index === page.events.length - 1;
                 const target = isLast && page.exhausted ? page.head : retained.seq;
                 const expectedCursor = previousSequence;

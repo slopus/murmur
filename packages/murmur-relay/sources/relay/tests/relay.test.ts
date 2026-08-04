@@ -277,4 +277,35 @@ describe("ordered relay", () => {
         now += 2;
         await expect(relay.issueReadChallenge(topic)).resolves.toBeDefined();
     });
+
+    test("runtime-validates direct read cursors, topics, and proof shapes", async () => {
+        const relay = service();
+        const owner = randomBytes(32);
+        const publicTopic = {
+            type: "write" as const,
+            name: "direct-runtime",
+            writeKey: ed25519.getPublicKey(owner),
+        };
+        await expect(relay.readEvents(publicTopic, 0.5 as unknown as bigint)).rejects.toMatchObject(
+            { status: 400, body: { error: "malformed" } },
+        );
+        await expect(
+            relay.readEvents({ ...publicTopic, extra: true } as unknown as RelayTopic, 0n),
+        ).rejects.toMatchObject({ status: 400 });
+
+        const protectedTopic = {
+            type: "read" as const,
+            name: "protected-runtime",
+            readKey: ed25519.getPublicKey(owner),
+        };
+        await expect(
+            relay.readEvents(protectedTopic, 0n, 256, 0, {} as ReadProof),
+        ).rejects.toMatchObject({ status: 400, body: { error: "malformed" } });
+        await expect(
+            relay.readEvents(protectedTopic, 0n, 256, 0, {
+                challengeId: "missing",
+                signature: new Uint8Array(64),
+            }),
+        ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
+    });
 });

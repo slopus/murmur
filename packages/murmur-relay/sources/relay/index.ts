@@ -46,6 +46,28 @@ function positiveInteger(value: number, name: string): number {
     return value;
 }
 
+function validatedReadProof(value: unknown): ReadProof | undefined {
+    if (value === undefined) return undefined;
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new RelayError(400, "Invalid read proof", { error: "malformed" });
+    }
+    const proof = value as Record<string, unknown>;
+    if (
+        Object.keys(proof).length !== 2 ||
+        !Object.hasOwn(proof, "challengeId") ||
+        !Object.hasOwn(proof, "signature") ||
+        typeof proof.challengeId !== "string" ||
+        !(proof.signature instanceof Uint8Array) ||
+        proof.signature.length !== 64
+    ) {
+        throw new RelayError(400, "Invalid read proof", { error: "malformed" });
+    }
+    return {
+        challengeId: proof.challengeId,
+        signature: proof.signature,
+    };
+}
+
 function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
     const resolved = {
         maximumEventPayloadBytes: positiveInteger(
@@ -235,7 +257,9 @@ export class RelayService {
         maximumEncodedBytes: number = Number.MAX_SAFE_INTEGER,
     ): Promise<EventPage> {
         this.#assertOpen();
+        validateRelayTopic(topic);
         if (
+            typeof since !== "bigint" ||
             since < 0n ||
             since > MAXIMUM_SEQUENCE ||
             !Number.isSafeInteger(limit) ||
@@ -249,7 +273,8 @@ export class RelayService {
         ) {
             throw new RelayError(400, "Invalid event read", { error: "malformed" });
         }
-        await this.#authorizeRead(topic, since, limit, waitMilliseconds, proof);
+        const checkedProof = validatedReadProof(proof);
+        await this.#authorizeRead(topic, since, limit, waitMilliseconds, checkedProof);
         const topicId = relayTopicId(topic);
         const constraints: PageReadConstraints = { maximumEncodedBytes };
         const current = await this.#store.readEvents(

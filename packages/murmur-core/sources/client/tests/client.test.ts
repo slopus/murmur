@@ -40,6 +40,24 @@ class OrderedTransport implements RelayTransport {
     }
 }
 
+class PerTopicTransport implements RelayTransport {
+    readonly pages = new Map<string, EventPage>();
+
+    async publish(_event: SignedRelayEvent): Promise<{ seq: bigint; duplicate: boolean }> {
+        return { seq: 1n, duplicate: false };
+    }
+
+    async readEvents(access: TopicAccess): Promise<EventPage> {
+        return (
+            this.pages.get(relayTopicId(access.topic)) ?? {
+                events: [],
+                head: 0n,
+                exhausted: true,
+            }
+        );
+    }
+}
+
 describe("single-relay stateful client", () => {
     test("advances durable cursors across legal sequence holes", async () => {
         const identity = generateIdentityKeyPair();
@@ -226,5 +244,53 @@ describe("single-relay stateful client", () => {
         });
         client.subscribe({ topic });
         await expect(client.sync()).rejects.toThrow("invalid ordered event page");
+    });
+
+    test("does not strand an earlier valid topic when a later page is malicious", async () => {
+        const identity = generateIdentityKeyPair();
+        const attacker = generateIdentityKeyPair();
+        const firstTopic = {
+            type: "write" as const,
+            name: "first-valid",
+            writeKey: identity.signingKey,
+        };
+        const secondTopic = {
+            type: "write" as const,
+            name: "second-malicious",
+            writeKey: identity.signingKey,
+        };
+        const firstEvent = createRelayEvent(identity, firstTopic, new Uint8Array([1]), {}, 1);
+        const malicious = createRelayEvent(attacker, secondTopic, new Uint8Array([2]), {}, 1);
+        const transport = new PerTopicTransport();
+        transport.pages.set(relayTopicId(firstTopic), {
+            events: [{ seq: 1n, event: firstEvent }],
+            head: 1n,
+            exhausted: true,
+        });
+        transport.pages.set(relayTopicId(secondTopic), {
+            events: [{ seq: 1n, event: malicious }],
+            head: 1n,
+            exhausted: true,
+        });
+        const client = new MurmurClient({
+            identity,
+            store: new MemoryMurmurStore(),
+            transport,
+        });
+        client.subscribe({ topic: firstTopic });
+        client.subscribe({ topic: secondTopic });
+        await expect(client.sync()).rejects.toThrow("invalid ordered event page");
+
+        const corrected = createRelayEvent(identity, secondTopic, new Uint8Array([2]), {}, 1);
+        transport.pages.set(relayTopicId(secondTopic), {
+            events: [{ seq: 1n, event: corrected }],
+            head: 1n,
+            exhausted: true,
+        });
+        const recovered = await client.sync();
+        expect(recovered.events.map(({ event }) => event.topic.name).sort()).toEqual([
+            "first-valid",
+            "second-malicious",
+        ]);
     });
 });
