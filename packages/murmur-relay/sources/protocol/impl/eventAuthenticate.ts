@@ -28,7 +28,7 @@ export function verifyRelayEventSignature(event: SignedRelayEvent): boolean {
     }
 }
 
-/** Hash the canonical signature preimage for topic-local idempotency. */
+/** Hash the full canonical signed event, including its signature, for idempotency. */
 export function relayEventFingerprint(event: SignedRelayEvent): Uint8Array {
     return sha256(canonicalJson(signedRelayEventToJson(event)));
 }

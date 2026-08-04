@@ -19,12 +19,15 @@ crosses the relay boundary.
 
 Each topic contains only an ordered event store. A missing `expiresAt` makes an
 event durable. Publishing with a `collapseKey` atomically removes older retained
-events carrying the same key in that topic. Relay sequences are never reused, so
-expiration and collapse create intentional cursor holes.
+events from the same author carrying the same key in that topic. Collapse
+follows relay arrival order, so applications must authenticate a logical
+version in opaque payloads and reject delayed state regressions. Relay sequences
+are never reused, so expiration and collapse create intentional cursor holes.
 
 Read pages include `exhausted`; clients advance across trailing holes to the
 topic head only when it is true. Exact authenticated retries keep their original
-sequence even after timestamp or explicit event expiration.
+sequence even after they would fail current future-skew or elapsed-expiration
+checks.
 
 ## Run
 

@@ -78,6 +78,12 @@ author signing key with the same collapse key. The replacement event must
 contain complete replacement content. On public-write `read` topics, one author
 therefore cannot collapse another author's event.
 
+Collapse is ordered by relay arrival, not `createdAt` or any application
+version. A delayed publication of older logical state can arrive later and
+supersede newer retained state. Applications using collapse must authenticate a
+logical version inside the opaque payload and reject regressions when applying
+events. The relay does not interpret that version.
+
 Every accepted new event receives a monotonically increasing per-topic
 sequence. Expiration and collapse create legal holes; sequences are never
 reused. The topic head is the greatest sequence ever allocated.

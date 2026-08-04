@@ -102,6 +102,13 @@ public-write `Read Topic` from collapsing one another's state. Clients use
 collapse only when the new payload completely replaces the author's earlier
 state.
 
+Collapse follows relay arrival order, not an application timestamp or logical
+version. A delayed publication carrying older logical state can therefore
+arrive later and supersede newer retained state. Applications that use collapse
+must carry an authenticated logical version in the opaque payload and reject
+regressions when applying events; the relay deliberately does not interpret
+that version.
+
 The relay's head sequence never decreases. Removed events therefore produce
 legal holes:
 
