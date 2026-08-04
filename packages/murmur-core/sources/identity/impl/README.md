@@ -1,5 +1,5 @@
 # Identity implementation
 
-Profile JSON encoding and validation, plus the strict durable FriendRecord
-codec and legacy active-contact upgrade. Cryptographic operations remain in
-the `crypto` domain.
+Strict clean-rewrite codecs for the single public identity key, authenticated
+friend requests/responses, profiles, and durable lifecycle records. There are
+no legacy two-key decoders or migration branches.

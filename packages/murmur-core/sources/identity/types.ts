@@ -1,52 +1,167 @@
-import type { IdentityPublicKeys } from "../crypto/index.js";
+import type { IdentityPublicKey } from "../crypto/index.js";
+import type { StoreTransaction } from "../storage/index.js";
 
-/** Small user-controlled contact profile. */
+/** Small authenticated profile controlled by its identity. */
 export interface IdentityProfile {
     readonly name: string;
     readonly avatar?: Uint8Array;
     readonly metadata?: Readonly<Record<string, string>>;
 }
 
-/** Public identity representation used at transport boundaries. */
+/** The complete public wire representation of an identity. */
 export interface SerializedPublicIdentity {
-    readonly signingKey: string;
-    readonly encryptionKey: string;
+    readonly publicKey: string;
 }
 
-/** Opaque encrypted profile carried by a relay event. */
-export interface EncryptedProfile {
+/** Encrypted first-contact request addressed to one identity inbox. */
+export interface FriendRequestEnvelope {
     readonly version: 1;
+    readonly type: "friend-request";
     readonly recipient: string;
     readonly ephemeralPublicKey: string;
     readonly nonce: string;
     readonly ciphertext: string;
 }
 
-/** Result of authenticating and decrypting a contact profile and private data. */
-export interface OpenedProfile {
-    readonly identity: IdentityPublicKeys;
+/** Authenticated request content recovered by its intended recipient. */
+export interface OpenedFriendRequest {
+    readonly id: string;
+    readonly sender: IdentityPublicKey;
+    readonly responseAddress: string;
     readonly profile: IdentityProfile;
     readonly privateData?: Uint8Array;
 }
 
-/** Authenticated contact persisted locally by one identity. */
-export interface Contact {
-    readonly identity: IdentityPublicKeys;
+/** Decision returned for one authenticated friend request. */
+export type FriendResponseDecision = "accepted" | "rejected";
+
+/** Encrypted response addressed back to the request author. */
+export interface FriendResponseEnvelope {
+    readonly version: 1;
+    readonly type: "friend-response";
+    readonly recipient: string;
+    readonly ephemeralPublicKey: string;
+    readonly nonce: string;
+    readonly ciphertext: string;
+}
+
+/** Authenticated response content recovered by the original requester. */
+export type OpenedFriendResponse =
+    | {
+          readonly id: string;
+          readonly requestId: string;
+          readonly responder: IdentityPublicKey;
+          readonly decision: "accepted";
+          readonly responseAddress: string;
+          readonly profile: IdentityProfile;
+          readonly privateData?: Uint8Array;
+      }
+    | {
+          readonly id: string;
+          readonly requestId: string;
+          readonly responder: IdentityPublicKey;
+          readonly decision: "rejected";
+      };
+
+/** Inputs signed and encrypted into a friend request. */
+export interface FriendRequestInput {
+    readonly id: string;
+    readonly responseAddress: string;
     readonly profile: IdentityProfile;
-    readonly addedAt: number;
+    readonly privateData?: Uint8Array;
+}
+
+/** Inputs signed and encrypted into a friend response. */
+export type FriendResponseInput =
+    | {
+          readonly id: string;
+          readonly requestId: string;
+          readonly decision: "accepted";
+          readonly responseAddress: string;
+          readonly profile: IdentityProfile;
+          readonly privateData?: Uint8Array;
+      }
+    | {
+          readonly id: string;
+          readonly requestId: string;
+          readonly decision: "rejected";
+      };
+
+/** Durable lifecycle state for one peer identity. */
+export type FriendStatus = "pending-incoming" | "pending-outgoing" | "active" | "ended";
+
+/** Durable friend state, including bootstrap routing and opaque private data. */
+export interface FriendRecord {
+    readonly identity: IdentityPublicKey;
+    readonly status: FriendStatus;
+    readonly requestId: string;
+    readonly profile?: IdentityProfile;
+    readonly peerResponseAddress?: string;
+    readonly privateData?: Uint8Array;
+    readonly createdAt: number;
     readonly updatedAt: number;
 }
 
-/** Durable friend lifecycle state. Records are retained after removal. */
-export type FriendStatus = "active" | "removed";
-
-/** Authenticated identity/profile record retained for the owner's lifetime. */
-export interface FriendRecord extends Contact {
-    readonly status: FriendStatus;
-    readonly statusUpdatedAt: number;
+/** Result of accepting an inbound request or response into durable state. */
+export interface FriendAcceptance<RecordType extends FriendRecord = FriendRecord> {
+    readonly status: "opened" | "duplicate";
+    readonly record: RecordType;
 }
 
-/** Visibility options for friend lookups. Removed records are hidden by default. */
-export interface FriendQuery {
-    readonly includeRemoved?: boolean;
+/** A response plus the state transition committed before it is published. */
+export interface PreparedFriendResponse {
+    readonly envelope: FriendResponseEnvelope;
+    readonly record: FriendRecord;
 }
+
+/** Caller-owned outbox persistence committed with an outgoing request. */
+export type PersistFriendRequest = (
+    transaction: StoreTransaction,
+    envelope: FriendRequestEnvelope,
+) => Promise<void>;
+
+/** Caller-owned outbox persistence committed with an outgoing response. */
+export type PersistFriendResponse = (
+    transaction: StoreTransaction,
+    envelope: FriendResponseEnvelope,
+) => Promise<void>;
+
+/** Retention requested for an opaque friend-control payload. */
+export type FriendControlRetention =
+    | { readonly kind: "durable" }
+    | { readonly kind: "temporary"; readonly expiresAt: number };
+
+/** Opaque control content sent on the non-MLS friend channel. */
+export interface FriendControlMessage {
+    readonly id: string;
+    readonly sentAt: number;
+    readonly retention: FriendControlRetention;
+    readonly payload: Uint8Array;
+}
+
+/** Encrypted and identity-signed friend-control wire envelope. */
+export interface FriendControlEnvelope {
+    readonly version: 1;
+    readonly type: "friend-control";
+    readonly sender: SerializedPublicIdentity;
+    readonly recipient: string;
+    readonly nonce: string;
+    readonly ciphertext: string;
+}
+
+/** Authenticated control content recovered from a friend channel. */
+export interface OpenedFriendControl {
+    readonly sender: IdentityPublicKey;
+    readonly message: FriendControlMessage;
+}
+
+/** Durable replay result for a friend-control envelope. */
+export interface AcceptedFriendControl extends OpenedFriendControl {
+    readonly status: "opened" | "duplicate";
+}
+
+/** Application persistence performed atomically with replay acceptance. */
+export type PersistFriendControl = (
+    transaction: StoreTransaction,
+    opened: OpenedFriendControl,
+) => Promise<void>;

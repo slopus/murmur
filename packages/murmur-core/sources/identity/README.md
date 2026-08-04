@@ -1,30 +1,41 @@
-# Identity
+# Identity and friends
 
-An identity combines independent Ed25519 signing and X25519 encryption keys.
-Profiles are signed by their owner and sealed directly to the contact who may
-read them.
+This domain implements the bootstrap before MLS. It has no relay client,
+arbitrary topic string, chat message, or group semantics.
 
-First contact uses `identityInboxTopic(signingKey)`. This topic is intentionally
-publicly derivable: anyone holding the identity token can read it. The sealed
-payload contains the sender identity, and the relay event uses a one-use signing
-identity. The public inbox therefore leaks that N unlinkable contact requests
-exist, but not which identities sent them. It must carry no ongoing chat
-traffic.
+## Friend exchange
 
-Optional private profile data, such as the CLI's MLS KeyPackage, is signed and
-sealed in the same envelope rather than exposed beside it.
+`createFriendRequest` signs an authenticated profile, an opaque response
+address, and optional application bytes, then seals all of it to the
+recipient's single public identity key. Only the recipient learns who sent the
+request and where a response belongs.
+
+`createFriendResponse` returns an authenticated accepted or rejected decision
+bound to the original request ID and requester. An accepted response includes
+the responder profile, response address, and optional private bootstrap bytes.
+
+`FriendBook` owns the durable state machine:
 
 ```text
-first contact: public inbox -> sealed profile
-ongoing chat:  X25519 shared secret -> pairwise capability topic
+none/ended -> pending-outgoing -> active/ended
+none/ended -> pending-incoming -> active/ended
+active     -> ended
 ```
 
-`pairwiseTopic(self, peer)` hashes an X25519 shared secret with a fixed domain
-and both encryption public keys in canonical order. Alice and Bob derive the
-same topic; public identity tokens alone do not reveal it.
+Inbound request/response fingerprints and lifecycle changes commit in the same
+`MurmurStore` transaction. Replays return `"duplicate"`; authenticated reuse of
+an ID with different content throws a typed collision error. Optional callbacks
+let applications persist an outgoing envelope in their outbox within the same
+transaction as the state transition.
 
-`FriendBook` never deletes an authenticated identity/profile record:
-`remove()` changes its status to `removed`, ordinary `get()`/`list()` hide it,
-and `{ includeRemoved: true }` reveals it for gapless protocol handling. Saving
-a later authenticated profile reactivates the friend while preserving
-`addedAt`. `ContactBook` remains the release-compatible active-only adapter.
+## Friend channel
+
+After acceptance, `FriendChannel` derives one shared encryption key and one
+opaque topic authorization key from X25519 agreement over the peers' single
+identity keys. It carries only opaque durable or expiring control bytes, such
+as profile changes, friendship termination, or a later MLS Welcome.
+
+Control payloads are AES-GCM encrypted with the shared channel key and also
+Ed25519-signed by their individual sender. `acceptFriendControl` commits an
+application effect and replay marker atomically. Normal two-person and
+multi-person conversation data belongs to MLS, not this channel.

@@ -1,4 +1,5 @@
 # Crypto implementation
 
-Mechanical sealed-box construction. It is intentionally isolated from identity
-profiles and transport wire formats.
+Mechanical recipient-sealed boxes live here. Identity conversion and validation
+remain in the public crypto domain; profile, friend, relay, and MLS formats do
+not enter this directory.

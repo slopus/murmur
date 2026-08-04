@@ -1,7 +1,7 @@
 {
     "name": "@slopus/murmur",
     "version": "0.1.13",
-    "description": "End-to-end encrypted messaging and MLS over dumb Murmur relays",
+    "description": "Stateful end-to-end encrypted communication over a dumb relay",
     "keywords": [
         "encrypted-messaging",
         "end-to-end-encryption",
@@ -48,10 +48,6 @@
             "types": "./dist/document/index.d.ts",
             "import": "./dist/document/index.js"
         },
-        "./directChat": {
-            "types": "./dist/directChat/index.d.ts",
-            "import": "./dist/directChat/index.js"
-        },
         "./identity": {
             "types": "./dist/identity/index.d.ts",
             "import": "./dist/identity/index.js"
@@ -59,10 +55,6 @@
         "./mls": {
             "types": "./dist/mls/index.d.ts",
             "import": "./dist/mls/index.js"
-        },
-        "./messaging": {
-            "types": "./dist/messaging/index.d.ts",
-            "import": "./dist/messaging/index.js"
         },
         "./sharedSession": {
             "types": "./dist/mls/sharedSession/index.d.ts",

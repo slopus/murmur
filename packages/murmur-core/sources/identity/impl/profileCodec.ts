@@ -1,4 +1,9 @@
-import { decodeBase64Url, encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
+import {
+    canonicalJsonBytes,
+    decodeBase64Url,
+    encodeBase64Url,
+    utf8Decode,
+} from "../../utils/index.js";
 import type { IdentityProfile } from "../types.js";
 
 interface SerializedProfile {
@@ -12,12 +17,30 @@ export function encodeProfilePayload(profile: IdentityProfile): Uint8Array {
     if (profile.name.length === 0 || profile.name.length > 256) {
         throw new Error("Profile name must contain 1 to 256 characters");
     }
+    if (!(profile.avatar === undefined || profile.avatar instanceof Uint8Array)) {
+        throw new Error("Invalid profile avatar");
+    }
+    if (
+        profile.metadata !== undefined &&
+        (typeof profile.metadata !== "object" ||
+            profile.metadata === null ||
+            Array.isArray(profile.metadata) ||
+            (Object.getPrototypeOf(profile.metadata) !== Object.prototype &&
+                Object.getPrototypeOf(profile.metadata) !== null) ||
+            Object.values(profile.metadata).some((value) => typeof value !== "string"))
+    ) {
+        throw new Error("Invalid profile metadata");
+    }
     const serialized: SerializedProfile = {
         name: profile.name,
         ...(profile.avatar === undefined ? {} : { avatar: encodeBase64Url(profile.avatar) }),
         ...(profile.metadata === undefined ? {} : { metadata: profile.metadata }),
     };
-    return utf8Encode(JSON.stringify(serialized));
+    return canonicalJsonBytes({
+        name: serialized.name,
+        ...(serialized.avatar === undefined ? {} : { avatar: serialized.avatar }),
+        ...(serialized.metadata === undefined ? {} : { metadata: serialized.metadata }),
+    });
 }
 
 /** Decode and validate a version-one profile. */
@@ -29,7 +52,8 @@ export function decodeProfilePayload(bytes: Uint8Array): IdentityProfile {
         !("name" in value) ||
         typeof value.name !== "string" ||
         value.name.length === 0 ||
-        value.name.length > 256
+        value.name.length > 256 ||
+        Object.keys(value).some((key) => !["name", "avatar", "metadata"].includes(key))
     ) {
         throw new Error("Invalid profile name");
     }
