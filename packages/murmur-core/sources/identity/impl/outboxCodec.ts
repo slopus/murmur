@@ -4,6 +4,7 @@ import {
     equalBytes,
     utf8Decode,
     utf8Encode,
+    zeroBytes,
 } from "../../utils/index.js";
 import type {
     FriendControlIntentOutboxItem,
@@ -260,7 +261,15 @@ export function decodeFriendOutboxItem(bytes: Uint8Array): FriendOutboxItem {
         : { ...common, kind: "response", envelope };
 }
 
-/** Compare an outbox item against exact persisted bytes. */
+/** Compare canonical strict semantic encodings, independent of JSON insertion order. */
 export function matchesFriendOutboxItem(item: FriendOutboxItem, persisted: Uint8Array): boolean {
-    return equalBytes(encodeFriendOutboxItem(item), persisted);
+    const decoded = decodeFriendOutboxItem(persisted);
+    const expected = encodeFriendOutboxItem(item);
+    const actual = encodeFriendOutboxItem(decoded);
+    try {
+        return equalBytes(expected, actual);
+    } finally {
+        zeroBytes(expected);
+        zeroBytes(actual);
+    }
 }

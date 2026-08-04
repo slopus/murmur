@@ -257,7 +257,9 @@ describe("durable friendship lifecycle and outbox", () => {
         await bobFriends.end(alice, 15);
         expect((await new FriendBook(alice, aliceStore).get(bob))?.status).toBe("ended");
         const aliceIntent = (await aliceFriends.listOutbox())[0];
-        const bobIntent = (await bobFriends.listOutbox())[0];
+        const bobIntent = (await bobFriends.listOutbox()).find(
+            (item) => item.kind === "control-intent",
+        );
         expect(aliceIntent).toMatchObject({
             kind: "control-intent",
             intent: { type: "friendship-ended" },
@@ -291,6 +293,37 @@ describe("durable friendship lifecycle and outbox", () => {
         ).rejects.toThrow("outbox unavailable");
         expect(await book.get(bob)).toBeUndefined();
         expect(await book.listOutbox()).toEqual([]);
+    });
+
+    it("compares canonical outbox semantics and rejects an unrelated persisted requester", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const mallory = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        const book = new FriendBook(alice, store);
+        const request = await book.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        const entries = await store.list("murmur/v1/friend-book/");
+        const outbox = [...entries].find(([key]) => key.includes("/outbox/"));
+        const record = [...entries].find(([key]) => key.includes("/records/"));
+        if (outbox === undefined || record === undefined) {
+            throw new Error("Expected persisted friend state");
+        }
+        const outboxJson = JSON.parse(utf8Decode(outbox[1])) as Record<string, unknown>;
+        await store.set(
+            outbox[0],
+            utf8Encode(JSON.stringify(Object.fromEntries(Object.entries(outboxJson).reverse()))),
+        );
+        expect(await book.confirmOutbox(request, "accepted")).toBe(true);
+
+        const recordJson = JSON.parse(utf8Decode(record[1])) as Record<string, unknown>;
+        recordJson.requester = { publicKey: identityId(mallory) };
+        await store.set(record[0], utf8Encode(JSON.stringify(recordJson)));
+        await expect(book.get(bob)).rejects.toThrow("neither owner nor peer");
     });
 
     it("converges simultaneous crossed requests on one canonical contender", async () => {
@@ -414,6 +447,7 @@ describe("durable friendship lifecycle and outbox", () => {
         }
 
         await friends.end(bob, 11);
+        expect((await friends.get(bob))?.nextRequestPredecessorId).toBe(pending.requestId);
         const terminalOutbox = await friends.listOutbox();
         expect(terminalOutbox.map((item) => item.kind).sort()).toEqual([
             "control-intent",
@@ -455,6 +489,118 @@ describe("durable friendship lifecycle and outbox", () => {
         ).resolves.toMatchObject({
             status: "duplicate",
             record: { status: "ended" },
+        });
+    });
+
+    it("retains an accepted response when the responder ends before publication", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceFriends = new FriendBook(alice, new MemoryMurmurStore());
+        const bobStore = new MemoryMurmurStore();
+        const bobFriends = new FriendBook(bob, bobStore);
+        const prepared = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 20,
+        });
+        await bobFriends.receiveRequest(prepared.envelope, 21);
+        await bobFriends.respond(alice, {
+            decision: "accepted",
+            profile: { name: "Bob" },
+            responseAddress: "bob-response",
+            now: 22,
+        });
+        await bobFriends.end(alice, 23);
+
+        const outbox = await new FriendBook(bob, bobStore).listOutbox();
+        expect(outbox.map((item) => item.kind).sort()).toEqual(["control-intent", "response"]);
+        expect((await bobFriends.get(alice))?.nextRequestPredecessorId).toBe(prepared.id);
+    });
+
+    it("accepts a responder successor before the original response or terminal arrives", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceFriends = new FriendBook(alice, new MemoryMurmurStore());
+        const bobFriends = new FriendBook(bob, new MemoryMurmurStore());
+        const first = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response-1",
+            now: 30,
+        });
+        await bobFriends.receiveRequest(first.envelope, 31);
+        const accepted = await bobFriends.respond(alice, {
+            decision: "accepted",
+            profile: { name: "Bob" },
+            responseAddress: "bob-response-1",
+            now: 32,
+        });
+        await bobFriends.end(alice, 33);
+        const successor = await bobFriends.createRequest(alice, {
+            profile: { name: "Bob successor" },
+            destination: "alice-inbox",
+            responseAddress: "bob-response-2",
+            now: 34,
+        });
+
+        await expect(aliceFriends.receiveRequest(successor.envelope, 35)).resolves.toMatchObject({
+            status: "opened",
+            record: {
+                status: "pending-incoming",
+                previousRequestId: first.id,
+            },
+        });
+        await expect(
+            aliceFriends.receiveResponse(bob, accepted.outbox.envelope, 36),
+        ).resolves.toMatchObject({
+            status: "superseded",
+            record: { requestId: successor.id },
+        });
+        const successorResponse = await aliceFriends.respond(bob, {
+            decision: "accepted",
+            profile: { name: "Alice successor" },
+            responseAddress: "alice-response-2",
+            now: 37,
+        });
+        await bobFriends.receiveResponse(alice, successorResponse.outbox.envelope, 38);
+        expect((await aliceFriends.get(bob))?.status).toBe("active");
+        expect((await bobFriends.get(alice))?.status).toBe("active");
+    });
+
+    it("accepts a successor before an original rejection arrives", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceFriends = new FriendBook(alice, new MemoryMurmurStore());
+        const bobFriends = new FriendBook(bob, new MemoryMurmurStore());
+        const first = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 40,
+        });
+        await bobFriends.receiveRequest(first.envelope, 41);
+        const rejected = await bobFriends.respond(alice, {
+            decision: "rejected",
+            now: 42,
+        });
+        await bobFriends.end(alice, 43);
+        const successor = await bobFriends.createRequest(alice, {
+            profile: { name: "Bob successor" },
+            destination: "alice-inbox",
+            responseAddress: "bob-response",
+            now: 44,
+        });
+
+        await aliceFriends.receiveRequest(successor.envelope, 45);
+        await expect(
+            aliceFriends.receiveResponse(bob, rejected.outbox.envelope, 46),
+        ).resolves.toMatchObject({
+            status: "superseded",
+            record: {
+                status: "pending-incoming",
+                requestId: successor.id,
+            },
         });
     });
 
@@ -542,86 +688,43 @@ describe("durable friendship lifecycle and outbox", () => {
         );
     });
 
-    it("does not treat a canceled unpublished request as mutually-known history", async () => {
+    it("uses a retained pending-end request as the immediate successor predecessor", async () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
         const aliceStore = new MemoryMurmurStore();
-        const bobStore = new MemoryMurmurStore();
         const aliceFriends = new FriendBook(alice, aliceStore);
-        await aliceFriends.createRequest(bob, {
+        const first = await aliceFriends.createRequest(bob, {
             profile: { name: "Alice" },
             destination: "bob-inbox",
             responseAddress: "alice-response",
             now: 1,
         });
         await aliceFriends.end(bob, 2);
-        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBeNull();
+        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBe(first.id);
 
-        const bobRequest = await new FriendBook(bob, bobStore).createRequest(alice, {
-            profile: { name: "Bob" },
-            destination: "alice-inbox",
-            responseAddress: "bob-response",
-            now: 3,
-        });
-        await expect(
-            new FriendBook(alice, aliceStore).receiveRequest(requestEnvelope(bobRequest), 3),
-        ).resolves.toMatchObject({
-            status: "opened",
-            record: {
-                status: "pending-incoming",
-                previousRequestId: null,
-                nextRequestPredecessorId: bobRequest.id,
-            },
-        });
-    });
-
-    it("lets both peers cancel unseen requests and later retry as a crossed pair", async () => {
-        const alice = generateIdentityKeyPair();
-        const bob = generateIdentityKeyPair();
-        const aliceStore = new MemoryMurmurStore();
-        const bobStore = new MemoryMurmurStore();
-        const aliceFriends = new FriendBook(alice, aliceStore);
-        const bobFriends = new FriendBook(bob, bobStore);
-        await aliceFriends.createRequest(bob, {
-            profile: { name: "Alice" },
-            destination: "bob-inbox",
-            responseAddress: "alice-response",
-            now: 1,
-        });
-        await bobFriends.createRequest(alice, {
-            profile: { name: "Bob" },
-            destination: "alice-inbox",
-            responseAddress: "bob-response",
-            now: 1,
-        });
-        await aliceFriends.end(bob, 2);
-        await bobFriends.end(alice, 2);
-
-        const restoredAlice = new FriendBook(alice, aliceStore);
-        const restoredBob = new FriendBook(bob, bobStore);
-        const aliceRetry = await restoredAlice.createRequest(bob, {
-            profile: { name: "Alice retry" },
+        const successor = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice successor" },
             destination: "bob-inbox",
             responseAddress: "alice-response-2",
             now: 3,
         });
-        const bobRetry = await restoredBob.createRequest(alice, {
-            profile: { name: "Bob retry" },
-            destination: "alice-inbox",
-            responseAddress: "bob-response-2",
-            now: 3,
+        expect(openFriendRequest(bob, successor.envelope)).toMatchObject({
+            id: successor.id,
+            previousRequestId: first.id,
         });
-        const aliceResult = await restoredAlice.receiveRequest(requestEnvelope(bobRetry), 4);
-        const bobResult = await restoredBob.receiveRequest(requestEnvelope(aliceRetry), 4);
-
-        expect([aliceResult.status, bobResult.status].sort()).toEqual(["opened", "superseded"]);
-        expect([aliceResult.record.previousRequestId, bobResult.record.previousRequestId]).toEqual([
-            null,
-            null,
-        ]);
+        const bobFriends = new FriendBook(bob, new MemoryMurmurStore());
+        await bobFriends.receiveRequest(first.envelope, 3);
+        await expect(bobFriends.receiveRequest(successor.envelope, 4)).resolves.toMatchObject({
+            status: "opened",
+            record: {
+                status: "pending-incoming",
+                requestId: successor.id,
+                previousRequestId: first.id,
+            },
+        });
     });
 
-    it("promotes a late response across a canceled unseen successor using the tracker edge", async () => {
+    it("does not let a late response regress a retained successor generation", async () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
         const aliceStore = new MemoryMurmurStore();
@@ -643,21 +746,21 @@ describe("durable friendship lifecycle and outbox", () => {
         }
         await aliceFriends.end(bob, 2);
 
-        await aliceFriends.createRequest(bob, {
+        const request2 = await aliceFriends.createRequest(bob, {
             profile: { name: "Alice 2" },
             destination: "bob-inbox",
             responseAddress: "alice-response-2",
             now: 3,
         });
         await aliceFriends.end(bob, 4);
-        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBeNull();
+        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBe(request2.id);
 
         await expect(
             new FriendBook(alice, aliceStore).receiveResponse(bob, response1.envelope, 5),
         ).resolves.toMatchObject({
             status: "superseded",
             record: {
-                nextRequestPredecessorId: request1.id,
+                nextRequestPredecessorId: request2.id,
             },
         });
 
@@ -669,13 +772,7 @@ describe("durable friendship lifecycle and outbox", () => {
         });
         await expect(
             new FriendBook(alice, aliceStore).receiveRequest(requestEnvelope(bobNext), 6),
-        ).resolves.toMatchObject({
-            status: "opened",
-            record: {
-                previousRequestId: request1.id,
-                nextRequestPredecessorId: bobNext.id,
-            },
-        });
+        ).rejects.toThrow("causal predecessor");
     });
 
     it("does not regress a newer shared predecessor from an older tracker response", async () => {
@@ -886,8 +983,34 @@ describe("friend control channel", () => {
             bobChannel.verifyTopicBytes(authorization, aliceChannel.signTopicBytes(authorization)),
         ).toBe(true);
         expect(bobChannel.open(envelope).message.payload).toEqual(message.payload);
+        const reverse = bobChannel.seal(
+            bobChannel.createMessage(utf8Encode("independent reverse direction")),
+        );
+        expect(utf8Decode(aliceChannel.open(reverse).message.payload)).toBe(
+            "independent reverse direction",
+        );
         expect(() => bobChannel.open({ ...envelope, nonce: "!".repeat(17) })).toThrow("ciphertext");
         zeroBytes(bobTopicSecret);
+    });
+
+    it("is sealed and idempotently unusable after destruction", () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const channel = new FriendChannel(alice, bob);
+        const message = channel.createMessage(utf8Encode("before destroy"));
+        channel.destroy();
+        channel.destroy();
+
+        expect(() => channel.self).toThrow("destroyed");
+        expect(() => channel.peer).toThrow("destroyed");
+        expect(() => channel.topicPublicKey).toThrow("destroyed");
+        expect(() => channel.exportTopicSecretKey()).toThrow("destroyed");
+        expect(() => channel.createMessage(new Uint8Array())).toThrow("destroyed");
+        expect(() => channel.seal(message)).toThrow("destroyed");
+        expect(() => channel.signTopicBytes(new Uint8Array())).toThrow("destroyed");
+        expect(() => channel.verifyTopicBytes(new Uint8Array(), new Uint8Array(64))).toThrow(
+            "destroyed",
+        );
     });
 
     it("rejects temporary control content at and after semantic expiration", async () => {

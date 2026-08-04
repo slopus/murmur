@@ -41,6 +41,8 @@ export interface JoinMlsGroupFromWelcomeOptions {
     readonly welcome: Uint8Array;
     readonly tree: MlsRatchetTree;
     readonly keyPackageBundle: MlsKeyPackageBundle;
+    /** Confirmation tag carried by the exact retained Commit named by the invitation. */
+    readonly expectedCommitConfirmationTag: Uint8Array;
 }
 
 /**
@@ -74,6 +76,7 @@ export function joinMlsGroupFromWelcome(options: JoinMlsGroupFromWelcomeOptions)
         welcome: options.welcome,
         keyPackageBundle: options.keyPackageBundle,
         expectedGroupId: options.groupId,
+        expectedCommitConfirmationTag: options.expectedCommitConfirmationTag,
         validateExternalTree: (groupInfo) => {
             const signer = options.tree.nodes[groupInfo.signer * 2];
             return equalBytes(groupInfo.context.treeHash, options.tree.treeHash()) &&

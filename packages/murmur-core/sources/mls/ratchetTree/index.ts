@@ -52,6 +52,10 @@ function copyNode(node: MlsRatchetTreeNode): MlsRatchetTreeNode {
           };
 }
 
+function copyNodes(nodes: readonly MlsRatchetTreeNode[]): MlsRatchetTreeNode[] {
+    return Array.from({ length: nodes.length }, (_, index) => copyNode(nodes[index]));
+}
+
 function validateLeaf(leaf: MlsRatchetTreeLeaf): void {
     if (leaf.encoded.length === 0 || leaf.encoded.length > 1024 * 1024) {
         throw new Error("Invalid MLS ratchet-tree leaf");
@@ -117,7 +121,7 @@ export class MlsRatchetTree {
             throw new Error("MLS ratchet tree has too many leaves");
         }
         this.#leafCount = leafCount;
-        this.#nodes = nodes.map(copyNode);
+        this.#nodes = copyNodes(nodes);
         this.#validate();
     }
 
@@ -128,7 +132,7 @@ export class MlsRatchetTree {
 
     /** Defensive snapshot of the public node array. */
     get nodes(): readonly MlsRatchetTreeNode[] {
-        return this.#nodes.map(copyNode);
+        return copyNodes(this.#nodes);
     }
 
     /** Independent candidate tree for transactional Commit processing. */
@@ -232,7 +236,7 @@ export class MlsRatchetTree {
     addLeaf(leaf: MlsRatchetTreeLeaf): number {
         validateLeaf(leaf);
         this.#ensureUniqueKey(leaf.encryptionKey);
-        const previousNodes = this.#nodes.map(copyNode);
+        const previousNodes = copyNodes(this.#nodes);
         const previousLeafCount = this.#leafCount;
         let index = this.#leftmostBlankLeaf();
         try {
@@ -242,7 +246,9 @@ export class MlsRatchetTree {
                 }
                 index = this.#leafCount;
                 this.#leafCount *= 2;
-                this.#nodes.length = treeWidth(this.#leafCount);
+                while (this.#nodes.length < treeWidth(this.#leafCount)) {
+                    this.#nodes.push(undefined);
+                }
             }
             for (const parentIndex of directPath(index, this.#leafCount)) {
                 const parent = this.#nodes[parentIndex];
@@ -307,7 +313,7 @@ export class MlsRatchetTree {
      */
     prepareUpdatePath(sender: number, parentKeys: readonly Uint8Array[]): Uint8Array {
         this.#validateLeafIndex(sender);
-        const previousNodes = this.#nodes.map(copyNode);
+        const previousNodes = copyNodes(this.#nodes);
         try {
             for (const parent of directPath(sender, this.#leafCount)) {
                 this.#nodes[parent] = undefined;
@@ -366,7 +372,7 @@ export class MlsRatchetTree {
         leaf: MlsRatchetTreeLeaf,
         parentKeys: readonly Uint8Array[],
     ): void {
-        const previousNodes = this.#nodes.map(copyNode);
+        const previousNodes = copyNodes(this.#nodes);
         try {
             this.prepareUpdatePath(sender, parentKeys);
             this.setCommitLeaf(sender, leaf);

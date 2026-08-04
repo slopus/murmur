@@ -19,6 +19,14 @@ export type FriendControlFrame =
           readonly consumedReferences: readonly Uint8Array[];
       }
     | {
+          readonly type: "key-package-consumed-ack";
+          readonly consumedReferences: readonly Uint8Array[];
+      }
+    | {
+          readonly type: "key-package-retire";
+          readonly consumedReferences: readonly Uint8Array[];
+      }
+    | {
           readonly type: "group-invitation";
           readonly groupId: Uint8Array;
           readonly descriptor: Uint8Array;
@@ -42,7 +50,9 @@ export function encodeFriendControlFrame(frame: FriendControlFrame): Uint8Array 
     let profile: Uint8Array | undefined;
     try {
         if (
-            frame.type === "key-package-request" &&
+            (frame.type === "key-package-request" ||
+                frame.type === "key-package-consumed-ack" ||
+                frame.type === "key-package-retire") &&
             (frame.consumedReferences.length > 64 ||
                 new Set(frame.consumedReferences.map(encodeBase64Url)).size !==
                     frame.consumedReferences.length)
@@ -69,7 +79,9 @@ export function encodeFriendControlFrame(frame: FriendControlFrame): Uint8Array 
                         ? encodeBase64Url(frame.keyPackage)
                         : null,
                 consumedReferences:
-                    frame.type === "key-package-request"
+                    frame.type === "key-package-request" ||
+                    frame.type === "key-package-consumed-ack" ||
+                    frame.type === "key-package-retire"
                         ? frame.consumedReferences.map(encodeBase64Url)
                         : null,
                 groupId: frame.type === "group-invitation" ? encodeBase64Url(frame.groupId) : null,
@@ -199,7 +211,9 @@ export function decodeFriendControlFrame(encoded: Uint8Array): FriendControlFram
         };
     }
     if (
-        value.type === "key-package-request" &&
+        (value.type === "key-package-request" ||
+            value.type === "key-package-consumed-ack" ||
+            value.type === "key-package-retire") &&
         allNull(value, ["consumedReferences"]) &&
         Array.isArray(value.consumedReferences) &&
         value.consumedReferences.length <= 64
@@ -210,7 +224,10 @@ export function decodeFriendControlFrame(encoded: Uint8Array): FriendControlFram
         if (new Set(consumedReferences.map(encodeBase64Url)).size !== consumedReferences.length) {
             throw new Error("Duplicate consumed KeyPackage reference");
         }
-        return { type: "key-package-request", consumedReferences };
+        return {
+            type: value.type,
+            consumedReferences,
+        };
     }
     if (
         value.type === "group-invitation" &&

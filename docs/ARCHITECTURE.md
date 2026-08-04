@@ -65,9 +65,10 @@ lower relay sequence
 
 Only a winning Add queues its private friend-channel invitation. The recipient
 first verifies the invitation's Commit event ID and fingerprint at the claimed
-group sequence, then atomically consumes the matching private KeyPackage
-bundle, installs the Welcome epoch and stable topic capability, records the
-invitation replay marker, and starts its group cursor after that exact Commit.
+group sequence and matches its confirmation tag to the authenticated Welcome
+GroupInfo, then atomically consumes the matching private KeyPackage bundle,
+installs the Welcome epoch and stable topic capability, records the invitation
+replay marker, and starts its group cursor after that exact Commit.
 
 ## Relay storage
 

@@ -49,6 +49,8 @@ export interface OpenMlsWelcomeOptions {
         joiningKeyPackage: MlsKeyPackage,
     ) => Uint8Array | undefined;
     readonly expectedGroupId?: Uint8Array;
+    /** Exact retained Commit confirmation tag which this Welcome must authenticate. */
+    readonly expectedCommitConfirmationTag?: Uint8Array;
 }
 
 /** Verified epoch state recovered from a Welcome. */

@@ -19,12 +19,16 @@ recipient, then published to:
 The outer relay author is fresh and unlinkable. Responses use the same inner
 authentication and sealing and another fresh outer author.
 
-Accepted friends derive an encrypted `control` channel. Version-one frames are:
+Accepted friends derive an encrypted `control` channel with separate
+identity-ordered send and receive AES keys plus an independently derived stable
+topic key. Version-one frames are:
 
 - profile update;
 - friendship ended;
 - KeyPackage announce;
 - KeyPackage request;
+- KeyPackage consumed acknowledgement;
+- KeyPackage retirement;
 - group invitation.
 
 Temporary control retention maps exactly to relay `expiresAt`; all other
@@ -39,12 +43,24 @@ adoption transaction. Package lifetime is checked against the signed relay
 event creation time when an Add is created or admitted; delayed processing does
 not reinterpret a previously valid Commit using wall-clock time.
 
+Each friend has at most eight local private bundles and eight remote public
+packages, with a target of two immediately available packages. Consumption
+reports are chunked at 64 references and acknowledged; every chunk is a durable
+control event, so a list longer than 64 cannot strand later references.
+Reported local bundles stay reserved for a delayed winning invitation. A
+competing Commit sends retirement after it wins, while successful invitation
+adoption consumes the reserved bundle. Expired or excess remote announcements
+are explicitly retired instead of accumulating.
+
 An invitation carries the group ID, opaque descriptor and random binding nonce,
 descriptor binding, stable topic secret, exact KeyPackage reference, Welcome,
 ratchet tree, winning Commit sequence, exact Commit event ID, and Commit
 fingerprint. The recipient reads and verifies that retained group event before
-installing any cursor or group state. The invitation is encrypted and
-authenticated by the friend channel. There is no public join operation.
+installing any cursor or group state. It also requires the authenticated
+Welcome GroupInfo confirmation tag to equal that exact public Commit's
+confirmation tag, preventing a valid Welcome from a competing Add from being
+substituted. The invitation is encrypted and authenticated by the friend
+channel. There is no public join operation.
 
 ## Group stream
 

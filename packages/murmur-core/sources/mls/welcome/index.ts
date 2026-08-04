@@ -298,6 +298,12 @@ export function openMlsWelcome(options: OpenMlsWelcomeOptions): OpenedMlsWelcome
         ) {
             throw new Error("Invalid MLS Welcome confirmation tag");
         }
+        if (
+            options.expectedCommitConfirmationTag !== undefined &&
+            !equalBytes(groupInfo.confirmationTag, options.expectedCommitConfirmationTag)
+        ) {
+            throw new Error("MLS Welcome does not match the retained Commit");
+        }
         const signerKey = options.validateExternalTree(
             groupInfo,
             options.keyPackageBundle.keyPackage,

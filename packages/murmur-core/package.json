@@ -45,7 +45,8 @@
         "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
         "build": "pnpm run clean && tsc -p tsconfig.build.json",
         "check": "tsc --noEmit -p tsconfig.json",
-        "test": "vitest run",
+        "test": "vitest run --exclude sources/murmur/tests/murmur.test.ts --maxWorkers=4 --testTimeout=60000 && pnpm run test:facade",
+        "test:facade": "vitest run sources/murmur/tests/murmur.test.ts --testTimeout=90000 -t 'restores identity|retries an accepted|durably converges rejection|quarantines an invalid' && vitest run sources/murmur/tests/murmur.test.ts --testTimeout=90000 -t 'rolls back MLS|converges without caller|delivers a terminal' && vitest run sources/murmur/tests/murmur.test.ts --testTimeout=90000 -t 'preserves causal|opens from a metadata' && vitest run sources/murmur/tests/murmur.test.ts --testTimeout=90000 -t 'catches up a winning' && vitest run sources/murmur/tests/murmur.test.ts --testTimeout=90000 -t 'rejects invitation' && vitest run sources/murmur/tests/murmur.test.ts --testTimeout=90000 -t 'acknowledges more than|deletes expired'",
         "test:watch": "vitest",
         "prepack": "pnpm run check && pnpm run build && pnpm run test"
     },

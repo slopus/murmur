@@ -101,7 +101,11 @@ export function encodeMlsRatchetTree(tree: MlsRatchetTree): Uint8Array {
     if (finalNode < 0) {
         throw new Error("MLS ratchet tree cannot be entirely blank");
     }
-    return encodeOpaqueV(concatBytes(...nodes.slice(0, finalNode + 1).map(encodeNode)));
+    return encodeOpaqueV(
+        concatBytes(
+            ...Array.from({ length: finalNode + 1 }, (_, index) => encodeNode(nodes[index])),
+        ),
+    );
 }
 
 /** Decode an RFC ratchet_tree extension value. */
@@ -158,7 +162,9 @@ export function decodeMlsRatchetTree(
     if (paddedLength > MAXIMUM_NODES) {
         throw new Error("MLS ratchet tree has too many nodes");
     }
-    nodes.length = paddedLength;
+    while (nodes.length < paddedLength) {
+        nodes.push(undefined);
+    }
     const leafCount = (paddedLength + 1) / 2;
     let unmergedEntries = 0;
     for (const node of nodes) {

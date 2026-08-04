@@ -3,7 +3,7 @@ import { hashBytes } from "../../crypto/index.js";
 import { createMlsKeyPackage, type MlsEpochState } from "../../mls/index.js";
 import { concatBytes, decodeBase64Url, utf8Encode, zeroBytes } from "../../utils/index.js";
 import type { MurmurGroup } from "../types.js";
-import type { StagedGroupCommit, StoredGroup } from "./stateCodec.js";
+import type { GroupOperation, StagedGroupCommit, StoredGroup } from "./stateCodec.js";
 
 const MLS_PROTOCOL_VERSION = 1;
 const MLS_PUBLIC_MESSAGE = 1;
@@ -62,4 +62,14 @@ export function destroyStagedCommit(staged: StagedGroupCommit | undefined): void
     zeroBytes(staged.fingerprint);
     zeroBytes(staged.peer);
     staged.keyPackageReference?.fill(0);
+}
+
+/** Zero decoded retained plaintext operations and their attempt fingerprints. */
+export function destroyGroupOperation(operation: GroupOperation): void {
+    if (operation.type === "send") {
+        zeroBytes(operation.payload);
+        operation.attempt?.fingerprint.fill(0);
+        return;
+    }
+    zeroBytes(operation.peer);
 }

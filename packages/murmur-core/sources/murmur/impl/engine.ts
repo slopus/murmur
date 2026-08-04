@@ -127,6 +127,7 @@ import {
 import {
     createMurmurKeyPackage,
     descriptorBinding,
+    destroyGroupOperation,
     destroyStagedCommit,
     groupView,
     isCommit,
@@ -158,6 +159,8 @@ export type {
 const MAXIMUM_SYNC_PASSES = 64;
 const EVENT_PAGE_LIMIT = 100;
 const LOCAL_KEY_PACKAGE_TARGET = 2;
+const MAXIMUM_LOCAL_KEY_PACKAGES = 8;
+const MAXIMUM_REMOTE_KEY_PACKAGES = 8;
 const MAXIMUM_REPORTED_KEY_PACKAGES = 64;
 const MAXIMUM_DESCRIPTOR_BYTES = 256 * 1024;
 const MAXIMUM_APPLICATION_BYTES = 256 * 1024;
@@ -1013,6 +1016,7 @@ export class MurmurEngine {
                 );
             } finally {
                 zeroBytes(fingerprint);
+                destroyGroupOperation(operation);
             }
         }
         const stagedBytes = await this.#store.get(groupStagedKey(record.purpose.groupId));
@@ -1055,19 +1059,24 @@ export class MurmurEngine {
                 const operationBytes = await transaction.get(operationKey);
                 if (operationBytes !== undefined) {
                     const operation = decodeGroupOperation(operationBytes);
-                    if (
-                        operation.type === "send" &&
-                        operation.attempt?.eventId === record.event.id
-                    ) {
-                        await transaction.set(
-                            operationKey,
-                            encodeGroupOperation({
-                                id: operation.id,
-                                type: "send",
-                                payload: operation.payload,
-                                createdAt: operation.createdAt,
-                            }),
-                        );
+                    try {
+                        if (
+                            operation.type === "send" &&
+                            operation.attempt?.eventId === record.event.id
+                        ) {
+                            await transaction.set(
+                                operationKey,
+                                encodeGroupOperation({
+                                    id: operation.id,
+                                    type: "send",
+                                    payload: operation.payload,
+                                    createdAt: operation.createdAt,
+                                }),
+                            );
+                        }
+                    } finally {
+                        zeroBytes(operationBytes);
+                        destroyGroupOperation(operation);
                     }
                 }
             } else {
@@ -1483,63 +1492,131 @@ export class MurmurEngine {
                 }
                 const record = decodeFriendRecord(recordBytes);
                 if (frame.type === "profile-update") {
-                    if (record.status !== "active") {
-                        throw new Error("Profile update requires an active friend");
+                    if (record.status === "active") {
+                        await transaction.set(
+                            friendRecordKey(this.#identity, peer),
+                            encodeFriendRecord({
+                                ...record,
+                                profile: copyProfile(frame.profile),
+                                updatedAt: Math.max(record.updatedAt, Date.now()),
+                            }),
+                        );
                     }
-                    await transaction.set(
-                        friendRecordKey(this.#identity, peer),
-                        encodeFriendRecord({
-                            ...record,
-                            profile: copyProfile(frame.profile),
-                            updatedAt: Math.max(record.updatedAt, Date.now()),
-                        }),
-                    );
                 } else if (frame.type === "friendship-ended") {
                     if (record.requestId !== frame.requestId) {
-                        throw new Error("Friendship end does not match its exchange");
-                    }
-                    if (record.status !== "ended") {
+                        if (record.previousRequestId !== frame.requestId) {
+                            throw new Error("Friendship end does not match its exchange");
+                        }
+                    } else if (record.status !== "ended") {
                         await transaction.set(
                             friendRecordKey(this.#identity, peer),
                             encodeFriendRecord({
                                 ...record,
                                 status: "ended",
+                                nextRequestPredecessorId: record.requestId,
                                 updatedAt: Math.max(record.updatedAt, Date.now()),
                             }),
                         );
                     }
                 } else if (frame.type === "key-package-request") {
-                    if (record.status !== "active") {
-                        throw new Error("KeyPackage request requires an active friend");
-                    }
-                    for (const reference of frame.consumedReferences) {
-                        await transaction.delete(localKeyPackageKey(peer, reference));
+                    if (record.status === "active") {
+                        for (const reference of frame.consumedReferences) {
+                            const localBundle = await transaction.get(
+                                localKeyPackageKey(peer, reference),
+                            );
+                            if (localBundle !== undefined) {
+                                zeroBytes(localBundle);
+                                await transaction.set(
+                                    `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
+                                        peer,
+                                    )}/${encodeBase64Url(reference)}`,
+                                    reference,
+                                );
+                            }
+                        }
+                        await this.#queueControl(
+                            transaction,
+                            peer,
+                            {
+                                type: "key-package-consumed-ack",
+                                consumedReferences: frame.consumedReferences,
+                            },
+                            { type: "friend-control" },
+                        );
                         await transaction.set(
-                            `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
-                                peer,
-                            )}/${encodeBase64Url(reference)}`,
-                            reference,
+                            `${KEY_PACKAGE_REQUEST_PREFIX}${identityId(peer)}`,
+                            new Uint8Array([1]),
                         );
                     }
-                    await transaction.set(
-                        `${KEY_PACKAGE_REQUEST_PREFIX}${identityId(peer)}`,
-                        new Uint8Array([1]),
-                    );
-                } else {
-                    if (record.status !== "active" || keyPackage === undefined) {
-                        throw new Error("KeyPackage announce requires an active friend");
-                    }
-                    const consumedKey = `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
-                        peer,
-                    )}/${encodeBase64Url(frame.reference)}`;
-                    if ((await transaction.get(consumedKey)) === undefined) {
-                        const remoteKey = remoteKeyPackageKey(peer, frame.reference);
-                        const existing = await transaction.get(remoteKey);
-                        if (existing !== undefined && !equalBytes(existing, frame.keyPackage)) {
-                            throw new Error("KeyPackage reference collision");
+                } else if (frame.type === "key-package-consumed-ack") {
+                    if (record.status === "active") {
+                        for (const reference of frame.consumedReferences) {
+                            await transaction.delete(
+                                `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
+                                    peer,
+                                )}/${encodeBase64Url(reference)}`,
+                            );
                         }
-                        await transaction.set(remoteKey, frame.keyPackage);
-                        await transaction.delete(`${KEY_PACKAGE_NEEDED_PREFIX}${identityId(peer)}`);
+                    }
+                } else if (frame.type === "key-package-retire") {
+                    if (record.status === "active") {
+                        for (const reference of frame.consumedReferences) {
+                            await transaction.delete(localKeyPackageKey(peer, reference));
+                            await transaction.delete(
+                                `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
+                                    peer,
+                                )}/${encodeBase64Url(reference)}`,
+                            );
+                        }
+                    }
+                } else {
+                    if (record.status === "active") {
+                        if (keyPackage === undefined) {
+                            throw new Error("KeyPackage announce is invalid");
+                        }
+                        const consumedKey = `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
+                            peer,
+                        )}/${encodeBase64Url(frame.reference)}`;
+                        const consumed = await transaction.get(consumedKey);
+                        if (consumed === undefined) {
+                            const remoteKey = remoteKeyPackageKey(peer, frame.reference);
+                            const existing = await transaction.get(remoteKey);
+                            const collision =
+                                existing !== undefined && !equalBytes(existing, frame.keyPackage);
+                            existing?.fill(0);
+                            if (collision) {
+                                throw new Error("KeyPackage reference collision");
+                            }
+                            if (existing === undefined) {
+                                const remote = await transaction.list(
+                                    `${REMOTE_KEY_PACKAGE_PREFIX}${identityId(peer)}/`,
+                                );
+                                try {
+                                    if (remote.size >= MAXIMUM_REMOTE_KEY_PACKAGES) {
+                                        await this.#queueControl(
+                                            transaction,
+                                            peer,
+                                            {
+                                                type: "key-package-retire",
+                                                consumedReferences: [frame.reference],
+                                            },
+                                            { type: "friend-control" },
+                                        );
+                                    } else {
+                                        await transaction.set(remoteKey, frame.keyPackage);
+                                        await transaction.delete(
+                                            `${KEY_PACKAGE_NEEDED_PREFIX}${identityId(peer)}`,
+                                        );
+                                    }
+                                } finally {
+                                    for (const bytes of remote.values()) {
+                                        zeroBytes(bytes);
+                                    }
+                                }
+                            }
+                        } else {
+                            zeroBytes(consumed);
+                        }
                     }
                 }
                 await transaction.set(replayKey, fingerprint);
@@ -1581,30 +1658,35 @@ export class MurmurEngine {
         } finally {
             zeroBytes(calculatedBinding);
         }
-        const committedEpoch = await this.#verifyInvitationCommit(frame);
+        const committed = await this.#verifyInvitationCommit(frame);
         const existingGroup = this.#groups.get(id);
         if (existingGroup !== undefined) {
-            if (
-                !equalBytes(existingGroup.record.descriptorBinding, frame.descriptorBinding) ||
-                !equalBytes(existingGroup.record.topicSecret, frame.topicSecret)
-            ) {
-                throw new Error("Invitation collides with an existing group");
-            }
             try {
-                await this.#store.transaction(async (transaction) => {
-                    await transaction.set(replayKey, fingerprint);
-                    await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
-                });
-            } catch (error: unknown) {
-                throw new Error("Murmur persistence transaction failed", {
-                    cause: error,
-                });
+                if (
+                    !equalBytes(existingGroup.record.descriptorBinding, frame.descriptorBinding) ||
+                    !equalBytes(existingGroup.record.topicSecret, frame.topicSecret)
+                ) {
+                    throw new Error("Invitation collides with an existing group");
+                }
+                try {
+                    await this.#store.transaction(async (transaction) => {
+                        await transaction.set(replayKey, fingerprint);
+                        await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                    });
+                } catch (error: unknown) {
+                    throw new Error("Murmur persistence transaction failed", {
+                        cause: error,
+                    });
+                }
+            } finally {
+                zeroBytes(committed.confirmationTag);
             }
             return;
         }
         const bundleKey = localKeyPackageKey(peer, frame.keyPackageReference);
         const bundleBytes = await this.#store.get(bundleKey);
         if (bundleBytes === undefined) {
+            zeroBytes(committed.confirmationTag);
             throw new Error("Invitation has no matching local KeyPackage");
         }
         const bundle = deserializeMlsKeyPackageBundle(bundleBytes);
@@ -1626,8 +1708,9 @@ export class MurmurEngine {
                 welcome: frame.welcome,
                 tree,
                 keyPackageBundle: bundle,
+                expectedCommitConfirmationTag: committed.confirmationTag,
             });
-            if (epoch.context.epoch !== committedEpoch + 1n) {
+            if (epoch.context.epoch !== committed.epoch + 1n) {
                 throw new Error("Invitation Welcome does not follow its winning Commit");
             }
             epochBytes = epoch.serialize();
@@ -1661,11 +1744,10 @@ export class MurmurEngine {
                     await transaction.set(groupEpochKey(id), epochBytes!);
                     await transaction.set(groupCursorKey, cursorBytes(frame.commitSequence));
                     await transaction.delete(bundleKey);
-                    await transaction.set(
+                    await transaction.delete(
                         `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(
                             peer,
                         )}/${encodeBase64Url(frame.keyPackageReference)}`,
-                        frame.keyPackageReference,
                     );
                     await transaction.set(replayKey, fingerprint);
                     await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
@@ -1685,12 +1767,13 @@ export class MurmurEngine {
             epochBytes?.fill(0);
             destroyMlsKeyPackageBundle(bundle);
             zeroBytes(bundleBytes);
+            zeroBytes(committed.confirmationTag);
         }
     }
 
     async #verifyInvitationCommit(
         frame: Extract<FriendControlFrame, { type: "group-invitation" }>,
-    ): Promise<bigint> {
+    ): Promise<{ readonly epoch: bigint; readonly confirmationTag: Uint8Array }> {
         const access = groupAccess(frame.topicSecret);
         try {
             let page: Awaited<ReturnType<RelayTransport["readEvents"]>>;
@@ -1758,7 +1841,10 @@ export class MurmurEngine {
             ) {
                 throw new Error("Invitation winning Commit used an expired KeyPackage");
             }
-            return commit.epoch;
+            return {
+                epoch: commit.epoch,
+                confirmationTag: commit.confirmationTag.slice(),
+            };
         } finally {
             destroyAccess(access);
         }
@@ -1879,12 +1965,12 @@ export class MurmurEngine {
             }
             return;
         }
-        destroyStagedCommit(staged);
         const clone = this.#cloneEpoch(group);
         let transition: ReturnType<MlsEpochState["applyCommit"]> | undefined;
         try {
             transition = clone.applyCommit(event.payload);
         } catch (error: unknown) {
+            destroyStagedCommit(staged);
             if (error instanceof MlsLocalMemberRemovedError) {
                 clone.destroy();
                 await this.#adoptLocalRemoval(
@@ -1921,6 +2007,17 @@ export class MurmurEngine {
                 await transaction.set(groupEpochKey(group.record.id), nextEpochBytes);
                 await transaction.set(groupReplayKey(group.record.id, fingerprint), fingerprint);
                 await transaction.delete(groupStagedKey(group.record.id));
+                if (staged?.type === "add" && staged.keyPackageReference !== undefined) {
+                    await this.#queueControl(
+                        transaction,
+                        { publicKey: staged.peer },
+                        {
+                            type: "key-package-retire",
+                            consumedReferences: [staged.keyPackageReference],
+                        },
+                        { type: "friend-control" },
+                    );
+                }
                 await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
             });
         } catch (error: unknown) {
@@ -1929,6 +2026,7 @@ export class MurmurEngine {
             throw error;
         } finally {
             zeroBytes(nextEpochBytes);
+            destroyStagedCommit(staged);
         }
         const next = transition.commit();
         group.epoch.destroy();
@@ -2079,9 +2177,8 @@ export class MurmurEngine {
         expectedCursor: bigint,
         cursorKey: string,
     ): Promise<void> {
-        const operations = [
-            ...(await this.#store.list(groupOperationPrefix(group.record.id))).values(),
-        ]
+        const operationRecords = await this.#store.list(groupOperationPrefix(group.record.id));
+        const operations = [...operationRecords.values()]
             .map(decodeGroupOperation)
             .filter(
                 (operation): operation is Extract<GroupOperation, { type: "send" }> =>
@@ -2089,111 +2186,123 @@ export class MurmurEngine {
                     operation.attempt !== undefined &&
                     equalBytes(operation.attempt.fingerprint, fingerprint),
             );
-        const own = operations[0];
-        if (own?.attempt !== undefined) {
-            if (own.attempt.epoch === group.record.epoch) {
+        try {
+            const own = operations[0];
+            if (own?.attempt !== undefined) {
+                if (own.attempt.epoch === group.record.epoch) {
+                    await this.#store.transaction(async (transaction) => {
+                        await transaction.set(
+                            groupEventKey(group.record.id, sequence),
+                            encodeGroupEvent({
+                                sequence,
+                                sender: this.#identity.publicKey,
+                                bytes: own.payload,
+                            }),
+                        );
+                        await transaction.set(
+                            groupReplayKey(group.record.id, fingerprint),
+                            fingerprint,
+                        );
+                        await transaction.delete(groupOperationKey(group.record.id, own.id));
+                        await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
+                        await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                    });
+                } else {
+                    const retried: GroupOperation = {
+                        id: own.id,
+                        type: "send",
+                        payload: own.payload,
+                        createdAt: own.createdAt,
+                    };
+                    await this.#store.transaction(async (transaction) => {
+                        await transaction.set(
+                            groupOperationKey(group.record.id, own.id),
+                            encodeGroupOperation(retried),
+                        );
+                        await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
+                        await this.#writeQuarantine(
+                            transaction,
+                            relayTopicId(event.topic),
+                            sequence,
+                            event,
+                        );
+                        await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                    });
+                }
+                return;
+            }
+
+            const clone = this.#cloneEpoch(group);
+            let opened: ReturnType<MlsEpochState["openWithCheckpoint"]>;
+            try {
+                opened = clone.openWithCheckpoint(event.payload);
+            } catch {
+                clone.destroy();
+                await this.#quarantine(
+                    relayTopicId(event.topic),
+                    sequence,
+                    event,
+                    expectedCursor,
+                    cursorKey,
+                );
+                return;
+            }
+            const sender = clone.memberSignatureKeys[opened.message.sender];
+            if (sender === undefined) {
+                clone.destroy();
+                zeroBytes(opened.state);
+                zeroBytes(opened.message.applicationData);
+                zeroBytes(opened.message.authenticatedData);
+                await this.#quarantine(
+                    relayTopicId(event.topic),
+                    sequence,
+                    event,
+                    expectedCursor,
+                    cursorKey,
+                );
+                return;
+            }
+            const nextRecord: StoredGroup = {
+                ...group.record,
+                persistenceGeneration: opened.persistenceGeneration,
+            };
+            try {
                 await this.#store.transaction(async (transaction) => {
+                    await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
+                    await transaction.set(groupEpochKey(group.record.id), opened.state);
                     await transaction.set(
                         groupEventKey(group.record.id, sequence),
                         encodeGroupEvent({
                             sequence,
-                            sender: this.#identity.publicKey,
-                            bytes: own.payload,
+                            sender,
+                            bytes: opened.message.applicationData,
                         }),
                     );
                     await transaction.set(
                         groupReplayKey(group.record.id, fingerprint),
                         fingerprint,
                     );
-                    await transaction.delete(groupOperationKey(group.record.id, own.id));
-                    await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
                     await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
                 });
-            } else {
-                const retried: GroupOperation = {
-                    id: own.id,
-                    type: "send",
-                    payload: own.payload,
-                    createdAt: own.createdAt,
-                };
-                await this.#store.transaction(async (transaction) => {
-                    await transaction.set(
-                        groupOperationKey(group.record.id, own.id),
-                        encodeGroupOperation(retried),
-                    );
-                    await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
-                    await this.#writeQuarantine(
-                        transaction,
-                        relayTopicId(event.topic),
-                        sequence,
-                        event,
-                    );
-                    await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
-                });
+            } catch (error: unknown) {
+                clone.destroy();
+                throw error;
+            } finally {
+                zeroBytes(opened.state);
+                zeroBytes(opened.message.applicationData);
+                zeroBytes(opened.message.authenticatedData);
             }
-            return;
-        }
-
-        const clone = this.#cloneEpoch(group);
-        let opened: ReturnType<MlsEpochState["openWithCheckpoint"]>;
-        try {
-            opened = clone.openWithCheckpoint(event.payload);
-        } catch {
-            clone.destroy();
-            await this.#quarantine(
-                relayTopicId(event.topic),
-                sequence,
-                event,
-                expectedCursor,
-                cursorKey,
-            );
-            return;
-        }
-        const sender = clone.memberSignatureKeys[opened.message.sender];
-        if (sender === undefined) {
-            clone.destroy();
-            zeroBytes(opened.state);
-            zeroBytes(opened.message.applicationData);
-            zeroBytes(opened.message.authenticatedData);
-            await this.#quarantine(
-                relayTopicId(event.topic),
-                sequence,
-                event,
-                expectedCursor,
-                cursorKey,
-            );
-            return;
-        }
-        const nextRecord: StoredGroup = {
-            ...group.record,
-            persistenceGeneration: opened.persistenceGeneration,
-        };
-        try {
-            await this.#store.transaction(async (transaction) => {
-                await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
-                await transaction.set(groupEpochKey(group.record.id), opened.state);
-                await transaction.set(
-                    groupEventKey(group.record.id, sequence),
-                    encodeGroupEvent({
-                        sequence,
-                        sender,
-                        bytes: opened.message.applicationData,
-                    }),
-                );
-                await transaction.set(groupReplayKey(group.record.id, fingerprint), fingerprint);
-                await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
-            });
-        } catch (error: unknown) {
-            clone.destroy();
-            throw error;
+            group.epoch.destroy();
+            group.epoch = clone;
+            group.record = nextRecord;
         } finally {
-            zeroBytes(opened.state);
-            zeroBytes(opened.message.applicationData);
-            zeroBytes(opened.message.authenticatedData);
+            for (const encoded of operationRecords.values()) {
+                zeroBytes(encoded);
+            }
+            for (const operation of operations) {
+                destroyGroupOperation(operation);
+            }
         }
-        group.epoch.destroy();
-        group.epoch = clone;
-        group.record = nextRecord;
     }
 
     async #prepareGroupOperations(): Promise<boolean> {
@@ -2206,12 +2315,13 @@ export class MurmurEngine {
                 continue;
             }
             const activeGroup = group as RuntimeGroup & { epoch: MlsEpochState };
-            if ((await this.#store.get(groupStagedKey(group.record.id))) !== undefined) {
+            const existingStage = await this.#store.get(groupStagedKey(group.record.id));
+            if (existingStage !== undefined) {
+                zeroBytes(existingStage);
                 continue;
             }
-            const operations = [
-                ...(await this.#store.list(groupOperationPrefix(group.record.id))).values(),
-            ]
+            const operationRecords = await this.#store.list(groupOperationPrefix(group.record.id));
+            const operations = [...operationRecords.values()]
                 .map(decodeGroupOperation)
                 .sort((left, right) =>
                     left.createdAt !== right.createdAt
@@ -2220,74 +2330,99 @@ export class MurmurEngine {
                           ? -1
                           : 1,
                 );
-            const operation = operations[0];
-            if (operation === undefined) {
-                continue;
-            }
-            if (operation.type === "send") {
-                if (operation.attempt === undefined) {
-                    await this.#prepareGroupSend(activeGroup, operation);
-                    changed = true;
+            try {
+                const operation = operations[0];
+                if (operation === undefined) {
+                    continue;
                 }
-                continue;
-            }
-            const present = group.record.members.some((member) =>
-                equalBytes(member, operation.peer),
-            );
-            if (
-                (operation.type === "add" && present) ||
-                (operation.type === "remove" && !present)
-            ) {
-                await this.#store.delete(groupOperationKey(group.record.id, operation.id));
-                changed = true;
-                continue;
-            }
-            if (operation.type === "add") {
-                const peer = { publicKey: operation.peer };
-                const remote = await this.#store.list(
-                    `${REMOTE_KEY_PACKAGE_PREFIX}${identityId(peer)}/`,
-                );
-                let candidate: readonly [string, Uint8Array] | undefined;
-                try {
-                    for (const [key, bytes] of [...remote].sort(([left], [right]) =>
-                        left < right ? -1 : 1,
-                    )) {
-                        let usable = false;
-                        try {
-                            const keyPackage = decodeMlsKeyPackage(bytes);
-                            usable =
-                                verifyMlsKeyPackage(keyPackage) &&
-                                equalBytes(keyPackage.leafNode.signatureKey, operation.peer);
-                        } catch {
-                            // Malformed and expired remote packages cannot be selected again.
-                        }
-                        if (usable) {
-                            candidate = [key, bytes] as const;
-                            break;
-                        }
-                        await this.#store.delete(key);
+                if (operation.type === "send") {
+                    if (operation.attempt === undefined) {
+                        await this.#prepareGroupSend(activeGroup, operation);
                         changed = true;
                     }
-                    if (candidate === undefined) {
-                        changed = (await this.#requestKeyPackage(peer)) || changed;
-                        continue;
-                    }
-                    await this.#prepareMembershipCommit(
-                        activeGroup,
-                        operation,
-                        candidate[0],
-                        candidate[1],
-                    );
-                    changed = true;
-                } finally {
-                    for (const bytes of remote.values()) {
-                        zeroBytes(bytes);
-                    }
+                    continue;
                 }
-                continue;
+                const present = group.record.members.some((member) =>
+                    equalBytes(member, operation.peer),
+                );
+                if (
+                    (operation.type === "add" && present) ||
+                    (operation.type === "remove" && !present)
+                ) {
+                    await this.#store.delete(groupOperationKey(group.record.id, operation.id));
+                    changed = true;
+                    continue;
+                }
+                if (operation.type === "add") {
+                    const peer = { publicKey: operation.peer };
+                    const remote = await this.#store.list(
+                        `${REMOTE_KEY_PACKAGE_PREFIX}${identityId(peer)}/`,
+                    );
+                    let candidate: readonly [string, Uint8Array] | undefined;
+                    try {
+                        for (const [key, bytes] of [...remote].sort(([left], [right]) =>
+                            left < right ? -1 : 1,
+                        )) {
+                            let usable = false;
+                            try {
+                                const keyPackage = decodeMlsKeyPackage(bytes);
+                                usable =
+                                    verifyMlsKeyPackage(keyPackage) &&
+                                    equalBytes(keyPackage.leafNode.signatureKey, operation.peer);
+                            } catch {
+                                // Malformed and expired remote packages cannot be selected again.
+                            }
+                            if (usable) {
+                                candidate = [key, bytes] as const;
+                                break;
+                            }
+                            const reference = decodeBase64Url(key.slice(key.lastIndexOf("/") + 1));
+                            try {
+                                await this.#store.transaction(async (transaction) => {
+                                    await transaction.delete(key);
+                                    await this.#queueControl(
+                                        transaction,
+                                        peer,
+                                        {
+                                            type: "key-package-retire",
+                                            consumedReferences: [reference],
+                                        },
+                                        { type: "friend-control" },
+                                    );
+                                });
+                            } finally {
+                                zeroBytes(reference);
+                            }
+                            changed = true;
+                        }
+                        if (candidate === undefined) {
+                            changed = (await this.#requestKeyPackage(peer)) || changed;
+                            continue;
+                        }
+                        await this.#prepareMembershipCommit(
+                            activeGroup,
+                            operation,
+                            candidate[0],
+                            candidate[1],
+                        );
+                        changed = true;
+                    } finally {
+                        for (const bytes of remote.values()) {
+                            zeroBytes(bytes);
+                        }
+                    }
+                    continue;
+                }
+                await this.#prepareMembershipCommit(activeGroup, operation);
+                changed = true;
+            } finally {
+                for (const encoded of operationRecords.values()) {
+                    zeroBytes(encoded);
+                }
+                for (const operation of operations) {
+                    destroyGroupOperation(operation);
+                }
             }
-            await this.#prepareMembershipCommit(activeGroup, operation);
-            changed = true;
         }
         return changed;
     }
@@ -2299,12 +2434,13 @@ export class MurmurEngine {
         const clone = this.#cloneEpoch(group);
         let checkpoint: Uint8Array | undefined;
         let access: TopicAccess | undefined;
+        let fingerprint: Uint8Array | undefined;
         try {
             const payload = clone.seal(operation.payload);
             checkpoint = clone.serialize();
             access = groupAccess(group.record.topicSecret);
             const event = createCapabilityEvent(access, payload);
-            const fingerprint = hashBytes(payload);
+            fingerprint = hashBytes(payload);
             const attempted: GroupOperation = {
                 ...operation,
                 attempt: {
@@ -2323,33 +2459,48 @@ export class MurmurEngine {
                     const currentOperation = await transaction.get(
                         groupOperationKey(group.record.id, operation.id),
                     );
-                    if (
-                        currentRecord === undefined ||
-                        decodeGroup(currentRecord).persistenceGeneration !==
-                            group.record.persistenceGeneration ||
-                        currentOperation === undefined ||
-                        decodeGroupOperation(currentOperation).type !== "send"
-                    ) {
-                        throw new Error("Group send base state changed");
+                    let decodedOperation: GroupOperation | undefined;
+                    try {
+                        decodedOperation =
+                            currentOperation === undefined
+                                ? undefined
+                                : decodeGroupOperation(currentOperation);
+                        if (
+                            currentRecord === undefined ||
+                            decodeGroup(currentRecord).persistenceGeneration !==
+                                group.record.persistenceGeneration ||
+                            decodedOperation?.type !== "send"
+                        ) {
+                            throw new Error("Group send base state changed");
+                        }
+                        await transaction.set(
+                            groupMetaKey(group.record.id),
+                            encodeGroup(nextRecord),
+                        );
+                        await transaction.set(groupEpochKey(group.record.id), checkpoint!);
+                        await transaction.set(
+                            groupOperationKey(group.record.id, operation.id),
+                            encodeGroupOperation(attempted),
+                        );
+                        await transaction.set(
+                            `${OUTBOX_PREFIX}${event.id}`,
+                            encodeRelayOutbox({
+                                event,
+                                purpose: {
+                                    type: "group-application",
+                                    groupId: group.record.id,
+                                    operationId: operation.id,
+                                },
+                                attempted: false,
+                            }),
+                        );
+                    } finally {
+                        currentRecord?.fill(0);
+                        currentOperation?.fill(0);
+                        if (decodedOperation !== undefined) {
+                            destroyGroupOperation(decodedOperation);
+                        }
                     }
-                    await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
-                    await transaction.set(groupEpochKey(group.record.id), checkpoint!);
-                    await transaction.set(
-                        groupOperationKey(group.record.id, operation.id),
-                        encodeGroupOperation(attempted),
-                    );
-                    await transaction.set(
-                        `${OUTBOX_PREFIX}${event.id}`,
-                        encodeRelayOutbox({
-                            event,
-                            purpose: {
-                                type: "group-application",
-                                groupId: group.record.id,
-                                operationId: operation.id,
-                            },
-                            attempted: false,
-                        }),
-                    );
                 });
             } catch (error: unknown) {
                 clone.destroy();
@@ -2363,6 +2514,7 @@ export class MurmurEngine {
             if (access !== undefined) {
                 destroyAccess(access);
             }
+            fingerprint?.fill(0);
         }
     }
 
@@ -2487,32 +2639,50 @@ export class MurmurEngine {
 
     async #requestKeyPackage(peer: IdentityPublicKey): Promise<boolean> {
         const key = `${KEY_PACKAGE_NEEDED_PREFIX}${identityId(peer)}`;
-        if ((await this.#store.get(key)) !== undefined) {
+        const existing = await this.#store.get(key);
+        if (existing !== undefined) {
+            zeroBytes(existing);
             return false;
         }
-        const consumed = [
-            ...(await this.#store.list(
-                `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(peer)}/`,
-            )),
-        ]
+        const consumedRecords = await this.#store.list(
+            `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(peer)}/`,
+        );
+        const consumed = [...consumedRecords]
             .sort(([left], [right]) => (left < right ? -1 : 1))
-            .slice(0, MAXIMUM_REPORTED_KEY_PACKAGES)
             .map(([, reference]) => reference);
         let created = false;
-        await this.#store.transaction(async (transaction) => {
-            if ((await transaction.get(key)) !== undefined) {
-                return;
+        try {
+            await this.#store.transaction(async (transaction) => {
+                if ((await transaction.get(key)) !== undefined) {
+                    return;
+                }
+                const pageCount = Math.max(
+                    1,
+                    Math.ceil(consumed.length / MAXIMUM_REPORTED_KEY_PACKAGES),
+                );
+                for (let page = 0; page < pageCount; page += 1) {
+                    await this.#queueControl(
+                        transaction,
+                        peer,
+                        {
+                            type: "key-package-request",
+                            consumedReferences: consumed.slice(
+                                page * MAXIMUM_REPORTED_KEY_PACKAGES,
+                                (page + 1) * MAXIMUM_REPORTED_KEY_PACKAGES,
+                            ),
+                        },
+                        { type: "friend-control" },
+                    );
+                }
+                await transaction.set(key, new Uint8Array([1]));
+                created = true;
+            });
+            return created;
+        } finally {
+            for (const reference of consumedRecords.values()) {
+                zeroBytes(reference);
             }
-            await this.#queueControl(
-                transaction,
-                peer,
-                { type: "key-package-request", consumedReferences: consumed },
-                { type: "friend-control" },
-            );
-            await transaction.set(key, new Uint8Array([1]));
-            created = true;
-        });
-        return created;
+        }
     }
 
     async #ensureKeyPackages(): Promise<boolean> {
@@ -2524,6 +2694,12 @@ export class MurmurEngine {
             const peer = friend.identity;
             const prefix = `${LOCAL_KEY_PACKAGE_PREFIX}${identityId(peer)}/`;
             const stored = await this.#store.list(prefix);
+            const consumedRecords = await this.#store.list(
+                `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(peer)}/`,
+            );
+            const consumedReferences = new Set(
+                [...consumedRecords.keys()].map((key) => key.slice(key.lastIndexOf("/") + 1)),
+            );
             const available: {
                 readonly reference: Uint8Array;
                 readonly keyPackageBytes: Uint8Array;
@@ -2533,6 +2709,11 @@ export class MurmurEngine {
                 let bundle;
                 try {
                     bundle = deserializeMlsKeyPackageBundle(bytes);
+                    const reference = mlsKeyPackageReference(bundle.keyPackage);
+                    if (consumedReferences.has(encodeBase64Url(reference))) {
+                        zeroBytes(reference);
+                        continue;
+                    }
                     if (
                         bundle.keyPackage.leafNode.notAfter < now ||
                         bundle.keyPackage.leafNode.notBefore > now
@@ -2541,10 +2722,11 @@ export class MurmurEngine {
                         // delayed invitation even after its public package expires.
                         // It is no longer eligible for a new Add, but deleting it
                         // here would make an already-winning Commit unrecoverable.
+                        zeroBytes(reference);
                         continue;
                     }
                     available.push({
-                        reference: mlsKeyPackageReference(bundle.keyPackage),
+                        reference,
                         keyPackageBytes: encodeMlsKeyPackage(bundle.keyPackage),
                     });
                 } finally {
@@ -2554,7 +2736,11 @@ export class MurmurEngine {
                     zeroBytes(bytes);
                 }
             }
-            while (available.length < LOCAL_KEY_PACKAGE_TARGET) {
+            let localCount = stored.size;
+            while (
+                available.length < LOCAL_KEY_PACKAGE_TARGET &&
+                localCount < MAXIMUM_LOCAL_KEY_PACKAGES
+            ) {
                 const bundle = createMurmurKeyPackage(this.#identity);
                 try {
                     const reference = mlsKeyPackageReference(bundle.keyPackage);
@@ -2578,6 +2764,7 @@ export class MurmurEngine {
                         reference,
                         keyPackageBytes,
                     });
+                    localCount += 1;
                     changed = true;
                     zeroBytes(bundleBytes);
                 } finally {
@@ -2585,7 +2772,9 @@ export class MurmurEngine {
                 }
             }
             const requestKey = `${KEY_PACKAGE_REQUEST_PREFIX}${identityId(peer)}`;
-            if ((await this.#store.get(requestKey)) !== undefined) {
+            const requestMarker = await this.#store.get(requestKey);
+            if (requestMarker !== undefined) {
+                zeroBytes(requestMarker);
                 await this.#store.transaction(async (transaction) => {
                     for (const item of available) {
                         await this.#queueControl(
@@ -2602,6 +2791,13 @@ export class MurmurEngine {
                     await transaction.delete(requestKey);
                 });
                 changed = true;
+            }
+            for (const marker of consumedRecords.values()) {
+                zeroBytes(marker);
+            }
+            for (const item of available) {
+                zeroBytes(item.reference);
+                zeroBytes(item.keyPackageBytes);
             }
         }
         return changed;

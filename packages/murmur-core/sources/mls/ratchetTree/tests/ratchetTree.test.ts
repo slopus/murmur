@@ -165,6 +165,32 @@ describe("MLS public ratchet tree", () => {
         expect(tree.filteredDirectPath(0)).toEqual([1]);
     });
 
+    it("keeps expanded and decoded trees dense through 4, 5, 6, and 8 members", () => {
+        const tree = new MlsRatchetTree([leaf("member-1")]);
+        for (let memberCount = 2; memberCount <= 8; memberCount += 1) {
+            expect(tree.addLeaf(leaf(`member-${memberCount}`))).toBe(memberCount - 1);
+            if ([4, 5, 6, 8].includes(memberCount)) {
+                const nodes = tree.nodes;
+                expect(Object.keys(nodes)).toHaveLength(nodes.length);
+
+                const decoded = decodeMlsRatchetTree(encodeMlsRatchetTree(tree), {
+                    groupId: TEST_GROUP_ID,
+                    authenticateCredential: () => true,
+                });
+                expect(decoded.leafCount).toBe(tree.leafCount);
+                expect(Object.keys(decoded.nodes)).toHaveLength(decoded.nodes.length);
+                expect(encodeMlsRatchetTree(decoded)).toEqual(encodeMlsRatchetTree(tree));
+            }
+        }
+
+        for (let leafIndex = 7; leafIndex >= 4; leafIndex -= 1) {
+            tree.removeLeaf(leafIndex);
+        }
+        expect(tree.leafCount).toBe(4);
+        expect(Object.keys(tree.nodes)).toHaveLength(tree.nodes.length);
+        expect(() => encodeMlsRatchetTree(tree)).not.toThrow();
+    });
+
     it("produces stable, mutation-sensitive RFC tree hashes", () => {
         const tree = new MlsRatchetTree([leaf("A"), undefined, leaf("B")]);
         const before = tree.treeHash();

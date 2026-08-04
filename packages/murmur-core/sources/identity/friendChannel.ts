@@ -41,7 +41,18 @@ const NONCE_CHARACTERS = 16;
 const SIGNATURE_CHARACTERS = 86;
 const MAX_CONTROL_PAYLOAD_CHARACTERS = Math.ceil((MAX_CONTROL_PAYLOAD_BYTES * 4) / 3);
 const MAX_CONTROL_CIPHERTEXT_CHARACTERS = Math.ceil((MAX_CONTROL_CIPHERTEXT_BYTES * 4) / 3);
-const DERIVATION_INFO = utf8Encode("murmur/friend-channel/v1");
+const TOPIC_DERIVATION_INFO = utf8Encode("murmur/friend-channel/topic/v1");
+
+function directionalDerivationInfo(
+    sender: IdentityPublicKey,
+    recipient: IdentityPublicKey,
+): Uint8Array {
+    return canonicalJsonBytes({
+        context: "murmur/friend-channel/direction/v1",
+        recipient: identityId(recipient),
+        sender: identityId(sender),
+    });
+}
 
 function validateControlMessage(message: FriendControlMessage): void {
     if (message.id.length !== ID_CHARACTERS) {
@@ -124,18 +135,19 @@ export class FriendControlIdCollisionError extends Error {
 /**
  * Non-MLS pairwise bootstrap/control channel.
  *
- * Both peers derive the same opaque topic capability and encryption key from
- * one root secret plus the other's single public identity key. Individual
- * payloads are additionally signed by their sender identity, so possession of
- * the shared channel key does not erase authorship.
+ * Both peers derive the same opaque topic capability plus distinct directional
+ * encryption keys from one root secret and the other's public identity.
+ * Individual payloads are additionally identity-signed.
  */
 export class FriendChannel {
     readonly #self: IdentityKeyPair;
     readonly #peer: IdentityPublicKey;
     readonly #now: () => number;
-    readonly #encryptionKey: Uint8Array;
+    readonly #sendEncryptionKey: Uint8Array;
+    readonly #receiveEncryptionKey: Uint8Array;
     readonly #topicSecretKey: Uint8Array;
     readonly #topicPublicKey: Uint8Array;
+    #destroyed = false;
 
     constructor(
         self: IdentityKeyPair,
@@ -147,36 +159,51 @@ export class FriendChannel {
         }
         const sharedSecret = deriveSharedSecret(self, peer);
         const salt = channelSalt(self, peer);
-        let material: Uint8Array | undefined;
+        const sendInfo = directionalDerivationInfo(self, peer);
+        const receiveInfo = directionalDerivationInfo(peer, self);
         try {
-            material = hkdf(sha256, sharedSecret, salt, DERIVATION_INFO, 64);
             this.#self = self;
             this.#peer = { publicKey: peer.publicKey.slice() };
             this.#now = options.now ?? Date.now;
-            this.#encryptionKey = material.slice(0, CONTROL_KEY_BYTES);
-            this.#topicSecretKey = material.slice(CONTROL_KEY_BYTES);
+            this.#sendEncryptionKey = hkdf(sha256, sharedSecret, salt, sendInfo, CONTROL_KEY_BYTES);
+            this.#receiveEncryptionKey = hkdf(
+                sha256,
+                sharedSecret,
+                salt,
+                receiveInfo,
+                CONTROL_KEY_BYTES,
+            );
+            this.#topicSecretKey = hkdf(
+                sha256,
+                sharedSecret,
+                salt,
+                TOPIC_DERIVATION_INFO,
+                CONTROL_KEY_BYTES,
+            );
             this.#topicPublicKey = ed25519.getPublicKey(this.#topicSecretKey);
         } finally {
             zeroBytes(sharedSecret);
             zeroBytes(salt);
-            if (material !== undefined) {
-                zeroBytes(material);
-            }
+            zeroBytes(sendInfo);
+            zeroBytes(receiveInfo);
         }
     }
 
     /** Peer identity bound to this channel. */
     get peer(): IdentityPublicKey {
+        this.#assertAlive();
         return { publicKey: this.#peer.publicKey.slice() };
     }
 
     /** Local public identity bound to this channel. */
     get self(): IdentityPublicKey {
+        this.#assertAlive();
         return { publicKey: this.#self.publicKey.slice() };
     }
 
     /** Shared opaque public key which authorizes this relay topic. */
     get topicPublicKey(): Uint8Array {
+        this.#assertAlive();
         return this.#topicPublicKey.slice();
     }
 
@@ -187,6 +214,7 @@ export class FriendChannel {
      * transport-specific read/write authorization.
      */
     exportTopicSecretKey(): Uint8Array {
+        this.#assertAlive();
         return this.#topicSecretKey.slice();
     }
 
@@ -196,6 +224,7 @@ export class FriendChannel {
         retention: FriendControlRetention = { kind: "durable" },
         sentAt: number = this.#now(),
     ): FriendControlMessage {
+        this.#assertAlive();
         const message: FriendControlMessage = {
             id: encodeBase64Url(randomBytes(24)),
             sentAt,
@@ -208,6 +237,7 @@ export class FriendChannel {
 
     /** Identity-sign and encrypt opaque control bytes to the peer. */
     seal(message: FriendControlMessage): FriendControlEnvelope {
+        this.#assertAlive();
         validateControlMessage(message);
         const signed = messageSignaturePayload(this.#self, this.#peer, message);
         let signature: Uint8Array | undefined;
@@ -234,7 +264,7 @@ export class FriendChannel {
                 type: "friend-control",
                 nonce: encodeBase64Url(nonce),
                 ciphertext: encodeBase64Url(
-                    gcm(this.#encryptionKey, nonce, aad).encrypt(plaintext),
+                    gcm(this.#sendEncryptionKey, nonce, aad).encrypt(plaintext),
                 ),
             };
         } finally {
@@ -256,6 +286,7 @@ export class FriendChannel {
 
     /** Decrypt, bind, and verify one peer-authored control envelope. */
     open(envelope: FriendControlEnvelope, now: number = this.#now()): OpenedFriendControl {
+        this.#assertAlive();
         if (!Number.isSafeInteger(now) || now < 0) {
             throw new Error("Friend-control time must be a non-negative safe integer");
         }
@@ -292,7 +323,7 @@ export class FriendChannel {
         const aad = envelopeAssociatedData(sender, this.#self);
         let plaintext: Uint8Array | undefined;
         try {
-            plaintext = gcm(this.#encryptionKey, nonce, aad).decrypt(ciphertext);
+            plaintext = gcm(this.#receiveEncryptionKey, nonce, aad).decrypt(ciphertext);
             const decoded: unknown = JSON.parse(utf8Decode(plaintext));
             if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
                 throw new Error("Invalid friend-control payload");
@@ -380,11 +411,13 @@ export class FriendChannel {
 
     /** Sign relay authorization bytes using the shared opaque topic capability. */
     signTopicBytes(bytes: Uint8Array): Uint8Array {
+        this.#assertAlive();
         return ed25519.sign(bytes, this.#topicSecretKey);
     }
 
     /** Verify relay authorization bytes against this channel's topic capability. */
     verifyTopicBytes(bytes: Uint8Array, signature: Uint8Array): boolean {
+        this.#assertAlive();
         try {
             return ed25519.verify(signature, bytes, this.#topicPublicKey, {
                 zip215: false,
@@ -396,8 +429,19 @@ export class FriendChannel {
 
     /** Zero channel-only secrets. The root identity remains caller-owned. */
     destroy(): void {
-        zeroBytes(this.#encryptionKey);
+        if (this.#destroyed) {
+            return;
+        }
+        this.#destroyed = true;
+        zeroBytes(this.#sendEncryptionKey);
+        zeroBytes(this.#receiveEncryptionKey);
         zeroBytes(this.#topicSecretKey);
+    }
+
+    #assertAlive(): void {
+        if (this.#destroyed) {
+            throw new Error("FriendChannel is destroyed");
+        }
     }
 }
 
@@ -420,10 +464,14 @@ export async function acceptFriendControl(
         return await store.transaction(async (transaction) => {
             const existing = await transaction.get(key);
             if (existing !== undefined) {
-                if (!equalBytes(existing, fingerprint)) {
-                    throw new FriendControlIdCollisionError();
+                try {
+                    if (!equalBytes(existing, fingerprint)) {
+                        throw new FriendControlIdCollisionError();
+                    }
+                    return { ...opened, status: "duplicate" };
+                } finally {
+                    zeroBytes(existing);
                 }
-                return { ...opened, status: "duplicate" };
             }
             await persist(transaction, opened);
             await transaction.set(key, fingerprint);

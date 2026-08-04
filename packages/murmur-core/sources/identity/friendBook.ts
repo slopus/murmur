@@ -211,10 +211,12 @@ export class FriendBook {
                     }
                     return { status: "duplicate", record: copyFriendRecord(existing) };
                 }
-                const replacesActive =
-                    existing?.status === "active" &&
+                const replacesKnownGeneration =
+                    (existing?.status === "active" ||
+                        existing?.status === "pending-incoming" ||
+                        existing?.status === "pending-outgoing") &&
                     opened.previousRequestId === existing.requestId;
-                if (existing?.status === "active" && !replacesActive) {
+                if (existing?.status === "active" && !replacesKnownGeneration) {
                     return { status: "superseded", record: copyFriendRecord(existing) };
                 }
                 if (
@@ -222,13 +224,16 @@ export class FriendBook {
                     (existing?.status === "ended" &&
                         opened.previousRequestId !== existing.nextRequestPredecessorId) ||
                     (existing?.status === "pending-outgoing" &&
-                        opened.previousRequestId !== existing.previousRequestId) ||
-                    (existing?.status === "active" && !replacesActive)
+                        opened.previousRequestId !== existing.previousRequestId &&
+                        !replacesKnownGeneration) ||
+                    (existing?.status === "pending-incoming" && !replacesKnownGeneration) ||
+                    (existing?.status === "active" && !replacesKnownGeneration)
                 ) {
                     throw new Error("Friend request causal predecessor does not match");
                 }
                 if (existing?.status === "pending-outgoing") {
                     const incomingWins =
+                        replacesKnownGeneration ||
                         compareContenders(
                             opened.sender,
                             opened.id,
@@ -252,7 +257,8 @@ export class FriendBook {
                 } else if (
                     existing !== undefined &&
                     existing.status !== "ended" &&
-                    existing.status !== "active"
+                    existing.status !== "active" &&
+                    existing.status !== "pending-incoming"
                 ) {
                     throw new Error(
                         `Cannot receive friendship request from ${existing.status} state`,
@@ -494,11 +500,17 @@ export class FriendBook {
             if (persisted === undefined) {
                 return false;
             }
-            if (!matchesFriendOutboxItem(item, persisted)) {
-                throw new Error("Friend outbox item does not exactly match persisted publication");
+            try {
+                if (!matchesFriendOutboxItem(item, persisted)) {
+                    throw new Error(
+                        "Friend outbox item does not exactly match persisted publication",
+                    );
+                }
+                await transaction.delete(key);
+                return true;
+            } finally {
+                zeroBytes(persisted);
             }
-            await transaction.delete(key);
-            return true;
         });
     }
 
@@ -548,9 +560,16 @@ export class FriendBook {
                 });
             } else {
                 await this.#insertEndIntent(transaction, existing, now);
-                await this.#deletePeerExchangeOutbox(transaction, existing.identity);
             }
-            const ended: FriendRecord = { ...existing, status: "ended", updatedAt: now };
+            const ended: FriendRecord = {
+                ...existing,
+                status: "ended",
+                nextRequestPredecessorId:
+                    existing.status === "pending-outgoing"
+                        ? existing.requestId
+                        : existing.nextRequestPredecessorId,
+                updatedAt: now,
+            };
             await transaction.set(key, encodeFriendRecord(ended));
             return copyFriendRecord(ended);
         });
@@ -563,7 +582,9 @@ export class FriendBook {
             return undefined;
         }
         try {
-            return copyFriendRecord(decodeFriendRecord(bytes));
+            const record = decodeFriendRecord(bytes);
+            this.#validateRecordRequester(record);
+            return copyFriendRecord(record);
         } finally {
             zeroBytes(bytes);
         }
@@ -575,7 +596,11 @@ export class FriendBook {
         try {
             return [...records]
                 .sort(([left], [right]) => (left < right ? -1 : left > right ? 1 : 0))
-                .map(([, value]) => copyFriendRecord(decodeFriendRecord(value)));
+                .map(([, value]) => {
+                    const record = decodeFriendRecord(value);
+                    this.#validateRecordRequester(record);
+                    return copyFriendRecord(record);
+                });
         } finally {
             for (const value of records.values()) {
                 zeroBytes(value);
@@ -607,9 +632,20 @@ export class FriendBook {
             return undefined;
         }
         try {
-            return decodeFriendRecord(bytes);
+            const record = decodeFriendRecord(bytes);
+            this.#validateRecordRequester(record);
+            return record;
         } finally {
             zeroBytes(bytes);
+        }
+    }
+
+    #validateRecordRequester(record: FriendRecord): void {
+        if (
+            !equalBytes(record.requester.publicKey, this.#owner.publicKey) &&
+            !equalBytes(record.requester.publicKey, record.identity.publicKey)
+        ) {
+            throw new Error("Persisted friend requester is neither owner nor peer");
         }
     }
 
@@ -663,28 +699,6 @@ export class FriendBook {
             await transaction.delete(key);
         } finally {
             zeroBytes(bytes);
-        }
-    }
-
-    async #deletePeerExchangeOutbox(
-        transaction: StoreTransaction,
-        peer: IdentityPublicKey,
-    ): Promise<void> {
-        const items = await transaction.list(this.#outboxPrefix);
-        try {
-            for (const [key, bytes] of items) {
-                const item = decodeFriendOutboxItem(bytes);
-                if (
-                    item.kind !== "control-intent" &&
-                    equalBytes(item.peer.publicKey, peer.publicKey)
-                ) {
-                    await transaction.delete(key);
-                }
-            }
-        } finally {
-            for (const value of items.values()) {
-                zeroBytes(value);
-            }
         }
     }
 

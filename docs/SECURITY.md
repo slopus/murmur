@@ -225,7 +225,8 @@ plaintext, or epoch secrets.
 
 - Friend request and response contents are recipient-confidential,
   identity-authenticated, and outer-author unlinkable.
-- Friend control content is pairwise encrypted and identity-signed.
+- Friend control content is pairwise encrypted with distinct directional keys
+  and identity-signed.
 - Group membership changes are real TreeKEM Commits.
 - Removed members cannot authenticate or decrypt later MLS application events.
 - Every outbound relay event is stored exactly before network access.
@@ -240,6 +241,9 @@ plaintext, or epoch secrets.
 ## Limits
 
 - Public identity keys still need an authenticated out-of-band exchange.
+- Compromise of the single identity root gives both Ed25519 signing and the
+  converted X25519 key-agreement capability; they are intentionally one
+  recovery and compromise domain.
 - The public identity inbox is intentionally linkable to that identity.
 - A relay can deny service, withhold, reorder, or delete retained data.
 - A current group member can read and write current group content.
