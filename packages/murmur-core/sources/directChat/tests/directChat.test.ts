@@ -883,6 +883,36 @@ describe("DirectChat", () => {
         expect(legacyHistory.opened.map((value) => value.message.text)).toEqual(["original"]);
     });
 
+    it("quarantines a structurally malformed payload instead of stalling the cursor", async () => {
+        const relay = new ChatTransport("relay");
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const friends = await addFriends(alice, aliceStore, bob, bobStore);
+        const aliceChat = chat(alice, aliceStore, friends.left, [relay]);
+        const bobClient = new MurmurClient({ identity: bob, store: bobStore, transports: [relay] });
+        const topic = pairwiseTopic(alice, bob);
+        const laterBytes = encodeEncryptedPrivateMessage(
+            encryptPrivateMessageForContact(bob, alice, createPrivateMessage("later", [], 7)),
+        );
+
+        // Valid JSON with none of the required fields: the codec reports this as a plain
+        // Error, so an unarmored decode escapes handleEvent and the cursor never advances.
+        await bobClient.publishEvent(createRelayEvent(bob, topic, utf8Encode("{}")));
+        await bobClient.publishEvent(createRelayEvent(bob, topic, laterBytes));
+
+        const result = await aliceChat.sync();
+
+        expect(result.status).toBe("events");
+        if (result.status === "events") {
+            expect(result.opened.map((value) => value.message.text)).toEqual(["later"]);
+            expect(result.quarantined).toBe(1);
+        }
+        expect(await aliceStore.list("direct-chat/v1/quarantine/")).toHaveLength(1);
+        expect(await aliceChat.sync()).toMatchObject({ status: "events", opened: [] });
+    });
+
     it("opens the valid self copy when an earlier self-prefixed element is bogus", async () => {
         const relay = new ChatTransport("relay");
         const alice = generateIdentityKeyPair();

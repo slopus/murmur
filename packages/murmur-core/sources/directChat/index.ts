@@ -98,6 +98,27 @@ export const MAX_DIRECT_CHAT_ATTACHMENTS = MAX_MESSAGE_ATTACHMENTS;
 
 class InvalidDirectChatEnvelopeError extends Error {}
 
+/**
+ * Decode a delivered payload, treating every malformed shape as an invalid envelope.
+ *
+ * These are the first attacker-controlled bytes the receive path touches, before
+ * anything has been authenticated, and the codec reports structural problems as a
+ * plain `Error`. Left unarmored, one such payload escapes `handleEvent`, the relay
+ * cursor never advances, and the same event is replayed forever: a permanent halt to
+ * direct-chat delivery that anyone who knows the topic can trigger once and for free.
+ * Quarantining instead keeps the cursor moving, which is what the surrounding code
+ * already does for every envelope it can name.
+ */
+function decodeDeliveredEnvelope(payload: Uint8Array): EncryptedPrivateMessage {
+    try {
+        return decodeEncryptedPrivateMessage(payload);
+    } catch (error: unknown) {
+        throw new InvalidDirectChatEnvelopeError(
+            error instanceof Error ? error.message : "Invalid encrypted private message",
+        );
+    }
+}
+
 interface PreparedEnvelope {
     readonly encrypted: EncryptedPrivateMessage;
     readonly opened: OpenedPrivateMessage;
@@ -671,7 +692,7 @@ export class DirectChat {
             return { status: "unhandled", event: delivery };
         }
         try {
-            const payloadEnvelope = decodeEncryptedPrivateMessage(delivery.event.payload);
+            const payloadEnvelope = decodeDeliveredEnvelope(delivery.event.payload);
             if (payloadEnvelope.recipient !== this.#ownerId) {
                 let prepared: PreparedEnvelope | undefined;
                 for (const operation of delivery.event.list ?? []) {
