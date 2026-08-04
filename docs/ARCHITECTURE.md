@@ -52,7 +52,10 @@ KeyPackage exhaustion is collected per friend: unrelated friend and group work
 still converges before a deterministic typed error is surfaced.
 Queued Adds are revalidated against current friendship state and dropped when
 that peer is no longer active; existing-member Removes remain independent group
-operations and continue.
+operations and continue. An exact staged Add is never discarded ambiguously. If
+it wins after friendship has ended and its invitation is suppressed, adoption
+atomically turns the original operation into a compensating Remove at the same
+queue position.
 
 Relay cursors advance in the same application-store transaction as the effect
 of an inbound event. Invalid, stale, unsupported, removed-member, and

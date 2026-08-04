@@ -43,6 +43,7 @@ import {
     decodeRelayOutbox,
     decodeStagedCommit,
     encodeGroupEvent,
+    encodeGroupOperation,
     encodeRelayOutbox,
 } from "../impl/stateCodec.js";
 import { createCapabilityEvent, friendControlAccess, groupAccess } from "../impl/topics.js";
@@ -1255,6 +1256,322 @@ describe("stateful Murmur facade", () => {
             }
         }
     }, 180_000);
+
+    it("drops a persisted Add queued after remote end before requesting control", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const fetch = inProcessFetch(relay);
+        const aliceStore = new MemoryMurmurStore();
+        const alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: aliceStore,
+            initialProfile: { name: "Alice" },
+            fetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Bob" },
+            fetch,
+        });
+        try {
+            await alice.friends.request(bob.identityKey);
+            await converge([alice, bob]);
+            await bob.friends.accept(alice.identityKey);
+            await converge([bob, alice], 8);
+            const groupId = await alice.groups.create(utf8Encode("persisted stale Add"));
+            await converge([alice], 2);
+
+            await bob.friends.end(alice.identityKey);
+            await converge([bob, alice], 6);
+            expect((await alice.friends.get(bob.identityKey))?.status).toBe("ended");
+
+            const encodedGroupId = encodeBase64Url(groupId);
+            const operationId = encodeBase64Url(randomBytes(24));
+            const operationBytes = encodeGroupOperation({
+                id: operationId,
+                type: "add",
+                peer: bob.identityKey,
+                createdAt: Date.now(),
+            });
+            try {
+                await aliceStore.set(
+                    `murmur/v1/groups/${encodedGroupId}/operations/${operationId}`,
+                    operationBytes,
+                );
+            } finally {
+                operationBytes.fill(0);
+            }
+            await alice.groups.send(groupId, utf8Encode("after persisted stale Add"));
+            await converge([alice], 6);
+
+            expect(
+                (await alice.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).toContain("after persisted stale Add");
+            const operations = await aliceStore.list(
+                `murmur/v1/groups/${encodedGroupId}/operations/`,
+            );
+            expect(operations.size).toBe(0);
+            for (const encoded of operations.values()) {
+                encoded.fill(0);
+            }
+            const peerId = identityId({ publicKey: bob.identityKey });
+            for (const key of [
+                `murmur/v1/key-packages/needed/${peerId}`,
+                `murmur/v1/key-packages/requests/${peerId}`,
+            ]) {
+                const marker = await aliceStore.get(key);
+                expect(marker).toBeUndefined();
+                marker?.fill(0);
+            }
+            const outboxes = await aliceStore.list("murmur/v1/relay-outbox/");
+            try {
+                const records = [...outboxes.values()].map(decodeRelayOutbox);
+                expect(records.some((record) => record.purpose.type === "friend-control")).toBe(
+                    false,
+                );
+                for (const record of records) {
+                    destroyRelayOutboxRecord(record);
+                }
+            } finally {
+                for (const encoded of outboxes.values()) {
+                    encoded.fill(0);
+                }
+            }
+        } finally {
+            await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 60_000);
+
+    it("compensates a winning staged Add when friendship ends before invitation", async () => {
+        for (const ending of ["local", "remote"] as const) {
+            const relay = new RelayService(new SqliteRelayStore(":memory:"));
+            const handler = createRelayFetchHandler(relay);
+            const aliceStore = new MemoryMurmurStore();
+            const bobStore = new MemoryMurmurStore();
+            let interceptAdd = false;
+            let disconnected = false;
+            let blockGroupReads = false;
+            let blockCompensatingRemove = false;
+            let compensatingRemoveBlocked = false;
+            let acceptedAddId: string | undefined;
+            const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+                const request = new Request(input, init);
+                const path = new URL(request.url).pathname;
+                if (disconnected && path === "/v1/events/read") {
+                    throw new Error("disconnected after staged Add acceptance");
+                }
+                if (blockGroupReads && path === "/v1/events/read") {
+                    const read = JSON.parse(await request.clone().text()) as {
+                        readonly topic?: { readonly name?: unknown };
+                    };
+                    if (read.topic?.name === "group-events") {
+                        throw new Error("blocked group read before remote end");
+                    }
+                }
+                if (request.method === "POST" && path === "/v1/events") {
+                    const event = decodeSignedRelayEventWire(
+                        utf8Encode(await request.clone().text()),
+                    );
+                    if (interceptAdd && event.topic.name === "group-events") {
+                        if (acceptedAddId === undefined) {
+                            await handler(request);
+                            acceptedAddId = event.id;
+                            disconnected = true;
+                            throw new Error("accepted staged Add then disconnected");
+                        }
+                        if (blockCompensatingRemove && event.id !== acceptedAddId) {
+                            compensatingRemoveBlocked = true;
+                            throw new Error("blocked compensating Remove");
+                        }
+                    }
+                }
+                return handler(request);
+            };
+            const sharedFetch = inProcessFetch(relay);
+            let alice = await Murmur.open({
+                relay: "https://relay.test",
+                store: aliceStore,
+                initialProfile: { name: `Alice ${ending}` },
+                fetch: aliceFetch,
+            });
+            const bob = await Murmur.open({
+                relay: "https://relay.test",
+                store: bobStore,
+                initialProfile: { name: `Bob ${ending}` },
+                fetch: sharedFetch,
+            });
+            const aliceIdentity = alice.identityKey;
+            try {
+                await alice.friends.request(bob.identityKey);
+                await converge([alice, bob]);
+                await bob.friends.accept(alice.identityKey);
+                await converge([bob, alice], 8);
+
+                const legitimateGroup = await alice.groups.create(
+                    utf8Encode(`legitimate membership ${ending}`),
+                    [bob.identityKey],
+                );
+                await converge([alice, bob], 10);
+                const phantomGroup = await alice.groups.create(
+                    utf8Encode(`staged phantom ${ending}`),
+                );
+
+                interceptAdd = true;
+                await alice.groups.add(phantomGroup, bob.identityKey);
+                await expect(alice.sync()).rejects.toThrow();
+                expect(acceptedAddId).toBeDefined();
+                const encodedGroupId = encodeBase64Url(phantomGroup);
+                const stagedKey = `murmur/v1/groups/${encodedGroupId}/staged`;
+                const stagedAddBytes = await aliceStore.get(stagedKey);
+                if (stagedAddBytes === undefined) {
+                    throw new Error("Accepted Add was not retained as staged state");
+                }
+                const stagedAdd = decodeStagedCommit(stagedAddBytes);
+                stagedAddBytes.fill(0);
+                try {
+                    expect(stagedAdd.type).toBe("add");
+                } finally {
+                    stagedAdd.fingerprint.fill(0);
+                    stagedAdd.nextEpoch.fill(0);
+                    stagedAdd.peer.fill(0);
+                    stagedAdd.keyPackageReference?.fill(0);
+                    stagedAdd.welcome?.fill(0);
+                    stagedAdd.tree?.fill(0);
+                }
+
+                if (ending === "local") {
+                    await alice.friends.end(bob.identityKey);
+                    await alice.close();
+                } else {
+                    await alice.close();
+                    await bob.friends.end(aliceIdentity);
+                    await bob.sync();
+                    disconnected = false;
+                    blockGroupReads = true;
+                    alice = await Murmur.open({
+                        relay: "https://relay.test",
+                        store: aliceStore,
+                        fetch: aliceFetch,
+                    });
+                    await waitFor(async () => {
+                        try {
+                            await alice.sync();
+                        } catch (error: unknown) {
+                            if (
+                                !(error instanceof Error) ||
+                                !error.message.includes("blocked group read before remote end")
+                            ) {
+                                throw error;
+                            }
+                        }
+                        return (await alice.friends.get(bob.identityKey))?.status === "ended";
+                    }, 30_000);
+                    await alice.close();
+                    blockGroupReads = false;
+                }
+
+                disconnected = false;
+                blockCompensatingRemove = true;
+                alice = await Murmur.open({
+                    relay: "https://relay.test",
+                    store: aliceStore,
+                    fetch: aliceFetch,
+                });
+                await waitFor(async () => {
+                    try {
+                        await alice.sync();
+                    } catch (error: unknown) {
+                        if (
+                            !(error instanceof Error) ||
+                            !error.message.includes("blocked compensating Remove")
+                        ) {
+                            throw error;
+                        }
+                    }
+                    return compensatingRemoveBlocked;
+                }, 30_000);
+                expect(
+                    (await alice.groups.get(phantomGroup))?.group.members.map(encodeBase64Url),
+                ).toContain(encodeBase64Url(bob.identityKey));
+                const stagedRemoveBytes = await aliceStore.get(stagedKey);
+                if (stagedRemoveBytes === undefined) {
+                    throw new Error("Compensating Remove was not durably staged");
+                }
+                const stagedRemove = decodeStagedCommit(stagedRemoveBytes);
+                stagedRemoveBytes.fill(0);
+                try {
+                    expect(stagedRemove.type).toBe("remove");
+                    expect(stagedRemove.peer).toEqual(bob.identityKey);
+                } finally {
+                    stagedRemove.fingerprint.fill(0);
+                    stagedRemove.nextEpoch.fill(0);
+                    stagedRemove.peer.fill(0);
+                    stagedRemove.keyPackageReference?.fill(0);
+                    stagedRemove.welcome?.fill(0);
+                    stagedRemove.tree?.fill(0);
+                }
+
+                await alice.close();
+                blockCompensatingRemove = false;
+                alice = await Murmur.open({
+                    relay: "https://relay.test",
+                    store: aliceStore,
+                    fetch: aliceFetch,
+                });
+                await converge([alice, bob], 12);
+
+                expect(
+                    (await alice.groups.get(phantomGroup))?.group.members.map(encodeBase64Url),
+                ).toEqual([encodeBase64Url(alice.identityKey)]);
+                expect(await bob.groups.get(phantomGroup)).toBeUndefined();
+                expect((await alice.groups.get(legitimateGroup))?.group.members).toHaveLength(2);
+                expect((await bob.groups.get(legitimateGroup))?.group.members).toHaveLength(2);
+
+                await alice.groups.send(
+                    phantomGroup,
+                    utf8Encode(`after compensating Remove ${ending}`),
+                );
+                await converge([alice], 4);
+                expect(
+                    (await alice.groups.get(phantomGroup))?.events.map((event) =>
+                        utf8Decode(event.bytes),
+                    ),
+                ).toContain(`after compensating Remove ${ending}`);
+
+                expect(await aliceStore.get(stagedKey)).toBeUndefined();
+                expect(
+                    (await aliceStore.list(`murmur/v1/groups/${encodedGroupId}/operations/`)).size,
+                ).toBe(0);
+                const peerId = identityId({ publicKey: bob.identityKey });
+                for (const prefix of [
+                    `murmur/v1/key-packages/local/${peerId}/`,
+                    `murmur/v1/key-packages/local-consumed/${peerId}/`,
+                    `murmur/v1/key-packages/remote/${peerId}/`,
+                    `murmur/v1/key-packages/remote-consumed/${peerId}/`,
+                ]) {
+                    const records = await aliceStore.list(prefix);
+                    expect(records.size).toBe(0);
+                    for (const bytes of records.values()) {
+                        bytes.fill(0);
+                    }
+                }
+                const outboxes = await aliceStore.list("murmur/v1/relay-outbox/");
+                expect(outboxes.size).toBe(0);
+                for (const bytes of outboxes.values()) {
+                    bytes.fill(0);
+                }
+            } finally {
+                interceptAdd = false;
+                disconnected = false;
+                blockGroupReads = false;
+                blockCompensatingRemove = false;
+                compensatingRemoveBlocked = false;
+                await Promise.all([alice.close(), bob.close()]);
+                await relay.close();
+            }
+        }
+    }, 240_000);
 
     it("catches up a winning removal before publishing an old-epoch send", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"));

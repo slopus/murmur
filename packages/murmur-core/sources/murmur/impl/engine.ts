@@ -2765,50 +2765,98 @@ export class MurmurEngine {
                 persistenceGeneration: next.persistenceGeneration,
             };
             await this.#store.transaction(async (transaction) => {
-                const current = await transaction.get(groupStagedKey(group.record.id));
-                let currentStaged: StagedGroupCommit | undefined;
+                let currentOperation: GroupOperation | undefined;
                 try {
-                    currentStaged = current === undefined ? undefined : decodeStagedCommit(current);
-                    if (currentStaged?.eventId !== staged.eventId) {
-                        throw new Error("Staged MLS candidate changed before adoption");
+                    const current = await transaction.get(groupStagedKey(group.record.id));
+                    const operationKey = groupOperationKey(group.record.id, staged.operationId);
+                    const operationBytes = await transaction.get(operationKey);
+                    let currentStaged: StagedGroupCommit | undefined;
+                    try {
+                        currentStaged =
+                            current === undefined ? undefined : decodeStagedCommit(current);
+                        if (currentStaged?.eventId !== staged.eventId) {
+                            throw new Error("Staged MLS candidate changed before adoption");
+                        }
+                        currentOperation =
+                            operationBytes === undefined
+                                ? undefined
+                                : decodeGroupOperation(operationBytes);
+                        if (
+                            currentOperation === undefined ||
+                            currentOperation.type !== staged.type ||
+                            !equalBytes(currentOperation.peer, staged.peer)
+                        ) {
+                            throw new Error("Staged MLS operation changed before adoption");
+                        }
+                    } finally {
+                        current?.fill(0);
+                        operationBytes?.fill(0);
+                        destroyStagedCommit(currentStaged);
                     }
-                } finally {
-                    current?.fill(0);
-                    destroyStagedCommit(currentStaged);
-                }
-                await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
-                await transaction.set(groupEpochKey(group.record.id), rebasedBytes!);
-                await this.#recordGroupReplay(transaction, group.record.id, fingerprint, sequence);
-                await transaction.delete(groupStagedKey(group.record.id));
-                await transaction.delete(groupOperationKey(group.record.id, staged.operationId));
-                await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
-                if (
-                    staged.type === "add" &&
-                    staged.keyPackageReference !== undefined &&
-                    staged.welcome !== undefined &&
-                    staged.tree !== undefined
-                ) {
-                    await this.#queueControl(
+
+                    await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
+                    await transaction.set(groupEpochKey(group.record.id), rebasedBytes!);
+                    await this.#recordGroupReplay(
                         transaction,
-                        { publicKey: staged.peer },
-                        {
-                            type: "group-invitation",
-                            groupId: decodeBase64Url(group.record.id),
-                            descriptor: group.record.descriptor,
-                            descriptorNonce: group.record.descriptorNonce,
-                            descriptorBinding: group.record.descriptorBinding,
-                            topicSecret: group.record.topicSecret,
-                            keyPackageReference: staged.keyPackageReference,
-                            welcome: staged.welcome,
-                            tree: staged.tree,
-                            commitSequence: sequence,
-                            commitEventId: event.id,
-                            commitFingerprint: fingerprint,
-                        },
-                        { type: "friend-control" },
+                        group.record.id,
+                        fingerprint,
+                        sequence,
                     );
+                    await transaction.delete(groupStagedKey(group.record.id));
+                    await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
+                    let invitationQueued = false;
+                    if (
+                        staged.type === "add" &&
+                        staged.keyPackageReference !== undefined &&
+                        staged.welcome !== undefined &&
+                        staged.tree !== undefined
+                    ) {
+                        invitationQueued = await this.#queueControl(
+                            transaction,
+                            { publicKey: staged.peer },
+                            {
+                                type: "group-invitation",
+                                groupId: decodeBase64Url(group.record.id),
+                                descriptor: group.record.descriptor,
+                                descriptorNonce: group.record.descriptorNonce,
+                                descriptorBinding: group.record.descriptorBinding,
+                                topicSecret: group.record.topicSecret,
+                                keyPackageReference: staged.keyPackageReference,
+                                welcome: staged.welcome,
+                                tree: staged.tree,
+                                commitSequence: sequence,
+                                commitEventId: event.id,
+                                commitFingerprint: fingerprint,
+                            },
+                            { type: "friend-control" },
+                        );
+                    }
+                    if (staged.type === "add" && !invitationQueued) {
+                        await transaction.set(
+                            operationKey,
+                            encodeGroupOperation({
+                                id: currentOperation.id,
+                                type: "remove",
+                                peer: staged.peer,
+                                createdAt: currentOperation.createdAt,
+                            }),
+                        );
+                        if (staged.keyPackageReference !== undefined) {
+                            await transaction.delete(
+                                `${REMOTE_KEY_PACKAGE_CONSUMED_PREFIX}${identityId({
+                                    publicKey: staged.peer,
+                                })}/${encodeBase64Url(staged.keyPackageReference)}`,
+                            );
+                        }
+                    } else {
+                        await transaction.delete(operationKey);
+                    }
+                    await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
+                } finally {
+                    if (currentOperation !== undefined) {
+                        destroyGroupOperation(currentOperation);
+                    }
                 }
-                await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
             });
         } catch (error: unknown) {
             next.destroy();

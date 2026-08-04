@@ -72,6 +72,14 @@ is an honest current group member; relay order alone does not establish
 membership validity for the joiner. The invitation is encrypted and
 authenticated by the friend channel. There is no public join operation.
 
+A queued Add is dropped if its peer is no longer an active friend when
+preparation begins. Once an Add is staged, exact retry and relay-order safety
+take precedence: the candidate is retained until its echo or a competing Commit
+settles it. If that staged Add wins after friendship ended, Murmur suppresses
+the invitation and atomically retains the operation as a compensating Remove,
+which restores membership without peer cooperation. Ordinary friendship end
+does not remove a peer who was already a legitimate group member.
+
 ## Group stream
 
 A one-member group and a many-member group are the same primitive. The
