@@ -19,3 +19,14 @@ secret intermediate is zeroed after use.
 `encodeIdentityRoot` and `decodeIdentityRoot` provide the strict
 application-owned storage representation. It contains only the one root secret;
 applications are responsible for protecting those stored bytes.
+
+```text
+                  32-byte identity root
+                    /              \
+          Ed25519 signing       X25519 agreement
+                 |                    |
+        public identity key     sealed-box shared key
+```
+
+All higher-level authentication and encryption enters through this single-root
+boundary; wire and storage codecs receive defensive byte copies.

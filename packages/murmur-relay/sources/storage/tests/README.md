@@ -7,3 +7,15 @@ instead of timing-dependent. Store instrumentation verifies that adversarial
 maximum-size metadata pages hydrate only the selected event JSON rows. SQLite
 overflow-row coverage also requires an explicit covering-index plan and a
 generous repeated-read performance ceiling.
+
+```text
+                 shared conformance cases
+                 /                      \
+        SQLite :memory:             PGlite
+       sequence/receipt      sequence/receipt/lock
+                 \                      /
+            identical pages, heads, collapse, challenges
+```
+
+The paired suite prevents one backend from silently weakening relay ordering
+or one-use challenge behavior.

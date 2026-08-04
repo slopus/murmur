@@ -20,3 +20,12 @@ returns, so a caller can end its own never-ending responses — for the relay,
 `RelayService.closeStreams()` — immediately afterwards and still have them
 counted in the drain. Anything still open when `graceMilliseconds` expires is
 destroyed, so one open stream cannot hold shutdown open forever.
+
+```text
+IncomingMessage -> URL/headers/body -> Fetch Request -> handler
+ServerResponse <- headers/stream ---- Fetch Response <-+
+      |
+socket backpressure + abort propagation + graceful drain
+```
+
+This is the only layer that depends on Node HTTP lifecycle and socket behavior.

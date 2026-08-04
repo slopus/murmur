@@ -8,6 +8,7 @@ PROTOCOL.md ----- friend/control/MLS wire behavior
 RELAY_API.md ---- ordered opaque relay HTTP contract
 SECURITY.md ----- guarantees, exposure, and limits
 DEPLOYMENT.md --- standalone relay operation
+RELEASING.md ---- version, package, image, and release procedure
 ```
 
 Application chat, document, file, and session semantics intentionally do not

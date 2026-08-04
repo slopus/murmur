@@ -44,3 +44,14 @@ transaction before publication. Adopt the already-checkpointed transition only
 after publication is confirmed. Both inbound opens and outbound seals are
 blocked while a transition is staged so the staged checkpoint cannot lose a
 later current-epoch ratchet mutation.
+
+```text
+active epoch E
+   +-- seal/open application -> ratchet -> checkpoint E'
+   `-- prepare Commit -------> staged E+1
+                                  +-- cancel -> destroy E+1, resume E
+                                  `-- commit -> destroy E, activate E+1
+```
+
+The wrapper is the single ownership boundary tying cryptographic mutation to
+the facade's prepare-persist-publish/adopt durability rules.

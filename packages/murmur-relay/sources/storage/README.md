@@ -21,3 +21,14 @@ one another.
 Read challenges use indexed expiration, atomic delete-on-consume, and a
 transactionally maintained outstanding count. A schema-version marker rejects
 legacy layouts before partial clean-schema creation.
+
+```text
+topic head ----> monotonically allocated sequence
+event ID ------> idempotency receipt
+retained rows -> expiration/collapse filtering -> bounded page
+
+read challenge -> store -> atomic consume -> proof accepted once
+```
+
+SQLite and Postgres implement this same conformance contract despite different
+locking and notification mechanisms.
