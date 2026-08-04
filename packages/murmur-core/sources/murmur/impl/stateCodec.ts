@@ -9,6 +9,12 @@ export type OutboxPurpose =
     | { readonly type: "friend-exchange"; readonly sourceId: string }
     | { readonly type: "friend-control" }
     | {
+          readonly type: "group-invitation";
+          readonly groupId: string;
+          readonly operationId: string;
+          readonly peerId: string;
+      }
+    | {
           readonly type: "group-application";
           readonly groupId: string;
           readonly operationId: string;
@@ -191,12 +197,19 @@ export function encodeRelayOutbox(record: RelayOutboxRecord): Uint8Array {
                     groupId: null,
                     operationId: null,
                 }
-              : {
-                    type: record.purpose.type,
-                    sourceId: null,
-                    groupId: record.purpose.groupId,
-                    operationId: record.purpose.operationId,
-                };
+              : record.purpose.type === "group-invitation"
+                ? {
+                      type: record.purpose.type,
+                      sourceId: record.purpose.peerId,
+                      groupId: record.purpose.groupId,
+                      operationId: record.purpose.operationId,
+                  }
+                : {
+                      type: record.purpose.type,
+                      sourceId: null,
+                      groupId: record.purpose.groupId,
+                      operationId: record.purpose.operationId,
+                  };
     return utf8Encode(
         JSON.stringify({
             version: 1,
@@ -246,6 +259,18 @@ export function decodeRelayOutbox(encoded: Uint8Array): RelayOutboxRecord {
         purpose.operationId === null
     ) {
         decodedPurpose = { type: "friend-control" };
+    } else if (
+        purpose.type === "group-invitation" &&
+        typeof purpose.sourceId === "string" &&
+        typeof purpose.groupId === "string" &&
+        typeof purpose.operationId === "string"
+    ) {
+        decodedPurpose = {
+            type: "group-invitation",
+            peerId: id(purpose.sourceId, "group invitation peer", 32),
+            groupId: id(purpose.groupId, "group ID", 32),
+            operationId: id(purpose.operationId, "group operation ID", 24),
+        };
     } else if (
         (purpose.type === "group-application" || purpose.type === "group-commit") &&
         purpose.sourceId === null &&

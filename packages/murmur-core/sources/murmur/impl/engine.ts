@@ -668,9 +668,109 @@ export class MurmurEngine {
                 let record: RelayOutboxRecord | undefined;
                 try {
                     record = decodeRelayOutbox(encoded);
+                    if (relayTopicId(record.event.topic) !== topicId) {
+                        continue;
+                    }
+                    if (record.purpose.type === "group-invitation") {
+                        await this.#queueInvitationCompensation(
+                            transaction,
+                            peer,
+                            record.event.createdAt,
+                            record.purpose,
+                        );
+                        await transaction.delete(key);
+                    } else if (record.purpose.type === "friend-control") {
+                        await transaction.delete(key);
+                    }
+                } finally {
+                    destroyRelayOutboxRecord(record);
+                }
+            }
+        } finally {
+            for (const encoded of outboxes.values()) {
+                zeroBytes(encoded);
+            }
+        }
+    }
+
+    async #queueInvitationCompensation(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+        invitationCreatedAt: number,
+        purpose: Extract<RelayOutboxRecord["purpose"], { type: "group-invitation" }>,
+    ): Promise<void> {
+        if (purpose.peerId !== identityId(peer)) {
+            throw new Error("Group invitation purpose does not match its friend channel");
+        }
+        const metadata = await transaction.get(groupMetaKey(purpose.groupId));
+        if (metadata === undefined) {
+            return;
+        }
+        let group: StoredGroup;
+        try {
+            group = decodeGroup(metadata);
+        } finally {
+            zeroBytes(metadata);
+        }
+        try {
+            if (
+                group.status !== "active" ||
+                !group.members.some((member) => equalBytes(member, peer.publicKey))
+            ) {
+                return;
+            }
+            const operationKey = groupOperationKey(purpose.groupId, purpose.operationId);
+            const existingBytes = await transaction.get(operationKey);
+            if (existingBytes !== undefined) {
+                let existing: GroupOperation | undefined;
+                try {
+                    existing = decodeGroupOperation(existingBytes);
+                    if (existing.type !== "remove" || !equalBytes(existing.peer, peer.publicKey)) {
+                        throw new Error(
+                            "Group invitation compensation operation ID was already reused",
+                        );
+                    }
+                    return;
+                } finally {
+                    zeroBytes(existingBytes);
+                    if (existing !== undefined) {
+                        destroyGroupOperation(existing);
+                    }
+                }
+            }
+            const compensation: GroupOperation = {
+                id: purpose.operationId,
+                type: "remove",
+                peer: peer.publicKey,
+                createdAt: invitationCreatedAt,
+            };
+            const encoded = encodeGroupOperation(compensation);
+            try {
+                await transaction.set(operationKey, encoded);
+            } finally {
+                zeroBytes(encoded);
+            }
+        } finally {
+            destroyStoredGroup(group);
+        }
+    }
+
+    async #purgeObsoleteGroupInvitations(
+        transaction: StoreTransaction,
+        groupId: string,
+        members: readonly Uint8Array[],
+    ): Promise<void> {
+        const memberIds = new Set(members.map(encodeBase64Url));
+        const outboxes = await transaction.list(OUTBOX_PREFIX);
+        try {
+            for (const [key, encoded] of outboxes) {
+                let record: RelayOutboxRecord | undefined;
+                try {
+                    record = decodeRelayOutbox(encoded);
                     if (
-                        record.purpose.type === "friend-control" &&
-                        relayTopicId(record.event.topic) === topicId
+                        record.purpose.type === "group-invitation" &&
+                        record.purpose.groupId === groupId &&
+                        !memberIds.has(record.purpose.peerId)
                     ) {
                         await transaction.delete(key);
                     }
@@ -1759,7 +1859,9 @@ export class MurmurEngine {
                             await scoped.confirmOutbox(pending, "accepted");
                         }
                     }
-                    await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
+                    if (exactOutbox?.purpose.type !== "group-invitation") {
+                        await transaction.delete(`${OUTBOX_PREFIX}${event.id}`);
+                    }
                     await transaction.delete(`${CONTROL_SELF_PREFIX}${event.id}`);
                     await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);
                 });
@@ -2701,6 +2803,11 @@ export class MurmurEngine {
             await this.#store.transaction(async (transaction) => {
                 await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
                 await transaction.set(groupEpochKey(group.record.id), nextEpochBytes);
+                await this.#purgeObsoleteGroupInvitations(
+                    transaction,
+                    group.record.id,
+                    nextRecord.members,
+                );
                 await this.#recordGroupReplay(transaction, group.record.id, fingerprint, sequence);
                 await transaction.delete(groupStagedKey(group.record.id));
                 if (staged?.type === "add" && staged.keyPackageReference !== undefined) {
@@ -2796,6 +2903,11 @@ export class MurmurEngine {
 
                     await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
                     await transaction.set(groupEpochKey(group.record.id), rebasedBytes!);
+                    await this.#purgeObsoleteGroupInvitations(
+                        transaction,
+                        group.record.id,
+                        nextRecord.members,
+                    );
                     await this.#recordGroupReplay(
                         transaction,
                         group.record.id,
@@ -2828,7 +2940,12 @@ export class MurmurEngine {
                                 commitEventId: event.id,
                                 commitFingerprint: fingerprint,
                             },
-                            { type: "friend-control" },
+                            {
+                                type: "group-invitation",
+                                groupId: group.record.id,
+                                operationId: staged.operationId,
+                                peerId: identityId({ publicKey: staged.peer }),
+                            },
                         );
                     }
                     if (staged.type === "add" && !invitationQueued) {
@@ -2893,6 +3010,7 @@ export class MurmurEngine {
         await this.#store.transaction(async (transaction) => {
             await transaction.set(groupMetaKey(group.record.id), encodeGroup(nextRecord));
             await transaction.delete(groupEpochKey(group.record.id));
+            await this.#purgeObsoleteGroupInvitations(transaction, group.record.id, []);
             await this.#clearRemovedGroupPendingState(transaction, group.record.id, staged);
             await this.#recordGroupReplay(transaction, group.record.id, fingerprint, sequence);
             await this.#advanceCursor(transaction, cursorKey, expectedCursor, sequence);

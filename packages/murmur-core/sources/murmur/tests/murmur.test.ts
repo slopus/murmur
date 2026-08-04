@@ -884,7 +884,7 @@ describe("stateful Murmur facade", () => {
         }
     }, 30_000);
 
-    it("retires KeyPackages and rejects a retained invitation after friendship end", async () => {
+    it("retires KeyPackages, compensates, and rejects a retained invitation after friendship end", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"));
         const handler = createRelayFetchHandler(relay);
         const aliceStore = new MemoryMurmurStore();
@@ -975,7 +975,7 @@ describe("stateful Murmur facade", () => {
             await converge([alice, bob], 8);
             expect((await alice.friends.get(bob.identityKey))?.status).toBe("ended");
             expect((await bob.friends.get(alice.identityKey))?.status).toBe("ended");
-            expect((await alice.groups.get(groupId))?.group.members).toHaveLength(2);
+            expect((await alice.groups.get(groupId))?.group.members).toEqual([alice.identityKey]);
 
             if (retainedInvitationBody === undefined) {
                 throw new Error("Expected a retained invitation body");
@@ -989,6 +989,20 @@ describe("stateful Murmur facade", () => {
             );
             await bob.sync();
             expect(await bob.groups.get(groupId)).toBeUndefined();
+
+            await alice.groups.send(groupId, utf8Encode("after retained invitation compensation"));
+            await converge([alice], 4);
+            expect(
+                (await alice.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).toContain("after retained invitation compensation");
+            const encodedGroupId = encodeBase64Url(groupId);
+            expect(
+                (await aliceStore.list(`murmur/v1/groups/${encodedGroupId}/operations/`)).size,
+            ).toBe(0);
+            expect(
+                await aliceStore.get(`murmur/v1/groups/${encodedGroupId}/staged`),
+            ).toBeUndefined();
+            expect((await aliceStore.list("murmur/v1/relay-outbox/")).size).toBe(0);
 
             const alicePeer = identityId({ publicKey: bob.identityKey });
             const bobPeer = identityId({ publicKey: alice.identityKey });
@@ -1021,6 +1035,299 @@ describe("stateful Murmur facade", () => {
             await relay.close();
         }
     }, 120_000);
+
+    it("compensates remote and ambiguous invitations but retains confirmed membership", async () => {
+        for (const scenario of ["queued-remote", "accepted-restart", "confirmed"] as const) {
+            const relay = new RelayService(new SqliteRelayStore(":memory:"));
+            const handler = createRelayFetchHandler(relay);
+            const aliceStore = new MemoryMurmurStore();
+            const bobStore = new MemoryMurmurStore();
+            let aliceRoot: IdentityKeyPair | undefined;
+            let bobRoot: IdentityKeyPair | undefined;
+            let blockInvitation = scenario !== "confirmed";
+            let invitationAccepted = false;
+            let blockGroupPublications = false;
+            let watchGroupPublications = false;
+            const compensationEventIds = new Set<string>();
+            const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+                const request = new Request(input, init);
+                if (request.method !== "POST" || new URL(request.url).pathname !== "/v1/events") {
+                    return handler(request);
+                }
+                const body = await request.clone().text();
+                const event = decodeSignedRelayEventWire(utf8Encode(body));
+                if (event.topic.name === "group-events" && watchGroupPublications) {
+                    compensationEventIds.add(event.id);
+                    if (blockGroupPublications) {
+                        throw new Error("blocked invitation compensation");
+                    }
+                }
+                if (
+                    !blockInvitation ||
+                    event.topic.name !== "control" ||
+                    aliceRoot === undefined ||
+                    bobRoot === undefined
+                ) {
+                    return handler(request);
+                }
+                const receiver = new FriendChannel(bobRoot, {
+                    publicKey: aliceRoot.publicKey,
+                });
+                let frame: FriendControlFrame | undefined;
+                try {
+                    const opened = receiver.open(
+                        JSON.parse(utf8Decode(event.payload)) as FriendControlEnvelope,
+                    );
+                    frame = decodeFriendControlFrame(opened.message.payload);
+                    opened.message.payload.fill(0);
+                } catch {
+                    return handler(request);
+                } finally {
+                    receiver.destroy();
+                }
+                try {
+                    if (frame.type !== "group-invitation") {
+                        return handler(request);
+                    }
+                    if (scenario === "accepted-restart" && !invitationAccepted) {
+                        await handler(request);
+                        invitationAccepted = true;
+                    }
+                    throw new Error(`held ${scenario} group invitation`);
+                } finally {
+                    destroyFriendControlFrame(frame);
+                }
+            };
+            const bobFetch = inProcessFetch(relay);
+            let alice = await Murmur.open({
+                relay: "https://relay.test",
+                store: aliceStore,
+                initialProfile: { name: `Alice ${scenario}` },
+                fetch: aliceFetch,
+            });
+            const bob = await Murmur.open({
+                relay: "https://relay.test",
+                store: bobStore,
+                initialProfile: { name: `Bob ${scenario}` },
+                fetch: bobFetch,
+            });
+            const aliceIdentity = alice.identityKey;
+            try {
+                const aliceRootBytes = await aliceStore.get("murmur/v1/root");
+                const bobRootBytes = await bobStore.get("murmur/v1/root");
+                if (aliceRootBytes === undefined || bobRootBytes === undefined) {
+                    throw new Error("Test identity root was not persisted");
+                }
+                aliceRoot = decodeIdentityRoot(aliceRootBytes);
+                bobRoot = decodeIdentityRoot(bobRootBytes);
+                aliceRootBytes.fill(0);
+                bobRootBytes.fill(0);
+
+                await alice.friends.request(bob.identityKey);
+                await converge([alice, bob]);
+                await bob.friends.accept(alice.identityKey);
+                await converge([bob, alice], 8);
+
+                const groupId = await alice.groups.create(
+                    utf8Encode(`invitation liveness ${scenario}`),
+                    [bob.identityKey],
+                );
+                const encodedGroupId = encodeBase64Url(groupId);
+                let invitationOperationId: string | undefined;
+                if (scenario === "confirmed") {
+                    await converge([alice, bob], 10);
+                    expect((await bob.groups.get(groupId))?.group.members).toHaveLength(2);
+                } else {
+                    await waitFor(async () => {
+                        try {
+                            await alice.sync();
+                        } catch {
+                            // The deliberately held invitation remains an exact durable outbox.
+                        }
+                        const outboxes = await aliceStore.list("murmur/v1/relay-outbox/");
+                        try {
+                            for (const encoded of outboxes.values()) {
+                                const record = decodeRelayOutbox(encoded);
+                                try {
+                                    if (
+                                        record.purpose.type === "group-invitation" &&
+                                        record.purpose.groupId === encodedGroupId
+                                    ) {
+                                        expect(record.purpose.peerId).toBe(
+                                            identityId({ publicKey: bob.identityKey }),
+                                        );
+                                        invitationOperationId = record.purpose.operationId;
+                                    }
+                                } finally {
+                                    destroyRelayOutboxRecord(record);
+                                }
+                            }
+                        } finally {
+                            for (const encoded of outboxes.values()) {
+                                encoded.fill(0);
+                            }
+                        }
+                        return (
+                            invitationOperationId !== undefined &&
+                            (await alice.groups.get(groupId))?.group.members.length === 2
+                        );
+                    }, 30_000);
+                    expect(invitationOperationId).toBeDefined();
+                    expect(invitationAccepted).toBe(scenario === "accepted-restart");
+                }
+
+                if (scenario === "accepted-restart") {
+                    await bob.sync();
+                    expect((await bob.groups.get(groupId))?.group.members).toHaveLength(2);
+                    await alice.close();
+                    alice = await Murmur.open({
+                        relay: "https://relay.test",
+                        store: aliceStore,
+                        fetch: aliceFetch,
+                    });
+                }
+
+                watchGroupPublications = true;
+                blockGroupPublications = scenario !== "confirmed";
+                if (scenario === "queued-remote") {
+                    await bob.friends.end(aliceIdentity);
+                    await bob.sync();
+                    await waitFor(async () => {
+                        try {
+                            await alice.sync();
+                        } catch {
+                            // Invitation and compensation publication are intentionally held.
+                        }
+                        return (await alice.friends.get(bob.identityKey))?.status === "ended";
+                    }, 30_000);
+                } else {
+                    await alice.friends.end(bob.identityKey);
+                }
+
+                if (scenario !== "confirmed") {
+                    await waitFor(async () => {
+                        try {
+                            await alice.sync();
+                        } catch {
+                            // The compensating Remove is intentionally retained for inspection.
+                        }
+                        return compensationEventIds.size > 0;
+                    }, 30_000);
+                    const operations = await aliceStore.list(
+                        `murmur/v1/groups/${encodedGroupId}/operations/`,
+                    );
+                    try {
+                        const decoded = [...operations.values()].map(decodeGroupOperation);
+                        try {
+                            const removals = decoded.filter(
+                                (operation) =>
+                                    operation.type === "remove" &&
+                                    encodeBase64Url(operation.peer) ===
+                                        encodeBase64Url(bob.identityKey),
+                            );
+                            expect(removals).toHaveLength(1);
+                            expect(removals[0]?.id).toBe(invitationOperationId);
+                        } finally {
+                            for (const operation of decoded) {
+                                destroyGroupOperation(operation);
+                            }
+                        }
+                    } finally {
+                        for (const encoded of operations.values()) {
+                            encoded.fill(0);
+                        }
+                    }
+                    const outboxes = await aliceStore.list("murmur/v1/relay-outbox/");
+                    try {
+                        const purposes = [...outboxes.values()].map(decodeRelayOutbox);
+                        try {
+                            expect(
+                                purposes.some(
+                                    (record) => record.purpose.type === "group-invitation",
+                                ),
+                            ).toBe(false);
+                        } finally {
+                            for (const record of purposes) {
+                                destroyRelayOutboxRecord(record);
+                            }
+                        }
+                    } finally {
+                        for (const encoded of outboxes.values()) {
+                            encoded.fill(0);
+                        }
+                    }
+                }
+
+                blockInvitation = false;
+                blockGroupPublications = false;
+                await converge([alice, bob], 12);
+                if (scenario === "confirmed") {
+                    expect(compensationEventIds.size).toBe(0);
+                    expect((await alice.groups.get(groupId))?.group.members).toHaveLength(2);
+                    expect((await bob.groups.get(groupId))?.group.members).toHaveLength(2);
+                } else {
+                    expect(compensationEventIds.size).toBe(1);
+                    expect((await alice.groups.get(groupId))?.group.members).toEqual([
+                        alice.identityKey,
+                    ]);
+                    if (scenario === "accepted-restart") {
+                        expect((await bob.groups.get(groupId))?.group.status).toBe("removed");
+                    } else {
+                        expect(await bob.groups.get(groupId)).toBeUndefined();
+                    }
+                }
+
+                watchGroupPublications = false;
+                await alice.groups.send(groupId, utf8Encode(`after ${scenario} end`));
+                await converge([alice, bob], 6);
+                expect(
+                    (await alice.groups.get(groupId))?.events.map((event) =>
+                        utf8Decode(event.bytes),
+                    ),
+                ).toContain(`after ${scenario} end`);
+                if (scenario === "confirmed") {
+                    expect(
+                        (await bob.groups.get(groupId))?.events.map((event) =>
+                            utf8Decode(event.bytes),
+                        ),
+                    ).toContain(`after ${scenario} end`);
+                }
+
+                expect(
+                    (await aliceStore.list(`murmur/v1/groups/${encodedGroupId}/operations/`)).size,
+                ).toBe(0);
+                expect(
+                    await aliceStore.get(`murmur/v1/groups/${encodedGroupId}/staged`),
+                ).toBeUndefined();
+                expect((await aliceStore.list("murmur/v1/relay-outbox/")).size).toBe(0);
+                const peerId = identityId({ publicKey: bob.identityKey });
+                for (const prefix of [
+                    `murmur/v1/key-packages/local/${peerId}/`,
+                    `murmur/v1/key-packages/local-consumed/${peerId}/`,
+                    `murmur/v1/key-packages/remote/${peerId}/`,
+                    `murmur/v1/key-packages/remote-consumed/${peerId}/`,
+                ]) {
+                    const records = await aliceStore.list(prefix);
+                    expect(records.size).toBe(0);
+                    for (const bytes of records.values()) {
+                        bytes.fill(0);
+                    }
+                }
+            } finally {
+                blockInvitation = false;
+                blockGroupPublications = false;
+                watchGroupPublications = false;
+                if (aliceRoot !== undefined) {
+                    destroyIdentity(aliceRoot);
+                }
+                if (bobRoot !== undefined) {
+                    destroyIdentity(bobRoot);
+                }
+                await Promise.all([alice.close(), bob.close()]);
+                await relay.close();
+            }
+        }
+    }, 240_000);
 
     it("drops queued Adds after local and remote friendship end without blocking later work", async () => {
         for (const ending of ["local", "remote"] as const) {

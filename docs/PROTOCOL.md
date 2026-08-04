@@ -80,6 +80,16 @@ the invitation and atomically retains the operation as a compensating Remove,
 which restores membership without peer cooperation. Ordinary friendship end
 does not remove a peer who was already a legitimate group member.
 
+If the Add wins first, Murmur retains a strict invitation outbox purpose bound
+to that group, peer, and exact Add operation until the relay publication
+returns success. A failed or accepted-then-disconnected publication remains
+ambiguous across restart. If friendship ends while that exact invitation is
+still pending, the same cleanup transaction deletes it and its KeyPackage state
+and queues one Remove under the source operation ID. If the exact retry had
+already returned accepted or duplicate, the invitation marker was deleted and
+friendship end leaves membership independent. A recipient that adopted an
+ambiguously published invitation can still process the later MLS Remove.
+
 ## Group stream
 
 A one-member group and a many-member group are the same primitive. The

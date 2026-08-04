@@ -19,5 +19,7 @@ public facade (../index.ts)
   `-- topics.ts
 ```
 
-All codecs are bounded and reject unknown fields. Secret-bearing records remain
-inside application-provided persistence.
+All codecs are bounded and reject unknown fields. Exact group-invitation
+outboxes retain the group, peer, and source Add until publication confirmation
+so friend-end cleanup can durably compensate only unresolved membership.
+Secret-bearing records remain inside application-provided persistence.

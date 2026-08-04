@@ -55,7 +55,12 @@ that peer is no longer active; existing-member Removes remain independent group
 operations and continue. An exact staged Add is never discarded ambiguously. If
 it wins after friendship has ended and its invitation is suppressed, adoption
 atomically turns the original operation into a compensating Remove at the same
-queue position.
+queue position. After an Add wins while friendship is active, its exact
+invitation outbox durably names the group, peer, and source Add until
+publication is confirmed. Friend-end cleanup atomically turns an unconfirmed
+or accepted-but-ambiguous invitation into exactly one Remove using that source
+ID. A confirmed invitation has no such marker, so ordinary friendship end does
+not alter that established group membership.
 
 Relay cursors advance in the same application-store transaction as the effect
 of an inbound event. Invalid, stale, unsupported, removed-member, and

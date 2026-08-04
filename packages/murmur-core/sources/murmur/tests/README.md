@@ -15,5 +15,7 @@ KeyPackages, staged/competing Commit races, Welcome binding, remove/re-add,
 per-topic failure isolation, fresh-relay cursor reset, quarantine/replay bounds,
 friend-end cleanup of queued Adds without suppressing group Removes, abortable
 close, accepted staged-Add compensation after local or remote friendship end,
-guard-sensitive persisted-operation races, and a 500-event offline backlog
-restored through one explicit convergence cycle.
+queued and accepted-but-ambiguous invitation compensation, confirmed
+invitation membership independence, guard-sensitive persisted-operation races,
+and a 500-event offline backlog restored through one explicit convergence
+cycle.
