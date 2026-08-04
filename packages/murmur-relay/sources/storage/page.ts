@@ -17,22 +17,25 @@ export interface StoredPageCandidate extends RetainedRelayEvent {
     readonly encodedBytes: number;
 }
 
-function encodedPageBytes(
-    events: readonly StoredPageCandidate[],
-    head: bigint,
-    exhausted: boolean,
-): number {
-    let bytes = textEncoder.encode(
+/** Optional deterministic accounting hook used by complexity regressions. */
+export interface PageSelectionInstrumentation {
+    readonly candidateEncoded: () => void;
+}
+
+function encodedEmptyPageBytes(head: bigint, exhausted: boolean): number {
+    return textEncoder.encode(
         `{"events":[],"head":"${head.toString()}","exhausted":${exhausted.toString()}}`,
     ).length;
-    for (const [index, retained] of events.entries()) {
-        bytes +=
-            (index === 0 ? 0 : 1) +
-            textEncoder.encode(`{"seq":"${retained.seq.toString()}","event":`).length +
-            retained.encodedBytes +
-            1;
-    }
-    return bytes;
+}
+
+function encodedCandidateBytes(
+    retained: StoredPageCandidate,
+    index: number,
+    instrumentation: PageSelectionInstrumentation | undefined,
+): number {
+    const metadataBytes = textEncoder.encode(`{"seq":"${retained.seq.toString()}","event":`).length;
+    instrumentation?.candidateEncoded();
+    return (index === 0 ? 0 : 1) + metadataBytes + retained.encodedBytes + 1;
 }
 
 /**
@@ -47,25 +50,28 @@ export function selectEventPage(
     head: bigint,
     limit: number,
     constraints: PageReadConstraints,
+    instrumentation?: PageSelectionInstrumentation,
 ): EventPage {
     if (candidates.length === 0) {
         return { events: [], head, exhausted: true };
     }
     const available = candidates.slice(0, limit);
+    let exhaustedBytes = encodedEmptyPageBytes(head, true);
+    let continuedBytes = encodedEmptyPageBytes(head, false);
+    let selectedCount = 1;
+    for (const [index, retained] of available.entries()) {
+        const encodedBytes = encodedCandidateBytes(retained, index, instrumentation);
+        exhaustedBytes += encodedBytes;
+        continuedBytes += encodedBytes;
+        if (index > 0 && continuedBytes <= constraints.maximumEncodedBytes) {
+            selectedCount = index + 1;
+        }
+    }
     if (
         candidates.length <= limit &&
-        (available.length === 1 ||
-            encodedPageBytes(available, head, true) <= constraints.maximumEncodedBytes)
+        (available.length === 1 || exhaustedBytes <= constraints.maximumEncodedBytes)
     ) {
         return { events: available, head, exhausted: true };
-    }
-    let selectedCount = 1;
-    while (
-        selectedCount < available.length &&
-        encodedPageBytes(available.slice(0, selectedCount + 1), head, false) <=
-            constraints.maximumEncodedBytes
-    ) {
-        selectedCount += 1;
     }
     return {
         events: available.slice(0, selectedCount),
