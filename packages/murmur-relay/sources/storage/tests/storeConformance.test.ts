@@ -1,6 +1,7 @@
 import { PGlite } from "@electric-sql/pglite";
 import { ed25519 } from "@noble/curves/ed25519";
 import { randomBytes } from "@noble/hashes/utils";
+import { performance } from "node:perf_hooks";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vitest";
 import {
@@ -84,12 +85,65 @@ describe("relay store conformance", () => {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 1);
+            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 2);
         `);
         expect(() => new SqliteRelayStore(":memory:", { database })).toThrow(
             "Unsupported SQLite relay schema version",
         );
         database.close();
+    });
+
+    test("fresh schemas use version 3 and retain author-scoped collapse indexes", async () => {
+        const sqliteDatabase = new DatabaseSync(":memory:");
+        const sqlite = new SqliteRelayStore(":memory:", { database: sqliteDatabase });
+        try {
+            expect(
+                sqliteDatabase
+                    .prepare("SELECT version FROM murmur_relay_schema WHERE singleton = 1")
+                    .get(),
+            ).toEqual({ version: 3 });
+            const sqliteIndexes = sqliteDatabase
+                .prepare(
+                    `SELECT name, sql FROM sqlite_master
+                     WHERE type = 'index' AND name LIKE 'murmur_relay_events_%'
+                     ORDER BY name`,
+                )
+                .all() as readonly Record<string, unknown>[];
+            expect(sqliteIndexes).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        name: "murmur_relay_events_page",
+                        sql: expect.stringContaining("(topic_id, seq, encoded_bytes, expires_at)"),
+                    }),
+                    expect.objectContaining({
+                        name: "murmur_relay_events_collapse",
+                        sql: expect.stringContaining(
+                            "(topic_id, author_signing_key, collapse_key)",
+                        ),
+                    }),
+                ]),
+            );
+        } finally {
+            await sqlite.close();
+        }
+
+        const postgresDatabase = new PGliteDatabase(new PGlite());
+        const postgres = await PostgresRelayStore.create(postgresDatabase);
+        try {
+            const version = await postgresDatabase.query<{ version: unknown }>(
+                "SELECT version FROM murmur_relay_schema WHERE singleton = 1",
+            );
+            expect(String(version.rows[0]?.version)).toBe("3");
+            const indexes = await postgresDatabase.query<{ indexdef: unknown }>(
+                `SELECT indexdef FROM pg_indexes
+                 WHERE indexname = 'murmur_relay_events_collapse'`,
+            );
+            expect(String(indexes.rows[0]?.indexdef)).toContain(
+                "(topic_id, author_signing_key, collapse_key)",
+            );
+        } finally {
+            await postgres.close();
+        }
     });
 
     test("SQLite and PGlite preserve heads while collapse removes older rows", async () => {
@@ -341,6 +395,96 @@ describe("relay store conformance", () => {
         }
     });
 
+    test("SQLite metadata reads stay covering and bounded across 257 overflow events", async () => {
+        const database = new DatabaseSync(":memory:");
+        const hydrated: bigint[] = [];
+        const store = new SqliteRelayStore(":memory:", {
+            database,
+            instrumentation: {
+                eventJsonHydrated: (seq) => hydrated.push(seq),
+            },
+        });
+        const secretKey = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "overflow-metadata",
+            writeKey: ed25519.getPublicKey(secretKey),
+        };
+        const topicId = relayTopicId(topic);
+        const baseEvent = signed(secretKey, topic, 1);
+        const event = { ...baseEvent, payload: new Uint8Array(64 * 1024) };
+        const eventJson = JSON.stringify(signedRelayEventToJson(event));
+        const encodedBytes = new TextEncoder().encode(eventJson).length;
+        try {
+            expect(encodedBytes).toBeGreaterThan(64 * 1024);
+            database.exec("BEGIN IMMEDIATE");
+            database
+                .prepare("INSERT INTO murmur_relay_topics (id, head) VALUES (?, 257)")
+                .run(topicId);
+            const insert = database.prepare(
+                `INSERT INTO murmur_relay_events
+                    (topic_id, seq, event_json, encoded_bytes, expires_at,
+                     author_signing_key, collapse_key)
+                 VALUES (?, ?, ?, ?, NULL, ?, NULL)`,
+            );
+            for (let seq = 1; seq <= 257; seq += 1) {
+                insert.run(
+                    topicId,
+                    BigInt(seq),
+                    eventJson,
+                    BigInt(encodedBytes),
+                    event.author.signingKey,
+                );
+            }
+            database.exec("COMMIT");
+
+            const plan = database
+                .prepare(`EXPLAIN QUERY PLAN ${SQLITE_READ_EVENTS_QUERY}`)
+                .all(topicId, 0n, BigInt(NOW), 257n) as readonly Record<string, unknown>[];
+            const details = plan.map((row) => String(row["detail"])).join("\n");
+            expect(details).toMatch(
+                /SEARCH murmur_relay_events USING COVERING INDEX murmur_relay_events_page \(topic_id=\? AND seq>\?\)/,
+            );
+            expect(details).not.toMatch(/USE TEMP B-TREE|MATERIALIZE|CO-ROUTINE/);
+
+            const metadata = database.prepare(SQLITE_READ_EVENTS_QUERY);
+            metadata.setReadBigInts(true);
+            let metadataRows: readonly Record<string, unknown>[] = [];
+            const started = performance.now();
+            for (let iteration = 0; iteration < 25; iteration += 1) {
+                metadataRows = metadata.all(topicId, 0n, BigInt(NOW), 257n) as readonly Record<
+                    string,
+                    unknown
+                >[];
+            }
+            const elapsed = performance.now() - started;
+            expect(metadataRows).toHaveLength(257);
+            expect(Object.keys(metadataRows[0]!)).toEqual(["seq", "encoded_bytes"]);
+            expect(elapsed).toBeLessThan(5_000);
+
+            const page = await store.readEvents(topicId, 0n, 256, NOW, {
+                maximumEncodedBytes: MAXIMUM_PAGE_BYTES,
+            });
+            expect(page.events.length).toBeGreaterThan(0);
+            expect(page.events.length).toBeLessThan(257);
+            expect(hydrated).toEqual(page.events.map(({ seq }) => seq));
+            expect(page.exhausted).toBe(false);
+            const responseBytes = new TextEncoder().encode(
+                JSON.stringify({
+                    events: page.events.map(({ seq, event: retained }) => ({
+                        seq: seq.toString(),
+                        event: signedRelayEventToJson(retained),
+                    })),
+                    head: page.head.toString(),
+                    exhausted: page.exhausted,
+                }),
+            ).length;
+            expect(responseBytes).toBeLessThanOrEqual(MAXIMUM_PAGE_BYTES);
+        } finally {
+            await store.close();
+        }
+    });
+
     test("large SQLite catch-up stays on a bounded ordered index plan", async () => {
         const database = new DatabaseSync(":memory:");
         const store = new SqliteRelayStore(":memory:", { database });
@@ -382,7 +526,7 @@ describe("relay store conformance", () => {
                 .all(topicId, 0n, BigInt(NOW), 65n) as readonly Record<string, unknown>[];
             const details = plan.map((row) => String(row["detail"])).join("\n");
             expect(details).toMatch(
-                /SEARCH murmur_relay_events USING INDEX .* \(topic_id=\? AND seq>\?\)/,
+                /SEARCH murmur_relay_events USING COVERING INDEX murmur_relay_events_page \(topic_id=\? AND seq>\?\)/,
             );
             expect(details).not.toMatch(/USE TEMP B-TREE|MATERIALIZE|CO-ROUTINE/);
             expect(SQLITE_READ_EVENTS_QUERY).not.toContain("event_json");

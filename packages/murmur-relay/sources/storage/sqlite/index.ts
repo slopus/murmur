@@ -179,7 +179,7 @@ export class SqliteRelayStore implements RelayStore {
             const schema = this.#requiredGet(
                 "SELECT version FROM murmur_relay_schema WHERE singleton = 1",
             );
-            if (bigintColumn(schema.version) !== 2n) {
+            if (bigintColumn(schema.version) !== 3n) {
                 throw new Error("Unsupported SQLite relay schema version");
             }
             return;
@@ -191,7 +191,7 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 2);
+            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 3);
             CREATE TABLE murmur_relay_topics (
                 id TEXT PRIMARY KEY,
                 head INTEGER NOT NULL CHECK (head >= 0)
@@ -213,6 +213,8 @@ export class SqliteRelayStore implements RelayStore {
                 collapse_key BLOB,
                 PRIMARY KEY (topic_id, seq)
             ) STRICT;
+            CREATE INDEX murmur_relay_events_page
+                ON murmur_relay_events(topic_id, seq, encoded_bytes, expires_at);
             CREATE INDEX murmur_relay_events_expiration
                 ON murmur_relay_events(expires_at) WHERE expires_at IS NOT NULL;
             CREATE INDEX murmur_relay_events_collapse

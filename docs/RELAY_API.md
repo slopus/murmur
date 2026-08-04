@@ -252,6 +252,9 @@ migrations or compatibility readers for the superseded relay model.
 An explicit version marker rejects legacy layouts before adding clean tables.
 The event table stores author signing keys for collapse identity and compact
 encoded event byte lengths for page allocation.
+SQLite's fresh schema covers page metadata reads with
+`(topic_id, seq, encoded_bytes, expires_at)`, keeping large `event_json`
+overflow pages out of the candidate scan.
 
 `WakeSource` notifications only reduce long-poll latency. Reads and timeout
 rechecks preserve correctness if notifications are lost.

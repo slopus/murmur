@@ -23,7 +23,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     "SELECT version FROM murmur_relay_schema WHERE singleton = 1",
                 );
                 const versionRow = version.rows[0];
-                if (versionRow === undefined || bigintColumn(versionRow.version) !== 2n) {
+                if (versionRow === undefined || bigintColumn(versionRow.version) !== 3n) {
                     throw new Error("Unsupported Postgres relay schema version");
                 }
                 return;
@@ -33,7 +33,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 2)`,
+                `INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 3)`,
                 `CREATE TABLE murmur_relay_topics (
                     id text PRIMARY KEY,
                     head bigint NOT NULL CHECK (head >= 0)
