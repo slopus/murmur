@@ -19,3 +19,18 @@ export class MurmurKeyPackagePoolExhaustedError extends Error {
         return this.#peerIdentityKey.slice();
     }
 }
+
+/** Copy a retained convergence error without erasing its public domain type. */
+export function copyMurmurError(error: Error): Error {
+    if (error instanceof MurmurKeyPackagePoolExhaustedError) {
+        const peer = error.peerIdentityKey;
+        try {
+            return new MurmurKeyPackagePoolExhaustedError(peer);
+        } finally {
+            peer.fill(0);
+        }
+    }
+    const copy = new Error(error.message);
+    copy.name = error.name;
+    return copy;
+}

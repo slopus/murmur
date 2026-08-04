@@ -32,7 +32,12 @@ Murmur owns every protocol state transition between them.
 
 Request and response relay envelopes use fresh one-use Ed25519 authors. Control
 and group envelopes use their shared capability author, while encrypted inner
-content authenticates the Murmur or MLS sender.
+content authenticates the Murmur or MLS sender. Every group Commit and
+application message is additionally sealed in a versioned outer AEAD envelope.
+Its key is domain-separated from the stable random group topic secret, and its
+AAD binds the envelope domain and complete group topic. The encrypted version,
+random nonce, and ciphertext leave no MLS PublicMessage header or Murmur
+identity credential visible to the relay.
 
 ## Synchronization
 
@@ -42,6 +47,8 @@ retries exact outboxes, catches up all discovered topics, processes retained
 events in sequence, replenishes KeyPackages, prepares queued operations, reads
 echoes, and repeats to a bounded quiescent state. `sync()` is an optional
 explicit observation/test boundary, not required caller choreography.
+KeyPackage exhaustion is collected per friend: unrelated friend and group work
+still converges before a deterministic typed error is surfaced.
 
 Relay cursors advance in the same application-store transaction as the effect
 of an inbound event. Invalid, stale, unsupported, removed-member, and
@@ -54,7 +61,9 @@ topics.
 ## MLS ordering
 
 Application sends persist a cloned post-ratchet epoch, retained plaintext
-intent, and exact relay event atomically before publication.
+intent, and exact outer relay event atomically before publication. Group
+fingerprints, staged Commit identity, echo matching, and outbox idempotency all
+refer to those exact retained ciphertext bytes.
 
 Membership Commits keep active epoch `E` and staged candidate `E+1` separate.
 Publication does not adopt. The first valid current-epoch Commit encountered in
@@ -69,10 +78,17 @@ lower relay sequence
 
 Only a winning Add queues its private friend-channel invitation. The recipient
 first verifies the invitation's Commit event ID and fingerprint at the claimed
-group sequence and matches its confirmation tag to the authenticated Welcome
-GroupInfo, then atomically consumes the matching private KeyPackage bundle,
+group sequence, decrypts that exact retained envelope using the carried topic
+secret, and matches its confirmation tag to the authenticated Welcome
+GroupInfo. It then atomically consumes the matching private KeyPackage bundle,
 installs the Welcome epoch and stable topic capability, records the invitation
 replay marker, and starts its group cursor after that exact Commit.
+
+This consistency check binds an invitation to one retained Commit and Welcome;
+it does not prove to a joiner that the inviter named the relay-order winning
+fork. Membership admission therefore trusts an honest inviter who is a current
+group member, rather than treating relay order as a validity oracle for a
+joiner.
 
 A removed member can be added again only with a fresh KeyPackage and a new
 authenticated Welcome. Reinstallation resets that group's cursor to the

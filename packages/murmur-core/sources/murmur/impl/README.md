@@ -10,6 +10,7 @@ public facade (../index.ts)
   engine.ts
   +-- friend bootstrap/control helpers ---> friendProcessing.ts
   +-- ordered MLS group helpers ----------> groupProcessing.ts
+  +-- opaque outer group AEAD envelopes --> groupEnvelope.ts
   +-- exact outbox + cursor transactions -> persistence.ts
   +-- retry/backoff + cancellation ------> convergenceWorker.ts
   |

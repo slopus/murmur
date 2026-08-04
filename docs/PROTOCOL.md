@@ -49,7 +49,10 @@ reports are chunked at 64 references and acknowledged; every chunk is a durable
 control event, so a list longer than 64 cannot strand later references.
 Exact retirement releases a private reservation. Eight abandoned authenticated
 reservations surface a typed terminal convergence error rather than causing
-silent starvation, package reuse, or unbounded allocation.
+silent starvation, package reuse, or unbounded allocation. Exhaustion is
+isolated per friend: Murmur continues unrelated peer maintenance and group
+operations, then reports the deterministic typed error after that durable work
+converges.
 Reported local bundles stay reserved for a delayed winning invitation. A
 competing Commit sends retirement after it wins, while successful invitation
 adoption consumes the reserved bundle. Expired or excess remote announcements
@@ -59,11 +62,15 @@ An invitation carries the group ID, opaque descriptor and random binding nonce,
 descriptor binding, stable topic secret, exact KeyPackage reference, Welcome,
 ratchet tree, winning Commit sequence, exact Commit event ID, and Commit
 fingerprint. The recipient reads and verifies that retained group event before
-installing any cursor or group state. It also requires the authenticated
+installing any cursor or group state. Using the carried topic secret, it
+decrypts the exact retained group envelope and requires the authenticated
 Welcome GroupInfo confirmation tag to equal that exact public Commit's
 confirmation tag, preventing a valid Welcome from a competing Add from being
-substituted. The invitation is encrypted and authenticated by the friend
-channel. There is no public join operation.
+substituted. This proves Commit/Welcome consistency, but a malicious inviter
+can still name its own losing fork. A joiner therefore trusts that its inviter
+is an honest current group member; relay order alone does not establish
+membership validity for the joiner. The invitation is encrypted and
+authenticated by the friend channel. There is no public join operation.
 
 ## Group stream
 
@@ -71,9 +78,30 @@ A one-member group and a many-member group are the same primitive. The
 descriptor and application bytes are opaque and retained even when the
 application does not understand them.
 
-Commits are durable MLS PublicMessages. Application events are durable MLS
-PrivateMessages. Murmur currently exposes no expiration or collapse option for
-MLS content, avoiding unsafe Secret Tree generation skips.
+The inner messages are MLS PublicMessage Commits and MLS PrivateMessage
+applications. Before either kind enters a relay event, Murmur wraps it in the
+same strict version-one group envelope:
+
+```text
+random 12-byte nonce || AES-256-GCM(version || MLS message)
+```
+
+The AEAD key is derived with HKDF-SHA-256 from the stable random group topic
+secret under a dedicated versioned key domain; the capability secret is never
+used directly as an encryption key. AAD binds a separate versioned envelope
+domain and the complete `group-events` topic descriptor. The version byte is
+encrypted, payload size is bounded by the relay limit, and decoding rejects
+wrong topics, wrong topic secrets, tampering, unknown versions, and malformed
+lengths. Murmur authenticates and decrypts the envelope before classifying or
+processing the MLS message. Consequently relay storage cannot distinguish a
+Commit from an application message or decode an MLS PublicMessage header or
+Murmur identity credential.
+
+Group messages are durable. Murmur currently exposes no expiration or collapse
+option for MLS content, avoiding unsafe Secret Tree generation skips.
+Outboxes, staged Commit fingerprints, own-echo matching, invitation
+fingerprints, and replay checks use the exact outer ciphertext retained by the
+relay.
 
 Inbound application persistence is atomic across:
 
@@ -87,9 +115,10 @@ Inbound Commit persistence is atomic across:
 next epoch + membership + replay marker + cursor
 ```
 
-Removed members keep the relay topic capability but not newer MLS epoch
-secrets. Their later injections cannot authenticate as current MLS content and
-are quarantined.
+Removed members keep the relay topic capability and topic secret but not newer
+MLS epoch secrets. They can decrypt later outer envelopes and inject junk, but
+MLS still prevents them from authenticating or decrypting newer-epoch inner
+content. Their invalid injections are quarantined.
 
 Quarantine is bounded to 32 minimal metadata records per topic and never stores
 the rejected payload. Group replay fingerprints are bounded to 128 entries;

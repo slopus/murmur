@@ -21,12 +21,16 @@ pnpm --filter @murmur/relay build
 
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+MURMUR_RELAY_ORIGINS='https://app.example' \
 pnpm --filter @murmur/relay start
 ```
 
 The defaults are `sqlite`, `./data/murmur-relay.sqlite`, host `0.0.0.0`, and
-port `8787`. The process prunes expired retained events hourly and closes the
-HTTP server, wake source, and store on `SIGINT` or `SIGTERM`.
+port `8787`. `MURMUR_RELAY_ORIGINS` defaults to `*`, which sends wildcard CORS
+and permits requests from any browser origin. Production deployments should
+set a comma-separated list of exact allowed origins. The process prunes expired
+retained events hourly and closes the HTTP server, wake source, and store on
+`SIGINT` or `SIGTERM`.
 
 For PostgreSQL, set:
 
@@ -42,12 +46,13 @@ process for a database file.
 
 ## Configuration
 
-| Variable             | Default                      | Meaning                                  |
-| -------------------- | ---------------------------- | ---------------------------------------- |
-| `HOST`               | `0.0.0.0`                    | HTTP listen host                         |
-| `PORT`               | `8787`                       | HTTP listen port                         |
-| `MURMUR_RELAY_STORE` | `sqlite`                     | `sqlite` or `postgres`                   |
-| `MURMUR_RELAY_DB`    | `./data/murmur-relay.sqlite` | SQLite path or PostgreSQL connection URL |
+| Variable               | Default                      | Meaning                                      |
+| ---------------------- | ---------------------------- | -------------------------------------------- |
+| `HOST`                 | `0.0.0.0`                    | HTTP listen host                             |
+| `PORT`                 | `8787`                       | HTTP listen port                             |
+| `MURMUR_RELAY_STORE`   | `sqlite`                     | `sqlite` or `postgres`                       |
+| `MURMUR_RELAY_DB`      | `./data/murmur-relay.sqlite` | SQLite path or PostgreSQL connection URL     |
+| `MURMUR_RELAY_ORIGINS` | `*`                          | `*` or comma-separated exact browser origins |
 
 Terminate public TLS in front of the relay and preserve request bodies without
 rewriting them. The API routes are documented in

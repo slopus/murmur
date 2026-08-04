@@ -136,6 +136,7 @@ import {
     friendStateError,
     friendView,
 } from "./friendProcessing.js";
+import { openGroupRelayPayload, sealGroupRelayPayload } from "./groupEnvelope.js";
 import {
     createMurmurKeyPackage,
     descriptorBinding,
@@ -527,9 +528,7 @@ export class MurmurEngine {
             await this.#exclusive(async () => {
                 const workerError = this.#worker.takeError();
                 if (workerError !== undefined) {
-                    throw new Error("Background Murmur convergence failed", {
-                        cause: workerError,
-                    });
+                    throw workerError;
                 }
                 await this.#sync(options);
             });
@@ -608,6 +607,17 @@ export class MurmurEngine {
             const scoped = new FriendBook(this.#identity, new TransactionStore(transaction));
             await scoped.end(peer);
             await this.#clearFriendKeyPackageState(transaction, peer);
+        });
+        this.#worker.clearError((error) => {
+            if (!(error instanceof MurmurKeyPackagePoolExhaustedError)) {
+                return false;
+            }
+            const exhaustedPeer = error.peerIdentityKey;
+            try {
+                return equalBytes(exhaustedPeer, peer.publicKey);
+            } finally {
+                zeroBytes(exhaustedPeer);
+            }
         });
     }
 
@@ -947,6 +957,7 @@ export class MurmurEngine {
         const attempted = new Set<string>();
         const publishErrors: Error[] = [];
         const convergenceErrors: Error[] = [];
+        let keyPackageErrors: readonly MurmurKeyPackagePoolExhaustedError[] = [];
         let waited = false;
         for (let pass = 0; pass < MAXIMUM_SYNC_PASSES; pass += 1) {
             if (options.signal?.aborted === true) {
@@ -970,7 +981,9 @@ export class MurmurEngine {
             const deferred = await this.#processDeferredInvitations(options.signal);
             changed = deferred.changed || changed;
             convergenceErrors.push(...deferred.errors);
-            changed = (await this.#ensureKeyPackages()) || changed;
+            const keyPackages = await this.#ensureKeyPackages();
+            changed = keyPackages.changed || changed;
+            keyPackageErrors = keyPackages.errors;
             changed = (await this.#prepareGroupOperations()) || changed;
             if (changed) {
                 continue;
@@ -988,6 +1001,9 @@ export class MurmurEngine {
                     convergenceErrors,
                     "Murmur topic convergence failed",
                 );
+            }
+            if (keyPackageErrors.length > 0) {
+                throw keyPackageErrors[0]!;
             }
             return;
         }
@@ -2357,6 +2373,7 @@ export class MurmurEngine {
         signal?: AbortSignal,
     ): Promise<{ readonly epoch: bigint; readonly confirmationTag: Uint8Array }> {
         const access = groupAccess(frame.topicSecret);
+        let innerPayload: Uint8Array | undefined;
         try {
             let page: Awaited<ReturnType<RelayTransport["readEvents"]>>;
             try {
@@ -2403,7 +2420,12 @@ export class MurmurEngine {
             } finally {
                 zeroBytes(fingerprint);
             }
-            const commit = decodeMlsTreeCommit(retained.event.payload);
+            innerPayload = openGroupRelayPayload(
+                frame.topicSecret,
+                retained.event.topic,
+                retained.event.payload,
+            );
+            const commit = decodeMlsTreeCommit(innerPayload);
             if (!equalBytes(commit.groupId, frame.groupId)) {
                 throw new Error("Invitation winning Commit belongs to another group");
             }
@@ -2433,6 +2455,7 @@ export class MurmurEngine {
                 confirmationTag: commit.confirmationTag.slice(),
             };
         } finally {
+            innerPayload?.fill(0);
             destroyAccess(access);
         }
     }
@@ -2456,6 +2479,7 @@ export class MurmurEngine {
             return;
         }
         const fingerprint = hashBytes(event.payload);
+        let innerPayload: Uint8Array | undefined;
         try {
             const replay = await this.#store.get(groupReplayKey(groupId, fingerprint));
             if (replay !== undefined) {
@@ -2479,10 +2503,27 @@ export class MurmurEngine {
                 return;
             }
             const activeGroup = group as RuntimeGroup & { epoch: MlsEpochState };
-            if (isCommit(event.payload)) {
+            try {
+                innerPayload = openGroupRelayPayload(
+                    group.record.topicSecret,
+                    event.topic,
+                    event.payload,
+                );
+            } catch {
+                await this.#quarantine(
+                    relayTopicId(event.topic),
+                    sequence,
+                    event,
+                    expectedCursor,
+                    cursorKey,
+                );
+                return;
+            }
+            if (isCommit(innerPayload)) {
                 await this.#processGroupCommit(
                     activeGroup,
                     event,
+                    innerPayload,
                     fingerprint,
                     sequence,
                     expectedCursor,
@@ -2493,12 +2534,14 @@ export class MurmurEngine {
             await this.#processGroupApplication(
                 activeGroup,
                 event,
+                innerPayload,
                 fingerprint,
                 sequence,
                 expectedCursor,
                 cursorKey,
             );
         } finally {
+            innerPayload?.fill(0);
             zeroBytes(fingerprint);
         }
     }
@@ -2506,13 +2549,14 @@ export class MurmurEngine {
     async #processGroupCommit(
         group: RuntimeGroup & { epoch: MlsEpochState },
         event: SignedRelayEvent,
+        payload: Uint8Array,
         fingerprint: Uint8Array,
         sequence: bigint,
         expectedCursor: bigint,
         cursorKey: string,
     ): Promise<void> {
         try {
-            const commit = decodeMlsTreeCommit(event.payload);
+            const commit = decodeMlsTreeCommit(payload);
             const createdAtSeconds = Math.floor(event.createdAt / 1_000);
             if (
                 commit.proposals.some(
@@ -2564,7 +2608,7 @@ export class MurmurEngine {
         const clone = this.#cloneEpoch(group);
         let transition: ReturnType<MlsEpochState["applyCommit"]> | undefined;
         try {
-            transition = clone.applyCommit(event.payload);
+            transition = clone.applyCommit(payload);
         } catch (error: unknown) {
             if (error instanceof MlsLocalMemberRemovedError) {
                 clone.destroy();
@@ -2573,6 +2617,7 @@ export class MurmurEngine {
                         group,
                         staged,
                         event,
+                        payload,
                         fingerprint,
                         sequence,
                         expectedCursor,
@@ -2595,7 +2640,7 @@ export class MurmurEngine {
             return;
         }
         const nextEpochBytes = transition.serialize();
-        const nextMembers = this.#membersAfterCommit(group.epoch, event.payload);
+        const nextMembers = this.#membersAfterCommit(group.epoch, payload);
         const nextRecord: StoredGroup = {
             ...group.record,
             members: nextMembers,
@@ -2730,6 +2775,7 @@ export class MurmurEngine {
         group: RuntimeGroup,
         staged: StagedGroupCommit | undefined,
         event: SignedRelayEvent,
+        payload: Uint8Array,
         fingerprint: Uint8Array,
         sequence: bigint,
         expectedCursor: bigint,
@@ -2741,7 +2787,7 @@ export class MurmurEngine {
         }
         const nextRecord: StoredGroup = {
             ...group.record,
-            members: this.#membersAfterCommit(epoch, event.payload),
+            members: this.#membersAfterCommit(epoch, payload),
             epoch: group.record.epoch + 1n,
             persistenceGeneration: group.record.persistenceGeneration + 1n,
             status: "removed",
@@ -2845,6 +2891,7 @@ export class MurmurEngine {
     async #processGroupApplication(
         group: RuntimeGroup & { epoch: MlsEpochState },
         event: SignedRelayEvent,
+        payload: Uint8Array,
         fingerprint: Uint8Array,
         sequence: bigint,
         expectedCursor: bigint,
@@ -2909,7 +2956,7 @@ export class MurmurEngine {
             const clone = this.#cloneEpoch(group);
             let opened: ReturnType<MlsEpochState["openWithCheckpoint"]>;
             try {
-                opened = clone.openWithCheckpoint(event.payload);
+                opened = clone.openWithCheckpoint(payload);
             } catch {
                 clone.destroy();
                 await this.#quarantine(
@@ -3119,14 +3166,21 @@ export class MurmurEngine {
         let checkpoint: Uint8Array | undefined;
         let access: TopicAccess | undefined;
         let fingerprint: Uint8Array | undefined;
+        let innerPayload: Uint8Array | undefined;
+        let relayPayload: Uint8Array | undefined;
         try {
-            const payload = clone.seal(operation.payload);
+            innerPayload = clone.seal(operation.payload);
             checkpoint = clone.serialize();
             access = groupAccess(group.record.topicSecret);
-            const event = createCapabilityEvent(access, payload, {
+            relayPayload = sealGroupRelayPayload(
+                group.record.topicSecret,
+                access.topic,
+                innerPayload,
+            );
+            const event = createCapabilityEvent(access, relayPayload, {
                 createdAt: this.#nextEventTime(),
             });
-            fingerprint = hashBytes(payload);
+            fingerprint = hashBytes(event.payload);
             const attempted: GroupOperation = {
                 ...operation,
                 attempt: {
@@ -3201,6 +3255,8 @@ export class MurmurEngine {
                 destroyAccess(access);
             }
             fingerprint?.fill(0);
+            innerPayload?.fill(0);
+            relayPayload?.fill(0);
         }
     }
 
@@ -3217,6 +3273,7 @@ export class MurmurEngine {
         let addition: MlsKeyPackage | undefined;
         let prepared: ReturnType<MlsEpochState["prepareCommit"]> | undefined;
         let staged: StagedGroupCommit | undefined;
+        let relayPayload: Uint8Array | undefined;
         try {
             if (operation.type === "add") {
                 if (remoteKey === undefined || remoteBytes === undefined) {
@@ -3243,7 +3300,12 @@ export class MurmurEngine {
             }
             nextEpoch = prepared.transition.serialize();
             access = groupAccess(group.record.topicSecret);
-            const event = createCapabilityEvent(access, prepared.commit, {
+            relayPayload = sealGroupRelayPayload(
+                group.record.topicSecret,
+                access.topic,
+                prepared.commit,
+            );
+            const event = createCapabilityEvent(access, relayPayload, {
                 createdAt: this.#nextEventTime(),
             });
             if (
@@ -3252,7 +3314,7 @@ export class MurmurEngine {
             ) {
                 throw new Error("Remote KeyPackage expired before Commit creation");
             }
-            const fingerprint = hashBytes(prepared.commit);
+            const fingerprint = hashBytes(event.payload);
             staged = {
                 operationId: operation.id,
                 eventId: event.id,
@@ -3334,6 +3396,7 @@ export class MurmurEngine {
             }
             nextEpoch?.fill(0);
             keyPackageReference?.fill(0);
+            relayPayload?.fill(0);
             destroyStagedCommit(staged);
         }
     }
@@ -3386,130 +3449,150 @@ export class MurmurEngine {
         }
     }
 
-    async #ensureKeyPackages(): Promise<boolean> {
-        const active = (await this.#friendBook.list()).filter(
-            (friend) => friend.status === "active",
-        );
+    async #ensureKeyPackages(): Promise<{
+        readonly changed: boolean;
+        readonly errors: readonly MurmurKeyPackagePoolExhaustedError[];
+    }> {
+        const active = (await this.#friendBook.list())
+            .filter((friend) => friend.status === "active")
+            .sort((left, right) => {
+                const leftId = identityId(left.identity);
+                const rightId = identityId(right.identity);
+                return leftId < rightId ? -1 : leftId > rightId ? 1 : 0;
+            });
         let changed = false;
+        const errors: MurmurKeyPackagePoolExhaustedError[] = [];
         for (const friend of active) {
-            const peer = friend.identity;
-            const prefix = `${LOCAL_KEY_PACKAGE_PREFIX}${identityId(peer)}/`;
-            const stored = await this.#store.list(prefix);
-            const consumedRecords = await this.#store.list(
-                `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(peer)}/`,
-            );
-            const consumedReferences = new Set(
-                [...consumedRecords.keys()].map((key) => key.slice(key.lastIndexOf("/") + 1)),
-            );
-            const available: {
-                readonly reference: Uint8Array;
-                readonly keyPackageBytes: Uint8Array;
-            }[] = [];
-            const now = BigInt(Math.floor(Date.now() / 1_000));
-            for (const bytes of stored.values()) {
-                let bundle;
-                try {
-                    bundle = deserializeMlsKeyPackageBundle(bytes);
-                    const reference = mlsKeyPackageReference(bundle.keyPackage);
-                    if (consumedReferences.has(encodeBase64Url(reference))) {
-                        zeroBytes(reference);
-                        continue;
-                    }
-                    if (
-                        bundle.keyPackage.leafNode.notAfter < now ||
-                        bundle.keyPackage.leafNode.notBefore > now
-                    ) {
-                        // An announced private bundle remains necessary to adopt a
-                        // delayed invitation even after its public package expires.
-                        // It is no longer eligible for a new Add, but deleting it
-                        // here would make an already-winning Commit unrecoverable.
-                        zeroBytes(reference);
-                        continue;
-                    }
-                    available.push({
-                        reference,
-                        keyPackageBytes: encodeMlsKeyPackage(bundle.keyPackage),
-                    });
-                } finally {
-                    if (bundle !== undefined) {
-                        destroyMlsKeyPackageBundle(bundle);
-                    }
-                    zeroBytes(bytes);
+            try {
+                changed = (await this.#ensureFriendKeyPackages(friend.identity)) || changed;
+            } catch (error: unknown) {
+                if (!(error instanceof MurmurKeyPackagePoolExhaustedError)) {
+                    throw error;
                 }
+                errors.push(error);
             }
-            let localCount = stored.size;
-            while (
-                available.length < LOCAL_KEY_PACKAGE_TARGET &&
-                localCount < MAXIMUM_LOCAL_KEY_PACKAGES
-            ) {
-                const bundle = createMurmurKeyPackage(this.#identity);
-                try {
-                    const reference = mlsKeyPackageReference(bundle.keyPackage);
-                    const bundleBytes = serializeMlsKeyPackageBundle(bundle);
-                    const keyPackageBytes = encodeMlsKeyPackage(bundle.keyPackage);
-                    const key = localKeyPackageKey(peer, reference);
-                    await this.#store.transaction(async (transaction) => {
-                        await transaction.set(key, bundleBytes);
-                        await this.#queueControl(
-                            transaction,
-                            peer,
-                            {
-                                type: "key-package-announce",
-                                reference,
-                                keyPackage: keyPackageBytes,
-                            },
-                            { type: "friend-control" },
-                        );
-                    });
-                    available.push({
-                        reference,
-                        keyPackageBytes,
-                    });
-                    localCount += 1;
-                    changed = true;
-                    zeroBytes(bundleBytes);
-                } finally {
+        }
+        return { changed, errors };
+    }
+
+    async #ensureFriendKeyPackages(peer: IdentityPublicKey): Promise<boolean> {
+        let changed = false;
+        const prefix = `${LOCAL_KEY_PACKAGE_PREFIX}${identityId(peer)}/`;
+        const stored = await this.#store.list(prefix);
+        const consumedRecords = await this.#store.list(
+            `${LOCAL_KEY_PACKAGE_CONSUMED_PREFIX}${identityId(peer)}/`,
+        );
+        const consumedReferences = new Set(
+            [...consumedRecords.keys()].map((key) => key.slice(key.lastIndexOf("/") + 1)),
+        );
+        const available: {
+            readonly reference: Uint8Array;
+            readonly keyPackageBytes: Uint8Array;
+        }[] = [];
+        const now = BigInt(Math.floor(Date.now() / 1_000));
+        for (const bytes of stored.values()) {
+            let bundle;
+            try {
+                bundle = deserializeMlsKeyPackageBundle(bytes);
+                const reference = mlsKeyPackageReference(bundle.keyPackage);
+                if (consumedReferences.has(encodeBase64Url(reference))) {
+                    zeroBytes(reference);
+                    continue;
+                }
+                if (
+                    bundle.keyPackage.leafNode.notAfter < now ||
+                    bundle.keyPackage.leafNode.notBefore > now
+                ) {
+                    // An announced private bundle remains necessary to adopt a
+                    // delayed invitation even after its public package expires.
+                    // It is no longer eligible for a new Add, but deleting it
+                    // here would make an already-winning Commit unrecoverable.
+                    zeroBytes(reference);
+                    continue;
+                }
+                available.push({
+                    reference,
+                    keyPackageBytes: encodeMlsKeyPackage(bundle.keyPackage),
+                });
+            } finally {
+                if (bundle !== undefined) {
                     destroyMlsKeyPackageBundle(bundle);
                 }
+                zeroBytes(bytes);
             }
-            if (
-                available.length === 0 &&
-                localCount >= MAXIMUM_LOCAL_KEY_PACKAGES &&
-                consumedRecords.size > 0
-            ) {
-                for (const marker of consumedRecords.values()) {
-                    zeroBytes(marker);
-                }
-                throw new MurmurKeyPackagePoolExhaustedError(peer.publicKey);
-            }
-            const requestKey = `${KEY_PACKAGE_REQUEST_PREFIX}${identityId(peer)}`;
-            const requestMarker = await this.#store.get(requestKey);
-            if (requestMarker !== undefined) {
-                zeroBytes(requestMarker);
+        }
+        let localCount = stored.size;
+        while (
+            available.length < LOCAL_KEY_PACKAGE_TARGET &&
+            localCount < MAXIMUM_LOCAL_KEY_PACKAGES
+        ) {
+            const bundle = createMurmurKeyPackage(this.#identity);
+            try {
+                const reference = mlsKeyPackageReference(bundle.keyPackage);
+                const bundleBytes = serializeMlsKeyPackageBundle(bundle);
+                const keyPackageBytes = encodeMlsKeyPackage(bundle.keyPackage);
+                const key = localKeyPackageKey(peer, reference);
                 await this.#store.transaction(async (transaction) => {
-                    for (const item of available) {
-                        await this.#queueControl(
-                            transaction,
-                            peer,
-                            {
-                                type: "key-package-announce",
-                                reference: item.reference,
-                                keyPackage: item.keyPackageBytes,
-                            },
-                            { type: "friend-control" },
-                        );
-                    }
-                    await transaction.delete(requestKey);
+                    await transaction.set(key, bundleBytes);
+                    await this.#queueControl(
+                        transaction,
+                        peer,
+                        {
+                            type: "key-package-announce",
+                            reference,
+                            keyPackage: keyPackageBytes,
+                        },
+                        { type: "friend-control" },
+                    );
                 });
+                available.push({
+                    reference,
+                    keyPackageBytes,
+                });
+                localCount += 1;
                 changed = true;
+                zeroBytes(bundleBytes);
+            } finally {
+                destroyMlsKeyPackageBundle(bundle);
             }
+        }
+        if (
+            available.length === 0 &&
+            localCount >= MAXIMUM_LOCAL_KEY_PACKAGES &&
+            consumedRecords.size > 0
+        ) {
             for (const marker of consumedRecords.values()) {
                 zeroBytes(marker);
             }
-            for (const item of available) {
-                zeroBytes(item.reference);
-                zeroBytes(item.keyPackageBytes);
-            }
+            throw new MurmurKeyPackagePoolExhaustedError(peer.publicKey);
+        }
+        const requestKey = `${KEY_PACKAGE_REQUEST_PREFIX}${identityId(peer)}`;
+        const requestMarker = await this.#store.get(requestKey);
+        if (requestMarker !== undefined) {
+            zeroBytes(requestMarker);
+            await this.#store.transaction(async (transaction) => {
+                for (const item of available) {
+                    await this.#queueControl(
+                        transaction,
+                        peer,
+                        {
+                            type: "key-package-announce",
+                            reference: item.reference,
+                            keyPackage: item.keyPackageBytes,
+                        },
+                        { type: "friend-control" },
+                    );
+                }
+                await transaction.delete(requestKey);
+            });
+            changed = true;
+        }
+        for (const marker of consumedRecords.values()) {
+            zeroBytes(marker);
+        }
+        for (const item of available) {
+            zeroBytes(item.reference);
+            zeroBytes(item.keyPackageBytes);
         }
         return changed;
     }

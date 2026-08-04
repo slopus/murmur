@@ -1,3 +1,5 @@
+import { copyMurmurError } from "../errors.js";
+
 const IDLE_MILLISECONDS = 1_000;
 const MUTATION_DELAY_MILLISECONDS = 25;
 const INITIAL_BACKOFF_MILLISECONDS = 100;
@@ -29,12 +31,7 @@ export class ConvergenceWorker {
 
     /** Defensive view of the latest retained background error. */
     get error(): Error | undefined {
-        if (this.#error === undefined) {
-            return undefined;
-        }
-        const copy = new Error(this.#error.message);
-        copy.name = this.#error.name;
-        return copy;
+        return this.#error === undefined ? undefined : copyMurmurError(this.#error);
     }
 
     /** Schedule the initial convergence pass. */
@@ -69,6 +66,14 @@ export class ConvergenceWorker {
         const error = this.#error;
         this.#error = undefined;
         return error;
+    }
+
+    /** Clear a retained error only when it belongs to resolved durable state. */
+    clearError(predicate: (error: Error) => boolean): void {
+        if (this.#error !== undefined && predicate(this.#error)) {
+            this.#error = undefined;
+            this.#backoff = INITIAL_BACKOFF_MILLISECONDS;
+        }
     }
 
     /** Cancel scheduled and active work permanently. */

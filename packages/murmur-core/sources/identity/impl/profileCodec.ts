@@ -14,6 +14,15 @@ interface SerializedProfile {
 
 /** Encode a profile to the version-one JSON representation. */
 export function encodeProfilePayload(profile: IdentityProfile): Uint8Array {
+    if (
+        typeof profile !== "object" ||
+        profile === null ||
+        Array.isArray(profile) ||
+        !("name" in profile) ||
+        typeof profile.name !== "string"
+    ) {
+        throw new Error("Invalid identity profile: expected an object with a string name");
+    }
     if (profile.name.length === 0 || profile.name.length > 256) {
         throw new Error("Profile name must contain 1 to 256 characters");
     }

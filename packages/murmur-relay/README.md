@@ -35,11 +35,15 @@ checks.
 pnpm --filter @murmur/relay build
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+MURMUR_RELAY_ORIGINS='https://app.example' \
 pnpm --filter @murmur/relay start
 ```
 
 Set `MURMUR_RELAY_STORE=postgres` and provide a Postgres URL in
-`MURMUR_RELAY_DB` for the Postgres backend. Node 22.5 or later is required.
+`MURMUR_RELAY_DB` for the Postgres backend. `MURMUR_RELAY_ORIGINS` accepts `*`
+or a comma-separated list of exact browser origins; it defaults to `*`, which
+sends wildcard CORS and allows every browser origin. Node 22.5 or later is
+required.
 
 ## HTTP API
 

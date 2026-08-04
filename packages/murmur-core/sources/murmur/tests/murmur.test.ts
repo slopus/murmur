@@ -1,14 +1,23 @@
+import { DatabaseSync } from "node:sqlite";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@murmur/relay";
 import { describe, expect, it } from "vitest";
 import {
     decodeIdentityRoot,
     destroyIdentity,
+    randomBytes,
     type IdentityKeyPair,
     type IdentityPublicKey,
 } from "../../crypto/index.js";
-import { FriendChannel, identityId, type FriendControlEnvelope } from "../../identity/index.js";
+import {
+    FriendChannel,
+    identityId,
+    validateIdentityProfile,
+    type FriendControlEnvelope,
+    type IdentityProfile,
+} from "../../identity/index.js";
 import {
     createMlsKeyPackage,
+    decodeMlsTreeCommit,
     destroyMlsKeyPackageBundle,
     encodeMlsKeyPackage,
     mlsKeyPackageReference,
@@ -25,6 +34,7 @@ import {
     destroyFriendControlFrame,
     encodeFriendControlFrame,
 } from "../impl/controlCodec.js";
+import { sealGroupRelayPayload } from "../impl/groupEnvelope.js";
 import {
     decodeGroup,
     decodeRelayOutbox,
@@ -60,6 +70,89 @@ async function waitFor(
         await new Promise<void>((resolve) => {
             setTimeout(resolve, 25);
         });
+    }
+}
+
+async function exhaustFriendKeyPackagePool(
+    victim: Murmur,
+    victimStore: MurmurStore,
+    hostile: Murmur,
+    hostileStore: MurmurStore,
+    fetch: RelayFetch,
+): Promise<MurmurKeyPackagePoolExhaustedError> {
+    const rootBytes = await hostileStore.get("murmur/v1/root");
+    if (rootBytes === undefined) {
+        throw new Error("Hostile friend root was not persisted");
+    }
+    const hostileRoot = decodeIdentityRoot(rootBytes);
+    rootBytes.fill(0);
+    const channel = new FriendChannel(hostileRoot, {
+        publicKey: victim.identityKey,
+    });
+    const access = friendControlAccess(channel);
+    const peerId = identityId({ publicKey: hostile.identityKey });
+    const localPrefix = `murmur/v1/key-packages/local/${peerId}/`;
+    const consumedPrefix = `murmur/v1/key-packages/local-consumed/${peerId}/`;
+    try {
+        for (let round = 0; round < 8; round += 1) {
+            const local = await victimStore.list(localPrefix);
+            const consumed = await victimStore.list(consumedPrefix);
+            const available = [...local.keys()]
+                .filter(
+                    (key) =>
+                        !consumed.has(`${consumedPrefix}${key.slice(key.lastIndexOf("/") + 1)}`),
+                )
+                .slice(0, 2)
+                .map((key) => decodeBase64Url(key.slice(key.lastIndexOf("/") + 1)));
+            for (const bytes of local.values()) {
+                bytes.fill(0);
+            }
+            for (const bytes of consumed.values()) {
+                bytes.fill(0);
+            }
+            if (available.length === 0) {
+                break;
+            }
+            const bogus = new Uint8Array(32);
+            bogus.fill(round + 1);
+            const frameBytes = encodeFriendControlFrame({
+                type: "key-package-request",
+                consumedReferences: [...available, bogus],
+            });
+            const envelope = channel.seal(channel.createMessage(frameBytes));
+            const payload = utf8Encode(JSON.stringify(envelope));
+            try {
+                const response = await fetch("https://relay.test/v1/events", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: utf8Decode(
+                        encodeSignedRelayEventWire(createCapabilityEvent(access, payload)),
+                    ),
+                });
+                expect(response.ok).toBe(true);
+                try {
+                    await victim.sync();
+                } catch (error: unknown) {
+                    if (error instanceof MurmurKeyPackagePoolExhaustedError) {
+                        return error;
+                    }
+                    throw error;
+                }
+            } finally {
+                for (const reference of available) {
+                    reference.fill(0);
+                }
+                bogus.fill(0);
+                frameBytes.fill(0);
+                payload.fill(0);
+            }
+        }
+        throw new Error("Hostile friend did not exhaust the bounded KeyPackage pool");
+    } finally {
+        channel.destroy();
+        access.readSecretKey?.fill(0);
+        access.writeSecretKey?.fill(0);
+        destroyIdentity(hostileRoot);
     }
 }
 
@@ -175,8 +268,53 @@ class TransactionFaultStore implements MurmurStore {
 }
 
 describe("stateful Murmur facade", () => {
-    it("restores identity and converges friends, invitations, MLS events, and removal", async () => {
+    it("rejects malformed public JavaScript profiles with a domain error", async () => {
+        const invalidProfiles = [null, [], {}, { avatar: new Uint8Array() }];
+        for (const invalid of invalidProfiles) {
+            const profile = invalid as unknown as IdentityProfile;
+            expect(() => validateIdentityProfile(profile)).toThrow(
+                "Invalid identity profile: expected an object with a string name",
+            );
+            await expect(
+                Murmur.open({
+                    relay: "https://relay.test",
+                    store: new MemoryMurmurStore(),
+                    initialProfile: profile,
+                    fetch: async (): Promise<Response> => {
+                        throw new Error("Invalid profile must fail before network access");
+                    },
+                }),
+            ).rejects.toThrow("Invalid identity profile: expected an object with a string name");
+        }
+
         const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const murmur = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Valid" },
+            fetch: inProcessFetch(relay),
+        });
+        try {
+            for (const invalid of invalidProfiles) {
+                await expect(
+                    murmur.setProfile(invalid as unknown as IdentityProfile),
+                ).rejects.toThrow(
+                    "Invalid identity profile: expected an object with a string name",
+                );
+            }
+        } finally {
+            await murmur.close();
+            await relay.close();
+        }
+    });
+
+    it("restores identity and converges friends, invitations, MLS events, and removal", async () => {
+        const database = new DatabaseSync(":memory:");
+        const relay = new RelayService(
+            new SqliteRelayStore(":memory:", {
+                database,
+            }),
+        );
         const fetch = inProcessFetch(relay);
         const aliceStore = new MemoryMurmurStore();
         const bobStore = new MemoryMurmurStore();
@@ -255,6 +393,31 @@ describe("stateful Murmur facade", () => {
                 "opaque from Alice",
                 "opaque from Bob",
             ]);
+
+            const rawGroupRows = database
+                .prepare("SELECT event_json FROM murmur_relay_events ORDER BY seq")
+                .all()
+                .flatMap((row) => {
+                    if (typeof row.event_json !== "string") {
+                        throw new Error("Relay event JSON probe returned a non-string");
+                    }
+                    const wire = JSON.parse(row.event_json) as {
+                        readonly topic?: { readonly name?: unknown };
+                    };
+                    return wire.topic?.name === "group-events" ? [row.event_json] : [];
+                });
+            expect(rawGroupRows.length).toBeGreaterThanOrEqual(3);
+            const identityEncodings = [
+                encodeBase64Url(alice.identityKey),
+                encodeBase64Url(bob.identityKey),
+            ];
+            for (const raw of rawGroupRows) {
+                for (const identity of identityEncodings) {
+                    expect(raw).not.toContain(identity);
+                }
+                const retained = decodeSignedRelayEventWire(utf8Encode(raw));
+                expect(() => decodeMlsTreeCommit(retained.payload)).toThrow();
+            }
 
             await bob.close();
             await alice.groups.send(groupId, utf8Encode("while Bob is offline"));
@@ -481,6 +644,28 @@ describe("stateful Murmur facade", () => {
             const record = decodeGroup(metadata[1]);
             const access = groupAccess(record.topicSecret);
             try {
+                const inner = utf8Encode("opaque-envelope-probe");
+                const sealed = sealGroupRelayPayload(record.topicSecret, access.topic, inner);
+                const tampered = sealed.slice();
+                tampered[tampered.length - 1] = (tampered.at(-1) ?? 0) ^ 1;
+                const wrongSecret = randomBytes(32);
+                const wrongAccess = groupAccess(wrongSecret);
+                const wrongEnvelope = sealGroupRelayPayload(wrongSecret, wrongAccess.topic, inner);
+                try {
+                    await relay.publish(createCapabilityEvent(access, tampered));
+                    await relay.publish(createCapabilityEvent(access, wrongEnvelope));
+                } finally {
+                    inner.fill(0);
+                    sealed.fill(0);
+                    tampered.fill(0);
+                    wrongSecret.fill(0);
+                    wrongEnvelope.fill(0);
+                    wrongAccess.readSecretKey?.fill(0);
+                    wrongAccess.writeSecretKey?.fill(0);
+                }
+                await alice.sync();
+                expect((await store.list("murmur/v1/quarantine/")).size).toBe(2);
+
                 for (let index = 0; index < 40; index += 1) {
                     await relay.publish(
                         createCapabilityEvent(access, new Uint8Array([0xff, index & 0xff])),
@@ -1779,6 +1964,132 @@ describe("stateful Murmur facade", () => {
                 destroyIdentity(bobRoot);
             }
             await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 90_000);
+
+    it("isolates one hostile KeyPackage pool while unrelated groups keep converging", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const fetch = inProcessFetch(relay);
+        const ownerStore = new MemoryMurmurStore();
+        const hostileStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const carolStore = new MemoryMurmurStore();
+        const owner = await Murmur.open({
+            relay: "https://relay.test",
+            store: ownerStore,
+            initialProfile: { name: "Owner" },
+            fetch,
+        });
+        const hostile = await Murmur.open({
+            relay: "https://relay.test",
+            store: hostileStore,
+            initialProfile: { name: "Hostile Alice" },
+            fetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: bobStore,
+            initialProfile: { name: "Bob" },
+            fetch,
+        });
+        const carol = await Murmur.open({
+            relay: "https://relay.test",
+            store: carolStore,
+            initialProfile: { name: "Carol" },
+            fetch,
+        });
+        try {
+            for (const peer of [hostile, bob, carol]) {
+                await owner.friends.request(peer.identityKey);
+            }
+            await converge([owner, hostile, bob, carol], 4);
+            await hostile.friends.accept(owner.identityKey);
+            await bob.friends.accept(owner.identityKey);
+            await carol.friends.accept(owner.identityKey);
+            await converge([hostile, bob, carol, owner], 10);
+
+            const exhausted = await exhaustFriendKeyPackagePool(
+                owner,
+                ownerStore,
+                hostile,
+                hostileStore,
+                fetch,
+            );
+            const exhaustedPeer = exhausted.peerIdentityKey;
+            try {
+                expect(exhaustedPeer).toEqual(hostile.identityKey);
+            } finally {
+                exhaustedPeer.fill(0);
+            }
+
+            let surfaced = 0;
+            const syncOwner = async (): Promise<void> => {
+                try {
+                    await owner.sync();
+                } catch (error: unknown) {
+                    expect(error).toBeInstanceOf(MurmurKeyPackagePoolExhaustedError);
+                    if (error instanceof MurmurKeyPackagePoolExhaustedError) {
+                        const peer = error.peerIdentityKey;
+                        try {
+                            expect(peer).toEqual(hostile.identityKey);
+                        } finally {
+                            peer.fill(0);
+                        }
+                    }
+                    surfaced += 1;
+                }
+            };
+
+            const groupId = await owner.groups.create(utf8Encode("unrelated Bob/Carol"), [
+                bob.identityKey,
+                carol.identityKey,
+            ]);
+            for (let round = 0; round < 18; round += 1) {
+                await syncOwner();
+                await bob.sync();
+                await carol.sync();
+                if (
+                    (await bob.groups.get(groupId))?.group.members.length === 3 &&
+                    (await carol.groups.get(groupId))?.group.members.length === 3
+                ) {
+                    break;
+                }
+            }
+            expect((await bob.groups.get(groupId))?.group.members).toHaveLength(3);
+            expect((await carol.groups.get(groupId))?.group.members).toHaveLength(3);
+
+            for (let index = 0; index < 3; index += 1) {
+                await owner.groups.send(groupId, utf8Encode(`unrelated-${index}`));
+                await syncOwner();
+                await bob.sync();
+                await carol.sync();
+            }
+            expect(
+                (await bob.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).toEqual(["unrelated-0", "unrelated-1", "unrelated-2"]);
+            expect(
+                (await carol.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).toEqual(["unrelated-0", "unrelated-1", "unrelated-2"]);
+            expect(surfaced).toBeGreaterThan(0);
+
+            await waitFor(
+                async () => owner.convergenceError instanceof MurmurKeyPackagePoolExhaustedError,
+                5_000,
+            );
+            expect(owner.convergenceError).toBeInstanceOf(MurmurKeyPackagePoolExhaustedError);
+
+            await owner.friends.end(hostile.identityKey);
+            expect(owner.convergenceError).toBeUndefined();
+            await converge([owner, hostile, bob, carol], 4);
+
+            await owner.groups.send(groupId, utf8Encode("after hostile end"));
+            await converge([owner, bob, carol], 5);
+            expect(
+                (await carol.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).toContain("after hostile end");
+        } finally {
+            await Promise.all([owner.close(), hostile.close(), bob.close(), carol.close()]);
             await relay.close();
         }
     }, 90_000);
