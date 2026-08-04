@@ -40,6 +40,19 @@ These topic keys are relay capabilities, not Murmur identities, and the relay
 does not link them to Murmur identities. The exact request challenge, key
 derivation, signature exchange, and wire mechanics remain unspecified.
 
+## Topic state and retention
+
+A topic may have an optional snapshot, a bounded history of events, and an
+optional ordered list of elements.
+
+Expiration or a timeout may be specified independently for the snapshot, an
+individual event, the list as a whole, and an individual list element. Each
+timeout is permitted but not required. When no component-specific timeout is
+supplied, this plan imposes none. Event history remains bounded by relay policy.
+
+This plan does not choose default durations, expiration cleanup timing,
+conflict behavior, or wire fields.
+
 ## The first version
 
 The first version has no external account or Murmur identity authorization. We
@@ -73,6 +86,10 @@ if a fully anonymous relay is too open.
 - A topic is identified by its exact type, relevant authorization public key or
   keys, and name. One key may authorize several names, and every name has
   separate topic state.
+- A topic supports an optional snapshot, a relay-bounded event history, and an
+  optional ordered list.
+- Snapshot, event, whole-list, and list-element timeouts can be specified
+  independently, while none is required.
 - An inbox uses a `Read Topic`: it accepts any correctly signed write but
   exposes its contents only to the designated read capability.
 - The relay stores and serves topic state without understanding its contents or
