@@ -12,9 +12,29 @@ import {
 import { RelayService } from "../../relay/index.js";
 import { SqliteRelayStore, type EventPage, type PageReadConstraints } from "../../storage/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../../utils/base64Url.js";
-import { createRelayFetchHandler } from "../index.js";
+import { createRelayFetchHandler, parseRelayAllowedOrigins } from "../index.js";
 
 describe("relay HTTP read authorization", () => {
+    test("strictly parses standalone CORS origins", () => {
+        expect(parseRelayAllowedOrigins(undefined)).toBe("*");
+        expect(parseRelayAllowedOrigins("*")).toBe("*");
+        expect(parseRelayAllowedOrigins("https://app.test, http://localhost:3000")).toEqual([
+            "https://app.test",
+            "http://localhost:3000",
+        ]);
+        for (const invalid of [
+            "",
+            "https://app.test,",
+            "*,https://app.test",
+            "https://app.test/",
+            "https://app.test/path",
+            "ftp://app.test",
+            "https://app.test,https://app.test",
+        ]) {
+            expect(() => parseRelayAllowedOrigins(invalid)).toThrow("MURMUR_RELAY_ORIGINS");
+        }
+    });
+
     test("issues and consumes a challenge without receiving a secret key", async () => {
         const readSecretKey = new Uint8Array(32).fill(9);
         const writeSecretKey = new Uint8Array(32).fill(8);
@@ -129,6 +149,22 @@ describe("relay HTTP read authorization", () => {
                 }),
             );
             expect(response.status).toBe(400);
+            const tooManyDigits = await handler(
+                new Request("https://relay.test/v1/events/read", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        topic: {
+                            type: "write",
+                            name: "cursor",
+                            writeKey: encodeBase64Url(key),
+                        },
+                        since: "10000000000000000000",
+                        limit: 1,
+                        waitMilliseconds: 0,
+                    }),
+                }),
+            );
+            expect(tooManyDigits.status).toBe(400);
         } finally {
             await relay.close();
         }

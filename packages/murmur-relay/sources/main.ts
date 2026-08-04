@@ -1,7 +1,7 @@
 import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Pool } from "pg";
-import { createRelayFetchHandler } from "./http/index.js";
+import { createRelayFetchHandler, parseRelayAllowedOrigins } from "./http/index.js";
 import {
     InProcessWakeSource,
     PostgresWakeSource,
@@ -49,14 +49,27 @@ async function createStore(): Promise<{ store: RelayStore; wakeSource: WakeSourc
 
 /** Start the standalone ordered-event relay. */
 export async function main(): Promise<void> {
+    const allowedOrigins = parseRelayAllowedOrigins(process.env.MURMUR_RELAY_ORIGINS);
     const { store, wakeSource } = await createStore();
     const service = new RelayService(store, {}, wakeSource);
-    const server = createNodeRelayServer(createRelayFetchHandler(service));
+    const server = createNodeRelayServer(
+        createRelayFetchHandler(service, {
+            allowedOrigins,
+        }),
+    );
     await listenNodeRelayServer(server, {
         host: process.env.HOST ?? "0.0.0.0",
         port: port(process.env.PORT),
     });
-    const pruneTimer = setInterval(() => void service.pruneExpired(), PRUNE_INTERVAL_MILLISECONDS);
+    const prune = (): void => {
+        void service
+            .pruneExpired()
+            .catch((error: unknown) =>
+                logger.error(`relay:prune-failed ${safeErrorSummary(error)}`),
+            );
+    };
+    prune();
+    const pruneTimer = setInterval(prune, PRUNE_INTERVAL_MILLISECONDS);
     pruneTimer.unref();
     const stop = (): void => {
         clearInterval(pruneTimer);

@@ -8,17 +8,16 @@ import {
     RelayError,
     parseSignedRelayEvent,
     relayEventFingerprint,
-    signedRelayEventToJson,
     type SignedRelayEvent,
 } from "../../protocol/index.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
+import { encodeStoredRelayEvent, selectEventPage, type StoredPageCandidate } from "../page.js";
 import type {
     EventPage,
     PageReadConstraints,
     PublishOutcome,
     PublishReceipt,
     RelayStore,
-    RetainedRelayEvent,
     StoredReadChallenge,
 } from "../types.js";
 
@@ -40,6 +39,14 @@ function textColumn(value: unknown, name: string): string {
     }
     return value;
 }
+
+/** Bounded retained-candidate query kept visible for query-plan regression tests. */
+export const SQLITE_READ_EVENTS_QUERY = `
+    SELECT seq, event_json, encoded_bytes
+    FROM murmur_relay_events
+    WHERE topic_id = ? AND seq > ? AND (expires_at IS NULL OR expires_at > ?)
+    ORDER BY seq
+    LIMIT ?`;
 
 /** Fresh-schema SQLite ordered event store. */
 export class SqliteRelayStore implements RelayStore {
@@ -151,7 +158,7 @@ export class SqliteRelayStore implements RelayStore {
             const schema = this.#requiredGet(
                 "SELECT version FROM murmur_relay_schema WHERE singleton = 1",
             );
-            if (bigintColumn(schema.version) !== 1n) {
+            if (bigintColumn(schema.version) !== 2n) {
                 throw new Error("Unsupported SQLite relay schema version");
             }
             return;
@@ -163,7 +170,7 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 1);
+            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 2);
             CREATE TABLE murmur_relay_topics (
                 id TEXT PRIMARY KEY,
                 head INTEGER NOT NULL CHECK (head >= 0)
@@ -179,14 +186,16 @@ export class SqliteRelayStore implements RelayStore {
                 topic_id TEXT NOT NULL REFERENCES murmur_relay_topics(id) ON DELETE CASCADE,
                 seq INTEGER NOT NULL CHECK (seq > 0),
                 event_json TEXT NOT NULL,
+                encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes > 0),
                 expires_at INTEGER,
+                author_signing_key BLOB NOT NULL,
                 collapse_key BLOB,
                 PRIMARY KEY (topic_id, seq)
             ) STRICT;
             CREATE INDEX murmur_relay_events_expiration
                 ON murmur_relay_events(expires_at) WHERE expires_at IS NOT NULL;
             CREATE INDEX murmur_relay_events_collapse
-                ON murmur_relay_events(topic_id, collapse_key)
+                ON murmur_relay_events(topic_id, author_signing_key, collapse_key)
                 WHERE collapse_key IS NOT NULL;
             CREATE TABLE murmur_relay_read_challenges (
                 id TEXT PRIMARY KEY,
@@ -256,19 +265,25 @@ export class SqliteRelayStore implements RelayStore {
             this.#run("UPDATE murmur_relay_topics SET head = ? WHERE id = ?", seq, topicId);
             if (event.collapseKey !== undefined) {
                 this.#run(
-                    "DELETE FROM murmur_relay_events WHERE topic_id = ? AND collapse_key = ?",
+                    `DELETE FROM murmur_relay_events
+                     WHERE topic_id = ? AND author_signing_key = ? AND collapse_key = ?`,
                     topicId,
+                    event.author.signingKey,
                     event.collapseKey,
                 );
             }
+            const encoded = encodeStoredRelayEvent(event);
             this.#run(
                 `INSERT INTO murmur_relay_events
-                    (topic_id, seq, event_json, expires_at, collapse_key)
-                 VALUES (?, ?, ?, ?, ?)`,
+                    (topic_id, seq, event_json, encoded_bytes, expires_at,
+                     author_signing_key, collapse_key)
+                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
                 topicId,
                 seq,
-                JSON.stringify(signedRelayEventToJson(event)),
+                encoded.json,
+                BigInt(encoded.encodedBytes),
                 event.expiresAt === undefined ? null : BigInt(event.expiresAt),
+                event.author.signingKey,
                 event.collapseKey ?? null,
             );
             this.#run(
@@ -303,40 +318,26 @@ export class SqliteRelayStore implements RelayStore {
                 return { events: [], head: 0n, exhausted: true };
             }
             const rows = this.#all(
-                `WITH candidates AS (
-                SELECT seq, event_json,
-                    ROW_NUMBER() OVER (ORDER BY seq) AS row_number,
-                    COUNT(*) OVER () AS available_count,
-                    SUM(LENGTH(event_json) + 64) OVER (
-                        ORDER BY seq ROWS UNBOUNDED PRECEDING
-                    ) AS cumulative_bytes
-                FROM murmur_relay_events
-                WHERE topic_id = ? AND seq > ? AND (expires_at IS NULL OR expires_at > ?)
-             )
-             SELECT seq, event_json, row_number, available_count FROM candidates
-             WHERE row_number = 1 OR cumulative_bytes <= ?
-             ORDER BY seq LIMIT ?`,
+                SQLITE_READ_EVENTS_QUERY,
                 topicId,
                 since,
                 BigInt(now),
-                BigInt(constraints.maximumEncodedBytes),
-                BigInt(limit),
+                BigInt(limit + 1),
             );
-            const page = {
-                events: rows.map(
-                    (row): RetainedRelayEvent => ({
+            const page = selectEventPage(
+                rows.map(
+                    (row): StoredPageCandidate => ({
                         seq: bigintColumn(row.seq),
                         event: parseSignedRelayEvent(
                             JSON.parse(textColumn(row.event_json, "event JSON")) as unknown,
                         ),
+                        encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
-                head: bigintColumn(topic.head),
-                exhausted:
-                    rows.length === 0 ||
-                    bigintColumn(rows.at(-1)!.row_number) ===
-                        bigintColumn(rows.at(-1)!.available_count),
-            };
+                bigintColumn(topic.head),
+                limit,
+                constraints,
+            );
             this.#database.exec("COMMIT");
             return page;
         } catch (error) {

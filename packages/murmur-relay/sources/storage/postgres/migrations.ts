@@ -23,7 +23,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     "SELECT version FROM murmur_relay_schema WHERE singleton = 1",
                 );
                 const versionRow = version.rows[0];
-                if (versionRow === undefined || bigintColumn(versionRow.version) !== 1n) {
+                if (versionRow === undefined || bigintColumn(versionRow.version) !== 2n) {
                     throw new Error("Unsupported Postgres relay schema version");
                 }
                 return;
@@ -33,7 +33,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 1)`,
+                `INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 2)`,
                 `CREATE TABLE murmur_relay_topics (
                     id text PRIMARY KEY,
                     head bigint NOT NULL CHECK (head >= 0)
@@ -49,14 +49,16 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     topic_id text NOT NULL REFERENCES murmur_relay_topics(id) ON DELETE CASCADE,
                     seq bigint NOT NULL CHECK (seq > 0),
                     event_json jsonb NOT NULL,
+                    encoded_bytes bigint NOT NULL CHECK (encoded_bytes > 0),
                     expires_at bigint,
+                    author_signing_key bytea NOT NULL,
                     collapse_key bytea,
                     PRIMARY KEY (topic_id, seq)
                 )`,
                 `CREATE INDEX murmur_relay_events_expiration
                     ON murmur_relay_events(expires_at) WHERE expires_at IS NOT NULL`,
                 `CREATE INDEX murmur_relay_events_collapse
-                    ON murmur_relay_events(topic_id, collapse_key)
+                    ON murmur_relay_events(topic_id, author_signing_key, collapse_key)
                     WHERE collapse_key IS NOT NULL`,
                 `CREATE TABLE murmur_relay_read_challenges (
                     id text PRIMARY KEY,

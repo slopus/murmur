@@ -154,7 +154,7 @@ The standalone executable reads these variables from
 | `HOST`                              | `0.0.0.0`                    | TCP listen host.                                                          |
 | `MURMUR_RELAY_STORE`                | `sqlite`                     | Storage backend: `sqlite` or `postgres`.                                  |
 | `MURMUR_RELAY_DB`                   | `./data/murmur-relay.sqlite` | SQLite database path; required Postgres connection string for `postgres`. |
-| `MURMUR_RELAY_ORIGINS`              | `*`                          | `*` or a comma-separated CORS origin list.                                |
+| `MURMUR_RELAY_ORIGINS`              | `*`                          | `*` or a comma-separated list of exact HTTP(S) CORS origins.              |
 | `MURMUR_RELAY_BLOB_BACKEND`         | `local`                      | Blob backend: `local` or `s3`.                                            |
 | `MURMUR_RELAY_BLOB_DIR`             | `./data/blobs`               | Local content-addressed filesystem root.                                  |
 | `MURMUR_RELAY_BLOB_SECRET`          | generated per process        | Local signed-link HMAC secret, encoded as UTF-8 and at least 32 bytes.    |
@@ -175,6 +175,12 @@ for a persistent local deployment. Treat it as a secret.
 look at `X-Forwarded-For`. Leave it unset for a direct deployment. Configure it
 only when the immediate network path is understood; otherwise client-provided
 forwarded headers could choose the rate-limit key.
+
+`MURMUR_RELAY_ORIGINS` accepts `*` by itself, or exact origins such as
+`https://app.example,http://localhost:3000`. Entries may be separated by
+whitespace after commas. Paths, queries, fragments, credentials, trailing
+slashes, non-HTTP(S) URLs, empty entries, duplicates, and combining `*` with
+another entry are startup errors.
 
 ## Single-instance production
 

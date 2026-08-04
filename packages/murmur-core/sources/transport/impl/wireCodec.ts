@@ -25,6 +25,7 @@ export interface SignedRelayEventJson {
 
 const TOPIC_NAME = /^[\x20-\x7e]{1,128}$/;
 const MAXIMUM_SEQUENCE = 9_223_372_036_854_775_807n;
+const DECIMAL_SEQUENCE = /^(0|[1-9]\d*)$/;
 
 function object(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -62,6 +63,17 @@ function integer(value: unknown, name: string): number {
         throw new Error(`Invalid ${name}`);
     }
     return value;
+}
+
+function sequence(value: unknown, name: string, minimum: bigint): bigint {
+    if (typeof value !== "string" || value.length > 19 || !DECIMAL_SEQUENCE.test(value)) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const parsed = BigInt(value);
+    if (parsed < minimum || parsed > MAXIMUM_SEQUENCE) {
+        throw new Error(`Invalid ${name}`);
+    }
+    return parsed;
 }
 
 /** Convert a topic to its canonical JSON representation. */
@@ -258,17 +270,12 @@ export function decodeEventPageWire(value: Uint8Array): EventPage {
     ) {
         throw new Error("Invalid event page");
     }
-    const head = BigInt(input.head);
-    if (head < 0n || head > MAXIMUM_SEQUENCE) throw new Error("Invalid event page head");
+    const head = sequence(input.head, "event page head", 0n);
     return {
         events: input.events.map((item) => {
             const retained = object(item, "retained event");
             exact(retained, ["seq", "event"], [], "retained event");
-            if (typeof retained.seq !== "string" || !/^(0|[1-9]\d*)$/.test(retained.seq)) {
-                throw new Error("Invalid event sequence");
-            }
-            const seq = BigInt(retained.seq);
-            if (seq < 1n || seq > MAXIMUM_SEQUENCE) throw new Error("Invalid event sequence");
+            const seq = sequence(retained.seq, "event sequence", 1n);
             return { seq, event: event(retained.event) };
         }),
         head,

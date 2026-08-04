@@ -85,7 +85,7 @@ Each topic contains exactly one ordered event store:
 publish signed event
         |
         +-- allocate never-reused topic sequence
-        +-- optionally remove older matching collapse key
+        +-- optionally remove older matching author + collapse key
         +-- insert opaque event
         `-- retain idempotency receipt
 ```

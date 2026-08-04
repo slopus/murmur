@@ -91,8 +91,11 @@ No `expiresAt` means durable. Once expiration passes, the event is omitted from
 reads and can be physically deleted.
 
 When `collapseKey` is present, publishing atomically removes all older retained
-events in that topic carrying equal opaque bytes. Clients use collapse only when
-the new payload completely replaces the earlier state.
+events in that topic from the same author signing key carrying equal opaque
+bytes. Including the author in this identity prevents independent writers to a
+public-write `Read Topic` from collapsing one another's state. Clients use
+collapse only when the new payload completely replaces the author's earlier
+state.
 
 The relay's head sequence never decreases. Removed events therefore produce
 legal holes:
@@ -121,6 +124,11 @@ Events are ordered by sequence and strictly greater than the requested cursor.
 `exhausted` is computed from retained candidates before count and encoded-byte
 page limits. It is false whenever another retained event follows the page, even
 if the returned page is shorter than the requested count.
+
+Stores fetch at most `limit + 1` retained candidates under the same snapshot.
+They persist the compact encoded event byte length at publish time and use that
+identical value for SQLite and Postgres page budgeting. The first retained event
+is always returned, even when it alone exceeds a caller-supplied page budget.
 
 Clients advance the last returned event to `head` only when `exhausted` is true.
 Otherwise they advance to that event's sequence and request the next page.

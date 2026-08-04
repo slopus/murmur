@@ -2,17 +2,16 @@ import {
     RelayError,
     parseSignedRelayEvent,
     relayEventFingerprint,
-    signedRelayEventToJson,
     type SignedRelayEvent,
 } from "../../protocol/index.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
+import { encodeStoredRelayEvent, selectEventPage, type StoredPageCandidate } from "../page.js";
 import type {
     EventPage,
     PageReadConstraints,
     PublishOutcome,
     PublishReceipt,
     RelayStore,
-    RetainedRelayEvent,
     StoredReadChallenge,
 } from "../types.js";
 import type { PostgresDatabase } from "./database.js";
@@ -31,6 +30,15 @@ export {
 
 /** Shared LISTEN/NOTIFY channel used only to reduce long-poll latency. */
 export const POSTGRES_WAKE_CHANNEL = "murmur_relay_wake_v2";
+
+/** Bounded retained-candidate query kept visible for query-plan regression tests. */
+export const POSTGRES_READ_EVENTS_QUERY = `
+    SELECT seq, event_json, encoded_bytes
+    FROM murmur_relay_events
+    WHERE topic_id = $1 AND seq > $2
+      AND (expires_at IS NULL OR expires_at > $3)
+    ORDER BY seq
+    LIMIT $4`;
 
 function jsonValue(value: unknown): unknown {
     return typeof value === "string" ? (JSON.parse(value) as unknown) : value;
@@ -184,19 +192,24 @@ export class PostgresRelayStore implements RelayStore {
             ]);
             if (event.collapseKey !== undefined) {
                 await transaction.query(
-                    "DELETE FROM murmur_relay_events WHERE topic_id = $1 AND collapse_key = $2",
-                    [topicId, event.collapseKey],
+                    `DELETE FROM murmur_relay_events
+                     WHERE topic_id = $1 AND author_signing_key = $2 AND collapse_key = $3`,
+                    [topicId, event.author.signingKey, event.collapseKey],
                 );
             }
+            const encoded = encodeStoredRelayEvent(event);
             await transaction.query(
                 `INSERT INTO murmur_relay_events
-                    (topic_id, seq, event_json, expires_at, collapse_key)
-                 VALUES ($1, $2, $3::jsonb, $4, $5)`,
+                    (topic_id, seq, event_json, encoded_bytes, expires_at,
+                     author_signing_key, collapse_key)
+                 VALUES ($1, $2, $3::jsonb, $4, $5, $6, $7)`,
                 [
                     topicId,
                     seq.toString(),
-                    JSON.stringify(signedRelayEventToJson(event)),
+                    encoded.json,
+                    encoded.encodedBytes,
                     event.expiresAt?.toString() ?? null,
+                    event.author.signingKey,
                     event.collapseKey ?? null,
                 ],
             );
@@ -230,44 +243,20 @@ export class PostgresRelayStore implements RelayStore {
             const result = await transaction.query<{
                 seq: unknown;
                 event_json: unknown;
-                row_number: unknown;
-                available_count: unknown;
-            }>(
-                `WITH candidates AS (
-                    SELECT seq, event_json,
-                        ROW_NUMBER() OVER (ORDER BY seq) AS row_number,
-                        COUNT(*) OVER () AS available_count,
-                        SUM(OCTET_LENGTH(event_json::text) + 64) OVER (
-                            ORDER BY seq ROWS UNBOUNDED PRECEDING
-                        ) AS cumulative_bytes
-                    FROM murmur_relay_events
-                    WHERE topic_id = $1 AND seq > $2
-                      AND (expires_at IS NULL OR expires_at > $3)
-                 )
-                 SELECT seq, event_json, row_number, available_count FROM candidates
-                 WHERE row_number = 1 OR cumulative_bytes <= $4
-                 ORDER BY seq LIMIT $5`,
-                [
-                    topicId,
-                    since.toString(),
-                    now.toString(),
-                    constraints.maximumEncodedBytes.toString(),
-                    limit,
-                ],
-            );
-            return {
-                events: result.rows.map(
-                    (row): RetainedRelayEvent => ({
+                encoded_bytes: unknown;
+            }>(POSTGRES_READ_EVENTS_QUERY, [topicId, since.toString(), now.toString(), limit + 1]);
+            return selectEventPage(
+                result.rows.map(
+                    (row): StoredPageCandidate => ({
                         seq: bigintColumn(row.seq),
                         event: parseSignedRelayEvent(jsonValue(row.event_json)),
+                        encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
-                head: bigintColumn(topic.head),
-                exhausted:
-                    result.rows.length === 0 ||
-                    bigintColumn(result.rows.at(-1)!.row_number) ===
-                        bigintColumn(result.rows.at(-1)!.available_count),
-            };
+                bigintColumn(topic.head),
+                limit,
+                constraints,
+            );
         }, "repeatable read");
     }
 

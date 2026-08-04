@@ -73,8 +73,10 @@ interface SignedRelayEventJson {
 event is omitted from reads and may be physically pruned.
 
 `collapseKey` is optional opaque client-selected bytes. Publishing an event with
-one atomically removes older retained events in the same topic with the same
-key. The replacement event must contain complete replacement content.
+one atomically removes older retained events in the same topic from the same
+author signing key with the same collapse key. The replacement event must
+contain complete replacement content. On public-write `read` topics, one author
+therefore cannot collapse another author's event.
 
 Every accepted new event receives a monotonically increasing per-topic
 sequence. Expiration and collapse create legal holes; sequences are never
@@ -199,6 +201,12 @@ The final serialized response is measured against `maximumJsonBodyBytes`.
 Configuration must fit one maximum-sized event; a larger multi-event response
 returns HTTP 413 and can be continued with a lower `limit`.
 
+SQLite and Postgres fetch at most `limit + 1` retained candidates for a page,
+under the same head snapshot. Both persist the UTF-8 length of the same compact
+event JSON at publish time, so byte-budget boundaries are backend-independent.
+The first retained event is returned even when a smaller embedding-supplied
+budget would otherwise exclude it.
+
 ### `OPTIONS`
 
 Returns the configured CORS policy. CORS defaults to `*`.
@@ -239,6 +247,8 @@ interface RelayStore {
 SQLite and Postgres/PGlite implement the same fresh schema. There are no schema
 migrations or compatibility readers for the superseded relay model.
 An explicit version marker rejects legacy layouts before adding clean tables.
+The event table stores author signing keys for collapse identity and compact
+encoded event byte lengths for page allocation.
 
 `WakeSource` notifications only reduce long-poll latency. Reads and timeout
 rechecks preserve correctness if notifications are lost.

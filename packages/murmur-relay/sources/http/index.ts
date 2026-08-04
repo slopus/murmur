@@ -24,6 +24,35 @@ export interface RelayHttpOptions {
     readonly allowedOrigins?: "*" | readonly string[];
 }
 
+/** Strictly parse the standalone relay's CORS origin environment value. */
+export function parseRelayAllowedOrigins(value: string | undefined): "*" | readonly string[] {
+    if (value === undefined || value === "*") return "*";
+    const origins = value.split(",").map((origin) => origin.trim());
+    if (origins.length === 0 || origins.some((origin) => origin.length === 0)) {
+        throw new Error("MURMUR_RELAY_ORIGINS must be * or a comma-separated origin list");
+    }
+    const seen = new Set<string>();
+    for (const origin of origins) {
+        if (origin === "*" || seen.has(origin)) {
+            throw new Error("MURMUR_RELAY_ORIGINS contains an invalid or duplicate origin");
+        }
+        let parsed: URL;
+        try {
+            parsed = new URL(origin);
+        } catch {
+            throw new Error("MURMUR_RELAY_ORIGINS contains an invalid origin");
+        }
+        if (
+            (parsed.protocol !== "http:" && parsed.protocol !== "https:") ||
+            parsed.origin !== origin
+        ) {
+            throw new Error("MURMUR_RELAY_ORIGINS contains an invalid origin");
+        }
+        seen.add(origin);
+    }
+    return origins;
+}
+
 function json(
     body: unknown,
     status: number = 200,
@@ -201,7 +230,11 @@ export function createRelayFetchHandler(
                     await readJson(request, relay.options.maximumJsonBodyBytes),
                     "event read",
                 );
-                if (typeof body.since !== "string" || !/^(0|[1-9]\d*)$/.test(body.since)) {
+                if (
+                    typeof body.since !== "string" ||
+                    body.since.length > 19 ||
+                    !/^(0|[1-9]\d*)$/.test(body.since)
+                ) {
                     throw new RelayError(400, "Invalid event cursor", { error: "malformed" });
                 }
                 const page = await relay.readEvents(
