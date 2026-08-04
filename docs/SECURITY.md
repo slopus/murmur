@@ -212,3 +212,38 @@ requests local replica deletion and retires its protocol rows, cursors, and
 epoch secrets, but cannot erase plaintext or history-page keys a member already
 copied. Revocation protects future MLS epochs and page keys; it is not remote
 data destruction.
+
+## Stateful facade guarantees
+
+Murmur treats the relay as untrusted ordered storage. The relay sees topic
+descriptors, outer author keys, timing, sizes, expiration, and sequence
+activity. It does not receive topic secrets, identity secrets, profiles,
+friend-control plaintext, group descriptors, MLS application bytes, Welcome
+plaintext, or epoch secrets.
+
+## Guarantees
+
+- Friend request and response contents are recipient-confidential,
+  identity-authenticated, and outer-author unlinkable.
+- Friend control content is pairwise encrypted and identity-signed.
+- Group membership changes are real TreeKEM Commits.
+- Removed members cannot authenticate or decrypt later MLS application events.
+- Every outbound relay event is stored exactly before network access.
+- Ambiguous publication retries the same bytes, ID, author, and signature.
+- MLS ratchets never advance only in RAM: cloned post-state and the exact event
+  commit atomically.
+- Relay order, not publish return order, chooses concurrent Commit winners.
+- Invalid retained events cannot permanently stall a topic.
+- `close()` and `destroy()` zero live identity, topic, and epoch secrets.
+
+## Limits
+
+- Public identity keys still need an authenticated out-of-band exchange.
+- The public identity inbox is intentionally linkable to that identity.
+- A relay can deny service, withhold, reorder, or delete retained data.
+- A current group member can read and write current group content.
+- Removed members retain the stable relay capability and can inject junk, but
+  not valid newer-epoch MLS content.
+- Local storage compromise exposes the identity, friend capabilities,
+  KeyPackage bundles, and MLS checkpoints held there.
+- This implementation has not received an independent cryptographic audit.

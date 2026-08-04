@@ -67,7 +67,7 @@ class FailingOutboxStore implements MurmurStore {
             operation({
                 ...transaction,
                 set: async (key, value): Promise<void> => {
-                    if (key.includes("/friend-outbox/")) {
+                    if (key.includes("/outbox/")) {
                         throw new Error("outbox unavailable");
                     }
                     await transaction.set(key, value);
@@ -819,8 +819,8 @@ describe("durable friendship lifecycle and outbox", () => {
             responseAddress: "alice-response",
             now: 1,
         });
-        const entries = await store.list("identity/");
-        const outboxEntry = [...entries].find(([key]) => key.includes("/friend-outbox/"));
+        const entries = await store.list("murmur/v1/friend-book/");
+        const outboxEntry = [...entries].find(([key]) => key.includes("/outbox/"));
         if (outboxEntry === undefined) {
             throw new Error("Expected outbox entry");
         }

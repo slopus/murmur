@@ -1,5 +1,3 @@
-# Create murmur-relay-secrets in the default namespace before applying this manifest.
-# See docs/DEPLOYMENT.md#k3s for the one-time command.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
@@ -71,15 +69,6 @@ spec:
                         value: sqlite
                       - name: MURMUR_RELAY_DB
                         value: /data/murmur-relay.sqlite
-                      - name: MURMUR_RELAY_BLOB_BACKEND
-                        value: local
-                      - name: MURMUR_RELAY_BLOB_DIR
-                        value: /data/blobs
-                      - name: MURMUR_RELAY_BLOB_SECRET
-                        valueFrom:
-                            secretKeyRef:
-                                name: murmur-relay-secrets
-                                key: blob-secret
                   startupProbe:
                       httpGet:
                           path: /health

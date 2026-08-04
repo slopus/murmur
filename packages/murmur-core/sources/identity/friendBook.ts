@@ -112,11 +112,12 @@ export class FriendBook {
         const ownerId = identityId(owner);
         this.#owner = owner;
         this.#store = store;
-        this.#recordsPrefix = `identity/v1/${ownerId}/friends/`;
-        this.#replayPrefix = `identity/v1/${ownerId}/friend-exchange-replay/`;
-        this.#outboxPrefix = `identity/v1/${ownerId}/friend-outbox/`;
-        this.#outboxIdsPrefix = `identity/v1/${ownerId}/friend-outbox-ids/`;
-        this.#outgoingPrefix = `identity/v1/${ownerId}/friend-outgoing/`;
+        const prefix = `murmur/v1/friend-book/${ownerId}/`;
+        this.#recordsPrefix = `${prefix}records/`;
+        this.#replayPrefix = `${prefix}exchange-replay/`;
+        this.#outboxPrefix = `${prefix}outbox/`;
+        this.#outboxIdsPrefix = `${prefix}outbox-ids/`;
+        this.#outgoingPrefix = `${prefix}outgoing/`;
         this.#generateId = options.generateId ?? newExchangeId;
     }
 

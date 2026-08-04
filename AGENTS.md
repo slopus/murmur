@@ -1,8 +1,7 @@
 # Murmur - Claude Development Guide
 
-End-to-end encrypted messaging for people and AI agents, over deliberately dumb
-relays. Identities and direct messages use Ed25519 signatures and X25519 sealed
-boxes; groups and shared objects use MLS (an RFC 9420 subset).
+Stateful encrypted friend bootstrap and opaque MLS group event streams over one
+deliberately dumb relay.
 
 ## Master plans
 
@@ -33,10 +32,7 @@ murmur/
 ├── docs/                    # Architecture and protocol reference
 ├── packages/
 │   ├── murmur-core/         # @slopus/murmur, the single published library
-│   ├── murmur-mls/          # MLS implementation, bundled into the library
-│   ├── murmur-relay/        # Runtime-neutral dumb relay service + HTTP handler
-│   ├── murmur-relay-node/   # SQLite store and Node HTTP host for the relay
-│   └── murmur-cli/          # murmur-chat, the Node CLI
+│   └── murmur-relay/        # Dumb relay, HTTP handler, stores, and Node host
 ├── package.json             # Workspace scripts and shared dev tooling
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json       # Shared strict TypeScript options
@@ -44,8 +40,8 @@ murmur/
 └── .oxlintrc.json           # Linter config
 ```
 
-`@slopus/murmur` is the only package published to npm as a library, plus
-`murmur-chat` for the CLI. `@murmur/*` packages are internal to the workspace.
+`@slopus/murmur` is the only package published to npm. `@murmur/*` packages are
+internal to the workspace.
 
 How code is laid out inside a package is dictated by
 [`master-plans/02-code-organization.md`](master-plans/02-code-organization.md):
@@ -108,8 +104,8 @@ The published library depends only on Noble:
 - `@noble/ciphers`: ChaCha20-Poly1305 and AES-GCM
 
 `@slopus/murmur` must stay browser-safe: no `node:*` imports, no side effects.
-`node:sqlite` (Node, experimental) is used only by the CLI and the Node relay
-host, which is why those require Node 22.5 or later.
+`node:sqlite` is used only by the relay package, which requires Node 22.5 or
+later.
 
 ## Protocol Notes
 
@@ -118,24 +114,16 @@ that most often trip up a change:
 
 ### Identity
 
-An identity is two independent key pairs: Ed25519 for signing and X25519 for
-encryption. `identityId` is the base64url public signing key; the inbox topic
-is derived by hashing it, so the relay routes without learning who you are.
-There is no account and no server-side registry.
+An identity exposes one Ed25519 public key. Signing and X25519 key agreement are
+deliberately derived from one 32-byte root. The request inbox is a protected
+`Read Topic` scoped directly to that public key. There is no account or
+server-side registry.
 
 ### Contacts
 
-Adding a contact is one signed profile, sealed to the recipient's X25519 key and
-published to their inbox topic. Profiles are bound to a specific recipient, so
-they cannot be replayed at a third party. The exchange is two-directional:
-receiving a profile authenticates the sender to you, not you to them.
-
-### Direct messages
-
-Signed, then sealed with an ephemeral X25519 key pair.
-`acceptPrivateMessageFromContact` commits the application record and the replay
-marker in one store transaction and reports `"opened"` or `"duplicate"`. Never
-acknowledge a relay delivery before that transaction commits.
+Adding a friend uses a signed and sealed request plus a random protected
+response topic. Active friends derive one encrypted control channel for profile
+updates, friendship termination, KeyPackages, and group invitations.
 
 ### MLS groups
 
@@ -143,16 +131,9 @@ Groups are forward-secret epochs over a TreeKEM ratchet tree. Every membership
 change is a Commit that advances the epoch. All epochs of a group share one
 opaque relay topic.
 
-Outbound group work always follows **prepare → persist → publish**. A restart
-must never be able to publish a Commit whose next-epoch private state was not
-durably written first; that is what locks a member out of their own group.
-
-### Shared documents
-
-Operation-based replicated text carried as ordinary MLS application messages.
-Operations are idempotent and commutative; deletes are tombstones that may
-arrive before their target. Every operation's actor is bound to the
-authenticated MLS leaf. No relay code knows a document exists.
+Application sends persist a cloned post-ratchet epoch and exact event before
+publication. Commits persist active and staged-next epochs separately. Relay
+echo order chooses the winner; a publish result never adopts a Commit.
 
 ## Security Principles
 
@@ -160,13 +141,6 @@ authenticated MLS leaf. No relay code knows a document exists.
 - Use constant-time comparison for authentication
 - Zero secret memory when done (call zeroBytes)
 - Validate all inputs before cryptographic operations
-
-## CLI
-
-`murmur` signs in, exchanges contacts, sends messages and attachments, syncs,
-manages MLS groups, and edits shared documents. Every result is JSON except
-`help`, so an agent can drive it directly. Run `murmur help` for the current
-command list, and start a relay with `@murmur/relay-node` for local testing.
 
 ## Feedback Loop
 

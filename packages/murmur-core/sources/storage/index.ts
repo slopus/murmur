@@ -7,22 +7,27 @@ export class MemoryMurmurStore implements MurmurStore {
     readonly #values = new Map<string, Uint8Array>();
     #transactionTail: Promise<void> = Promise.resolve();
 
+    /** Return a defensive byte copy for one key. */
     async get(key: string): Promise<Uint8Array | undefined> {
         return this.#exclusive(async () => this.#get(key));
     }
 
+    /** Store a defensive byte copy. */
     async set(key: string, value: Uint8Array): Promise<void> {
         await this.#exclusive(async () => this.#set(key, value));
     }
 
+    /** Remove one key when present. */
     async delete(key: string): Promise<void> {
         await this.#exclusive(async () => this.#delete(key));
     }
 
+    /** Return defensive copies of entries under one prefix. */
     async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
         return this.#exclusive(async () => this.#list(prefix));
     }
 
+    /** Run one serialized in-memory transaction with rollback on throw. */
     async transaction<Result>(
         operation: (transaction: StoreTransaction) => Promise<Result>,
     ): Promise<Result> {

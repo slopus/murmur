@@ -1,85 +1,72 @@
 # Architecture
 
-Murmur is a browser-safe, stateful encrypted-communication library connected to
-one deliberately dumb relay. Application and MLS layers encrypt their content;
-the relay stores only signed opaque events.
-
-## Layers
+Murmur is one stateful library over exactly one relay.
 
 ```text
-application-specific protocol
-        |
-        v
-@slopus/murmur
-stateful keys · persistence · synchronization · MLS group streams
-        |
-        v
-browser-safe RelayTransport
-exactly one configured relay
-        |
-================ trust boundary ================
-        |
-@murmur/relay
-typed capability policy · ordered events · SQLite/Postgres
+application semantics (chat, documents, files, or something unknown)
+                           |
+                           v
+                    @slopus/murmur
+ identity · friends · KeyPackages · MLS · outboxes · replay · cursors
+                           |
+                           v
+                browser-safe HTTP transport
+                           |
+===================== trust boundary =====================
+                           |
+                           v
+       typed capability topics · ordered opaque events
 ```
 
-There is no CLI-owned protocol in the library architecture. Two-member and
-multi-member conversations use the same higher-level MLS group primitive.
-Chat semantics are intentionally outside the relay and transport.
+The application supplies `MurmurStore`. The relay supplies ordered storage.
+Murmur owns every protocol state transition between them.
 
-## Trust boundary
+## Topics
 
-The relay is untrusted for confidentiality, application semantics, and
-availability. It can withhold, delay, replay, expire, collapse, or delete data.
-End-to-end cryptography must authenticate application payloads independently.
+- The identity inbox is a public-writer, protected-reader `Read Topic` named
+  `friend-requests`, keyed by the public identity.
+- Every outgoing request carries a fresh random protected response `Read Topic`.
+- Active friends derive one stable encrypted `ReadWrite Topic` named `control`.
+- Every group has a separately random stable `ReadWrite Topic` named
+  `group-events`. It never derives from a rotating MLS exporter.
 
-The relay can see:
+Request and response relay envelopes use fresh one-use Ed25519 authors. Control
+and group envelopes use their shared capability author, while encrypted inner
+content authenticates the Murmur or MLS sender.
 
-- canonical topic descriptors and their authorization public keys;
-- event authors, timestamps, expiration, collapse-key equality, and sizes;
-- opaque event payloads and per-topic sequence activity.
+## Synchronization
 
-It does not receive topic secret keys and does not know whether bytes represent
-a profile, invitation, MLS Commit, group application message, or another future
-protocol.
+`sync()` restores and retries exact outboxes, catches up all discovered topics,
+processes retained events in sequence, replenishes KeyPackages, prepares queued
+operations, reads echoes, and repeats to a bounded quiescent state. A newly
+accepted friend or invitation contributes its topics on the next internal pass.
 
-## Key-scoped topics
+Relay cursors advance in the same application-store transaction as the effect
+of an inbound event. Invalid, stale, unsupported, removed-member, and
+future-without-Commit payloads are durably quarantined and advanced.
 
-Topics are typed descriptors rather than arbitrary strings:
+## MLS ordering
 
-- `Write Topic`: designated-key writes, public reads;
-- `Read Topic`: any signed writer, designated-key reads;
-- `Read and Write Topic`: designated keys in both directions.
+Application sends persist a cloned post-ratchet epoch, retained plaintext
+intent, and exact relay event atomically before publication.
 
-The physical store key is a hash of `(type, name, authorization public key(s))`.
-One capability key may intentionally namespace several independent named
-streams. Capability keys are not relay accounts and need not be Murmur identity
-keys.
+Membership Commits keep active epoch `E` and staged candidate `E+1` separate.
+Publication does not adopt. The first valid current-epoch Commit encountered in
+relay order wins:
 
-Applications keep secret material in `TopicAccess`:
-
-```ts
-interface TopicAccess {
-    topic: RelayTopic;
-    readSecretKey?: Uint8Array;
-    writeSecretKey?: Uint8Array;
-}
+```text
+lower relay sequence
+        |
+        +-- exact local candidate -> promote staged E+1
+        `-- competing Commit -----> apply winner, discard candidate, replan intent
 ```
 
-For protected writes, `MurmurClient` verifies that `writeSecretKey` derives the
-descriptor's `writeKey`, then signs the relay event with that capability rather
-than its identity. `Read Topic` writes use the client's identity because that
-topic intentionally accepts any valid signing author.
+Only a winning Add queues its private friend-channel invitation. The recipient
+atomically consumes the matching private KeyPackage bundle, installs the
+Welcome epoch and stable topic capability, records the invitation replay
+marker, and starts its group cursor after the winning Commit.
 
-For protected reads, `HttpRelayTransport` verifies the local read secret,
-obtains a one-use challenge, and signs the exact topic and read parameters.
-Challenge records live in `RelayStore`, so issuance and consumption may happen
-on different Postgres relay instances without sticky routing. Consumption is an
-atomic delete; expiration is indexed and outstanding counts are transactional.
-
-## Ordered event storage
-
-Each topic contains exactly one ordered event store:
+## Relay storage
 
 ```text
 publish signed event

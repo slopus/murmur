@@ -1,74 +1,80 @@
 # Protocol
 
-This document describes the clean Murmur relay envelope. Higher-level friend
-exchange and MLS group payload formats are intentionally specified separately;
-the relay treats all payload bytes as opaque.
+All wire and durable formats are strict, versioned, bounded, and new to this
+rewrite. No prior Murmur layout is read.
 
-## Cryptographic conventions
+## Identity and friends
 
-- Keys and ciphertext are `Uint8Array` internally.
-- JSON and storage boundaries use canonical unpadded base64url.
-- Signatures are Ed25519 with strict RFC 8032 verification (`zip215: false`).
-- Hashing is SHA-256.
-- Signatures cover recursively key-sorted canonical JSON.
-- Secret capability keys never cross the relay boundary.
+One 32-byte root is an Ed25519 seed and is deliberately converted to X25519 for
+key agreement. The public identity is the 32-byte Ed25519 public key.
 
-## Topic descriptors
-
-```ts
-type RelayTopic =
-    | {
-          type: "write";
-          name: string;
-          writeKey: Uint8Array;
-      }
-    | {
-          type: "read";
-          name: string;
-          readKey: Uint8Array;
-      }
-    | {
-          type: "read-write";
-          name: string;
-          readKey: Uint8Array;
-          writeKey: Uint8Array;
-      };
-```
-
-The physical topic ID is:
+A friend request contains the sender profile, causal request identifier, and a
+random protected response address. It is identity-signed, sealed to the
+recipient, then published to:
 
 ```text
-base64url(SHA-256(canonical JSON(topic descriptor)))
+{ type: "read", name: "friend-requests", readKey: recipientIdentityKey }
 ```
 
-The descriptor is included in every signed event, so changing its type, name,
-or authorization keys produces both a different signature preimage and a
-different physical topic.
+The outer relay author is fresh and unlinkable. Responses use the same inner
+authentication and sealing and another fresh outer author.
 
-`Write Topic` requires the event author key to equal `writeKey`.
-`Read Topic` accepts any valid event author. `Read and Write Topic` enforces its
-`writeKey`.
+Accepted friends derive an encrypted `control` channel. Version-one frames are:
 
-## Relay events
+- profile update;
+- friendship ended;
+- KeyPackage announce;
+- KeyPackage request;
+- group invitation.
 
-```ts
-interface SignedRelayEvent {
-    version: 1;
-    id: string;
-    topic: RelayTopic;
-    author: {
-        signingKey: Uint8Array;
-    };
-    createdAt: number;
-    expiresAt?: number;
-    collapseKey?: Uint8Array;
-    payload: Uint8Array;
-    signature: Uint8Array;
-}
+Temporary control retention maps exactly to relay `expiresAt`; all other
+control events are durable.
+
+## KeyPackages and invitations
+
+Each friend pair maintains durable local private and remote public one-use
+KeyPackage pools. A remote package is moved to a consumed marker in the same
+transaction that stages an Add. A local bundle is consumed in the invitation
+adoption transaction.
+
+An invitation carries the group ID, opaque descriptor and random binding nonce,
+descriptor binding, stable topic secret, exact KeyPackage reference, Welcome,
+ratchet tree, and winning Commit sequence. It is encrypted and authenticated by
+the friend channel. There is no public join operation.
+
+## Group stream
+
+A one-member group and a many-member group are the same primitive. The
+descriptor and application bytes are opaque and retained even when the
+application does not understand them.
+
+Commits are durable MLS PublicMessages. Application events are durable MLS
+PrivateMessages. Murmur currently exposes no expiration or collapse option for
+MLS content, avoiding unsafe Secret Tree generation skips.
+
+Inbound application persistence is atomic across:
+
+```text
+post-open epoch + opaque event + authenticated sender + replay marker + cursor
 ```
 
-`id` encodes 32 random bytes. The signature covers every field except
-`signature`, after byte arrays are encoded as base64url.
+Inbound Commit persistence is atomic across:
+
+```text
+next epoch + membership + replay marker + cursor
+```
+
+Removed members keep the relay topic capability but not newer MLS epoch
+secrets. Their later injections cannot authenticate as current MLS content and
+are quarantined.
+
+## Relay envelope
+
+Relay event signatures use strict Ed25519 verification and cover canonical JSON
+containing the complete typed topic descriptor, event ID, author, creation time,
+optional expiration and collapse key, and opaque payload. Keys and ciphertext
+remain `Uint8Array` internally and use unpadded base64url only at JSON and
+storage boundaries. Secret capability keys never cross the relay boundary.
 
 For a new event the relay:
 
@@ -109,28 +115,10 @@ must carry an authenticated logical version in the opaque payload and reject
 regressions when applying events; the relay deliberately does not interpret
 that version.
 
-The relay's head sequence never decreases. Removed events therefore produce
-legal holes:
-
-```text
-stored sequences: 1, 2, 3, 4
-collapse 2 and expire 3
-retained:         1,       4
-head:                         4
-```
+The relay's head sequence never decreases. Expiration and collapse therefore
+produce legal sequence holes without reusing sequence numbers.
 
 ## Event pages
-
-```ts
-interface EventPage {
-    events: readonly {
-        seq: bigint;
-        event: SignedRelayEvent;
-    }[];
-    head: bigint;
-    exhausted: boolean;
-}
-```
 
 Events are ordered by sequence and strictly greater than the requested cursor.
 `exhausted` is computed from retained candidates before count and encoded-byte

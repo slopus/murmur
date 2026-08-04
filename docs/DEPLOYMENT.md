@@ -1,16 +1,20 @@
-# Deployment
+# Relay deployment
 
-The Murmur relay stores opaque signed topic state and serves or issues links for
-ciphertext blobs. It does not hold client identity secrets or plaintext, but it
-remains an availability and metadata boundary. Run it as a Node process, a
-standalone Bun executable, or the published Linux container.
+The Murmur relay is an ordered opaque event store. It persists signed events,
+publish receipts, protected-read challenges, and per-topic heads. It has no
+identity registry, application protocol, blob service, or plaintext.
 
-Node 22.5 or later is required for the source build. Bun is embedded in the
-standalone executable and release container.
+```text
+Murmur -- HTTPS --> relay -- SQLite file
+                            `-- or PostgreSQL
+```
 
-## Local run
+Node 22.5 or later is required for a source build. The release container embeds
+the Bun-built relay executable.
 
-Build and start the standalone relay:
+## Local process
+
+Build and run a single SQLite-backed relay:
 
 ```bash
 pnpm --filter @murmur/relay build
@@ -20,56 +24,39 @@ MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
 pnpm --filter @murmur/relay start
 ```
 
-Defaults are SQLite, `./data/murmur-relay.sqlite`, local blobs in
-`./data/blobs`, host `0.0.0.0`, and port `8787`. On startup the process runs a
-retention sweep, then repeats it hourly. It closes the HTTP server, blob
-backend, wake source, and store on `SIGINT` or `SIGTERM`.
+The defaults are `sqlite`, `./data/murmur-relay.sqlite`, host `0.0.0.0`, and
+port `8787`. The process prunes expired retained events hourly and closes the
+HTTP server, wake source, and store on `SIGINT` or `SIGTERM`.
 
-Point the CLI at it:
-
-```bash
-murmur sign-in --first-name Alice --relay http://127.0.0.1:8787
-```
-
-## Standalone Bun executable
-
-Bun 1.3.6 or later can compile the relay, its JavaScript dependencies, and the
-Bun runtime into one platform-specific executable:
+For PostgreSQL, set:
 
 ```bash
-pnpm --filter @murmur/relay build:binary
-./packages/murmur-relay/dist/murmur-relay
+MURMUR_RELAY_STORE=postgres \
+MURMUR_RELAY_DB=postgres://user:password@database/murmur \
+pnpm --filter @murmur/relay start
 ```
 
-The build-only adapter maps the relay's `node:sqlite` usage onto Bun's embedded
-SQLite implementation. It does not change the ordinary Node build. The same
-environment variables configure both executables.
+PostgreSQL supplies both durable storage and cross-process wake notifications.
+SQLite uses in-process wake notifications and therefore supports one relay
+process for a database file.
 
-To cross-compile, pass one of Bun's compile targets and a distinct output path:
+## Configuration
 
-```bash
-pnpm --filter @murmur/relay build:binary -- \
-    --target bun-linux-x64 \
-    --outfile dist/murmur-relay-linux-x64
-```
+| Variable             | Default                      | Meaning                                  |
+| -------------------- | ---------------------------- | ---------------------------------------- |
+| `HOST`               | `0.0.0.0`                    | HTTP listen host                         |
+| `PORT`               | `8787`                       | HTTP listen port                         |
+| `MURMUR_RELAY_STORE` | `sqlite`                     | `sqlite` or `postgres`                   |
+| `MURMUR_RELAY_DB`    | `./data/murmur-relay.sqlite` | SQLite path or PostgreSQL connection URL |
 
-The output embeds Bun and all bundled JavaScript, but it is not a fully
-statically linked binary: standard operating-system libraries remain dynamic.
-It also does not embed mutable state or configuration. The SQLite database,
-local blob directory, Postgres service, S3 service, secrets, and environment
-remain external.
+Terminate public TLS in front of the relay and preserve request bodies without
+rewriting them. The API routes are documented in
+[`RELAY_API.md`](RELAY_API.md).
 
-## Container image
+## Container
 
-Every version release publishes a multi-architecture image:
-
-```text
-ghcr.io/slopus/murmur-relay:<version>
-    +-- linux/amd64
-    `-- linux/arm64
-```
-
-Run the SQLite and local-blob configuration with a persistent named volume:
+The release image runs as UID/GID 65532 and stores its default SQLite database
+at `/data/murmur-relay.sqlite`:
 
 ```bash
 docker volume create murmur-relay-data
@@ -78,40 +65,27 @@ docker run --detach \
     --restart unless-stopped \
     --publish 8787:8787 \
     --volume murmur-relay-data:/data \
-    --env MURMUR_RELAY_BLOB_SECRET="<stable-secret-at-least-32-characters>" \
     ghcr.io/slopus/murmur-relay:latest
 ```
 
-The image runs as UID/GID 65532 and writes the SQLite database and local blobs
-under `/data`. A bind mount must be writable by that identity. The image does
-not terminate TLS; put it behind an HTTPS reverse proxy for public access.
+The image exposes `/health` for startup, readiness, and liveness probes. A bind
+mount must be writable by UID/GID 65532.
 
 ## k3s
 
-[`murmur-relay.k3s.yaml`](../murmur-relay.k3s.yaml) deploys the released
-multi-architecture image in Kubernetes' `default` namespace. It uses k3s's
-default `local-path` StorageClass, one 10 GiB persistent volume, one SQLite
-relay replica, health probes, resource bounds, and a restricted container
-security context.
-
-Create the stable blob-link secret once in the `default` namespace:
+[`murmur-relay.k3s.yaml`](../murmur-relay.k3s.yaml) runs one SQLite replica with
+a `ReadWriteOnce` persistent volume and a `Recreate` strategy:
 
 ```bash
-MURMUR_K3S_BLOB_SECRET="$(openssl rand -base64 48)"
-kubectl --namespace default create secret generic murmur-relay-secrets \
-    --from-literal=blob-secret="$MURMUR_K3S_BLOB_SECRET"
-unset MURMUR_K3S_BLOB_SECRET
+kubectl apply -f murmur-relay.k3s.yaml
+kubectl rollout status deployment/murmur-relay
 ```
 
-Do not recreate that secret during ordinary upgrades: rotating it immediately
-invalidates every outstanding local blob-transfer link. Deploy and wait for
-readiness:
+Pin the manifest image tag and digest to a reviewed release before production.
+Use PostgreSQL and a deployment configured with `MURMUR_RELAY_STORE=postgres`
+when multiple relay replicas are required.
 
-```bash
-kubectl apply --filename=murmur-relay.k3s.yaml
-kubectl --namespace default rollout status deployment/murmur-relay
-kubectl --namespace default get pods,persistentvolumeclaims,services
-```
+## Operations
 
 The manifest intentionally creates a ClusterIP service. For a quick local
 check:
@@ -292,3 +266,15 @@ Before exposing a public service, also decide how to manage backups, database
 credentials, S3 credentials, TLS, reverse-proxy limits, monitoring, incident
 response, and retention requirements. Murmur does not provide those operating
 procedures.
+
+## Durable operations
+
+- Back up the SQLite file or PostgreSQL database using ordinary database tools.
+- Monitor `/health`, HTTP error rates, retained event volume, and disk usage.
+- Keep the relay clock synchronized because event creation and expiration
+  validation uses Unix milliseconds.
+- Preserve publish receipts when pruning expired event bodies; exact retries
+  depend on those receipts remaining durable.
+- Treat database disclosure as metadata and ciphertext disclosure. Relay
+  compromise cannot decrypt Murmur payloads but can affect availability,
+  ordering, retention, and traffic analysis.

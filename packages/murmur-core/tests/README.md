@@ -9,5 +9,6 @@ built package exports
     `-- bundled by esbuild for a browser
 ```
 
-The compatibility test covers every public ESM subpath, including the MLS
-implementation copied into the published package during the build.
+The package test proves that the root contains only the facade runtime exports
+and bundles for browsers without Node imports. MLS is compiled internally and
+has no package subpath.

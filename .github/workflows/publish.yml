@@ -171,7 +171,7 @@ jobs:
                           "- npm: \`pnpm add @slopus/murmur@$release_version\`" \
                           "- container: \`ghcr.io/slopus/murmur-relay:$release_version\`" \
                           "- container platforms: Linux amd64 and arm64" \
-                          "The npm package includes identities, encrypted direct messages and files, durable relay synchronization, MLS groups, and shared text. The container includes the standalone Bun relay with an SBOM and provenance."
+                          "The npm package includes stateful friend bootstrap, automatic relay convergence, and opaque MLS group event streams. The container includes the standalone ordered-event relay with an SBOM and provenance."
                       gh release create "$GITHUB_REF_NAME" \
                           --verify-tag \
                           --title "Murmur $GITHUB_REF_NAME" \

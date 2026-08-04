@@ -1,14 +1,15 @@
 # Sources
 
-Public exports start in `index.ts`. Each directory owns one domain; secondary
-encoding and cryptographic mechanics live below that domain in `impl`.
-
 ```text
-index.ts
-  |-- client
-  |-- crypto
-  |-- directChat
-  |-- identity
-  |-- storage
-  `-- transport
+index.ts        public root export
+murmur/         stateful facade and synchronization
+identity/       one-key identity and friend bootstrap/control
+mls/            internal RFC 9420 / TreeKEM subset
+crypto/         Noble-based identity and sealed boxes
+transport/      browser-safe HTTP relay wire implementation
+storage/        application persistence boundary
+utils/          strict byte and JSON helpers
 ```
+
+Only `index.ts` is exported by the package. Other modules are internal
+implementation boundaries compiled once into `@slopus/murmur`.

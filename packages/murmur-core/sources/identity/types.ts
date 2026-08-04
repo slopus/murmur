@@ -3,8 +3,11 @@ import type { StoreTransaction } from "../storage/index.js";
 
 /** Small authenticated profile controlled by its identity. */
 export interface IdentityProfile {
+    /** Human-readable display name. */
     readonly name: string;
+    /** Optional opaque avatar bytes. */
     readonly avatar?: Uint8Array;
+    /** Optional application-defined string metadata. */
     readonly metadata?: Readonly<Record<string, string>>;
 }
 

@@ -1,11 +1,10 @@
 {
     "name": "@slopus/murmur",
     "version": "0.1.13",
-    "description": "Stateful end-to-end encrypted communication over a dumb relay",
+    "description": "Stateful encrypted friend bootstrap and opaque MLS event streams",
     "keywords": [
-        "encrypted-messaging",
+        "encrypted-events",
         "end-to-end-encryption",
-        "messaging",
         "mls",
         "relay",
         "typescript"
@@ -36,42 +35,6 @@
             "types": "./dist/index.d.ts",
             "import": "./dist/index.js"
         },
-        "./client": {
-            "types": "./dist/client/index.d.ts",
-            "import": "./dist/client/index.js"
-        },
-        "./crypto": {
-            "types": "./dist/crypto/index.d.ts",
-            "import": "./dist/crypto/index.js"
-        },
-        "./document": {
-            "types": "./dist/document/index.d.ts",
-            "import": "./dist/document/index.js"
-        },
-        "./identity": {
-            "types": "./dist/identity/index.d.ts",
-            "import": "./dist/identity/index.js"
-        },
-        "./mls": {
-            "types": "./dist/mls/index.d.ts",
-            "import": "./dist/mls/index.js"
-        },
-        "./sharedSession": {
-            "types": "./dist/mls/sharedSession/index.d.ts",
-            "import": "./dist/mls/sharedSession/index.js"
-        },
-        "./storage": {
-            "types": "./dist/storage/index.d.ts",
-            "import": "./dist/storage/index.js"
-        },
-        "./transport": {
-            "types": "./dist/transport/index.d.ts",
-            "import": "./dist/transport/index.js"
-        },
-        "./utils": {
-            "types": "./dist/utils/index.d.ts",
-            "import": "./dist/utils/index.js"
-        },
         "./package.json": "./package.json"
     },
     "publishConfig": {
@@ -80,11 +43,11 @@
     },
     "scripts": {
         "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
-        "build": "pnpm run clean && tsc -p tsconfig.build.json && pnpm --dir ../murmur-mls build && node --input-type=module -e \"import { cpSync } from 'node:fs'; cpSync('../murmur-mls/dist', 'dist/mls', { recursive: true });\"",
+        "build": "pnpm run clean && tsc -p tsconfig.build.json",
         "check": "tsc --noEmit -p tsconfig.json",
         "test": "vitest run",
         "test:watch": "vitest",
-        "prepack": "pnpm run check && pnpm run build && pnpm run test && pnpm --filter @murmur/mls test"
+        "prepack": "pnpm run check && pnpm run build && pnpm run test"
     },
     "dependencies": {
         "@noble/ciphers": "^1.2.1",
@@ -92,6 +55,7 @@
         "@noble/hashes": "^1.7.1"
     },
     "devDependencies": {
+        "@murmur/relay": "workspace:*",
         "esbuild": "^0.28.1",
         "typescript": "^5.9.3",
         "vitest": "^3.2.7"
