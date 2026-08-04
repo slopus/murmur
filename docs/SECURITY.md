@@ -234,7 +234,8 @@ plaintext, or epoch secrets.
   commit atomically.
 - Relay order, not publish return order, chooses concurrent Commit winners.
 - Invalid retained events cannot permanently stall a topic.
-- `close()` and `destroy()` zero live identity, topic, and epoch secrets.
+- awaited `close()` and `destroy()` abort convergence, await serialized active
+  work, then zero live identity, topic, and epoch secrets.
 
 ## Limits
 

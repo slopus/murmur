@@ -14,7 +14,10 @@ export type FriendControlFrame =
           readonly reference: Uint8Array;
           readonly keyPackage: Uint8Array;
       }
-    | { readonly type: "key-package-request" }
+    | {
+          readonly type: "key-package-request";
+          readonly consumedReferences: readonly Uint8Array[];
+      }
     | {
           readonly type: "group-invitation";
           readonly groupId: Uint8Array;
@@ -26,6 +29,8 @@ export type FriendControlFrame =
           readonly welcome: Uint8Array;
           readonly tree: Uint8Array;
           readonly commitSequence: bigint;
+          readonly commitEventId: string;
+          readonly commitFingerprint: Uint8Array;
       };
 
 function nullable(value: Uint8Array | undefined): string | null {
@@ -36,6 +41,20 @@ function nullable(value: Uint8Array | undefined): string | null {
 export function encodeFriendControlFrame(frame: FriendControlFrame): Uint8Array {
     let profile: Uint8Array | undefined;
     try {
+        if (
+            frame.type === "key-package-request" &&
+            (frame.consumedReferences.length > 64 ||
+                new Set(frame.consumedReferences.map(encodeBase64Url)).size !==
+                    frame.consumedReferences.length)
+        ) {
+            throw new Error("Invalid consumed KeyPackage references");
+        }
+        if (
+            frame.type === "group-invitation" &&
+            encodeBase64Url(bytes(frame.commitEventId, 32, 32)) !== frame.commitEventId
+        ) {
+            throw new Error("Invalid invitation Commit event ID");
+        }
         profile = frame.type === "profile-update" ? encodeProfilePayload(frame.profile) : undefined;
         const encoded = utf8Encode(
             JSON.stringify({
@@ -48,6 +67,10 @@ export function encodeFriendControlFrame(frame: FriendControlFrame): Uint8Array 
                 keyPackage:
                     frame.type === "key-package-announce"
                         ? encodeBase64Url(frame.keyPackage)
+                        : null,
+                consumedReferences:
+                    frame.type === "key-package-request"
+                        ? frame.consumedReferences.map(encodeBase64Url)
                         : null,
                 groupId: frame.type === "group-invitation" ? encodeBase64Url(frame.groupId) : null,
                 descriptor:
@@ -70,6 +93,11 @@ export function encodeFriendControlFrame(frame: FriendControlFrame): Uint8Array 
                 tree: frame.type === "group-invitation" ? encodeBase64Url(frame.tree) : null,
                 commitSequence:
                     frame.type === "group-invitation" ? frame.commitSequence.toString() : null,
+                commitEventId: frame.type === "group-invitation" ? frame.commitEventId : null,
+                commitFingerprint:
+                    frame.type === "group-invitation"
+                        ? encodeBase64Url(frame.commitFingerprint)
+                        : null,
             }),
         );
         if (encoded.length > MAXIMUM_CONTROL_FRAME_BYTES) {
@@ -93,6 +121,7 @@ function object(value: unknown): Record<string, unknown> {
         "requestId",
         "reference",
         "keyPackage",
+        "consumedReferences",
         "groupId",
         "descriptor",
         "descriptorNonce",
@@ -102,6 +131,8 @@ function object(value: unknown): Record<string, unknown> {
         "welcome",
         "tree",
         "commitSequence",
+        "commitEventId",
+        "commitFingerprint",
     ];
     if (
         Object.keys(result).length !== fields.length ||
@@ -167,8 +198,19 @@ export function decodeFriendControlFrame(encoded: Uint8Array): FriendControlFram
             keyPackage: bytes(value.keyPackage, MAXIMUM_MLS_MATERIAL_BYTES),
         };
     }
-    if (value.type === "key-package-request" && allNull(value, [])) {
-        return { type: "key-package-request" };
+    if (
+        value.type === "key-package-request" &&
+        allNull(value, ["consumedReferences"]) &&
+        Array.isArray(value.consumedReferences) &&
+        value.consumedReferences.length <= 64
+    ) {
+        const consumedReferences = value.consumedReferences.map((reference) =>
+            bytes(reference, 32, 32),
+        );
+        if (new Set(consumedReferences.map(encodeBase64Url)).size !== consumedReferences.length) {
+            throw new Error("Duplicate consumed KeyPackage reference");
+        }
+        return { type: "key-package-request", consumedReferences };
     }
     if (
         value.type === "group-invitation" &&
@@ -182,9 +224,12 @@ export function decodeFriendControlFrame(encoded: Uint8Array): FriendControlFram
             "welcome",
             "tree",
             "commitSequence",
+            "commitEventId",
+            "commitFingerprint",
         ]) &&
         typeof value.commitSequence === "string" &&
-        /^[1-9]\d*$/.test(value.commitSequence)
+        /^[1-9]\d*$/.test(value.commitSequence) &&
+        typeof value.commitEventId === "string"
     ) {
         const commitSequence = BigInt(value.commitSequence);
         if (commitSequence > 0xffff_ffff_ffff_ffffn) {
@@ -201,6 +246,8 @@ export function decodeFriendControlFrame(encoded: Uint8Array): FriendControlFram
             welcome: bytes(value.welcome, MAXIMUM_MLS_MATERIAL_BYTES),
             tree: bytes(value.tree, MAXIMUM_MLS_MATERIAL_BYTES),
             commitSequence,
+            commitEventId: encodeBase64Url(bytes(value.commitEventId, 32, 32)),
+            commitFingerprint: bytes(value.commitFingerprint, 32, 32),
         };
     }
     throw new Error("Unsupported friend-control frame");

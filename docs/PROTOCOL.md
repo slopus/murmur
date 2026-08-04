@@ -35,12 +35,16 @@ control events are durable.
 Each friend pair maintains durable local private and remote public one-use
 KeyPackage pools. A remote package is moved to a consumed marker in the same
 transaction that stages an Add. A local bundle is consumed in the invitation
-adoption transaction.
+adoption transaction. Package lifetime is checked against the signed relay
+event creation time when an Add is created or admitted; delayed processing does
+not reinterpret a previously valid Commit using wall-clock time.
 
 An invitation carries the group ID, opaque descriptor and random binding nonce,
 descriptor binding, stable topic secret, exact KeyPackage reference, Welcome,
-ratchet tree, and winning Commit sequence. It is encrypted and authenticated by
-the friend channel. There is no public join operation.
+ratchet tree, winning Commit sequence, exact Commit event ID, and Commit
+fingerprint. The recipient reads and verifies that retained group event before
+installing any cursor or group state. The invitation is encrypted and
+authenticated by the friend channel. There is no public join operation.
 
 ## Group stream
 

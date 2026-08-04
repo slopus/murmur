@@ -36,10 +36,12 @@ content authenticates the Murmur or MLS sender.
 
 ## Synchronization
 
-`sync()` restores and retries exact outboxes, catches up all discovered topics,
-processes retained events in sequence, replenishes KeyPackages, prepares queued
-operations, reads echoes, and repeats to a bounded quiescent state. A newly
-accepted friend or invitation contributes its topics on the next internal pass.
+`Murmur.open()` starts an internal convergence worker. Local mutations wake it;
+failures back off without discarding durable work. Each pass restores and
+retries exact outboxes, catches up all discovered topics, processes retained
+events in sequence, replenishes KeyPackages, prepares queued operations, reads
+echoes, and repeats to a bounded quiescent state. `sync()` is an optional
+explicit observation/test boundary, not required caller choreography.
 
 Relay cursors advance in the same application-store transaction as the effect
 of an inbound event. Invalid, stale, unsupported, removed-member, and
@@ -62,9 +64,10 @@ lower relay sequence
 ```
 
 Only a winning Add queues its private friend-channel invitation. The recipient
-atomically consumes the matching private KeyPackage bundle, installs the
-Welcome epoch and stable topic capability, records the invitation replay
-marker, and starts its group cursor after the winning Commit.
+first verifies the invitation's Commit event ID and fingerprint at the claimed
+group sequence, then atomically consumes the matching private KeyPackage
+bundle, installs the Welcome epoch and stable topic capability, records the
+invitation replay marker, and starts its group cursor after that exact Commit.
 
 ## Relay storage
 

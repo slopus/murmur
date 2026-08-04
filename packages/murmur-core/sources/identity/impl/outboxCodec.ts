@@ -33,7 +33,7 @@ function validateId(id: string): void {
     }
 }
 
-/** Validate a transport-neutral destination address. */
+/** Validate a strict opaque relay destination address. */
 export function validateFriendDestination(destination: string): void {
     const bytes = utf8Encode(destination).length;
     if (bytes === 0 || bytes > 4096) {
@@ -100,7 +100,7 @@ export function copyFriendOutboxItem(item: FriendOutboxItem): FriendOutboxItem {
     };
 }
 
-/** Encode one exact transport-neutral outbox item. */
+/** Encode one exact relay-addressed semantic outbox item. */
 export function encodeFriendOutboxItem(item: FriendOutboxItem): Uint8Array {
     validateId(item.id);
     validateFriendDestination(item.destination);

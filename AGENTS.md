@@ -72,7 +72,7 @@ predate it and are not to be reorganized unless the user asks.
 - Run `pnpm format` before every commit and include all of its output in the
   commit, including changes to files in `master-plans`.
 - Always commit and push changes when done.
-- Use Angular-style commit messages (e.g., `feat(cli): add webhook sync`).
+- Use Angular-style commit messages (e.g., `feat(core): add durable group sync`).
 
 ## Key Conventions
 

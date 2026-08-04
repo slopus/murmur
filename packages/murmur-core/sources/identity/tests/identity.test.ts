@@ -60,6 +60,13 @@ class FailingOutboxStore implements MurmurStore {
         return this.#memory.list(prefix);
     }
 
+    scan(
+        prefix: string,
+        options: { readonly after?: string; readonly limit: number },
+    ): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#memory.scan(prefix, options);
+    }
+
     transaction<Result>(
         operation: (transaction: StoreTransaction) => Promise<Result>,
     ): Promise<Result> {
@@ -390,7 +397,7 @@ describe("durable friendship lifecycle and outbox", () => {
         );
     });
 
-    it("ends pending outgoing durably and treats a late valid response as terminal replay", async () => {
+    it("ends pending outgoing with request plus terminal intent and treats a late response as replay", async () => {
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
         const store = new MemoryMurmurStore();
@@ -407,7 +414,26 @@ describe("durable friendship lifecycle and outbox", () => {
         }
 
         await friends.end(bob, 11);
-        expect(await friends.listOutbox()).toEqual([]);
+        const terminalOutbox = await friends.listOutbox();
+        expect(terminalOutbox.map((item) => item.kind).sort()).toEqual([
+            "control-intent",
+            "request",
+        ]);
+        expect(terminalOutbox).toContainEqual(
+            expect.objectContaining({
+                kind: "request",
+                id: pending.requestId,
+            }),
+        );
+        expect(terminalOutbox).toContainEqual(
+            expect.objectContaining({
+                kind: "control-intent",
+                intent: {
+                    type: "friendship-ended",
+                    requestId: pending.requestId,
+                },
+            }),
+        );
         expect((await new FriendBook(alice, store).get(bob))?.status).toBe("ended");
 
         const late = createFriendResponse(bob, alice, {

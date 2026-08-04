@@ -30,12 +30,14 @@ const murmur = await Murmur.open({
 });
 
 await murmur.friends.request(bobIdentityKey);
-await murmur.sync();
 
 const groupId = await murmur.groups.create(applicationDescriptor, [bobIdentityKey]);
-await murmur.sync();
 await murmur.groups.send(groupId, applicationBytes);
-await murmur.sync();
+
+// Optional when the application needs an explicit observed boundary:
+await murmur.sync({ waitMilliseconds: 5_000 });
+
+await murmur.close();
 ```
 
 `MemoryMurmurStore` is for tests and examples. Production applications provide
@@ -44,6 +46,10 @@ a durable `MurmurStore` whose transaction callback is genuinely atomic.
 The published package has one import path: `@slopus/murmur`. Relay topics,
 cursors, Welcome messages, KeyPackages, epoch checkpoints, and publish/adopt
 choreography are internal.
+
+`Murmur.open()` starts an internal convergence worker. Mutations wake it and
+durable failures are retried with backoff; `sync()` remains available for
+tests, shutdown coordination, or an application-requested observation point.
 
 > Murmur is a `0.x` project and has not received an independent security audit.
 > Its MLS code is a tested RFC 9420 subset, not a complete interoperable MLS

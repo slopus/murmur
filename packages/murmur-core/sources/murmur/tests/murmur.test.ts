@@ -1,10 +1,28 @@
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@murmur/relay";
 import { describe, expect, it } from "vitest";
+import {
+    decodeIdentityRoot,
+    destroyIdentity,
+    type IdentityKeyPair,
+    type IdentityPublicKey,
+} from "../../crypto/index.js";
+import { FriendChannel, identityId, type FriendControlEnvelope } from "../../identity/index.js";
+import {
+    createMlsKeyPackage,
+    destroyMlsKeyPackageBundle,
+    encodeMlsKeyPackage,
+    mlsKeyPackageReference,
+} from "../../mls/index.js";
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
-import type { RelayFetch } from "../../transport/index.js";
-import { utf8Decode, utf8Encode } from "../../utils/index.js";
-import { decodeGroup } from "../impl/stateCodec.js";
-import { createCapabilityEvent, groupAccess } from "../impl/topics.js";
+import {
+    decodeSignedRelayEventWire,
+    encodeSignedRelayEventWire,
+    type RelayFetch,
+} from "../../transport/index.js";
+import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
+import { decodeFriendControlFrame, encodeFriendControlFrame } from "../impl/controlCodec.js";
+import { decodeGroup, encodeGroupEvent } from "../impl/stateCodec.js";
+import { createCapabilityEvent, friendControlAccess, groupAccess } from "../impl/topics.js";
 import { Murmur } from "../index.js";
 
 function inProcessFetch(relay: RelayService): RelayFetch {
@@ -17,6 +35,71 @@ async function converge(peers: readonly Murmur[], rounds: number = 4): Promise<v
         for (const peer of peers) {
             await peer.sync();
         }
+    }
+}
+
+async function waitFor(
+    predicate: () => Promise<boolean>,
+    timeoutMilliseconds: number = 5_000,
+): Promise<void> {
+    const deadline = Date.now() + timeoutMilliseconds;
+    while (!(await predicate())) {
+        if (Date.now() >= deadline) {
+            throw new Error("Timed out waiting for autonomous Murmur convergence");
+        }
+        await new Promise<void>((resolve) => {
+            setTimeout(resolve, 25);
+        });
+    }
+}
+
+class ProbeStore implements MurmurStore {
+    readonly #inner: MurmurStore;
+    readonly scans: {
+        readonly prefix: string;
+        readonly limit: number;
+        readonly returned: number;
+    }[] = [];
+    readonly lists: string[] = [];
+
+    constructor(inner: MurmurStore) {
+        this.#inner = inner;
+    }
+
+    get(key: string): Promise<Uint8Array | undefined> {
+        return this.#inner.get(key);
+    }
+
+    set(key: string, value: Uint8Array): Promise<void> {
+        return this.#inner.set(key, value);
+    }
+
+    delete(key: string): Promise<void> {
+        return this.#inner.delete(key);
+    }
+
+    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+        this.lists.push(prefix);
+        return this.#inner.list(prefix);
+    }
+
+    async scan(
+        prefix: string,
+        options: { readonly after?: string; readonly limit: number },
+    ): Promise<ReadonlyMap<string, Uint8Array>> {
+        const result = await this.#inner.scan(prefix, options);
+        this.scans.push({
+            prefix,
+            limit: options.limit,
+            returned: result.size,
+        });
+        return result;
+    }
+
+    transaction<Result>(
+        operation: (transaction: StoreTransaction) => Promise<Result>,
+    ): Promise<Result> {
+        return this.#inner.transaction(operation);
     }
 }
 
@@ -44,6 +127,13 @@ class TransactionFaultStore implements MurmurStore {
         return this.#inner.list(prefix);
     }
 
+    async scan(
+        prefix: string,
+        options: { readonly after?: string; readonly limit: number },
+    ): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#inner.scan(prefix, options);
+    }
+
     async transaction<Result>(
         operation: (transaction: StoreTransaction) => Promise<Result>,
     ): Promise<Result> {
@@ -61,6 +151,8 @@ class TransactionFaultStore implements MurmurStore {
                 },
                 list: async (prefix): Promise<ReadonlyMap<string, Uint8Array>> =>
                     transaction.list(prefix),
+                scan: async (prefix, options): Promise<ReadonlyMap<string, Uint8Array>> =>
+                    transaction.scan(prefix, options),
             };
             const result = await operation(observed);
             if (this.#failurePredicate?.(changedKeys) === true) {
@@ -86,7 +178,7 @@ describe("stateful Murmur facade", () => {
             fetch,
         });
         const originalAliceKey = alice.identityKey;
-        alice.close();
+        await alice.close();
         alice = await Murmur.open({
             relay: "https://relay.test",
             store: aliceStore,
@@ -154,7 +246,7 @@ describe("stateful Murmur facade", () => {
                 "opaque from Bob",
             ]);
 
-            bob.close();
+            await bob.close();
             await alice.groups.send(groupId, utf8Encode("while Bob is offline"));
             await converge([alice], 4);
             bob = await Murmur.open({
@@ -205,7 +297,7 @@ describe("stateful Murmur facade", () => {
                 (await charlie.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
             ).not.toContain("after removal");
 
-            alice.close();
+            await alice.close();
             alice = await Murmur.open({
                 relay: "https://relay.test",
                 store: aliceStore,
@@ -219,9 +311,7 @@ describe("stateful Murmur facade", () => {
             await converge([bob, alice]);
             expect((await alice.friends.get(bob.identityKey))?.status).toBe("ended");
         } finally {
-            alice.close();
-            bob.close();
-            charlie.close();
+            await Promise.all([alice.close(), bob.close(), charlie.close()]);
             await relay.close();
         }
     }, 30_000);
@@ -268,8 +358,7 @@ describe("stateful Murmur facade", () => {
             await bob.sync();
             expect((await bob.friends.get(alice.identityKey))?.status).toBe("pending-incoming");
         } finally {
-            alice.close();
-            bob.close();
+            await Promise.all([alice.close(), bob.close()]);
             await relay.close();
         }
     });
@@ -301,8 +390,7 @@ describe("stateful Murmur facade", () => {
             expect((await alice.friends.get(bob.identityKey))?.status).toBe("ended");
             expect((await bob.friends.get(alice.identityKey))?.status).toBe("ended");
         } finally {
-            alice.close();
-            bob.close();
+            await Promise.all([alice.close(), bob.close()]);
             await relay.close();
         }
     });
@@ -357,8 +445,7 @@ describe("stateful Murmur facade", () => {
                 (await bob.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
             ).toEqual(["survives rollback"]);
         } finally {
-            alice.close();
-            bob.close();
+            await Promise.all([alice.close(), bob.close()]);
             await relay.close();
         }
     }, 30_000);
@@ -398,8 +485,536 @@ describe("stateful Murmur facade", () => {
                 (await alice.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
             ).toEqual(["valid after invalid"]);
         } finally {
-            alice.close();
+            await alice.close();
             await relay.close();
         }
     });
+
+    it("converges without caller-driven sync and closes after active publication", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const handler = createRelayFetchHandler(relay);
+        let publicationStarted: (() => void) | undefined;
+        let releasePublication: (() => void) | undefined;
+        const started = new Promise<void>((resolve) => {
+            publicationStarted = resolve;
+        });
+        const gate = new Promise<void>((resolve) => {
+            releasePublication = resolve;
+        });
+        let gateNextPublication = false;
+        const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+            const request = new Request(input, init);
+            if (
+                gateNextPublication &&
+                request.method === "POST" &&
+                new URL(request.url).pathname === "/v1/events"
+            ) {
+                gateNextPublication = false;
+                publicationStarted?.();
+                await gate;
+            }
+            return handler(request);
+        };
+        const alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Alice" },
+            fetch: aliceFetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Bob" },
+            fetch: inProcessFetch(relay),
+        });
+        try {
+            await alice.friends.request(bob.identityKey);
+            await waitFor(
+                async () =>
+                    (await bob.friends.get(alice.identityKey))?.status === "pending-incoming",
+            );
+            await bob.friends.accept(alice.identityKey);
+            await waitFor(
+                async () => (await alice.friends.get(bob.identityKey))?.status === "active",
+            );
+
+            gateNextPublication = true;
+            await alice.setProfile({ name: "Alice gated" });
+            await started;
+            let closed = false;
+            const closing = alice.close().then(() => {
+                closed = true;
+            });
+            await Promise.resolve();
+            expect(closed).toBe(false);
+            releasePublication?.();
+            await closing;
+            expect(closed).toBe(true);
+            expect(() => alice.identityKey).toThrow("Murmur is closed");
+        } finally {
+            releasePublication?.();
+            await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 15_000);
+
+    it("delivers a terminal intent after an ambiguous pending request and restart", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const handler = createRelayFetchHandler(relay);
+        let throwAfterAcceptance = true;
+        const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+            const request = new Request(input, init);
+            const response = await handler(request);
+            if (
+                throwAfterAcceptance &&
+                response.ok &&
+                request.method === "POST" &&
+                new URL(request.url).pathname === "/v1/events"
+            ) {
+                throwAfterAcceptance = false;
+                throw new Error("ambiguous request acceptance");
+            }
+            return response;
+        };
+        const aliceStore = new MemoryMurmurStore();
+        let alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: aliceStore,
+            initialProfile: { name: "Alice" },
+            fetch: aliceFetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Bob" },
+            fetch: inProcessFetch(relay),
+        });
+        try {
+            await alice.friends.request(bob.identityKey);
+            await expect(alice.sync()).rejects.toThrow("ambiguous request acceptance");
+            await alice.friends.end(bob.identityKey);
+            await alice.close();
+            alice = await Murmur.open({
+                relay: "https://relay.test",
+                store: aliceStore,
+                fetch: aliceFetch,
+            });
+            await converge([alice, bob], 8);
+            expect((await alice.friends.get(bob.identityKey))?.status).toBe("ended");
+            expect((await bob.friends.get(alice.identityKey))?.status).toBe("ended");
+        } finally {
+            await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 15_000);
+
+    it("preserves causal successor requests regardless of old-end topic order", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const fetch = inProcessFetch(relay);
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        let alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: aliceStore,
+            initialProfile: { name: "Alice" },
+            fetch,
+        });
+        let bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: bobStore,
+            initialProfile: { name: "Bob" },
+            fetch,
+        });
+        try {
+            await alice.friends.request(bob.identityKey);
+            await converge([alice, bob]);
+            await bob.friends.accept(alice.identityKey);
+            await converge([bob, alice], 6);
+
+            for (let iteration = 0; iteration < 6; iteration += 1) {
+                await alice.friends.end(bob.identityKey);
+                await alice.friends.request(bob.identityKey);
+                if (iteration % 2 === 0) {
+                    await bob.close();
+                    bob = await Murmur.open({
+                        relay: "https://relay.test",
+                        store: bobStore,
+                        fetch,
+                    });
+                }
+                await converge([alice, bob], 8);
+                expect((await bob.friends.get(alice.identityKey))?.status).toBe("pending-incoming");
+                await bob.friends.accept(alice.identityKey);
+                await converge([bob, alice], 6);
+                expect((await alice.friends.get(bob.identityKey))?.status).toBe("active");
+                expect((await bob.friends.get(alice.identityKey))?.status).toBe("active");
+            }
+        } finally {
+            await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 30_000);
+
+    it("catches up a winning removal before publishing an old-epoch send", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const handler = createRelayFetchHandler(relay);
+        let blockAliceGroupPublication = false;
+        const blockedBodies: string[] = [];
+        const acceptedBodies: string[] = [];
+        const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+            const request = new Request(input, init);
+            if (request.method === "POST" && new URL(request.url).pathname === "/v1/events") {
+                const body = await request.clone().text();
+                const wire = JSON.parse(body) as { readonly topic?: { readonly name?: unknown } };
+                if (wire.topic?.name === "group-events") {
+                    if (blockAliceGroupPublication) {
+                        blockedBodies.push(body);
+                        throw new Error("blocked old-epoch group publication");
+                    }
+                    acceptedBodies.push(body);
+                }
+            }
+            return handler(request);
+        };
+        const sharedFetch = inProcessFetch(relay);
+        const alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Alice" },
+            fetch: aliceFetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Bob" },
+            fetch: sharedFetch,
+        });
+        const charlie = await Murmur.open({
+            relay: "https://relay.test",
+            store: new MemoryMurmurStore(),
+            initialProfile: { name: "Charlie" },
+            fetch: sharedFetch,
+        });
+        try {
+            await alice.friends.request(bob.identityKey);
+            await alice.friends.request(charlie.identityKey);
+            await converge([alice, bob, charlie]);
+            await bob.friends.accept(alice.identityKey);
+            await charlie.friends.accept(alice.identityKey);
+            await converge([bob, charlie, alice], 8);
+            const groupId = await alice.groups.create(utf8Encode("removal race"), [
+                bob.identityKey,
+                charlie.identityKey,
+            ]);
+            await converge([alice, bob, charlie], 14);
+
+            acceptedBodies.length = 0;
+            blockAliceGroupPublication = true;
+            await alice.groups.send(groupId, utf8Encode("must be resealed"));
+            await expect(alice.sync()).rejects.toThrow("blocked old-epoch group publication");
+            expect(blockedBodies).toHaveLength(1);
+
+            await bob.groups.remove(groupId, charlie.identityKey);
+            await converge([bob], 6);
+            blockAliceGroupPublication = false;
+            await converge([alice, bob, charlie], 10);
+
+            expect(acceptedBodies).toHaveLength(1);
+            expect(acceptedBodies[0]).not.toBe(blockedBodies[0]);
+            expect(
+                (await bob.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).toContain("must be resealed");
+            expect((await charlie.groups.get(groupId))?.group.status).toBe("removed");
+            expect(
+                (await charlie.groups.get(groupId))?.events.map((event) => utf8Decode(event.bytes)),
+            ).not.toContain("must be resealed");
+        } finally {
+            blockAliceGroupPublication = false;
+            await Promise.all([alice.close(), bob.close(), charlie.close()]);
+            await relay.close();
+        }
+    }, 40_000);
+
+    it("opens from a metadata index and paginates O(limit) retained events", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const fetch = inProcessFetch(relay);
+        const memory = new MemoryMurmurStore();
+        const first = await Murmur.open({
+            relay: "https://relay.test",
+            store: memory,
+            initialProfile: { name: "Alice" },
+            fetch,
+        });
+        const groupId = await first.groups.create(utf8Encode("large history"));
+        await first.close();
+        const encodedGroupId = encodeBase64Url(groupId);
+        await memory.transaction(async (transaction) => {
+            for (let sequence = 1n; sequence <= 2_500n; sequence += 1n) {
+                await transaction.set(
+                    `murmur/v1/groups/${encodedGroupId}/events/${sequence
+                        .toString()
+                        .padStart(20, "0")}`,
+                    encodeGroupEvent({
+                        sequence,
+                        sender: new Uint8Array(32),
+                        bytes: utf8Encode(`event-${sequence}`),
+                    }),
+                );
+            }
+        });
+        const probe = new ProbeStore(memory);
+        const reopened = await Murmur.open({
+            relay: "https://relay.test",
+            store: probe,
+            fetch,
+        });
+        try {
+            expect(
+                probe.lists.some((prefix) => prefix.includes(`/groups/${encodedGroupId}/events/`)),
+            ).toBe(false);
+            const page = await reopened.groups.get(groupId, { limit: 7 });
+            expect(page?.events).toHaveLength(7);
+            expect(page?.nextAfter).toBe(7n);
+            expect(
+                probe.scans.find((scan) =>
+                    scan.prefix.includes(`/groups/${encodedGroupId}/events/`),
+                ),
+            ).toEqual({
+                prefix: `murmur/v1/groups/${encodedGroupId}/events/`,
+                limit: 8,
+                returned: 8,
+            });
+        } finally {
+            await reopened.close();
+            await relay.close();
+        }
+    }, 15_000);
+
+    it("rejects invitation cursor and fingerprint tampering without poisoning later adoption", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const handler = createRelayFetchHandler(relay);
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        let aliceRoot: IdentityKeyPair | undefined;
+        let bobRoot: IdentityKeyPair | undefined;
+        let tamper: "cursor" | "fingerprint" | undefined;
+        let tampered = 0;
+        const tamperedDescriptors: string[] = [];
+        const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+            const request = new Request(input, init);
+            if (
+                tamper === undefined ||
+                request.method !== "POST" ||
+                new URL(request.url).pathname !== "/v1/events" ||
+                aliceRoot === undefined ||
+                bobRoot === undefined
+            ) {
+                return handler(request);
+            }
+            const original = decodeSignedRelayEventWire(utf8Encode(await request.clone().text()));
+            if (original.topic.name !== "control") {
+                return handler(request);
+            }
+            const receiver = new FriendChannel(bobRoot, {
+                publicKey: aliceRoot.publicKey,
+            });
+            let opened;
+            try {
+                opened = receiver.open(
+                    JSON.parse(utf8Decode(original.payload)) as FriendControlEnvelope,
+                );
+            } catch {
+                receiver.destroy();
+                return handler(request);
+            }
+            receiver.destroy();
+            const frame = decodeFriendControlFrame(opened.message.payload);
+            opened.message.payload.fill(0);
+            if (frame.type !== "group-invitation") {
+                return handler(request);
+            }
+            const changed =
+                tamper === "cursor"
+                    ? {
+                          ...frame,
+                          commitSequence: frame.commitSequence + 10_000n,
+                      }
+                    : {
+                          ...frame,
+                          commitFingerprint: Uint8Array.from(
+                              frame.commitFingerprint,
+                              (byte, index) => (index === 0 ? byte ^ 1 : byte),
+                          ),
+                      };
+            const frameBytes = encodeFriendControlFrame(changed);
+            const sender = new FriendChannel(aliceRoot, {
+                publicKey: bobRoot.publicKey,
+            } satisfies IdentityPublicKey);
+            const access = friendControlAccess(sender);
+            try {
+                const envelope = sender.seal({
+                    ...opened.message,
+                    payload: frameBytes,
+                });
+                const payload = utf8Encode(JSON.stringify(envelope));
+                try {
+                    const replacement = createCapabilityEvent(access, payload);
+                    const replacementBody = utf8Decode(encodeSignedRelayEventWire(replacement));
+                    tampered += 1;
+                    tamperedDescriptors.push(utf8Decode(frame.descriptor));
+                    tamper = undefined;
+                    return handler(
+                        new Request(request.url, {
+                            method: "POST",
+                            headers: request.headers,
+                            body: replacementBody,
+                        }),
+                    );
+                } finally {
+                    payload.fill(0);
+                }
+            } finally {
+                frameBytes.fill(0);
+                access.readSecretKey?.fill(0);
+                access.writeSecretKey?.fill(0);
+                sender.destroy();
+            }
+        };
+        const alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: aliceStore,
+            initialProfile: { name: "Alice" },
+            fetch: aliceFetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: bobStore,
+            initialProfile: { name: "Bob" },
+            fetch: inProcessFetch(relay),
+        });
+        try {
+            const aliceRootBytes = await aliceStore.get("murmur/v1/root");
+            const bobRootBytes = await bobStore.get("murmur/v1/root");
+            if (aliceRootBytes === undefined || bobRootBytes === undefined) {
+                throw new Error("Test identity root was not persisted");
+            }
+            aliceRoot = decodeIdentityRoot(aliceRootBytes);
+            bobRoot = decodeIdentityRoot(bobRootBytes);
+            aliceRootBytes.fill(0);
+            bobRootBytes.fill(0);
+
+            await alice.friends.request(bob.identityKey);
+            await converge([alice, bob]);
+            await bob.friends.accept(alice.identityKey);
+            await converge([bob, alice], 8);
+
+            tamper = "cursor";
+            const cursorGroup = await alice.groups.create(utf8Encode("bad cursor"), [
+                bob.identityKey,
+            ]);
+            for (
+                let round = 0;
+                round < 24 && !tamperedDescriptors.includes("bad cursor");
+                round += 1
+            ) {
+                await converge([alice, bob], 1);
+            }
+            expect(tamperedDescriptors).toContain("bad cursor");
+            expect(await bob.groups.get(cursorGroup)).toBeUndefined();
+
+            tamper = "fingerprint";
+            const fingerprintGroup = await alice.groups.create(utf8Encode("bad fingerprint"), [
+                bob.identityKey,
+            ]);
+            for (
+                let round = 0;
+                round < 24 && !tamperedDescriptors.includes("bad fingerprint");
+                round += 1
+            ) {
+                await converge([alice, bob], 1);
+            }
+            expect(tamperedDescriptors).toEqual(["bad cursor", "bad fingerprint"]);
+            expect(await bob.groups.get(fingerprintGroup)).toBeUndefined();
+            expect(tampered).toBe(2);
+
+            const validGroup = await alice.groups.create(utf8Encode("valid later"), [
+                bob.identityKey,
+            ]);
+            await converge([alice, bob], 12);
+            expect((await bob.groups.get(validGroup))?.group.members).toHaveLength(2);
+        } finally {
+            if (aliceRoot !== undefined) {
+                destroyIdentity(aliceRoot);
+            }
+            if (bobRoot !== undefined) {
+                destroyIdentity(bobRoot);
+            }
+            await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 30_000);
+
+    it("deletes expired remote KeyPackages and never reserves them for an Add", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"));
+        const fetch = inProcessFetch(relay);
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const alice = await Murmur.open({
+            relay: "https://relay.test",
+            store: aliceStore,
+            initialProfile: { name: "Alice" },
+            fetch,
+        });
+        const bob = await Murmur.open({
+            relay: "https://relay.test",
+            store: bobStore,
+            initialProfile: { name: "Bob" },
+            fetch,
+        });
+        let bobRoot: IdentityKeyPair | undefined;
+        try {
+            await alice.friends.request(bob.identityKey);
+            await converge([alice, bob]);
+            await bob.friends.accept(alice.identityKey);
+            await converge([bob, alice], 8);
+            const groupId = await alice.groups.create(utf8Encode("expired package"));
+
+            const remotePrefix = `murmur/v1/key-packages/remote/${identityId({
+                publicKey: bob.identityKey,
+            })}/`;
+            for (const key of (await aliceStore.list(remotePrefix)).keys()) {
+                await aliceStore.delete(key);
+            }
+            const rootBytes = await bobStore.get("murmur/v1/root");
+            if (rootBytes === undefined) {
+                throw new Error("Bob root was not persisted");
+            }
+            bobRoot = decodeIdentityRoot(rootBytes);
+            rootBytes.fill(0);
+            const expired = createMlsKeyPackage(bobRoot, Math.floor(Date.now() / 1_000) - 100, 1);
+            const reference = mlsKeyPackageReference(expired.keyPackage);
+            const expiredKey = `${remotePrefix}${encodeBase64Url(reference)}`;
+            try {
+                await aliceStore.set(expiredKey, encodeMlsKeyPackage(expired.keyPackage));
+            } finally {
+                destroyMlsKeyPackageBundle(expired);
+                reference.fill(0);
+            }
+
+            await alice.groups.add(groupId, bob.identityKey);
+            await alice.sync();
+            expect(await aliceStore.get(expiredKey)).toBeUndefined();
+            expect((await alice.groups.get(groupId))?.group.members).toHaveLength(1);
+            expect(
+                (await aliceStore.list(`murmur/v1/groups/${encodeBase64Url(groupId)}/operations/`))
+                    .size,
+            ).toBe(1);
+        } finally {
+            if (bobRoot !== undefined) {
+                destroyIdentity(bobRoot);
+            }
+            await Promise.all([alice.close(), bob.close()]);
+            await relay.close();
+        }
+    }, 15_000);
 });

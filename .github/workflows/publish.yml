@@ -52,13 +52,31 @@ jobs:
             - run: pnpm typecheck
             - run: pnpm lint
             - run: pnpm format:check
-            - name: Build and inspect npm tarball
+            - name: Build and enforce npm tarball surface
               env:
                   PACKAGE_SMOKE_DIRECTORY: ${{ runner.temp }}/murmur-package-smoke
               run: |
                   mkdir -p .context/release
                   pnpm --filter @slopus/murmur pack --pack-destination .context/release
-                  tar --list --file .context/release/slopus-murmur-*.tgz
+                  package_tarball="$(find .context/release -maxdepth 1 -name 'slopus-murmur-*.tgz' -print -quit)"
+                  package_contents="$(tar --list --file "$package_tarball")"
+                  printf '%s\n' "$package_contents"
+                  unexpected="$(printf '%s\n' "$package_contents" | grep -Ev '^package/(dist/.*|LICENSE|README\.md|package\.json)$' || true)"
+                  if [ -n "$unexpected" ]; then
+                      printf 'Unexpected npm package entries:\n%s\n' "$unexpected" >&2
+                      exit 1
+                  fi
+                  legacy="$(printf '%s\n' "$package_contents" | grep -E '^package/(mls|sharedSession)(/|$)|^package/dist/(cli|client|document|sharedSession|groupChannel|ephemeral)(/|\\.)' || true)"
+                  if [ -n "$legacy" ]; then
+                      printf 'Legacy artifacts found in npm package:\n%s\n' "$legacy" >&2
+                      exit 1
+                  fi
+                  for required in package/package.json package/dist/index.js package/dist/index.d.ts; do
+                      if ! printf '%s\n' "$package_contents" | grep -Fx "$required" >/dev/null; then
+                          echo "Required npm package entry is missing: $required" >&2
+                          exit 1
+                      fi
+                  done
                   mkdir -p "$PACKAGE_SMOKE_DIRECTORY"
                   printf '{"private":true,"type":"module"}\n' > "$PACKAGE_SMOKE_DIRECTORY/package.json"
                   pnpm --dir "$PACKAGE_SMOKE_DIRECTORY" add "$GITHUB_WORKSPACE"/.context/release/slopus-murmur-*.tgz

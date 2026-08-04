@@ -1,3 +1,11 @@
+/** Bounded lexicographic scan within one key prefix. */
+export interface StoreScanOptions {
+    /** Return keys strictly after this complete key. */
+    readonly after?: string;
+    /** Maximum number of entries to materialize. */
+    readonly limit: number;
+}
+
 /** Atomic value exposed by a storage transaction. */
 export interface StoreTransaction {
     /** Return a defensive byte copy for one key, or `undefined` when absent. */
@@ -8,6 +16,8 @@ export interface StoreTransaction {
     delete(key: string): Promise<void>;
     /** Return defensive copies of every entry whose key begins with `prefix`. */
     list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>>;
+    /** Return one bounded lexicographically ordered page under `prefix`. */
+    scan(prefix: string, options: StoreScanOptions): Promise<ReadonlyMap<string, Uint8Array>>;
 }
 
 /** Durable storage boundary used by browser and Node clients. */

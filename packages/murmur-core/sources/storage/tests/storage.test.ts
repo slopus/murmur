@@ -28,6 +28,30 @@ describe("MemoryMurmurStore", () => {
         );
     });
 
+    it("scans one bounded lexicographic page", async () => {
+        const store = new MemoryMurmurStore();
+        await store.set("events/0003", new Uint8Array([3]));
+        await store.set("events/0001", new Uint8Array([1]));
+        await store.set("other/0000", new Uint8Array([9]));
+        await store.set("events/0002", new Uint8Array([2]));
+
+        expect(await store.scan("events/", { limit: 2 })).toEqual(
+            new Map([
+                ["events/0001", new Uint8Array([1])],
+                ["events/0002", new Uint8Array([2])],
+            ]),
+        );
+        expect(
+            await store.scan("events/", {
+                after: "events/0002",
+                limit: 2,
+            }),
+        ).toEqual(new Map([["events/0003", new Uint8Array([3])]]));
+        await expect(store.scan("events/", { after: "other/0000", limit: 1 })).rejects.toThrow(
+            "Invalid Murmur store scan",
+        );
+    });
+
     it("does not roll back a successful write queued behind a failed transaction", async () => {
         const store = new MemoryMurmurStore();
         let releaseTransaction: (() => void) | undefined;
