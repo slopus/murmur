@@ -32,6 +32,8 @@ export interface RetainedRelayEvent {
 export interface EventPage {
     readonly events: readonly RetainedRelayEvent[];
     readonly head: bigint;
+    /** Whether no further retained event exists after the returned page. */
+    readonly exhausted: boolean;
 }
 
 /** Atomic persistence operations required by the relay service. */

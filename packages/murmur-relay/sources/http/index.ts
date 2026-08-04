@@ -196,6 +196,7 @@ export function createRelayFetchHandler(
                             event: signedRelayEventToJson(retained.event),
                         })),
                         head: page.head.toString(),
+                        exhausted: page.exhausted,
                     },
                     200,
                     corsHeaders,

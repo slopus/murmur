@@ -1,155 +1,160 @@
 # Architecture
 
-Murmur is a browser-safe client library connected to a deliberately dumb,
-Node-only relay. Clients encrypt application data; relays retain opaque topic
-state and validate the signed event envelope around it.
+Murmur is a browser-safe, stateful encrypted-communication library connected to
+one deliberately dumb relay. Application and MLS layers encrypt their content;
+the relay stores only signed opaque events.
 
 ## Layers
 
 ```text
-┌──────────────────────────────────────────────────────────────────┐
-│ application                                                      │
-│ message/document semantics · durable application records         │
-├──────────────────────────────────────────────────────────────────┤
-│ @slopus/murmur                                                   │
-│ identity · contacts · direct messages · files · client cursors   │
-│ shared documents · topic streams · ephemeral frames              │
-├──────────────────────────────────────────────────────────────────┤
-│ @slopus/murmur/mls                                               │
-│ MLS epochs · TreeKEM · KeyPackages · Commits · group channel     │
-├══════════════════════════════════════════════════════════════════┤
-│ trust boundary                                                    │
-├──────────────────────────────────────────────────────────────────┤
-│ @murmur/relay (Node only)                                        │
-│ HTTP handler · policy · SQLite/Postgres · blob links · limits    │
-└──────────────────────────────────────────────────────────────────┘
+application-specific protocol
+        |
+        v
+@slopus/murmur
+stateful keys · persistence · synchronization · MLS group streams
+        |
+        v
+browser-safe RelayTransport
+exactly one configured relay
+        |
+================ trust boundary ================
+        |
+@murmur/relay
+typed capability policy · ordered events · SQLite/Postgres
 ```
 
-`@slopus/murmur` is the published library. It has no Node imports or side
-effects and depends only on Noble cryptography. `murmur-mls` is built into its
-`@slopus/murmur/mls` subpath. The relay is intentionally not runtime-neutral:
-it contains the Node HTTP server, `node:sqlite` store, Postgres adapter, and
-filesystem blob backend. `murmur-chat` is the Node CLI.
+There is no CLI-owned protocol in the library architecture. Two-member and
+multi-member conversations use the same higher-level MLS group primitive.
+Chat semantics are intentionally outside the relay and transport.
 
 ## Trust boundary
 
-The relay is untrusted for confidentiality and application semantics.
+The relay is untrusted for confidentiality, application semantics, and
+availability. It can withhold, delay, replay, expire, collapse, or delete data.
+End-to-end cryptography must authenticate application payloads independently.
 
-| The relay can see                                                                    | The relay cannot learn from protocol data                         |
-| ------------------------------------------------------------------------------------ | ----------------------------------------------------------------- |
-| Topic IDs                                                                            | Plaintext profiles, messages, files, MLS content, or documents    |
-| `author.signingKey` on every relay event                                             | What a topic represents                                           |
-| Event timestamps and ciphertext sizes                                                | Group name, membership, or epoch secrets                          |
-| Opaque event payloads, snapshots, and list elements                                  | File keys and nonces, which stay inside encrypted message content |
-| Ciphertext blob IDs and, with the local backend, ciphertext bytes in transit/storage | Direct-message or MLS plaintext                                   |
+The relay can see:
 
-Unauthenticated reads are intentional: a topic ID is a read capability.
-Authenticated event writes do not make a topic private on their own. For this
-reason direct conversations use a pairwise topic derived from X25519 secret
-material, rather than a topic derived from a public identity key.
+- canonical topic descriptors and their authorization public keys;
+- event authors, timestamps, expiration, collapse-key equality, and sizes;
+- opaque event payloads and per-topic sequence activity.
 
-The relay is still trusted for availability. It can withhold, delay, replay, or
-delete data; the crypto does not prevent denial of service.
+It does not receive topic secret keys and does not know whether bytes represent
+a profile, invitation, MLS Commit, group application message, or another future
+protocol.
 
-## Topic state
+## Key-scoped topics
 
-```text
-              publish signed event
-                       |
-                       v
-+----------------------------------------------------+
-| topic                                              |
-|   head sequence                                    |
-|   snapshot: optional opaque bytes + version        |
-|   list: ordered opaque elements + versions         |
-|   retained events: bounded mutation history        |
-+----------------------------------------------------+
+Topics are typed descriptors rather than arbitrary strings:
+
+- `Write Topic`: designated-key writes, public reads;
+- `Read Topic`: any signed writer, designated-key reads;
+- `Read and Write Topic`: designated keys in both directions.
+
+The physical store key is a hash of `(type, name, authorization public key(s))`.
+One capability key may intentionally namespace several independent named
+streams. Capability keys are not relay accounts and need not be Murmur identity
+keys.
+
+Applications keep secret material in `TopicAccess`:
+
+```ts
+interface TopicAccess {
+    topic: RelayTopic;
+    readSecretKey?: Uint8Array;
+    writeSecretKey?: Uint8Array;
+}
 ```
 
-- The snapshot and current list are durable while their topic remains active.
-- Event bodies expire after seven days by default. A durable receipt remains,
-  so retrying the same `(topic, event id)` still returns its original sequence.
-- A topic is removed after 30 days without a successful publish. Reads do not
-  refresh that activity timer.
-- The relay does not tie blobs to topic lifecycle. The backend owns blob
-  retention.
+For protected writes, `MurmurClient` verifies that `writeSecretKey` derives the
+descriptor's `writeKey`, then signs the relay event with that capability rather
+than its identity. `Read Topic` writes use the client's identity because that
+topic intentionally accepts any valid signing author.
 
-An event is one atomic mutation. It can replace or delete the snapshot and
-perform at most 256 append, replace, or delete operations on the list. Snapshot
-and list element versions provide optimistic concurrency. State conflicts carry
-the observed snapshot and touched-element versions, rather than silently
-overwriting another write.
+For protected reads, `HttpRelayTransport` verifies the local read secret,
+obtains a one-use challenge, and signs the exact topic and read parameters.
+
+## Ordered event storage
+
+Each topic contains exactly one ordered event store:
+
+```text
+publish signed event
+        |
+        +-- allocate never-reused topic sequence
+        +-- optionally remove older matching collapse key
+        +-- insert opaque event
+        `-- retain idempotency receipt
+```
+
+There are no snapshots, separate mutable lists, relay blobs, or ephemeral
+fanout. Missing expiration means durable. Explicit expiration and collapse
+remove retained rows but never rewind the head, so cursors remain stable across
+sequence holes.
+
+SQLite uses `BEGIN IMMEDIATE`. Postgres uses a per-topic advisory transaction
+lock. Both allocate the sequence, apply collapse, insert the event, and record
+idempotency atomically. The schema is fresh and intentionally has no legacy
+migration path.
 
 ## Publishing
 
 ```text
-client.publish()
-    |
-    +-- create canonical JSON relay event
-    +-- sign event with Ed25519
-    +-- retain exact event in local outbound state
-    |
-    `-- publish to configured relays
-             |
-             +-- relay verifies signature, time, and limits
-             +-- store atomically allocates topic sequence and applies mutation
-             +-- relay records durable idempotency receipt
-             `-- a successful duplicate returns the original sequence
+MurmurClient.publish(access, payload)
+        |
+        +-- choose identity signer for Read Topic
+        |   or verify/use shared write capability
+        +-- sign canonical event
+        `-- publish once through the one configured transport
+                |
+                +-- relay verifies shape/signature/write key
+                +-- exact receipt retry returns original sequence
+                +-- new event passes freshness/expiration policy
+                `-- store commits atomically
 ```
 
-The client retains the exact signed event until every configured relay accepts
-it. Publishing is successful when at least one relay accepts it; later
-`retryOutboundSettled()` retries only relays that have not accepted the event.
+The clean client has no relay arrays, failover ordering, or generic hidden retry
+loop. A higher-level durable protocol may retain an exact signed event in its
+own state and retry it. Exact retries remain idempotent after the event's
+timestamp window or explicit expiration because the durable receipt is checked
+before freshness for already-authenticated content.
 
-At the relay, a repeated `(topic, id)` is idempotent only if the canonical
-signed content matches its durable receipt. Reusing an ID for different content
-is a 409 `id_collision`.
+## Reading and cursors
 
-## Reading, cursors, and reset
-
-The relay has no subscription records, recipient queues, or acknowledgements.
-`MurmurClient.subscribe(topic)` only adds the topic to one local client's sync
-set.
+The relay has no subscription records or acknowledgements.
+`MurmurClient.subscribe(access)` only adds a local synchronization target.
 
 ```text
-local cursor C
-    |
-    v
-GET events?since=C
-    |
-    +-- one retained page after C
-    |       |
-    |       `-- application transaction:
-    |              persist application effect
-    |              ReceivedEvent.advanceCursor(transaction)
-    |
-    `-- reset: true
-            |
-            `-- load snapshot + every list page, then atomically install H
+durable cursor C
+        |
+        v
+read events after C
+        |
+        +-- retained events in sequence order
+        |       |
+        |       `-- application transaction:
+        |              persist effect
+        |              advanceCursor(transaction)
+        |
+        `-- head H + exhausted flag
 ```
 
-The store keeps a cursor for every `(relay ID, topic)` pair because relay
-sequences are local to a relay. `advanceCursor(transaction)` rejects skips. If
-the application transaction aborts, the cursor does not advance and the event
-is available again.
+`ReceivedEvent.advanceCursor(transaction)` must commit with the application
+effect. It rejects skipping an earlier retained event but accepts holes that the
+relay has already removed.
 
-A `MurmurClient.sync()` call reads one page per subscribed relay/topic (100
-events by the current client default). Repeat `sync()` to drain additional
-pages, or use the client's `events()` iterator.
+Pages carry `exhausted`. Count and encoded-byte limits can make a short page
+non-exhausted, so the last event advances only to its own sequence in that case.
+Only an exhausted page may advance the last event, or an empty suffix, to the
+topic head.
 
-A cursor becomes unusable when it precedes the oldest retained event or is
-ahead of the topic head. The relay returns `reset: true`; `sync()` then returns
-`{ status: "reset", resets }` and deliberately omits all events. Calling
-`loadTopic()` reads state plus the complete permanent list, invokes the
-application callback, and writes the new cursor in the same
-`MurmurStore.transaction()`. This prevents a reset from looking like a normal
-empty catch-up.
+Subscribed topics read concurrently through the single transport. Long-poll
+wakes are latency hints; register-then-recheck and timeout reads preserve
+correctness without them.
 
-## Storage contracts
+## Persistence
 
-### Client storage
-
-Applications supply a transactional `MurmurStore`:
+Applications supply `MurmurStore`:
 
 ```ts
 interface StoreTransaction {
@@ -166,108 +171,6 @@ interface MurmurStore extends StoreTransaction {
 }
 ```
 
-The transaction is part of the protocol contract. A direct-message record and
-replay marker, an application effect and cursor, or an MLS checkpoint and its
-outbox record must commit together. `MemoryMurmurStore` is provided only for
-tests and examples.
-
-### Relay storage
-
-The relay abstracts SQLite and Postgres behind `RelayStore`. A store implements
-atomic publish, consistent snapshot/list/event reads, retention pruning, health,
-and close. `SqliteRelayStore` serializes writes with SQLite transactions and
-WAL. `PostgresRelayStore` uses per-topic advisory locks for publishing, versioned
-migrations under an advisory lock, and cluster-wide try-locks for pruning.
-
-The Postgres implementation is exercised with PGlite in tests. It has not been
-tested against a live PostgreSQL service, including `PgPoolDatabase`,
-cross-instance `LISTEN`/`NOTIFY`, and advisory-lock contention.
-
-## Blobs
-
-The relay does not offer a general unauthenticated `PUT` or `GET` blob API.
-Instead the client requests a transfer link:
-
-```text
-client ── POST /upload-link ──► BlobBackend ──► PUT link
-client ── POST /download-link ─► BlobBackend ──► GET link
-client ─────────────────────────────────────────► bytes
-```
-
-`LocalBlobBackend` returns a relay-relative URL. It validates a signed link,
-streams uploads to a same-directory temporary file, hashes the stream, and
-atomically links the finished file into a sharded content-addressed tree only
-when its SHA-256 matches the requested ID. A partial or mismatched upload is
-not served. Downloads stream from the installed file.
-
-Local links are HMAC-SHA256 values over a versioned link preimage containing
-the HTTP method, blob ID, and expiry. Signatures are compared in constant time.
-The local backend is the only backend that handles the returned relay-local
-transfer route.
-
-`S3BlobBackend` returns an absolute AWS SigV4 presigned URL, so ciphertext
-bytes do not pass through the relay. Uploads require a signed
-`x-amz-checksum-sha256` header derived from the blob ID. A download-link request
-first performs a signed S3 `HEAD` to confirm that the object exists. The SigV4
-implementation matches the published AWS presigned-GET test vector, but has
-not been tested against a live S3 bucket or MinIO.
-
-## Rate limiting and long polling
-
-The Fetch handler creates an in-process token bucket by default:
-
-```text
-every request        ip:<client address> bucket
-valid event publish  ip:<client address> bucket + author:<signing key> bucket
-```
-
-The defaults are a capacity of 1,000 tokens, a 50-token-per-second refill, and
-at most 50,000 least-recently-used buckets. Reads cost 1, upload-link requests
-and local signed uploads cost 10, and publishes cost 25. A rejected request
-returns HTTP 429 with `Retry-After`.
-
-Forwarded addresses are ignored unless `MURMUR_RELAY_TRUSTED_PROXIES` explicitly
-sets a trusted hop count or trusted proxy IP list. This prevents an arbitrary
-`X-Forwarded-For` header from bypassing the IP limit.
-
-The default limiter is per process. With `N` relay instances, the effective
-limit is roughly `N` times higher. `RateLimiter` is an interface so a shared,
-store-backed limiter can replace it at the HTTP boundary.
-
-Events may be read with a long-poll wait of at most 30 seconds. Wake sources
-only reduce latency: a timeout and re-read preserve correctness if a wake is
-lost. SQLite uses in-process wakes. Postgres publishes an in-transaction
-notification and uses a dedicated reconnecting `LISTEN` connection to wake
-waiters on other instances.
-
-## The ephemeral path
-
-A 30-second long poll is correct for a transcript and useless for a keystroke,
-so the relay also offers a path that stores nothing:
-
-```text
-POST /v1/topics/:topic/ephemeral ──► EphemeralFanout ──► GET .../stream
-        opaque bytes, no receipt          bounded            text/event-stream
-        no sequence, no retention         drop-oldest        ready/frame/wake/drop
-```
-
-This does not make the relay less dumb. It allocates no sequence, writes no
-receipt, refreshes no activity timer, and still cannot tell one opaque frame
-from another. Frame fan-out is in-process, behind the substitutable
-`EphemeralFanout` interface; the `wake` event rides the existing `WakeSource`,
-so it crosses instances and makes durable publishes prompt as well.
-
-Every buffer on this path is bounded. A subscriber's queue drops its oldest
-frames and reports the count rather than growing, and the response body is
-pull-driven, so a reader that stalls costs the relay a small constant multiple
-of that queue and never more: a pull drains what is queued while the producer
-refills it, so the true ceiling is about twice the queue bound, not once.
-Subscribers are capped per topic as well as globally, and an ephemeral publish
-is priced by the fan-out it causes, so neither an open stream nor a cheap POST
-is a way to make the relay do unbounded work.
-
-`@slopus/murmur/sharedSession` uses this path for the non-durable side channel
-of a shared agent session. Those frames are keyed from the RFC 9420 exporter of
-the group's _current_ epoch, so they share the group's membership and
-revocation exactly while creating no durability obligation. Confidentiality is
-unchanged: the relay sees opaque bytes here as everywhere else.
+The library owns key and synchronization state, while the application owns the
+durable store implementation. `MemoryMurmurStore` is appropriate only for tests
+and examples.

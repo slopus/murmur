@@ -130,7 +130,9 @@ export class RelayService {
             event.author.signingKey.length !== 32 ||
             event.signature.length !== 64 ||
             !Number.isSafeInteger(event.createdAt) ||
-            event.createdAt < 0
+            event.createdAt < 0 ||
+            (event.expiresAt !== undefined &&
+                (!Number.isSafeInteger(event.expiresAt) || event.expiresAt < 0))
         ) {
             throw new RelayError(400, "Invalid relay event", { error: "malformed" });
         }
@@ -144,15 +146,6 @@ export class RelayService {
                 event.collapseKey.length > this.#options.maximumCollapseKeyBytes)
         ) {
             throw new RelayError(400, "Invalid collapse key", { error: "malformed" });
-        }
-        const now = this.#now();
-        if (
-            event.createdAt < now - FIVE_MINUTES ||
-            event.createdAt > now + FIVE_MINUTES ||
-            (event.expiresAt !== undefined &&
-                (!Number.isSafeInteger(event.expiresAt) || event.expiresAt <= now))
-        ) {
-            throw new RelayError(401, "Expired relay event", { error: "unauthorized" });
         }
         if (!verifyRelayEventSignature(event)) {
             throw new RelayError(401, "Invalid relay event signature", {
@@ -177,6 +170,14 @@ export class RelayService {
                 });
             }
             return { seq: receipt.seq, duplicate: true };
+        }
+        const now = this.#now();
+        if (
+            event.createdAt < now - FIVE_MINUTES ||
+            event.createdAt > now + FIVE_MINUTES ||
+            (event.expiresAt !== undefined && event.expiresAt <= now)
+        ) {
+            throw new RelayError(401, "Expired relay event", { error: "unauthorized" });
         }
         const outcome = await this.#store.publish(event, topicId, now);
         if (!outcome.duplicate) {
@@ -249,7 +250,7 @@ export class RelayService {
                 error: "malformed",
             });
         }
-        if (current.events.length > 0 || waitMilliseconds === 0) {
+        if (current.events.length > 0 || current.head > since || waitMilliseconds === 0) {
             return current;
         }
         await this.#park(

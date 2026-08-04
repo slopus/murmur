@@ -153,7 +153,11 @@ export function decodeSignedRelayEventWire(value: Uint8Array): SignedRelayEvent 
 /** Decode one event page response. */
 export function decodeEventPageWire(value: Uint8Array): EventPage {
     const input = object(JSON.parse(utf8Decode(value)) as unknown, "event page");
-    if (!Array.isArray(input.events) || typeof input.head !== "string") {
+    if (
+        !Array.isArray(input.events) ||
+        typeof input.head !== "string" ||
+        typeof input.exhausted !== "boolean"
+    ) {
         throw new Error("Invalid event page");
     }
     return {
@@ -163,5 +167,6 @@ export function decodeEventPageWire(value: Uint8Array): EventPage {
             return { seq: BigInt(retained.seq), event: event(retained.event) };
         }),
         head: BigInt(input.head),
+        exhausted: input.exhausted,
     };
 }

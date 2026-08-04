@@ -27,7 +27,7 @@ describe("HTTP relay transport", () => {
                 });
             }
             readBody = JSON.parse(String(init?.body)) as Record<string, unknown>;
-            return Response.json({ events: [], head: "0" });
+            return Response.json({ events: [], head: "0", exhausted: true });
         };
         const transport = new HttpRelayTransport("https://relay.test", relayFetch);
         await transport.readEvents({ topic, readSecretKey: secretKey }, 0n, 10, 25);

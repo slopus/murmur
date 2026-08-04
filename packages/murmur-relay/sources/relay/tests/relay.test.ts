@@ -133,4 +133,33 @@ describe("ordered relay", () => {
         await relay.publish(event(owner, topic, "wake"));
         await expect(waiting).resolves.toMatchObject({ head: 1n });
     });
+
+    test("keeps exact retries idempotent after timestamp and event expiration", async () => {
+        const relay = service();
+        const owner = randomBytes(32);
+        const topic = {
+            type: "write" as const,
+            name: "retry",
+            writeKey: ed25519.getPublicKey(owner),
+        };
+        const original = event(owner, topic, "original", { expiresAt: now + 1 });
+        await expect(relay.publish(original)).resolves.toEqual({ seq: 1n, duplicate: false });
+        now += 10 * 60 * 1_000;
+        expect(await relay.pruneExpired()).toBe(1);
+        await expect(relay.publish(original)).resolves.toEqual({ seq: 1n, duplicate: true });
+
+        const changedUnsigned: SignedRelayEvent = {
+            ...original,
+            payload: new TextEncoder().encode("changed"),
+            signature: new Uint8Array(64),
+        };
+        const changed = {
+            ...changedUnsigned,
+            signature: ed25519.sign(relayEventSigningBytes(changedUnsigned), owner),
+        };
+        await expect(relay.publish(changed)).rejects.toMatchObject({
+            status: 409,
+            body: { error: "id_collision" },
+        });
+    });
 });

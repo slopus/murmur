@@ -27,6 +27,13 @@ export type RelayTopic = WriteTopic | ReadTopic | ReadWriteTopic;
 export interface TopicAccess {
     readonly topic: RelayTopic;
     readonly readSecretKey?: Uint8Array;
+    readonly writeSecretKey?: Uint8Array;
+}
+
+/** Minimal Ed25519 signing material accepted when constructing an event. */
+export interface RelaySigningKey {
+    readonly signingKey: Uint8Array;
+    readonly signingSecretKey: Uint8Array;
 }
 
 /** Complete signed durable relay event. */
@@ -58,6 +65,8 @@ export interface RetainedRelayEvent {
 export interface EventPage {
     readonly events: readonly RetainedRelayEvent[];
     readonly head: bigint;
+    /** Whether no further retained event exists after the returned page. */
+    readonly exhausted: boolean;
 }
 
 /** Browser-safe fetch signature accepted by the HTTP transport. */

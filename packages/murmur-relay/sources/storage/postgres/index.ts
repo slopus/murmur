@@ -145,12 +145,18 @@ export class PostgresRelayStore implements RelayStore {
             );
             const topic = topicResult.rows[0];
             if (topic === undefined) {
-                return { events: [], head: 0n };
+                return { events: [], head: 0n, exhausted: true };
             }
-            const result = await transaction.query<{ seq: unknown; event_json: unknown }>(
+            const result = await transaction.query<{
+                seq: unknown;
+                event_json: unknown;
+                row_number: unknown;
+                available_count: unknown;
+            }>(
                 `WITH candidates AS (
                     SELECT seq, event_json,
                         ROW_NUMBER() OVER (ORDER BY seq) AS row_number,
+                        COUNT(*) OVER () AS available_count,
                         SUM(OCTET_LENGTH(event_json::text) + 64) OVER (
                             ORDER BY seq ROWS UNBOUNDED PRECEDING
                         ) AS cumulative_bytes
@@ -158,7 +164,7 @@ export class PostgresRelayStore implements RelayStore {
                     WHERE topic_id = $1 AND seq > $2
                       AND (expires_at IS NULL OR expires_at > $3)
                  )
-                 SELECT seq, event_json FROM candidates
+                 SELECT seq, event_json, row_number, available_count FROM candidates
                  WHERE row_number = 1 OR cumulative_bytes <= $4
                  ORDER BY seq LIMIT $5`,
                 [
@@ -177,6 +183,10 @@ export class PostgresRelayStore implements RelayStore {
                     }),
                 ),
                 head: bigintColumn(topic.head),
+                exhausted:
+                    result.rows.length === 0 ||
+                    bigintColumn(result.rows.at(-1)!.row_number) ===
+                        bigintColumn(result.rows.at(-1)!.available_count),
             };
         }, "repeatable read");
     }

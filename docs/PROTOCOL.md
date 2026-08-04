@@ -1,548 +1,177 @@
 # Protocol
 
-This document describes the bytes Murmur clients place in relay events. The
-relay protocol itself is in [RELAY_API.md](RELAY_API.md). The relay treats all
-application payloads, snapshots, and list elements as opaque bytes.
+This document describes the clean Murmur relay envelope. Higher-level friend
+exchange and MLS group payload formats are intentionally specified separately;
+the relay treats all payload bytes as opaque.
 
-## Conventions and primitives
+## Cryptographic conventions
 
-All byte values use unpadded base64url at JSON and storage boundaries.
-Internally, keys and ciphertexts are `Uint8Array`.
+- Keys and ciphertext are `Uint8Array` internally.
+- JSON and storage boundaries use canonical unpadded base64url.
+- Signatures are Ed25519 with strict RFC 8032 verification (`zip215: false`).
+- Hashing is SHA-256.
+- Signatures cover recursively key-sorted canonical JSON.
+- Secret capability keys never cross the relay boundary.
 
-| Purpose                                 | Current construction                                    |
-| --------------------------------------- | ------------------------------------------------------- |
-| Relay-event and application signatures  | Ed25519, strict RFC 8032 verification (`zip215: false`) |
-| Identity key agreement                  | X25519                                                  |
-| Profile and direct-message sealed boxes | Ephemeral X25519, HKDF-SHA256, AES-256-GCM              |
-| File encryption                         | AES-256-GCM                                             |
-| Hashing and content addresses           | SHA-256                                                 |
-| Local blob-link authentication          | HMAC-SHA256                                             |
-| S3 links                                | AWS Signature Version 4                                 |
+## Topic descriptors
 
-The sealed-box key is HKDF-SHA256 over the X25519 shared secret. Its salt binds
-the ephemeral and recipient public encryption keys, and its information string
-is `murmur sealed box v1`. Its AES-GCM nonce is 12 bytes.
+```ts
+type RelayTopic =
+    | {
+          type: "write";
+          name: string;
+          writeKey: Uint8Array;
+      }
+    | {
+          type: "read";
+          name: string;
+          readKey: Uint8Array;
+      }
+    | {
+          type: "read-write";
+          name: string;
+          readKey: Uint8Array;
+          writeKey: Uint8Array;
+      };
+```
 
-Secret arrays are zeroed by the implementation when intermediate work is done
-where practical. Zeroing cannot guarantee removal from JavaScript runtimes or
-their garbage collectors.
+The physical topic ID is:
+
+```text
+base64url(SHA-256(canonical JSON(topic descriptor)))
+```
+
+The descriptor is included in every signed event, so changing its type, name,
+or authorization keys produces both a different signature preimage and a
+different physical topic.
+
+`Write Topic` requires the event author key to equal `writeKey`.
+`Read Topic` accepts any valid event author. `Read and Write Topic` enforces its
+`writeKey`.
 
 ## Relay events
 
-Every topic write is a version-one signed relay event:
-
 ```ts
-{
-    version: 1,
-    id: string, // canonical base64url encoding of 32 random bytes
-    topic: string,
+interface SignedRelayEvent {
+    version: 1;
+    id: string;
+    topic: RelayTopic;
     author: {
-        signingKey: string, // canonical base64url encoding of 32 Ed25519 public-key bytes
-    },
-    createdAt: number, // integer Unix milliseconds
-    payload: string, // base64url opaque bytes
-    snapshot?: {
-        expectedVersion: number,
-        bytes?: string, // absent means delete
-    },
-    list?: [
-        { op: "append", id: string, bytes: string },
-        { op: "replace", id: string, expectedVersion?: number, bytes: string },
-        { op: "delete", id: string, expectedVersion?: number },
-    ],
-    signature: string, // canonical base64url encoding of 64 bytes
+        signingKey: Uint8Array;
+    };
+    createdAt: number;
+    expiresAt?: number;
+    collapseKey?: Uint8Array;
+    payload: Uint8Array;
+    signature: Uint8Array;
 }
 ```
 
-`topic` uses `[A-Za-z0-9_.:-]` and is at most 512 characters. List element IDs
-use the same alphabet and are at most 256 characters.
+`id` encodes 32 random bytes. The signature covers every field except
+`signature`, after byte arrays are encoded as base64url.
 
-The signature authenticates recursively key-sorted canonical JSON containing
-every field except `signature`; all byte values have already become base64url
-strings. The event ID, topic, author, timestamp, payload, snapshot mutation,
-and list mutations are therefore all signed.
+For a new event the relay:
 
-For a new event, the relay verifies that signature and enforces a timestamp
-within five minutes of its clock. It assigns a gapless sequence local to the
-topic only after the event is accepted. A receipt keeps the event's
-signature-preimage hash and resulting sequence even after the retained event
-body expires, so an exact retry returns its original result before timestamp
-validation.
+1. strictly validates shape and bounds;
+2. verifies the Ed25519 signature;
+3. enforces the topic's write capability;
+4. checks for an existing `(topic, id)` receipt;
+5. validates `createdAt` within five minutes and requires `expiresAt` to remain
+   in the future;
+6. atomically allocates a sequence, applies collapse, stores the event, and
+   stores its receipt.
 
-The author signing key is deliberately plaintext: the relay needs it to verify
-the event. It is metadata, not an end-to-end identity proof for application
-content; application payloads authenticate themselves where that matters.
+For an existing receipt, steps 1–4 still apply. Equal authenticated content
+returns the original sequence even after the timestamp window or explicit
+expiration. Different content returns `id_collision`.
 
-## Identities and identity inboxes
+## Expiration and collapse
 
-An identity is:
+No `expiresAt` means durable. Once expiration passes, the event is omitted from
+reads and can be physically deleted.
+
+When `collapseKey` is present, publishing atomically removes all older retained
+events in that topic carrying equal opaque bytes. Clients use collapse only when
+the new payload completely replaces the earlier state.
+
+The relay's head sequence never decreases. Removed events therefore produce
+legal holes:
 
 ```text
-IdentityKeyPair
-├── signingSecretKey / signingKey          Ed25519
-└── encryptionSecretKey / encryptionKey    X25519
+stored sequences: 1, 2, 3, 4
+collapse 2 and expire 3
+retained:         1,       4
+head:                         4
 ```
 
-The stable identity ID is the base64url public signing key. Its serializable
-public form is:
+## Event pages
+
+```ts
+interface EventPage {
+    events: readonly {
+        seq: bigint;
+        event: SignedRelayEvent;
+    }[];
+    head: bigint;
+    exhausted: boolean;
+}
+```
+
+Events are ordered by sequence and strictly greater than the requested cursor.
+`exhausted` is computed from retained candidates before count and encoded-byte
+page limits. It is false whenever another retained event follows the page, even
+if the returned page is shorter than the requested count.
+
+Clients advance the last returned event to `head` only when `exhausted` is true.
+Otherwise they advance to that event's sequence and request the next page.
+
+## Read authentication
+
+Public `Write Topic` reads need no proof. `Read Topic` and `Read and Write Topic`
+use a short-lived one-use relay challenge:
+
+```ts
+interface ReadChallenge {
+    id: string;
+    nonce: Uint8Array;
+    expiresAt: number;
+}
+```
+
+The client signs canonical JSON:
 
 ```ts
 {
-    signingKey: string,
-    encryptionKey: string,
+    challengeId: string;
+    nonce: string;
+    topic: RelayTopic;
+    since: string;
+    limit: number;
+    waitMilliseconds: number;
 }
 ```
 
-No account or registry binds these keys to a person. Clients exchange this
-public pair out of band. Murmur does not verify that channel.
+The relay removes the challenge before signature verification. Consequently a
+successful proof, an invalid attempt, or a replay consumes it. The challenge is
+also bound to the topic descriptor and expiration.
 
-### First-contact address
-
-```text
-identityInboxTopic(identity)
-    = "identity:" + base64url(SHA-256(identity.signingKey))
-```
-
-This is public by design: anyone who has the recipient's public token can
-compute and read it. It is only a first-contact inbox, never a direct-message
-topic.
-
-A first-contact client uses `publishUnlinkable()`, which signs the outer relay
-event with a fresh one-use identity. The sealed profile payload contains the
-actual sender identity. The inbox consequently reveals that a number of
-unlinkable contact requests arrived without putting a long-lived sender
-identity in the outer event author field.
-
-## Contact profiles
-
-`IdentityProfile` is:
+## Stateful client contract
 
 ```ts
-{
-    name: string,
-    avatar?: Uint8Array,
-    metadata?: Readonly<Record<string, string>>,
+interface TopicAccess {
+    topic: RelayTopic;
+    readSecretKey?: Uint8Array;
+    writeSecretKey?: Uint8Array;
 }
 ```
 
-Its JSON encoding is limited to 1 MiB. A profile envelope is:
-
-```ts
-{
-    version: 1,
-    recipient: string, // recipient signing-key identity ID
-    ephemeralPublicKey: string,
-    nonce: string,
-    ciphertext: string,
-}
-```
-
-Before encryption, the sender creates:
-
-```text
-signature = Ed25519.sign(canonical JSON {
-    version: 1,
-    recipient,
-    profile: base64url(profile JSON),
-    privateData: base64url(optional bytes),
-})
-
-plaintext JSON = {
-    sender: { signingKey, encryptionKey },
-    profile: base64url(profile JSON),
-    privateData: base64url(optional bytes),
-    signature: base64url(signature),
-}
-```
-
-The plaintext is sealed to the recipient X25519 key. The recipient identity and
-version are AES-GCM associated data. On receipt, the client checks the envelope
-recipient, decrypts it, verifies the sender signature over the recipient-bound
-profile, and only then stores the contact. The recipient binding prevents an
-observed profile from being replayed to a third identity.
-
-Profiles may carry up to 256 KiB of optional private application bytes. The CLI
-uses that channel for a contact's one-use MLS KeyPackage.
-
-## Pairwise addressing
-
-Direct conversations do not use public inboxes. Given self's private X25519
-key and the peer's public X25519 key:
-
-```text
-sharedSecret = X25519(self.encryptionSecretKey, peer.encryptionKey)
-publicKeys   = sort([
-    base64url(self.encryptionKey),
-    base64url(peer.encryptionKey),
-])
-
-pairwiseTopic = "pairwise:" + base64url(SHA-256(canonical JSON {
-    context: "murmur/pairwise-topic/x25519-sha256/v1",
-    publicKeys,
-    sharedSecret: base64url(sharedSecret),
-}))
-```
-
-The implementation zeros the derived secret and hashing preimage after
-derivation. Alice and Bob derive the same topic; possession of both public
-identity tokens is insufficient.
-
-This is necessary because topic reads have no authentication. A topic derived
-only from a public token would let anyone with that token inspect the event
-authors, timing, and sizes of its writer's traffic.
-
-## Direct messages
-
-The decrypted `PrivateMessage` format is:
-
-```ts
-{
-    version: 1,
-    id: string, // base64url encoding of 24 random bytes
-    sentAt: number,
-    text: string,
-    attachments: readonly EncryptedFileDescriptor[],
-}
-```
-
-The sender first encodes that JSON and signs:
-
-```text
-Ed25519.sign(canonical JSON {
-    version: 1,
-    recipient: recipient identity ID,
-    message: base64url(private-message JSON),
-})
-```
-
-It places the message bytes and signature in JSON, then seals that JSON to the
-recipient's **long-term** X25519 key. The final event payload is the UTF-8 JSON
-form:
-
-```ts
-{
-    version: 1,
-    sender: { signingKey: string, encryptionKey: string },
-    recipient: string,
-    ephemeralPublicKey: string,
-    nonce: string,
-    ciphertext: string,
-}
-```
-
-The outer sealed-box associated data binds the claimed sender public keys,
-recipient identity ID, and version. A receiving client decrypts, checks the
-recipient, and verifies the inner sender signature.
-
-The direct-message envelope is both the relay event payload and the bytes of
-one appended permanent list element. Its list ID is:
-
-```text
-"message:" + base64url(SHA-256(canonical JSON {
-    context: "murmur/private-message-list-element/v1",
-    sender: base64url(sender signing key),
-    id: message ID,
-}))
-```
-
-That stable author-scoped list ID prevents a retained publication retry from
-creating a second message history element.
-
-Messages managed by `DirectChat` append a second version-one envelope sealed
-to the sender's own long-term X25519 key. It is stored on the same pairwise
-topic, but never used as the live event payload. Its distinct list ID is:
-
-```text
-"self-message:" + base64url(SHA-256(canonical JSON {
-    context: "murmur/private-message-self-list-element/v1",
-    sender: base64url(sender signing key),
-    peer: base64url(recipient signing key),
-    id: message ID,
-}))
-```
-
-The peer binding prevents a retained self copy from being attributed to a
-different pairwise conversation. The recipient cannot open this copy. A fresh
-sender device can open it, while ignoring the recipient-sealed element. Both
-participants collapse their authorized copy to the same logical message ID, so
-copies repeated by several relays do not duplicate history. Older topics with
-only recipient-sealed elements remain readable by recipients.
-
-The direct-chat outbox remains until every still-configured relay accepts the
-logical send. For attachment messages it transactionally retains ciphertext
-blobs and per-relay upload/event progress with the canonical message, both
-encrypted copies, and application callback state. A relay event is published
-only after that same relay has accepted every referenced blob. Ambiguous
-uploads are retried idempotently. Local outbox ciphertext is removed after all
-still-configured relays accept blobs and event; removed relays do not poison
-retention. Relay blobs remain permanent opaque content-addressed ciphertext.
-
-If a pending signed event approaches the relay's timestamp window, the client
-atomically replaces it with a freshly timestamped and signed event whose topic,
-payload, and two stable list operations are byte-equivalent. Different relays
-may therefore retain different event IDs for one logical message; stable
-element IDs and authenticated replay records collapse them.
-
-### Direct-message acceptance
-
-`acceptPrivateMessageFromContact()` uses a local replay key scoped to recipient,
-authenticated sender, and a SHA-256 digest of the message ID. In one
-`MurmurStore.transaction()` it:
-
-1. decrypts and verifies the message before starting persistence;
-2. invokes the application callback only for a new record;
-3. records a fingerprint of the complete authenticated message;
-4. optionally calls `ReceivedEvent.advanceCursor(transaction)`.
-
-An identical replay returns `"duplicate"` and can advance a pending cursor. A
-same-ID message whose authenticated content differs raises
-`DirectMessageIdCollisionError` and leaves the transaction unchanged.
-
-Direct messages do **not** have post-compromise security. A stolen long-term
-recipient X25519 encryption key can open previously recorded direct-message
-sealed boxes and future ones addressed to that key.
-
-`DirectChat` additionally requires the authenticated envelope sender to match
-the friend identity that derives the pairwise topic. Invalid envelopes,
-same-ID/different-content collisions, and messages received while that friend
-is removed are replay-marked and quarantined while the relay cursor advances
-atomically. Applications persist their message row in that same transaction,
-but own all chat, UI, read-state, and presentation semantics.
-
-## Files and blobs
-
-`encryptFile()` produces:
-
-```ts
-{
-    descriptor: {
-        version: 1,
-        blobId: string, // base64url(SHA-256(ciphertext))
-        key: Uint8Array, // 32 bytes
-        nonce: Uint8Array, // 12 bytes
-        name: string,
-        mediaType: string,
-        plaintextBytes: number,
-    },
-    blob: {
-        id: string,
-        bytes: Uint8Array, // AES-GCM ciphertext
-    },
-}
-```
-
-The file key and nonce are random. AES-GCM associated data is canonical JSON of
-the descriptor's version, name, media type, and plaintext length. Thus a
-modified descriptor does not decrypt. `decryptFile()` verifies the blob content
-address, descriptor ID, ciphertext size, AEAD tag, and resulting plaintext
-length.
-
-The descriptor is delivered only inside an encrypted direct or MLS message.
-Blob transport is separate:
-
-```text
-POST /v1/blobs/:id/upload-link
-    -> { url, method: "PUT", expiresAt, headers? }
-
-POST /v1/blobs/:id/download-link
-    -> { url, method: "GET", expiresAt, headers? }
-```
-
-The local backend's `url` is relative to the relay and contains signed expiry
-parameters. S3's is an absolute presigned URL. An ordinary unsigned
-`PUT /v1/blobs/:id` or `GET /v1/blobs/:id` is not a blob API.
-
-DirectChat allows at most 64 attachments and 64 MiB aggregate plaintext per
-logical message. A non-`image/*` document has an absolute 10 MiB plaintext
-limit; images retain the per-file maximum implied by the 64 MiB encrypted relay
-cap. Authenticated oversize document metadata remains part of message history,
-but the stateless attachment fetch reports a typed policy refusal before
-network or decryption work.
-
-Attachment downloads pass the authenticated `plaintextBytes + 16` ciphertext
-length to the relay transport. The HTTP implementation rejects a larger
-declared or streamed response before concatenating it, requires the exact final
-length, and then verifies the content address. DirectChat separately classifies
-unavailable ciphertext, policy refusal, and hash/AEAD/metadata integrity
-failure. AES-GCM remains a whole-blob operation; no resumability is claimed.
-
-## MLS groups
-
-Murmur implements a tested subset of RFC 9420. A group has a random opaque
-`groupId`; each epoch has TreeKEM ratchet state and group membership. Its stable
-relay address is:
-
-```text
-mlsGroupTopic(groupId) = "mls:" + base64url(SHA-256(groupId))
-```
-
-Every epoch uses that one topic. The relay observes only signed outer events
-and opaque MLS payloads; it does not interpret group membership or document
-traffic.
-
-`MlsGroupChannel` routes a relay event to one current epoch. It distinguishes
-MLS PublicMessage-form Commit bytes from application ciphertext, hashes the
-payload as a replay fingerprint, and returns one of these delivery outcomes:
-
-| Status                            | Required durable action                                                                                                  |
-| --------------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `opened`                          | Persist application record, post-open epoch checkpoint, replay fingerprint, and cursor together; then `markPersisted()`. |
-| `commit`                          | Persist the staged next-epoch checkpoint and Commit marker, `markPersisted()`, then `adopt()`.                           |
-| `application-applied` / `applied` | Persist only the relevant cursor if the replay marker is already durable.                                                |
-| `removed`                         | Persist group retirement and cursor before `markPersisted()` destroys live state.                                        |
-| `deferred`                        | Do not advance automatically. It may be a valid future-epoch message.                                                    |
-
-### Prepare → persist → publish
-
-Sending ratchets secret state. `prepareSend()` returns application ciphertext
-and a serialized post-ratchet epoch checkpoint. `prepareCommit()` returns a
-Commit, optional Welcome, staged next epoch, and replay fingerprint. In both
-cases the caller must:
-
-```text
-prepare
-    -> atomically persist exact payload, checkpoint, and application outbox
-    -> markPersisted()
-    -> publish()
-    -> for a Commit, adopt()
-```
-
-A timeout after publish starts is ambiguous, not a safe failure. The prepared
-operation remains staged until a retained Murmur outbound retry confirms the
-matching payload.
-
-The order prevents loss of the sender's next state. In particular, publishing a
-Commit before the next-epoch private state is durable can permanently lock the
-sender out of its own group after a crash.
-
-Groups offer forward-secret epochs after membership transitions. This is better
-than direct messages, but it does not repair an unverified identity-token
-exchange or make the relay available.
-
-## Shared agent sessions
-
-A shared agent session is an owner-controlled application protocol over one
-stable MLS group. Rig supplies the opaque bounded `shareId`; Murmur binds it
-permanently to one owner and one MLS group ID/topic.
-
-Owner entry frames contain a gapless positive `shareSequence`, owner-minted
-UUIDv7 `shareEventId`, timestamp, SHA-256 content hash, and the complete opaque
-canonical-JSON Rig payload. Murmur does not interpret roles, tool calls, or
-transcript bodies. Entry replay identity is the share, sequence, event ID, and
-matching content hash; conflicting authenticated content is a protocol error.
-
-Non-owner application frames come in two kinds, both authenticated by MLS at
-the peer leaf and both carrying the current owner-issued `grantEpoch` with a
-caller-stable identifier. A **post** is bounded text. A **control** frame is
-bounded opaque canonical JSON, for negotiation that is durable-appropriate but
-is not conversation; the owner deduplicates `(share, peer, grantEpoch, id)` for
-each kind independently. An application which supplies no `persistControl`
-callback accepts no control at all: inbound control is quarantined rather than
-surfaced anywhere. Keeping the two apart is what stops attacker-controlled
-structured data from having to travel as chat text on its way to a model.
-
-Owner-signed state gives each peer a stable `shareMemberId` and increments its
-`grantEpoch` on every re-add. Ended state is keyed by both values, so an old
-ended frame cannot terminate a later grant. Only the pinned owner may author
-state, entries, history offers, or MLS Commits.
-
-History is not old MLS ciphertext. Rig streams bounded pages which Murmur
-encrypts as independent file blobs. A page contains at most 256 entries and
-4 MiB of plaintext. Encrypted offers carry at most 256 page descriptors and
-chain without a lifetime byte ceiling. Members persist one page at a time,
-track the highest contiguous sequence, and keep a bounded durable live tail
-while backfilling.
-
-### Ephemeral frames
-
-Terminal bytes are wrong to write down: they must not be durable, must not be
-sequenced against transcript entries, and must not wait for a long poll. They
-travel on a separate, non-durable channel over the **same** MLS group.
-
-Key material comes from the RFC 9420 exporter of the group's current epoch
-(`MLS-Exporter("murmur ephemeral channel v1", shareId, 32)`), not from the
-application ratchet, so a frame creates no checkpoint obligation and nothing is
-written to `MurmurStore`. Membership, the owner-only-committer rule, and
-epoch-based revocation therefore apply unchanged, with no second group and no
-second trust root.
-
-One frame is `version(1) | type(1) | epoch(8) | senderLeaf(2) | streamId(16) |
-counter(8)`, then a 64-byte Ed25519 signature by the sender's MLS leaf key,
-then AES-128-GCM ciphertext. The header and the group ID are the AEAD
-associated data. The signature is not redundant: every member of an epoch holds
-the same exported secret, so without it one member could forge another's
-frames. Per-stream keys are derived from `senderLeaf || streamId`, and the
-random per-instance `streamId` is what lets the counter live in memory — a
-restarted sender picks a new stream and therefore a new key, so no nonce is
-reused and no counter is ever stored.
-
-The header is cleartext, so nothing it says is trusted until the signature
-verifies. A receiver resolves the sender's leaf key and checks the signature
-_before_ it looks at the epoch, because a foreign epoch is reported to the
-application as evidence that membership moved: acting on an unverified header
-would let anyone who can reach the relay name an arbitrary epoch and drive that
-reaction. A frame that fails to verify is an `authentication` drop and reports
-no epoch at all. Inbound stream state is bounded at 8 live streams per sending
-leaf and 256 leaves; an evicted stream leaves behind its high-water counter, so
-flushing the table does not reopen its frames to replay.
-
-Payloads are bounded at 64 KiB, well under the relay's 1 MiB event payload
-limit. The channel is lossy on purpose: a sender's queue is bounded in both
-frames and bytes and drops its oldest entries under pressure rather than
-growing, and a forged, stale, replayed, or malformed frame is a counted drop
-rather than an error. Ordering holds per sender only. An authenticated frame
-naming a different epoch is reported as an epoch change, which is the earliest
-available warning that membership moved; adopting a Commit locally rekeys the
-channel at once and discards anything still queued under the old epoch. That
-warning is an optimization rather than a guarantee — a Commit which blanks a
-peer's leaf silences it outright instead of reporting an epoch, so durable
-sync remains the backstop. Only
-application data travels here: every other header type byte is rejected, so no
-frame is ever accepted and then silently discarded.
-
-Ephemeral frames are carried by `POST /v1/topics/{topic}/ephemeral` and
-`GET /v1/topics/{topic}/stream`, which store nothing at the relay.
-
-Revocation sends authenticated ended state before the owner Remove Commit.
-Receiving ended state or an MLS removal invokes the application's termination
-callback in the transaction which deletes protocol replica rows and transport
-cursors, then destroys epoch secrets. This is cooperative deletion: plaintext
-or blob keys already saved by a former member cannot be cryptographically
-erased. Later epoch and history-page keys remain inaccessible. Because the
-ephemeral channel is keyed from the same epoch, the Remove Commit also voids
-in-flight ephemeral traffic immediately, without waiting for a durable sync.
-
-## Shared text documents
-
-A shared document is an operation-based replicated growable array. Its
-operations are UTF-8 JSON carried as MLS application data:
-
-```ts
-// insert
-{
-    version: 1,
-    type: "insert",
-    id: { actor: string, sequence: number },
-    after: { actor: string, sequence: number } | null,
-    text: string,
-}
-
-// delete
-{
-    version: 1,
-    type: "delete",
-    id: { actor: string, sequence: number },
-    target: { actor: string, sequence: number },
-}
-```
-
-`actor` is a canonical base64url 32-byte public signing key and `sequence` is a
-non-negative 32-bit integer. `SharedTextDocument.apply()` receives both an
-operation and the actor authenticated by the MLS leaf; it rejects an operation
-whose `id.actor` differs from that actor.
-
-Operations are idempotent and commutative. Concurrent inserts after the same
-anchor sort by operation ID. Deletes are permanent tombstones and may arrive
-before their target. Replicas retain at most 10,000 operations and 4 MiB of
-encoded operation state; when a bound is exceeded, deterministic trimming keeps
-the same lowest operation IDs on each replica.
+For protected writes, the client derives the public key from `writeSecretKey`
+and requires it to equal `topic.writeKey` before signing. This permits several
+different Murmur identities to share one MLS or control-stream capability
+without exposing their identity signing keys to the relay envelope.
+
+For `Read Topic`, no designated write capability exists, so the client's normal
+identity signer is a valid relay author.
+
+There is exactly one `RelayTransport` per stateful client. Multi-relay ordering,
+failover, and relay-specific cursors are not protocol concepts.

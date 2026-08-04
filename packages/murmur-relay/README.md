@@ -22,6 +22,10 @@ event durable. Publishing with a `collapseKey` atomically removes older retained
 events carrying the same key in that topic. Relay sequences are never reused, so
 expiration and collapse create intentional cursor holes.
 
+Read pages include `exhausted`; clients advance across trailing holes to the
+topic head only when it is true. Exact authenticated retries keep their original
+sequence even after timestamp or explicit event expiration.
+
 ## Run
 
 ```bash

@@ -1,5 +1,5 @@
-import type { IdentityKeyPair } from "../crypto/index.js";
-import { hashBytes, randomBytes, signBytes, verifyBytes } from "../crypto/index.js";
+import { ed25519 } from "@noble/curves/ed25519";
+import { hashBytes, randomBytes, verifyBytes } from "../crypto/index.js";
 import { canonicalJsonBytes, encodeBase64Url, equalBytes } from "../utils/index.js";
 import {
     decodeSignedRelayEventWire,
@@ -7,7 +7,7 @@ import {
     relayTopicToJson,
     signedRelayEventToJson,
 } from "./impl/wireCodec.js";
-import type { RelayTopic, SignedRelayEvent } from "./types.js";
+import type { RelaySigningKey, RelayTopic, SignedRelayEvent } from "./types.js";
 
 export type {
     EventPage,
@@ -15,6 +15,7 @@ export type {
     ReadTopic,
     ReadWriteTopic,
     RelayFetch,
+    RelaySigningKey,
     RelayTopic,
     RelayTransport,
     RetainedRelayEvent,
@@ -48,7 +49,7 @@ export function relayEventSigningBytes(event: SignedRelayEvent): Uint8Array {
 
 /** Create one signed durable event. */
 export function createRelayEvent(
-    author: IdentityKeyPair,
+    author: RelaySigningKey,
     topic: RelayTopic,
     payload: Uint8Array,
     options: {
@@ -75,7 +76,17 @@ export function createRelayEvent(
             signature: new Uint8Array(64),
         }),
     );
-    return { ...unsigned, signature: signBytes(author, relayEventSigningBytes(unsigned)) };
+    if (
+        author.signingKey.length !== 32 ||
+        author.signingSecretKey.length !== 32 ||
+        !equalBytes(ed25519.getPublicKey(author.signingSecretKey), author.signingKey)
+    ) {
+        throw new Error("Invalid relay signing key");
+    }
+    return {
+        ...unsigned,
+        signature: ed25519.sign(relayEventSigningBytes(unsigned), author.signingSecretKey),
+    };
 }
 
 /** Verify an event using strict Ed25519 and exact wire validation. */

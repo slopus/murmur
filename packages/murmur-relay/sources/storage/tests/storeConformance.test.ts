@@ -62,6 +62,22 @@ describe("relay store conformance", () => {
                 });
                 expect(page.head).toBe(2n);
                 expect(page.events.map(({ seq }) => seq)).toEqual([2n]);
+                expect(page.exhausted).toBe(true);
+
+                const pagedTopic = { ...topic, name: "byte-page" };
+                const pagedTopicId = relayTopicId(pagedTopic);
+                await store.publish(signed(secretKey, pagedTopic, 3), pagedTopicId, NOW);
+                await store.publish(signed(secretKey, pagedTopic, 4), pagedTopicId, NOW);
+                const firstPage = await store.readEvents(pagedTopicId, 0n, 100, NOW, {
+                    maximumEncodedBytes: 1,
+                });
+                expect(firstPage.events.map(({ seq }) => seq)).toEqual([1n]);
+                expect(firstPage.exhausted).toBe(false);
+                const secondPage = await store.readEvents(pagedTopicId, 1n, 100, NOW, {
+                    maximumEncodedBytes: 1,
+                });
+                expect(secondPage.events.map(({ seq }) => seq)).toEqual([2n]);
+                expect(secondPage.exhausted).toBe(true);
             } finally {
                 await store.close();
             }

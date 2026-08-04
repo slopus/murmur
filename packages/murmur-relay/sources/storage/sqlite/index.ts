@@ -164,19 +164,20 @@ export class SqliteRelayStore implements RelayStore {
         this.#assertOpen();
         const topic = this.#get("SELECT head FROM murmur_relay_topics WHERE id = ?", topicId);
         if (topic === undefined) {
-            return { events: [], head: 0n };
+            return { events: [], head: 0n, exhausted: true };
         }
         const rows = this.#all(
             `WITH candidates AS (
                 SELECT seq, event_json,
                     ROW_NUMBER() OVER (ORDER BY seq) AS row_number,
+                    COUNT(*) OVER () AS available_count,
                     SUM(LENGTH(event_json) + 64) OVER (
                         ORDER BY seq ROWS UNBOUNDED PRECEDING
                     ) AS cumulative_bytes
                 FROM murmur_relay_events
                 WHERE topic_id = ? AND seq > ? AND (expires_at IS NULL OR expires_at > ?)
              )
-             SELECT seq, event_json FROM candidates
+             SELECT seq, event_json, row_number, available_count FROM candidates
              WHERE row_number = 1 OR cumulative_bytes <= ?
              ORDER BY seq LIMIT ?`,
             topicId,
@@ -195,6 +196,10 @@ export class SqliteRelayStore implements RelayStore {
                 }),
             ),
             head: bigintColumn(topic.head),
+            exhausted:
+                rows.length === 0 ||
+                bigintColumn(rows.at(-1)!.row_number) ===
+                    bigintColumn(rows.at(-1)!.available_count),
         };
     }
 

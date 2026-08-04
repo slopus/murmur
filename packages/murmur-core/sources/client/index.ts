@@ -1,16 +1,18 @@
 import type { IdentityKeyPair } from "../crypto/index.js";
+import { ed25519 } from "@noble/curves/ed25519";
 import { identityId } from "../identity/index.js";
 import type { MurmurStore, StoreTransaction } from "../storage/index.js";
 import {
     createRelayEvent,
     relayTopicId,
     verifyRelayEvent,
+    type RelaySigningKey,
     type RelayTopic,
     type RelayTransport,
     type SignedRelayEvent,
     type TopicAccess,
 } from "../transport/index.js";
-import { utf8Decode, utf8Encode } from "../utils/index.js";
+import { equalBytes, utf8Decode, utf8Encode } from "../utils/index.js";
 import type { PublishResult, ReceivedEvent, Subscription, SyncResult } from "./types.js";
 
 export type { PublishResult, ReceivedEvent, Subscription, SyncResult } from "./types.js";
@@ -80,14 +82,15 @@ export class MurmurClient {
 
     /** Sign and publish opaque bytes to the single configured relay. */
     async publish(
-        topic: RelayTopic,
+        access: TopicAccess,
         payload: Uint8Array,
         options: {
             readonly expiresAt?: number;
             readonly collapseKey?: Uint8Array;
         } = {},
     ): Promise<PublishResult> {
-        return this.publishEvent(createRelayEvent(this.#identity, topic, payload, options));
+        const signer = this.#writeSigner(access);
+        return this.publishEvent(createRelayEvent(signer, access.topic, payload, options));
     }
 
     /** Publish one pre-created event with no hidden retry or failover behavior. */
@@ -131,6 +134,9 @@ export class MurmurClient {
                 throw new Error("Relay returned a topic head behind the durable cursor");
             }
             if (page.events.length === 0) {
+                if (!page.exhausted) {
+                    throw new Error("Relay returned an empty non-exhausted event page");
+                }
                 if (page.head > cursor) await this.#store.set(cursorKey, cursorBytes(page.head));
                 continue;
             }
@@ -140,16 +146,14 @@ export class MurmurClient {
                 if (
                     retained === undefined ||
                     retained.seq <= previousSequence ||
+                    retained.seq > page.head ||
                     relayTopicId(retained.event.topic) !== topicId ||
                     !verifyRelayEvent(retained.event)
                 ) {
                     throw new Error("Relay returned an invalid ordered event page");
                 }
                 const isLast = index === page.events.length - 1;
-                const target =
-                    isLast && page.events.length < DEFAULT_EVENT_PAGE_LIMIT
-                        ? page.head
-                        : retained.seq;
+                const target = isLast && page.exhausted ? page.head : retained.seq;
                 const expectedCursor = previousSequence;
                 events.push({
                     seq: retained.seq,
@@ -185,5 +189,23 @@ export class MurmurClient {
 
     #cursorKey(topic: RelayTopic): string {
         return `${this.#cursorPrefix}${relayTopicId(topic)}`;
+    }
+
+    #writeSigner(access: TopicAccess): RelaySigningKey {
+        if (access.topic.type === "read") {
+            return this.#identity;
+        }
+        const secretKey = access.writeSecretKey;
+        if (
+            secretKey === undefined ||
+            secretKey.length !== 32 ||
+            !equalBytes(ed25519.getPublicKey(secretKey), access.topic.writeKey)
+        ) {
+            throw new Error("Write secret key does not match the topic capability");
+        }
+        return {
+            signingKey: access.topic.writeKey,
+            signingSecretKey: secretKey,
+        };
     }
 }
