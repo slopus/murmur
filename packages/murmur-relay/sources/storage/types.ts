@@ -1,103 +1,51 @@
 import type { SignedRelayEvent } from "../protocol/index.js";
 
-/** Result of an atomic publish, preserved exactly for idempotent retries. */
+/** Result of an atomic idempotent publish. */
 export interface PublishOutcome {
     readonly seq: bigint;
     readonly duplicate: boolean;
-    readonly snapshotVersion?: bigint;
 }
 
-/** Durable identity and original outcome of one successfully published event. */
+/** Durable identity and original outcome of a published event. */
 export interface PublishReceipt {
     readonly seq: bigint;
     readonly fingerprint: Uint8Array;
-    readonly snapshotVersion?: bigint;
 }
 
-/** Relay policy which a store must enforce inside the publish transaction. */
-export interface PublishConstraints {
-    readonly maximumElementsPerTopic: number;
-}
-
-/** Allocation bound applied while a store materializes one response page. */
+/** Allocation bound applied while materializing one event page. */
 export interface PageReadConstraints {
     readonly maximumEncodedBytes: number;
 }
 
-/** Current opaque snapshot with its last mutation version and topic sequence. */
-export interface TopicSnapshot {
-    readonly version: bigint;
-    readonly seq: bigint;
-    readonly bytes: Uint8Array;
-}
-
-/** Current opaque list element in relay-assigned order. */
-export interface ListElement {
-    readonly id: string;
-    readonly version: bigint;
-    readonly position: bigint;
-    readonly seq: bigint;
-    readonly bytes: Uint8Array;
-}
-
-/** One stable page of current list elements. */
-export interface ListPage {
-    readonly elements: readonly ListElement[];
-    readonly nextCursor: string | null;
-}
-
-/** Snapshot and first list page read at one transactionally consistent sequence. */
-export interface TopicState {
-    readonly seq: bigint;
-    readonly snapshot: TopicSnapshot | null;
-    readonly list: ListPage;
-}
-
-/** One retained signed mutation associated with its per-topic sequence. */
+/** One retained event associated with its never-reused topic sequence. */
 export interface RetainedRelayEvent {
     readonly seq: bigint;
     readonly event: SignedRelayEvent;
 }
 
-/** Bounded retained events plus reset information and the current topic head. */
+/**
+ * Retained events after a cursor and the current topic head.
+ *
+ * Sequence gaps are expected after expiration or collapse. `head` is the
+ * greatest sequence ever allocated and remains monotonic across those holes.
+ */
 export interface EventPage {
     readonly events: readonly RetainedRelayEvent[];
-    readonly reset: boolean;
-    readonly seq: bigint;
-}
-
-/** Counts returned after dropping inactive topic state. */
-export interface PruneResult {
-    readonly topics: number;
+    readonly head: bigint;
 }
 
 /** Atomic persistence operations required by the relay service. */
 export interface RelayStore {
-    readPublishReceipt(topic: string, id: string): Promise<PublishReceipt | undefined>;
-    publish(
-        event: SignedRelayEvent,
-        now: number,
-        constraints: PublishConstraints,
-    ): Promise<PublishOutcome>;
-    readState(
-        topic: string,
-        limit: number,
-        constraints: PageReadConstraints,
-    ): Promise<TopicState | undefined>;
-    readList(
-        topic: string,
-        cursor: string | undefined,
-        limit: number,
-        constraints: PageReadConstraints,
-    ): Promise<ListPage | undefined>;
+    readPublishReceipt(topicId: string, id: string): Promise<PublishReceipt | undefined>;
+    publish(event: SignedRelayEvent, topicId: string, now: number): Promise<PublishOutcome>;
     readEvents(
-        topic: string,
+        topicId: string,
         since: bigint,
         limit: number,
+        now: number,
         constraints: PageReadConstraints,
-    ): Promise<EventPage | undefined>;
-    pruneEvents(olderThan: number): Promise<number>;
-    pruneInactiveTopics(olderThan: number): Promise<PruneResult>;
+    ): Promise<EventPage>;
+    pruneExpired(now: number): Promise<number>;
     health(): Promise<void>;
     close(): Promise<void>;
 }

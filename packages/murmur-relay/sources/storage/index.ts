@@ -1,4 +1,5 @@
 export { SqliteRelayStore } from "./sqlite/index.js";
+export type { SqliteRelayStoreOptions } from "./sqlite/index.js";
 export {
     PgPoolDatabase,
     PGliteDatabase,
@@ -15,16 +16,9 @@ export type {
 } from "./postgres/index.js";
 export type {
     EventPage,
-    ListElement,
-    ListPage,
     PageReadConstraints,
-    PruneResult,
-    PublishConstraints,
     PublishOutcome,
     PublishReceipt,
     RelayStore,
     RetainedRelayEvent,
-    TopicSnapshot,
-    TopicState,
 } from "./types.js";
-export type { SqliteRelayStoreOptions } from "./sqlite/index.js";

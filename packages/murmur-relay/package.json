@@ -2,7 +2,7 @@
     "name": "@murmur/relay",
     "version": "0.1.0",
     "private": true,
-    "description": "Murmur Relay: encrypted topics with snapshot, list, and a bounded event log",
+    "description": "Murmur Relay: key-scoped ordered event storage",
     "license": "MIT",
     "bin": {
         "murmur-relay": "./dist/main.js"
@@ -28,7 +28,6 @@
         "check": "tsc --noEmit -p tsconfig.json",
         "start": "node dist/main.js",
         "test": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run",
-        "test:live": "MURMUR_LIVE_TESTS=true vitest run sources/http/tests/live.test.ts",
         "test:watch": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest"
     },
     "dependencies": {

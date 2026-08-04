@@ -1,718 +1,212 @@
 import {
     RelayError,
+    parseRelayTopic,
     parseSignedRelayEvent,
     signedRelayEventToJson,
-    verifyRelayEventSignature,
+    type ReadProof,
 } from "../protocol/index.js";
-import type { BlobBackend } from "../blobs/index.js";
-import { isBlobId } from "../blobs/index.js";
-import { InMemoryTokenBucketRateLimiter, type RateLimiter } from "../rate-limit/index.js";
 import type { RelayService } from "../relay/index.js";
-import type {
-    EventPage,
-    ListElement,
-    ListPage,
-    PublishOutcome,
-    TopicState,
-} from "../storage/index.js";
-import { encodeBase64Url } from "../utils/base64Url.js";
-import { encodeListCursor } from "../utils/cursor.js";
-import { resolveClientIp, type TrustedProxyPolicy } from "./impl/clientIp.js";
-import { readBoundedRequestBody } from "./impl/requestReadBody.js";
-import { createEphemeralStreamResponse } from "./impl/streamResponse.js";
+import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 
-const decoder = new TextDecoder("utf-8", { fatal: true });
-const DEFAULT_MAXIMUM_PAGE_RESPONSE_BYTES = 8 * 1024 * 1024;
-
-export type { TrustedProxyPolicy } from "./impl/clientIp.js";
-
-/** CORS policy for the Fetch-compatible relay handler. */
-export interface RelayHttpOptions {
-    /** `*` or an explicit browser origin allowlist. Defaults to `*`. */
-    readonly origins?: "*" | readonly string[];
-    /** Aggregate encoded event/list page budget. Defaults to 8 MiB. */
-    readonly maximumPageResponseBytes?: number;
-    /** Blob link backend. Blob routes return unavailable when omitted. */
-    readonly blobBackend?: BlobBackend;
-    /** Replacement rate limiter, such as a future shared-store implementation. */
-    readonly rateLimiter?: RateLimiter;
-    /** Explicit proxy hop count or exact trusted proxy address list. */
-    readonly trustedProxies?: TrustedProxyPolicy;
-    /** Clock used for link expiry and rate-limit accounting. */
-    readonly now?: () => number;
-    /** Optional request-summary logger. The reusable handler is silent by default. */
-    readonly logger?: RelayHttpLogger;
-}
-
-/** Minimal logger accepted by the HTTP boundary. */
-export interface RelayHttpLogger {
-    readonly info: (message: string) => void;
-    readonly warn: (message: string) => void;
-    readonly error: (message: string) => void;
-}
-
-/** Socket metadata supplied by the Node adapter rather than caller headers. */
+/** Metadata supplied by a concrete HTTP host. */
 export interface RelayRequestContext {
     readonly remoteAddress?: string;
 }
 
-/** Fetch-compatible relay handler with optional trusted transport metadata. */
+/** Fetch-compatible relay request handler. */
 export type RelayFetchHandler = (
     request: Request,
     context?: RelayRequestContext,
 ) => Promise<Response>;
 
-interface ResolvedRelayHttpOptions {
-    readonly origins: "*" | readonly string[];
-    readonly maximumPageResponseBytes: number;
-    readonly blobBackend: BlobBackend | undefined;
-    readonly rateLimiter: RateLimiter | undefined;
-    readonly trustedProxies: TrustedProxyPolicy | undefined;
-    readonly now: () => number;
-    readonly logger: RelayHttpLogger | undefined;
+/** CORS policy for the relay HTTP boundary. */
+export interface RelayHttpOptions {
+    readonly allowedOrigins?: "*" | readonly string[];
 }
 
-class HttpRateLimitError extends Error {
-    constructor(readonly retryAfterMilliseconds: number) {
-        super("Relay rate limit exceeded");
-    }
-}
-
-function jsonStringify(value: unknown): string {
-    return JSON.stringify(value, (_key: string, member: unknown): unknown =>
-        typeof member === "bigint" ? member.toString() : member,
-    );
-}
-
-function jsonTextResponse(value: string, status: number = 200): Response {
-    return new Response(value, {
-        status,
-        headers: { "content-type": "application/json; charset=utf-8" },
-    });
-}
-
-function jsonResponse(value: unknown, status: number = 200): Response {
-    return jsonTextResponse(jsonStringify(value), status);
-}
-
-function textResponse(value: string, status: number = 200): Response {
-    return new Response(value, {
-        status,
-        headers: { "content-type": "text/plain; charset=utf-8" },
-    });
-}
-
-function rateLimitResponse(error: HttpRateLimitError): Response {
-    return new Response(
-        jsonStringify({
-            error: "rate_limited",
-            retryAfterMilliseconds: error.retryAfterMilliseconds,
-        }),
-        {
-            status: 429,
-            headers: {
-                "content-type": "application/json; charset=utf-8",
-                "retry-after": Math.max(
-                    1,
-                    Math.ceil(error.retryAfterMilliseconds / 1_000),
-                ).toString(),
-            },
-        },
-    );
-}
-
-function decodePathSegment(value: string): string {
-    try {
-        return decodeURIComponent(value);
-    } catch {
-        throw new RelayError(400, "Invalid route encoding", { error: "malformed" });
-    }
-}
-
-function queryValue(url: URL, name: string): string | undefined {
-    const values = url.searchParams.getAll(name);
-    if (values.length > 1) {
-        throw new RelayError(400, `Repeated ${name} query parameter`, {
-            error: "malformed",
-        });
-    }
-    return values[0];
-}
-
-function integerQuery(url: URL, name: string): number | undefined {
-    const value = queryValue(url, name);
-    if (value === undefined) {
-        return undefined;
-    }
-    if (!/^(?:0|[1-9][0-9]*)$/.test(value)) {
-        throw new RelayError(400, `Invalid ${name} query parameter`, {
-            error: "malformed",
-        });
-    }
-    const parsed = Number(value);
-    if (!Number.isSafeInteger(parsed)) {
-        throw new RelayError(400, `Invalid ${name} query parameter`, {
-            error: "malformed",
-        });
-    }
-    return parsed;
-}
-
-function bigintQuery(url: URL, name: string, fallback: bigint): bigint {
-    const value = queryValue(url, name);
-    if (value === undefined) {
-        return fallback;
-    }
-    if (!/^(?:0|[1-9][0-9]*)$/.test(value)) {
-        throw new RelayError(400, `Invalid ${name} query parameter`, {
-            error: "malformed",
-        });
-    }
-    return BigInt(value);
-}
-
-async function jsonBody(request: Request, maximumBytes: number): Promise<unknown> {
-    const bytes = await readBoundedRequestBody(request, maximumBytes);
-    try {
-        return JSON.parse(decoder.decode(bytes)) as unknown;
-    } catch {
-        throw new RelayError(400, "Malformed JSON body", { error: "malformed" });
-    }
-}
-
-function elementJson(element: ListElement): {
-    readonly id: string;
-    readonly version: string;
-    readonly bytes: string;
-} {
-    return {
-        id: element.id,
-        version: element.version.toString(),
-        bytes: encodeBase64Url(element.bytes),
-    };
-}
-
-function byteLength(value: string): number {
-    return Buffer.byteLength(value, "utf8");
-}
-
-function listPageText(page: ListPage, maximumBytes: number): string {
-    const prefix = '{"elements":[';
-    const itemTexts: string[] = [];
-    let itemBytes = 0;
-    let nextCursor = page.nextCursor;
-    for (const [index, element] of page.elements.entries()) {
-        const itemText = jsonStringify(elementJson(element));
-        const hasMore = index < page.elements.length - 1 || page.nextCursor !== null;
-        const candidateCursor = hasMore ? encodeListCursor(element.position) : null;
-        const candidateItemBytes =
-            itemBytes + byteLength(itemText) + (itemTexts.length === 0 ? 0 : 1);
-        const suffix = `],"nextCursor":${jsonStringify(candidateCursor)}}`;
-        const candidateBytes = byteLength(prefix) + candidateItemBytes + byteLength(suffix);
-        if (candidateBytes > maximumBytes && itemTexts.length > 0) {
-            nextCursor = encodeListCursor(page.elements[index - 1]?.position ?? 0n);
-            break;
-        }
-        itemTexts.push(itemText);
-        itemBytes = candidateItemBytes;
-        nextCursor = candidateCursor;
-    }
-    return `${prefix}${itemTexts.join(",")}],"nextCursor":${jsonStringify(nextCursor)}}`;
-}
-
-function stateText(state: TopicState, maximumBytes: number): string {
-    const snapshot = jsonStringify(
-        state.snapshot === null
-            ? null
-            : {
-                  version: state.snapshot.version.toString(),
-                  bytes: encodeBase64Url(state.snapshot.bytes),
-              },
-    );
-    const prefix = `{"seq":"${state.seq.toString()}","snapshot":${snapshot},"list":`;
-    const suffix = "}";
-    const listBudget = Math.max(1, maximumBytes - byteLength(prefix) - byteLength(suffix));
-    return `${prefix}${listPageText(state.list, listBudget)}${suffix}`;
-}
-
-function eventPageText(page: EventPage, maximumBytes: number): string {
-    const prefix = '{"events":[';
-    const suffix = `],"reset":${String(page.reset)},"seq":"${page.seq.toString()}"}`;
-    const itemTexts: string[] = [];
-    let itemBytes = 0;
-    for (const retained of page.events) {
-        const itemText = jsonStringify({
-            seq: retained.seq.toString(),
-            ...signedRelayEventToJson(retained.event),
-        });
-        const candidateItemBytes =
-            itemBytes + byteLength(itemText) + (itemTexts.length === 0 ? 0 : 1);
-        const candidateBytes = byteLength(prefix) + candidateItemBytes + byteLength(suffix);
-        if (candidateBytes > maximumBytes && itemTexts.length > 0) {
-            break;
-        }
-        itemTexts.push(itemText);
-        itemBytes = candidateItemBytes;
-    }
-    return `${prefix}${itemTexts.join(",")}${suffix}`;
-}
-
-function publishJson(outcome: PublishOutcome): unknown {
-    if (outcome.snapshotVersion === undefined) {
-        return {
-            seq: outcome.seq.toString(),
-            duplicate: outcome.duplicate,
-        };
-    }
-    return {
-        seq: outcome.seq.toString(),
-        duplicate: outcome.duplicate,
-        snapshotVersion: outcome.snapshotVersion.toString(),
-    };
-}
-
-function corsHeaders(request: Request, options: ResolvedRelayHttpOptions): Headers {
-    const headers = new Headers();
-    const origins = options.origins ?? "*";
-    const origin = request.headers.get("origin");
-    if (origins === "*") {
-        headers.set("access-control-allow-origin", "*");
-    } else if (origin !== null && origins.includes(origin)) {
-        headers.set("access-control-allow-origin", origin);
-        headers.set("vary", "Origin");
-    }
-    headers.set("access-control-allow-methods", "GET, POST, PUT, OPTIONS");
-    headers.set("access-control-allow-headers", "Content-Type, Content-Length");
-    headers.set("access-control-max-age", "86400");
-    return headers;
-}
-
-function withCors(
-    response: Response,
-    request: Request,
-    options: ResolvedRelayHttpOptions,
+function json(
+    body: unknown,
+    status: number = 200,
+    headers?: Readonly<Record<string, string>>,
 ): Response {
-    const headers = new Headers(response.headers);
-    for (const [name, value] of corsHeaders(request, options)) {
-        headers.set(name, value);
-    }
-    return new Response(response.body, {
-        status: response.status,
-        statusText: response.statusText,
-        headers,
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+            ...headers,
+        },
     });
 }
 
-async function routeRequest(
-    service: RelayService,
-    request: Request,
-    options: ResolvedRelayHttpOptions,
-    context: RelayRequestContext,
-): Promise<Response> {
-    const url = new URL(request.url);
-    const segments = url.pathname
-        .split("/")
-        .filter((segment) => segment.length > 0)
-        .map(decodePathSegment);
+function object(value: unknown, name: string): Record<string, unknown> {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) {
+        throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
+    }
+    return value as Record<string, unknown>;
+}
 
-    if (request.method === "OPTIONS") {
-        return new Response(null, { status: 204 });
+async function readJson(request: Request, maximumBytes: number): Promise<unknown> {
+    const declared = request.headers.get("content-length");
+    if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maximumBytes)) {
+        throw new RelayError(413, "Request body exceeds relay limit", { error: "limit" });
     }
-    const now = options.now();
-    if (!Number.isSafeInteger(now) || now < 0) {
-        throw new Error("Relay HTTP clock returned an invalid time");
-    }
-    const isPublish =
-        request.method === "POST" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "events";
-    const isUpload =
-        (request.method === "POST" &&
-            segments.length === 4 &&
-            segments[0] === "v1" &&
-            segments[1] === "blobs" &&
-            segments[3] === "upload-link") ||
-        (request.method === "PUT" &&
-            segments.length === 3 &&
-            segments[0] === "v1" &&
-            segments[1] === "blobs");
-    const isEphemeral =
-        request.method === "POST" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "ephemeral";
-    const rateLimit = service.options.rateLimit;
-    const cost =
-        rateLimit === false
-            ? 0
-            : isPublish
-              ? rateLimit.costs.publish
-              : isUpload
-                ? rateLimit.costs.upload
-                : isEphemeral
-                  ? rateLimit.costs.ephemeral
-                  : rateLimit.costs.read;
-    if (options.rateLimiter !== undefined && cost > 0) {
-        const clientIp = resolveClientIp(request, context.remoteAddress, options.trustedProxies);
-        await consumeRateLimit(options.rateLimiter, `ip:${clientIp}`, cost, now);
-    }
-    if (request.method === "GET" && segments.length === 0) {
-        return textResponse("Welcome to Murmur Relay!");
-    }
-    if (request.method === "GET" && segments.length === 1 && segments[0] === "health") {
-        await service.health();
-        return jsonResponse({ ok: true });
-    }
-    if (
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "events"
-    ) {
-        const topic = segments[2];
-        if (topic === undefined) {
-            throw new RelayError(400, "Missing topic", { error: "malformed" });
-        }
-        if (request.method === "POST") {
-            const event = parseSignedRelayEvent(
-                await jsonBody(request, service.options.maximumJsonBodyBytes),
-            );
-            if (event.topic !== topic) {
-                throw new RelayError(400, "Route topic does not match signed event", {
-                    error: "malformed",
-                });
+    const reader = request.body?.getReader();
+    const chunks: Uint8Array[] = [];
+    let size = 0;
+    if (reader !== undefined) {
+        try {
+            for (;;) {
+                const result = await reader.read();
+                if (result.done) break;
+                size += result.value.length;
+                if (size > maximumBytes || chunks.length >= 65_536) {
+                    await reader.cancel().catch(() => undefined);
+                    throw new RelayError(413, "Request body exceeds relay limit", {
+                        error: "limit",
+                    });
+                }
+                chunks.push(result.value);
             }
-            if (
-                options.rateLimiter !== undefined &&
-                rateLimit !== false &&
-                verifyRelayEventSignature(event)
-            ) {
-                await consumeRateLimit(
-                    options.rateLimiter,
-                    `author:${encodeBase64Url(event.author.signingKey)}`,
-                    rateLimit.costs.publish,
-                    now,
-                );
-            }
-            return jsonResponse(publishJson(await service.publish(event)));
-        }
-        if (request.method === "GET") {
-            const page = await service.readEvents(
-                topic,
-                bigintQuery(url, "since", 0n),
-                integerQuery(url, "limit"),
-                integerQuery(url, "wait") ?? 0,
-                request.signal,
-                options.maximumPageResponseBytes,
-            );
-            return page === undefined
-                ? jsonResponse({ error: "not_found" }, 404)
-                : jsonTextResponse(eventPageText(page, options.maximumPageResponseBytes));
+        } finally {
+            reader.releaseLock();
         }
     }
-    if (
-        request.method === "POST" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "ephemeral"
-    ) {
-        const topic = segments[2];
-        if (topic === undefined) {
-            throw new RelayError(400, "Missing topic", { error: "malformed" });
-        }
-        // `content-type` is deliberately not inspected: the body is opaque bytes
-        // and the relay stays dumb about what a client sends.
-        const frame = await readBoundedRequestBody(
-            request,
-            service.options.maximumEphemeralFrameBytes,
-        );
-        // One cheap POST fans out to every subscriber of the topic, so the
-        // fan-out is priced before it happens: a rejected publisher never gets
-        // the amplification. The count is read immediately before the
-        // synchronous publish below, so it is the count the frame is delivered
-        // to except for a stream opening or closing while the limiter answers.
-        const subscribers = service.ephemeralSubscriberCountForTopic(topic);
-        if (options.rateLimiter !== undefined && rateLimit !== false && subscribers > 0) {
-            const clientIp = resolveClientIp(
-                request,
-                context.remoteAddress,
-                options.trustedProxies,
-            );
-            await consumeRateLimit(
-                options.rateLimiter,
-                `ip:${clientIp}`,
-                // Clamped because a bucket can never pay a cost above its capacity.
-                Math.min(subscribers * rateLimit.costs.ephemeral, rateLimit.capacity),
-                now,
-            );
-        }
-        return jsonResponse({ delivered: service.publishEphemeral(topic, frame) });
+    const bytes = new Uint8Array(size);
+    let offset = 0;
+    for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.length;
     }
-    if (
-        request.method === "GET" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "stream"
-    ) {
-        const topic = segments[2];
-        if (topic === undefined) {
-            throw new RelayError(400, "Missing topic", { error: "malformed" });
-        }
-        return createEphemeralStreamResponse(service, topic, request.signal);
-    }
-    if (
-        request.method === "GET" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "state"
-    ) {
-        const topic = segments[2];
-        if (topic === undefined) {
-            throw new RelayError(400, "Missing topic", { error: "malformed" });
-        }
-        const state = await service.readState(
-            topic,
-            integerQuery(url, "limit"),
-            options.maximumPageResponseBytes,
-        );
-        return state === undefined
-            ? jsonResponse({ error: "not_found" }, 404)
-            : jsonTextResponse(stateText(state, options.maximumPageResponseBytes));
-    }
-    if (
-        request.method === "GET" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "topics" &&
-        segments[3] === "list"
-    ) {
-        const topic = segments[2];
-        if (topic === undefined) {
-            throw new RelayError(400, "Missing topic", { error: "malformed" });
-        }
-        const page = await service.readList(
-            topic,
-            queryValue(url, "cursor"),
-            integerQuery(url, "limit"),
-            options.maximumPageResponseBytes,
-        );
-        return page === undefined
-            ? jsonResponse({ error: "not_found" }, 404)
-            : jsonTextResponse(listPageText(page, options.maximumPageResponseBytes));
-    }
-    if (
-        request.method === "POST" &&
-        segments.length === 4 &&
-        segments[0] === "v1" &&
-        segments[1] === "blobs" &&
-        (segments[3] === "upload-link" || segments[3] === "download-link")
-    ) {
-        const id = segments[2];
-        if (id === undefined || !isBlobId(id)) {
-            throw new RelayError(400, "Invalid blob identifier", { error: "malformed" });
-        }
-        if (options.blobBackend === undefined) {
-            throw new RelayError(503, "Blob backend is unavailable", {
-                error: "blob_unavailable",
-            });
-        }
-        if (segments[3] === "upload-link") {
-            return jsonResponse(await options.blobBackend.createUploadLink(id, now));
-        }
-        const link = await options.blobBackend.createDownloadLink(id, now);
-        return link === undefined ? jsonResponse({ error: "not_found" }, 404) : jsonResponse(link);
-    }
-    if (
-        segments.length === 3 &&
-        segments[0] === "v1" &&
-        segments[1] === "blobs" &&
-        (request.method === "PUT" || request.method === "GET")
-    ) {
-        const id = segments[2];
-        if (id === undefined || !isBlobId(id)) {
-            throw new RelayError(400, "Invalid blob identifier", { error: "malformed" });
-        }
-        if (options.blobBackend?.handleTransfer === undefined) {
-            return jsonResponse({ error: "not_found" }, 404);
-        }
-        return options.blobBackend.handleTransfer(
-            request,
-            id,
-            now,
-            service.options.maximumBlobBytes,
-        );
-    }
-    return jsonResponse({ error: "not_found" }, 404);
-}
-
-type RequestRoute =
-    | "root"
-    | "health"
-    | "topic-events"
-    | "topic-ephemeral"
-    | "topic-stream"
-    | "topic-state"
-    | "topic-list"
-    | "blob-upload-link"
-    | "blob-download-link"
-    | "blob-transfer"
-    | "unknown";
-
-function requestRoute(request: Request): RequestRoute {
-    const segments = new URL(request.url).pathname
-        .split("/")
-        .filter((segment) => segment.length > 0);
-    if (segments.length === 0) {
-        return "root";
-    }
-    if (segments.length === 1 && segments[0] === "health") {
-        return "health";
-    }
-    if (segments.length === 4 && segments[0] === "v1" && segments[1] === "topics") {
-        if (segments[3] === "events") {
-            return "topic-events";
-        }
-        if (segments[3] === "ephemeral") {
-            return "topic-ephemeral";
-        }
-        if (segments[3] === "stream") {
-            return "topic-stream";
-        }
-        if (segments[3] === "state") {
-            return "topic-state";
-        }
-        if (segments[3] === "list") {
-            return "topic-list";
-        }
-    }
-    if (segments.length === 4 && segments[0] === "v1" && segments[1] === "blobs") {
-        if (segments[3] === "upload-link") {
-            return "blob-upload-link";
-        }
-        if (segments[3] === "download-link") {
-            return "blob-download-link";
-        }
-    }
-    if (segments.length === 3 && segments[0] === "v1" && segments[1] === "blobs") {
-        return "blob-transfer";
-    }
-    return "unknown";
-}
-
-function logRequest(
-    logger: RelayHttpLogger | undefined,
-    request: Request,
-    response: Response,
-    startedAt: number,
-): void {
-    if (logger === undefined) {
-        return;
-    }
-    const route = requestRoute(request);
-    if (route === "health" && response.status < 500) {
-        return;
-    }
-    const durationMilliseconds = Math.max(0, Date.now() - startedAt);
-    const message =
-        `http:request method=${request.method} route=${route} ` +
-        `status=${response.status.toString()} durationMs=${durationMilliseconds.toString()}`;
-    if (response.status >= 500) {
-        logger.error(message);
-    } else if (response.status >= 400) {
-        logger.warn(message);
-    } else {
-        logger.info(message);
+    try {
+        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+    } catch {
+        throw new RelayError(400, "Invalid JSON request", { error: "malformed" });
     }
 }
 
-async function consumeRateLimit(
-    limiter: RateLimiter,
-    key: string,
-    cost: number,
-    now: number,
-): Promise<void> {
-    const decision = await limiter.consume(key, cost, now);
-    if (!decision.allowed) {
-        throw new HttpRateLimitError(decision.retryAfterMilliseconds);
+function integer(value: unknown, name: string): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
     }
+    return value;
 }
 
-function resolveHttpOptions(
-    service: RelayService,
-    options: RelayHttpOptions,
-): ResolvedRelayHttpOptions {
-    const maximumPageResponseBytes =
-        options.maximumPageResponseBytes ?? DEFAULT_MAXIMUM_PAGE_RESPONSE_BYTES;
-    if (!Number.isSafeInteger(maximumPageResponseBytes) || maximumPageResponseBytes < 1) {
-        throw new Error("Maximum page response bytes must be a positive safe integer");
-    }
-    const trustedProxies = options.trustedProxies;
+function proof(value: unknown): ReadProof | undefined {
+    if (value === undefined) return undefined;
+    const input = object(value, "read proof");
     if (
-        typeof trustedProxies === "number" &&
-        (!Number.isSafeInteger(trustedProxies) || trustedProxies < 1)
+        typeof input.challengeId !== "string" ||
+        typeof input.signature !== "string" ||
+        Object.keys(input).some((key) => key !== "challengeId" && key !== "signature")
     ) {
-        throw new Error("Trusted proxy hop count must be a positive safe integer");
+        throw new RelayError(400, "Invalid read proof", { error: "malformed" });
     }
-    const configuredRateLimit = service.options.rateLimit;
-    const rateLimiter =
-        options.rateLimiter ??
-        (configuredRateLimit === false
-            ? undefined
-            : new InMemoryTokenBucketRateLimiter({
-                  capacity: configuredRateLimit.capacity,
-                  refillTokensPerSecond: configuredRateLimit.refillTokensPerSecond,
-                  maximumBuckets: configuredRateLimit.maximumBuckets,
-              }));
-    return {
-        origins: options.origins ?? "*",
-        maximumPageResponseBytes,
-        blobBackend: options.blobBackend,
-        rateLimiter,
-        trustedProxies,
-        now: options.now ?? Date.now,
-        logger: options.logger,
-    };
+    try {
+        return {
+            challengeId: input.challengeId,
+            signature: decodeBase64Url(input.signature, 64),
+        };
+    } catch {
+        throw new RelayError(400, "Invalid read proof", { error: "malformed" });
+    }
 }
 
-/** Create the complete Fetch-compatible Murmur relay handler. */
+function corsOrigin(request: Request, options: RelayHttpOptions): string | undefined {
+    const origin = request.headers.get("origin");
+    if (origin === null) return undefined;
+    const allowed = options.allowedOrigins ?? "*";
+    if (allowed === "*" || allowed.includes(origin)) return allowed === "*" ? "*" : origin;
+    return undefined;
+}
+
+/** Create the relay's complete ordered-event HTTP API. */
 export function createRelayFetchHandler(
-    service: RelayService,
+    relay: RelayService,
     options: RelayHttpOptions = {},
 ): RelayFetchHandler {
-    const resolvedOptions = resolveHttpOptions(service, options);
-    return async (request, context = {}): Promise<Response> => {
-        const startedAt = Date.now();
-        let response: Response;
+    return async (request): Promise<Response> => {
+        const origin = corsOrigin(request, options);
+        const corsHeaders: Record<string, string> =
+            origin === undefined ? {} : { "access-control-allow-origin": origin };
         try {
-            response = withCors(
-                await routeRequest(service, request, resolvedOptions, context),
-                request,
-                resolvedOptions,
-            );
-        } catch (error) {
-            if (error instanceof HttpRateLimitError) {
-                response = withCors(rateLimitResponse(error), request, resolvedOptions);
-            } else if (error instanceof RelayError) {
-                response = withCors(
-                    jsonResponse(error.body, error.status),
-                    request,
-                    resolvedOptions,
+            const url = new URL(request.url);
+            if (request.method === "OPTIONS") {
+                return new Response(null, {
+                    status: 204,
+                    headers: {
+                        ...corsHeaders,
+                        "access-control-allow-methods": "GET, POST, OPTIONS",
+                        "access-control-allow-headers": "content-type",
+                    },
+                });
+            }
+            if (request.method === "GET" && url.pathname === "/health") {
+                await relay.health();
+                return json({ ok: true }, 200, corsHeaders);
+            }
+            if (request.method === "POST" && url.pathname === "/v1/events") {
+                const event = parseSignedRelayEvent(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
                 );
-            } else {
-                response = withCors(
-                    jsonResponse({ error: "internal" }, 500),
-                    request,
-                    resolvedOptions,
+                const outcome = await relay.publish(event);
+                return json(
+                    { seq: outcome.seq.toString(), duplicate: outcome.duplicate },
+                    200,
+                    corsHeaders,
                 );
             }
+            if (request.method === "POST" && url.pathname === "/v1/read-challenges") {
+                const body = object(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                    "challenge request",
+                );
+                const challenge = relay.issueReadChallenge(parseRelayTopic(body.topic));
+                return json(
+                    {
+                        id: challenge.id,
+                        nonce: encodeBase64Url(challenge.nonce),
+                        expiresAt: challenge.expiresAt,
+                    },
+                    200,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/events/read") {
+                const body = object(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                    "event read",
+                );
+                if (typeof body.since !== "string" || !/^(0|[1-9]\d*)$/.test(body.since)) {
+                    throw new RelayError(400, "Invalid event cursor", { error: "malformed" });
+                }
+                const page = await relay.readEvents(
+                    parseRelayTopic(body.topic),
+                    BigInt(body.since),
+                    integer(body.limit, "event limit"),
+                    integer(body.waitMilliseconds, "long-poll duration"),
+                    proof(body.proof),
+                    request.signal,
+                    relay.options.maximumJsonBodyBytes,
+                );
+                return json(
+                    {
+                        events: page.events.map((retained) => ({
+                            seq: retained.seq.toString(),
+                            event: signedRelayEventToJson(retained.event),
+                        })),
+                        head: page.head.toString(),
+                    },
+                    200,
+                    corsHeaders,
+                );
+            }
+            return json({ error: "not_found" }, 404, corsHeaders);
+        } catch (error: unknown) {
+            if (error instanceof RelayError) {
+                return json(error.body, error.status, corsHeaders);
+            }
+            return json({ error: "internal" }, 500, corsHeaders);
         }
-        logRequest(resolvedOptions.logger, request, response, startedAt);
-        return response;
     };
 }

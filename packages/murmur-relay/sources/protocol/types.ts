@@ -1,83 +1,79 @@
-/** Public signing identity attached to every relay write. */
+/** A publicly readable topic whose durable writes require this key. */
+export interface WriteTopic {
+    readonly type: "write";
+    readonly name: string;
+    readonly writeKey: Uint8Array;
+}
+
+/** A publicly writable topic whose reads require this key. */
+export interface ReadTopic {
+    readonly type: "read";
+    readonly name: string;
+    readonly readKey: Uint8Array;
+}
+
+/** A topic whose reads and writes require their designated keys. */
+export interface ReadWriteTopic {
+    readonly type: "read-write";
+    readonly name: string;
+    readonly readKey: Uint8Array;
+    readonly writeKey: Uint8Array;
+}
+
+/** Typed, named, key-scoped relay topic descriptor. */
+export type RelayTopic = WriteTopic | ReadTopic | ReadWriteTopic;
+
+/** Public signing identity attached to every durable relay write. */
 export interface RelayAuthor {
     readonly signingKey: Uint8Array;
 }
-
-/** Optimistic replacement or deletion of the topic snapshot. */
-export interface SnapshotMutation {
-    readonly expectedVersion: number;
-    readonly bytes?: Uint8Array;
-}
-
-/** Append one new opaque list element at the end of the topic order. */
-export interface AppendListOperation {
-    readonly op: "append";
-    readonly id: string;
-    readonly bytes: Uint8Array;
-}
-
-/** Replace one existing opaque list element without changing its position. */
-export interface ReplaceListOperation {
-    readonly op: "replace";
-    readonly id: string;
-    readonly expectedVersion?: number;
-    readonly bytes: Uint8Array;
-}
-
-/** Delete one existing opaque list element. */
-export interface DeleteListOperation {
-    readonly op: "delete";
-    readonly id: string;
-    readonly expectedVersion?: number;
-}
-
-/** One ordered list mutation carried by a signed event. */
-export type ListOperation = AppendListOperation | ReplaceListOperation | DeleteListOperation;
 
 /** Complete authenticated event accepted by the relay store. */
 export interface SignedRelayEvent {
     readonly version: 1;
     readonly id: string;
-    readonly topic: string;
+    readonly topic: RelayTopic;
     readonly author: RelayAuthor;
     readonly createdAt: number;
+    readonly expiresAt?: number;
+    readonly collapseKey?: Uint8Array;
     readonly payload: Uint8Array;
-    readonly snapshot?: SnapshotMutation;
-    readonly list?: readonly ListOperation[];
     readonly signature: Uint8Array;
 }
 
-/** JSON-compatible representation of a signed event at the HTTP and SQL boundary. */
+/** JSON-compatible topic descriptor. */
+export type RelayTopicJson =
+    | { readonly type: "write"; readonly name: string; readonly writeKey: string }
+    | { readonly type: "read"; readonly name: string; readonly readKey: string }
+    | {
+          readonly type: "read-write";
+          readonly name: string;
+          readonly readKey: string;
+          readonly writeKey: string;
+      };
+
+/** JSON-compatible signed event representation. */
 export interface SignedRelayEventJson {
     readonly version: 1;
     readonly id: string;
-    readonly topic: string;
-    readonly author: {
-        readonly signingKey: string;
-    };
+    readonly topic: RelayTopicJson;
+    readonly author: { readonly signingKey: string };
     readonly createdAt: number;
+    readonly expiresAt?: number;
+    readonly collapseKey?: string;
     readonly payload: string;
-    readonly snapshot?: {
-        readonly expectedVersion: number;
-        readonly bytes?: string;
-    };
-    readonly list?: readonly (
-        | {
-              readonly op: "append";
-              readonly id: string;
-              readonly bytes: string;
-          }
-        | {
-              readonly op: "replace";
-              readonly id: string;
-              readonly expectedVersion?: number;
-              readonly bytes: string;
-          }
-        | {
-              readonly op: "delete";
-              readonly id: string;
-              readonly expectedVersion?: number;
-          }
-    )[];
     readonly signature: string;
+}
+
+/** One-use relay challenge for a protected read. */
+export interface ReadChallenge {
+    readonly id: string;
+    readonly nonce: Uint8Array;
+    readonly expiresAt: number;
+}
+
+/** Signature consuming one challenge for exact read parameters. */
+export interface ReadProof {
+    readonly challengeId: string;
+    readonly signature: Uint8Array;
 }

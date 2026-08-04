@@ -1,25 +1,29 @@
 export {
     copySignedRelayEvent,
-    isElementId,
     isEventId,
-    isTopicId,
+    parseRelayTopic,
     parseSignedRelayEvent,
+    relayTopicToJson,
     signedRelayEventToJson,
 } from "./impl/eventCodec.js";
 export {
+    readProofSigningBytes,
     relayEventFingerprint,
     relayEventSigningBytes,
+    relayTopicId,
     verifyRelayEventSignature,
 } from "./impl/eventAuthenticate.js";
-export { RelayConflictError, RelayError } from "./errors.js";
+export { RelayError } from "./errors.js";
 export type { RelayErrorStatus } from "./errors.js";
 export type {
-    AppendListOperation,
-    DeleteListOperation,
-    ListOperation,
+    ReadChallenge,
+    ReadProof,
+    ReadTopic,
+    ReadWriteTopic,
     RelayAuthor,
-    ReplaceListOperation,
+    RelayTopic,
+    RelayTopicJson,
     SignedRelayEvent,
     SignedRelayEventJson,
-    SnapshotMutation,
+    WriteTopic,
 } from "./types.js";

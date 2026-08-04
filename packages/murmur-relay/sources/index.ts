@@ -1,66 +1,46 @@
-export { LocalBlobBackend, S3BlobBackend } from "./blobs/index.js";
+export {
+    RelayError,
+    parseRelayTopic,
+    parseSignedRelayEvent,
+    readProofSigningBytes,
+    relayEventFingerprint,
+    relayEventSigningBytes,
+    relayTopicId,
+    relayTopicToJson,
+    signedRelayEventToJson,
+    verifyRelayEventSignature,
+} from "./protocol/index.js";
 export type {
-    BlobBackend,
-    BlobLink,
-    LocalBlobBackendOptions,
-    S3BlobBackendOptions,
-} from "./blobs/index.js";
-export { RelayConflictError, RelayError } from "./protocol/errors.js";
-export type {
-    AppendListOperation,
-    DeleteListOperation,
-    ListOperation,
+    ReadChallenge,
+    ReadProof,
+    ReadTopic,
+    ReadWriteTopic,
     RelayAuthor,
-    ReplaceListOperation,
+    RelayTopic,
+    RelayTopicJson,
     SignedRelayEvent,
-    SnapshotMutation,
-} from "./protocol/types.js";
-export { InProcessEphemeralFanout } from "./relay/impl/ephemeralFanout.js";
-export type { InProcessEphemeralFanoutOptions } from "./relay/impl/ephemeralFanout.js";
-export { InProcessWakeSource } from "./relay/impl/wakeInProcess.js";
-export { PostgresWakeSource } from "./relay/impl/wakePostgres.js";
-export { RelayService } from "./relay/index.js";
-export type {
-    EphemeralFanout,
-    EphemeralStreamMessage,
-    EphemeralSubscription,
-    RelayOptions,
-    RelayRateLimitCosts,
-    RelayRateLimitOptions,
-    WakeSource,
-} from "./relay/types.js";
-export { InMemoryTokenBucketRateLimiter } from "./rate-limit/index.js";
-export type {
-    InMemoryTokenBucketOptions,
-    RateLimitDecision,
-    RateLimiter,
-} from "./rate-limit/index.js";
-export { PgPoolDatabase } from "./storage/postgres/database.js";
-export { PostgresRelayStore } from "./storage/postgres/index.js";
-export { SqliteRelayStore } from "./storage/sqlite/index.js";
-export type { SqliteRelayStoreOptions } from "./storage/sqlite/index.js";
+    SignedRelayEventJson,
+    WriteTopic,
+} from "./protocol/index.js";
+export { InProcessWakeSource, PostgresWakeSource, RelayService } from "./relay/index.js";
+export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./relay/index.js";
+export {
+    PgPoolDatabase,
+    PGliteDatabase,
+    PostgresRelayStore,
+    SqliteRelayStore,
+} from "./storage/index.js";
 export type {
     EventPage,
-    ListElement,
-    ListPage,
     PageReadConstraints,
-    PruneResult,
-    PublishConstraints,
     PublishOutcome,
     PublishReceipt,
     RelayStore,
     RetainedRelayEvent,
-    TopicSnapshot,
-    TopicState,
-} from "./storage/types.js";
+    SqliteRelayStoreOptions,
+} from "./storage/index.js";
 export { createRelayFetchHandler } from "./http/index.js";
-export type {
-    RelayFetchHandler,
-    RelayHttpLogger,
-    RelayHttpOptions,
-    RelayRequestContext,
-    TrustedProxyPolicy,
-} from "./http/index.js";
+export type { RelayFetchHandler, RelayHttpOptions, RelayRequestContext } from "./http/index.js";
 export {
     closeNodeRelayServer,
     createNodeRelayServer,

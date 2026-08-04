@@ -1,13 +1,5 @@
 # Relay protocol
 
-This module owns the relay wire boundary. It strictly decodes signed writes,
-builds their canonical JSON signature preimage, verifies Ed25519, and exposes
-opaque byte-oriented domain types.
-
-```text
-JSON strings -> strict decode -> Uint8Array fields -> canonical JSON -> Ed25519
-```
-
-The relay never decodes `payload`, snapshot bytes, or list bytes. Blob IDs and
-link authentication live in the separate blob module rather than this topic
-protocol.
+Strict codecs and canonical Ed25519 authentication for typed topic descriptors,
+durable events, and protected-read challenges. Topic IDs are SHA-256 hashes of
+canonical `(type, name, authorization key(s))` descriptors.

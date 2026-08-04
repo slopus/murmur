@@ -1,54 +1,34 @@
+import { ed25519 } from "@noble/curves/ed25519";
+import { randomBytes } from "@noble/hashes/utils";
 import {
     RelayError,
-    isElementId,
     isEventId,
-    isTopicId,
+    readProofSigningBytes,
     relayEventFingerprint,
+    relayTopicId,
     verifyRelayEventSignature,
+    type ReadChallenge,
+    type ReadProof,
+    type RelayTopic,
     type SignedRelayEvent,
 } from "../protocol/index.js";
 import type {
     EventPage,
-    ListPage,
     PageReadConstraints,
     PublishOutcome,
     RelayStore,
-    TopicState,
 } from "../storage/index.js";
+import { encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
-import { InProcessEphemeralFanout } from "./impl/ephemeralFanout.js";
 import { InProcessWakeSource } from "./impl/wakeInProcess.js";
-import type {
-    EphemeralFanout,
-    EphemeralSubscription,
-    RelayOptions,
-    RelayPruneOutcome,
-    ResolvedRelayOptions,
-    ResolvedRelayRateLimitOptions,
-    WakeSource,
-} from "./types.js";
+import type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./types.js";
 
-export { InProcessEphemeralFanout } from "./impl/ephemeralFanout.js";
-export type { InProcessEphemeralFanoutOptions } from "./impl/ephemeralFanout.js";
 export { InProcessWakeSource } from "./impl/wakeInProcess.js";
 export { PostgresWakeSource } from "./impl/wakePostgres.js";
-export type {
-    EphemeralFanout,
-    EphemeralStreamMessage,
-    EphemeralSubscription,
-    RelayOptions,
-    RelayPruneOutcome,
-    RelayRateLimitCosts,
-    RelayRateLimitOptions,
-    ResolvedRelayOptions,
-    ResolvedRelayRateLimitOptions,
-    WakeSource,
-} from "./types.js";
+export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./types.js";
 
 const MEBIBYTE = 1024 * 1024;
 const FIVE_MINUTES = 5 * 60 * 1_000;
-const SEVEN_DAYS = 7 * 24 * 60 * 60 * 1_000;
-const THIRTY_DAYS = 30 * 24 * 60 * 60 * 1_000;
 const HARD_MAXIMUM_LONG_POLL_MILLISECONDS = 30_000;
 
 interface Waiter {
@@ -56,164 +36,67 @@ interface Waiter {
     readonly reject: (error: Error) => void;
 }
 
-function positiveSafeInteger(value: number, name: string): number {
+interface StoredChallenge {
+    readonly challenge: ReadChallenge;
+    readonly topicId: string;
+}
+
+function positiveInteger(value: number, name: string): number {
     if (!Number.isSafeInteger(value) || value < 1) {
         throw new Error(`${name} must be a positive safe integer`);
     }
     return value;
 }
 
-function positiveFinite(value: number, name: string): number {
-    if (!Number.isFinite(value) || value <= 0) {
-        throw new Error(`${name} must be a positive finite number`);
-    }
-    return value;
-}
-
-function resolveRateLimit(
-    options: RelayOptions["rateLimit"],
-): ResolvedRelayRateLimitOptions | false {
-    if (options === false) {
-        return false;
-    }
-    const capacity = positiveFinite(options?.capacity ?? 1_000, "Rate-limit capacity");
-    const costs = {
-        publish: positiveFinite(options?.costs?.publish ?? 25, "Publish rate-limit cost"),
-        upload: positiveFinite(options?.costs?.upload ?? 10, "Upload rate-limit cost"),
-        read: positiveFinite(options?.costs?.read ?? 1, "Read rate-limit cost"),
-        ephemeral: positiveFinite(options?.costs?.ephemeral ?? 1, "Ephemeral rate-limit cost"),
-    };
-    if (Object.values(costs).some((cost) => cost > capacity)) {
-        throw new Error("Rate-limit costs cannot exceed bucket capacity");
-    }
-    return {
-        capacity,
-        refillTokensPerSecond: positiveFinite(
-            options?.refillTokensPerSecond ?? 50,
-            "Rate-limit refill tokens per second",
-        ),
-        maximumBuckets: positiveSafeInteger(
-            options?.maximumBuckets ?? 50_000,
-            "Maximum rate-limit buckets",
-        ),
-        costs,
-    };
-}
-
 function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
-    const resolved: ResolvedRelayOptions = {
-        maximumEventPayloadBytes: positiveSafeInteger(
+    const resolved = {
+        maximumEventPayloadBytes: positiveInteger(
             options.maximumEventPayloadBytes ?? MEBIBYTE,
             "Maximum event payload bytes",
         ),
-        maximumSnapshotBytes: positiveSafeInteger(
-            options.maximumSnapshotBytes ?? 4 * MEBIBYTE,
-            "Maximum snapshot bytes",
+        maximumCollapseKeyBytes: positiveInteger(
+            options.maximumCollapseKeyBytes ?? 256,
+            "Maximum collapse key bytes",
         ),
-        maximumListElementBytes: positiveSafeInteger(
-            options.maximumListElementBytes ?? 256 * 1024,
-            "Maximum list element bytes",
-        ),
-        maximumListOperationsPerEvent: positiveSafeInteger(
-            options.maximumListOperationsPerEvent ?? 256,
-            "Maximum list operations per event",
-        ),
-        maximumElementsPerTopic: positiveSafeInteger(
-            options.maximumElementsPerTopic ?? 100_000,
-            "Maximum elements per topic",
-        ),
-        maximumBlobBytes: positiveSafeInteger(
-            options.maximumBlobBytes ?? 64 * MEBIBYTE,
-            "Maximum blob bytes",
-        ),
-        maximumJsonBodyBytes: positiveSafeInteger(
-            options.maximumJsonBodyBytes ?? 8 * MEBIBYTE,
+        maximumJsonBodyBytes: positiveInteger(
+            options.maximumJsonBodyBytes ?? 2 * MEBIBYTE,
             "Maximum JSON body bytes",
         ),
-        maximumEventsPerRead: positiveSafeInteger(
+        maximumEventsPerRead: positiveInteger(
             options.maximumEventsPerRead ?? 256,
             "Maximum events per read",
         ),
-        maximumListElementsPerPage: positiveSafeInteger(
-            options.maximumListElementsPerPage ?? 256,
-            "Maximum list elements per page",
-        ),
-        maximumLongPollMilliseconds: positiveSafeInteger(
-            options.maximumLongPollMilliseconds ?? HARD_MAXIMUM_LONG_POLL_MILLISECONDS,
+        maximumLongPollMilliseconds: positiveInteger(
+            options.maximumLongPollMilliseconds ?? 30_000,
             "Maximum long poll milliseconds",
         ),
-        maximumConcurrentLongPolls: positiveSafeInteger(
+        maximumConcurrentLongPolls: positiveInteger(
             options.maximumConcurrentLongPolls ?? 10_000,
             "Maximum concurrent long polls",
         ),
-        eventRetentionMilliseconds: positiveSafeInteger(
-            options.eventRetentionMilliseconds ?? SEVEN_DAYS,
-            "Event retention milliseconds",
+        readChallengeLifetimeMilliseconds: positiveInteger(
+            options.readChallengeLifetimeMilliseconds ?? 30_000,
+            "Read challenge lifetime",
         ),
-        topicInactivityMilliseconds: positiveSafeInteger(
-            options.topicInactivityMilliseconds ?? THIRTY_DAYS,
-            "Topic inactivity milliseconds",
+        maximumOutstandingReadChallenges: positiveInteger(
+            options.maximumOutstandingReadChallenges ?? 50_000,
+            "Maximum outstanding read challenges",
         ),
-        maximumEphemeralFrameBytes: positiveSafeInteger(
-            options.maximumEphemeralFrameBytes ?? 128 * 1024,
-            "Maximum ephemeral frame bytes",
-        ),
-        maximumConcurrentStreams: positiveSafeInteger(
-            options.maximumConcurrentStreams ?? 10_000,
-            "Maximum concurrent streams",
-        ),
-        maximumStreamsPerTopic: positiveSafeInteger(
-            options.maximumStreamsPerTopic ?? 256,
-            "Maximum streams per topic",
-        ),
-        maximumStreamQueueFrames: positiveSafeInteger(
-            options.maximumStreamQueueFrames ?? 64,
-            "Maximum stream queue frames",
-        ),
-        maximumStreamQueueBytes: positiveSafeInteger(
-            options.maximumStreamQueueBytes ?? MEBIBYTE,
-            "Maximum stream queue bytes",
-        ),
-        maximumTotalStreamQueueBytes: positiveSafeInteger(
-            options.maximumTotalStreamQueueBytes ?? 64 * MEBIBYTE,
-            "Maximum total stream queue bytes",
-        ),
-        streamKeepAliveMilliseconds: positiveSafeInteger(
-            options.streamKeepAliveMilliseconds ?? 15_000,
-            "Stream keepalive milliseconds",
-        ),
-        rateLimit: resolveRateLimit(options.rateLimit),
     };
     if (resolved.maximumLongPollMilliseconds > HARD_MAXIMUM_LONG_POLL_MILLISECONDS) {
         throw new Error("Maximum long poll cannot exceed 30 seconds");
     }
-    // A queue smaller than one accepted frame evicts the frame it just took and
-    // drops every ephemeral frame without a trace, so refuse the configuration.
-    if (resolved.maximumStreamQueueBytes < resolved.maximumEphemeralFrameBytes) {
-        throw new Error("Maximum stream queue bytes cannot be below maximum ephemeral frame bytes");
-    }
-    // An aggregate budget below one subscriber's queue would make that queue
-    // unreachable and turn the global bound into the only one that ever applies.
-    if (resolved.maximumTotalStreamQueueBytes < resolved.maximumStreamQueueBytes) {
-        throw new Error(
-            "Maximum total stream queue bytes cannot be below maximum stream queue bytes",
-        );
-    }
     return resolved;
 }
 
-function abortError(signal: AbortSignal): Error {
-    return signal.reason instanceof Error ? signal.reason : new Error("Long poll aborted");
-}
-
-/** Policy and realtime orchestration over one opaque relay store. */
+/** Authorization and long-poll orchestration over one ordered event store. */
 export class RelayService {
     readonly #store: RelayStore;
     readonly #wakeSource: WakeSource;
-    readonly #fanout: EphemeralFanout;
     readonly #now: () => number;
     readonly #options: ResolvedRelayOptions;
     readonly #waiters = new Map<string, Set<Waiter>>();
+    readonly #challenges = new Map<string, StoredChallenge>();
     #waiterCount = 0;
     #closed = false;
 
@@ -222,278 +105,180 @@ export class RelayService {
         options: RelayOptions = {},
         wakeSource: WakeSource = new InProcessWakeSource(),
         now: () => number = Date.now,
-        fanout?: EphemeralFanout,
     ) {
         this.#store = store;
         this.#options = resolveOptions(options);
         this.#wakeSource = wakeSource;
-        this.#fanout =
-            fanout ??
-            new InProcessEphemeralFanout({
-                maximumConcurrentStreams: this.#options.maximumConcurrentStreams,
-                maximumStreamsPerTopic: this.#options.maximumStreamsPerTopic,
-                maximumStreamQueueFrames: this.#options.maximumStreamQueueFrames,
-                maximumStreamQueueBytes: this.#options.maximumStreamQueueBytes,
-                maximumTotalStreamQueueBytes: this.#options.maximumTotalStreamQueueBytes,
-            });
         this.#now = now;
-        void this.#wakeSource
-            .subscribe((topic) => {
-                this.#wake(topic);
-            })
-            .catch(() => {
-                // The timeout/read backstop preserves correctness without realtime wakes.
-            });
+        void wakeSource.subscribe((topicId) => this.#wake(topicId)).catch(() => undefined);
     }
 
-    /** Resolved immutable limits used by transport adapters before buffering bodies. */
+    /** Resolved immutable limits used by the HTTP boundary. */
     get options(): ResolvedRelayOptions {
         return this.#options;
     }
 
-    /** Validate and atomically publish one signed event. */
+    /** Validate authorization and atomically append one durable signed event. */
     async publish(event: SignedRelayEvent): Promise<PublishOutcome> {
         this.#assertOpen();
         if (
             event.version !== 1 ||
             !isEventId(event.id) ||
-            !isTopicId(event.topic) ||
-            !Number.isSafeInteger(event.createdAt) ||
-            event.createdAt < 0 ||
             !(event.payload instanceof Uint8Array) ||
+            !(event.signature instanceof Uint8Array) ||
             !(event.author.signingKey instanceof Uint8Array) ||
             event.author.signingKey.length !== 32 ||
-            !(event.signature instanceof Uint8Array) ||
             event.signature.length !== 64 ||
-            (event.snapshot !== undefined &&
-                (!Number.isSafeInteger(event.snapshot.expectedVersion) ||
-                    event.snapshot.expectedVersion < 0 ||
-                    (event.snapshot.bytes !== undefined &&
-                        !(event.snapshot.bytes instanceof Uint8Array)))) ||
-            (event.list !== undefined && !Array.isArray(event.list))
+            !Number.isSafeInteger(event.createdAt) ||
+            event.createdAt < 0
         ) {
             throw new RelayError(400, "Invalid relay event", { error: "malformed" });
         }
         if (event.payload.length > this.#options.maximumEventPayloadBytes) {
-            throw new RelayError(413, "Event payload exceeds relay limit", {
-                error: "limit",
-            });
+            throw new RelayError(413, "Event payload exceeds relay limit", { error: "limit" });
         }
         if (
-            event.snapshot?.bytes !== undefined &&
-            event.snapshot.bytes.length > this.#options.maximumSnapshotBytes
+            event.collapseKey !== undefined &&
+            (!(event.collapseKey instanceof Uint8Array) ||
+                event.collapseKey.length < 1 ||
+                event.collapseKey.length > this.#options.maximumCollapseKeyBytes)
         ) {
-            throw new RelayError(413, "Snapshot exceeds relay limit", {
-                error: "limit",
-            });
+            throw new RelayError(400, "Invalid collapse key", { error: "malformed" });
         }
-        const operations = event.list ?? [];
-        if (operations.length > this.#options.maximumListOperationsPerEvent) {
-            throw new RelayError(413, "List operation count exceeds relay limit", {
-                error: "limit",
-            });
-        }
-        for (const operation of operations) {
-            if (
-                !isElementId(operation.id) ||
-                (operation.op !== "append" &&
-                    operation.op !== "replace" &&
-                    operation.op !== "delete") ||
-                (operation.op !== "append" &&
-                    operation.expectedVersion !== undefined &&
-                    (!Number.isSafeInteger(operation.expectedVersion) ||
-                        operation.expectedVersion < 0)) ||
-                (operation.op !== "delete" && !(operation.bytes instanceof Uint8Array))
-            ) {
-                throw new RelayError(400, "Invalid list operation", {
-                    error: "malformed",
-                });
-            }
-            if (
-                operation.op !== "delete" &&
-                operation.bytes.length > this.#options.maximumListElementBytes
-            ) {
-                throw new RelayError(413, "List element exceeds relay limit", {
-                    error: "limit",
-                });
-            }
+        const now = this.#now();
+        if (
+            event.createdAt < now - FIVE_MINUTES ||
+            event.createdAt > now + FIVE_MINUTES ||
+            (event.expiresAt !== undefined &&
+                (!Number.isSafeInteger(event.expiresAt) || event.expiresAt <= now))
+        ) {
+            throw new RelayError(401, "Expired relay event", { error: "unauthorized" });
         }
         if (!verifyRelayEventSignature(event)) {
             throw new RelayError(401, "Invalid relay event signature", {
                 error: "unauthorized",
             });
         }
-        const fingerprint = relayEventFingerprint(event);
-        const receipt = await this.#store.readPublishReceipt(event.topic, event.id);
+        const requiredWriteKey = event.topic.type === "read" ? undefined : event.topic.writeKey;
+        if (
+            requiredWriteKey !== undefined &&
+            !equalBytes(requiredWriteKey, event.author.signingKey)
+        ) {
+            throw new RelayError(403, "Writer is not authorized for this topic", {
+                error: "unauthorized",
+            });
+        }
+        const topicId = relayTopicId(event.topic);
+        const receipt = await this.#store.readPublishReceipt(topicId, event.id);
         if (receipt !== undefined) {
-            if (!equalBytes(receipt.fingerprint, fingerprint)) {
+            if (!equalBytes(receipt.fingerprint, relayEventFingerprint(event))) {
                 throw new RelayError(409, "Event identifier collision", {
                     error: "id_collision",
                 });
             }
-            if (receipt.snapshotVersion === undefined) {
-                return { seq: receipt.seq, duplicate: true };
-            }
-            return {
-                seq: receipt.seq,
-                duplicate: true,
-                snapshotVersion: receipt.snapshotVersion,
-            };
+            return { seq: receipt.seq, duplicate: true };
         }
-        const now = this.#now();
-        if (event.createdAt < now - FIVE_MINUTES || event.createdAt > now + FIVE_MINUTES) {
-            throw new RelayError(401, "Expired relay event", { error: "unauthorized" });
-        }
-        const outcome = await this.#store.publish(event, now, {
-            maximumElementsPerTopic: this.#options.maximumElementsPerTopic,
-        });
+        const outcome = await this.#store.publish(event, topicId, now);
         if (!outcome.duplicate) {
-            this.#wake(event.topic);
-            await this.#wakeSource.notify(event.topic).catch(() => {
-                // A committed write remains successful; timeout-backed readers will poll.
-            });
+            this.#wake(topicId);
+            await this.#wakeSource.notify(topicId).catch(() => undefined);
         }
         return outcome;
     }
 
-    /** Read a transactionally consistent snapshot and first list page. */
-    async readState(
-        topic: string,
-        limit?: number,
-        maximumEncodedBytes?: number,
-    ): Promise<TopicState | undefined> {
+    /** Issue a short-lived one-use challenge for a protected read topic. */
+    issueReadChallenge(topic: RelayTopic): ReadChallenge {
         this.#assertOpen();
-        this.#validateTopic(topic);
-        return this.#store.readState(
-            topic,
-            this.#pageLimit(limit),
-            this.#pageReadConstraints(maximumEncodedBytes),
-        );
-    }
-
-    /** Read a bounded ordered list page. */
-    async readList(
-        topic: string,
-        cursor?: string,
-        limit?: number,
-        maximumEncodedBytes?: number,
-    ): Promise<ListPage | undefined> {
-        this.#assertOpen();
-        this.#validateTopic(topic);
-        return this.#store.readList(
-            topic,
-            cursor,
-            this.#pageLimit(limit),
-            this.#pageReadConstraints(maximumEncodedBytes),
-        );
-    }
-
-    /** Read retained events, optionally parking until a wake or timeout. */
-    async readEvents(
-        topic: string,
-        since: bigint,
-        limit?: number,
-        waitMilliseconds: number = 0,
-        signal?: AbortSignal,
-        maximumEncodedBytes?: number,
-    ): Promise<EventPage | undefined> {
-        this.#assertOpen();
-        this.#validateTopic(topic);
-        if (since < 0n) {
-            throw new RelayError(400, "Invalid event sequence", { error: "malformed" });
-        }
-        const boundedLimit = this.#eventLimit(limit);
-        const constraints = this.#pageReadConstraints(maximumEncodedBytes);
-        if (
-            !Number.isSafeInteger(waitMilliseconds) ||
-            waitMilliseconds < 0 ||
-            waitMilliseconds > this.#options.maximumLongPollMilliseconds
-        ) {
-            throw new RelayError(400, "Invalid long-poll duration", {
+        if (topic.type === "write") {
+            throw new RelayError(400, "Publicly readable topics need no challenge", {
                 error: "malformed",
             });
         }
-        const current = await this.#store.readEvents(topic, since, boundedLimit, constraints);
+        const now = this.#now();
+        this.#discardExpiredChallenges(now);
+        if (this.#challenges.size >= this.#options.maximumOutstandingReadChallenges) {
+            throw new RelayError(503, "Too many outstanding read challenges", {
+                error: "overloaded",
+            });
+        }
+        const challenge: ReadChallenge = {
+            id: encodeBase64Url(randomBytes(32)),
+            nonce: randomBytes(32),
+            expiresAt: now + this.#options.readChallengeLifetimeMilliseconds,
+        };
+        this.#challenges.set(challenge.id, { challenge, topicId: relayTopicId(topic) });
+        return challenge;
+    }
+
+    /** Read retained events, consuming a signed proof when the topic is protected. */
+    async readEvents(
+        topic: RelayTopic,
+        since: bigint,
+        limit: number = this.#options.maximumEventsPerRead,
+        waitMilliseconds: number = 0,
+        proof?: ReadProof,
+        signal?: AbortSignal,
+        maximumEncodedBytes: number = Number.MAX_SAFE_INTEGER,
+    ): Promise<EventPage> {
+        this.#assertOpen();
         if (
-            current === undefined ||
-            current.reset ||
-            current.events.length > 0 ||
-            waitMilliseconds === 0
+            since < 0n ||
+            !Number.isSafeInteger(limit) ||
+            limit < 1 ||
+            limit > this.#options.maximumEventsPerRead ||
+            !Number.isSafeInteger(waitMilliseconds) ||
+            waitMilliseconds < 0 ||
+            waitMilliseconds > this.#options.maximumLongPollMilliseconds ||
+            !Number.isSafeInteger(maximumEncodedBytes) ||
+            maximumEncodedBytes < 1
         ) {
+            throw new RelayError(400, "Invalid event read", { error: "malformed" });
+        }
+        this.#authorizeRead(topic, since, limit, waitMilliseconds, proof);
+        const topicId = relayTopicId(topic);
+        const constraints: PageReadConstraints = { maximumEncodedBytes };
+        const current = await this.#store.readEvents(
+            topicId,
+            since,
+            limit,
+            this.#now(),
+            constraints,
+        );
+        if (since > current.head) {
+            throw new RelayError(400, "Event cursor is beyond the topic head", {
+                error: "malformed",
+            });
+        }
+        if (current.events.length > 0 || waitMilliseconds === 0) {
             return current;
         }
-        await this.#park(topic, since, boundedLimit, constraints, waitMilliseconds, signal);
-        return this.#store.readEvents(topic, since, boundedLimit, constraints);
-    }
-
-    /**
-     * Fan one opaque ephemeral frame to every local stream subscriber of a topic.
-     *
-     * Nothing is stored: no receipt, sequence, signature check, topic-existence
-     * check, or activity refresh. The returned count is the number of local
-     * subscribers enqueued and is informational, never a delivery guarantee.
-     */
-    publishEphemeral(topic: string, frame: Uint8Array): number {
-        this.#assertOpen();
-        this.#validateTopic(topic);
-        if (!(frame instanceof Uint8Array)) {
-            throw new RelayError(400, "Invalid ephemeral frame", { error: "malformed" });
-        }
-        if (frame.length > this.#options.maximumEphemeralFrameBytes) {
-            throw new RelayError(413, "Ephemeral frame exceeds relay limit", { error: "limit" });
-        }
-        return this.#fanout.publishFrame(topic, frame);
-    }
-
-    /**
-     * Register one local ephemeral stream subscriber, or `undefined` when either
-     * the per-process or the per-topic concurrent-stream cap is reached.
-     */
-    openStream(topic: string): EphemeralSubscription | undefined {
-        this.#assertOpen();
-        this.#validateTopic(topic);
-        return this.#fanout.subscribe(topic);
-    }
-
-    /** Count of live local ephemeral stream subscribers, exposed for diagnostics and tests. */
-    get ephemeralSubscriberCount(): number {
-        return this.#fanout.subscriberCount;
-    }
-
-    /**
-     * Count of live local ephemeral stream subscribers of one topic.
-     *
-     * The HTTP boundary reads this immediately before {@link publishEphemeral}
-     * to price a fan-out, so the cost of one ephemeral POST tracks the work it
-     * actually causes.
-     */
-    ephemeralSubscriberCountForTopic(topic: string): number {
-        this.#assertOpen();
-        this.#validateTopic(topic);
-        return this.#fanout.subscriberCountForTopic(topic);
-    }
-
-    /**
-     * Close every live ephemeral stream subscriber without closing the service.
-     *
-     * An SSE body only ends when its subscription closes, so a graceful
-     * shutdown must call this before waiting for open responses to drain.
-     */
-    closeStreams(): void {
-        this.#fanout.close();
-    }
-
-    /** Run both configured retention policies using relay-observed time. */
-    async prune(): Promise<RelayPruneOutcome> {
-        this.#assertOpen();
-        const now = this.#now();
-        const events = await this.#store.pruneEvents(
-            now - this.#options.eventRetentionMilliseconds,
+        await this.#park(
+            topicId,
+            waitMilliseconds,
+            async () =>
+                (await this.#store.readEvents(topicId, since, limit, this.#now(), constraints))
+                    .events.length > 0,
+            signal,
         );
-        const inactive = await this.#store.pruneInactiveTopics(
-            now - this.#options.topicInactivityMilliseconds,
+        const result = await this.#store.readEvents(
+            topicId,
+            since,
+            limit,
+            this.#now(),
+            constraints,
         );
-        return { events, topics: inactive.topics };
+        if (since > result.head) {
+            throw new RelayError(400, "Event cursor is beyond the topic head", {
+                error: "malformed",
+            });
+        }
+        return result;
+    }
+
+    /** Delete only events whose explicit expiration has elapsed. */
+    async pruneExpired(): Promise<number> {
+        this.#assertOpen();
+        return this.#store.pruneExpired(this.#now());
     }
 
     /** Confirm the backing store is reachable. */
@@ -502,18 +287,14 @@ export class RelayService {
         await this.#store.health();
     }
 
-    /** Stop waiters and close the wake source and store in dependency order. */
+    /** Stop waiters and close dependencies. */
     async close(): Promise<void> {
-        if (this.#closed) {
-            return;
-        }
+        if (this.#closed) return;
         this.#closed = true;
         for (const waiters of this.#waiters.values()) {
-            for (const waiter of waiters) {
-                waiter.reject(new Error("Relay service closed"));
-            }
+            for (const waiter of waiters) waiter.reject(new Error("Relay service closed"));
         }
-        this.#fanout.close();
+        this.#challenges.clear();
         try {
             await this.#wakeSource.close();
         } finally {
@@ -521,132 +302,113 @@ export class RelayService {
         }
     }
 
-    async #park(
-        topic: string,
+    #authorizeRead(
+        topic: RelayTopic,
         since: bigint,
         limit: number,
-        constraints: PageReadConstraints,
-        milliseconds: number,
-        signal?: AbortSignal,
-    ): Promise<void> {
-        if (signal?.aborted === true) {
-            throw abortError(signal);
+        waitMilliseconds: number,
+        proof: ReadProof | undefined,
+    ): void {
+        if (topic.type === "write") {
+            if (proof !== undefined) {
+                throw new RelayError(400, "Public read must not include a proof", {
+                    error: "malformed",
+                });
+            }
+            return;
         }
-        if (this.#waiterCount >= this.#options.maximumConcurrentLongPolls) {
-            throw new RelayError(503, "Relay has too many concurrent long polls", {
-                error: "overloaded",
+        if (proof === undefined || proof.signature.length !== 64) {
+            throw new RelayError(401, "Read proof required", { error: "unauthorized" });
+        }
+        const stored = this.#challenges.get(proof.challengeId);
+        this.#challenges.delete(proof.challengeId);
+        if (
+            stored === undefined ||
+            stored.challenge.expiresAt <= this.#now() ||
+            stored.topicId !== relayTopicId(topic)
+        ) {
+            throw new RelayError(401, "Invalid or expired read challenge", {
+                error: "unauthorized",
             });
         }
+        try {
+            if (
+                !ed25519.verify(
+                    proof.signature,
+                    readProofSigningBytes(stored.challenge, topic, since, limit, waitMilliseconds),
+                    topic.readKey,
+                    { zip215: false },
+                )
+            ) {
+                throw new Error("invalid");
+            }
+        } catch {
+            throw new RelayError(401, "Invalid read proof", { error: "unauthorized" });
+        }
+    }
+
+    async #park(
+        topicId: string,
+        milliseconds: number,
+        recheck: () => Promise<boolean>,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        if (signal?.aborted === true) throw new Error("Long poll aborted");
+        if (this.#waiterCount >= this.#options.maximumConcurrentLongPolls) {
+            throw new RelayError(503, "Too many concurrent long polls", { error: "overloaded" });
+        }
         await new Promise<void>((resolve, reject) => {
-            const waiters = this.#waiters.get(topic) ?? new Set<Waiter>();
-            let settled = false;
-            let timer: ReturnType<typeof setTimeout> | undefined;
-            const cleanup = (): void => {
-                if (settled) {
-                    return;
-                }
-                settled = true;
-                if (timer !== undefined) {
-                    clearTimeout(timer);
-                }
-                signal?.removeEventListener("abort", onAbort);
+            const waiters = this.#waiters.get(topicId) ?? new Set<Waiter>();
+            let done = false;
+            let timer: ReturnType<typeof setTimeout>;
+            const finish = (error?: Error): void => {
+                if (done) return;
+                done = true;
+                clearTimeout(timer);
+                signal?.removeEventListener("abort", abort);
                 waiters.delete(waiter);
                 this.#waiterCount -= 1;
-                if (waiters.size === 0) {
-                    this.#waiters.delete(topic);
-                }
-            };
-            const onAbort = (): void => {
-                if (signal !== undefined) {
-                    waiter.reject(abortError(signal));
-                }
-            };
-            const waiter: Waiter = {
-                resolve: (): void => {
-                    cleanup();
+                if (waiters.size === 0) this.#waiters.delete(topicId);
+                if (error === undefined) {
                     resolve();
-                },
-                reject: (error): void => {
-                    cleanup();
+                } else {
                     reject(error);
-                },
+                }
             };
+            const abort = (): void => finish(new Error("Long poll aborted"));
+            const waiter: Waiter = { resolve: () => finish(), reject: finish };
             waiters.add(waiter);
             this.#waiterCount += 1;
-            this.#waiters.set(topic, waiters);
-            signal?.addEventListener("abort", onAbort, { once: true });
-            timer = setTimeout(() => waiter.resolve(), milliseconds);
-            void this.#store.readEvents(topic, since, limit, constraints).then(
-                (page) => {
-                    if (page === undefined || page.reset || page.events.length > 0) {
-                        waiter.resolve();
-                    }
+            this.#waiters.set(topicId, waiters);
+            timer = setTimeout(() => finish(), milliseconds);
+            signal?.addEventListener("abort", abort, { once: true });
+            if (signal?.aborted === true) {
+                abort();
+            }
+            void recheck().then(
+                (ready) => {
+                    if (ready) waiter.resolve();
                 },
                 (error: unknown) => {
                     waiter.reject(
-                        error instanceof Error ? error : new Error("Relay event recheck failed"),
+                        error instanceof Error ? error : new Error("Relay recheck failed"),
                     );
                 },
             );
         });
     }
 
-    #wake(topic: string): void {
-        for (const waiter of this.#waiters.get(topic) ?? []) {
-            waiter.resolve();
-        }
-        this.#fanout.wake(topic);
+    #wake(topicId: string): void {
+        for (const waiter of this.#waiters.get(topicId) ?? []) waiter.resolve();
     }
 
-    #pageLimit(limit: number | undefined): number {
-        const resolved = limit ?? this.#options.maximumListElementsPerPage;
-        if (
-            !Number.isSafeInteger(resolved) ||
-            resolved < 1 ||
-            resolved > this.#options.maximumListElementsPerPage
-        ) {
-            throw new RelayError(400, "Invalid list page limit", {
-                error: "malformed",
-            });
-        }
-        return resolved;
-    }
-
-    #eventLimit(limit: number | undefined): number {
-        const resolved = limit ?? this.#options.maximumEventsPerRead;
-        if (
-            !Number.isSafeInteger(resolved) ||
-            resolved < 1 ||
-            resolved > this.#options.maximumEventsPerRead
-        ) {
-            throw new RelayError(400, "Invalid event page limit", {
-                error: "malformed",
-            });
-        }
-        return resolved;
-    }
-
-    #pageReadConstraints(maximumEncodedBytes: number | undefined): PageReadConstraints {
-        const resolved = maximumEncodedBytes ?? Number.MAX_SAFE_INTEGER;
-        if (!Number.isSafeInteger(resolved) || resolved < 1) {
-            throw new RelayError(400, "Invalid page byte limit", {
-                error: "malformed",
-            });
-        }
-        return { maximumEncodedBytes: resolved };
-    }
-
-    #validateTopic(topic: string): void {
-        if (!isTopicId(topic)) {
-            throw new RelayError(400, "Invalid topic identifier", {
-                error: "malformed",
-            });
+    #discardExpiredChallenges(now: number): void {
+        for (const [id, stored] of this.#challenges) {
+            if (stored.challenge.expiresAt <= now) this.#challenges.delete(id);
         }
     }
 
     #assertOpen(): void {
-        if (this.#closed) {
-            throw new Error("Relay service is closed");
-        }
+        if (this.#closed) throw new Error("Relay service is closed");
     }
 }
