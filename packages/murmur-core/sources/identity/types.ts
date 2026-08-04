@@ -25,6 +25,7 @@ export interface FriendRequestEnvelope {
 /** Authenticated request content recovered by its intended recipient. */
 export interface OpenedFriendRequest {
     readonly id: string;
+    readonly previousRequestId: string | null;
     readonly sender: IdentityPublicKey;
     readonly responseAddress: string;
     readonly profile: IdentityProfile;
@@ -64,6 +65,7 @@ export type OpenedFriendResponse =
 /** Inputs signed and encrypted into a friend request. */
 export interface FriendRequestInput {
     readonly id: string;
+    readonly previousRequestId: string | null;
     readonly responseAddress: string;
     readonly profile: IdentityProfile;
     readonly privateData?: Uint8Array;
@@ -94,6 +96,7 @@ export interface FriendRecord {
     readonly requester: IdentityPublicKey;
     readonly status: FriendStatus;
     readonly requestId: string;
+    readonly previousRequestId: string | null;
     readonly profile?: IdentityProfile;
     readonly peerResponseAddress?: string;
     readonly localResponseAddress?: string;
@@ -121,6 +124,11 @@ export interface CreateFriendRequestOptions {
     readonly responseAddress: string;
     readonly privateData?: Uint8Array;
     readonly now?: number;
+}
+
+/** Deterministic/testable construction options for durable friendship state. */
+export interface FriendBookOptions {
+    readonly generateId?: () => string;
 }
 
 /** Options for accepting an inbound request and preparing its response. */
@@ -156,8 +164,24 @@ export interface FriendResponseOutboxItem extends FriendOutboxItemBase {
     readonly envelope: FriendResponseEnvelope;
 }
 
+/** Durable semantic operation which a facade seals onto the friend channel. */
+export interface FriendControlIntent {
+    readonly type: "friendship-ended";
+    readonly requestId: string;
+}
+
+/** Exact durable control intent awaiting friend-channel publication. */
+export interface FriendControlIntentOutboxItem extends FriendOutboxItemBase {
+    readonly kind: "control-intent";
+    readonly destination: "friend-channel";
+    readonly intent: FriendControlIntent;
+}
+
 /** Exact durable request/response publication retained by `FriendBook`. */
-export type FriendOutboxItem = FriendRequestOutboxItem | FriendResponseOutboxItem;
+export type FriendOutboxItem =
+    | FriendRequestOutboxItem
+    | FriendResponseOutboxItem
+    | FriendControlIntentOutboxItem;
 
 /** Relay-neutral successful publication outcome accepted by outbox confirmation. */
 export type FriendOutboxOutcome = "accepted" | "duplicate";

@@ -6,6 +6,7 @@ import {
     utf8Encode,
 } from "../../utils/index.js";
 import type {
+    FriendControlIntentOutboxItem,
     FriendOutboxItem,
     FriendRequestEnvelope,
     FriendRequestOutboxItem,
@@ -15,9 +16,17 @@ import type {
 import { deserializePublicIdentity, serializePublicIdentity } from "./identityCodec.js";
 
 type FriendEnvelope = FriendRequestEnvelope | FriendResponseEnvelope;
+const ID_CHARACTERS = 32;
+const EPHEMERAL_KEY_CHARACTERS = 43;
+const NONCE_CHARACTERS = 16;
 const MAX_ENVELOPE_CIPHERTEXT_BYTES = 2 * 1024 * 1024;
+const MAX_ENVELOPE_CIPHERTEXT_CHARACTERS = Math.ceil((MAX_ENVELOPE_CIPHERTEXT_BYTES * 4) / 3);
+const MAX_OUTBOX_BYTES = 3 * 1024 * 1024;
 
 function validateId(id: string): void {
+    if (id.length !== ID_CHARACTERS) {
+        throw new Error("Invalid friend outbox ID");
+    }
     const decoded = decodeBase64Url(id);
     if (decoded.length !== 24 || encodeBase64Url(decoded) !== id) {
         throw new Error("Invalid friend outbox ID");
@@ -38,7 +47,13 @@ function validateEnvelope(envelope: FriendEnvelope): void {
         Object.keys(envelope).length !== fields.length ||
         Object.keys(envelope).some((key) => !fields.includes(key)) ||
         envelope.version !== 1 ||
-        (envelope.type !== "friend-request" && envelope.type !== "friend-response")
+        (envelope.type !== "friend-request" && envelope.type !== "friend-response") ||
+        typeof envelope.ephemeralPublicKey !== "string" ||
+        envelope.ephemeralPublicKey.length !== EPHEMERAL_KEY_CHARACTERS ||
+        typeof envelope.nonce !== "string" ||
+        envelope.nonce.length !== NONCE_CHARACTERS ||
+        typeof envelope.ciphertext !== "string" ||
+        envelope.ciphertext.length > MAX_ENVELOPE_CIPHERTEXT_CHARACTERS
     ) {
         throw new Error("Invalid friend outbox envelope");
     }
@@ -60,6 +75,9 @@ function validateEnvelope(envelope: FriendEnvelope): void {
 /** Deep-copy one exact outbox publication. */
 export function copyFriendOutboxItem(item: FriendRequestOutboxItem): FriendRequestOutboxItem;
 export function copyFriendOutboxItem(item: FriendResponseOutboxItem): FriendResponseOutboxItem;
+export function copyFriendOutboxItem(
+    item: FriendControlIntentOutboxItem,
+): FriendControlIntentOutboxItem;
 export function copyFriendOutboxItem(item: FriendOutboxItem): FriendOutboxItem;
 export function copyFriendOutboxItem(item: FriendOutboxItem): FriendOutboxItem {
     const common = {
@@ -68,23 +86,40 @@ export function copyFriendOutboxItem(item: FriendOutboxItem): FriendOutboxItem {
         destination: item.destination,
         createdAt: item.createdAt,
     };
-    return item.kind === "request"
-        ? { ...common, kind: "request", envelope: { ...item.envelope } }
-        : { ...common, kind: "response", envelope: { ...item.envelope } };
+    if (item.kind === "request") {
+        return { ...common, kind: "request", envelope: { ...item.envelope } };
+    }
+    if (item.kind === "response") {
+        return { ...common, kind: "response", envelope: { ...item.envelope } };
+    }
+    return {
+        ...common,
+        kind: "control-intent",
+        destination: "friend-channel",
+        intent: { ...item.intent },
+    };
 }
 
 /** Encode one exact transport-neutral outbox item. */
 export function encodeFriendOutboxItem(item: FriendOutboxItem): Uint8Array {
     validateId(item.id);
     validateFriendDestination(item.destination);
-    validateEnvelope(item.envelope);
-    if (
-        (item.kind === "request" && item.envelope.type !== "friend-request") ||
-        (item.kind === "response" && item.envelope.type !== "friend-response") ||
-        !Number.isSafeInteger(item.createdAt) ||
-        item.createdAt < 0
-    ) {
+    if (!Number.isSafeInteger(item.createdAt) || item.createdAt < 0) {
         throw new Error("Invalid friend outbox item");
+    }
+    if (item.kind === "control-intent") {
+        validateId(item.intent.requestId);
+        if (item.destination !== "friend-channel" || item.intent.type !== "friendship-ended") {
+            throw new Error("Invalid friend control intent");
+        }
+    } else {
+        validateEnvelope(item.envelope);
+        if (
+            (item.kind === "request" && item.envelope.type !== "friend-request") ||
+            (item.kind === "response" && item.envelope.type !== "friend-response")
+        ) {
+            throw new Error("Invalid friend outbox item");
+        }
     }
     return utf8Encode(
         JSON.stringify({
@@ -93,7 +128,8 @@ export function encodeFriendOutboxItem(item: FriendOutboxItem): Uint8Array {
             kind: item.kind,
             peer: serializePublicIdentity(item.peer),
             destination: item.destination,
-            envelope: item.envelope,
+            envelope: item.kind === "control-intent" ? null : item.envelope,
+            intent: item.kind === "control-intent" ? item.intent : null,
             createdAt: item.createdAt,
         }),
     );
@@ -101,35 +137,90 @@ export function encodeFriendOutboxItem(item: FriendOutboxItem): Uint8Array {
 
 /** Decode one strict clean-rewrite outbox item. */
 export function decodeFriendOutboxItem(bytes: Uint8Array): FriendOutboxItem {
+    if (bytes.length > MAX_OUTBOX_BYTES) {
+        throw new Error("Invalid persisted friend outbox item");
+    }
     const decoded: unknown = JSON.parse(utf8Decode(bytes));
     if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
         throw new Error("Invalid persisted friend outbox item");
     }
     const value = decoded as Record<string, unknown>;
-    const fields = ["version", "id", "kind", "peer", "destination", "envelope", "createdAt"];
+    const fields = [
+        "version",
+        "id",
+        "kind",
+        "peer",
+        "destination",
+        "envelope",
+        "intent",
+        "createdAt",
+    ];
     if (
         Object.keys(value).length !== fields.length ||
         Object.keys(value).some((key) => !fields.includes(key)) ||
         value.version !== 1 ||
         typeof value.id !== "string" ||
-        (value.kind !== "request" && value.kind !== "response") ||
+        (value.kind !== "request" &&
+            value.kind !== "response" &&
+            value.kind !== "control-intent") ||
         typeof value.destination !== "string" ||
         typeof value.createdAt !== "number" ||
         !Number.isSafeInteger(value.createdAt) ||
         value.createdAt < 0 ||
         typeof value.peer !== "object" ||
         value.peer === null ||
-        Array.isArray(value.peer) ||
-        typeof value.envelope !== "object" ||
-        value.envelope === null ||
-        Array.isArray(value.envelope)
+        Array.isArray(value.peer)
     ) {
         throw new Error("Invalid persisted friend outbox item");
     }
     validateId(value.id);
     validateFriendDestination(value.destination);
     const peerValue = value.peer as Record<string, unknown>;
-    if (Object.keys(peerValue).length !== 1 || typeof peerValue.publicKey !== "string") {
+    if (
+        Object.keys(peerValue).length !== 1 ||
+        typeof peerValue.publicKey !== "string" ||
+        peerValue.publicKey.length !== 43
+    ) {
+        throw new Error("Invalid persisted friend outbox item");
+    }
+    const common = {
+        id: value.id,
+        peer: deserializePublicIdentity({ publicKey: peerValue.publicKey }),
+        destination: value.destination,
+        createdAt: value.createdAt,
+    };
+    if (value.kind === "control-intent") {
+        if (
+            value.envelope !== null ||
+            value.destination !== "friend-channel" ||
+            typeof value.intent !== "object" ||
+            value.intent === null ||
+            Array.isArray(value.intent)
+        ) {
+            throw new Error("Invalid persisted friend control intent");
+        }
+        const intent = value.intent as Record<string, unknown>;
+        if (
+            Object.keys(intent).length !== 2 ||
+            intent.type !== "friendship-ended" ||
+            typeof intent.requestId !== "string"
+        ) {
+            throw new Error("Invalid persisted friend control intent");
+        }
+        validateId(intent.requestId);
+        return {
+            ...common,
+            kind: "control-intent",
+            destination: "friend-channel",
+            intent: { type: "friendship-ended", requestId: intent.requestId },
+        };
+    }
+    if (
+        value.intent !== null ||
+        typeof value.envelope !== "object" ||
+        value.envelope === null ||
+        Array.isArray(value.envelope)
+    ) {
         throw new Error("Invalid persisted friend outbox item");
     }
     const envelopeValue = value.envelope as Record<string, unknown>;
@@ -164,12 +255,6 @@ export function decodeFriendOutboxItem(bytes: Uint8Array): FriendOutboxItem {
                   ciphertext: envelopeValue.ciphertext,
               };
     validateEnvelope(envelope);
-    const common = {
-        id: value.id,
-        peer: deserializePublicIdentity({ publicKey: peerValue.publicKey }),
-        destination: value.destination,
-        createdAt: value.createdAt,
-    };
     return envelope.type === "friend-request"
         ? { ...common, kind: "request", envelope }
         : { ...common, kind: "response", envelope };

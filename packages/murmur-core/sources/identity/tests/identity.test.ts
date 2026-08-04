@@ -10,6 +10,7 @@ import {
     FriendChannel,
     FriendControlIdCollisionError,
     FriendExchangeIdCollisionError,
+    FriendOutboxIdCollisionError,
     acceptFriendControl,
     createFriendRequest,
     createFriendResponse,
@@ -19,6 +20,12 @@ import {
     openFriendResponse,
     serializePublicIdentity,
 } from "../index.js";
+
+function fixedId(byte: number): string {
+    const bytes = new Uint8Array(24);
+    bytes.fill(byte);
+    return encodeBase64Url(bytes);
+}
 
 function requestEnvelope(item: FriendOutboxItem): FriendRequestEnvelope {
     if (item.kind !== "request" || item.envelope.type !== "friend-request") {
@@ -102,6 +109,7 @@ describe("friend request protocol", () => {
         const bob = generateIdentityKeyPair();
         const request = createFriendRequest(alice, bob, {
             id: encodeBase64Url(randomBytes(24)),
+            previousRequestId: null,
             responseAddress: "opaque:alice-response",
             profile: { name: "Alice", metadata: { role: "agent" } },
             privateData: utf8Encode("private bootstrap bytes"),
@@ -134,6 +142,7 @@ describe("friend request protocol", () => {
         const eve = generateIdentityKeyPair();
         const request = createFriendRequest(alice, bob, {
             id: encodeBase64Url(randomBytes(24)),
+            previousRequestId: null,
             responseAddress: "reply",
             profile: { name: "Alice" },
         });
@@ -155,16 +164,19 @@ describe("friend request protocol", () => {
         const id = encodeBase64Url(randomBytes(24));
         const first = createFriendRequest(alice, bob, {
             id,
+            previousRequestId: null,
             responseAddress: "reply",
             profile: { name: "Alice" },
         });
         const duplicate = createFriendRequest(alice, bob, {
             id,
+            previousRequestId: null,
             responseAddress: "reply",
             profile: { name: "Alice" },
         });
         const collision = createFriendRequest(alice, bob, {
             id,
+            previousRequestId: null,
             responseAddress: "reply",
             profile: { name: "Different Alice" },
         });
@@ -231,18 +243,30 @@ describe("durable friendship lifecycle and outbox", () => {
             profile: { name: "Bob" },
         });
 
-        await expect(
-            aliceFriends.confirmOutbox(
-                { ...request, destination: "wrong-destination" },
-                "accepted",
-            ),
-        ).rejects.toThrow("exactly match");
-        expect(await aliceFriends.confirmOutbox(request, "duplicate")).toBe(true);
         expect(await aliceFriends.listOutbox()).toEqual([]);
+        expect(await aliceFriends.confirmOutbox(request, "duplicate")).toBe(false);
 
         await aliceFriends.end(bob, 15);
         await bobFriends.end(alice, 15);
         expect((await new FriendBook(alice, aliceStore).get(bob))?.status).toBe("ended");
+        const aliceIntent = (await aliceFriends.listOutbox())[0];
+        const bobIntent = (await bobFriends.listOutbox())[0];
+        expect(aliceIntent).toMatchObject({
+            kind: "control-intent",
+            intent: { type: "friendship-ended" },
+        });
+        expect(bobIntent).toMatchObject({
+            kind: "control-intent",
+            intent: { type: "friendship-ended" },
+        });
+        await aliceFriends.end(bob, 16);
+        expect(await aliceFriends.listOutbox()).toEqual([aliceIntent]);
+        if (aliceIntent === undefined) {
+            throw new Error("Expected durable termination intent");
+        }
+        expect(await new FriendBook(alice, aliceStore).confirmOutbox(aliceIntent, "accepted")).toBe(
+            true,
+        );
     });
 
     it("rolls back lifecycle state when its owned outbox cannot persist", async () => {
@@ -289,7 +313,22 @@ describe("durable friendship lifecycle and outbox", () => {
         const responderBook = winnerIsAlice ? bobFriends : aliceFriends;
         const winnerBook = winnerIsAlice ? aliceFriends : bobFriends;
         const responderIdentity: IdentityPublicKey = winnerIsAlice ? bob : alice;
-        const winnerIdentity: IdentityPublicKey = winnerIsAlice ? alice : bob;
+        const winnerKeyPair = winnerIsAlice ? alice : bob;
+        const winnerIdentity: IdentityPublicKey = winnerKeyPair;
+        const losingRequest = winnerIsAlice ? bobRequest : aliceRequest;
+        const lateLosingResponse = createFriendResponse(winnerKeyPair, responderIdentity, {
+            id: fixedId(88),
+            requestId: losingRequest.id,
+            decision: "accepted",
+            responseAddress: "late-response",
+            profile: { name: "Late winner" },
+        });
+        await expect(
+            responderBook.receiveResponse(winnerIdentity, lateLosingResponse, 2),
+        ).resolves.toMatchObject({
+            status: "superseded",
+            record: { status: "pending-incoming" },
+        });
         const response = await responderBook.respond(winnerIdentity, {
             decision: "accepted",
             profile: { name: winnerIsAlice ? "Bob" : "Alice" },
@@ -338,11 +377,264 @@ describe("durable friendship lifecycle and outbox", () => {
             responder: { publicKey: bob.publicKey },
             decision: "accepted",
         });
+        expect(() =>
+            openFriendResponse(alice, bob, {
+                ...first,
+                ephemeralPublicKey: "!".repeat(44),
+            }),
+        ).toThrow("misaddressed");
         expect(() => openFriendResponse(alice, eve, first)).toThrow();
         await aliceFriends.receiveResponse(bob, first, 2);
         await expect(aliceFriends.receiveResponse(bob, collision, 3)).rejects.toBeInstanceOf(
             FriendExchangeIdCollisionError,
         );
+    });
+
+    it("ends pending outgoing durably and treats a late valid response as terminal replay", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        const friends = new FriendBook(alice, store);
+        await friends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 10,
+        });
+        const pending = await friends.get(bob);
+        if (pending === undefined) {
+            throw new Error("Expected pending outgoing friend");
+        }
+
+        await friends.end(bob, 11);
+        expect(await friends.listOutbox()).toEqual([]);
+        expect((await new FriendBook(alice, store).get(bob))?.status).toBe("ended");
+
+        const late = createFriendResponse(bob, alice, {
+            id: fixedId(90),
+            requestId: pending.requestId,
+            decision: "accepted",
+            responseAddress: "bob-response",
+            profile: { name: "Bob" },
+        });
+        await expect(friends.receiveResponse(bob, late, 12)).resolves.toMatchObject({
+            status: "superseded",
+            record: { status: "ended" },
+        });
+        await expect(
+            new FriendBook(alice, store).receiveResponse(bob, late, 13),
+        ).resolves.toMatchObject({
+            status: "duplicate",
+            record: { status: "ended" },
+        });
+    });
+
+    it("ends pending incoming with an exact durable rejected response", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const bobStore = new MemoryMurmurStore();
+        const bobFriends = new FriendBook(bob, bobStore);
+        const request = createFriendRequest(alice, bob, {
+            id: fixedId(31),
+            previousRequestId: null,
+            responseAddress: "alice-response",
+            profile: { name: "Alice" },
+        });
+        await bobFriends.receiveRequest(request, 1);
+
+        await bobFriends.end(alice, 2);
+        const restored = new FriendBook(bob, bobStore);
+        const outbox = await restored.listOutbox();
+        expect(outbox).toHaveLength(1);
+        expect(outbox[0]).toMatchObject({
+            kind: "response",
+            destination: "alice-response",
+        });
+        if (outbox[0]?.kind !== "response") {
+            throw new Error("Expected rejected response outbox item");
+        }
+        expect(openFriendResponse(alice, bob, outbox[0].envelope)).toMatchObject({
+            decision: "rejected",
+            requestId: fixedId(31),
+        });
+        await restored.end(alice, 3);
+        expect(await restored.listOutbox()).toEqual(outbox);
+    });
+
+    it("requires the durable causal predecessor for a new request after ended", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceFriends = new FriendBook(alice, new MemoryMurmurStore());
+        const bobFriends = new FriendBook(bob, new MemoryMurmurStore());
+        const initial = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        await bobFriends.receiveRequest(requestEnvelope(initial), 1);
+        await bobFriends.end(alice, 2);
+        const rejection = (await bobFriends.listOutbox())[0];
+        if (rejection?.kind !== "response") {
+            throw new Error("Expected rejection");
+        }
+        await aliceFriends.receiveResponse(bob, rejection.envelope, 2);
+
+        const next = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice again" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response-2",
+            now: 3,
+        });
+        const stale = createFriendRequest(alice, bob, {
+            id: fixedId(32),
+            previousRequestId: null,
+            responseAddress: "stale-response",
+            profile: { name: "Stale Alice" },
+        });
+
+        await expect(bobFriends.receiveRequest(stale, 3)).rejects.toThrow("causal predecessor");
+        await expect(bobFriends.receiveRequest(requestEnvelope(next), 1)).rejects.toThrow(
+            "backwards",
+        );
+        await expect(bobFriends.receiveRequest(requestEnvelope(next), 3)).resolves.toMatchObject({
+            status: "opened",
+            record: { status: "pending-incoming" },
+        });
+    });
+
+    it("fails closed on forced same-kind, cross-kind, and termination outbox IDs", async () => {
+        const repeated = fixedId(44);
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const carol = generateIdentityKeyPair();
+        const sameKind = new FriendBook(alice, new MemoryMurmurStore(), {
+            generateId: () => repeated,
+        });
+        const firstReserved = await sameKind.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        expect(await sameKind.confirmOutbox(firstReserved, "accepted")).toBe(true);
+        await expect(
+            sameKind.createRequest(carol, {
+                profile: { name: "Alice" },
+                destination: "carol-inbox",
+                responseAddress: "alice-response",
+                now: 1,
+            }),
+        ).rejects.toBeInstanceOf(FriendOutboxIdCollisionError);
+        expect(await sameKind.get(carol)).toBeUndefined();
+
+        const crossStore = new MemoryMurmurStore();
+        const crossKind = new FriendBook(bob, crossStore, {
+            generateId: () => repeated,
+        });
+        await crossKind.createRequest(carol, {
+            profile: { name: "Bob" },
+            destination: "carol-inbox",
+            responseAddress: "bob-response",
+            now: 1,
+        });
+        await crossKind.receiveRequest(
+            createFriendRequest(alice, bob, {
+                id: fixedId(45),
+                previousRequestId: null,
+                responseAddress: "alice-response",
+                profile: { name: "Alice" },
+            }),
+            1,
+        );
+        await expect(
+            crossKind.respond(alice, {
+                decision: "accepted",
+                profile: { name: "Bob" },
+                responseAddress: "bob-response",
+                now: 2,
+            }),
+        ).rejects.toBeInstanceOf(FriendOutboxIdCollisionError);
+        expect((await crossKind.get(alice))?.status).toBe("pending-incoming");
+
+        const terminalStore = new MemoryMurmurStore();
+        const terminal = new FriendBook(bob, terminalStore, {
+            generateId: () => repeated,
+        });
+        await terminal.receiveRequest(
+            createFriendRequest(alice, bob, {
+                id: fixedId(46),
+                previousRequestId: null,
+                responseAddress: "alice-response",
+                profile: { name: "Alice" },
+            }),
+            1,
+        );
+        await terminal.respond(alice, {
+            decision: "accepted",
+            profile: { name: "Bob" },
+            responseAddress: "bob-response",
+            now: 2,
+        });
+        await expect(terminal.end(alice, 3)).rejects.toBeInstanceOf(FriendOutboxIdCollisionError);
+        expect((await terminal.get(alice))?.status).toBe("active");
+    });
+
+    it("rejects encoded overbounds before decoding request and persisted outbox fields", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const request = createFriendRequest(alice, bob, {
+            id: fixedId(55),
+            previousRequestId: null,
+            responseAddress: "alice-response",
+            profile: { name: "Alice" },
+        });
+        expect(() =>
+            openFriendRequest(bob, {
+                ...request,
+                ephemeralPublicKey: "!".repeat(44),
+            }),
+        ).toThrow("misaddressed");
+        expect(() =>
+            openFriendRequest(bob, {
+                ...request,
+                nonce: "!".repeat(17),
+            }),
+        ).toThrow("misaddressed");
+        expect(() =>
+            openFriendRequest(bob, {
+                ...request,
+                ciphertext: "!".repeat(Math.ceil((2 * 1024 * 1024 * 4) / 3) + 1),
+            }),
+        ).toThrow("misaddressed");
+        expect(() =>
+            createFriendRequest(alice, bob, {
+                id: "!".repeat(33),
+                previousRequestId: null,
+                responseAddress: "reply",
+                profile: { name: "Alice" },
+            }),
+        ).toThrow("24 bytes");
+
+        const store = new MemoryMurmurStore();
+        const friends = new FriendBook(alice, store);
+        await friends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        const entries = await store.list("identity/");
+        const outboxEntry = [...entries].find(([key]) => key.includes("/friend-outbox/"));
+        if (outboxEntry === undefined) {
+            throw new Error("Expected outbox entry");
+        }
+        const corrupt = JSON.parse(utf8Decode(outboxEntry[1])) as {
+            envelope: { ephemeralPublicKey: string };
+        };
+        corrupt.envelope.ephemeralPublicKey = "!".repeat(44);
+        await store.set(outboxEntry[0], utf8Encode(JSON.stringify(corrupt)));
+        await expect(friends.listOutbox()).rejects.toThrow("outbox envelope");
     });
 });
 
@@ -373,6 +665,7 @@ describe("friend control channel", () => {
             bobChannel.verifyTopicBytes(authorization, aliceChannel.signTopicBytes(authorization)),
         ).toBe(true);
         expect(bobChannel.open(envelope).message.payload).toEqual(message.payload);
+        expect(() => bobChannel.open({ ...envelope, nonce: "!".repeat(17) })).toThrow("ciphertext");
         zeroBytes(bobTopicSecret);
     });
 
@@ -410,15 +703,18 @@ describe("friend control channel", () => {
             payload: utf8Encode("second"),
         });
         let calls = 0;
+        let failedPayload: Uint8Array | undefined;
         const persist = async (): Promise<void> => {
             calls += 1;
         };
 
         await expect(
-            acceptFriendControl(bobChannel, store, first, async () => {
+            acceptFriendControl(bobChannel, store, first, async (_transaction, opened) => {
+                failedPayload = opened.message.payload;
                 throw new Error("application failed");
             }),
         ).rejects.toThrow("application failed");
+        expect(failedPayload?.every((byte) => byte === 0)).toBe(true);
         await expect(acceptFriendControl(bobChannel, store, first, persist)).resolves.toMatchObject(
             { status: "opened" },
         );

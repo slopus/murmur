@@ -7,7 +7,10 @@ export type {
     CreateFriendRequestOptions,
     CreateFriendResponseOptions,
     FriendAcceptance,
+    FriendBookOptions,
     FriendChannelOptions,
+    FriendControlIntent,
+    FriendControlIntentOutboxItem,
     FriendControlEnvelope,
     FriendControlMessage,
     FriendControlRetention,
@@ -41,7 +44,11 @@ export {
     openFriendRequest,
     openFriendResponse,
 } from "./impl/friendProtocol.js";
-export { FriendBook, FriendExchangeIdCollisionError } from "./friendBook.js";
+export {
+    FriendBook,
+    FriendExchangeIdCollisionError,
+    FriendOutboxIdCollisionError,
+} from "./friendBook.js";
 export {
     acceptFriendControl,
     FriendChannel,

@@ -9,6 +9,7 @@ interface StoredFriendRecord {
     readonly requester: { readonly publicKey: string };
     readonly status: FriendStatus;
     readonly requestId: string;
+    readonly previousRequestId: string | null;
     readonly profile: string | null;
     readonly peerResponseAddress: string | null;
     readonly localResponseAddress: string | null;
@@ -17,11 +18,20 @@ interface StoredFriendRecord {
     readonly updatedAt: number;
 }
 
+const MAX_PROFILE_BYTES = 1024 * 1024;
+const MAX_PRIVATE_DATA_BYTES = 256 * 1024;
+const MAX_PROFILE_CHARACTERS = Math.ceil((MAX_PROFILE_BYTES * 4) / 3);
+const MAX_PRIVATE_DATA_CHARACTERS = Math.ceil((MAX_PRIVATE_DATA_BYTES * 4) / 3);
+const MAX_FRIEND_RECORD_BYTES = 2 * 1024 * 1024;
+
 function validTime(value: number): boolean {
     return Number.isSafeInteger(value) && value >= 0;
 }
 
 function validExchangeId(value: string): boolean {
+    if (value.length !== 32) {
+        return false;
+    }
     try {
         const decoded = decodeBase64Url(value);
         return decoded.length === 24 && encodeBase64Url(decoded) === value;
@@ -37,6 +47,7 @@ export function copyFriendRecord(record: FriendRecord): FriendRecord {
         requester: { publicKey: record.requester.publicKey.slice() },
         status: record.status,
         requestId: record.requestId,
+        previousRequestId: record.previousRequestId,
         ...(record.profile === undefined
             ? {}
             : {
@@ -73,6 +84,7 @@ export function encodeFriendRecord(record: FriendRecord): Uint8Array {
             requester: serializePublicIdentity(record.requester),
             status: record.status,
             requestId: record.requestId,
+            previousRequestId: record.previousRequestId,
             profile: profileBytes === undefined ? null : encodeBase64Url(profileBytes),
             peerResponseAddress: record.peerResponseAddress ?? null,
             localResponseAddress: record.localResponseAddress ?? null,
@@ -89,6 +101,9 @@ export function encodeFriendRecord(record: FriendRecord): Uint8Array {
 
 /** Decode strict clean-rewrite friend state. */
 export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
+    if (bytes.length > MAX_FRIEND_RECORD_BYTES) {
+        throw new Error("Invalid persisted friend record");
+    }
     const decoded: unknown = JSON.parse(utf8Decode(bytes));
     if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) {
         throw new Error("Invalid persisted friend record");
@@ -100,6 +115,7 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
         "requester",
         "status",
         "requestId",
+        "previousRequestId",
         "profile",
         "peerResponseAddress",
         "localResponseAddress",
@@ -117,10 +133,16 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
             value.status !== "ended") ||
         typeof value.requestId !== "string" ||
         !validExchangeId(value.requestId) ||
+        (value.previousRequestId !== null &&
+            (typeof value.previousRequestId !== "string" ||
+                !validExchangeId(value.previousRequestId))) ||
         (value.profile !== null && typeof value.profile !== "string") ||
+        (typeof value.profile === "string" && value.profile.length > MAX_PROFILE_CHARACTERS) ||
         (value.peerResponseAddress !== null && typeof value.peerResponseAddress !== "string") ||
         (value.localResponseAddress !== null && typeof value.localResponseAddress !== "string") ||
         (value.privateData !== null && typeof value.privateData !== "string") ||
+        (typeof value.privateData === "string" &&
+            value.privateData.length > MAX_PRIVATE_DATA_CHARACTERS) ||
         typeof value.createdAt !== "number" ||
         typeof value.updatedAt !== "number" ||
         !validTime(value.createdAt) ||
@@ -139,9 +161,15 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
     if (Object.keys(identityValue).length !== 1 || typeof identityValue.publicKey !== "string") {
         throw new Error("Invalid persisted friend record");
     }
+    if (identityValue.publicKey.length !== 43) {
+        throw new Error("Invalid persisted friend record");
+    }
     const identity = deserializePublicIdentity({ publicKey: identityValue.publicKey });
     const requesterValue = value.requester as Record<string, unknown>;
     if (Object.keys(requesterValue).length !== 1 || typeof requesterValue.publicKey !== "string") {
+        throw new Error("Invalid persisted friend record");
+    }
+    if (requesterValue.publicKey.length !== 43) {
         throw new Error("Invalid persisted friend record");
     }
     const requester = deserializePublicIdentity({ publicKey: requesterValue.publicKey });
@@ -149,7 +177,7 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
     if (typeof value.profile === "string") {
         const profileBytes = decodeBase64Url(value.profile);
         try {
-            if (profileBytes.length > 1024 * 1024) {
+            if (profileBytes.length > MAX_PROFILE_BYTES) {
                 throw new Error("Invalid persisted friend record");
             }
             profile = decodeProfilePayload(profileBytes);
@@ -159,39 +187,48 @@ export function decodeFriendRecord(bytes: Uint8Array): FriendRecord {
     }
     const privateData =
         typeof value.privateData === "string" ? decodeBase64Url(value.privateData) : undefined;
-    if (
-        (privateData !== undefined && privateData.length > 256 * 1024) ||
-        (typeof value.peerResponseAddress === "string" &&
-            (utf8Encode(value.peerResponseAddress).length === 0 ||
-                utf8Encode(value.peerResponseAddress).length > 4096)) ||
-        (typeof value.localResponseAddress === "string" &&
-            (utf8Encode(value.localResponseAddress).length === 0 ||
-                utf8Encode(value.localResponseAddress).length > 4096)) ||
-        ((value.status === "pending-incoming" || value.status === "active") &&
-            (profile === undefined || typeof value.peerResponseAddress !== "string")) ||
-        (value.status === "pending-outgoing" &&
-            (profile !== undefined ||
-                value.peerResponseAddress !== null ||
-                typeof value.localResponseAddress !== "string" ||
-                privateData !== undefined))
-    ) {
-        privateData?.fill(0);
-        throw new Error("Invalid persisted friend record");
+    let keepPrivateData = false;
+    try {
+        if (
+            (privateData !== undefined && privateData.length > MAX_PRIVATE_DATA_BYTES) ||
+            (typeof value.peerResponseAddress === "string" &&
+                (utf8Encode(value.peerResponseAddress).length === 0 ||
+                    utf8Encode(value.peerResponseAddress).length > 4096)) ||
+            (typeof value.localResponseAddress === "string" &&
+                (utf8Encode(value.localResponseAddress).length === 0 ||
+                    utf8Encode(value.localResponseAddress).length > 4096)) ||
+            ((value.status === "pending-incoming" || value.status === "active") &&
+                (profile === undefined || typeof value.peerResponseAddress !== "string")) ||
+            (value.status === "pending-outgoing" &&
+                (profile !== undefined ||
+                    value.peerResponseAddress !== null ||
+                    typeof value.localResponseAddress !== "string" ||
+                    privateData !== undefined))
+        ) {
+            throw new Error("Invalid persisted friend record");
+        }
+        const record: FriendRecord = {
+            identity,
+            requester,
+            status: value.status,
+            requestId: value.requestId,
+            previousRequestId: value.previousRequestId,
+            ...(profile === undefined ? {} : { profile }),
+            ...(typeof value.peerResponseAddress === "string"
+                ? { peerResponseAddress: value.peerResponseAddress }
+                : {}),
+            ...(typeof value.localResponseAddress === "string"
+                ? { localResponseAddress: value.localResponseAddress }
+                : {}),
+            ...(privateData === undefined ? {} : { privateData }),
+            createdAt: value.createdAt,
+            updatedAt: value.updatedAt,
+        };
+        keepPrivateData = true;
+        return record;
+    } finally {
+        if (!keepPrivateData) {
+            privateData?.fill(0);
+        }
     }
-    return {
-        identity,
-        requester,
-        status: value.status,
-        requestId: value.requestId,
-        ...(profile === undefined ? {} : { profile }),
-        ...(typeof value.peerResponseAddress === "string"
-            ? { peerResponseAddress: value.peerResponseAddress }
-            : {}),
-        ...(typeof value.localResponseAddress === "string"
-            ? { localResponseAddress: value.localResponseAddress }
-            : {}),
-        ...(privateData === undefined ? {} : { privateData }),
-        createdAt: value.createdAt,
-        updatedAt: value.updatedAt,
-    };
 }

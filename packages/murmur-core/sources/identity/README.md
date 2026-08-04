@@ -33,6 +33,17 @@ Simultaneous crossed requests resolve by the canonical tuple `(requester
 identity ID, request ID)`. Both peers choose the same winner and atomically
 retire the losing local request/outbox.
 
+Every request authenticates `previousRequestId`. An initial request uses
+`null`; a request after an ended relationship must name the durable tombstone's
+request ID. This causal predecessor, rather than wall-clock ordering, prevents
+delayed old requests from reopening ended state.
+
+`end()` is state-specific: it retires a pending outgoing request, queues an
+exact rejection for pending incoming, or replaces stale active request/accept
+publications with a durable `friendship-ended` control intent. Intents survive
+restart and use the same exact `confirmOutbox()` contract after the facade seals
+and publishes them.
+
 Relay-visible request and response envelopes contain only their type,
 ephemeral key, nonce, and ciphertext. Sender and recipient bindings remain
 inside the signed encrypted payload.
@@ -53,3 +64,7 @@ The relay-visible control envelope contains no identity. Both peers derive the
 same topic public key and secret; `exportTopicSecretKey()` returns a defensive
 copy which its caller must zero. An injected/default clock rejects temporary
 payloads at or after `expiresAt`.
+
+All base64url fields are length-bounded before decoding. Sensitive decoded
+private/control bytes are zeroed on every failed validation, signature, expiry,
+or application-persistence path.

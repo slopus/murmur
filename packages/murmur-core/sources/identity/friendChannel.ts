@@ -35,9 +35,18 @@ const CONTROL_KEY_BYTES = 32;
 const CONTROL_NONCE_BYTES = 12;
 const MAX_CONTROL_PAYLOAD_BYTES = 1024 * 1024;
 const MAX_CONTROL_CIPHERTEXT_BYTES = Math.ceil((MAX_CONTROL_PAYLOAD_BYTES * 4) / 3) + 2048;
+const ID_CHARACTERS = 32;
+const PUBLIC_KEY_CHARACTERS = 43;
+const NONCE_CHARACTERS = 16;
+const SIGNATURE_CHARACTERS = 86;
+const MAX_CONTROL_PAYLOAD_CHARACTERS = Math.ceil((MAX_CONTROL_PAYLOAD_BYTES * 4) / 3);
+const MAX_CONTROL_CIPHERTEXT_CHARACTERS = Math.ceil((MAX_CONTROL_CIPHERTEXT_BYTES * 4) / 3);
 const DERIVATION_INFO = utf8Encode("murmur/friend-channel/v1");
 
 function validateControlMessage(message: FriendControlMessage): void {
+    if (message.id.length !== ID_CHARACTERS) {
+        throw new Error("Invalid friend-control message");
+    }
     const id = decodeBase64Url(message.id);
     if (
         id.length !== 24 ||
@@ -264,10 +273,15 @@ export class FriendChannel {
         if (envelope.version !== 1 || envelope.type !== "friend-control") {
             throw new Error("Friend-control envelope is not for this channel");
         }
-        const nonce = decodeBase64Url(envelope.nonce);
-        if (envelope.ciphertext.length > Math.ceil((MAX_CONTROL_CIPHERTEXT_BYTES * 4) / 3)) {
+        if (
+            typeof envelope.nonce !== "string" ||
+            envelope.nonce.length !== NONCE_CHARACTERS ||
+            typeof envelope.ciphertext !== "string" ||
+            envelope.ciphertext.length > MAX_CONTROL_CIPHERTEXT_CHARACTERS
+        ) {
             throw new Error("Invalid friend-control ciphertext");
         }
+        const nonce = decodeBase64Url(envelope.nonce);
         const ciphertext = decodeBase64Url(envelope.ciphertext);
         if (
             nonce.length !== CONTROL_NONCE_BYTES ||
@@ -287,13 +301,18 @@ export class FriendChannel {
             if (
                 Object.keys(value).length !== 7 ||
                 typeof value.id !== "string" ||
+                value.id.length !== ID_CHARACTERS ||
                 typeof value.sender !== "string" ||
+                value.sender.length !== PUBLIC_KEY_CHARACTERS ||
                 value.sender !== identityId(sender) ||
                 typeof value.recipient !== "string" ||
+                value.recipient.length !== PUBLIC_KEY_CHARACTERS ||
                 value.recipient !== identityId(this.#self) ||
                 typeof value.sentAt !== "number" ||
                 typeof value.payload !== "string" ||
+                value.payload.length > MAX_CONTROL_PAYLOAD_CHARACTERS ||
                 typeof value.signature !== "string" ||
+                value.signature.length !== SIGNATURE_CHARACTERS ||
                 typeof value.retention !== "object" ||
                 value.retention === null ||
                 Array.isArray(value.retention)
@@ -310,34 +329,44 @@ export class FriendChannel {
             ) {
                 throw new Error("Invalid friend-control retention");
             }
-            const message: FriendControlMessage = {
-                id: value.id,
-                sentAt: value.sentAt,
-                retention:
-                    retentionValue.kind === "durable"
-                        ? { kind: "durable" }
-                        : {
-                              kind: "temporary",
-                              expiresAt: retentionValue.expiresAt as number,
-                          },
-                payload: decodeBase64Url(value.payload),
-            };
-            validateControlMessage(message);
-            const signed = messageSignaturePayload(sender, this.#self, message);
-            const signature = decodeBase64Url(value.signature);
+            const payload = decodeBase64Url(value.payload);
+            let keepPayload = false;
             try {
-                if (!verifyBytes(sender, signed, signature)) {
-                    zeroBytes(message.payload);
-                    throw new Error("Invalid friend-control signature");
+                const message: FriendControlMessage = {
+                    id: value.id,
+                    sentAt: value.sentAt,
+                    retention:
+                        retentionValue.kind === "durable"
+                            ? { kind: "durable" }
+                            : {
+                                  kind: "temporary",
+                                  expiresAt: retentionValue.expiresAt as number,
+                              },
+                    payload,
+                };
+                validateControlMessage(message);
+                const signed = messageSignaturePayload(sender, this.#self, message);
+                const signature = decodeBase64Url(value.signature);
+                try {
+                    if (!verifyBytes(sender, signed, signature)) {
+                        throw new Error("Invalid friend-control signature");
+                    }
+                    if (
+                        message.retention.kind === "temporary" &&
+                        message.retention.expiresAt <= now
+                    ) {
+                        throw new Error("Friend-control message has expired");
+                    }
+                    keepPayload = true;
+                    return { sender, message };
+                } finally {
+                    zeroBytes(signed);
+                    zeroBytes(signature);
                 }
-                if (message.retention.kind === "temporary" && message.retention.expiresAt <= now) {
-                    zeroBytes(message.payload);
-                    throw new Error("Friend-control message has expired");
-                }
-                return { sender, message };
             } finally {
-                zeroBytes(signed);
-                zeroBytes(signature);
+                if (!keepPayload) {
+                    zeroBytes(payload);
+                }
             }
         } finally {
             zeroBytes(nonce);
@@ -400,6 +429,9 @@ export async function acceptFriendControl(
             await transaction.set(key, fingerprint);
             return { ...opened, status: "opened" };
         });
+    } catch (error: unknown) {
+        zeroBytes(opened.message.payload);
+        throw error;
     } finally {
         zeroBytes(preimage);
         zeroBytes(fingerprint);

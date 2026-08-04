@@ -1,7 +1,14 @@
 import type { IdentityKeyPair, IdentityPublicKey } from "../crypto/index.js";
 import { randomBytes, validateIdentityKeyPair } from "../crypto/index.js";
 import type { MurmurStore, StoreTransaction } from "../storage/index.js";
-import { encodeBase64Url, equalBytes, zeroBytes } from "../utils/index.js";
+import {
+    decodeBase64Url,
+    encodeBase64Url,
+    equalBytes,
+    utf8Decode,
+    utf8Encode,
+    zeroBytes,
+} from "../utils/index.js";
 import { copyFriendRecord, decodeFriendRecord, encodeFriendRecord } from "./impl/friendCodec.js";
 import {
     createFriendRequest,
@@ -23,6 +30,8 @@ import type {
     CreateFriendRequestOptions,
     CreateFriendResponseOptions,
     FriendAcceptance,
+    FriendBookOptions,
+    FriendControlIntentOutboxItem,
     FriendOutboxItem,
     FriendOutboxOutcome,
     FriendRecord,
@@ -41,6 +50,16 @@ function validateTime(now: number): void {
 
 function newExchangeId(): string {
     return encodeBase64Url(randomBytes(24));
+}
+
+function validateExchangeId(id: string): void {
+    if (id.length !== 32) {
+        throw new Error("Friend exchange ID must encode exactly 24 bytes");
+    }
+    const decoded = decodeBase64Url(id);
+    if (decoded.length !== 24 || encodeBase64Url(decoded) !== id) {
+        throw new Error("Friend exchange ID must encode exactly 24 bytes");
+    }
 }
 
 function compareContenders(
@@ -65,6 +84,14 @@ export class FriendExchangeIdCollisionError extends Error {
     }
 }
 
+/** Attempt to replace an unrelated durable outbox item with the same ID. */
+export class FriendOutboxIdCollisionError extends Error {
+    constructor() {
+        super("Friend outbox ID collision");
+        this.name = "FriendOutboxIdCollisionError";
+    }
+}
+
 /** Durable, transactional request/response friendship lifecycle and outbox. */
 export class FriendBook {
     readonly #owner: IdentityKeyPair;
@@ -72,8 +99,11 @@ export class FriendBook {
     readonly #recordsPrefix: string;
     readonly #replayPrefix: string;
     readonly #outboxPrefix: string;
+    readonly #outboxIdsPrefix: string;
+    readonly #outgoingPrefix: string;
+    readonly #generateId: () => string;
 
-    constructor(owner: IdentityKeyPair, store: MurmurStore) {
+    constructor(owner: IdentityKeyPair, store: MurmurStore, options: FriendBookOptions = {}) {
         validateIdentityKeyPair(owner);
         const ownerId = identityId(owner);
         this.#owner = owner;
@@ -81,6 +111,9 @@ export class FriendBook {
         this.#recordsPrefix = `identity/v1/${ownerId}/friends/`;
         this.#replayPrefix = `identity/v1/${ownerId}/friend-exchange-replay/`;
         this.#outboxPrefix = `identity/v1/${ownerId}/friend-outbox/`;
+        this.#outboxIdsPrefix = `identity/v1/${ownerId}/friend-outbox-ids/`;
+        this.#outgoingPrefix = `identity/v1/${ownerId}/friend-outgoing/`;
+        this.#generateId = options.generateId ?? newExchangeId;
     }
 
     /** Atomically prepare a pending request and its exact durable publication. */
@@ -94,22 +127,8 @@ export class FriendBook {
         if (equalBytes(this.#owner.publicKey, recipient.publicKey)) {
             throw new Error("An identity cannot request friendship with itself");
         }
-        const requestId = newExchangeId();
-        const envelope = createFriendRequest(this.#owner, recipient, {
-            id: requestId,
-            responseAddress: options.responseAddress,
-            profile: options.profile,
-            ...(options.privateData === undefined ? {} : { privateData: options.privateData }),
-        });
-        const outbox: FriendRequestOutboxItem = {
-            id: requestId,
-            kind: "request",
-            peer: { publicKey: recipient.publicKey.slice() },
-            destination: options.destination,
-            envelope,
-            createdAt: now,
-        };
-        await this.#store.transaction(async (transaction) => {
+        const requestId = this.#newId();
+        return this.#store.transaction(async (transaction) => {
             const key = this.#recordKey(recipient);
             const existing = await this.#read(transaction, key);
             if (existing !== undefined && existing.status !== "ended") {
@@ -118,19 +137,37 @@ export class FriendBook {
             if (existing !== undefined && now < existing.updatedAt) {
                 throw new Error("Friend state must not move backwards in time");
             }
+            const previousRequestId = existing?.status === "ended" ? existing.requestId : null;
+            const envelope = createFriendRequest(this.#owner, recipient, {
+                id: requestId,
+                previousRequestId,
+                responseAddress: options.responseAddress,
+                profile: options.profile,
+                ...(options.privateData === undefined ? {} : { privateData: options.privateData }),
+            });
+            const outbox: FriendRequestOutboxItem = {
+                id: requestId,
+                kind: "request",
+                peer: { publicKey: recipient.publicKey.slice() },
+                destination: options.destination,
+                envelope,
+                createdAt: now,
+            };
             const record: FriendRecord = {
                 identity: { publicKey: recipient.publicKey.slice() },
                 requester: { publicKey: this.#owner.publicKey.slice() },
                 status: "pending-outgoing",
                 requestId,
+                previousRequestId,
                 localResponseAddress: options.responseAddress,
                 createdAt: existing?.createdAt ?? now,
                 updatedAt: now,
             };
             await transaction.set(key, encodeFriendRecord(record));
-            await transaction.set(this.#outboxKey(outbox.id), encodeFriendOutboxItem(outbox));
+            await this.#insertOutgoingTracker(transaction, recipient, requestId, "pending");
+            await this.#insertOutbox(transaction, outbox);
+            return copyFriendOutboxItem(outbox);
         });
-        return copyFriendOutboxItem(outbox);
     }
 
     /**
@@ -158,6 +195,9 @@ export class FriendBook {
                 );
                 const key = this.#recordKey(opened.sender);
                 const existing = await this.#read(transaction, key);
+                if (existing !== undefined && now < existing.updatedAt) {
+                    throw new Error("Friend state must not move backwards in time");
+                }
                 if (replay === "duplicate") {
                     if (existing === undefined) {
                         throw new Error("Friend request replay exists without durable state");
@@ -166,6 +206,15 @@ export class FriendBook {
                 }
                 if (existing?.status === "active") {
                     return { status: "superseded", record: copyFriendRecord(existing) };
+                }
+                if (
+                    (existing === undefined && opened.previousRequestId !== null) ||
+                    (existing?.status === "ended" &&
+                        opened.previousRequestId !== existing.requestId) ||
+                    (existing?.status === "pending-outgoing" &&
+                        opened.previousRequestId !== existing.previousRequestId)
+                ) {
+                    throw new Error("Friend request causal predecessor does not match");
                 }
                 if (existing?.status === "pending-outgoing") {
                     const incomingWins =
@@ -178,7 +227,17 @@ export class FriendBook {
                     if (!incomingWins) {
                         return { status: "superseded", record: copyFriendRecord(existing) };
                     }
-                    await transaction.delete(this.#outboxKey(existing.requestId));
+                    await this.#deleteRequestOutbox(
+                        transaction,
+                        existing.identity,
+                        existing.requestId,
+                    );
+                    await this.#setOutgoingTracker(
+                        transaction,
+                        existing.identity,
+                        existing.requestId,
+                        "retired",
+                    );
                 } else if (existing !== undefined && existing.status !== "ended") {
                     throw new Error(
                         `Cannot receive friendship request from ${existing.status} state`,
@@ -189,6 +248,7 @@ export class FriendBook {
                     requester: { publicKey: opened.sender.publicKey.slice() },
                     status: "pending-incoming",
                     requestId: opened.id,
+                    previousRequestId: opened.previousRequestId,
                     profile: opened.profile,
                     peerResponseAddress: opened.responseAddress,
                     ...(existing?.localResponseAddress === undefined
@@ -228,7 +288,7 @@ export class FriendBook {
             if (existing.peerResponseAddress === undefined) {
                 throw new Error("Pending incoming friend is missing its response destination");
             }
-            const responseId = newExchangeId();
+            const responseId = this.#newId();
             const envelope =
                 options.decision === "accepted"
                     ? createFriendResponse(this.#owner, existing.identity, {
@@ -264,7 +324,7 @@ export class FriendBook {
                       }
                     : { ...existing, status: "ended", updatedAt: now };
             await transaction.set(key, encodeFriendRecord(record));
-            await transaction.set(this.#outboxKey(outbox.id), encodeFriendOutboxItem(outbox));
+            await this.#insertOutbox(transaction, outbox);
             return {
                 outbox: copyFriendOutboxItem(outbox),
                 record: copyFriendRecord(record),
@@ -292,20 +352,43 @@ export class FriendBook {
                 );
                 const key = this.#recordKey(opened.responder);
                 const existing = await this.#read(transaction, key);
+                if (existing !== undefined && now < existing.updatedAt) {
+                    throw new Error("Friend state must not move backwards in time");
+                }
                 if (replay === "duplicate") {
                     if (existing === undefined) {
                         throw new Error("Friend response replay exists without durable state");
                     }
                     return { status: "duplicate", record: copyFriendRecord(existing) };
                 }
+                const outgoingState = await this.#getOutgoingTracker(
+                    transaction,
+                    opened.responder,
+                    opened.requestId,
+                );
+                const matchesPending =
+                    outgoingState === "pending" &&
+                    existing?.status === "pending-outgoing" &&
+                    existing.requestId === opened.requestId;
+                if (!matchesPending) {
+                    if (
+                        existing !== undefined &&
+                        (outgoingState === "retired" || outgoingState === "answered")
+                    ) {
+                        return {
+                            status: "superseded",
+                            record: copyFriendRecord(existing),
+                        };
+                    }
+                    throw new Error(
+                        "Friend response does not match durable outgoing request state",
+                    );
+                }
                 if (
                     existing?.status !== "pending-outgoing" ||
                     existing.requestId !== opened.requestId
                 ) {
                     throw new Error("Friend response does not match pending outgoing state");
-                }
-                if (now < existing.updatedAt) {
-                    throw new Error("Friend state must not move backwards in time");
                 }
                 const record: FriendRecord =
                     opened.decision === "accepted"
@@ -320,6 +403,13 @@ export class FriendBook {
                               updatedAt: now,
                           }
                         : { ...existing, status: "ended", updatedAt: now };
+                await this.#deleteRequestOutbox(transaction, existing.identity, existing.requestId);
+                await this.#setOutgoingTracker(
+                    transaction,
+                    existing.identity,
+                    existing.requestId,
+                    "answered",
+                );
                 await transaction.set(key, encodeFriendRecord(record));
                 return { status: "opened", record: copyFriendRecord(record) };
             });
@@ -371,7 +461,10 @@ export class FriendBook {
         });
     }
 
-    /** End pending or active friendship while retaining its durable record. */
+    /**
+     * End friendship and atomically retire or enqueue the state-specific
+     * terminal publication. Repeated calls in ended state are idempotent.
+     */
     async end(peer: IdentityPublicKey, now: number = Date.now()): Promise<FriendRecord> {
         validateTime(now);
         return this.#store.transaction(async (transaction) => {
@@ -385,6 +478,48 @@ export class FriendBook {
             }
             if (existing.status === "ended") {
                 return copyFriendRecord(existing);
+            }
+            if (existing.status === "pending-outgoing") {
+                await this.#deleteRequestOutbox(transaction, existing.identity, existing.requestId);
+                await this.#setOutgoingTracker(
+                    transaction,
+                    existing.identity,
+                    existing.requestId,
+                    "retired",
+                );
+            } else if (existing.status === "pending-incoming") {
+                if (existing.peerResponseAddress === undefined) {
+                    throw new Error("Pending incoming friend is missing its response destination");
+                }
+                const responseId = this.#newId();
+                const envelope = createFriendResponse(this.#owner, existing.identity, {
+                    id: responseId,
+                    requestId: existing.requestId,
+                    decision: "rejected",
+                });
+                await this.#insertOutbox(transaction, {
+                    id: responseId,
+                    kind: "response",
+                    peer: { publicKey: existing.identity.publicKey.slice() },
+                    destination: existing.peerResponseAddress,
+                    envelope,
+                    createdAt: now,
+                });
+            } else {
+                const intentId = this.#newId();
+                const intent: FriendControlIntentOutboxItem = {
+                    id: intentId,
+                    kind: "control-intent",
+                    peer: { publicKey: existing.identity.publicKey.slice() },
+                    destination: "friend-channel",
+                    intent: {
+                        type: "friendship-ended",
+                        requestId: existing.requestId,
+                    },
+                    createdAt: now,
+                };
+                await this.#insertOutbox(transaction, intent);
+                await this.#deletePeerExchangeOutbox(transaction, existing.identity);
             }
             const ended: FriendRecord = { ...existing, status: "ended", updatedAt: now };
             await transaction.set(key, encodeFriendRecord(ended));
@@ -414,9 +549,108 @@ export class FriendBook {
         return `${this.#outboxPrefix}${id}`;
     }
 
+    #outgoingKey(peer: IdentityPublicKey, id: string): string {
+        return `${this.#outgoingPrefix}${identityId(peer)}/${id}`;
+    }
+
+    #newId(): string {
+        const id = this.#generateId();
+        validateExchangeId(id);
+        return id;
+    }
+
     async #read(transaction: StoreTransaction, key: string): Promise<FriendRecord | undefined> {
         const bytes = await transaction.get(key);
         return bytes === undefined ? undefined : decodeFriendRecord(bytes);
+    }
+
+    async #insertOutbox(transaction: StoreTransaction, item: FriendOutboxItem): Promise<void> {
+        const key = this.#outboxKey(item.id);
+        const reservationKey = `${this.#outboxIdsPrefix}${item.id}`;
+        if (
+            (await transaction.get(key)) !== undefined ||
+            (await transaction.get(reservationKey)) !== undefined
+        ) {
+            throw new FriendOutboxIdCollisionError();
+        }
+        await transaction.set(reservationKey, utf8Encode(item.kind));
+        await transaction.set(key, encodeFriendOutboxItem(item));
+    }
+
+    async #deleteRequestOutbox(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+        requestId: string,
+    ): Promise<void> {
+        const key = this.#outboxKey(requestId);
+        const bytes = await transaction.get(key);
+        if (bytes === undefined) {
+            return;
+        }
+        const item = decodeFriendOutboxItem(bytes);
+        if (item.kind !== "request" || !equalBytes(item.peer.publicKey, peer.publicKey)) {
+            throw new FriendOutboxIdCollisionError();
+        }
+        await transaction.delete(key);
+    }
+
+    async #deletePeerExchangeOutbox(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+    ): Promise<void> {
+        const items = await transaction.list(this.#outboxPrefix);
+        for (const [key, bytes] of items) {
+            const item = decodeFriendOutboxItem(bytes);
+            if (item.kind !== "control-intent" && equalBytes(item.peer.publicKey, peer.publicKey)) {
+                await transaction.delete(key);
+            }
+        }
+    }
+
+    async #insertOutgoingTracker(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+        requestId: string,
+        state: "pending" | "retired" | "answered",
+    ): Promise<void> {
+        const key = this.#outgoingKey(peer, requestId);
+        if ((await transaction.get(key)) !== undefined) {
+            throw new FriendExchangeIdCollisionError();
+        }
+        await transaction.set(key, utf8Encode(state));
+    }
+
+    async #setOutgoingTracker(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+        requestId: string,
+        state: "pending" | "retired" | "answered",
+    ): Promise<void> {
+        const key = this.#outgoingKey(peer, requestId);
+        const existing = await this.#getOutgoingTracker(transaction, peer, requestId);
+        if (existing !== "pending") {
+            throw new Error("Outgoing friend request tracker is not pending");
+        }
+        await transaction.set(key, utf8Encode(state));
+    }
+
+    async #getOutgoingTracker(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+        requestId: string,
+    ): Promise<"pending" | "retired" | "answered" | undefined> {
+        const bytes = await transaction.get(this.#outgoingKey(peer, requestId));
+        if (bytes === undefined) {
+            return undefined;
+        }
+        if (bytes.length > 8) {
+            throw new Error("Invalid outgoing friend request tracker");
+        }
+        const value = utf8Decode(bytes);
+        if (value !== "pending" && value !== "retired" && value !== "answered") {
+            throw new Error("Invalid outgoing friend request tracker");
+        }
+        return value;
     }
 
     async #checkReplay(

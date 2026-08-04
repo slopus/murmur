@@ -25,10 +25,21 @@ const MAX_PROFILE_BYTES = 1024 * 1024;
 const MAX_PRIVATE_DATA_BYTES = 256 * 1024;
 const MAX_RESPONSE_ADDRESS_BYTES = 4096;
 const MAX_CIPHERTEXT_BYTES = 2 * 1024 * 1024;
+const ID_CHARACTERS = 32;
+const PUBLIC_KEY_CHARACTERS = 43;
+const EPHEMERAL_KEY_CHARACTERS = 43;
+const NONCE_CHARACTERS = 16;
+const SIGNATURE_CHARACTERS = 86;
+const MAX_PROFILE_CHARACTERS = Math.ceil((MAX_PROFILE_BYTES * 4) / 3);
+const MAX_PRIVATE_DATA_CHARACTERS = Math.ceil((MAX_PRIVATE_DATA_BYTES * 4) / 3);
+const MAX_CIPHERTEXT_CHARACTERS = Math.ceil((MAX_CIPHERTEXT_BYTES * 4) / 3);
 
 type FriendEnvelope = FriendRequestEnvelope | FriendResponseEnvelope;
 
 function validateId(id: string): void {
+    if (id.length !== ID_CHARACTERS) {
+        throw new Error("Friend exchange ID must encode exactly 24 bytes");
+    }
     const decoded = decodeBase64Url(id);
     if (decoded.length !== 24 || encodeBase64Url(decoded) !== id) {
         throw new Error("Friend exchange ID must encode exactly 24 bytes");
@@ -79,6 +90,9 @@ function encodeProfile(profile: IdentityProfile): string {
 }
 
 function decodeProfile(encoded: string): IdentityProfile {
+    if (encoded.length > MAX_PROFILE_CHARACTERS) {
+        throw new Error(`Profile exceeds ${MAX_PROFILE_BYTES} bytes`);
+    }
     const bytes = decodeBase64Url(encoded);
     try {
         if (bytes.length > MAX_PROFILE_BYTES) {
@@ -150,7 +164,12 @@ function openSigned(
         Object.keys(envelope).length !== fields.length ||
         Object.keys(envelope).some((key) => !fields.includes(key)) ||
         envelope.version !== 1 ||
-        envelope.ciphertext.length > Math.ceil((MAX_CIPHERTEXT_BYTES * 4) / 3) ||
+        typeof envelope.ephemeralPublicKey !== "string" ||
+        envelope.ephemeralPublicKey.length !== EPHEMERAL_KEY_CHARACTERS ||
+        typeof envelope.nonce !== "string" ||
+        envelope.nonce.length !== NONCE_CHARACTERS ||
+        typeof envelope.ciphertext !== "string" ||
+        envelope.ciphertext.length > MAX_CIPHERTEXT_CHARACTERS ||
         decodeBase64Url(envelope.ephemeralPublicKey).length !== 32 ||
         decodeBase64Url(envelope.nonce).length !== 12
     ) {
@@ -202,10 +221,14 @@ export function createFriendRequest(
     input: FriendRequestInput,
 ): FriendRequestEnvelope {
     validateId(input.id);
+    if (input.previousRequestId !== null) {
+        validateId(input.previousRequestId);
+    }
     validateResponseAddress(input.responseAddress);
     const privateData = validateTimeFreePrivateData(input.privateData);
     return sealSigned("friend-request", sender, recipient, {
         id: input.id,
+        previousRequestId: input.previousRequestId,
         sender: serializePublicIdentity(sender).publicKey,
         recipient: identityId(recipient),
         responseAddress: input.responseAddress,
@@ -225,6 +248,7 @@ export function openFriendRequest(
     const payload = openSigned(recipient, envelope);
     const expected = [
         "id",
+        "previousRequestId",
         "sender",
         "recipient",
         "responseAddress",
@@ -236,36 +260,49 @@ export function openFriendRequest(
         Object.keys(payload).length !== expected.length ||
         Object.keys(payload).some((key) => !expected.includes(key)) ||
         typeof payload.id !== "string" ||
+        (payload.previousRequestId !== null && typeof payload.previousRequestId !== "string") ||
         typeof payload.sender !== "string" ||
+        payload.sender.length !== PUBLIC_KEY_CHARACTERS ||
         typeof payload.recipient !== "string" ||
+        payload.recipient.length !== PUBLIC_KEY_CHARACTERS ||
         payload.recipient !== identityId(recipient) ||
         typeof payload.responseAddress !== "string" ||
         typeof payload.profile !== "string" ||
+        payload.profile.length > MAX_PROFILE_CHARACTERS ||
         typeof payload.privateData !== "string" ||
-        typeof payload.signature !== "string"
+        payload.privateData.length > MAX_PRIVATE_DATA_CHARACTERS ||
+        typeof payload.signature !== "string" ||
+        payload.signature.length !== SIGNATURE_CHARACTERS
     ) {
         throw new Error("Invalid friend request payload");
     }
     validateId(payload.id);
+    if (typeof payload.previousRequestId === "string") {
+        validateId(payload.previousRequestId);
+    }
     validateResponseAddress(payload.responseAddress);
     const sender = deserializePublicIdentity({ publicKey: payload.sender });
     const privateData = decodeBase64Url(payload.privateData);
-    const signature = decodeBase64Url(payload.signature);
-    const signed = signaturePayload("friend-request", identityId(recipient), {
-        id: payload.id,
-        sender: payload.sender,
-        recipient: payload.recipient,
-        responseAddress: payload.responseAddress,
-        profile: payload.profile,
-        privateData: payload.privateData,
-    });
+    let signature: Uint8Array | undefined;
+    let signed: Uint8Array | undefined;
     try {
+        signature = decodeBase64Url(payload.signature);
+        signed = signaturePayload("friend-request", identityId(recipient), {
+            id: payload.id,
+            previousRequestId: payload.previousRequestId,
+            sender: payload.sender,
+            recipient: payload.recipient,
+            responseAddress: payload.responseAddress,
+            profile: payload.profile,
+            privateData: payload.privateData,
+        });
         validateTimeFreePrivateData(privateData);
         if (!verifyBytes(sender, signed, signature)) {
             throw new Error("Invalid friend request signature");
         }
         return {
             id: payload.id,
+            previousRequestId: payload.previousRequestId,
             sender,
             responseAddress: payload.responseAddress,
             profile: decodeProfile(payload.profile),
@@ -273,8 +310,12 @@ export function openFriendRequest(
         };
     } finally {
         zeroBytes(privateData);
-        zeroBytes(signature);
-        zeroBytes(signed);
+        if (signature !== undefined) {
+            zeroBytes(signature);
+        }
+        if (signed !== undefined) {
+            zeroBytes(signed);
+        }
     }
 }
 
@@ -331,13 +372,19 @@ export function openFriendResponse(
         typeof payload.id !== "string" ||
         typeof payload.requestId !== "string" ||
         typeof payload.responder !== "string" ||
+        payload.responder.length !== PUBLIC_KEY_CHARACTERS ||
         typeof payload.recipient !== "string" ||
+        payload.recipient.length !== PUBLIC_KEY_CHARACTERS ||
         payload.recipient !== identityId(recipient) ||
         (payload.decision !== "accepted" && payload.decision !== "rejected") ||
         (payload.responseAddress !== null && typeof payload.responseAddress !== "string") ||
         (payload.profile !== null && typeof payload.profile !== "string") ||
+        (typeof payload.profile === "string" && payload.profile.length > MAX_PROFILE_CHARACTERS) ||
         (payload.privateData !== null && typeof payload.privateData !== "string") ||
-        typeof payload.signature !== "string"
+        (typeof payload.privateData === "string" &&
+            payload.privateData.length > MAX_PRIVATE_DATA_CHARACTERS) ||
+        typeof payload.signature !== "string" ||
+        payload.signature.length !== SIGNATURE_CHARACTERS
     ) {
         throw new Error("Invalid friend response payload");
     }
@@ -410,6 +457,7 @@ export function openFriendResponse(
 export function friendRequestFingerprint(opened: OpenedFriendRequest): Uint8Array {
     const preimage = canonicalJsonBytes({
         id: opened.id,
+        previousRequestId: opened.previousRequestId,
         sender: identityId(opened.sender),
         responseAddress: opened.responseAddress,
         profile: encodeProfile(opened.profile),
