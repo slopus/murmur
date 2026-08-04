@@ -96,17 +96,17 @@ sequence holes.
 
 SQLite uses `BEGIN IMMEDIATE`. Postgres uses a per-topic advisory transaction
 lock. Both allocate the sequence, apply collapse, insert the event, and record
-idempotency atomically. The schema is fresh and intentionally has no legacy
-migration path.
+idempotency atomically. The current schema is version 3, fresh, and
+intentionally has no legacy migration path.
 
 ## Publishing
 
 ```text
-MurmurClient.publish(access, payload)
+durable stateful outbox event
         |
-        +-- choose identity signer for Read Topic
-        |   or verify/use shared write capability
-        +-- sign canonical event
+        +-- use a fresh author for request/response Read Topics
+        |   or the shared write capability for control/group topics
+        +-- retain the exact signed event before network access
         `-- publish once through the one configured transport
                 |
                 +-- relay verifies shape/signature/write key
@@ -115,17 +115,17 @@ MurmurClient.publish(access, payload)
                 `-- store commits atomically
 ```
 
-The clean client has no relay arrays, failover ordering, or generic hidden retry
-loop. A higher-level durable protocol may retain an exact signed event in its
-own state and retry it. A first publish has no maximum past age, so offline
-outbox work does not expire implicitly. Exact retries remain idempotent after
-explicit expiration because the durable receipt is checked before lifecycle
-policy for already-authenticated content.
+The stateful facade has no relay arrays or failover ordering. It durably retains
+exact outbox bytes and retries them during convergence. A first publish has no
+maximum past age, so offline outbox work does not expire implicitly. Exact
+retries remain idempotent after explicit expiration because the durable receipt
+is checked before lifecycle policy for already-authenticated content.
 
 ## Reading and cursors
 
-The relay has no subscription records or acknowledgements.
-`MurmurClient.subscribe(access)` only adds a local synchronization target.
+The relay has no subscription records or acknowledgements. Murmur persists its
+own per-topic cursors and discovers synchronization targets from durable friend
+and group state.
 
 ```text
 durable cursor C
@@ -135,29 +135,25 @@ read events after C
         |
         +-- retained events in sequence order
         |       |
-        |       `-- application transaction:
-        |              persist effect
-        |              advanceCursor(transaction)
+        |       `-- MurmurStore transaction:
+        |              persist protocol/application effect
+        |              advance durable cursor
         |
         `-- head H + exhausted flag
 ```
 
-`ReceivedEvent.advanceCursor(transaction)` must commit with the application
-effect. It rejects skipping an earlier retained event but accepts holes that the
-relay has already removed.
-
-Sync passes are serialized and pending deliveries block the same topic from
-being returned again. Empty head-only progress re-reads the cursor inside a
-transaction and can only increase it.
+The stateful engine commits each event's protocol effect and cursor advancement
+together. Sync passes are serialized. Empty head-only progress re-reads the
+cursor inside a transaction and can only increase it.
 
 Pages carry `exhausted`. Count and encoded-byte limits can make a short page
 non-exhausted, so the last event advances only to its own sequence in that case.
 Only an exhausted page may advance the last event, or an empty suffix, to the
 topic head.
 
-Subscribed topics read concurrently through the single transport. Long-poll
-wakes are latency hints; register-then-recheck and timeout reads preserve
-correctness without them.
+Active topics read through the single transport. Long-poll wakes are latency
+hints; register-then-recheck and timeout reads preserve correctness without
+them.
 
 ## Persistence
 

@@ -195,7 +195,7 @@ successful proof, an invalid attempt, or a replay consumes it. The challenge is
 also bound to the topic descriptor and expiration. Issuance and atomic
 consumption use shared relay storage rather than process memory.
 
-## Stateful client contract
+## Internal relay access
 
 ```ts
 interface TopicAccess {
@@ -205,18 +205,15 @@ interface TopicAccess {
 }
 ```
 
-For protected writes, the client derives the public key from `writeSecretKey`
-and requires it to equal `topic.writeKey` before signing. This permits several
-different Murmur identities to share one MLS or control-stream capability
-without exposing their identity signing keys to the relay envelope.
+Murmur holds this capability material internally. Request and response
+`Read Topic` events use fresh unlinkable authors. Control and group
+`Read and Write Topic` events use the shared write capability after verifying
+that its derived public key equals `topic.writeKey`. The exact signed event is
+then persisted in the outbox before publication.
 
-For `Read Topic`, no designated write capability exists, so the client's normal
-identity signer is a valid relay author.
-
-There is exactly one `RelayTransport` per stateful client. Multi-relay ordering,
-failover, and relay-specific cursors are not protocol concepts.
-
-Clients independently validate descriptor shape, event signature, topic
-identity, sequence range, and designated write author on received pages. Sync
-passes are serialized, and a pending delivery must advance transactionally
-before that topic is read again.
+There is exactly one `RelayTransport` per stateful Murmur instance. Multi-relay
+ordering, failover, and relay-specific cursors are not protocol concepts. The
+transport validates descriptor shape, event signature, canonical sequence
+encoding, topic identity, sequence range, and designated write author on
+received pages. The stateful engine serializes sync and advances each topic
+cursor transactionally with the event's durable effect.
