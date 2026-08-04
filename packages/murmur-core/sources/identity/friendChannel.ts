@@ -20,13 +20,10 @@ import {
     utf8Encode,
     zeroBytes,
 } from "../utils/index.js";
-import {
-    deserializePublicIdentity,
-    identityId,
-    serializePublicIdentity,
-} from "./impl/identityCodec.js";
+import { identityId } from "./impl/identityCodec.js";
 import type {
     AcceptedFriendControl,
+    FriendChannelOptions,
     FriendControlEnvelope,
     FriendControlMessage,
     FriendControlRetention,
@@ -126,11 +123,16 @@ export class FriendControlIdCollisionError extends Error {
 export class FriendChannel {
     readonly #self: IdentityKeyPair;
     readonly #peer: IdentityPublicKey;
+    readonly #now: () => number;
     readonly #encryptionKey: Uint8Array;
     readonly #topicSecretKey: Uint8Array;
     readonly #topicPublicKey: Uint8Array;
 
-    constructor(self: IdentityKeyPair, peer: IdentityPublicKey) {
+    constructor(
+        self: IdentityKeyPair,
+        peer: IdentityPublicKey,
+        options: FriendChannelOptions = {},
+    ) {
         if (equalBytes(self.publicKey, peer.publicKey)) {
             throw new Error("A friend channel requires two distinct identities");
         }
@@ -141,6 +143,7 @@ export class FriendChannel {
             material = hkdf(sha256, sharedSecret, salt, DERIVATION_INFO, 64);
             this.#self = self;
             this.#peer = { publicKey: peer.publicKey.slice() };
+            this.#now = options.now ?? Date.now;
             this.#encryptionKey = material.slice(0, CONTROL_KEY_BYTES);
             this.#topicSecretKey = material.slice(CONTROL_KEY_BYTES);
             this.#topicPublicKey = ed25519.getPublicKey(this.#topicSecretKey);
@@ -158,16 +161,31 @@ export class FriendChannel {
         return { publicKey: this.#peer.publicKey.slice() };
     }
 
+    /** Local public identity bound to this channel. */
+    get self(): IdentityPublicKey {
+        return { publicKey: this.#self.publicKey.slice() };
+    }
+
     /** Shared opaque public key which authorizes this relay topic. */
     get topicPublicKey(): Uint8Array {
         return this.#topicPublicKey.slice();
+    }
+
+    /**
+     * Export a defensive copy of the shared relay topic secret.
+     *
+     * The caller owns this copy and must zero it after constructing its
+     * transport-specific read/write authorization.
+     */
+    exportTopicSecretKey(): Uint8Array {
+        return this.#topicSecretKey.slice();
     }
 
     /** Create a new opaque control message with a random 192-bit ID. */
     createMessage(
         payload: Uint8Array,
         retention: FriendControlRetention = { kind: "durable" },
-        sentAt: number = Date.now(),
+        sentAt: number = this.#now(),
     ): FriendControlMessage {
         const message: FriendControlMessage = {
             id: encodeBase64Url(randomBytes(24)),
@@ -192,6 +210,8 @@ export class FriendChannel {
             plaintext = utf8Encode(
                 JSON.stringify({
                     id: message.id,
+                    sender: identityId(this.#self),
+                    recipient: identityId(this.#peer),
                     sentAt: message.sentAt,
                     retention: retentionJson(message.retention),
                     payload: encodeBase64Url(message.payload),
@@ -203,8 +223,6 @@ export class FriendChannel {
             return {
                 version: 1,
                 type: "friend-control",
-                sender: serializePublicIdentity(this.#self),
-                recipient: identityId(this.#peer),
                 nonce: encodeBase64Url(nonce),
                 ciphertext: encodeBase64Url(
                     gcm(this.#encryptionKey, nonce, aad).encrypt(plaintext),
@@ -228,8 +246,11 @@ export class FriendChannel {
     }
 
     /** Decrypt, bind, and verify one peer-authored control envelope. */
-    open(envelope: FriendControlEnvelope): OpenedFriendControl {
-        const fields = ["version", "type", "sender", "recipient", "nonce", "ciphertext"];
+    open(envelope: FriendControlEnvelope, now: number = this.#now()): OpenedFriendControl {
+        if (!Number.isSafeInteger(now) || now < 0) {
+            throw new Error("Friend-control time must be a non-negative safe integer");
+        }
+        const fields = ["version", "type", "nonce", "ciphertext"];
         if (
             typeof envelope !== "object" ||
             envelope === null ||
@@ -239,13 +260,8 @@ export class FriendChannel {
         ) {
             throw new Error("Invalid friend-control envelope");
         }
-        const sender = deserializePublicIdentity(envelope.sender);
-        if (
-            envelope.version !== 1 ||
-            envelope.type !== "friend-control" ||
-            envelope.recipient !== identityId(this.#self) ||
-            !equalBytes(sender.publicKey, this.#peer.publicKey)
-        ) {
+        const sender = this.#peer;
+        if (envelope.version !== 1 || envelope.type !== "friend-control") {
             throw new Error("Friend-control envelope is not for this channel");
         }
         const nonce = decodeBase64Url(envelope.nonce);
@@ -269,8 +285,12 @@ export class FriendChannel {
             }
             const value = decoded as Record<string, unknown>;
             if (
-                Object.keys(value).length !== 5 ||
+                Object.keys(value).length !== 7 ||
                 typeof value.id !== "string" ||
+                typeof value.sender !== "string" ||
+                value.sender !== identityId(sender) ||
+                typeof value.recipient !== "string" ||
+                value.recipient !== identityId(this.#self) ||
                 typeof value.sentAt !== "number" ||
                 typeof value.payload !== "string" ||
                 typeof value.signature !== "string" ||
@@ -309,6 +329,10 @@ export class FriendChannel {
                 if (!verifyBytes(sender, signed, signature)) {
                     zeroBytes(message.payload);
                     throw new Error("Invalid friend-control signature");
+                }
+                if (message.retention.kind === "temporary" && message.retention.expiresAt <= now) {
+                    zeroBytes(message.payload);
+                    throw new Error("Friend-control message has expired");
                 }
                 return { sender, message };
             } finally {
@@ -359,13 +383,9 @@ export async function acceptFriendControl(
     persist: PersistFriendControl,
 ): Promise<AcceptedFriendControl> {
     const opened = channel.open(envelope);
-    const preimage = messageSignaturePayload(
-        opened.sender,
-        { publicKey: decodeBase64Url(envelope.recipient) },
-        opened.message,
-    );
+    const preimage = messageSignaturePayload(opened.sender, channel.self, opened.message);
     const fingerprint = hashBytes(preimage);
-    const prefix = `identity/v1/${envelope.recipient}/friend-control-replay/`;
+    const prefix = `identity/v1/${identityId(channel.self)}/friend-control-replay/`;
     const key = `${prefix}${identityId(opened.sender)}/${opened.message.id}`;
     try {
         return await store.transaction(async (transaction) => {

@@ -10,6 +10,7 @@ import {
     openBox,
     sealBox,
     signBytes,
+    validateIdentityPublicKey,
     verifyBytes,
 } from "../index.js";
 import { equalBytes, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
@@ -110,5 +111,20 @@ describe("one-key identity crypto", () => {
         expect(
             verifyBytes({ publicKey: identityPoint }, utf8Encode("any content"), forgedSignature),
         ).toBe(false);
+    });
+
+    it("rejects all-zero and compressed identity Ed25519 points", () => {
+        const allZero = new Uint8Array(32);
+        const compressedIdentity = new Uint8Array(32);
+        compressedIdentity[0] = 1;
+
+        for (const publicKey of [allZero, compressedIdentity]) {
+            expect(() => validateIdentityPublicKey({ publicKey })).toThrow(
+                "Invalid Ed25519 identity point",
+            );
+            expect(() => identityDhPublicKey({ publicKey })).toThrow(
+                "Invalid Ed25519 identity point",
+            );
+        }
     });
 });

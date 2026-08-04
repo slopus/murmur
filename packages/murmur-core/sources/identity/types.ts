@@ -17,7 +17,6 @@ export interface SerializedPublicIdentity {
 export interface FriendRequestEnvelope {
     readonly version: 1;
     readonly type: "friend-request";
-    readonly recipient: string;
     readonly ephemeralPublicKey: string;
     readonly nonce: string;
     readonly ciphertext: string;
@@ -39,7 +38,6 @@ export type FriendResponseDecision = "accepted" | "rejected";
 export interface FriendResponseEnvelope {
     readonly version: 1;
     readonly type: "friend-response";
-    readonly recipient: string;
     readonly ephemeralPublicKey: string;
     readonly nonce: string;
     readonly ciphertext: string;
@@ -93,10 +91,12 @@ export type FriendStatus = "pending-incoming" | "pending-outgoing" | "active" | 
 /** Durable friend state, including bootstrap routing and opaque private data. */
 export interface FriendRecord {
     readonly identity: IdentityPublicKey;
+    readonly requester: IdentityPublicKey;
     readonly status: FriendStatus;
     readonly requestId: string;
     readonly profile?: IdentityProfile;
     readonly peerResponseAddress?: string;
+    readonly localResponseAddress?: string;
     readonly privateData?: Uint8Array;
     readonly createdAt: number;
     readonly updatedAt: number;
@@ -104,27 +104,63 @@ export interface FriendRecord {
 
 /** Result of accepting an inbound request or response into durable state. */
 export interface FriendAcceptance<RecordType extends FriendRecord = FriendRecord> {
-    readonly status: "opened" | "duplicate";
+    readonly status: "opened" | "duplicate" | "superseded";
     readonly record: RecordType;
 }
 
 /** A response plus the state transition committed before it is published. */
 export interface PreparedFriendResponse {
-    readonly envelope: FriendResponseEnvelope;
+    readonly outbox: FriendResponseOutboxItem;
     readonly record: FriendRecord;
 }
 
-/** Caller-owned outbox persistence committed with an outgoing request. */
-export type PersistFriendRequest = (
-    transaction: StoreTransaction,
-    envelope: FriendRequestEnvelope,
-) => Promise<void>;
+/** Options for atomically preparing a friend request and its outbox item. */
+export interface CreateFriendRequestOptions {
+    readonly profile: IdentityProfile;
+    readonly destination: string;
+    readonly responseAddress: string;
+    readonly privateData?: Uint8Array;
+    readonly now?: number;
+}
 
-/** Caller-owned outbox persistence committed with an outgoing response. */
-export type PersistFriendResponse = (
-    transaction: StoreTransaction,
-    envelope: FriendResponseEnvelope,
-) => Promise<void>;
+/** Options for accepting an inbound request and preparing its response. */
+export type CreateFriendResponseOptions =
+    | {
+          readonly decision: "accepted";
+          readonly profile: IdentityProfile;
+          readonly responseAddress: string;
+          readonly privateData?: Uint8Array;
+          readonly now?: number;
+      }
+    | {
+          readonly decision: "rejected";
+          readonly now?: number;
+      };
+
+interface FriendOutboxItemBase {
+    readonly id: string;
+    readonly peer: IdentityPublicKey;
+    readonly destination: string;
+    readonly createdAt: number;
+}
+
+/** Exact durable outgoing friend request. */
+export interface FriendRequestOutboxItem extends FriendOutboxItemBase {
+    readonly kind: "request";
+    readonly envelope: FriendRequestEnvelope;
+}
+
+/** Exact durable outgoing friend response. */
+export interface FriendResponseOutboxItem extends FriendOutboxItemBase {
+    readonly kind: "response";
+    readonly envelope: FriendResponseEnvelope;
+}
+
+/** Exact durable request/response publication retained by `FriendBook`. */
+export type FriendOutboxItem = FriendRequestOutboxItem | FriendResponseOutboxItem;
+
+/** Relay-neutral successful publication outcome accepted by outbox confirmation. */
+export type FriendOutboxOutcome = "accepted" | "duplicate";
 
 /** Retention requested for an opaque friend-control payload. */
 export type FriendControlRetention =
@@ -143,10 +179,13 @@ export interface FriendControlMessage {
 export interface FriendControlEnvelope {
     readonly version: 1;
     readonly type: "friend-control";
-    readonly sender: SerializedPublicIdentity;
-    readonly recipient: string;
     readonly nonce: string;
     readonly ciphertext: string;
+}
+
+/** Injectable friend-channel clock, primarily for deterministic expiry handling. */
+export interface FriendChannelOptions {
+    readonly now?: () => number;
 }
 
 /** Authenticated control content recovered from a friend channel. */

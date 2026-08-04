@@ -42,21 +42,26 @@ const bob = generateIdentityKeyPair();
 const aliceFriends = new FriendBook(alice, new MemoryMurmurStore());
 const bobFriends = new FriendBook(bob, new MemoryMurmurStore());
 
-const request = await aliceFriends.createRequest(bob, { name: "Alice" }, "opaque-response-address");
-await bobFriends.receiveRequest(request);
+const request = await aliceFriends.createRequest(bob, {
+    profile: { name: "Alice" },
+    destination: "bob-friend-inbox",
+    responseAddress: "alice-response-route",
+});
+await bobFriends.receiveRequest(request.envelope);
 
-const response = await bobFriends.respond(
-    alice,
-    "accepted",
-    { name: "Bob" },
-    "opaque-response-address",
-);
-await aliceFriends.receiveResponse(response.envelope);
+const response = await bobFriends.respond(alice, {
+    decision: "accepted",
+    profile: { name: "Bob" },
+    responseAddress: "bob-response-route",
+});
+await aliceFriends.receiveResponse(bob, response.outbox.envelope);
 ```
 
 Request/response replay markers and lifecycle state are committed atomically.
-Outgoing methods accept a persistence callback so an application can store the
-wire envelope in its outbox in the same transaction.
+`FriendBook` owns exact request/response outbox items and their opaque
+destinations in the same transaction. Applications publish `listOutbox()`
+items and call `confirmOutbox()` only after an accepted or duplicate outcome.
+Crossed requests converge through one canonical contender.
 
 ## Friend control channel
 
@@ -64,6 +69,11 @@ wire envelope in its outbox in the same transaction.
 two identities know each other. Both peers derive the same opaque relay topic
 authorization key and message-encryption key. Payloads are opaque bytes with
 durable or expiring retention and individual sender signatures.
+
+Outer request, response, and control envelopes expose no Murmur identity IDs.
+The friend channel rejects semantically expired temporary content. Its
+defensive-copy topic secret export lets transport integration construct a
+read/write capability without coupling this domain to relay types.
 
 It is suitable for profile changes, friendship termination, and MLS invitation
 bytes. It is not a chat protocol. Ordinary two-person and multi-person

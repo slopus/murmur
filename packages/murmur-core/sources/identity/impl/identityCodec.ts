@@ -1,4 +1,5 @@
 import type { IdentityPublicKey } from "../../crypto/index.js";
+import { validateIdentityPublicKey } from "../../crypto/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../../utils/index.js";
 import type { SerializedPublicIdentity } from "../types.js";
 
@@ -6,9 +7,7 @@ const PUBLIC_KEY_CHARACTERS = 43;
 
 /** Serialize the one public identity key. */
 export function serializePublicIdentity(identity: IdentityPublicKey): SerializedPublicIdentity {
-    if (identity.publicKey.length !== 32) {
-        throw new Error("Identity public key must be 32 bytes");
-    }
+    validateIdentityPublicKey(identity);
     return { publicKey: encodeBase64Url(identity.publicKey) };
 }
 
@@ -28,6 +27,7 @@ export function deserializePublicIdentity(serialized: SerializedPublicIdentity):
     if (publicKey.length !== 32 || encodeBase64Url(publicKey) !== serialized.publicKey) {
         throw new Error("Invalid serialized public identity");
     }
+    validateIdentityPublicKey({ publicKey });
     return { publicKey };
 }
 

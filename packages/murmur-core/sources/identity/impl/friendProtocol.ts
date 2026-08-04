@@ -4,6 +4,7 @@ import {
     canonicalJsonBytes,
     decodeBase64Url,
     encodeBase64Url,
+    equalBytes,
     utf8Decode,
     utf8Encode,
     zeroBytes,
@@ -49,8 +50,12 @@ function validateTimeFreePrivateData(value: Uint8Array | undefined): Uint8Array 
     return data;
 }
 
-function associatedData(type: FriendEnvelope["type"], recipient: string): Uint8Array {
-    return canonicalJsonBytes({ recipient, type, version: 1 });
+function associatedData(
+    type: FriendEnvelope["type"],
+    recipient: string,
+    sender: string | null,
+): Uint8Array {
+    return canonicalJsonBytes({ recipient, sender, type, version: 1 });
 }
 
 function signaturePayload(
@@ -104,12 +109,15 @@ function sealSigned(
                 signature: encodeBase64Url(signature),
             }),
         );
-        aad = associatedData(type, recipientId);
+        aad = associatedData(
+            type,
+            recipientId,
+            type === "friend-response" ? identityId(signer) : null,
+        );
         const box = sealBox(recipient, plaintext, aad);
         return {
             version: 1,
             type,
-            recipient: recipientId,
             ephemeralPublicKey: encodeBase64Url(box.ephemeralPublicKey),
             nonce: encodeBase64Url(box.nonce),
             ciphertext: encodeBase64Url(box.ciphertext),
@@ -128,8 +136,13 @@ function sealSigned(
     }
 }
 
-function openSigned(recipient: IdentityKeyPair, envelope: FriendEnvelope): Record<string, unknown> {
-    const fields = ["version", "type", "recipient", "ephemeralPublicKey", "nonce", "ciphertext"];
+function openSigned(
+    recipient: IdentityKeyPair,
+    envelope: FriendEnvelope,
+    expectedSender?: IdentityPublicKey,
+): Record<string, unknown> {
+    const fields = ["version", "type", "ephemeralPublicKey", "nonce", "ciphertext"];
+    const recipientId = identityId(recipient);
     if (
         typeof envelope !== "object" ||
         envelope === null ||
@@ -137,18 +150,26 @@ function openSigned(recipient: IdentityKeyPair, envelope: FriendEnvelope): Recor
         Object.keys(envelope).length !== fields.length ||
         Object.keys(envelope).some((key) => !fields.includes(key)) ||
         envelope.version !== 1 ||
-        envelope.recipient !== identityId(recipient) ||
         envelope.ciphertext.length > Math.ceil((MAX_CIPHERTEXT_BYTES * 4) / 3) ||
         decodeBase64Url(envelope.ephemeralPublicKey).length !== 32 ||
         decodeBase64Url(envelope.nonce).length !== 12
     ) {
         throw new Error("Invalid or misaddressed friend envelope");
     }
+    if (envelope.type === "friend-response" && expectedSender === undefined) {
+        throw new Error("Friend response requires an expected sender");
+    }
     const ciphertext = decodeBase64Url(envelope.ciphertext);
     if (ciphertext.length > MAX_CIPHERTEXT_BYTES) {
         throw new Error("Friend envelope ciphertext is too large");
     }
-    const aad = associatedData(envelope.type, envelope.recipient);
+    const aad = associatedData(
+        envelope.type,
+        recipientId,
+        envelope.type === "friend-response" && expectedSender !== undefined
+            ? identityId(expectedSender)
+            : null,
+    );
     let plaintext: Uint8Array | undefined;
     try {
         plaintext = openBox(
@@ -186,6 +207,7 @@ export function createFriendRequest(
     return sealSigned("friend-request", sender, recipient, {
         id: input.id,
         sender: serializePublicIdentity(sender).publicKey,
+        recipient: identityId(recipient),
         responseAddress: input.responseAddress,
         profile: encodeProfile(input.profile),
         privateData: encodeBase64Url(privateData),
@@ -201,12 +223,22 @@ export function openFriendRequest(
         throw new Error("Expected a friend request");
     }
     const payload = openSigned(recipient, envelope);
-    const expected = ["id", "sender", "responseAddress", "profile", "privateData", "signature"];
+    const expected = [
+        "id",
+        "sender",
+        "recipient",
+        "responseAddress",
+        "profile",
+        "privateData",
+        "signature",
+    ];
     if (
         Object.keys(payload).length !== expected.length ||
         Object.keys(payload).some((key) => !expected.includes(key)) ||
         typeof payload.id !== "string" ||
         typeof payload.sender !== "string" ||
+        typeof payload.recipient !== "string" ||
+        payload.recipient !== identityId(recipient) ||
         typeof payload.responseAddress !== "string" ||
         typeof payload.profile !== "string" ||
         typeof payload.privateData !== "string" ||
@@ -219,9 +251,10 @@ export function openFriendRequest(
     const sender = deserializePublicIdentity({ publicKey: payload.sender });
     const privateData = decodeBase64Url(payload.privateData);
     const signature = decodeBase64Url(payload.signature);
-    const signed = signaturePayload("friend-request", envelope.recipient, {
+    const signed = signaturePayload("friend-request", identityId(recipient), {
         id: payload.id,
         sender: payload.sender,
+        recipient: payload.recipient,
         responseAddress: payload.responseAddress,
         profile: payload.profile,
         privateData: payload.privateData,
@@ -263,6 +296,7 @@ export function createFriendResponse(
         id: input.id,
         requestId: input.requestId,
         responder: serializePublicIdentity(responder).publicKey,
+        recipient: identityId(requester),
         decision: input.decision,
         responseAddress: input.decision === "accepted" ? input.responseAddress : null,
         profile: input.decision === "accepted" ? encodeProfile(input.profile) : null,
@@ -273,16 +307,18 @@ export function createFriendResponse(
 /** Open and authenticate a friend response addressed to this identity. */
 export function openFriendResponse(
     recipient: IdentityKeyPair,
+    expectedResponder: IdentityPublicKey,
     envelope: FriendResponseEnvelope,
 ): OpenedFriendResponse {
     if (envelope.type !== "friend-response") {
         throw new Error("Expected a friend response");
     }
-    const payload = openSigned(recipient, envelope);
+    const payload = openSigned(recipient, envelope, expectedResponder);
     const expected = [
         "id",
         "requestId",
         "responder",
+        "recipient",
         "decision",
         "responseAddress",
         "profile",
@@ -295,6 +331,8 @@ export function openFriendResponse(
         typeof payload.id !== "string" ||
         typeof payload.requestId !== "string" ||
         typeof payload.responder !== "string" ||
+        typeof payload.recipient !== "string" ||
+        payload.recipient !== identityId(recipient) ||
         (payload.decision !== "accepted" && payload.decision !== "rejected") ||
         (payload.responseAddress !== null && typeof payload.responseAddress !== "string") ||
         (payload.profile !== null && typeof payload.profile !== "string") ||
@@ -306,10 +344,14 @@ export function openFriendResponse(
     validateId(payload.id);
     validateId(payload.requestId);
     const responder = deserializePublicIdentity({ publicKey: payload.responder });
-    const signed = signaturePayload("friend-response", envelope.recipient, {
+    if (!equalBytes(responder.publicKey, expectedResponder.publicKey)) {
+        throw new Error("Friend response is from an unexpected identity");
+    }
+    const signed = signaturePayload("friend-response", identityId(recipient), {
         id: payload.id,
         requestId: payload.requestId,
         responder: payload.responder,
+        recipient: payload.recipient,
         decision: payload.decision,
         responseAddress: payload.responseAddress,
         profile: payload.profile,

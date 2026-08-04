@@ -6,6 +6,7 @@ import {
     identityDhPublicKey,
     importIdentityKeyPair,
     validateIdentityKeyPair,
+    validateIdentityPublicKey,
 } from "./impl/identityKeys.js";
 import type { IdentityKeyPair, IdentityPublicKey } from "./types.js";
 
@@ -16,6 +17,7 @@ export {
     identityDhPublicKey,
     importIdentityKeyPair,
     validateIdentityKeyPair,
+    validateIdentityPublicKey,
 } from "./impl/identityKeys.js";
 
 const KEY_LENGTH = 32;
@@ -71,8 +73,8 @@ export function verifyBytes(
     signature: Uint8Array,
 ): boolean {
     try {
+        validateIdentityPublicKey(identity);
         return (
-            identity.publicKey.length === KEY_LENGTH &&
             signature.length === 64 &&
             ed25519.verify(signature, message, identity.publicKey, {
                 zip215: false,
