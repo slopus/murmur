@@ -26,6 +26,7 @@ import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../.
 import {
     decodeSignedRelayEventWire,
     encodeSignedRelayEventWire,
+    relayTopicId,
     type RelayFetch,
 } from "../../transport/index.js";
 import { decodeBase64Url, encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
@@ -33,16 +34,19 @@ import {
     decodeFriendControlFrame,
     destroyFriendControlFrame,
     encodeFriendControlFrame,
+    type FriendControlFrame,
 } from "../impl/controlCodec.js";
 import { sealGroupRelayPayload } from "../impl/groupEnvelope.js";
 import {
     decodeGroup,
+    decodeGroupOperation,
     decodeRelayOutbox,
     decodeStagedCommit,
     encodeGroupEvent,
     encodeRelayOutbox,
 } from "../impl/stateCodec.js";
 import { createCapabilityEvent, friendControlAccess, groupAccess } from "../impl/topics.js";
+import { destroyGroupOperation, destroyRelayOutboxRecord } from "../impl/groupProcessing.js";
 import { Murmur, MurmurKeyPackagePoolExhaustedError } from "../index.js";
 
 function inProcessFetch(relay: RelayService): RelayFetch {
@@ -1016,6 +1020,241 @@ describe("stateful Murmur facade", () => {
             await relay.close();
         }
     }, 120_000);
+
+    it("drops queued Adds after local and remote friendship end without blocking later work", async () => {
+        for (const ending of ["local", "remote"] as const) {
+            const relay = new RelayService(new SqliteRelayStore(":memory:"));
+            const handler = createRelayFetchHandler(relay);
+            const aliceStore = new MemoryMurmurStore();
+            const bobStore = new MemoryMurmurStore();
+            const carolStore = new MemoryMurmurStore();
+            let watchBobControl = false;
+            const controlsAfterEnd: FriendControlFrame["type"][] = [];
+            let aliceIdentityKey: Uint8Array | undefined;
+            let bobRoot: IdentityKeyPair | undefined;
+            let bobControlTopicId: string | undefined;
+            const aliceFetch: RelayFetch = async (input, init): Promise<Response> => {
+                const request = new Request(input, init);
+                const body =
+                    request.method === "POST" && new URL(request.url).pathname === "/v1/events"
+                        ? await request.clone().text()
+                        : undefined;
+                const response = await handler(request);
+                if (
+                    watchBobControl &&
+                    body !== undefined &&
+                    bobRoot !== undefined &&
+                    aliceIdentityKey !== undefined
+                ) {
+                    const event = decodeSignedRelayEventWire(utf8Encode(body));
+                    if (relayTopicId(event.topic) === bobControlTopicId) {
+                        const channel = new FriendChannel(bobRoot, {
+                            publicKey: aliceIdentityKey,
+                        });
+                        try {
+                            const opened = channel.open(
+                                JSON.parse(utf8Decode(event.payload)) as FriendControlEnvelope,
+                            );
+                            const frame = decodeFriendControlFrame(opened.message.payload);
+                            opened.message.payload.fill(0);
+                            try {
+                                controlsAfterEnd.push(frame.type);
+                            } finally {
+                                destroyFriendControlFrame(frame);
+                            }
+                        } finally {
+                            channel.destroy();
+                        }
+                    }
+                }
+                return response;
+            };
+            let alice = await Murmur.open({
+                relay: "https://relay.test",
+                store: aliceStore,
+                initialProfile: { name: `Alice ${ending}` },
+                fetch: aliceFetch,
+            });
+            const bob = await Murmur.open({
+                relay: "https://relay.test",
+                store: bobStore,
+                initialProfile: { name: `Bob ${ending}` },
+                fetch: inProcessFetch(relay),
+            });
+            const carol = await Murmur.open({
+                relay: "https://relay.test",
+                store: carolStore,
+                initialProfile: { name: `Carol ${ending}` },
+                fetch: inProcessFetch(relay),
+            });
+            try {
+                aliceIdentityKey = alice.identityKey;
+                await alice.friends.request(bob.identityKey);
+                await alice.friends.request(carol.identityKey);
+                await converge([alice, bob, carol]);
+                await bob.friends.accept(alice.identityKey);
+                await carol.friends.accept(alice.identityKey);
+                await converge([bob, carol, alice], 8);
+
+                const bobRootBytes = await bobStore.get("murmur/v1/root");
+                if (bobRootBytes === undefined) {
+                    throw new Error("Bob root was not persisted");
+                }
+                bobRoot = decodeIdentityRoot(bobRootBytes);
+                bobRootBytes.fill(0);
+                const controlChannel = new FriendChannel(bobRoot, {
+                    publicKey: aliceIdentityKey,
+                });
+                const controlAccess = friendControlAccess(controlChannel);
+                bobControlTopicId = relayTopicId(controlAccess.topic);
+                controlChannel.destroy();
+                controlAccess.readSecretKey?.fill(0);
+                controlAccess.writeSecretKey?.fill(0);
+
+                const removalGroup = await alice.groups.create(
+                    utf8Encode(`remove survives ${ending} end`),
+                    [bob.identityKey],
+                );
+                await converge([alice, bob], 10);
+                await alice.groups.remove(removalGroup, bob.identityKey);
+
+                const raceGroup = await alice.groups.create(
+                    utf8Encode(`queued Add ${ending} end`),
+                    [bob.identityKey],
+                );
+                await alice.groups.add(raceGroup, carol.identityKey);
+                await alice.groups.send(raceGroup, utf8Encode(`after ${ending} end`));
+
+                if (ending === "local") {
+                    await alice.friends.end(bob.identityKey);
+                    watchBobControl = true;
+                }
+                await alice.close();
+
+                if (ending === "local") {
+                    const queued = await aliceStore.list(
+                        `murmur/v1/groups/${encodeBase64Url(raceGroup)}/operations/`,
+                    );
+                    try {
+                        const operations = [...queued.values()].map(decodeGroupOperation);
+                        try {
+                            expect(
+                                operations.some(
+                                    (operation) =>
+                                        operation.type === "add" &&
+                                        encodeBase64Url(operation.peer) ===
+                                            encodeBase64Url(bob.identityKey),
+                                ),
+                            ).toBe(false);
+                        } finally {
+                            for (const operation of operations) {
+                                destroyGroupOperation(operation);
+                            }
+                        }
+                    } finally {
+                        for (const encoded of queued.values()) {
+                            encoded.fill(0);
+                        }
+                    }
+                } else {
+                    await bob.friends.end(aliceIdentityKey);
+                    await bob.sync();
+                    watchBobControl = true;
+                }
+
+                alice = await Murmur.open({
+                    relay: "https://relay.test",
+                    store: aliceStore,
+                    fetch: aliceFetch,
+                });
+                await converge([alice, bob, carol], 16);
+
+                expect((await alice.friends.get(bob.identityKey))?.status).toBe("ended");
+                expect((await bob.friends.get(alice.identityKey))?.status).toBe("ended");
+                expect((await bob.groups.get(removalGroup))?.group.status).toBe("removed");
+                expect((await bob.groups.get(raceGroup))?.group).toBeUndefined();
+                expect(
+                    (await alice.groups.get(raceGroup))?.group.members.map(encodeBase64Url).sort(),
+                ).toEqual([alice.identityKey, carol.identityKey].map(encodeBase64Url).sort());
+                expect(
+                    (await carol.groups.get(raceGroup))?.events.map((event) =>
+                        utf8Decode(event.bytes),
+                    ),
+                ).toContain(`after ${ending} end`);
+
+                const peerId = identityId({ publicKey: bob.identityKey });
+                for (const key of [
+                    `murmur/v1/key-packages/requests/${peerId}`,
+                    `murmur/v1/key-packages/needed/${peerId}`,
+                ]) {
+                    const marker = await aliceStore.get(key);
+                    expect(marker).toBeUndefined();
+                    marker?.fill(0);
+                }
+                for (const prefix of [
+                    `murmur/v1/key-packages/local/${peerId}/`,
+                    `murmur/v1/key-packages/local-consumed/${peerId}/`,
+                    `murmur/v1/key-packages/remote/${peerId}/`,
+                    `murmur/v1/key-packages/remote-consumed/${peerId}/`,
+                ]) {
+                    const records = await aliceStore.list(prefix);
+                    expect(records.size).toBe(0);
+                    for (const bytes of records.values()) {
+                        bytes.fill(0);
+                    }
+                }
+                const operations = await aliceStore.list("murmur/v1/groups/");
+                try {
+                    for (const [key, encoded] of operations) {
+                        if (!key.includes("/operations/")) {
+                            continue;
+                        }
+                        const operation = decodeGroupOperation(encoded);
+                        try {
+                            expect(
+                                operation.type === "add" &&
+                                    encodeBase64Url(operation.peer) ===
+                                        encodeBase64Url(bob.identityKey),
+                            ).toBe(false);
+                        } finally {
+                            destroyGroupOperation(operation);
+                        }
+                    }
+                } finally {
+                    for (const encoded of operations.values()) {
+                        encoded.fill(0);
+                    }
+                }
+                const outboxes = await aliceStore.list("murmur/v1/relay-outbox/");
+                try {
+                    for (const encoded of outboxes.values()) {
+                        const record = decodeRelayOutbox(encoded);
+                        try {
+                            expect(
+                                record.purpose.type === "friend-control" &&
+                                    relayTopicId(record.event.topic) === bobControlTopicId,
+                            ).toBe(false);
+                        } finally {
+                            destroyRelayOutboxRecord(record);
+                        }
+                    }
+                } finally {
+                    for (const encoded of outboxes.values()) {
+                        encoded.fill(0);
+                    }
+                }
+                expect(controlsAfterEnd).not.toContain("key-package-request");
+                expect(controlsAfterEnd.every((type) => type === "friendship-ended")).toBe(true);
+            } finally {
+                watchBobControl = false;
+                if (bobRoot !== undefined) {
+                    destroyIdentity(bobRoot);
+                }
+                await Promise.all([alice.close(), bob.close(), carol.close()]);
+                await relay.close();
+            }
+        }
+    }, 180_000);
 
     it("catches up a winning removal before publishing an old-epoch send", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"));

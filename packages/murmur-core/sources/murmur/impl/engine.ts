@@ -625,6 +625,7 @@ export class MurmurEngine {
         transaction: StoreTransaction,
         peer: IdentityPublicKey,
     ): Promise<void> {
+        await this.#purgeQueuedGroupAdds(transaction, peer);
         const peerId = identityId(peer);
         for (const prefix of [
             `${LOCAL_KEY_PACKAGE_PREFIX}${peerId}/`,
@@ -679,6 +680,55 @@ export class MurmurEngine {
             }
         } finally {
             for (const encoded of outboxes.values()) {
+                zeroBytes(encoded);
+            }
+        }
+    }
+
+    async #purgeQueuedGroupAdds(
+        transaction: StoreTransaction,
+        peer: IdentityPublicKey,
+    ): Promise<void> {
+        const indexes = await transaction.list(GROUP_INDEX_PREFIX);
+        try {
+            for (const indexKey of indexes.keys()) {
+                const groupId = indexKey.slice(GROUP_INDEX_PREFIX.length);
+                const stagedBytes = await transaction.get(groupStagedKey(groupId));
+                let staged: StagedGroupCommit | undefined;
+                try {
+                    staged =
+                        stagedBytes === undefined ? undefined : decodeStagedCommit(stagedBytes);
+                } finally {
+                    stagedBytes?.fill(0);
+                }
+                const operations = await transaction.list(groupOperationPrefix(groupId));
+                try {
+                    for (const [key, encoded] of operations) {
+                        let operation: GroupOperation | undefined;
+                        try {
+                            operation = decodeGroupOperation(encoded);
+                            if (
+                                operation.type === "add" &&
+                                operation.id !== staged?.operationId &&
+                                equalBytes(operation.peer, peer.publicKey)
+                            ) {
+                                await transaction.delete(key);
+                            }
+                        } finally {
+                            if (operation !== undefined) {
+                                destroyGroupOperation(operation);
+                            }
+                        }
+                    }
+                } finally {
+                    for (const encoded of operations.values()) {
+                        zeroBytes(encoded);
+                    }
+                    destroyStagedCommit(staged);
+                }
+            }
+        } finally {
+            for (const encoded of indexes.values()) {
                 zeroBytes(encoded);
             }
         }
@@ -3086,6 +3136,14 @@ export class MurmurEngine {
                 }
                 if (operation.type === "add") {
                     const peer = { publicKey: operation.peer };
+                    const friend = await this.#friendBook.get(peer);
+                    if (friend?.status !== "active") {
+                        await this.#store.transaction(async (transaction) => {
+                            await this.#clearFriendKeyPackageState(transaction, peer);
+                        });
+                        changed = true;
+                        continue;
+                    }
                     const remote = await this.#store.list(
                         `${REMOTE_KEY_PACKAGE_PREFIX}${identityId(peer)}/`,
                     );
@@ -3417,26 +3475,34 @@ export class MurmurEngine {
         let created = false;
         try {
             await this.#store.transaction(async (transaction) => {
-                if ((await transaction.get(key)) !== undefined) {
+                const current = await transaction.get(key);
+                if (current !== undefined) {
+                    zeroBytes(current);
                     return;
                 }
                 const pageCount = Math.max(
                     1,
                     Math.ceil(consumed.length / MAXIMUM_REPORTED_KEY_PACKAGES),
                 );
+                let queued = false;
                 for (let page = 0; page < pageCount; page += 1) {
-                    await this.#queueControl(
-                        transaction,
-                        peer,
-                        {
-                            type: "key-package-request",
-                            consumedReferences: consumed.slice(
-                                page * MAXIMUM_REPORTED_KEY_PACKAGES,
-                                (page + 1) * MAXIMUM_REPORTED_KEY_PACKAGES,
-                            ),
-                        },
-                        { type: "friend-control" },
-                    );
+                    queued =
+                        (await this.#queueControl(
+                            transaction,
+                            peer,
+                            {
+                                type: "key-package-request",
+                                consumedReferences: consumed.slice(
+                                    page * MAXIMUM_REPORTED_KEY_PACKAGES,
+                                    (page + 1) * MAXIMUM_REPORTED_KEY_PACKAGES,
+                                ),
+                            },
+                            { type: "friend-control" },
+                        )) || queued;
+                }
+                if (!queued) {
+                    await transaction.delete(key);
+                    return;
                 }
                 await transaction.set(key, new Uint8Array([1]));
                 created = true;
@@ -3632,12 +3698,17 @@ export class MurmurEngine {
         frame: FriendControlFrame,
         purpose: RelayOutboxRecord["purpose"],
         expiresAt?: number,
-    ): Promise<void> {
+    ): Promise<boolean> {
+        const scoped = new FriendBook(this.#identity, new TransactionStore(transaction));
+        if ((await scoped.get(peer))?.status !== "active") {
+            return false;
+        }
         const event = this.#createControlEvent(peer, frame, expiresAt);
         const record: RelayOutboxRecord = { event, purpose, attempted: false };
         const encoded = encodeRelayOutbox(record);
         try {
             await transaction.set(`${OUTBOX_PREFIX}${event.id}`, encoded);
+            return true;
         } finally {
             zeroBytes(encoded);
             destroyRelayOutboxRecord(record);

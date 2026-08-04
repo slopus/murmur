@@ -13,5 +13,6 @@ remains `MemoryMurmurStore`, which supplies real serialized transactions.
 The lifecycle suite covers restart-safe friend termination, bounded
 KeyPackages, staged/competing Commit races, Welcome binding, remove/re-add,
 per-topic failure isolation, fresh-relay cursor reset, quarantine/replay bounds,
-abortable close, and a 500-event offline backlog restored through one explicit
+friend-end cleanup of queued Adds without suppressing group Removes, abortable
+close, and a 500-event offline backlog restored through one explicit
 convergence cycle.

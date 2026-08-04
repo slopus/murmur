@@ -20,11 +20,12 @@ interoperability or a substitute for an audit.
   and identity-signed.
 - Group membership changes are real TreeKEM Commits.
 - Group relay payloads use a strict versioned AEAD key domain derived from the
-  stable random topic secret, with a random nonce and AAD binding the envelope
-  domain and complete topic. The Ed25519 capability secret is not reused
-  directly as an encryption key.
-- The relay cannot classify group Commit and application payloads or decode
-  their MLS headers.
+  stable random topic secret, with a random 96-bit nonce and AAD binding the
+  envelope domain and complete topic. The Ed25519 capability secret is not
+  reused directly as an encryption key.
+- The relay cannot parse MLS headers or recover credentials or plaintext from
+  group ciphertext. Exact sizes and timing remain visible and can make a likely
+  Commit/application traffic type inferable.
 - Removed members cannot authenticate or decrypt later inner MLS application
   events.
 - Every outbound relay event is stored exactly before network access.
@@ -80,6 +81,11 @@ malicious relay trustworthy.
   can decrypt the outer envelope and inject junk. They lack newer MLS epoch
   secrets and therefore cannot decrypt or authenticate valid newer-epoch inner
   content.
+- The outer group key remains stable for the topic-secret lifetime. Stay well
+  below `2^32` randomly nonced envelopes under one topic secret and create a new
+  group before that operational ceiling. Inner MLS contains outer-layer
+  weakness for application PrivateMessages, but PublicMessage Commit headers
+  and credentials rely on the outer layer for relay confidentiality.
 
 ## Limits
 

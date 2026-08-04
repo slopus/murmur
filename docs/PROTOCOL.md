@@ -93,9 +93,20 @@ domain and the complete `group-events` topic descriptor. The version byte is
 encrypted, payload size is bounded by the relay limit, and decoding rejects
 wrong topics, wrong topic secrets, tampering, unknown versions, and malformed
 lengths. Murmur authenticates and decrypts the envelope before classifying or
-processing the MLS message. Consequently relay storage cannot distinguish a
-Commit from an application message or decode an MLS PublicMessage header or
-Murmur identity credential.
+processing the MLS message. Consequently relay storage cannot parse or decode
+an MLS PublicMessage header, recover a Murmur identity credential, or recover
+MLS/application plaintext. Exact ciphertext sizes and timing remain visible,
+so traffic analysis may infer that some events are more likely Commits or
+applications.
+
+The outer AEAD key is stable for the lifetime of the random group topic secret;
+it does not rotate with MLS epochs. Each invocation uses an independently
+random 96-bit nonce. Implementations must stay well below `2^32` total outer
+envelopes under one topic secret and create a new group/topic secret before
+that operational ceiling, limiting random-nonce collision risk. Inner MLS
+provides containment: application PrivateMessages remain MLS-encrypted if the
+outer layer is weakened, although Commit headers and credentials are public
+inside that wrapper and would no longer be hidden by it.
 
 Group messages are durable. Murmur currently exposes no expiration or collapse
 option for MLS content, avoiding unsafe Secret Tree generation skips.
@@ -160,11 +171,11 @@ No `expiresAt` means durable. Once expiration passes, the event is omitted from
 reads and can be physically deleted.
 
 When `collapseKey` is present, publishing atomically removes all older retained
-events in that topic from the same author signing key carrying equal opaque
-bytes. Including the author in this identity prevents independent writers to a
-public-write `Read Topic` from collapsing one another's state. Clients use
-collapse only when the new payload completely replaces the author's earlier
-state.
+events in that topic from the same author signing key carrying an equal
+`collapseKey`. Including the author in this identity prevents independent
+writers to a public-write `Read Topic` from collapsing one another's state.
+Clients use collapse only when the new payload completely replaces the
+author's earlier state.
 
 Collapse follows relay arrival order, not an application timestamp or logical
 version. A delayed publication carrying older logical state can therefore

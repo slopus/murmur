@@ -37,7 +37,8 @@ application message is additionally sealed in a versioned outer AEAD envelope.
 Its key is domain-separated from the stable random group topic secret, and its
 AAD binds the envelope domain and complete group topic. The encrypted version,
 random nonce, and ciphertext leave no MLS PublicMessage header or Murmur
-identity credential visible to the relay.
+identity credential parseable by the relay. Exact envelope sizes and timing
+remain visible, so traffic analysis may still infer likely message types.
 
 ## Synchronization
 
@@ -49,6 +50,9 @@ echoes, and repeats to a bounded quiescent state. `sync()` is an optional
 explicit observation/test boundary, not required caller choreography.
 KeyPackage exhaustion is collected per friend: unrelated friend and group work
 still converges before a deterministic typed error is surfaced.
+Queued Adds are revalidated against current friendship state and dropped when
+that peer is no longer active; existing-member Removes remain independent group
+operations and continue.
 
 Relay cursors advance in the same application-store transaction as the effect
 of an inbound event. Invalid, stale, unsupported, removed-member, and

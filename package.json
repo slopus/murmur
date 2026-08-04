@@ -8,7 +8,7 @@
         "format:check": "oxfmt --check .",
         "lint": "oxlint .",
         "test": "pnpm --filter @slopus/murmur build && pnpm --filter @murmur/relay build && pnpm --recursive --filter './packages/**' run test",
-        "typecheck": "pnpm --filter @slopus/murmur build && pnpm --filter @slopus/murmur check && pnpm --filter @murmur/relay check"
+        "typecheck": "pnpm --filter @murmur/relay build && pnpm --filter @slopus/murmur build && pnpm --filter @slopus/murmur check && pnpm --filter @murmur/relay check"
     },
     "devDependencies": {
         "@types/node": "^24.0.10",
