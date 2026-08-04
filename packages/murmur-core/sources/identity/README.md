@@ -43,7 +43,10 @@ The tombstone stores this separately as nullable
 Canceling an unpublished outgoing request preserves the prior predecessor, so
 the other peer can still initiate with `null` (or the last mutually-known
 generation) without deadlocking. The canceled `requestId` remains available
-independently for late-response replay correlation.
+independently for late-response replay correlation. Each outgoing tracker also
+stores the request's signed predecessor. A late authenticated response may
+advance the tombstone only when that predecessor is still current, preventing
+an older response from regressing a newer mutually-known generation.
 
 `end()` is state-specific: it retires a pending outgoing request, queues an
 exact rejection for pending incoming, or replaces stale active request/accept

@@ -595,6 +595,109 @@ describe("durable friendship lifecycle and outbox", () => {
         ]);
     });
 
+    it("promotes a late response across a canceled unseen successor using the tracker edge", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
+        const aliceFriends = new FriendBook(alice, aliceStore);
+        const bobFriends = new FriendBook(bob, bobStore);
+
+        const request1 = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice 1" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response-1",
+            now: 1,
+        });
+        await bobFriends.receiveRequest(requestEnvelope(request1), 1);
+        await bobFriends.end(alice, 2);
+        const response1 = (await bobFriends.listOutbox()).find((item) => item.kind === "response");
+        if (response1?.kind !== "response") {
+            throw new Error("Expected response to request 1");
+        }
+        await aliceFriends.end(bob, 2);
+
+        await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice 2" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response-2",
+            now: 3,
+        });
+        await aliceFriends.end(bob, 4);
+        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBeNull();
+
+        await expect(
+            new FriendBook(alice, aliceStore).receiveResponse(bob, response1.envelope, 5),
+        ).resolves.toMatchObject({
+            status: "superseded",
+            record: {
+                nextRequestPredecessorId: request1.id,
+            },
+        });
+
+        const bobNext = await bobFriends.createRequest(alice, {
+            profile: { name: "Bob next" },
+            destination: "alice-inbox",
+            responseAddress: "bob-response-next",
+            now: 6,
+        });
+        await expect(
+            new FriendBook(alice, aliceStore).receiveRequest(requestEnvelope(bobNext), 6),
+        ).resolves.toMatchObject({
+            status: "opened",
+            record: {
+                previousRequestId: request1.id,
+                nextRequestPredecessorId: bobNext.id,
+            },
+        });
+    });
+
+    it("does not regress a newer shared predecessor from an older tracker response", async () => {
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobFriends = new FriendBook(bob, new MemoryMurmurStore());
+        const aliceFriends = new FriendBook(alice, aliceStore);
+        const request1 = await aliceFriends.createRequest(bob, {
+            profile: { name: "Alice" },
+            destination: "bob-inbox",
+            responseAddress: "alice-response",
+            now: 1,
+        });
+        await bobFriends.receiveRequest(requestEnvelope(request1), 1);
+        await bobFriends.end(alice, 2);
+        const response1 = (await bobFriends.listOutbox()).find((item) => item.kind === "response");
+        if (response1?.kind !== "response") {
+            throw new Error("Expected first response");
+        }
+        await aliceFriends.end(bob, 2);
+        await aliceFriends.receiveResponse(bob, response1.envelope, 3);
+
+        const newer = await bobFriends.createRequest(alice, {
+            profile: { name: "Bob newer" },
+            destination: "alice-inbox",
+            responseAddress: "bob-newer-response",
+            now: 4,
+        });
+        await aliceFriends.receiveRequest(requestEnvelope(newer), 4);
+        await aliceFriends.end(bob, 5);
+        expect((await aliceFriends.get(bob))?.nextRequestPredecessorId).toBe(newer.id);
+
+        const olderLate = createFriendResponse(bob, alice, {
+            id: fixedId(99),
+            requestId: request1.id,
+            decision: "rejected",
+        });
+        await expect(
+            new FriendBook(alice, aliceStore).receiveResponse(bob, olderLate, 6),
+        ).resolves.toMatchObject({
+            status: "superseded",
+            record: {
+                nextRequestPredecessorId: newer.id,
+            },
+        });
+    });
+
     it("fails closed on forced same-kind, cross-kind, and termination outbox IDs", async () => {
         const repeated = fixedId(44);
         const alice = generateIdentityKeyPair();

@@ -5,7 +5,6 @@ import {
     decodeBase64Url,
     encodeBase64Url,
     equalBytes,
-    utf8Decode,
     utf8Encode,
     zeroBytes,
 } from "../utils/index.js";
@@ -26,6 +25,11 @@ import {
     matchesFriendOutboxItem,
     validateFriendDestination,
 } from "./impl/outboxCodec.js";
+import {
+    decodeOutgoingRequestTracker,
+    encodeOutgoingRequestTracker,
+    type OutgoingRequestTracker,
+} from "./impl/outgoingTrackerCodec.js";
 import type {
     CreateFriendRequestOptions,
     CreateFriendResponseOptions,
@@ -166,7 +170,7 @@ export class FriendBook {
                 updatedAt: now,
             };
             await transaction.set(key, encodeFriendRecord(record));
-            await this.#insertOutgoingTracker(transaction, recipient, requestId, "pending");
+            await this.#insertOutgoingTracker(transaction, recipient, requestId, previousRequestId);
             await this.#insertOutbox(transaction, outbox);
             return copyFriendOutboxItem(outbox);
         });
@@ -370,17 +374,17 @@ export class FriendBook {
                     opened.requestId,
                 );
                 const matchesPending =
-                    outgoingState === "pending" &&
+                    outgoingState?.state === "pending" &&
                     existing?.status === "pending-outgoing" &&
                     existing.requestId === opened.requestId;
                 if (!matchesPending) {
                     if (
                         existing !== undefined &&
-                        (outgoingState === "retired" || outgoingState === "answered")
+                        (outgoingState?.state === "retired" || outgoingState?.state === "answered")
                     ) {
                         const terminal =
-                            existing.status === "ended" &&
-                            existing.requestId === opened.requestId &&
+                            outgoingState.state === "retired" &&
+                            outgoingState.previousRequestId === existing.nextRequestPredecessorId &&
                             existing.nextRequestPredecessorId !== opened.requestId
                                 ? {
                                       ...existing,
@@ -633,13 +637,19 @@ export class FriendBook {
         transaction: StoreTransaction,
         peer: IdentityPublicKey,
         requestId: string,
-        state: "pending" | "retired" | "answered",
+        previousRequestId: string | null,
     ): Promise<void> {
         const key = this.#outgoingKey(peer, requestId);
         if ((await transaction.get(key)) !== undefined) {
             throw new FriendExchangeIdCollisionError();
         }
-        await transaction.set(key, utf8Encode(state));
+        await transaction.set(
+            key,
+            encodeOutgoingRequestTracker({
+                state: "pending",
+                previousRequestId,
+            }),
+        );
     }
 
     async #setOutgoingTracker(
@@ -650,29 +660,28 @@ export class FriendBook {
     ): Promise<void> {
         const key = this.#outgoingKey(peer, requestId);
         const existing = await this.#getOutgoingTracker(transaction, peer, requestId);
-        if (existing !== "pending") {
+        if (existing?.state !== "pending") {
             throw new Error("Outgoing friend request tracker is not pending");
         }
-        await transaction.set(key, utf8Encode(state));
+        await transaction.set(
+            key,
+            encodeOutgoingRequestTracker({
+                ...existing,
+                state,
+            }),
+        );
     }
 
     async #getOutgoingTracker(
         transaction: StoreTransaction,
         peer: IdentityPublicKey,
         requestId: string,
-    ): Promise<"pending" | "retired" | "answered" | undefined> {
+    ): Promise<OutgoingRequestTracker | undefined> {
         const bytes = await transaction.get(this.#outgoingKey(peer, requestId));
         if (bytes === undefined) {
             return undefined;
         }
-        if (bytes.length > 8) {
-            throw new Error("Invalid outgoing friend request tracker");
-        }
-        const value = utf8Decode(bytes);
-        if (value !== "pending" && value !== "retired" && value !== "answered") {
-            throw new Error("Invalid outgoing friend request tracker");
-        }
-        return value;
+        return decodeOutgoingRequestTracker(bytes);
     }
 
     async #checkReplay(
