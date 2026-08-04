@@ -24,31 +24,6 @@ importers:
         specifier: ^5.8.3
         version: 5.9.3
 
-  packages/murmur-cli:
-    dependencies:
-      '@murmur/mls':
-        specifier: workspace:*
-        version: link:../murmur-mls
-      '@slopus/murmur':
-        specifier: workspace:*
-        version: link:../murmur-core
-    devDependencies:
-      '@murmur/relay':
-        specifier: workspace:*
-        version: link:../murmur-relay
-      '@types/node':
-        specifier: '>=20'
-        version: 24.13.3
-      tsx:
-        specifier: ^4.20.6
-        version: 4.23.1
-      typescript:
-        specifier: ^5
-        version: 5.9.3
-      vitest:
-        specifier: ^3.2.4
-        version: 3.2.7(@types/node@24.13.3)(jiti@2.7.0)(tsx@4.23.1)(yaml@2.9.0)
-
   packages/murmur-core:
     dependencies:
       '@noble/ciphers':

@@ -15,7 +15,6 @@ WORKDIR /workspace
 
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
-COPY packages/murmur-cli/package.json packages/murmur-cli/package.json
 COPY packages/murmur-core/package.json packages/murmur-core/package.json
 COPY packages/murmur-mls/package.json packages/murmur-mls/package.json
 COPY packages/murmur-relay/package.json packages/murmur-relay/package.json

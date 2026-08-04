@@ -3,12 +3,11 @@
 End-to-end encrypted messaging and shared state over deliberately dumb,
 self-hosted relays.
 
-Murmur ships one public, browser-safe ESM library,
-[`@slopus/murmur`](packages/murmur-core), plus the `murmur-chat` CLI. The
-library supplies identities, encrypted contacts and direct messages, encrypted
-files, durable topic synchronization, MLS groups, and convergent shared text.
-Applications choose the meaning of their data and own their durable local
-storage.
+Murmur ships one public, browser-safe ESM library:
+[`@slopus/murmur`](packages/murmur-core). The library supplies identities,
+encrypted contacts and direct messages, encrypted files, durable topic
+synchronization, MLS groups, and convergent shared text. Applications choose
+the meaning of their data and own their durable local storage.
 
 ```text
 application
@@ -356,50 +355,6 @@ await client.subscribe(identityInboxTopic(identity));
 `MemoryMurmurStore` is for examples and tests. A real application must provide
 a durable `MurmurStore` whose `transaction()` method is genuinely atomic.
 
-## CLI
-
-`murmur-chat` exposes the same features through the `murmur` command. It
-requires Node 22.5 or later. Results are JSON except for `help`.
-
-```bash
-pnpm add --global murmur-chat
-
-murmur sign-in --first-name Alice
-murmur me
-murmur contacts add <identity-token>
-murmur send --to <identity-id-or-token> --message "hello"
-murmur sync --realtime --timeout 25000
-murmur messages --with <identity-id-or-token>
-```
-
-The complete command surface is:
-
-```text
-murmur sign-in --first-name <name> [--last-name <name>]
-murmur me
-murmur contacts [add <identity-token> | remove <identity-id-or-token>]
-murmur send --to <identity-id-or-token> --message <text> [--attach <path> ...]
-murmur sync [--realtime] [--timeout <milliseconds>]
-murmur messages [--with <identity-id-or-token>] [--limit <count>]
-murmur attachment --message <id> --name <file> --out <path>
-murmur groups
-murmur groups create --name <name>
-murmur groups invite --group <id-or-name> --contact <identity>
-murmur groups remove --group <id-or-name> --contact <identity>
-murmur groups send --group <id-or-name> --message <text>
-murmur groups messages [--group <id-or-name>] [--limit <count>]
-murmur documents [--group <id-or-name>]
-murmur documents create --group <id-or-name> --name <name>
-murmur documents insert --document <id-or-name> --text <text> [--after <actor>:<sequence>]
-murmur documents delete --document <id-or-name> --target <actor>:<sequence>
-```
-
-Global relay selection is repeatable `--relay <url>` or the comma-separated
-`MURMUR_RELAYS` environment variable. With neither set, the CLI uses
-`https://murmur.cluster-fluster.com`. Local state is
-`~/.murmur/murmur.sqlite` by default; use `--db <sqlite-path>` or
-`MURMUR_HOME` to choose another location.
-
 ## Run a relay
 
 For local source development, build and start the `@murmur/relay` package with
@@ -435,7 +390,6 @@ packages/
   murmur-core/               published @slopus/murmur library
   murmur-mls/                MLS implementation bundled into the library build
   murmur-relay/              Node relay: HTTP host, SQLite, Postgres, blobs
-  murmur-cli/                published murmur-chat Node CLI
 ```
 
 - [Architecture](docs/ARCHITECTURE.md) — layers, trust boundary, state and cursor flows
@@ -447,7 +401,7 @@ packages/
 ## Development
 
 This is a pnpm workspace. Node 22.5 or later is required for the full workspace
-because the relay and CLI use `node:sqlite`.
+because the relay uses `node:sqlite`.
 
 ```bash
 pnpm test
