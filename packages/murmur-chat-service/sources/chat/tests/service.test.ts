@@ -12,6 +12,7 @@ import {
     ChatAlreadyOpenError,
     ChatClosedError,
     ChatFrameTooLargeError,
+    ChatOutboxFailedError,
     ChatValidationError,
 } from "../errors.js";
 import { encodeFrame } from "../impl/codec.js";
@@ -147,6 +148,50 @@ class TimeoutThenBlobStore implements BlobStore {
     }
 }
 
+class StalledRangeBlobStore implements BlobStore {
+    readonly #inner: BlobStore;
+    readonly rangeStarted: Promise<void>;
+    #markRangeStarted: (() => void) | undefined;
+    headCalls = 0;
+
+    constructor(inner: BlobStore) {
+        this.#inner = inner;
+        this.rangeStarted = new Promise<void>((resolve) => {
+            this.#markRangeStarted = resolve;
+        });
+    }
+
+    put(
+        blobId: Uint8Array,
+        byteLength: number,
+        bytes: AsyncIterable<Uint8Array>,
+        signal: AbortSignal,
+    ): Promise<void> {
+        return this.#inner.put(blobId, byteLength, bytes, signal);
+    }
+
+    head(blobId: Uint8Array, signal: AbortSignal): Promise<{ byteLength: number } | undefined> {
+        this.headCalls += 1;
+        return this.#inner.head(blobId, signal);
+    }
+
+    get(
+        _blobId: Uint8Array,
+        _offset: number,
+        _byteLength: number,
+        signal: AbortSignal,
+    ): Promise<Uint8Array> {
+        this.#markRangeStarted?.();
+        return new Promise<Uint8Array>((_resolve, reject) => {
+            if (signal.aborted) {
+                reject(signal.reason);
+                return;
+            }
+            signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+        });
+    }
+}
+
 class DelegatingStore implements MurmurStore {
     readonly inner: MurmurStore;
 
@@ -266,6 +311,17 @@ function known(
     items: readonly ChatHistoryItem<string, string>[],
 ): readonly ChatMessage<string, string>[] {
     return items.filter((item): item is ChatMessage<string, string> => item.kind === "message");
+}
+
+interface RuntimeProcessEvents {
+    on(
+        event: "unhandledRejection" | "uncaughtException",
+        listener: (failure: unknown) => void,
+    ): void;
+    off(
+        event: "unhandledRejection" | "uncaughtException",
+        listener: (failure: unknown) => void,
+    ): void;
 }
 
 describe("ChatService", () => {
@@ -636,6 +692,92 @@ describe("ChatService", () => {
         destroyAttachment(received.attachments[0]!);
         expect(received.attachments[0]!.fileKey.every((value) => value === 0)).toBe(true);
     }, 90_000);
+
+    it("keeps process rejection channels clean across pre-chunk attachment aborts", async () => {
+        const blobs = new MemoryBlobStore();
+        const { murmurs, stores, chats, sources } = await openPeers(1, blobs);
+        const conversationId = await chats[0]!.createConversation();
+        const source = new TestSource("abort-download", new Uint8Array(1024).fill(23));
+        sources.set(source.sourceId, source);
+        await chats[0]!.send(conversationId, {
+            message: "abort safely",
+            attachments: [{ sourceId: source.sourceId, metadata: "abort" }],
+        });
+        await chats[0]!.sync();
+        const attachment = known((await chats[0]!.history(conversationId)).messages)[0]!
+            .attachments[0]!;
+        await chats[0]!.close();
+
+        const runtimeProcess = (
+            globalThis as typeof globalThis & { readonly process: RuntimeProcessEvents }
+        ).process;
+        const processFailures: unknown[] = [];
+        const recordFailure = (failure: unknown): void => {
+            processFailures.push(failure);
+        };
+        runtimeProcess.on("unhandledRejection", recordFailure);
+        runtimeProcess.on("uncaughtException", recordFailure);
+        try {
+            const alreadyAbortedStore = new StalledRangeBlobStore(blobs);
+            chats[0] = await openChat(murmurs[0]!, stores[0]!, {
+                blobStore: alreadyAbortedStore,
+                sources,
+            });
+            const alreadyAborted = new AbortController();
+            const alreadyAbortedReason = new Error("caller was already aborted");
+            alreadyAborted.abort(alreadyAbortedReason);
+            const iterator = chats[0]!
+                .openAttachment(attachment, { signal: alreadyAborted.signal })
+                [Symbol.asyncIterator]();
+            await expect(iterator.next()).rejects.toBe(alreadyAbortedReason);
+            await expect(
+                chats[0]!.downloadAttachment(attachment, {
+                    signal: alreadyAborted.signal,
+                }),
+            ).rejects.toBe(alreadyAbortedReason);
+            expect(alreadyAbortedStore.headCalls).toBe(0);
+            await chats[0]!.close();
+
+            const callerAbortStore = new StalledRangeBlobStore(blobs);
+            chats[0] = await openChat(murmurs[0]!, stores[0]!, {
+                blobStore: callerAbortStore,
+                sources,
+            });
+            const callerAbort = new AbortController();
+            const callerAbortReason = new Error("caller aborted before first chunk");
+            const beforeFirstChunk = chats[0]!
+                .openAttachment(attachment, { signal: callerAbort.signal })
+                [Symbol.asyncIterator]()
+                .next();
+            await callerAbortStore.rangeStarted;
+            callerAbort.abort(callerAbortReason);
+            await expect(beforeFirstChunk).rejects.toBe(callerAbortReason);
+            await chats[0]!.close();
+
+            const timeoutStore = new StalledRangeBlobStore(blobs);
+            chats[0] = await openChat(murmurs[0]!, stores[0]!, {
+                blobStore: timeoutStore,
+                sources,
+                networkTimeoutMilliseconds: 25,
+            });
+            const beforeTimedOutRange = chats[0]!
+                .openAttachment(attachment)
+                [Symbol.asyncIterator]()
+                .next();
+            await timeoutStore.rangeStarted;
+            await expect(beforeTimedOutRange).rejects.toMatchObject({
+                code: "network-timeout",
+            } satisfies Partial<ChatOutboxFailedError>);
+            await chats[0]!.close();
+
+            await new Promise<void>((resolve) => setTimeout(resolve, 25));
+            expect(processFailures).toEqual([]);
+            await expect(chats[0]!.close()).resolves.toBeUndefined();
+        } finally {
+            runtimeProcess.off("unhandledRejection", recordFailure);
+            runtimeProcess.off("uncaughtException", recordFailure);
+        }
+    }, 30_000);
 
     it("persists upload failure, lets unrelated traffic converge, and retries exact staging", async () => {
         const blobs = new OneFailureBlobStore();

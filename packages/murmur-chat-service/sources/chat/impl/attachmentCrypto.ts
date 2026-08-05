@@ -157,19 +157,20 @@ export async function uploadStagedAttachment(
     const iterator = iterable[Symbol.asyncIterator]();
     try {
         await abortable(
-            blobStore.put(
-                manifest.blobId.slice(),
-                expectedLength,
-                { [Symbol.asyncIterator]: (): AsyncIterator<Uint8Array> => iterator },
-                signal,
-            ),
+            () =>
+                blobStore.put(
+                    manifest.blobId.slice(),
+                    expectedLength,
+                    { [Symbol.asyncIterator]: (): AsyncIterator<Uint8Array> => iterator },
+                    signal,
+                ),
             signal,
         );
     } finally {
         await iterator.return?.();
     }
 
-    const head = await abortable(blobStore.head(manifest.blobId.slice(), signal), signal);
+    const head = await abortable(() => blobStore.head(manifest.blobId.slice(), signal), signal);
     if (head === undefined || head.byteLength !== expectedLength) {
         throw new ChatAttachmentAuthenticationError(
             "Blob verification head has an inconsistent length",
@@ -180,7 +181,7 @@ export async function uploadStagedAttachment(
     for (let index = 0; index < manifest.chunkCount; index += 1) {
         const length = ciphertextChunkLength(manifest, index);
         const backendRange = await abortable(
-            blobStore.get(manifest.blobId.slice(), offset, length, signal),
+            () => blobStore.get(manifest.blobId.slice(), offset, length, signal),
             signal,
         );
         if (!(backendRange instanceof Uint8Array) || backendRange.length !== length) {
@@ -252,7 +253,7 @@ export async function* openVerifiedAttachment(
         expectedCommitment.fill(0);
     }
     const expectedLength = ciphertextLength(manifest);
-    const head = await abortable(blobStore.head(manifest.blobId.slice(), signal), signal);
+    const head = await abortable(() => blobStore.head(manifest.blobId.slice(), signal), signal);
     if (head === undefined || head.byteLength !== expectedLength) {
         throw new ChatAttachmentAuthenticationError("Attachment blob is missing or wrong length");
     }
@@ -264,7 +265,7 @@ export async function* openVerifiedAttachment(
             ensureNotAborted(signal);
             const length = ciphertextChunkLength(manifest, index);
             const backendRange = await abortable(
-                blobStore.get(manifest.blobId.slice(), offset, length, signal),
+                () => blobStore.get(manifest.blobId.slice(), offset, length, signal),
                 signal,
             );
             if (!(backendRange instanceof Uint8Array) || backendRange.length !== length) {
@@ -447,15 +448,29 @@ async function readOwnedSourceRange(
     length: number,
     signal: AbortSignal,
 ): Promise<Uint8Array> {
-    const borrowed = await abortable(source.read(offset, length, signal), signal);
+    const borrowed = await abortable(() => source.read(offset, length, signal), signal);
     if (!(borrowed instanceof Uint8Array) || borrowed.length !== length) {
         throw new ChatAttachmentSourceChangedError("Attachment source returned a changed range");
     }
     return borrowed.slice();
 }
 
-async function abortable<Result>(promise: Promise<Result>, signal: AbortSignal): Promise<Result> {
+async function abortable<Result>(
+    operation: () => Promise<Result>,
+    signal: AbortSignal,
+): Promise<Result> {
     ensureNotAborted(signal);
+    let promise: Promise<Result>;
+    try {
+        promise = Promise.resolve(operation());
+    } catch (error: unknown) {
+        if (signal.aborted) throw abortError(signal);
+        throw error;
+    }
+    if (signal.aborted) {
+        void promise.catch((): undefined => undefined);
+        throw abortError(signal);
+    }
     let onAbort: (() => void) | undefined;
     const aborted = new Promise<never>((_resolve, reject) => {
         onAbort = (): void => reject(abortError(signal));
