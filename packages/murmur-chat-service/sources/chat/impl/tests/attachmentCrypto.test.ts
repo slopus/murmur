@@ -254,4 +254,132 @@ describe("staged attachment cryptography", () => {
         expect(() => verifyManifestShape(malformed)).toThrow(/Invalid attachment manifest/);
         expect(() => verifyManifestShape(null)).toThrow(/Invalid attachment manifest/);
     });
+
+    it("rejects cross-group and cross-sender manifest replay", async () => {
+        const source = new MutableSource("bound", new Uint8Array(30).fill(3));
+        const blobs = new RecordingBlobStore();
+        const { manifest } = await stageAndUpload(source, intent(source), blobs);
+        await expect(
+            collect(
+                openVerifiedAttachment(
+                    manifest,
+                    new Uint8Array(32).fill(9),
+                    sender,
+                    blobs,
+                    new AbortController().signal,
+                ),
+            ),
+        ).rejects.toThrow(/commitment/);
+        await expect(
+            collect(
+                openVerifiedAttachment(
+                    manifest,
+                    conversation,
+                    new Uint8Array(32).fill(10),
+                    blobs,
+                    new AbortController().signal,
+                ),
+            ),
+        ).rejects.toThrow(/commitment/);
+    });
+
+    it("rejects corrupt tags, wrong lengths, truncation, extension, and reordering", async () => {
+        const source = new MutableSource("hostile", new Uint8Array(300_000).fill(12));
+        const base = new RecordingBlobStore();
+        const { manifest } = await stageAndUpload(source, intent(source), base);
+        const corrupt: BlobStore = {
+            put: base.put.bind(base),
+            head: base.head.bind(base),
+            get: async (id, offset, length, signal) => {
+                const bytes = await base.get(id, offset, length, signal);
+                bytes[bytes.length - 1]! ^= 1;
+                return bytes;
+            },
+        };
+        await expect(
+            collect(
+                openVerifiedAttachment(
+                    manifest,
+                    conversation,
+                    sender,
+                    corrupt,
+                    new AbortController().signal,
+                ),
+            ),
+        ).rejects.toThrow(/authentication/);
+
+        for (const delta of [-1, 1]) {
+            const wrongLength: BlobStore = {
+                put: base.put.bind(base),
+                head: async () => ({
+                    byteLength: manifest.plaintextLength + manifest.chunkCount * 16 + delta,
+                }),
+                get: base.get.bind(base),
+            };
+            await expect(
+                collect(
+                    openVerifiedAttachment(
+                        manifest,
+                        conversation,
+                        sender,
+                        wrongLength,
+                        new AbortController().signal,
+                    ),
+                ),
+            ).rejects.toThrow(/wrong length/);
+        }
+
+        const shortRange: BlobStore = {
+            put: base.put.bind(base),
+            head: base.head.bind(base),
+            get: async (id, offset, length, signal) =>
+                (await base.get(id, offset, length, signal)).slice(0, -1),
+        };
+        await expect(
+            collect(
+                openVerifiedAttachment(
+                    manifest,
+                    conversation,
+                    sender,
+                    shortRange,
+                    new AbortController().signal,
+                ),
+            ),
+        ).rejects.toThrow(/truncated/);
+
+        const reordered: BlobStore = {
+            put: base.put.bind(base),
+            head: base.head.bind(base),
+            get: async (id, offset, length, signal) =>
+                base.get(id, offset === 0 ? 256 * 1024 + 16 : 0, length, signal),
+        };
+        await expect(
+            collect(
+                openVerifiedAttachment(
+                    manifest,
+                    conversation,
+                    sender,
+                    reordered,
+                    new AbortController().signal,
+                ),
+            ),
+        ).rejects.toThrow();
+    });
+
+    it("aborts a hostile stalled backend", async () => {
+        const source = new MutableSource("abort", new Uint8Array(10).fill(1));
+        const base = new RecordingBlobStore();
+        const { manifest } = await stageAndUpload(source, intent(source), base);
+        const stalled: BlobStore = {
+            put: base.put.bind(base),
+            head: async () => new Promise<BlobHead>(() => undefined),
+            get: base.get.bind(base),
+        };
+        const controller = new AbortController();
+        const pending = collect(
+            openVerifiedAttachment(manifest, conversation, sender, stalled, controller.signal),
+        );
+        controller.abort(new Error("stop"));
+        await expect(pending).rejects.toThrow("stop");
+    });
 });

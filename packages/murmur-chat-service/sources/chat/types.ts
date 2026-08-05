@@ -133,6 +133,22 @@ export interface ChatOutboxEntry {
     };
 }
 
+/** One bounded durable outbox page in local enqueue order. */
+export interface ChatOutboxPage {
+    readonly entries: readonly ChatOutboxEntry[];
+    /** Opaque key to pass as `after` for the next page. */
+    readonly nextAfter?: string;
+}
+
+/** Result of dropping local tracking for an outbox intent. */
+export interface ChatCancelResult {
+    /**
+     * `may-have-delivered` means Murmur handoff happened or local tracking was
+     * already absent, so cancellation cannot revoke a relay event.
+     */
+    readonly status: "cancelled" | "may-have-delivered";
+}
+
 /** Observable service mutation. */
 export interface ChatChange {
     readonly kind: "conversation" | "message" | "outbox" | "error";
@@ -162,8 +178,15 @@ export interface ChatServiceOptions<TMessage, TAttachmentMetadata> {
     ) => Promise<AttachmentSource>;
     /** Background idle polling floor, default 250 ms. */
     readonly idlePollMilliseconds?: number;
-    /** Per blob/source operation deadline, default and maximum 30 seconds. */
+    /**
+     * Legacy shared operation deadline. Prefer the separate source and network
+     * settings; the applicable maximum is still enforced.
+     */
     readonly operationTimeoutMilliseconds?: number;
+    /** Source read/hash/encryption deadline, default and maximum 30 seconds. */
+    readonly sourceTimeoutMilliseconds?: number;
+    /** Blob PUT/readback deadline, default 30 seconds and maximum 30 minutes. */
+    readonly networkTimeoutMilliseconds?: number;
 }
 
 /** Explicit convergence options. */

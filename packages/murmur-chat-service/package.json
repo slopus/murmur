@@ -24,8 +24,8 @@
     "scripts": {
         "build": "tsc -p tsconfig.build.json",
         "check": "tsc --noEmit -p tsconfig.json",
-        "test": "vitest run",
-        "test:browser": "esbuild sources/index.ts --bundle --platform=browser --format=esm --outfile=dist/browser-smoke.js"
+        "test": "vitest run && pnpm run test:browser",
+        "test:browser": "esbuild sources/index.ts --bundle --platform=browser --format=esm --outfile=dist/browser-smoke.js && node --input-type=module -e \"globalThis.Buffer = undefined; globalThis.process = undefined; await import('./dist/browser-smoke.js');\""
     },
     "dependencies": {
         "@noble/ciphers": "^1.2.1",
