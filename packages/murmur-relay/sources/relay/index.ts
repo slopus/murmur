@@ -495,9 +495,10 @@ export class RelayService {
         return this.#store.pruneExpired(this.#now());
     }
 
-    /** Confirm the backing store is reachable. */
+    /** Confirm the wake subscription and backing store are reachable. */
     async health(): Promise<void> {
         this.#assertOpen();
+        await this.#wakeSubscription;
         await this.#store.health();
     }
 

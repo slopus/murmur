@@ -49,14 +49,26 @@ describe("human-readable logger", () => {
         );
     });
 
-    it("summarizes errors without exposing messages or driver metadata", () => {
+    it("keeps actionable error details while redacting credentials and URLs", () => {
         const credentialUrl = "https://user:secret@example.test/path?signature=private";
-        const driverError = Object.assign(new TypeError(credentialUrl), {
-            code: "ECONNREFUSED",
-        });
+        const driverError = Object.assign(
+            new TypeError(
+                `${credentialUrl}\npassword=hunter2 token:private Authorization:Bearer.private`,
+            ),
+            {
+                code: "ECONNREFUSED",
+            },
+        );
 
-        expect(safeErrorSummary(driverError)).toBe("type=TypeError");
-        expect(safeErrorSummary(new Error(credentialUrl))).toBe("type=Error");
-        expect(safeErrorSummary(credentialUrl)).toBe("type=UnknownError");
+        expect(safeErrorSummary(driverError)).toBe(
+            'type=TypeError code=ECONNREFUSED message="https://[redacted] password=[redacted] token=[redacted] Authorization=[redacted]"',
+        );
+        expect(safeErrorSummary(new Error("MURMUR_RELAY_DB is required"))).toBe(
+            'type=Error message="MURMUR_RELAY_DB is required"',
+        );
+        expect(safeErrorSummary(credentialUrl)).toBe(
+            'type=UnknownError message="https://[redacted]"',
+        );
+        expect(safeErrorSummary({ connectionString: credentialUrl })).toBe("type=UnknownError");
     });
 });

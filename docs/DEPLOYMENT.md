@@ -31,6 +31,35 @@ SSE streams across processes; durable reads always come from tables, so
 notifications are not data. Write paths serialize through the global
 quota/UUID row.
 
+## Startup verification and logs
+
+The process checks its dependencies before listening for traffic. SQLite must
+answer its health query. Postgres must complete schema initialization, answer a
+health query, and establish the dedicated `LISTEN` connection used for
+cross-instance wakes. Any failure closes resources and exits non-zero without
+binding the HTTP port.
+
+Lifecycle logs go to standard output as single lines. A successful boot includes:
+
+```text
+relay:store-open-complete backend=postgres
+relay:connectivity-check-complete backend=postgres
+relay:ready backend=postgres host=0.0.0.0 port=8787
+relay:maintenance-ready intervalMilliseconds=10000 budgetMilliseconds=1000
+```
+
+Failures report the last stage plus a sanitized error type, code, and message.
+Connection URLs and credentials are redacted. `SIGINT` and `SIGTERM` log each
+HTTP and storage shutdown stage.
+
+For Kubernetes:
+
+```bash
+kubectl logs deployment/murmur-relay
+kubectl logs deployment/murmur-relay --previous
+kubectl describe pod -l app.kubernetes.io/name=murmur-relay
+```
+
 ## Network boundary
 
 The bundled host binds `HOST` (default `0.0.0.0`) and `PORT` (default `8787`)

@@ -19,6 +19,7 @@ import {
     PostgresRelayStore,
     RELAY_EXPIRATION_BATCH_ITEMS,
     SqliteRelayStore,
+    type RelayStoreBackend,
     type RelayStore,
 } from "./storage/index.js";
 import { createHumanLogger, safeErrorSummary } from "./utils/logger.js";
@@ -44,8 +45,9 @@ function optionalPositiveInteger(value: string | undefined, name: string): numbe
     return parsed;
 }
 
-async function createStore(): Promise<{ store: RelayStore; wakeSource: WakeSource }> {
-    const backend = parseRelayStoreBackend(process.env.MURMUR_RELAY_STORE);
+async function createStore(
+    backend: RelayStoreBackend,
+): Promise<{ store: RelayStore; wakeSource: WakeSource }> {
     if (backend === "sqlite") {
         const path = process.env.MURMUR_RELAY_DB ?? "./data/murmur-relay.sqlite";
         if (path !== ":memory:") await mkdir(dirname(resolve(path)), { recursive: true });
@@ -54,116 +56,207 @@ async function createStore(): Promise<{ store: RelayStore; wakeSource: WakeSourc
     const connectionString = process.env.MURMUR_RELAY_DB;
     if (connectionString === undefined) throw new Error("MURMUR_RELAY_DB is required");
     const database = new PgPoolDatabase(new Pool({ connectionString }));
-    return {
-        store: await PostgresRelayStore.create(database),
-        wakeSource: new PostgresWakeSource({ connectionString }),
-    };
+    try {
+        return {
+            store: await PostgresRelayStore.create(database),
+            wakeSource: new PostgresWakeSource({ connectionString }),
+        };
+    } catch (error) {
+        await database.close().catch(() => undefined);
+        throw error;
+    }
 }
 
 /** Start the standalone identity-queue relay. */
 export async function main(): Promise<void> {
-    const allowedOrigins = parseRelayAllowedOrigins(process.env.MURMUR_RELAY_ORIGINS);
-    const { store, wakeSource } = await createStore();
-    const maximumAdmissionReferences = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_ADMISSION_REFERENCES,
-        "MURMUR_RELAY_ADMISSION_REFERENCES",
-    );
-    const maximumInvitationBytes = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_INVITATION_BYTES,
-        "MURMUR_RELAY_INVITATION_BYTES",
-    );
-    const maximumInvitationItemsPerAdmissionPrincipal = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL,
-        "MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL",
-    );
-    const maximumInvitationBytesPerAdmissionPrincipal = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL,
-        "MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL",
-    );
-    const maximumGlobalInvitationItems = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_GLOBAL_INVITATION_ITEMS,
-        "MURMUR_RELAY_GLOBAL_INVITATION_ITEMS",
-    );
-    const maximumGlobalInvitationBytes = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_GLOBAL_INVITATION_BYTES,
-        "MURMUR_RELAY_GLOBAL_INVITATION_BYTES",
-    );
-    const service = new RelayService(
-        store,
-        {
-            ...(maximumAdmissionReferences === undefined ? {} : { maximumAdmissionReferences }),
-            ...(maximumInvitationBytes === undefined ? {} : { maximumInvitationBytes }),
-            ...(maximumInvitationItemsPerAdmissionPrincipal === undefined
-                ? {}
-                : { maximumInvitationItemsPerAdmissionPrincipal }),
-            ...(maximumInvitationBytesPerAdmissionPrincipal === undefined
-                ? {}
-                : { maximumInvitationBytesPerAdmissionPrincipal }),
-            ...(maximumGlobalInvitationItems === undefined ? {} : { maximumGlobalInvitationItems }),
-            ...(maximumGlobalInvitationBytes === undefined ? {} : { maximumGlobalInvitationBytes }),
-        },
-        wakeSource,
-    );
-    const maximumRequestsPerMinutePerAddress = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_REQUESTS_PER_MINUTE,
-        "MURMUR_RELAY_REQUESTS_PER_MINUTE",
-    );
-    const maximumTrackedAddresses = optionalPositiveInteger(
-        process.env.MURMUR_RELAY_TRACKED_ADDRESSES,
-        "MURMUR_RELAY_TRACKED_ADDRESSES",
-    );
-    const remoteAddressHeader = process.env.MURMUR_RELAY_REMOTE_ADDRESS_HEADER;
-    const server = createNodeRelayServer(
-        createRelayFetchHandler(service, {
-            allowedOrigins,
-            ...(maximumRequestsPerMinutePerAddress === undefined
-                ? {}
-                : { maximumRequestsPerMinutePerAddress }),
-            ...(maximumTrackedAddresses === undefined ? {} : { maximumTrackedAddresses }),
-            ...(remoteAddressHeader === undefined ? {} : { remoteAddressHeader }),
-        }),
-    );
-    await listenNodeRelayServer(server, {
-        host: process.env.HOST ?? "0.0.0.0",
-        port: port(process.env.PORT),
-    });
-    let pruneInFlight = false;
-    const prune = (): void => {
-        if (pruneInFlight) return;
-        pruneInFlight = true;
-        void (async () => {
-            const deadline = Date.now() + PRUNE_DRAIN_BUDGET_MILLISECONDS;
-            let removed: number;
-            do {
-                removed = await service.pruneExpired();
-            } while (removed >= RELAY_EXPIRATION_BATCH_ITEMS && Date.now() < deadline);
-        })()
-            .catch((error: unknown) =>
-                logger.error(`relay:prune-failed ${safeErrorSummary(error)}`),
-            )
-            .finally(() => {
-                pruneInFlight = false;
-            });
-    };
-    prune();
-    const pruneTimer = setInterval(prune, PRUNE_INTERVAL_MILLISECONDS);
-    pruneTimer.unref();
-    let stopPromise: Promise<void> | undefined;
-    const stop = (): void => {
-        stopPromise ??= (async () => {
-            clearInterval(pruneTimer);
-            await closeNodeRelayServer(server);
-            await service.close();
-        })().catch((error: unknown) => {
-            logger.error(`relay:stop-failed ${safeErrorSummary(error)}`);
-            process.exitCode = 1;
+    let stage = "configuration";
+    let store: RelayStore | undefined;
+    let wakeSource: WakeSource | undefined;
+    let service: RelayService | undefined;
+    let server: ReturnType<typeof createNodeRelayServer> | undefined;
+    try {
+        const backend = parseRelayStoreBackend(process.env.MURMUR_RELAY_STORE);
+        const host = process.env.HOST ?? "0.0.0.0";
+        const listenerPort = port(process.env.PORT);
+        const allowedOrigins = parseRelayAllowedOrigins(process.env.MURMUR_RELAY_ORIGINS);
+        const maximumAdmissionReferences = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_ADMISSION_REFERENCES,
+            "MURMUR_RELAY_ADMISSION_REFERENCES",
+        );
+        const maximumInvitationBytes = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_INVITATION_BYTES,
+            "MURMUR_RELAY_INVITATION_BYTES",
+        );
+        const maximumInvitationItemsPerAdmissionPrincipal = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL,
+            "MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL",
+        );
+        const maximumInvitationBytesPerAdmissionPrincipal = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL,
+            "MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL",
+        );
+        const maximumGlobalInvitationItems = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_GLOBAL_INVITATION_ITEMS,
+            "MURMUR_RELAY_GLOBAL_INVITATION_ITEMS",
+        );
+        const maximumGlobalInvitationBytes = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_GLOBAL_INVITATION_BYTES,
+            "MURMUR_RELAY_GLOBAL_INVITATION_BYTES",
+        );
+        const maximumRequestsPerMinutePerAddress = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_REQUESTS_PER_MINUTE,
+            "MURMUR_RELAY_REQUESTS_PER_MINUTE",
+        );
+        const maximumTrackedAddresses = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_TRACKED_ADDRESSES,
+            "MURMUR_RELAY_TRACKED_ADDRESSES",
+        );
+        const remoteAddressHeader = process.env.MURMUR_RELAY_REMOTE_ADDRESS_HEADER;
+        logger.info(
+            `relay:start backend=${backend} host=${host} port=${listenerPort} ` +
+                `origins=${allowedOrigins === "*" ? "wildcard" : allowedOrigins.length} ` +
+                `admission=${remoteAddressHeader === undefined ? "socket" : "header"}`,
+        );
+
+        stage = "store-open";
+        logger.info(`relay:store-open-start backend=${backend}`);
+        ({ store, wakeSource } = await createStore(backend));
+        logger.info(`relay:store-open-complete backend=${backend}`);
+
+        stage = "service-create";
+        logger.info(`relay:service-create-start backend=${backend}`);
+        const activeService = new RelayService(
+            store,
+            {
+                ...(maximumAdmissionReferences === undefined ? {} : { maximumAdmissionReferences }),
+                ...(maximumInvitationBytes === undefined ? {} : { maximumInvitationBytes }),
+                ...(maximumInvitationItemsPerAdmissionPrincipal === undefined
+                    ? {}
+                    : { maximumInvitationItemsPerAdmissionPrincipal }),
+                ...(maximumInvitationBytesPerAdmissionPrincipal === undefined
+                    ? {}
+                    : { maximumInvitationBytesPerAdmissionPrincipal }),
+                ...(maximumGlobalInvitationItems === undefined
+                    ? {}
+                    : { maximumGlobalInvitationItems }),
+                ...(maximumGlobalInvitationBytes === undefined
+                    ? {}
+                    : { maximumGlobalInvitationBytes }),
+            },
+            wakeSource,
+        );
+        service = activeService;
+        logger.info(`relay:service-create-complete backend=${backend}`);
+
+        stage = "connectivity-check";
+        logger.info(`relay:connectivity-check-start backend=${backend}`);
+        await activeService.health();
+        logger.info(`relay:connectivity-check-complete backend=${backend}`);
+
+        stage = "http-create";
+        const activeServer = createNodeRelayServer(
+            createRelayFetchHandler(activeService, {
+                allowedOrigins,
+                ...(maximumRequestsPerMinutePerAddress === undefined
+                    ? {}
+                    : { maximumRequestsPerMinutePerAddress }),
+                ...(maximumTrackedAddresses === undefined ? {} : { maximumTrackedAddresses }),
+                ...(remoteAddressHeader === undefined ? {} : { remoteAddressHeader }),
+            }),
+        );
+        server = activeServer;
+        stage = "http-listen";
+        logger.info(`relay:http-listen-start host=${host} port=${listenerPort}`);
+        await listenNodeRelayServer(activeServer, {
+            host,
+            port: listenerPort,
         });
-    };
-    process.once("SIGINT", stop);
-    process.once("SIGTERM", stop);
+        logger.info(`relay:ready backend=${backend} host=${host} port=${listenerPort}`);
+
+        let pruneInFlight = false;
+        const prune = (): void => {
+            if (pruneInFlight) return;
+            pruneInFlight = true;
+            void (async () => {
+                const deadline = Date.now() + PRUNE_DRAIN_BUDGET_MILLISECONDS;
+                let removed: number;
+                do {
+                    removed = await activeService.pruneExpired();
+                } while (removed >= RELAY_EXPIRATION_BATCH_ITEMS && Date.now() < deadline);
+            })()
+                .catch((error: unknown) =>
+                    logger.error(`relay:prune-failed ${safeErrorSummary(error)}`),
+                )
+                .finally(() => {
+                    pruneInFlight = false;
+                });
+        };
+        prune();
+        const pruneTimer = setInterval(prune, PRUNE_INTERVAL_MILLISECONDS);
+        pruneTimer.unref();
+        logger.info(
+            `relay:maintenance-ready intervalMilliseconds=${PRUNE_INTERVAL_MILLISECONDS} ` +
+                `budgetMilliseconds=${PRUNE_DRAIN_BUDGET_MILLISECONDS}`,
+        );
+        let stopPromise: Promise<void> | undefined;
+        const stop = (signal: NodeJS.Signals): void => {
+            logger.info(`relay:shutdown-request signal=${signal}`);
+            stopPromise ??= (async () => {
+                logger.info(`relay:shutdown-start signal=${signal}`);
+                clearInterval(pruneTimer);
+                let shutdownError: unknown;
+                logger.info("relay:http-close-start");
+                try {
+                    await closeNodeRelayServer(activeServer);
+                    logger.info("relay:http-close-complete");
+                } catch (error) {
+                    shutdownError = error;
+                    logger.error(`relay:http-close-failed ${safeErrorSummary(error)}`);
+                }
+                logger.info("relay:service-close-start");
+                try {
+                    await activeService.close();
+                    logger.info("relay:service-close-complete");
+                } catch (error) {
+                    shutdownError ??= error;
+                    logger.error(`relay:service-close-failed ${safeErrorSummary(error)}`);
+                }
+                if (shutdownError !== undefined) throw shutdownError;
+                logger.info(`relay:shutdown-complete signal=${signal}`);
+            })().catch((error: unknown) => {
+                logger.error(`relay:shutdown-failed signal=${signal} ${safeErrorSummary(error)}`);
+                process.exitCode = 1;
+            });
+        };
+        process.once("SIGINT", () => stop("SIGINT"));
+        process.once("SIGTERM", () => stop("SIGTERM"));
+    } catch (error) {
+        logger.error(`relay:start-failed stage=${stage} ${safeErrorSummary(error)}`);
+        logger.info(`relay:start-cleanup-start stage=${stage}`);
+        if (server !== undefined) {
+            await closeNodeRelayServer(server).catch((cleanupError: unknown) => {
+                logger.error(`relay:start-cleanup-http-failed ${safeErrorSummary(cleanupError)}`);
+            });
+        }
+        if (service !== undefined) {
+            await service.close().catch((cleanupError: unknown) => {
+                logger.error(
+                    `relay:start-cleanup-service-failed ${safeErrorSummary(cleanupError)}`,
+                );
+            });
+        } else {
+            await wakeSource?.close().catch((cleanupError: unknown) => {
+                logger.error(`relay:start-cleanup-wake-failed ${safeErrorSummary(cleanupError)}`);
+            });
+            await store?.close().catch((cleanupError: unknown) => {
+                logger.error(`relay:start-cleanup-store-failed ${safeErrorSummary(cleanupError)}`);
+            });
+        }
+        logger.info(`relay:start-cleanup-complete stage=${stage}`);
+        throw error;
+    }
 }
 
-void main().catch((error: unknown) => {
-    logger.error(`relay:start-failed ${safeErrorSummary(error)}`);
+void main().catch(() => {
     process.exitCode = 1;
 });

@@ -2,6 +2,7 @@ import pino, { type DestinationStream, type Logger } from "pino";
 import pretty, { type PrettyOptions } from "pino-pretty";
 
 const MODULE_WIDTH = 12;
+const MAXIMUM_ERROR_MESSAGE_CHARACTERS = 512;
 const RESET_COLOR = "\u001b[0m";
 const COLORS = [
     196, 202, 208, 214, 220, 226, 190, 154, 118, 82, 48, 50, 51, 45, 39, 33, 27, 21, 57, 93, 129,
@@ -69,9 +70,46 @@ function errorType(error: unknown): string {
     return error instanceof Error ? "Error" : "UnknownError";
 }
 
-/** Describe an error without exposing its message, URLs, credentials, or driver metadata. */
+function safeErrorCode(error: unknown): string | undefined {
+    if (!(error instanceof Error) || !("code" in error)) return undefined;
+    const code = (error as Error & { readonly code?: unknown }).code;
+    return typeof code === "string" && /^[A-Za-z0-9_.-]{1,64}$/.test(code) ? code : undefined;
+}
+
+function safeErrorMessage(error: unknown): string | undefined {
+    const raw = error instanceof Error ? error.message : typeof error === "string" ? error : "";
+    if (raw.length === 0) return undefined;
+    const printable = Array.from(raw, (character) => {
+        const code = character.charCodeAt(0);
+        return code <= 31 || code === 127 ? " " : character;
+    }).join("");
+    const sanitized = printable
+        .replace(
+            /\b([A-Za-z][A-Za-z0-9+.-]*):\/\/[^\s"'<>]+/gu,
+            (_match, scheme: string) => `${scheme.toLowerCase()}://[redacted]`,
+        )
+        .replace(
+            /\b(password|passwd|pwd|token|secret|authorization|credential|api[_-]?key|signature)\s*[:=]\s*([^\s,;&]+)/giu,
+            "$1=[redacted]",
+        )
+        .replace(/\bbearer\s+[A-Za-z0-9._~+/-]+=*/giu, "Bearer [redacted]")
+        .replace(/\s+/gu, " ")
+        .trim();
+    if (sanitized.length === 0) return undefined;
+    return sanitized.length <= MAXIMUM_ERROR_MESSAGE_CHARACTERS
+        ? sanitized
+        : `${sanitized.slice(0, MAXIMUM_ERROR_MESSAGE_CHARACTERS - 1)}…`;
+}
+
+/** Describe an error without exposing URLs, credentials, stacks, or driver metadata. */
 export function safeErrorSummary(error: unknown): string {
-    return `type=${errorType(error)}`;
+    const code = safeErrorCode(error);
+    const message = safeErrorMessage(error);
+    return [
+        `type=${errorType(error)}`,
+        ...(code === undefined ? [] : [`code=${code}`]),
+        ...(message === undefined ? [] : [`message=${JSON.stringify(message)}`]),
+    ].join(" ");
 }
 
 /** Create a Pino logger rendered as `HH:mm:ss MODULE  message`. */

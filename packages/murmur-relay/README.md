@@ -76,6 +76,31 @@ The standalone process drains expired data every ten seconds in fixed
 transactions, continuing for at most one second per tick. It skips overlapping
 ticks rather than building an unbounded maintenance queue.
 
+## Startup and shutdown logs
+
+The standalone process writes one human-readable line per lifecycle stage to
+standard output. Startup reports configuration parsing, store creation, the
+connectivity check, listener binding, maintenance scheduling, and readiness.
+It does not open the HTTP port until the backing store responds and the wake
+source is ready. For Postgres, this means both a database health query and the
+dedicated `LISTEN` connection must succeed.
+
+Fatal lines include a `stage`, safe driver error `code`, and sanitized `message`.
+Database URLs, credentials, tokens, and stacks are never logged. Graceful
+`SIGINT` and `SIGTERM` shutdown reports HTTP and service closure independently,
+so a failure in one cleanup path does not skip the other.
+
+For a Kubernetes crash loop, inspect both the current and previous container:
+
+```bash
+kubectl logs deployment/murmur-relay
+kubectl logs deployment/murmur-relay --previous
+kubectl describe pod -l app.kubernetes.io/name=murmur-relay
+```
+
+The last successful `relay:*` stage identifies where startup stopped. A healthy
+boot ends with `relay:ready` followed by `relay:maintenance-ready`.
+
 ## HTTP API
 
 | Method | Route                     | Purpose                                   |

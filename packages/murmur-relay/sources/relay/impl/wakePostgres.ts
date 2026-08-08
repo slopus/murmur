@@ -25,13 +25,18 @@ export class PostgresWakeSource implements WakeSource {
         // The store's transactional pg_notify is the authoritative cross-instance wake.
     }
 
-    /** Register a listener and establish the dedicated LISTEN connection in the background. */
+    /** Register a listener and establish the dedicated LISTEN connection. */
     async subscribe(listener: (queueId: string) => void): Promise<void> {
         if (this.#closed) {
             throw new Error("Wake source is closed");
         }
         this.#listeners.add(listener);
-        await this.#connect();
+        try {
+            await this.#connect(true);
+        } catch (error) {
+            this.#listeners.delete(listener);
+            throw error;
+        }
     }
 
     /** End LISTEN and cancel reconnect attempts without affecting the main pool. */
@@ -49,7 +54,7 @@ export class PostgresWakeSource implements WakeSource {
         this.#listeners.clear();
     }
 
-    async #connect(): Promise<void> {
+    async #connect(required: boolean = false): Promise<void> {
         if (this.#closed || this.#connecting || this.#client !== undefined) {
             return;
         }
@@ -81,11 +86,18 @@ export class PostgresWakeSource implements WakeSource {
                 }
                 await client.end().catch(() => undefined);
             }
-        } catch {
+        } catch (error) {
             if (this.#client === client) {
                 this.#client = undefined;
             }
             await client.end().catch(() => undefined);
+            if (required) {
+                if (this.#reconnectTimer !== undefined) {
+                    clearTimeout(this.#reconnectTimer);
+                    this.#reconnectTimer = undefined;
+                }
+                throw error;
+            }
             this.#scheduleReconnect();
         } finally {
             this.#connecting = false;

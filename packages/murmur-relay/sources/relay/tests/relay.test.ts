@@ -17,11 +17,49 @@ import type {
     RelayStore,
 } from "../../storage/index.js";
 import type { SignedDelivery } from "../../protocol/index.js";
-import { RelayService } from "../index.js";
+import { RelayService, type WakeSource } from "../index.js";
 
 const NOW = 10_000;
 
 describe("identity queue relay", () => {
+    test("health waits for the wake subscription before reporting ready", async () => {
+        let releaseSubscription: (() => void) | undefined;
+        const subscriptionReady = new Promise<void>((resolve) => {
+            releaseSubscription = resolve;
+        });
+        const wakeSource: WakeSource = {
+            async notify(): Promise<void> {},
+            async subscribe(): Promise<void> {
+                await subscriptionReady;
+            },
+            async close(): Promise<void> {},
+        };
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, wakeSource);
+        let healthy = false;
+        const health = relay.health().then(() => {
+            healthy = true;
+        });
+        await Promise.resolve();
+        expect(healthy).toBe(false);
+        releaseSubscription?.();
+        await health;
+        expect(healthy).toBe(true);
+        await relay.close();
+    });
+
+    test("health surfaces a failed wake subscription", async () => {
+        const wakeSource: WakeSource = {
+            async notify(): Promise<void> {},
+            async subscribe(): Promise<void> {
+                throw new Error("LISTEN connection refused");
+            },
+            async close(): Promise<void> {},
+        };
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, wakeSource);
+        await expect(relay.health()).rejects.toThrow("LISTEN connection refused");
+        await relay.close();
+    });
+
     test("publishes, authenticates reads, and trims only after a signed ack", async () => {
         let now = NOW;
         const aliceSecret = secret(1);
