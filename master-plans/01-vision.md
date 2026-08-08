@@ -3,14 +3,17 @@
 ## Vision
 
 Murmur is a stateful library for discovering a public identity, bootstrapping
-an MLS session, and exchanging opaque data through that session. A two-person
-interaction and a many-person interaction use the same MLS group primitive.
-Friend relationships, pairwise friend channels, chat semantics, and generic
-relay topics are not part of Murmur.
+an MLS session, establishing a built-in contact relationship, and exchanging
+data through typed synchronization services. A two-person interaction and a
+many-person interaction use the same MLS group primitive. Contacts are
+foundational Murmur state. Chat semantics remain an optional service above
+contacts, and the old friend-channel and generic relay-topic machinery are not
+part of Murmur.
 
 It ships as the browser-safe and Node.js-compatible `@slopus/murmur` library.
-The relay is internal infrastructure, and application protocols such as chat
-and documents live above the library.
+The relay is internal infrastructure. Chat, documents, and other application
+protocols live in optional typed services rather than in the relay or the MLS
+engine.
 
 The pre-v0.3 rewrite remains a clean break: its APIs, codecs, relay topics,
 storage schemas, and CLI are unsupported. Version 0.3.3 is the compatibility
@@ -44,12 +47,13 @@ over one recipient-authenticated SSE connection in inbox UUIDv7 order.
 A relay item is acknowledged only after its queue-processing outcome is
 durable. Successful session processing atomically persists Murmur state, replay
 and queue progress, and a bounded opaque application update before
-acknowledgement. One identity-wide synchronization loop later calls the
-application's asynchronous `onUpdates` hook with an inbox-ordered batch spanning
-all sessions. After the hook resolves, Murmur atomically drains the whole batch
-from local storage. A thrown hook or crash before that internal commit exposes
-the same stable event IDs again; applications needing durable exactly-once
-effects deduplicate those IDs in their own persistence.
+acknowledgement. One identity-wide synchronization loop routes an inbox-ordered
+batch to contact handling, enabled service callbacks, and the application's
+asynchronous `onUpdates` hook for application-owned updates. Only after all
+relevant asynchronous handling resolves does Murmur atomically drain the whole
+local batch. A thrown handler or crash before that internal commit exposes the
+same stable event IDs again; applications needing durable exactly-once effects
+deduplicate those IDs in their own persistence.
 
 A valid bootstrap becomes a durable pending local bootstrap or session together
 with replay and queue progress before acknowledgement; the application later
@@ -57,9 +61,11 @@ activates or ignores it locally. While pending, Murmur continues advancing its
 MLS state and durably buffers opaque application events without exposing them,
 so later queue items can also be acknowledged without waiting. Pending state
 and buffered data are strictly bounded. Activation makes its buffered events
-visible to the same identity-wide `onUpdates` loop; ignore or overflow
-terminally rejects the session and destroys pending secrets and data while
-retaining replay and rejection state.
+visible to the appropriate owner in the same identity-wide loop; ignore or
+overflow terminally rejects the session and destroys pending secrets and data
+while retaining replay and rejection state. Built-in contact bootstraps instead
+expose their validated profile hello while pending and follow the contact
+accept-or-reject flow.
 
 Malformed, unauthenticatable, undecryptable, unsupported, ignored during queue
 processing, or otherwise terminal deliveries are durably rejected or
@@ -80,12 +86,18 @@ being added again.
    invalid bundle.
 2. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
    material to the recipient's authenticated queue. The recipient persists it
-   as pending and trims the queue before the application later activates it
-   locally or ignores it.
+   as pending and trims the queue before generic application acceptance or
+   built-in contact handling.
 3. **MLS sessions.** Send opaque descriptors, application events, and
    membership changes through the same MLS primitive for two or more members.
-4. **Applications.** Define chat, documents, files, and every other meaning
-   above Murmur.
+4. **Contacts.** Use a two-person technical MLS session and a mutual typed
+   profile hello to establish durable cryptographic proof of contact.
+5. **Synchronization services.** Attach optional typed capabilities to the
+   client. Services own their persistence, callbacks, and session routing,
+   participate automatically in the identity-wide synchronization loop, and
+   may depend on contacts or other services.
+6. **Applications.** Use a generic typed synchronization service or a
+   domain-specific service such as chat, documents, or files.
 
 ## How we know it is done
 
@@ -102,17 +114,23 @@ being added again.
 - A pending session stays cryptographically current under a strict storage
   bound; activation durably hands off buffered events or effects, while ignore
   or overflow terminally rejects and destroys pending secrets and data.
-- The same opaque MLS session API works for two and many members, including
-  adding and removing members.
+- A two-person contact session becomes durable contact proof only after both
+  identities exchange and process their typed profile hellos; rejection
+  destroys the pending contact session.
+- Optional strictly typed synchronization services persist their state, route
+  their sessions, and participate in the identity-wide sync loop without
+  requiring applications to dispatch raw updates.
+- The same MLS session engine works for two and many members, including adding
+  and removing members in service-owned sessions.
 - Queue processing survives redelivery and acknowledges only after durably
   recording queue progress and its successful protocol state plus buffered
   update, pending bootstrap, or terminal rejection.
 - One `sync` loop delivers bounded identity-wide batches with stable event IDs
-  to an optional asynchronous `onUpdates` hook and commits a whole batch only
-  after that hook resolves; an uncommitted batch is returned again after
-  restart.
+  to contact handling, enabled service callbacks, or the optional application
+  `onUpdates` hook, and commits a whole batch only after its asynchronous
+  handling resolves; an uncommitted batch is returned again after restart.
 - Realtime delivery streams exact queued events over authenticated SSE in one
   inbox's UUIDv7 order, reconnects from the durable cursor, and may redeliver
   but cannot replace durable acknowledgement.
-- No friend state machine, friend channel, generic topic API, CLI, or
-  chat-specific protocol remains.
+- No legacy friend state machine, friend channel, generic topic API, CLI, or
+  built-in chat-specific protocol remains.

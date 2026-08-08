@@ -18,8 +18,12 @@ Code is organized into modules by domain. The boundary is practical rather than
 rigid: everything concerned with keys and encryption belongs in `crypto`; MLS
 epochs and ratchets belong in `mls`; inbound queues and publication belong in
 `delivery`; the relay's own behavior belongs in `relay`; public identity and
-discovery belong in `identity`. The goal is that someone working on a domain
-knows which module to open and finds all of that domain's behavior there.
+discovery belong in `identity`; foundational contact behavior belongs in
+`contacts`; optional typed synchronization capabilities belong in `services`.
+Each service is its own domain within `sources/services` and keeps its typed
+packets, persistence, callbacks, and dependency declarations together. The goal
+is that someone working on a domain knows which module to open and finds all of
+that domain's behavior there.
 
 Modules may call one another. Their dependencies should preferably form a rough
 tree, with higher-level modules calling lower-level ones, but this is not a folder

@@ -2,10 +2,12 @@
 
 ## Destination
 
-Murmur has public identity discovery, not friends. It defines and validates a
-self-contained signed discovery bundle containing a public identity and current
-signed MLS KeyPackage material sufficient to attempt a bootstrap. It does not
-create a relationship, exchange profiles, or establish a separate channel.
+Murmur has public identity discovery, but discovery alone does not create a
+contact. It defines and validates a self-contained signed discovery bundle
+containing a public identity and current signed MLS KeyPackage material
+sufficient to attempt a bootstrap. It does not itself create a relationship,
+exchange profiles, or establish a separate channel. The built-in contact
+protocol may use the verified result to begin its two-person contact handshake.
 
 The public identity identifies the recipient's authenticated relay queue.
 There are no anonymous request topics or capability addresses. Discovery
@@ -39,8 +41,9 @@ control of acceptance and implementations must bound unsolicited attempts.
 - The application may share the bundle itself, or share a 32-byte SHA-256
   digest that resolves only through the relay's non-enumerable five-minute
   cache.
-- Discovery creates no friend record, friend request state machine, profile
-  exchange, or pairwise control channel.
+- Discovery itself creates no contact record or profile exchange. Those begin
+  only when the built-in contact protocol accepts the verified material and
+  bootstraps its technical session.
 - The relay is not used as a retained identity directory, list, or anonymous
   request topic; cached bundles are opaque, content-addressed, and expire within
   five minutes.
