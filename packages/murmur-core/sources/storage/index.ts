@@ -2,6 +2,9 @@ import type { MurmurStore, StoreScanOptions, StoreTransaction } from "./types.js
 
 export type { MurmurStore, StoreScanOptions, StoreTransaction } from "./types.js";
 
+/** Largest bounded store scan accepted by every Murmur store. */
+export const MAXIMUM_STORE_SCAN_ITEMS = 10_000;
+
 /** Ephemeral store with serialized transactions. */
 export class MemoryMurmurStore implements MurmurStore {
     readonly #values = new Map<string, Uint8Array>();
@@ -100,7 +103,7 @@ export class MemoryMurmurStore implements MurmurStore {
         if (
             !Number.isSafeInteger(options.limit) ||
             options.limit < 1 ||
-            options.limit > 10_000 ||
+            options.limit > MAXIMUM_STORE_SCAN_ITEMS ||
             (options.after !== undefined && !options.after.startsWith(prefix))
         ) {
             throw new Error("Invalid Murmur store scan");

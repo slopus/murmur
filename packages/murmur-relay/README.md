@@ -1,35 +1,37 @@
 # `@murmur/relay`
 
-Murmur Relay is a deliberately dumb ordered event store. It sees signed opaque
-bytes, topic capabilities, expiration times, and collapse keys; it does not know
-about identities, contacts, chats, groups, or MLS.
+Private Murmur infrastructure implementing authenticated encrypted identity
+queues. The relay sees sender and recipient identities, exact fanout, timing,
+TTL, and queue progress. It never sees MLS or application plaintext.
 
-## Topics
+## Contract
 
-A topic is identified by its type, name, and authorization public key(s):
+- One ordered inbound queue per public identity.
+- One relay-assigned UUIDv7 event ID per atomic multicast.
+- Event IDs are time ordered and strictly monotonic within each inbox.
+- One queue reference per exact recipient.
+- Sender-scoped delivery IDs deduplicate while any reference remains.
+- Signed reads prove ownership of the recipient identity.
+- Signed monotonic acknowledgements trim one processed queue prefix.
+- A delivery disappears after every reference is acknowledged or it expires.
+- Per-recipient, per-sender, and relay-wide item/byte/reference quotas make
+  publication all-or-nothing and bound pending storage. Sender reference quota
+  charges multicast fanout rather than only ciphertext records.
+- Every trusted-ingress principal has an exact outstanding-reference quota.
+  References leave that quota when recipients acknowledge or TTL removes them.
 
-- `Write Topic` requires the designated key for writes and is publicly readable.
-- `Read Topic` accepts any correctly signed writer and requires the designated
-  key for reads.
-- `Read and Write Topic` requires the designated keys in both directions.
-
-One capability key can namespace many independent names. Protected reads use a
-short-lived one-use challenge signed by the read key. The secret key never
-crosses the relay boundary.
-
-Each topic contains only an ordered event store. A missing `expiresAt` makes an
-event durable. Publishing with a `collapseKey` atomically removes older retained
-events from the same author carrying the same key in that topic. Collapse
-follows relay arrival order, so applications must authenticate a logical
-version in opaque payloads and reject delayed state regressions. Relay sequences
-are never reused, so expiration and collapse create intentional cursor holes.
-
-Read pages include `exhausted`; clients advance across trailing holes to the
-topic head only when it is true. Exact authenticated retries keep their original
-sequence even after they would fail current future-skew or elapsed-expiration
-checks.
+There are no topics, snapshots, retained history, collapse keys, lists, or
+anonymous capability addresses.
 
 ## Run
+
+The standalone host speaks plain HTTP and must run behind TLS termination in
+production. Public identities are free to create, so relay quotas do not
+provide Sybil resistance. The ingress must authenticate a non-Sybil principal
+and enforce an outstanding-fanout budget before forwarding; the bundled
+per-address limiter is only a local safety bound. Do not expose the shown
+`0.0.0.0` listener directly to the internet: signed queue reads and
+acknowledgements are replayable inside their short clock-skew window.
 
 ```bash
 pnpm --filter @murmur/relay build
@@ -40,19 +42,31 @@ pnpm --filter @murmur/relay start
 ```
 
 Set `MURMUR_RELAY_STORE=postgres` and provide a Postgres URL in
-`MURMUR_RELAY_DB` for the Postgres backend. `MURMUR_RELAY_ORIGINS` accepts `*`
-or a comma-separated list of exact browser origins; it defaults to `*`, which
-sends wildcard CORS and allows every browser origin. Node 22.5 or later is
-required.
+`MURMUR_RELAY_DB` for the Postgres backend. Node 22.5 or later is required.
+The direct command is suitable for local development; production traffic must
+arrive through the TLS and admission boundary described above.
+
+Behind a trusted admission proxy that overwrites a client-address or principal
+header, set
+`MURMUR_RELAY_REMOTE_ADDRESS_HEADER` to that header name. Admission limits are
+configurable with `MURMUR_RELAY_REQUESTS_PER_MINUTE` and
+`MURMUR_RELAY_TRACKED_ADDRESSES`. The exact outstanding fanout allowed for one
+admitted principal is configured with `MURMUR_RELAY_ADMISSION_REFERENCES`. The
+default is 10,000 references, one percent of the default global ceiling.
+
+The queue schema is intentionally incompatible with the former topic relay.
+Startup fails when legacy `murmur_relay_*` tables are present; deploy with a
+clean SQLite database or Postgres schema rather than retaining old ciphertext.
+
+The standalone process drains expired data every ten seconds in fixed
+transactions, continuing for at most one second per tick. It skips overlapping
+ticks rather than building an unbounded maintenance queue.
 
 ## HTTP API
 
-| Method | Route                 | Purpose                                  |
-| ------ | --------------------- | ---------------------------------------- |
-| `GET`  | `/health`             | Store health                             |
-| `POST` | `/v1/events`          | Publish one signed durable event         |
-| `POST` | `/v1/read-challenges` | Issue a one-use protected-read challenge |
-| `POST` | `/v1/events/read`     | Read or long-poll ordered events         |
-
-There are no snapshot, list, blob, ephemeral fanout, account, or migration
-routes.
+| Method | Route            | Purpose                                   |
+| ------ | ---------------- | ----------------------------------------- |
+| `GET`  | `/health`        | Store health                              |
+| `POST` | `/v1/deliveries` | Publish one atomic encrypted multicast    |
+| `POST` | `/v1/queue/read` | Authenticated queue read or long poll     |
+| `POST` | `/v1/queue/ack`  | Authenticated monotonic queue-prefix trim |

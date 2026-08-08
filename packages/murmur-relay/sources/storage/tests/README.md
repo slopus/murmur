@@ -1,21 +1,15 @@
 # Storage tests
 
-Runs the ordered-event, monotonic-head, and collapse contract against SQLite and
-real in-process PGlite transactions. Direct page-selection tests instrument
-candidate byte accounting so large-page complexity regressions are deterministic
-instead of timing-dependent. Store instrumentation verifies that adversarial
-maximum-size metadata pages hydrate only the selected event JSON rows. SQLite
-overflow-row coverage also requires an explicit covering-index plan and a
-generous repeated-read performance ceiling.
+Cross-backend conformance for atomic multicast, independent trimming, pending
+idempotency, recipient/sender/global quota rollback, destructive expiration,
+empty-queue acknowledgement, metadata reclamation, and UUIDv7 monotonicity.
+SQLite also pins the fixed expiration batch boundary.
+Another regression proves a later quota rejection cannot roll that batch back.
 
 ```text
-                 shared conformance cases
-                 /                      \
-        SQLite :memory:             PGlite
-       sequence/receipt      sequence/receipt/lock
-                 \                      /
-            identical pages, heads, collapse, challenges
+same vectors -> SQLite
+             -> PGlite/Postgres adapter
+             -> equal queue outcomes
 ```
 
-The paired suite prevents one backend from silently weakening relay ordering
-or one-use challenge behavior.
+Page selection tests pin bounded hydration and UUID cursor behavior.

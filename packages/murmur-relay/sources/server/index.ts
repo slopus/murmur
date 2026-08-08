@@ -144,11 +144,6 @@ async function writeResponse(response: Response, outgoing: ServerResponse): Prom
         await endResponse(outgoing);
         return;
     }
-    // Flush status and headers before the first body chunk so an SSE client sees
-    // the stream open (and receives its `ready` event) without buffering delay.
-    if (response.headers.get("content-type")?.startsWith("text/event-stream") === true) {
-        outgoing.flushHeaders();
-    }
     await pipeline(Readable.fromWeb(response.body as ReadableStream<Uint8Array>), outgoing);
 }
 
@@ -207,13 +202,9 @@ export async function listenNodeRelayServer(
 /**
  * Stop accepting requests and resolve after active responses finish.
  *
- * The listener stops accepting synchronously, before the returned promise, so a
- * caller can end its own long-lived responses (an open SSE body never finishes
- * on its own) immediately afterwards and still have them counted in this drain.
- * Keep-alive connections that fall idle after that are swept, because Node only
- * closes the ones already idle when `close()` is called, and anything still open
- * once `graceMilliseconds` elapses is destroyed. Shutdown therefore cannot be
- * held open indefinitely by one client.
+ * Keep-alive connections that fall idle after `close()` are swept, and anything
+ * still open once `graceMilliseconds` elapses is destroyed. Shutdown therefore
+ * cannot be held open indefinitely by one client.
  */
 export function closeNodeRelayServer(
     server: Server,

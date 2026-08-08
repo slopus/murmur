@@ -1,15 +1,12 @@
 # Documentation
 
-These files describe the clean stateful library and its one untrusted relay.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — ownership, components, and durable
+  boundaries.
+- [PROTOCOL.md](PROTOCOL.md) — identity, discovery, delivery, and MLS session
+  behavior.
+- [RELAY_API.md](RELAY_API.md) — HTTP wire contract.
+- [SECURITY.md](SECURITY.md) — threat model, guarantees, and limitations.
+- [DEPLOYMENT.md](DEPLOYMENT.md) — relay deployment and operational boundaries.
+- [RELEASING.md](RELEASING.md) — checks and npm release procedure.
 
-```text
-ARCHITECTURE.md -- trust boundaries and durable state machines
-PROTOCOL.md ----- friend/control/MLS wire behavior
-RELAY_API.md ---- ordered opaque relay HTTP contract
-SECURITY.md ----- guarantees, exposure, and limits
-DEPLOYMENT.md --- standalone relay operation
-RELEASING.md ---- version, package, image, and release procedure
-```
-
-Application chat, document, file, and session semantics intentionally do not
-belong in this protocol documentation.
+Product intent and completion criteria live in `master-plans/`.

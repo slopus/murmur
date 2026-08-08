@@ -2,7 +2,7 @@ import { gcm } from "@noble/ciphers/aes";
 import { ed25519, x25519 } from "@noble/curves/ed25519";
 import { hmac } from "@noble/hashes/hmac";
 import { expand as hkdfExpand, extract as hkdfExtract } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes/sha256";
+import { sha256 } from "@noble/hashes/sha2";
 import {
     concatBytes,
     equalBytes,

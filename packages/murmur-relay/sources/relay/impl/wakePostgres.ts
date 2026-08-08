@@ -4,10 +4,10 @@ import type { WakeSource } from "../types.js";
 
 const RECONNECT_MILLISECONDS = 1_000;
 
-/** Dedicated resilient Postgres LISTEN connection for cross-instance topic wakes. */
+/** Dedicated resilient Postgres LISTEN connection for cross-instance queue wakes. */
 export class PostgresWakeSource implements WakeSource {
     readonly #configuration: ClientConfig;
-    readonly #listeners = new Set<(topic: string) => void>();
+    readonly #listeners = new Set<(queueId: string) => void>();
     #client: Client | undefined;
     #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
     #connecting = false;
@@ -21,12 +21,12 @@ export class PostgresWakeSource implements WakeSource {
      * Publication notifications are emitted by PostgresRelayStore inside its
      * transaction; this method is intentionally a no-op after local commit.
      */
-    async notify(_topic: string): Promise<void> {
+    async notify(_queueId: string): Promise<void> {
         // The store's transactional pg_notify is the authoritative cross-instance wake.
     }
 
     /** Register a listener and establish the dedicated LISTEN connection in the background. */
-    async subscribe(listener: (topic: string) => void): Promise<void> {
+    async subscribe(listener: (queueId: string) => void): Promise<void> {
         if (this.#closed) {
             throw new Error("Wake source is closed");
         }

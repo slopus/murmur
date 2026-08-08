@@ -1,21 +1,13 @@
 # SQLite store
 
-`node:sqlite`, WAL, foreign keys, and `BEGIN IMMEDIATE` make sequence allocation,
-idempotency receipts, collapse deletion, and event insertion one transaction.
-A covering `(topic_id, seq, encoded_bytes, expires_at)` index supplies bounded
-ordered page metadata without visiting event rows or overflow pages. The primary
-key then hydrates only the selected sequences inside the same read transaction.
-The collapse index remains `(topic_id, author_signing_key, collapse_key)`. Only
-explicitly expired event rows are pruned.
-
 ```text
-BEGIN IMMEDIATE
-  -> read/update topic head
-  -> check event ID receipt
-  -> delete collapsed predecessor
-  -> insert event + receipt
-COMMIT
+read ----------------------> ordinary snapshot transaction
+publish / ack / prune -----> BEGIN IMMEDIATE -> commit or rollback
 ```
 
-The single-process writer lock gives the same per-topic monotonicity that
-Postgres obtains with advisory locks.
+`node:sqlite`, WAL, foreign keys, and a busy timeout support one embedded relay.
+Writer transactions serialize UUIDv7 allocation, quota checks, queue-reference
+mutation, bounded expiration, and targeted orphan cleanup. Fanout writes are
+set-based, and expiration removes a fixed delivery batch plus chunked affected
+inbox rows. Reads do not prune or take the writer lock; they filter expired rows
+in their stable snapshot.

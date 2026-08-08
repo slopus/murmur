@@ -15,13 +15,19 @@ initial material through its authenticated identity queue.
 
 Each outbound MLS delivery has one verifiably bound recipient set containing
 every current epoch member, including the publisher. The relay publishes one
-ciphertext atomically to every recipient queue with one shared order.
+ciphertext atomically to every recipient queue with one UUIDv7 event ID. Event
+IDs are monotonic within each inbox; the session never assumes ordering across
+different inboxes.
 
-Publishing a Commit, including receiving publish success, only stages it and
-never advances or adopts an epoch. Every member, including its publisher,
-processes the Commit from its relay echo in shared queue order. The first valid
-current-epoch Commit in that order wins, and competing operations replan
-against the resulting epoch.
+Each epoch has exactly one authenticated committer recorded in MLS-protected
+session state. Only that member may publish a Commit for the epoch. Other
+members publish MLS Proposals, and the committer serializes accepted proposals
+into Commits. A Commit may transfer the committer role for the next epoch.
+Publish success only stages a Commit; every member, including the committer,
+adopts it from its own relay echo. Relay order never arbitrates concurrent
+Commits. Losing the current committer can block membership changes until local
+state is restored or the remaining members bootstrap a replacement session;
+application traffic in the current epoch remains usable.
 
 Murmur owns synchronization, outbox retry, replay protection, Commit
 resolution, current epochs and ratchets, Welcome processing, and session
@@ -63,9 +69,11 @@ local state requires restoring a backup or being added again.
 - Ongoing application and control traffic is MLS-protected; there is no friend
   channel or shared relay topic.
 - Every current epoch member, including the publisher, receives each ongoing
-  MLS delivery in one common relay order.
-- Publish success only stages a Commit. The first valid current-epoch Commit in
-  relay echo order wins, and competing operations replan.
+  MLS delivery with the same UUIDv7 event ID; ordering is guaranteed only
+  within an individual inbox.
+- Exactly one authenticated epoch committer serializes MLS Proposals into
+  Commits. Publish success only stages a Commit, and relay order never resolves
+  Commit conflicts.
 - Successful protocol state and any application effects are durable before
   queue acknowledgement.
 - A valid bootstrap becomes durable pending local state before acknowledgement,

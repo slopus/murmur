@@ -1,31 +1,5 @@
 # Node server
 
-This module adapts Node `IncomingMessage`/`ServerResponse` to the package's Fetch
-handler. Protocol behavior remains testable without a socket; this layer owns
-URL/header/body adaptation and listening. Premature request, response, or socket
-closure aborts the Fetch request so long-poll waiters are released immediately;
-all lifecycle listeners are removed after response completion. The adapter
-passes the socket's direct peer address as trusted request metadata and pipes
-Fetch response bodies with Node stream backpressure rather than buffering them.
-
-Long-lived SSE responses (`GET .../stream`) work unchanged: piping applies socket
-backpressure so a slow client throttles the source instead of growing memory, and
-Node exempts a fully received request (a bodyless `GET`) from `requestTimeout`,
-`headersTimeout`, and `keepAliveTimeout`, so a minutes-long response is not
-aborted. Streaming response headers are flushed before the first chunk so the
-client observes `ready` without buffering delay.
-
-`closeNodeRelayServer` stops the listener synchronously, before the promise it
-returns, so a caller can end its own never-ending responses — for the relay,
-`RelayService.closeStreams()` — immediately afterwards and still have them
-counted in the drain. Anything still open when `graceMilliseconds` expires is
-destroyed, so one open stream cannot hold shutdown open forever.
-
-```text
-IncomingMessage -> URL/headers/body -> Fetch Request -> handler
-ServerResponse <- headers/stream ---- Fetch Response <-+
-      |
-socket backpressure + abort propagation + graceful drain
-```
-
-This is the only layer that depends on Node HTTP lifecycle and socket behavior.
+Adapts Node `IncomingMessage` and `ServerResponse` to the relay's Fetch handler.
+It streams request and response bodies with backpressure, propagates disconnect
+abort signals into long polls, and bounds graceful shutdown.

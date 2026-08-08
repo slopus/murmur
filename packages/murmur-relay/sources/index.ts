@@ -1,26 +1,26 @@
 export {
     RelayError,
-    parseRelayTopic,
-    parseSignedRelayEvent,
-    readProofSigningBytes,
-    relayEventFingerprint,
-    relayEventSigningBytes,
-    relayTopicId,
-    relayTopicToJson,
-    signedRelayEventToJson,
-    verifyRelayEventSignature,
+    deliveryFingerprint,
+    deliverySigningBytes,
+    parseSignedDelivery,
+    parseSignedQueueAck,
+    parseSignedQueueRead,
+    queueAckSigningBytes,
+    queueReadSigningBytes,
+    signedDeliveryToJson,
+    signedQueueAckToJson,
+    signedQueueReadToJson,
+    verifyDeliverySignature,
+    verifyQueueAckSignature,
+    verifyQueueReadSignature,
 } from "./protocol/index.js";
 export type {
-    ReadChallenge,
-    ReadProof,
-    ReadTopic,
-    ReadWriteTopic,
-    RelayAuthor,
-    RelayTopic,
-    RelayTopicJson,
-    SignedRelayEvent,
-    SignedRelayEventJson,
-    WriteTopic,
+    SignedDelivery,
+    SignedDeliveryJson,
+    SignedQueueAck,
+    SignedQueueAckJson,
+    SignedQueueRead,
+    SignedQueueReadJson,
 } from "./protocol/index.js";
 export { InProcessWakeSource, PostgresWakeSource, RelayService } from "./relay/index.js";
 export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./relay/index.js";
@@ -29,21 +29,21 @@ export {
     PGliteDatabase,
     parseRelayStoreBackend,
     PostgresRelayStore,
+    RELAY_EXPIRATION_BATCH_ITEMS,
     SqliteRelayStore,
 } from "./storage/index.js";
 export type {
-    EventPage,
+    AcknowledgeOutcome,
     PageReadConstraints,
     PublishOutcome,
-    PublishReceipt,
-    PostgresRelayStoreOptions,
+    QueuedDelivery,
+    QueueLimits,
+    QueuePage,
     RelayStore,
     RelayStoreBackend,
-    RelayStoreInstrumentation,
-    RetainedRelayEvent,
     SqliteRelayStoreOptions,
 } from "./storage/index.js";
-export { createRelayFetchHandler } from "./http/index.js";
+export { createRelayFetchHandler, parseRelayAllowedOrigins } from "./http/index.js";
 export type { RelayFetchHandler, RelayHttpOptions, RelayRequestContext } from "./http/index.js";
 export {
     closeNodeRelayServer,

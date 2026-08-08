@@ -1,74 +1,77 @@
-import { signedRelayEventToJson, type SignedRelayEvent } from "../protocol/index.js";
+import { signedDeliveryToJson, type SignedDelivery } from "../protocol/index.js";
 import type { PageReadConstraints } from "./types.js";
 
 const textEncoder = new TextEncoder();
 
-/** Compact JSON and its exact UTF-8 byte length, persisted identically by every store. */
-export function encodeStoredRelayEvent(event: SignedRelayEvent): {
+/** Compact delivery JSON and its exact UTF-8 byte length. */
+export function encodeStoredDelivery(delivery: SignedDelivery): {
     readonly json: string;
     readonly encodedBytes: number;
 } {
-    const json = JSON.stringify(signedRelayEventToJson(event));
+    const json = JSON.stringify(signedDeliveryToJson(delivery));
     return { json, encodedBytes: textEncoder.encode(json).length };
 }
 
-/** Bounded retained-row metadata used before any event JSON is hydrated. */
+/** Bounded queue-row metadata selected before delivery JSON hydration. */
 export interface StoredPageCandidate {
-    readonly seq: bigint;
+    readonly eventId: string;
     readonly encodedBytes: number;
 }
 
-/** Selected retained metadata and snapshot state ready for exact hydration. */
+/** Selected queue metadata and transaction state ready for exact hydration. */
 export interface StoredPageSelection {
     readonly candidates: readonly StoredPageCandidate[];
-    readonly head: bigint;
+    readonly head: string | null;
+    readonly acknowledgedThrough: string | null;
     readonly exhausted: boolean;
 }
 
-/** Optional deterministic accounting hook used by complexity regressions. */
-export interface PageSelectionInstrumentation {
-    readonly candidateEncoded: () => void;
-}
-
-function encodedEmptyPageBytes(head: bigint, exhausted: boolean): number {
+function encodedEmptyPageBytes(
+    head: string | null,
+    acknowledgedThrough: string | null,
+    exhausted: boolean,
+): number {
     return textEncoder.encode(
-        `{"events":[],"head":"${head.toString()}","exhausted":${exhausted.toString()}}`,
+        `{"deliveries":[],"head":${head === null ? "null" : `"${head}"`},"acknowledgedThrough":${acknowledgedThrough === null ? "null" : `"${acknowledgedThrough}"`},"exhausted":${exhausted.toString()}}`,
     ).length;
 }
 
-function encodedCandidateBytes(
-    retained: StoredPageCandidate,
-    index: number,
-    instrumentation: PageSelectionInstrumentation | undefined,
-): number {
-    const metadataBytes = textEncoder.encode(`{"seq":"${retained.seq.toString()}","event":`).length;
-    instrumentation?.candidateEncoded();
-    return (index === 0 ? 0 : 1) + metadataBytes + retained.encodedBytes + 1;
+function encodedCandidateBytes(candidate: StoredPageCandidate, index: number): number {
+    const metadataBytes = textEncoder.encode(
+        `{"eventId":"${candidate.eventId}","delivery":`,
+    ).length;
+    return (index === 0 ? 0 : 1) + metadataBytes + candidate.encodedBytes + 1;
 }
 
 /**
- * Materialize a page from no more than `limit + 1` retained candidates.
+ * Select no more than `limit` queue references from `limit + 1` metadata rows.
  *
- * The first retained event is always returned so a small configured budget
- * cannot permanently strand a large valid event. Later events must fit the
- * exact compact HTTP response byte budget.
+ * The first valid delivery is always returned even when it alone exceeds the
+ * response budget. The HTTP boundary independently rejects a configured budget
+ * too small for one maximum-sized delivery.
  */
-export function selectEventPageMetadata(
+export function selectQueuePageMetadata(
     candidates: readonly StoredPageCandidate[],
-    head: bigint,
+    head: string | null,
+    acknowledgedThrough: string | null,
+    after: string | null,
     limit: number,
     constraints: PageReadConstraints,
-    instrumentation?: PageSelectionInstrumentation,
 ): StoredPageSelection {
     if (candidates.length === 0) {
-        return { candidates: [], head, exhausted: true };
+        return {
+            candidates: [],
+            head: after,
+            acknowledgedThrough,
+            exhausted: true,
+        };
     }
     const available = candidates.slice(0, limit);
-    let exhaustedBytes = encodedEmptyPageBytes(head, true);
-    let continuedBytes = encodedEmptyPageBytes(head, false);
+    let exhaustedBytes = encodedEmptyPageBytes(head, acknowledgedThrough, true);
+    let continuedBytes = encodedEmptyPageBytes(head, acknowledgedThrough, false);
     let selectedCount = 1;
-    for (const [index, retained] of available.entries()) {
-        const encodedBytes = encodedCandidateBytes(retained, index, instrumentation);
+    for (const [index, candidate] of available.entries()) {
+        const encodedBytes = encodedCandidateBytes(candidate, index);
         exhaustedBytes += encodedBytes;
         continuedBytes += encodedBytes;
         if (index > 0 && continuedBytes <= constraints.maximumEncodedBytes) {
@@ -79,11 +82,17 @@ export function selectEventPageMetadata(
         candidates.length <= limit &&
         (available.length === 1 || exhaustedBytes <= constraints.maximumEncodedBytes)
     ) {
-        return { candidates: available, head, exhausted: true };
+        return {
+            candidates: available,
+            head,
+            acknowledgedThrough,
+            exhausted: true,
+        };
     }
     return {
         candidates: available.slice(0, selectedCount),
         head,
+        acknowledgedThrough,
         exhausted: false,
     };
 }

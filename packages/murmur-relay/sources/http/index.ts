@@ -1,12 +1,11 @@
 import {
     RelayError,
-    parseRelayTopic,
-    parseSignedRelayEvent,
-    signedRelayEventToJson,
-    type ReadProof,
+    parseSignedDelivery,
+    parseSignedQueueAck,
+    parseSignedQueueRead,
+    signedDeliveryToJson,
 } from "../protocol/index.js";
 import type { RelayService } from "../relay/index.js";
-import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 
 /** Metadata supplied by a concrete HTTP host. */
 export interface RelayRequestContext {
@@ -22,7 +21,20 @@ export type RelayFetchHandler = (
 /** CORS policy for the relay HTTP boundary. */
 export interface RelayHttpOptions {
     readonly allowedOrigins?: "*" | readonly string[];
+    readonly maximumRequestsPerMinutePerAddress?: number;
+    readonly maximumTrackedAddresses?: number;
+    readonly requireRemoteAddress?: boolean;
+    readonly remoteAddressHeader?: string;
+    readonly defaultAdmissionPrincipal?: string;
 }
+
+interface AddressWindow {
+    count: number;
+    startedAt: number;
+}
+
+const textEncoder = new TextEncoder();
+const MINUTE_MILLISECONDS = 60_000;
 
 /** Strictly parse the standalone relay's CORS origin environment value. */
 export function parseRelayAllowedOrigins(value: string | undefined): "*" | readonly string[] {
@@ -53,11 +65,7 @@ export function parseRelayAllowedOrigins(value: string | undefined): "*" | reado
     return origins;
 }
 
-function json(
-    body: unknown,
-    status: number = 200,
-    headers?: Readonly<Record<string, string>>,
-): Response {
+function json(body: unknown, status: number, headers: Readonly<Record<string, string>>): Response {
     return new Response(JSON.stringify(body), {
         status,
         headers: {
@@ -72,10 +80,11 @@ function boundedJson(
     body: unknown,
     maximumBytes: number,
     headers: Readonly<Record<string, string>>,
+    overflowBody: unknown = { error: "limit" },
 ): Response {
     const encoded = JSON.stringify(body);
-    if (new TextEncoder().encode(encoded).length > maximumBytes) {
-        throw new RelayError(413, "Response exceeds relay limit", { error: "limit" });
+    if (textEncoder.encode(encoded).length > maximumBytes) {
+        return json(overflowBody, 413, headers);
     }
     return new Response(encoded, {
         status: 200,
@@ -85,13 +94,6 @@ function boundedJson(
             ...headers,
         },
     });
-}
-
-function object(value: unknown, name: string): Record<string, unknown> {
-    if (value === null || typeof value !== "object" || Array.isArray(value)) {
-        throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
-    }
-    return value as Record<string, unknown>;
 }
 
 async function readJson(request: Request, maximumBytes: number): Promise<unknown> {
@@ -133,33 +135,6 @@ async function readJson(request: Request, maximumBytes: number): Promise<unknown
     }
 }
 
-function integer(value: unknown, name: string): number {
-    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
-        throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
-    }
-    return value;
-}
-
-function proof(value: unknown): ReadProof | undefined {
-    if (value === undefined) return undefined;
-    const input = object(value, "read proof");
-    if (
-        typeof input.challengeId !== "string" ||
-        typeof input.signature !== "string" ||
-        Object.keys(input).some((key) => key !== "challengeId" && key !== "signature")
-    ) {
-        throw new RelayError(400, "Invalid read proof", { error: "malformed" });
-    }
-    try {
-        return {
-            challengeId: input.challengeId,
-            signature: decodeBase64Url(input.signature, 64),
-        };
-    } catch {
-        throw new RelayError(400, "Invalid read proof", { error: "malformed" });
-    }
-}
-
 function corsOrigin(request: Request, options: RelayHttpOptions): string | undefined {
     const origin = request.headers.get("origin");
     if (origin === null) return undefined;
@@ -168,12 +143,44 @@ function corsOrigin(request: Request, options: RelayHttpOptions): string | undef
     return undefined;
 }
 
-/** Create the relay's complete ordered-event HTTP API. */
+/** Create the relay's complete identity-queue HTTP API. */
 export function createRelayFetchHandler(
     relay: RelayService,
     options: RelayHttpOptions = {},
 ): RelayFetchHandler {
-    return async (request): Promise<Response> => {
+    const maximumRequestsPerMinutePerAddress = options.maximumRequestsPerMinutePerAddress ?? 600;
+    const maximumTrackedAddresses = options.maximumTrackedAddresses ?? 10_000;
+    const requireRemoteAddress = options.requireRemoteAddress ?? true;
+    const remoteAddressHeader = options.remoteAddressHeader?.toLowerCase();
+    const defaultAdmissionPrincipal = options.defaultAdmissionPrincipal;
+    if (
+        !Number.isSafeInteger(maximumRequestsPerMinutePerAddress) ||
+        maximumRequestsPerMinutePerAddress < 1 ||
+        !Number.isSafeInteger(maximumTrackedAddresses) ||
+        maximumTrackedAddresses < 1
+    ) {
+        throw new Error("HTTP rate limits must be positive safe integers");
+    }
+    if (
+        remoteAddressHeader !== undefined &&
+        !/^[!#$%&'*+\-.^_`|~0-9a-z]+$/.test(remoteAddressHeader)
+    ) {
+        throw new Error("Remote address header must be a valid HTTP field name");
+    }
+    if (
+        defaultAdmissionPrincipal !== undefined &&
+        (defaultAdmissionPrincipal.length < 1 || defaultAdmissionPrincipal.length > 255)
+    ) {
+        throw new Error("Default admission principal must contain 1 through 255 characters");
+    }
+    if (!requireRemoteAddress && defaultAdmissionPrincipal === undefined) {
+        throw new Error(
+            "Disabling remote-address admission requires one explicit default admission principal",
+        );
+    }
+    const addressWindows = new Map<string, AddressWindow>();
+
+    return async (request, context): Promise<Response> => {
         const origin = corsOrigin(request, options);
         const corsHeaders: Record<string, string> =
             origin === undefined
@@ -184,6 +191,19 @@ export function createRelayFetchHandler(
                   };
         try {
             const url = new URL(request.url);
+            const remoteAddress =
+                remoteAddressHeader === undefined
+                    ? context?.remoteAddress
+                    : (request.headers.get(remoteAddressHeader) ?? undefined);
+            const admissionPrincipal = remoteAddress ?? defaultAdmissionPrincipal;
+            if (
+                remoteAddress !== undefined &&
+                (remoteAddress.length < 1 || remoteAddress.length > 255)
+            ) {
+                throw new RelayError(400, "Invalid remote address admission value", {
+                    error: "malformed",
+                });
+            }
             if (request.method === "OPTIONS") {
                 return new Response(null, {
                     status: 204,
@@ -194,67 +214,104 @@ export function createRelayFetchHandler(
                     },
                 });
             }
+            if (
+                request.method !== "OPTIONS" &&
+                requireRemoteAddress &&
+                remoteAddress === undefined
+            ) {
+                throw new RelayError(503, "Remote address admission context is required", {
+                    error: "admission_context_required",
+                });
+            }
+            if (request.method !== "OPTIONS" && admissionPrincipal !== undefined) {
+                const now = Date.now();
+                let window = addressWindows.get(admissionPrincipal);
+                if (window !== undefined && now - window.startedAt >= MINUTE_MILLISECONDS) {
+                    addressWindows.delete(admissionPrincipal);
+                    window = undefined;
+                }
+                if (window === undefined) {
+                    if (addressWindows.size >= maximumTrackedAddresses) {
+                        for (const [address, candidate] of addressWindows) {
+                            if (now - candidate.startedAt >= MINUTE_MILLISECONDS) {
+                                addressWindows.delete(address);
+                            }
+                        }
+                    }
+                    if (addressWindows.size >= maximumTrackedAddresses) {
+                        throw new RelayError(503, "Relay request limiter is full", {
+                            error: "overloaded",
+                        });
+                    }
+                    window = { count: 0, startedAt: now };
+                    addressWindows.set(admissionPrincipal, window);
+                }
+                window.count += 1;
+                if (window.count > maximumRequestsPerMinutePerAddress) {
+                    throw new RelayError(429, "Too many requests from address", {
+                        error: "rate_limited",
+                    });
+                }
+            }
             if (request.method === "GET" && url.pathname === "/health") {
                 await relay.health();
                 return json({ ok: true }, 200, corsHeaders);
             }
-            if (request.method === "POST" && url.pathname === "/v1/events") {
-                const event = parseSignedRelayEvent(
+            if (request.method === "POST" && url.pathname === "/v1/deliveries") {
+                const delivery = parseSignedDelivery(
                     await readJson(request, relay.options.maximumJsonBodyBytes),
                 );
-                const outcome = await relay.publish(event);
-                return boundedJson(
-                    { seq: outcome.seq.toString(), duplicate: outcome.duplicate },
-                    relay.options.maximumJsonBodyBytes,
-                    corsHeaders,
-                );
-            }
-            if (request.method === "POST" && url.pathname === "/v1/read-challenges") {
-                const body = object(
-                    await readJson(request, relay.options.maximumJsonBodyBytes),
-                    "challenge request",
-                );
-                const challenge = await relay.issueReadChallenge(parseRelayTopic(body.topic));
+                if (admissionPrincipal === undefined) {
+                    throw new RelayError(503, "Admission principal is required", {
+                        error: "admission_context_required",
+                    });
+                }
+                const outcome = await relay.publish(delivery, admissionPrincipal);
                 return boundedJson(
                     {
-                        id: challenge.id,
-                        nonce: encodeBase64Url(challenge.nonce),
-                        expiresAt: challenge.expiresAt,
+                        eventId: outcome.eventId,
+                        duplicate: outcome.duplicate,
                     },
                     relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );
             }
-            if (request.method === "POST" && url.pathname === "/v1/events/read") {
-                const body = object(
+            if (request.method === "POST" && url.pathname === "/v1/queue/read") {
+                const read = parseSignedQueueRead(
                     await readJson(request, relay.options.maximumJsonBodyBytes),
-                    "event read",
                 );
-                if (
-                    typeof body.since !== "string" ||
-                    body.since.length > 19 ||
-                    !/^(0|[1-9]\d*)$/.test(body.since)
-                ) {
-                    throw new RelayError(400, "Invalid event cursor", { error: "malformed" });
-                }
-                const page = await relay.readEvents(
-                    parseRelayTopic(body.topic),
-                    BigInt(body.since),
-                    integer(body.limit, "event limit"),
-                    integer(body.waitMilliseconds, "long-poll duration"),
-                    proof(body.proof),
+                const page = await relay.readQueue(
+                    read,
                     request.signal,
                     relay.options.maximumJsonBodyBytes,
                 );
                 return boundedJson(
                     {
-                        events: page.events.map((retained) => ({
-                            seq: retained.seq.toString(),
-                            event: signedRelayEventToJson(retained.event),
+                        deliveries: page.deliveries.map((queued) => ({
+                            eventId: queued.eventId,
+                            delivery: signedDeliveryToJson(queued.delivery),
                         })),
-                        head: page.head.toString(),
+                        head: page.head,
+                        acknowledgedThrough: page.acknowledgedThrough,
                         exhausted: page.exhausted,
                     },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                    {
+                        error: "delivery_too_large",
+                        eventId: page.deliveries[0]?.eventId ?? null,
+                        head: page.head,
+                        acknowledgedThrough: page.acknowledgedThrough,
+                    },
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/queue/ack") {
+                const acknowledgement = parseSignedQueueAck(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const outcome = await relay.acknowledge(acknowledgement);
+                return boundedJson(
+                    { removed: outcome.removed },
                     relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );

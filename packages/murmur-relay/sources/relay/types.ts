@@ -1,30 +1,50 @@
 /** Relay limits with conservative defaults. */
 export interface RelayOptions {
-    readonly maximumEventPayloadBytes?: number;
-    readonly maximumCollapseKeyBytes?: number;
+    readonly maximumCiphertextBytes?: number;
+    readonly maximumRecipients?: number;
     readonly maximumJsonBodyBytes?: number;
-    readonly maximumEventsPerRead?: number;
+    readonly maximumQueueItems?: number;
+    readonly maximumQueueBytes?: number;
+    readonly maximumSenderItems?: number;
+    readonly maximumSenderBytes?: number;
+    readonly maximumSenderReferences?: number;
+    readonly maximumAdmissionReferences?: number;
+    readonly maximumGlobalItems?: number;
+    readonly maximumGlobalBytes?: number;
+    readonly maximumGlobalReferences?: number;
+    readonly maximumDeliveryTtlMilliseconds?: number;
+    readonly maximumAuthenticationSkewMilliseconds?: number;
+    readonly maximumDeliveriesPerRead?: number;
     readonly maximumLongPollMilliseconds?: number;
     readonly maximumConcurrentLongPolls?: number;
-    readonly readChallengeLifetimeMilliseconds?: number;
-    readonly maximumOutstandingReadChallenges?: number;
+    readonly maximumConcurrentLongPollsPerIdentity?: number;
 }
 
 /** Fully resolved relay limits. */
 export interface ResolvedRelayOptions {
-    readonly maximumEventPayloadBytes: number;
-    readonly maximumCollapseKeyBytes: number;
+    readonly maximumCiphertextBytes: number;
+    readonly maximumRecipients: number;
     readonly maximumJsonBodyBytes: number;
-    readonly maximumEventsPerRead: number;
+    readonly maximumQueueItems: number;
+    readonly maximumQueueBytes: number;
+    readonly maximumSenderItems: number;
+    readonly maximumSenderBytes: number;
+    readonly maximumSenderReferences: number;
+    readonly maximumAdmissionReferences: number;
+    readonly maximumGlobalItems: number;
+    readonly maximumGlobalBytes: number;
+    readonly maximumGlobalReferences: number;
+    readonly maximumDeliveryTtlMilliseconds: number;
+    readonly maximumAuthenticationSkewMilliseconds: number;
+    readonly maximumDeliveriesPerRead: number;
     readonly maximumLongPollMilliseconds: number;
     readonly maximumConcurrentLongPolls: number;
-    readonly readChallengeLifetimeMilliseconds: number;
-    readonly maximumOutstandingReadChallenges: number;
+    readonly maximumConcurrentLongPollsPerIdentity: number;
 }
 
-/** Cross-process signal used only to reduce long-poll latency. */
+/** Cross-process signal used only to reduce queue long-poll latency. */
 export interface WakeSource {
-    notify(topicId: string): Promise<void>;
-    subscribe(listener: (topicId: string) => void): Promise<void>;
+    notify(queueId: string): Promise<void>;
+    subscribe(listener: (queueId: string) => void): Promise<void>;
     close(): Promise<void>;
 }

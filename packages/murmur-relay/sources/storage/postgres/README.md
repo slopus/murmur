@@ -1,19 +1,15 @@
 # Postgres store
 
-Production wraps `pg.Pool`; tests wrap PGlite. A per-topic advisory transaction
-lock serializes monotonic sequence allocation and atomic collapse. The package
-creates only the clean schema and contains no legacy migration reader. Ordered
-reads run in a repeatable-read transaction, use the `(topic_id, seq)` primary
-index, select only `limit + 1` retained metadata candidates, and hydrate only
-the selected sequence rows under that same snapshot.
-
 ```text
-BEGIN
-  -> advisory lock(topic ID)
-  -> allocate head + idempotency receipt
-  -> apply collapse + insert retained event
-COMMIT -> optional NOTIFY(topic ID)
+publish / ack / prune -> lock global singleton -> mutate pending rows
+read -----------------> repeatable-read snapshot, no writes
+commit publish --------> transactional pg_notify(queue identity)
 ```
 
-PGlite exercises the same SQL transaction shape in process, while production
-adds pooling and cross-process wake notifications.
+Production wraps `pg.Pool`; tests wrap PGlite. The singleton usage lock protects
+pending-storage counters and monotonic UUIDv7 allocation. The public ordering
+guarantee is only within one inbox. Queue rows are additionally locked while
+enforcing quota through set-based target operations. Expiration deletes one
+fixed delivery batch and chunks affected-inbox cleanup. Reads only filter
+expired rows, avoiding serialization failures and write amplification.
+LISTEN/NOTIFY wakes readers only after publication commits.

@@ -1,7 +1,7 @@
 import { gcm } from "@noble/ciphers/aes";
 import { x25519 } from "@noble/curves/ed25519";
 import { expand as hkdfExpand, extract as hkdfExtract } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes/sha256";
+import { sha256 } from "@noble/hashes/sha2";
 import { randomBytes } from "@noble/hashes/utils";
 import { concatBytes, utf8Encode, zeroBytes } from "../../internal.js";
 import type { HpkeCiphertext, HpkeKeyPair } from "../types.js";

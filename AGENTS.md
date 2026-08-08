@@ -1,7 +1,8 @@
-# Murmur - Claude Development Guide
+# Murmur Development Guide
 
-Stateful encrypted friend bootstrap and opaque MLS group event streams over one
-deliberately dumb relay.
+Stateful MLS sessions over authenticated encrypted identity queues. Discovery
+is self-contained and application-routed; the relay is a disposable delivery
+buffer, never session state or history.
 
 ## Master plans
 
@@ -40,16 +41,15 @@ murmur/
 └── .oxlintrc.json           # Linter config
 ```
 
-`@slopus/murmur` is the only package published to npm. `@murmur/*` packages are
-internal to the workspace.
+`@slopus/murmur` is the only package published to npm. `@murmur/relay` is
+private deployment infrastructure.
 
 How code is laid out inside a package is dictated by
 [`master-plans/02-code-organization.md`](master-plans/02-code-organization.md):
 source in `sources`, `main.ts` for executables and `index.ts` for exported
 packages, domain modules with an `impl` directory beneath them, `utils` for
 self-contained helpers, tests in `tests` and `impl/tests`, and a `README.md` in
-every directory. Read that plan before adding files. The existing packages
-predate it and are not to be reorganized unless the user asks.
+every directory. Read that plan before adding files.
 
 ## Code Style
 
@@ -80,9 +80,13 @@ predate it and are not to be reorganized unless the user asks.
 2. **Base64url is only for serialization** - use encodeBase64Url/decodeBase64Url
    at wire and storage boundaries only
 3. **Errors throw** - no null returns for cryptographic failures
-4. **The application owns durability** - nothing is auto-acknowledged. Commit
-   application state first, then acknowledge the delivery
+4. **The application owns durability** - commit effects, MLS state, replay
+   state, and cursor first; acknowledge the delivery afterward
 5. **The relay is untrusted and dumb** - never add message semantics to it
+6. **One queue per public identity** - queue addresses are canonical Ed25519
+   identity keys, not anonymous topics or arbitrary routing labels
+7. **No compatibility layer** - previous topic, friendship, and retained-event
+   formats are unsupported and legacy relay databases must fail fast
 
 ## Testing
 
@@ -112,28 +116,32 @@ later.
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full description. The parts
 that most often trip up a change:
 
-### Identity
+### Identity and discovery
 
 An identity exposes one Ed25519 public key. Signing and X25519 key agreement are
-deliberately derived from one 32-byte root. The request inbox is a protected
-`Read Topic` scoped directly to that public key. There is no account or
-server-side registry.
+derived from one 32-byte root. A signed discovery bundle carries current
+one-use MLS KeyPackages and is exchanged out of band or through an
+application-supplied discovery service. The relay is not a directory.
 
-### Contacts
+### Delivery queues
 
-Adding a friend uses a signed and sealed request plus a random protected
-response topic. Active friends derive one encrypted control channel for profile
-updates, friendship termination, KeyPackages, and group invitations.
+The relay stores only unacknowledged and unexpired encrypted deliveries. One
+atomic multicast receives one UUIDv7 event ID and one reference in every exact
+recipient inbox. Event IDs are ordered only within an inbox. Recipient,
+sender-fanout, and global quotas bound storage; production ingress must also
+apply non-Sybil admission because public identities are free to create.
 
-### MLS groups
+### MLS sessions
 
-Groups are forward-secret epochs over a TreeKEM ratchet tree. Every membership
-change is a Commit that advances the epoch. All epochs of a group share one
-opaque relay topic.
+Two-person and many-person conversations use the same forward-secret TreeKEM
+session. Every membership change is a Commit. One authenticated epoch committer
+serializes Commits; other members submit proposals. The sender adopts its own
+Commit only from the authenticated queue echo, never from publish success.
 
-Application sends persist a cloned post-ratchet epoch and exact event before
-publication. Commits persist active and staged-next epochs separately. Relay
-echo order chooses the winner; a publish result never adopts a Commit.
+Application sends persist the cloned post-ratchet epoch and exact outbox before
+publication. Commits persist active and staged epochs separately. Pending
+Welcome sessions continue MLS processing while application events remain
+bounded and hidden until activation.
 
 ## Security Principles
 

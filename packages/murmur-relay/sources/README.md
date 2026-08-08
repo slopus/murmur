@@ -1,19 +1,10 @@
-# Relay source
-
-- `protocol` authenticates topic descriptors, writes, and read proofs.
-- `relay` enforces capability policy, limits, expiration, and long polling.
-- `storage` supplies SQLite and Postgres ordered-event stores.
-- `http` exposes the Fetch API.
-- `server` adapts Fetch to Node HTTP.
-- `utils` contains strict codecs and logging helpers.
+# Relay sources
 
 ```text
-Node socket -> server -> Fetch HTTP -> RelayService -> ordered storage
-                           |              |
-                     protocol codecs   wake sources
-                           |
-                    opaque signed events
+protocol -> relay policy -> atomic queue storage
+                   \-----> Fetch and Node hosts
 ```
 
-The dependency direction keeps event semantics out of the relay while allowing
-the HTTP and storage implementations to be tested in process.
+The relay stores one encrypted delivery record plus one queue reference per
+recipient until acknowledgement or expiration. It has no topic or application
+semantics.

@@ -8,7 +8,7 @@ X25519 agreement converts the Ed25519 root and public point with Noble's
 The Ed25519 and X25519 encodings are not raw aliases and no second public key is
 part of identity serialization. Sharing one root across these two operations is
 a deliberate product choice with the theoretical composition risk accepted in
-the friends master plan; this module does not claim a general security proof.
+the discovery master plan; this module does not claim a general security proof.
 Public identity decoding rejects non-canonical, identity, small-order, and
 non-torsion-free Ed25519 points before signing verification or X25519
 conversion.

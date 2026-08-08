@@ -1,79 +1,66 @@
-/** A publicly readable topic whose durable writes require this key. */
-export interface WriteTopic {
-    readonly type: "write";
-    readonly name: string;
-    readonly writeKey: Uint8Array;
-}
-
-/** A publicly writable topic whose reads require this key. */
-export interface ReadTopic {
-    readonly type: "read";
-    readonly name: string;
-    readonly readKey: Uint8Array;
-}
-
-/** A topic whose reads and writes require their designated keys. */
-export interface ReadWriteTopic {
-    readonly type: "read-write";
-    readonly name: string;
-    readonly readKey: Uint8Array;
-    readonly writeKey: Uint8Array;
-}
-
-/** Typed, named, key-scoped relay topic descriptor. */
-export type RelayTopic = WriteTopic | ReadTopic | ReadWriteTopic;
-
-/** Public signing identity attached to every durable relay write. */
-export interface RelayAuthor {
-    readonly signingKey: Uint8Array;
-}
-
-/** Complete authenticated event accepted by the relay store. */
-export interface SignedRelayEvent {
+/** One signed encrypted multicast delivery accepted by the relay. */
+export interface SignedDelivery {
     readonly version: 1;
+    /** Stable sender-scoped identifier used while the delivery remains pending. */
     readonly id: string;
-    readonly topic: RelayTopic;
-    readonly author: RelayAuthor;
+    /** Public Murmur identity that signed and published this delivery. */
+    readonly sender: Uint8Array;
+    /** Strictly sorted unique public identities receiving the same ciphertext. */
+    readonly recipients: readonly Uint8Array[];
     readonly createdAt: number;
-    readonly expiresAt?: number;
-    readonly collapseKey?: Uint8Array;
-    readonly payload: Uint8Array;
+    readonly expiresAt: number;
+    readonly ciphertext: Uint8Array;
     readonly signature: Uint8Array;
 }
 
-/** JSON-compatible topic descriptor. */
-export type RelayTopicJson =
-    | { readonly type: "write"; readonly name: string; readonly writeKey: string }
-    | { readonly type: "read"; readonly name: string; readonly readKey: string }
-    | {
-          readonly type: "read-write";
-          readonly name: string;
-          readonly readKey: string;
-          readonly writeKey: string;
-      };
-
-/** JSON-compatible signed event representation. */
-export interface SignedRelayEventJson {
+/** JSON representation of one signed encrypted multicast delivery. */
+export interface SignedDeliveryJson {
     readonly version: 1;
     readonly id: string;
-    readonly topic: RelayTopicJson;
-    readonly author: { readonly signingKey: string };
+    readonly sender: string;
+    readonly recipients: readonly string[];
     readonly createdAt: number;
-    readonly expiresAt?: number;
-    readonly collapseKey?: string;
-    readonly payload: string;
+    readonly expiresAt: number;
+    readonly ciphertext: string;
     readonly signature: string;
 }
 
-/** One-use relay challenge for a protected read. */
-export interface ReadChallenge {
-    readonly id: string;
-    readonly nonce: Uint8Array;
-    readonly expiresAt: number;
+/** Signed request to read one identity's queue. */
+export interface SignedQueueRead {
+    readonly version: 1;
+    readonly recipient: Uint8Array;
+    readonly after: string | null;
+    readonly limit: number;
+    readonly waitMilliseconds: number;
+    readonly createdAt: number;
+    readonly signature: Uint8Array;
 }
 
-/** Signature consuming one challenge for exact read parameters. */
-export interface ReadProof {
-    readonly challengeId: string;
+/** JSON representation of one signed queue read. */
+export interface SignedQueueReadJson {
+    readonly version: 1;
+    readonly recipient: string;
+    readonly after: string | null;
+    readonly limit: number;
+    readonly waitMilliseconds: number;
+    readonly createdAt: number;
+    readonly signature: string;
+}
+
+/** Signed monotonic request to trim one identity's processed queue prefix. */
+export interface SignedQueueAck {
+    readonly version: 1;
+    readonly recipient: Uint8Array;
+    readonly through: string;
+    readonly createdAt: number;
     readonly signature: Uint8Array;
+}
+
+/** JSON representation of one signed queue acknowledgement. */
+export interface SignedQueueAckJson {
+    readonly version: 1;
+    readonly recipient: string;
+    readonly through: string;
+    readonly createdAt: number;
+    readonly signature: string;
 }

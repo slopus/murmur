@@ -1,7 +1,7 @@
 import { gcm } from "@noble/ciphers/aes";
 import { ed25519, x25519 } from "@noble/curves/ed25519";
 import { hkdf } from "@noble/hashes/hkdf";
-import { sha256 } from "@noble/hashes/sha256";
+import { sha256 } from "@noble/hashes/sha2";
 import { randomBytes } from "@noble/hashes/utils";
 import { concatBytes, utf8Encode, zeroBytes } from "../../utils/index.js";
 import type { IdentityKeyPair, IdentityPublicKey, SealedBox } from "../types.js";

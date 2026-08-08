@@ -1,103 +1,58 @@
 # Relay deployment
 
-The Murmur relay is an ordered opaque event store. It persists signed events,
-publish receipts, protected-read challenges, and per-topic heads. It has no
-identity registry, application protocol, blob service, or plaintext.
+The standalone relay requires Node 22.5 or later and supports SQLite or
+Postgres.
 
-```text
-Murmur -- HTTPS --> relay -- SQLite file
-                            `-- or PostgreSQL
-```
-
-Node 22.5 or later is required for a source build. The release container embeds
-the Bun-built relay executable.
-
-## Local process
-
-Build and run a single SQLite-backed relay:
+## SQLite
 
 ```bash
 pnpm --filter @murmur/relay build
 
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
-MURMUR_RELAY_ORIGINS='https://app.example' \
+MURMUR_RELAY_ORIGINS=https://app.example \
 pnpm --filter @murmur/relay start
 ```
 
-The defaults are `sqlite`, `./data/murmur-relay.sqlite`, host `0.0.0.0`, and
-port `8787`. `MURMUR_RELAY_ORIGINS` defaults to `*`, which sends wildcard CORS
-and permits requests from any browser origin. Production deployments should
-set a comma-separated list of exact allowed origins. The process prunes expired
-retained events hourly and closes the HTTP server, wake source, and store on
-`SIGINT` or `SIGTERM`.
+SQLite is appropriate for one relay process. The store uses WAL mode,
+foreign-key enforcement, a busy timeout, and bounded write transactions.
 
-For PostgreSQL, set:
+## Postgres
 
 ```bash
 MURMUR_RELAY_STORE=postgres \
-MURMUR_RELAY_DB=postgres://user:password@database/murmur \
+MURMUR_RELAY_DB=postgres://user:password@db.example/murmur \
+MURMUR_RELAY_ORIGINS=https://app.example \
 pnpm --filter @murmur/relay start
 ```
 
-PostgreSQL supplies both durable storage and cross-process wake notifications.
-SQLite uses in-process wake notifications and therefore supports one relay
-process for a database file.
+Postgres supports multiple relay processes. LISTEN/NOTIFY reduces long-poll
+latency; durable reads always come from tables, so notifications are not data.
+Write paths serialize through the global quota/UUID row.
 
-## Configuration
+## Network boundary
 
-| Variable               | Default                      | Meaning                                      |
-| ---------------------- | ---------------------------- | -------------------------------------------- |
-| `HOST`                 | `0.0.0.0`                    | HTTP listen host                             |
-| `PORT`                 | `8787`                       | HTTP listen port                             |
-| `MURMUR_RELAY_STORE`   | `sqlite`                     | `sqlite` or `postgres`                       |
-| `MURMUR_RELAY_DB`      | `./data/murmur-relay.sqlite` | SQLite path or PostgreSQL connection URL     |
-| `MURMUR_RELAY_ORIGINS` | `*`                          | `*` or comma-separated exact browser origins |
+The bundled host binds `HOST` (default `0.0.0.0`) and `PORT` (default `8787`)
+using plain HTTP. Put it behind TLS termination. Do not expose it directly.
 
-Terminate public TLS in front of the relay and preserve request bodies without
-rewriting them. The API routes are documented in
-[`RELAY_API.md`](RELAY_API.md).
-
-## Container
-
-The release image runs as UID/GID 65532 and stores its default SQLite database
-at `/data/murmur-relay.sqlite`:
+The host rate-limits by socket peer. Behind a trusted proxy that overwrites a
+client-address header, configure:
 
 ```bash
-docker volume create murmur-relay-data
-docker run --detach \
-    --name murmur-relay \
-    --restart unless-stopped \
-    --publish 8787:8787 \
-    --volume murmur-relay-data:/data \
-    ghcr.io/slopus/murmur-relay:latest
+MURMUR_RELAY_REMOTE_ADDRESS_HEADER=x-real-ip
+MURMUR_RELAY_REQUESTS_PER_MINUTE=600
+MURMUR_RELAY_TRACKED_ADDRESSES=10000
 ```
 
-The image exposes `/health` for startup, readiness, and liveness probes. A bind
-mount must be writable by UID/GID 65532.
+Never trust a forwarding header that clients can supply unchanged.
 
-## k3s
+## Maintenance
 
-[`murmur-relay.k3s.yaml`](../murmur-relay.k3s.yaml) runs one SQLite replica with
-a `ReadWriteOnce` persistent volume and a `Recreate` strategy:
+The standalone process starts bounded expiration pruning every ten seconds,
+skips overlapping runs, and drains within a one-second time budget. Publish and
+acknowledgement paths also commit one bounded prune batch before their own
+transaction, so expired backlog cannot permanently block quota recovery.
 
-```bash
-kubectl apply -f murmur-relay.k3s.yaml
-kubectl rollout status deployment/murmur-relay
-```
-
-Pin the manifest image tag and digest to a reviewed release before production.
-Use PostgreSQL and a deployment configured with `MURMUR_RELAY_STORE=postgres`
-when multiple relay replicas are required.
-
-## Operations
-
-- Back up the SQLite file or PostgreSQL database using ordinary database tools.
-- Monitor `/health`, HTTP error rates, retained event volume, and disk usage.
-- Keep the relay clock synchronized because event creation and expiration
-  validation uses Unix milliseconds.
-- Preserve publish receipts when pruning expired event bodies; exact retries
-  depend on those receipts remaining durable.
-- Treat database disclosure as metadata and ciphertext disclosure. Relay
-  compromise cannot decrypt Murmur payloads but can affect availability,
-  ordering, retention, and traffic analysis.
+Back up the database as ordinary pending delivery infrastructure. A relay
+restore can replay or lose pending ciphertext; application correctness must
+remain idempotent and client state remains authoritative.

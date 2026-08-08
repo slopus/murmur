@@ -1,31 +1,27 @@
-export {
-    copySignedRelayEvent,
-    isEventId,
-    parseRelayTopic,
-    parseSignedRelayEvent,
-    relayTopicToJson,
-    signedRelayEventToJson,
-    validateRelayTopic,
-    validateSignedRelayEventShape,
-} from "./impl/eventCodec.js";
-export {
-    readProofSigningBytes,
-    relayEventFingerprint,
-    relayEventSigningBytes,
-    relayTopicId,
-    verifyRelayEventSignature,
-} from "./impl/eventAuthenticate.js";
 export { RelayError } from "./errors.js";
 export type { RelayErrorStatus } from "./errors.js";
+export {
+    deliveryFingerprint,
+    deliverySigningBytes,
+    isDeliveryId,
+    parseSignedDelivery,
+    parseSignedQueueAck,
+    parseSignedQueueRead,
+    queueAckSigningBytes,
+    queueReadSigningBytes,
+    signedDeliveryToJson,
+    signedQueueAckToJson,
+    signedQueueReadToJson,
+    validateSignedDeliveryShape,
+    verifyDeliverySignature,
+    verifyQueueAckSignature,
+    verifyQueueReadSignature,
+} from "./impl/deliveryCodec.js";
 export type {
-    ReadChallenge,
-    ReadProof,
-    ReadTopic,
-    ReadWriteTopic,
-    RelayAuthor,
-    RelayTopic,
-    RelayTopicJson,
-    SignedRelayEvent,
-    SignedRelayEventJson,
-    WriteTopic,
+    SignedDelivery,
+    SignedDeliveryJson,
+    SignedQueueAck,
+    SignedQueueAckJson,
+    SignedQueueRead,
+    SignedQueueReadJson,
 } from "./types.js";

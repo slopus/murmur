@@ -12,5 +12,5 @@ root/key validation -> sign + verify -> Ed25519/X25519 conversion
                                       -> zeroization assertions
 ```
 
-These tests pin the primitive invariants before friend bootstrap or MLS state
+These tests pin the primitive invariants before discovery bootstrap or MLS state
 machines consume the keys.

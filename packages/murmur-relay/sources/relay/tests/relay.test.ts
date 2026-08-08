@@ -1,378 +1,271 @@
-import { PGlite } from "@electric-sql/pglite";
-import { ed25519 } from "@noble/curves/ed25519";
-import { randomBytes } from "@noble/hashes/utils";
-import { afterEach, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import {
-    readProofSigningBytes,
-    relayEventFingerprint,
-    relayEventSigningBytes,
-    type ReadProof,
-    type RelayTopic,
-    type SignedRelayEvent,
-} from "../../protocol/index.js";
-import {
-    PGliteDatabase,
-    PostgresRelayStore,
-    SqliteRelayStore,
-    type EventPage,
-    type PageReadConstraints,
+    identity,
+    recipients,
+    secret,
+    signedAck,
+    signedDelivery,
+    signedRead,
+} from "../../protocol/tests/helpers.js";
+import { SqliteRelayStore } from "../../storage/index.js";
+import type {
+    AcknowledgeOutcome,
+    PageReadConstraints,
+    PublishOutcome,
+    QueueLimits,
+    QueuePage,
+    RelayStore,
 } from "../../storage/index.js";
-import { encodeBase64Url } from "../../utils/base64Url.js";
+import type { SignedDelivery } from "../../protocol/index.js";
 import { RelayService } from "../index.js";
 
-const services: RelayService[] = [];
-let now = 1_000_000;
+const NOW = 10_000;
 
-function event(
-    secretKey: Uint8Array,
-    topic: RelayTopic,
-    payload: string,
-    options: { createdAt?: number; expiresAt?: number; collapseKey?: Uint8Array } = {},
-): SignedRelayEvent {
-    const unsigned: SignedRelayEvent = {
-        version: 1,
-        id: encodeBase64Url(randomBytes(32)),
-        topic,
-        author: { signingKey: ed25519.getPublicKey(secretKey) },
-        createdAt: options.createdAt ?? now,
-        ...(options.expiresAt === undefined ? {} : { expiresAt: options.expiresAt }),
-        ...(options.collapseKey === undefined ? {} : { collapseKey: options.collapseKey }),
-        payload: new TextEncoder().encode(payload),
-        signature: new Uint8Array(64),
-    };
-    return { ...unsigned, signature: ed25519.sign(relayEventSigningBytes(unsigned), secretKey) };
-}
-
-function service(): RelayService {
-    const value = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
-    services.push(value);
-    return value;
-}
-
-async function readProof(
-    relay: RelayService,
-    topic: Exclude<RelayTopic, { type: "write" }>,
-    secretKey: Uint8Array,
-    since: bigint = 0n,
-    limit: number = 256,
-    wait: number = 0,
-): Promise<ReadProof> {
-    const challenge = await relay.issueReadChallenge(topic);
-    return {
-        challengeId: challenge.id,
-        signature: ed25519.sign(
-            readProofSigningBytes(challenge, topic, since, limit, wait),
-            secretKey,
-        ),
-    };
-}
-
-afterEach(async () => {
-    await Promise.all(services.splice(0).map((item) => item.close()));
-    now = 1_000_000;
-});
-
-describe("ordered relay", () => {
-    test("fingerprints the complete signed event including its signature", () => {
-        const owner = randomBytes(32);
-        const topic = {
-            type: "write" as const,
-            name: "fingerprint",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        const original = event(owner, topic, "body");
-        const signature = original.signature.slice();
-        signature[0] = signature[0]! ^ 1;
-        const changedSignature = {
-            ...original,
-            signature,
-        };
-        expect(relayEventFingerprint(changedSignature)).not.toEqual(
-            relayEventFingerprint(original),
-        );
-    });
-
-    test("rejects malformed direct-service descriptors before hashing or storage", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const topic = {
-            type: "write" as const,
-            name: "strict",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        const valid = event(owner, topic, "body");
-        await expect(
-            relay.publish({
-                ...valid,
-                topic: { ...topic, extra: true } as unknown as RelayTopic,
-            }),
-        ).rejects.toMatchObject({ status: 400 });
-        await expect(
-            relay.issueReadChallenge({
-                type: "read",
-                name: "é",
-                readKey: topic.writeKey,
-            }),
-        ).rejects.toMatchObject({ status: 400 });
-    });
-
-    test("enforces typed read/write capabilities and one-use read proofs", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const stranger = randomBytes(32);
-        const topic = {
-            type: "read-write" as const,
-            name: "group",
-            readKey: ed25519.getPublicKey(owner),
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        await expect(relay.publish(event(stranger, topic, "no"))).rejects.toMatchObject({
-            status: 403,
-        });
-        await relay.publish(event(owner, topic, "yes"));
-        await expect(relay.readEvents(topic, 0n)).rejects.toMatchObject({ status: 401 });
-        const proof = await readProof(relay, topic, owner);
-        await expect(relay.readEvents(topic, 0n, 256, 0, proof)).resolves.toMatchObject({
-            head: 1n,
-        });
-        await expect(relay.readEvents(topic, 0n, 256, 0, proof)).rejects.toMatchObject({
-            status: 401,
-        });
-
-        const inbox = {
-            type: "read" as const,
-            name: "friends",
-            readKey: ed25519.getPublicKey(owner),
-        };
-        await expect(relay.publish(event(stranger, inbox, "request"))).resolves.toMatchObject({
-            seq: 1n,
-        });
-        await expect(
-            relay.readEvents(inbox, 0n, 256, 0, await readProof(relay, inbox, owner)),
-        ).resolves.toMatchObject({ head: 1n });
-    });
-
-    test("keeps monotonic cursors across collapse and expiration holes", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const topic = {
-            type: "write" as const,
-            name: "updates",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        const collapseKey = new Uint8Array([7]);
-        await relay.publish(event(owner, topic, "old", { collapseKey }));
-        await relay.publish(event(owner, topic, "new", { collapseKey }));
-        await relay.publish(event(owner, topic, "temporary", { expiresAt: now + 1 }));
-        now += 2;
-        const page = await relay.readEvents(topic, 0n);
-        expect(page.head).toBe(3n);
-        expect(page.events.map(({ seq }) => seq)).toEqual([2n]);
-        expect(await relay.pruneExpired()).toBe(1);
-        expect((await relay.readEvents(topic, 2n)).head).toBe(3n);
-    });
-
-    test("wakes a long poll after an authorized durable publish", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const topic = {
-            type: "write" as const,
-            name: "live",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        const waiting = relay.readEvents(topic, 0n, 256, 1_000);
-        await relay.publish(event(owner, topic, "wake"));
-        await expect(waiting).resolves.toMatchObject({ head: 1n });
-    });
-
-    test("keeps exact retries idempotent after timestamp and event expiration", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const topic = {
-            type: "write" as const,
-            name: "retry",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        const original = event(owner, topic, "original", { expiresAt: now + 1 });
-        await expect(relay.publish(original)).resolves.toEqual({ seq: 1n, duplicate: false });
-        now += 10 * 60 * 1_000;
-        expect(await relay.pruneExpired()).toBe(1);
-        await expect(relay.publish(original)).resolves.toEqual({ seq: 1n, duplicate: true });
-
-        const changedUnsigned: SignedRelayEvent = {
-            ...original,
-            payload: new TextEncoder().encode("changed"),
-            signature: new Uint8Array(64),
-        };
-        const changed = {
-            ...changedUnsigned,
-            signature: ed25519.sign(relayEventSigningBytes(changedUnsigned), owner),
-        };
-        await expect(relay.publish(changed)).rejects.toMatchObject({
-            status: 409,
-            body: { error: "id_collision" },
-        });
-    });
-
-    test("accepts delayed first publishes on SQLite and PGlite but rejects future or expired events", async () => {
-        const stores = [
-            new SqliteRelayStore(":memory:"),
-            await PostgresRelayStore.create(new PGliteDatabase(new PGlite())),
-        ];
-        for (const store of stores) {
-            let relayNow = 30 * 24 * 60 * 60 * 1_000;
-            const relay = new RelayService(store, {}, undefined, () => relayNow);
-            services.push(relay);
-            const owner = randomBytes(32);
-            const topic = {
-                type: "write" as const,
-                name: "offline-lifecycle",
-                writeKey: ed25519.getPublicKey(owner),
-            };
-            const delayedTenMinutes = event(owner, topic, "ten-minutes-offline", {
-                createdAt: relayNow - 10 * 60 * 1_000,
-            });
-            await expect(relay.publish(delayedTenMinutes)).resolves.toEqual({
-                seq: 1n,
-                duplicate: false,
-            });
-            const delayedDays = event(owner, topic, "days-offline", {
-                createdAt: relayNow - 7 * 24 * 60 * 60 * 1_000,
-            });
-            await expect(relay.publish(delayedDays)).resolves.toEqual({
-                seq: 2n,
-                duplicate: false,
-            });
-            await expect(
-                relay.publish(
-                    event(owner, topic, "clock-behind", {
-                        createdAt: relayNow - 6 * 60 * 1_000,
-                    }),
-                ),
-            ).resolves.toEqual({ seq: 3n, duplicate: false });
-            await expect(
-                relay.publish(
-                    event(owner, topic, "future", {
-                        createdAt: relayNow + 5 * 60 * 1_000 + 1,
-                    }),
-                ),
-            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
-            await expect(
-                relay.publish(
-                    event(owner, topic, "expired", {
-                        createdAt: relayNow - 24 * 60 * 60 * 1_000,
-                        expiresAt: relayNow,
-                    }),
-                ),
-            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
-
-            relayNow += 30 * 24 * 60 * 60 * 1_000;
-            await expect(relay.publish(delayedDays)).resolves.toEqual({
-                seq: 2n,
+describe("identity queue relay", () => {
+    test("publishes, authenticates reads, and trims only after a signed ack", async () => {
+        let now = NOW;
+        const aliceSecret = secret(1);
+        const bobSecret = secret(2);
+        const alice = identity(aliceSecret);
+        const bob = identity(bobSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        try {
+            const delivery = signedDelivery(aliceSecret, recipients(alice, bob), { now });
+            const published = await relay.publish(delivery, "relay-tests");
+            expect(published.duplicate).toBe(false);
+            expect(await relay.publish(delivery, "relay-tests")).toEqual({
+                eventId: published.eventId,
                 duplicate: true,
             });
+            const bobPage = await relay.readQueue(signedRead(bobSecret, { now }));
+            expect(bobPage.deliveries).toHaveLength(1);
+            expect(bobPage.head).toBe(published.eventId);
+
+            const forged = { ...signedRead(bobSecret, { now }), recipient: alice };
+            await expect(relay.readQueue(forged)).rejects.toMatchObject({ status: 401 });
+
+            expect(await relay.acknowledge(signedAck(bobSecret, published.eventId, now))).toEqual({
+                removed: 1,
+            });
+            expect(
+                (await relay.readQueue(signedRead(bobSecret, { after: published.eventId, now })))
+                    .deliveries,
+            ).toEqual([]);
+            expect(
+                (await relay.readQueue(signedRead(bobSecret, { after: null, now }))).deliveries,
+            ).toEqual([]);
+
+            now += 1;
+        } finally {
+            await relay.close();
         }
     });
 
-    test("returns head-only progress without parking a long poll", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const topic = {
-            type: "write" as const,
-            name: "head-only",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        await relay.publish(event(owner, topic, "gone", { expiresAt: now + 1 }));
-        now += 2;
-        await expect(relay.readEvents(topic, 0n, 256, 1_000)).resolves.toMatchObject({
-            events: [],
-            head: 1n,
-            exhausted: true,
-        });
-    });
-
-    test("register recheck wakes when only the topic head raced forward", async () => {
-        class RacingHeadStore extends SqliteRelayStore {
-            #reads = 0;
-
-            override async readEvents(
-                _topicId: string,
-                _since: bigint,
-                _limit: number,
-                _observedAt: number,
-                _constraints: PageReadConstraints,
-            ): Promise<EventPage> {
-                this.#reads += 1;
-                return {
-                    events: [],
-                    head: this.#reads === 1 ? 0n : 1n,
-                    exhausted: true,
-                };
-            }
-        }
-        const relay = new RelayService(new RacingHeadStore(":memory:"));
-        services.push(relay);
-        const topic = {
-            type: "write" as const,
-            name: "racing-head",
-            writeKey: ed25519.getPublicKey(randomBytes(32)),
-        };
-        await expect(relay.readEvents(topic, 0n, 256, 1_000)).resolves.toMatchObject({
-            events: [],
-            head: 1n,
-        });
-    });
-
-    test("bounds outstanding challenges and admits after indexed expiration cleanup", async () => {
+    test("enforces signatures, ciphertext, recipient, TTL, and signed-request time limits", async () => {
+        let now = NOW;
+        const aliceSecret = secret(3);
+        const alice = identity(aliceSecret);
         const relay = new RelayService(
             new SqliteRelayStore(":memory:"),
             {
-                maximumOutstandingReadChallenges: 1,
-                readChallengeLifetimeMilliseconds: 1,
+                maximumCiphertextBytes: 4,
+                maximumRecipients: 1,
+                maximumDeliveryTtlMilliseconds: 1_000,
+                maximumAuthenticationSkewMilliseconds: 1,
             },
             undefined,
             () => now,
         );
-        services.push(relay);
-        const topic = {
-            type: "read" as const,
-            name: "bounded-challenges",
-            readKey: ed25519.getPublicKey(randomBytes(32)),
-        };
-        await relay.issueReadChallenge(topic);
-        await expect(relay.issueReadChallenge(topic)).rejects.toMatchObject({ status: 503 });
-        now += 2;
-        await expect(relay.issueReadChallenge(topic)).resolves.toBeDefined();
+        try {
+            await expect(
+                Reflect.apply(relay.publish, relay, [
+                    signedDelivery(aliceSecret, recipients(alice), { now }),
+                ]),
+            ).rejects.toMatchObject({ status: 400, body: { error: "malformed" } });
+            await expect(
+                relay.publish(
+                    {
+                        ...signedDelivery(aliceSecret, recipients(alice), { now }),
+                        ciphertext: new Uint8Array([9]),
+                    },
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 401 });
+            await expect(
+                relay.publish(
+                    signedDelivery(aliceSecret, recipients(alice), {
+                        now,
+                        ciphertext: new Uint8Array(5),
+                    }),
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 413 });
+            await expect(
+                relay.publish(
+                    signedDelivery(aliceSecret, recipients(alice, identity(secret(4))), { now }),
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 413 });
+            await expect(
+                relay.publish(
+                    signedDelivery(aliceSecret, recipients(alice), {
+                        now,
+                        expiresAt: now + 1_001,
+                    }),
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 401 });
+            await expect(
+                relay.publish(
+                    signedDelivery(aliceSecret, recipients(alice), {
+                        now: 0,
+                        expiresAt: now + 1,
+                    }),
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 401 });
+            await expect(
+                relay.publish(
+                    signedDelivery(aliceSecret, recipients(alice), {
+                        now: now + 1,
+                        expiresAt: now + 1,
+                    }),
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 401 });
+            now += 10 * 60 * 1_000;
+            await expect(
+                relay.readQueue(signedRead(aliceSecret, { now: NOW })),
+            ).rejects.toMatchObject({ status: 401 });
+        } finally {
+            await relay.close();
+        }
     });
 
-    test("runtime-validates direct read cursors, topics, and proof shapes", async () => {
-        const relay = service();
-        const owner = randomBytes(32);
-        const publicTopic = {
-            type: "write" as const,
-            name: "direct-runtime",
-            writeKey: ed25519.getPublicKey(owner),
-        };
-        await expect(relay.readEvents(publicTopic, 0.5 as unknown as bigint)).rejects.toMatchObject(
-            { status: 400, body: { error: "malformed" } },
-        );
-        await expect(
-            relay.readEvents({ ...publicTopic, extra: true } as unknown as RelayTopic, 0n),
-        ).rejects.toMatchObject({ status: 400 });
+    test("long polling closes the registration race and wakes on publication", async () => {
+        const aliceSecret = secret(5);
+        const bobSecret = secret(6);
+        const alice = identity(aliceSecret);
+        const bob = identity(bobSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        try {
+            const waiting = relay.readQueue(
+                signedRead(bobSecret, { now: NOW, waitMilliseconds: 5_000 }),
+            );
+            await Promise.resolve();
+            const published = await relay.publish(
+                signedDelivery(aliceSecret, recipients(alice, bob), { now: NOW }),
+                "relay-tests",
+            );
+            const page = await waiting;
+            expect(page.deliveries.map(({ eventId }) => eventId)).toEqual([published.eventId]);
+        } finally {
+            await relay.close();
+        }
+    });
 
-        const protectedTopic = {
-            type: "read" as const,
-            name: "protected-runtime",
-            readKey: ed25519.getPublicKey(owner),
+    test("expired queue data disappears and acknowledgement becomes a no-op", async () => {
+        let now = NOW;
+        const aliceSecret = secret(7);
+        const bobSecret = secret(8);
+        const bob = identity(bobSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        try {
+            const published = await relay.publish(
+                signedDelivery(aliceSecret, recipients(bob), {
+                    now,
+                    expiresAt: now + 1,
+                }),
+                "relay-tests",
+            );
+            now += 2;
+            const page = await relay.readQueue(signedRead(bobSecret, { now }));
+            expect(page).toMatchObject({
+                deliveries: [],
+                head: null,
+                exhausted: true,
+            });
+            expect(await relay.acknowledge(signedAck(bobSecret, published.eventId, now))).toEqual({
+                removed: 0,
+            });
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("abort during the registration recheck is handled and identity waits are bounded", async () => {
+        let readCount = 0;
+        let releaseSecondRead: (() => void) | undefined;
+        let secondReadStarted: (() => void) | undefined;
+        const secondRead = new Promise<void>((resolve) => {
+            secondReadStarted = resolve;
+        });
+        const release = new Promise<void>((resolve) => {
+            releaseSecondRead = resolve;
+        });
+        const emptyPage: QueuePage = {
+            deliveries: [],
+            head: null,
+            acknowledgedThrough: null,
+            exhausted: true,
         };
-        await expect(
-            relay.readEvents(protectedTopic, 0n, 256, 0, {} as ReadProof),
-        ).rejects.toMatchObject({ status: 400, body: { error: "malformed" } });
-        await expect(
-            relay.readEvents(protectedTopic, 0n, 256, 0, {
-                challengeId: "missing",
-                signature: new Uint8Array(64),
-            }),
-        ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
+        const store: RelayStore = {
+            async publish(
+                _delivery: SignedDelivery,
+                _now: number,
+                _limits: QueueLimits,
+            ): Promise<PublishOutcome> {
+                throw new Error("Unused");
+            },
+            async readQueue(
+                _recipient: Uint8Array,
+                _after: string | null,
+                _limit: number,
+                _now: number,
+                _constraints: PageReadConstraints,
+            ): Promise<QueuePage> {
+                readCount += 1;
+                if (readCount === 2) {
+                    secondReadStarted?.();
+                    await release;
+                }
+                return emptyPage;
+            },
+            async acknowledge(): Promise<AcknowledgeOutcome> {
+                throw new Error("Unused");
+            },
+            async pruneExpired(): Promise<number> {
+                return 0;
+            },
+            async health(): Promise<void> {},
+            async close(): Promise<void> {},
+        };
+        const bobSecret = secret(9);
+        const relay = new RelayService(
+            store,
+            { maximumConcurrentLongPolls: 2, maximumConcurrentLongPollsPerIdentity: 1 },
+            undefined,
+            () => NOW,
+        );
+        const controller = new AbortController();
+        try {
+            const waiting = relay.readQueue(
+                signedRead(bobSecret, { now: NOW, waitMilliseconds: 5_000 }),
+                controller.signal,
+            );
+            await secondRead;
+            await expect(
+                relay.readQueue(signedRead(bobSecret, { now: NOW, waitMilliseconds: 5_000 })),
+            ).rejects.toMatchObject({ status: 429 });
+            controller.abort();
+            releaseSecondRead?.();
+            await expect(waiting).rejects.toMatchObject({
+                status: 400,
+                body: { error: "aborted" },
+            });
+        } finally {
+            releaseSecondRead?.();
+            await relay.close();
+        }
     });
 });

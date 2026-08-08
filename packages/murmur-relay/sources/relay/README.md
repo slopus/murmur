@@ -1,17 +1,26 @@
-# Relay policy
+# Relay service
 
-`RelayService` validates signed writes, enforces typed topic capabilities,
-issues one-use read challenges, bounds resources, and coordinates long polling.
+Validates signed deliveries and signed queue operations, enforces TTL and quota
+policy, delegates atomic multicast and trimming to storage, and orchestrates
+bounded long polling.
 
-Long polling registers a waiter and then rechecks storage, closing the
-read-before-park race. Cross-process wake sources reduce latency; timeout-backed
-reads preserve correctness if a notification is lost.
+Every publication call must supply an explicit admission principal. The service
+hashes it before storage and never falls back to the free protocol sender
+identity. The HTTP boundary supplies the trusted socket/header principal or an
+explicit shared embedding principal.
 
 ```text
-publish: validate -> authorize writer -> store exact event -> notify topic
-read:    challenge/proof -> authorize reader -> page from cursor
-long poll: register waiter -> recheck store -> wait/timeout -> re-read
+signed request -> shape/time/signature policy -> atomic store operation
+                                                  |
+empty read -> bounded waiter -> wake hint --------+-> authoritative reread
 ```
 
-`RelayService` coordinates policy and ordering without inspecting any encrypted
-friend or MLS payload.
+Long polls are bounded globally and per recipient identity. Disconnects, relay
+shutdown, and timeouts settle each waiter exactly once. A wake is only a latency
+hint: duplicate publication also wakes readers, and every wake is followed by a
+fresh store read.
+
+UUIDv7 order is guaranteed only within one inbox and is not a cryptographic
+guarantee. A malicious relay can suppress or equivocate about delivery order.
+Clients must treat this as part of the untrusted-transport threat model rather
+than assuming event IDs prove consensus.

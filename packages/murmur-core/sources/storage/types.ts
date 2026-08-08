@@ -2,7 +2,7 @@
 export interface StoreScanOptions {
     /** Return keys strictly after this complete key. */
     readonly after?: string;
-    /** Maximum number of entries to materialize. */
+    /** Maximum number of entries to materialize, at most 10,000. */
     readonly limit: number;
 }
 

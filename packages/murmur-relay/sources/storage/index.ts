@@ -6,7 +6,6 @@ export {
     PostgresRelayStore,
     POSTGRES_WAKE_CHANNEL,
 } from "./postgres/index.js";
-export type { PostgresRelayStoreOptions } from "./postgres/index.js";
 export type {
     PGliteDatabaseLike,
     PGliteQueryLike,
@@ -16,20 +15,20 @@ export type {
     PostgresSession,
 } from "./postgres/index.js";
 export type {
-    EventPage,
+    AcknowledgeOutcome,
     PageReadConstraints,
     PublishOutcome,
-    PublishReceipt,
+    QueuedDelivery,
+    QueueLimits,
+    QueuePage,
     RelayStore,
-    RelayStoreInstrumentation,
-    RetainedRelayEvent,
-    StoredReadChallenge,
 } from "./types.js";
+export { RELAY_EXPIRATION_BATCH_ITEMS } from "./types.js";
 
 /** Storage backend names accepted by the standalone relay. */
 export type RelayStoreBackend = "sqlite" | "postgres";
 
-/** Strictly parse the standalone relay's storage backend environment value. */
+/** Strictly parse the standalone relay store backend. */
 export function parseRelayStoreBackend(value: string | undefined): RelayStoreBackend {
     const backend = value ?? "sqlite";
     if (backend !== "sqlite" && backend !== "postgres") {

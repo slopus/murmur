@@ -1,31 +1,21 @@
-# Key packages
+# MLS KeyPackage
 
-The supported RFC 9420 KeyPackage profile uses:
+Murmur's RFC 9420 KeyPackage profile binds:
 
-- protocol version `mls10`;
-- cipher suite `MLS_128_DHKEMX25519_AES128GCM_SHA256_Ed25519`;
-- BasicCredential containing the Murmur Ed25519 identity key;
-- empty extensions;
-- capabilities for Add, Update, and Remove proposals;
-- independent one-use init and leaf HPKE keys.
+- an X25519 init key;
+- an X25519 leaf encryption key;
+- the Ed25519 Murmur identity in BasicCredential and signature key;
+- a finite `notBefore`/`notAfter` lifetime;
+- signatures over the LeafNode and KeyPackage.
 
-KeyPackage and LeafNode signatures use their RFC labels. Consuming a bundle
-zeros both HPKE secret keys.
-
-Applications can serialize a bundle into private durable state. Restoration
-revalidates the public KeyPackage and proves that both stored HPKE private keys
-own the exact public init/leaf keys before returning the one-use bundle.
+`createMlsKeyPackage` returns public material plus one-use private HPKE keys.
+The private bundle is serialized only into the client store and is destroyed
+after successful Welcome processing or expiry. Discovery exposes the public
+KeyPackage and signs the outer bundle with the same Murmur identity.
 
 ```text
-identity signing key
-      |
-      v
-KeyPackage + init private key + leaf private key
-      |             |
- public announce    `-> private durable bundle
-      |
- reserve once -> Add Commit -> Welcome open -> consume + zero
+public KeyPackage ---- shared in discovery
+private HPKE keys ---- durable local state ---- consumed by Welcome
 ```
 
-The facade maintains separate per-friend public and private pools around this
-one-use cryptographic object.
+KeyPackage references use the RFC label and are the stable one-use claim key.

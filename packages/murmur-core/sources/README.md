@@ -1,15 +1,15 @@
-# Sources
+# Core source layout
 
 ```text
-index.ts        public root export
-murmur/         stateful facade and synchronization
-identity/       one-key identity and friend bootstrap/control
-mls/            internal RFC 9420 / TreeKEM subset
-crypto/         Noble-based identity and sealed boxes
-transport/      browser-safe HTTP relay wire implementation
-storage/        application persistence boundary
-utils/          strict byte and JSON helpers
+crypto/              one-root Ed25519/X25519 identity primitives
+delivery/            signed queue wire format, HTTP transport, inbox processor
+identity/discovery/  signed public KeyPackage bundles
+mls/                 browser-safe RFC 9420 profile
+sessions/            public stateful MLS coordinator
+storage/             transactional durable-store contract and memory store
+utils/               bounded serialization and byte utilities
+index.ts             root package exports
 ```
 
-Only `index.ts` is exported by the package. Other modules are internal
-implementation boundaries compiled once into `@slopus/murmur`.
+The public façade is `MurmurClient` in `sessions/`. Delivery queues are
+transport buffers; durable protocol state always crosses `storage/`.

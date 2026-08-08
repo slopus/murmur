@@ -1,56 +1,76 @@
 # Murmur
 
-Murmur is one browser-safe stateful library for encrypted friend bootstrap and
-opaque MLS group event streams over one deliberately dumb relay.
+Murmur is a browser-safe TypeScript library for stateful MLS sessions over one
+deliberately simple relay. The relay stores only unacknowledged encrypted
+deliveries in one authenticated queue per public identity. Durable identity,
+MLS epochs, replay protection, application effects, and history belong to the
+client application.
 
 ```text
-application
-    |
-    | MurmurStore
-    v
-@slopus/murmur ---- exactly one relay ---- ordered signed opaque events
-    |
-    +-- one identity and profile
-    +-- encrypted friend requests and control channels
-    `-- MLS groups with opaque descriptors and application bytes
+out-of-band discovery bundle
+            |
+            v
+MurmurClient -- signed encrypted multicast --> identity queues
+     |                                            |
+     +-- durable MLS checkpoints/outboxes <-------+
+     +-- application-owned event durability
 ```
 
-Murmur owns identity secrets, friend lifecycle, relay cursors, exact outboxes,
-KeyPackages, invitations, MLS epochs, replay, and crash recovery. The
-application supplies transactional persistence and decides what descriptors and
-events mean.
+Two-person and many-person interactions use the same MLS session primitive.
+There is no friendship protocol, anonymous addressing, relay-side session
+state, or server-side message history.
+
+## Packages
+
+- `@slopus/murmur` — the only published package; ESM-only and browser-safe.
+- `@murmur/relay` — private Node infrastructure with SQLite and Postgres
+  stores.
+
+## Minimal flow
 
 ```ts
-import { MemoryMurmurStore, Murmur } from "@slopus/murmur";
+import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";
 
-const murmur = await Murmur.open({
+const murmur = await MurmurClient.open({
     relay: "https://relay.example",
     store: new MemoryMurmurStore(),
-    initialProfile: { name: "Alice" },
 });
 
-await murmur.friends.request(bobIdentityKey);
+// Share this signed bundle through a QR code, link, directory, or another
+// application-owned discovery mechanism.
+const myBundle = await murmur.discovery();
 
-const groupId = await murmur.groups.create(applicationDescriptor, [bobIdentityKey]);
-await murmur.groups.send(groupId, applicationBytes);
+// A peer's bundle bootstraps a two-member MLS session.
+const session = await murmur.createSession({
+    descriptor: new TextEncoder().encode("opaque application metadata"),
+    members: [peerBundle],
+});
 
-// Optional when the application needs an explicit observed boundary:
-await murmur.sync({ waitMilliseconds: 5_000 });
-
-await murmur.close();
+await murmur.synchronize();
+await murmur.send(session.id, new TextEncoder().encode("opaque application event"));
+await murmur.synchronize();
 ```
 
-`MemoryMurmurStore` is for tests and examples. Production applications provide
-a durable `MurmurStore` whose transaction callback is genuinely atomic.
+Received sessions remain `pending` until the application calls
+`activateSession`. Pending sessions continue processing MLS state and buffer
+opaque application events within configured bounds.
 
-The published package has one import path: `@slopus/murmur`. Relay topics,
-cursors, Welcome messages, KeyPackages, epoch checkpoints, and publish/adopt
-choreography are internal.
+`MemoryMurmurStore` is for tests and examples. Production applications must
+provide a durable transactional `MurmurStore`.
 
-`Murmur.open()` starts an internal convergence worker. Mutations wake it and
-durable failures are retried with backoff; `sync()` remains available for
-tests, shutdown coordination, or an application-requested observation point.
+## Development
+
+```bash
+pnpm install
+pnpm format
+pnpm lint
+pnpm typecheck
+pnpm test
+pnpm build
+```
+
+Read [the architecture](docs/ARCHITECTURE.md), [protocol](docs/PROTOCOL.md),
+[relay API](docs/RELAY_API.md), and [security notes](docs/SECURITY.md) before
+integrating.
 
 > Murmur is a `0.x` project and has not received an independent security audit.
-> Its MLS code is a tested RFC 9420 subset, not a complete interoperable MLS
-> implementation.

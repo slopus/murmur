@@ -1,294 +1,250 @@
-import { ed25519 } from "@noble/curves/ed25519";
-import { randomBytes } from "@noble/hashes/utils";
 import { describe, expect, test } from "vitest";
 import {
-    readProofSigningBytes,
-    relayEventSigningBytes,
-    relayTopicToJson,
-    signedRelayEventToJson,
-    type ReadChallenge,
-    type SignedRelayEvent,
+    signedDeliveryToJson,
+    signedQueueAckToJson,
+    signedQueueReadToJson,
 } from "../../protocol/index.js";
+import {
+    identity,
+    recipients,
+    secret,
+    signedAck,
+    signedDelivery,
+    signedRead,
+} from "../../protocol/tests/helpers.js";
 import { RelayService } from "../../relay/index.js";
-import { SqliteRelayStore, type EventPage, type PageReadConstraints } from "../../storage/index.js";
-import { decodeBase64Url, encodeBase64Url } from "../../utils/base64Url.js";
+import { SqliteRelayStore } from "../../storage/index.js";
 import { createRelayFetchHandler, parseRelayAllowedOrigins } from "../index.js";
 
-describe("relay HTTP read authorization", () => {
-    test("strictly parses standalone CORS origins", () => {
-        expect(parseRelayAllowedOrigins(undefined)).toBe("*");
-        expect(parseRelayAllowedOrigins("*")).toBe("*");
-        expect(parseRelayAllowedOrigins("https://app.test, http://localhost:3000")).toEqual([
-            "https://app.test",
-            "http://localhost:3000",
-        ]);
-        for (const invalid of [
-            "",
-            "https://app.test,",
-            "*,https://app.test",
-            "https://app.test/",
-            "https://app.test/path",
-            "ftp://app.test",
-            "https://app.test,https://app.test",
-        ]) {
-            expect(() => parseRelayAllowedOrigins(invalid)).toThrow("MURMUR_RELAY_ORIGINS");
+const NOW = 10_000;
+
+function post(path: string, body: unknown, origin?: string): Request {
+    return new Request(`https://relay.example${path}`, {
+        method: "POST",
+        headers: {
+            "content-type": "application/json",
+            ...(origin === undefined ? {} : { origin }),
+        },
+        body: JSON.stringify(body),
+    });
+}
+
+describe("identity queue HTTP API", () => {
+    test("publishes, reads, and acknowledges", async () => {
+        const aliceSecret = secret(1);
+        const bobSecret = secret(2);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const handler = createRelayFetchHandler(relay, {
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "http-tests",
+        });
+        try {
+            const delivery = signedDelivery(
+                aliceSecret,
+                recipients(identity(aliceSecret), identity(bobSecret)),
+                { now: NOW },
+            );
+            const published = await handler(post("/v1/deliveries", signedDeliveryToJson(delivery)));
+            const publishBody = (await published.json()) as {
+                readonly eventId: string;
+                readonly duplicate: boolean;
+            };
+            expect(publishBody.duplicate).toBe(false);
+
+            const read = await handler(
+                post("/v1/queue/read", signedQueueReadToJson(signedRead(bobSecret))),
+            );
+            expect(read.status).toBe(200);
+            expect(await read.json()).toMatchObject({
+                head: publishBody.eventId,
+                acknowledgedThrough: null,
+                exhausted: true,
+                deliveries: [{ eventId: publishBody.eventId }],
+            });
+
+            const acknowledged = await handler(
+                post(
+                    "/v1/queue/ack",
+                    signedQueueAckToJson(signedAck(bobSecret, publishBody.eventId)),
+                ),
+            );
+            expect(await acknowledged.json()).toEqual({ removed: 1 });
+        } finally {
+            await relay.close();
         }
     });
 
-    test("accepts offline signed events while enforcing future skew and expiration", async () => {
-        let relayNow = 30 * 24 * 60 * 60 * 1_000;
-        const secretKey = new Uint8Array(32).fill(5);
-        const topic = {
-            type: "write" as const,
-            name: "offline-http",
-            writeKey: ed25519.getPublicKey(secretKey),
-        };
-        const signed = (createdAt: number, expiresAt?: number): SignedRelayEvent => {
-            const unsigned: SignedRelayEvent = {
-                version: 1,
-                id: encodeBase64Url(randomBytes(32)),
-                topic,
-                author: { signingKey: topic.writeKey },
-                createdAt,
-                ...(expiresAt === undefined ? {} : { expiresAt }),
-                payload: new Uint8Array([1]),
-                signature: new Uint8Array(64),
-            };
-            return {
-                ...unsigned,
-                signature: ed25519.sign(relayEventSigningBytes(unsigned), secretKey),
-            };
-        };
+    test("enforces exact CORS origins and bounded JSON", async () => {
+        expect(parseRelayAllowedOrigins("https://app.example")).toEqual(["https://app.example"]);
+        expect(() => parseRelayAllowedOrigins("https://app.example/")).toThrow("invalid origin");
         const relay = new RelayService(
             new SqliteRelayStore(":memory:"),
-            {},
+            { maximumCiphertextBytes: 1, maximumRecipients: 1, maximumJsonBodyBytes: 5_000 },
             undefined,
-            () => relayNow,
+            () => NOW,
         );
-        const handler = createRelayFetchHandler(relay);
-        const publish = (event: SignedRelayEvent): Promise<Response> =>
-            handler(
-                new Request("https://relay.test/v1/events", {
-                    method: "POST",
-                    body: JSON.stringify(signedRelayEventToJson(event)),
-                }),
-            );
-        try {
-            const delayed = signed(relayNow - 7 * 24 * 60 * 60 * 1_000);
-            const delayedResponse = await publish(delayed);
-            expect(delayedResponse.status).toBe(200);
-            await expect(delayedResponse.json()).resolves.toEqual({
-                seq: "1",
-                duplicate: false,
-            });
-            expect((await publish(signed(relayNow - 6 * 60 * 1_000))).status).toBe(200);
-            expect((await publish(signed(relayNow + 5 * 60 * 1_000 + 1))).status).toBe(401);
-            expect((await publish(signed(relayNow - 24 * 60 * 60 * 1_000, relayNow))).status).toBe(
-                401,
-            );
-
-            relayNow += 30 * 24 * 60 * 60 * 1_000;
-            const retry = await publish(delayed);
-            expect(retry.status).toBe(200);
-            await expect(retry.json()).resolves.toEqual({ seq: "1", duplicate: true });
-        } finally {
-            await relay.close();
-        }
-    });
-
-    test("issues and consumes a challenge without receiving a secret key", async () => {
-        const readSecretKey = new Uint8Array(32).fill(9);
-        const writeSecretKey = new Uint8Array(32).fill(8);
-        const topic = {
-            type: "read-write" as const,
-            name: "shared",
-            readKey: ed25519.getPublicKey(readSecretKey),
-            writeKey: ed25519.getPublicKey(writeSecretKey),
-        };
-        const relay = new RelayService(new SqliteRelayStore(":memory:"));
-        const handler = createRelayFetchHandler(relay);
-        try {
-            for (const payload of ["first", "second"]) {
-                const unsigned: SignedRelayEvent = {
-                    version: 1,
-                    id: encodeBase64Url(randomBytes(32)),
-                    topic,
-                    author: { signingKey: topic.writeKey },
-                    createdAt: Date.now(),
-                    payload: new TextEncoder().encode(payload),
-                    signature: new Uint8Array(64),
-                };
-                const event = {
-                    ...unsigned,
-                    signature: ed25519.sign(relayEventSigningBytes(unsigned), writeSecretKey),
-                };
-                const publishResponse = await handler(
-                    new Request("https://relay.test/v1/events", {
-                        method: "POST",
-                        body: JSON.stringify(signedRelayEventToJson(event)),
-                    }),
-                );
-                expect(publishResponse.status).toBe(200);
-            }
-            const challengeResponse = await handler(
-                new Request("https://relay.test/v1/read-challenges", {
-                    method: "POST",
-                    body: JSON.stringify({ topic: relayTopicToJson(topic) }),
-                }),
-            );
-            expect(challengeResponse.status).toBe(200);
-            const challengeJson = (await challengeResponse.json()) as {
-                id: string;
-                nonce: string;
-                expiresAt: number;
-            };
-            const challenge: ReadChallenge = {
-                id: challengeJson.id,
-                nonce: decodeBase64Url(challengeJson.nonce),
-                expiresAt: challengeJson.expiresAt,
-            };
-            const response = await handler(
-                new Request("https://relay.test/v1/events/read", {
-                    method: "POST",
-                    body: JSON.stringify({
-                        topic: relayTopicToJson(topic),
-                        since: "0",
-                        limit: 10,
-                        waitMilliseconds: 0,
-                        proof: {
-                            challengeId: challenge.id,
-                            signature: encodeBase64Url(
-                                ed25519.sign(
-                                    readProofSigningBytes(challenge, topic, 0n, 10, 0),
-                                    readSecretKey,
-                                ),
-                            ),
-                        },
-                    }),
-                }),
-            );
-            expect(response.status).toBe(200);
-            await expect(response.json()).resolves.toEqual({
-                events: expect.arrayContaining([
-                    expect.objectContaining({ seq: "1" }),
-                    expect.objectContaining({ seq: "2" }),
-                ]),
-                head: "2",
-                exhausted: true,
-            });
-        } finally {
-            await relay.close();
-        }
-    });
-
-    test("rejects oversized cursors before storage and reflects CORS with Vary", async () => {
-        const relay = new RelayService(new SqliteRelayStore(":memory:"));
         const handler = createRelayFetchHandler(relay, {
-            allowedOrigins: ["https://app.test"],
+            allowedOrigins: ["https://app.example"],
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "http-tests",
         });
         try {
             const health = await handler(
-                new Request("https://relay.test/health", {
-                    headers: { origin: "https://app.test" },
+                new Request("https://relay.example/health", {
+                    headers: { origin: "https://app.example" },
                 }),
             );
-            expect(health.headers.get("vary")).toBe("Origin");
-            const key = ed25519.getPublicKey(new Uint8Array(32).fill(3));
-            const response = await handler(
-                new Request("https://relay.test/v1/events/read", {
+            expect(health.headers.get("access-control-allow-origin")).toBe("https://app.example");
+            const oversized = await handler(
+                new Request("https://relay.example/v1/deliveries", {
                     method: "POST",
-                    body: JSON.stringify({
-                        topic: {
-                            type: "write",
-                            name: "cursor",
-                            writeKey: encodeBase64Url(key),
-                        },
-                        since: "9223372036854775808",
-                        limit: 1,
-                        waitMilliseconds: 0,
-                    }),
+                    headers: { "content-length": "5001" },
+                    body: "{}",
                 }),
             );
-            expect(response.status).toBe(400);
-            const tooManyDigits = await handler(
-                new Request("https://relay.test/v1/events/read", {
-                    method: "POST",
-                    body: JSON.stringify({
-                        topic: {
-                            type: "write",
-                            name: "cursor",
-                            writeKey: encodeBase64Url(key),
-                        },
-                        since: "10000000000000000000",
-                        limit: 1,
-                        waitMilliseconds: 0,
-                    }),
-                }),
-            );
-            expect(tooManyDigits.status).toBe(400);
+            expect(oversized.status).toBe(413);
         } finally {
             await relay.close();
         }
     });
 
-    test("enforces the actual encoded event-page response budget", async () => {
-        const secretKey = new Uint8Array(32).fill(6);
-        const topic = {
-            type: "write" as const,
-            name: "bounded",
-            writeKey: ed25519.getPublicKey(secretKey),
-        };
-        class OversizedPageStore extends SqliteRelayStore {
-            override async readEvents(
-                topicId: string,
-                since: bigint,
-                limit: number,
-                now: number,
-                constraints: PageReadConstraints,
-            ): Promise<EventPage> {
-                const page = await super.readEvents(topicId, since, limit, now, constraints);
-                const retained = page.events[0];
-                if (limit === 1 || retained === undefined) return page;
-                return {
-                    ...page,
-                    events: Array.from({ length: 20 }, () => retained),
-                };
-            }
-        }
-        const relay = new RelayService(new OversizedPageStore(":memory:"), {
-            maximumEventPayloadBytes: 64,
-            maximumCollapseKeyBytes: 1,
-            maximumJsonBodyBytes: 4_188,
+    test("returns skip metadata for a delivery above the current response budget", async () => {
+        const aliceSecret = secret(5);
+        const bobSecret = secret(6);
+        const store = new SqliteRelayStore(":memory:");
+        const publisher = new RelayService(
+            store,
+            {
+                maximumCiphertextBytes: 4_000,
+                maximumRecipients: 1,
+                maximumJsonBodyBytes: 10_000,
+            },
+            undefined,
+            () => NOW,
+        );
+        const reader = new RelayService(
+            store,
+            {
+                maximumCiphertextBytes: 1,
+                maximumRecipients: 1,
+                maximumJsonBodyBytes: 5_000,
+            },
+            undefined,
+            () => NOW,
+        );
+        const handler = createRelayFetchHandler(reader, {
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "http-tests",
         });
-        const handler = createRelayFetchHandler(relay);
         try {
-            const unsigned: SignedRelayEvent = {
-                version: 1,
-                id: encodeBase64Url(randomBytes(32)),
-                topic,
-                author: { signingKey: topic.writeKey },
-                createdAt: Date.now(),
-                payload: new Uint8Array(64),
-                signature: new Uint8Array(64),
-            };
-            await relay.publish({
-                ...unsigned,
-                signature: ed25519.sign(relayEventSigningBytes(unsigned), secretKey),
+            const published = await publisher.publish(
+                signedDelivery(aliceSecret, recipients(identity(bobSecret)), {
+                    now: NOW,
+                    ciphertext: new Uint8Array(4_000),
+                }),
+                "http-tests",
+            );
+            const response = await handler(
+                post("/v1/queue/read", signedQueueReadToJson(signedRead(bobSecret, { now: NOW }))),
+            );
+            expect(response.status).toBe(413);
+            expect(await response.json()).toEqual({
+                error: "delivery_too_large",
+                eventId: published.eventId,
+                head: published.eventId,
+                acknowledgedThrough: null,
             });
-            const request = (limit: number): Request =>
-                new Request("https://relay.test/v1/events/read", {
+        } finally {
+            await reader.close();
+            await publisher.close();
+        }
+    });
+
+    test("rate limits POST requests per remote address", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const handler = createRelayFetchHandler(relay, {
+            maximumRequestsPerMinutePerAddress: 1,
+        });
+        try {
+            expect(() => createRelayFetchHandler(relay, { requireRemoteAddress: false })).toThrow(
+                "explicit default admission principal",
+            );
+            const context = { remoteAddress: "203.0.113.10" };
+            const missingHealthContext = await handler(new Request("https://relay.example/health"));
+            expect(missingHealthContext.status).toBe(503);
+            const missingContext = await handler(post("/v1/deliveries", {}));
+            expect(missingContext.status).toBe(503);
+            expect(await missingContext.json()).toEqual({
+                error: "admission_context_required",
+            });
+            expect((await handler(post("/v1/deliveries", {}), context)).status).toBe(400);
+            const limited = await handler(post("/v1/deliveries", {}), context);
+            expect(limited.status).toBe(429);
+            expect(await limited.json()).toEqual({ error: "rate_limited" });
+
+            const proxyHandler = createRelayFetchHandler(relay, {
+                maximumRequestsPerMinutePerAddress: 1,
+                remoteAddressHeader: "x-real-ip",
+            });
+            const proxied = (): Request =>
+                new Request("https://relay.example/v1/deliveries", {
                     method: "POST",
-                    body: JSON.stringify({
-                        topic: relayTopicToJson(topic),
-                        since: "0",
-                        limit,
-                        waitMilliseconds: 0,
-                    }),
+                    headers: {
+                        "content-type": "application/json",
+                        "x-real-ip": "198.51.100.7",
+                    },
+                    body: "{}",
                 });
-            expect((await handler(request(256))).status).toBe(413);
-            const single = await handler(request(1));
-            expect(single.status).toBe(200);
-            expect(((await single.json()) as { exhausted: boolean }).exhausted).toBe(true);
+            expect((await proxyHandler(proxied())).status).toBe(400);
+            expect((await proxyHandler(proxied())).status).toBe(429);
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("bounds outstanding fanout by the trusted ingress principal", async () => {
+        const firstSender = secret(31);
+        const secondSender = secret(32);
+        const recipient = identity(secret(33));
+        const relay = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            { maximumAdmissionReferences: 1 },
+            undefined,
+            () => NOW,
+        );
+        const handler = createRelayFetchHandler(relay);
+        const principal = { remoteAddress: "account:example" };
+        try {
+            expect(
+                (
+                    await handler(
+                        post(
+                            "/v1/deliveries",
+                            signedDeliveryToJson(
+                                signedDelivery(firstSender, recipients(recipient), {
+                                    id: 34,
+                                    now: NOW,
+                                }),
+                            ),
+                        ),
+                        principal,
+                    )
+                ).status,
+            ).toBe(200);
+            const blocked = await handler(
+                post(
+                    "/v1/deliveries",
+                    signedDeliveryToJson(
+                        signedDelivery(secondSender, recipients(recipient), {
+                            id: 35,
+                            now: NOW,
+                        }),
+                    ),
+                ),
+                principal,
+            );
+            expect(blocked.status).toBe(429);
+            expect(await blocked.json()).toEqual({ error: "admission_full" });
         } finally {
             await relay.close();
         }

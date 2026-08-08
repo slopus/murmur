@@ -2,21 +2,21 @@ import type { WakeSource } from "../types.js";
 
 /** In-process wake fan-out used by the SQLite deployment. */
 export class InProcessWakeSource implements WakeSource {
-    readonly #listeners = new Set<(topic: string) => void>();
+    readonly #listeners = new Set<(queueId: string) => void>();
     #closed = false;
 
-    /** Deliver a committed topic wake to every local service listener. */
-    async notify(topic: string): Promise<void> {
+    /** Deliver a committed queue wake to every local service listener. */
+    async notify(queueId: string): Promise<void> {
         if (this.#closed) {
             return;
         }
         for (const listener of this.#listeners) {
-            listener(topic);
+            listener(queueId);
         }
     }
 
     /** Subscribe one local long-poll dispatcher. */
-    async subscribe(listener: (topic: string) => void): Promise<void> {
+    async subscribe(listener: (queueId: string) => void): Promise<void> {
         if (this.#closed) {
             throw new Error("Wake source is closed");
         }

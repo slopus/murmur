@@ -1,49 +1,31 @@
-import { describe, expect, test } from "vitest";
-import { selectEventPageMetadata, type StoredPageCandidate } from "../page.js";
+import { expect, test } from "vitest";
+import { eventId } from "../../protocol/tests/helpers.js";
+import { selectQueuePageMetadata } from "../page.js";
 
-function selectionWork(limit: number): {
-    readonly candidateEncodings: number;
-    readonly selected: number;
-    readonly exhausted: boolean;
-} {
-    const candidates: StoredPageCandidate[] = Array.from({ length: limit + 1 }, (_, index) => ({
-        seq: BigInt(index + 1),
-        encodedBytes: 512,
-    }));
-    let candidateEncodings = 0;
-    const page = selectEventPageMetadata(
-        candidates,
-        BigInt(candidates.length),
-        limit,
-        { maximumEncodedBytes: Number.MAX_SAFE_INTEGER },
-        {
-            candidateEncoded: () => {
-                candidateEncodings += 1;
-            },
-        },
-    );
-    return {
-        candidateEncodings,
-        selected: page.candidates.length,
-        exhausted: page.exhausted,
-    };
-}
-
-describe("event page selection", () => {
-    test("accounts each selectable candidate once as the page limit grows", () => {
-        const small = selectionWork(1_024);
-        const large = selectionWork(4_096);
-
-        expect(small).toEqual({
-            candidateEncodings: 1_024,
-            selected: 1_024,
-            exhausted: false,
-        });
-        expect(large).toEqual({
-            candidateEncodings: 4_096,
-            selected: 4_096,
-            exhausted: false,
-        });
-        expect(large.candidateEncodings / small.candidateEncodings).toBe(4);
+test("queue page selection always returns the first item and respects later byte bounds", () => {
+    const candidates = [
+        { eventId: eventId(2), encodedBytes: 10_000 },
+        { eventId: eventId(5), encodedBytes: 10 },
+        { eventId: eventId(9), encodedBytes: 10 },
+    ];
+    expect(
+        selectQueuePageMetadata(candidates, eventId(9), null, null, 3, {
+            maximumEncodedBytes: 1,
+        }),
+    ).toEqual({
+        candidates: [candidates[0]],
+        head: eventId(9),
+        acknowledgedThrough: null,
+        exhausted: false,
+    });
+    expect(
+        selectQueuePageMetadata(candidates, eventId(9), null, null, 2, {
+            maximumEncodedBytes: 100_000,
+        }),
+    ).toEqual({
+        candidates: candidates.slice(0, 2),
+        head: eventId(9),
+        acknowledgedThrough: null,
+        exhausted: false,
     });
 });

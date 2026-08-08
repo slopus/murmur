@@ -1,14 +1,9 @@
 # HTTP tests
 
-Exercises protected-read challenge issuance and consumption plus offline,
-future-skew, expiration, and exact-retry publication through the Fetch-compatible
-boundary.
+End-to-end Fetch coverage for publish, authenticated read, acknowledgement,
+bounded bodies and responses, exact CORS reflection, oversized-delivery skip
+metadata, mandatory admission context, and per-address admission bounds.
 
 ```text
-request challenge -> sign exact read tuple -> Fetch read -> retained page
-reuse challenge ---------------------------> reject
-malformed/oversized JSON ------------------> bounded error response
+protocol JSON -> Fetch handler -> real RelayService -> in-memory SQLite
 ```
-
-These tests prove route adaptation preserves the relay policy's one-use proof
-semantics.

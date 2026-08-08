@@ -47,14 +47,42 @@ describe("published package compatibility", () => {
         expect(manifest.bin).toBeUndefined();
     });
 
-    it("loads only the root facade export in Node", async () => {
+    it("loads only the supported root API in Node", async () => {
         const script = `
 const loaded = await import("@slopus/murmur");
 const names = Object.keys(loaded).sort();
 if (JSON.stringify(names) !== JSON.stringify([
+    "DeliveryAcknowledgementFutureError",
+    "DeliveryCursorTrimmedError",
+    "DeliveryTransportError",
+    "HttpDeliveryTransport",
+    "InboxProcessor",
+    "InboxStateRollbackError",
+    "MAXIMUM_STORE_SCAN_ITEMS",
     "MemoryMurmurStore",
-    "Murmur",
-    "MurmurKeyPackagePoolExhaustedError",
+    "MurmurClient",
+    "OversizedInboxDeliveryError",
+    "TerminalInboxDeliveryError",
+    "containsRecipient",
+    "createDiscoveryBundle",
+    "createSignedDelivery",
+    "createSignedInboxAck",
+    "createSignedInboxRead",
+    "decodeIdentityRoot",
+    "destroyIdentity",
+    "encodeIdentityRoot",
+    "generateIdentityKeyPair",
+    "importIdentityKeyPair",
+    "parseDiscoveryBundle",
+    "parseInboxPage",
+    "parseSignedDelivery",
+    "serializeDiscoveryBundle",
+    "signedDeliveryToJson",
+    "signedInboxAckToJson",
+    "signedInboxReadToJson",
+    "validateSignedDelivery",
+    "verifyDiscoveryBundle",
+    "verifySignedDelivery",
 ])) {
     throw new Error(\`Unexpected runtime exports: \${names.join(", ")}\`);
 }
@@ -124,31 +152,37 @@ for (const specifier of blocked) {
                 join(consumerDirectory, "consumer.ts"),
                 `
 import {
+    HttpDeliveryTransport,
     MemoryMurmurStore,
-    Murmur,
-    MurmurKeyPackagePoolExhaustedError,
-    type IdentityProfile,
-    type MurmurGroupPage,
-    type MurmurOpenOptions,
+    MurmurClient,
+    destroyIdentity,
+    generateIdentityKeyPair,
+    type DeliveryFetch,
+    type DiscoveryBundle,
+    type IdentityKeyPair,
+    type MurmurClientOptions,
+    type MurmurSessionPage,
     type MurmurStore,
-    type RelayFetch,
 } from "@slopus/murmur";
 
 const store: MurmurStore = new MemoryMurmurStore();
-const profile: IdentityProfile = { name: "TypeScript consumer" };
-const relayFetch: RelayFetch = globalThis.fetch;
-const options: MurmurOpenOptions = {
+const deliveryFetch: DeliveryFetch = globalThis.fetch;
+const transport = new HttpDeliveryTransport("https://relay.example", { fetch: deliveryFetch });
+const identity: IdentityKeyPair = generateIdentityKeyPair();
+const options: MurmurClientOptions = {
     relay: new URL("https://relay.example"),
     store,
-    initialProfile: profile,
-    fetch: relayFetch,
+    fetch: deliveryFetch,
+    identity,
 };
-const opening: Promise<Murmur> = Murmur.open(options);
-const page: MurmurGroupPage | undefined = undefined;
-const exhaustion: Error = new MurmurKeyPackagePoolExhaustedError(new Uint8Array(32));
+const opening: Promise<MurmurClient> = MurmurClient.open(options);
+const page: MurmurSessionPage | undefined = undefined;
+const discovery: DiscoveryBundle | undefined = undefined;
+void transport;
 void opening;
 void page;
-void exhaustion;
+void discovery;
+destroyIdentity(identity);
 `,
                 "utf8",
             );
@@ -198,8 +232,8 @@ void exhaustion;
             platform: "browser",
             stdin: {
                 contents:
-                    'import { MemoryMurmurStore, Murmur } from "@slopus/murmur";\n' +
-                    "globalThis.__MURMUR_PACKAGE_EXPORTS__ = { MemoryMurmurStore, Murmur };",
+                    'import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";\n' +
+                    "globalThis.__MURMUR_PACKAGE_EXPORTS__ = { MemoryMurmurStore, MurmurClient };",
                 loader: "js",
                 resolveDir: packageDirectory,
                 sourcefile: "murmur-browser-smoke.js",
@@ -228,8 +262,8 @@ void exhaustion;
         const exports = browser.__MURMUR_PACKAGE_EXPORTS__ as
             | Readonly<Record<string, unknown>>
             | undefined;
-        expect(Object.keys(exports ?? {}).sort()).toEqual(["MemoryMurmurStore", "Murmur"]);
+        expect(Object.keys(exports ?? {}).sort()).toEqual(["MemoryMurmurStore", "MurmurClient"]);
         expect(typeof exports?.MemoryMurmurStore).toBe("function");
-        expect(typeof exports?.Murmur).toBe("function");
+        expect(typeof exports?.MurmurClient).toBe("function");
     }, 30_000);
 });

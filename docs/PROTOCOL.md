@@ -1,277 +1,85 @@
 # Protocol
 
-All wire and durable formats are strict, versioned, bounded, and new to this
-rewrite. No prior Murmur layout is read.
+All current formats are version `1`. Previous Murmur friendship, topic, and
+event-log formats are intentionally unsupported.
 
-## Identity and friends
+## Identity and discovery
 
-One 32-byte root is an Ed25519 seed and is deliberately converted to X25519 for
-key agreement. The public identity is the 32-byte Ed25519 public key.
+One 32-byte identity root derives one Ed25519 public identity and the X25519
+material used by sealed bootstrap delivery. Internally, keys remain
+`Uint8Array`; base64url is used only at serialization boundaries.
 
-A friend request contains the sender profile, causal request identifier, and a
-random protected response address. It is identity-signed, sealed to the
-recipient, then published to:
+`MurmurClient.discovery()` creates:
 
-```text
-{ type: "read", name: "friend-requests", readKey: recipientIdentityKey }
-```
+- one signed, self-contained discovery bundle;
+- one current public MLS KeyPackage in that bundle;
+- the matching one-use private KeyPackage state in the local store.
 
-The outer relay author is fresh and unlinkable. Responses use the same inner
-authentication and sealing and another fresh outer author.
+The application shares the bundle out of band or through its own discovery
+service. The relay is not a directory. A discovery wrapper is short-lived, but
+local one-use claims remain until the KeyPackage's `notAfter` boundary so the
+same KeyPackage cannot be rewrapped and reused.
 
-Accepted friends derive an encrypted `control` channel with separate
-identity-ordered send and receive AES keys plus an independently derived stable
-topic key. Version-one frames are:
+## Bootstrap
 
-- profile update;
-- friendship ended;
-- KeyPackage announce;
-- KeyPackage request;
-- KeyPackage consumed acknowledgement;
-- KeyPackage retirement;
-- group invitation.
+Creating or adding a member prepares one MLS Commit plus one sealed Welcome for
+each addition. The Commit outbox contains the complete expected Welcome ID
+manifest. Before publishing any Welcome, Murmur validates the Commit, local
+staged state, every child record, and every secondary index.
 
-Temporary control retention maps exactly to relay `expiresAt`; all other
-control events are durable.
+Successful Welcome publications leave durable markers. The Commit publishes
+only after all markers are present and all current-epoch application/proposal
+outboxes have settled. The sender adopts the Commit only from its own identity
+queue echo; a publish response never advances the epoch.
 
-## KeyPackages and invitations
+A valid received Welcome creates a bounded `pending` session. MLS protocol
+traffic continues while pending. Application events are buffered but not
+exposed until `activateSession` applies them through an application transaction.
+`ignoreSession` destroys pending secrets and buffers.
 
-Each friend pair maintains durable local private and remote public one-use
-KeyPackage pools. A remote package is moved to a consumed marker in the same
-transaction that stages an Add. A local bundle is consumed in the invitation
-adoption transaction. Package lifetime is checked against the signed relay
-event creation time when an Add is created or admitted; delayed processing does
-not reinterpret a previously valid Commit using wall-clock time.
+## MLS sessions
 
-Each friend has at most eight local private bundles and eight remote public
-packages, with a target of two immediately available packages. Consumption
-reports are chunked at 64 references and acknowledged; every chunk is a durable
-control event, so a list longer than 64 cannot strand later references.
-Exact retirement releases a private reservation. Eight abandoned authenticated
-reservations surface a typed terminal convergence error rather than causing
-silent starvation, package reuse, or unbounded allocation. Exhaustion is
-isolated per friend: Murmur continues unrelated peer maintenance and group
-operations, then reports the deterministic typed error after that durable work
-converges.
-Reported local bundles stay reserved for a delayed winning invitation. A
-competing Commit sends retirement after it wins, while successful invitation
-adoption consumes the reserved bundle. Expired or excess remote announcements
-are explicitly retired instead of accumulating.
+Two-member and many-member sessions use the same RFC 9420 profile:
 
-An invitation carries the group ID, opaque descriptor and random binding nonce,
-descriptor binding, stable topic secret, exact KeyPackage reference, Welcome,
-ratchet tree, winning Commit sequence, exact Commit event ID, and Commit
-fingerprint. The recipient reads and verifies that retained group event before
-installing any cursor or group state. Using the carried topic secret, it
-decrypts the exact retained group envelope and requires the authenticated
-Welcome GroupInfo confirmation tag to equal that exact public Commit's
-confirmation tag, preventing a valid Welcome from a competing Add from being
-substituted. This proves Commit/Welcome consistency, but a malicious inviter
-can still name its own losing fork. A joiner therefore trusts that its inviter
-is an honest current group member; relay order alone does not establish
-membership validity for the joiner. The invitation is encrypted and
-authenticated by the friend channel. There is no public join operation.
+- X25519, HKDF-SHA-256, AES-128-GCM, and Ed25519;
+- BasicCredential bound to the Murmur identity key;
+- TreeKEM Adds, Removes, Welcome, Commit, and PrivateMessage;
+- one explicit epoch committer serialized through MLS authenticated data.
 
-A queued Add is dropped if its peer is no longer an active friend when
-preparation begins. Once an Add is staged, exact retry and relay-order safety
-take precedence: the candidate is retained until its echo or a competing Commit
-settles it. If that staged Add wins after friendship ended, Murmur suppresses
-the invitation and atomically retains the operation as a compensating Remove,
-which restores membership without peer cooperation. Ordinary friendship end
-does not remove a peer who was already a legitimate group member.
+Non-committers send authenticated Add or Remove proposals. The committer lists
+them with proposer identity and explicitly accepts a bounded selection.
 
-If the Add wins first, Murmur retains a strict invitation outbox purpose bound
-to that group, peer, and exact Add operation until the relay publication
-returns success. A failed or accepted-then-disconnected publication remains
-ambiguous across restart. If friendship ends while that exact invitation is
-still pending, the same cleanup transaction deletes it and its KeyPackage state
-and queues one Remove under the source operation ID. If the exact retry had
-already returned accepted or duplicate, the invitation marker was deleted and
-friendship end leaves membership independent. A recipient that adopted an
-ambiguously published invitation can still process the later MLS Remove.
+Application sends clone and persist the post-ratchet epoch plus exact outbox
+before publication. Commit preparation persists active and staged epochs
+separately. Remove drops prior-epoch receive state immediately; other membership
+changes retain a small time- and message-bounded prior-epoch window for in-flight
+traffic.
 
-## Group stream
+## Delivery and replay
 
-A one-member group and a many-member group are the same primitive. The
-descriptor and application bytes are opaque and retained even when the
-application does not understand them.
+Every sender-signed delivery carries:
 
-The inner messages are MLS PublicMessage Commits and MLS PrivateMessage
-applications. Before either kind enters a relay event, Murmur wraps it in the
-same strict version-one group envelope:
+- a stable sender-scoped delivery ID;
+- sorted unique recipient identities;
+- creation and expiration times;
+- opaque ciphertext;
+- an Ed25519 signature over a domain-separated canonical encoding.
 
-```text
-random 12-byte nonce || AES-256-GCM(version || MLS message)
-```
+The relay may forget a delivery ID after all references disappear. Recipients
+therefore persist sender-plus-delivery-ID replay state. Exact records are
+bounded; capacity overflow enters a bounded probabilistic filter whose only
+error is rejecting a new delivery. A separate rotating terminal filter
+amortizes repeated invalid-input authentication work without accumulating
+forever. Replay state and cursor progress commit with the application effect or
+terminal rejection.
 
-The AEAD key is derived with HKDF-SHA-256 from the stable random group topic
-secret under a dedicated versioned key domain; the capability secret is never
-used directly as an encryption key. AAD binds a separate versioned envelope
-domain and the complete `group-events` topic descriptor. The version byte is
-encrypted, payload size is bounded by the relay limit, and decoding rejects
-wrong topics, wrong topic secrets, tampering, unknown versions, and malformed
-lengths. Murmur authenticates and decrypts the envelope before classifying or
-processing the MLS message. Consequently relay storage cannot parse or decode
-an MLS PublicMessage header, recover a Murmur identity credential, or recover
-MLS/application plaintext. Exact ciphertext sizes and timing remain visible,
-so traffic analysis may infer that some events are more likely Commits or
-applications.
+Relay UUIDv7 event IDs provide a monotonic per-inbox cursor and processing-time
+floor. Implausible event times reject the page without durable mutation.
 
-The outer AEAD key is stable for the lifetime of the random group topic secret;
-it does not rotate with MLS epochs. Each invocation uses an independently
-random 96-bit nonce. Implementations must stay well below `2^32` total outer
-envelopes under one topic secret and create a new group/topic secret before
-that operational ceiling, limiting random-nonce collision risk. Inner MLS
-provides containment: application PrivateMessages remain MLS-encrypted if the
-outer layer is weakened, although Commit headers and credentials are public
-inside that wrapper and would no longer be hidden by it.
+## Queue acknowledgement
 
-Group messages are durable. Murmur currently exposes no expiration or collapse
-option for MLS content, avoiding unsafe Secret Tree generation skips.
-Outboxes, staged Commit fingerprints, own-echo matching, invitation
-fingerprints, and replay checks use the exact outer ciphertext retained by the
-relay.
-
-Inbound application persistence is atomic across:
-
-```text
-post-open epoch + opaque event + authenticated sender + replay marker + cursor
-```
-
-Inbound Commit persistence is atomic across:
-
-```text
-next epoch + membership + replay marker + cursor
-```
-
-Removed members keep the relay topic capability and topic secret but not newer
-MLS epoch secrets. They can decrypt later outer envelopes and inject junk, but
-MLS still prevents them from authenticating or decrypting newer-epoch inner
-content. Their invalid injections are quarantined.
-
-Quarantine is bounded to 32 minimal metadata records per topic and never stores
-the rejected payload. Group replay fingerprints are bounded to 128 entries;
-after eviction, the persisted Secret Tree ratchet still rejects replayed
-application ciphertext. Control replay state is retained when pruning could
-reapply a semantic control effect.
-
-## Relay envelope
-
-Relay event signatures use strict Ed25519 verification and cover canonical JSON
-containing the complete typed topic descriptor, event ID, author, creation time,
-optional expiration and collapse key, and opaque payload. Keys and ciphertext
-remain `Uint8Array` internally and use unpadded base64url only at JSON and
-storage boundaries. Secret capability keys never cross the relay boundary.
-
-For a new event the relay:
-
-1. strictly validates shape and bounds;
-2. verifies the Ed25519 signature;
-3. enforces the topic's write capability;
-4. checks for an existing `(topic, id)` receipt;
-5. rejects `createdAt` more than five minutes in the future and requires
-   `expiresAt` to remain in the future;
-6. atomically allocates a sequence, applies collapse, stores the event, and
-   stores its receipt.
-
-There is no maximum past age for `createdAt`. A correctly signed event that the
-relay has never accepted remains publishable after offline time or backward
-client clock drift; durable outbox work must not become invalid merely because
-delivery was delayed. `expiresAt` is the explicit author-selected deadline.
-
-For an existing receipt, steps 1–4 still apply. Equal authenticated content
-returns the original sequence even after future-skew or expiration policy would
-reject a new event. Different content returns `id_collision`.
-
-## Expiration and collapse
-
-No `expiresAt` means durable. Once expiration passes, the event is omitted from
-reads and can be physically deleted.
-
-When `collapseKey` is present, publishing atomically removes all older retained
-events in that topic from the same author signing key carrying an equal
-`collapseKey`. Including the author in this identity prevents independent
-writers to a public-write `Read Topic` from collapsing one another's state.
-Clients use collapse only when the new payload completely replaces the
-author's earlier state.
-
-Collapse follows relay arrival order, not an application timestamp or logical
-version. A delayed publication carrying older logical state can therefore
-arrive later and supersede newer retained state. Applications that use collapse
-must carry an authenticated logical version in the opaque payload and reject
-regressions when applying events; the relay deliberately does not interpret
-that version.
-
-The relay's head sequence never decreases. Expiration and collapse therefore
-produce legal sequence holes without reusing sequence numbers.
-
-## Event pages
-
-Events are ordered by sequence and strictly greater than the requested cursor.
-`exhausted` is computed from retained candidates before count and encoded-byte
-page limits. It is false whenever another retained event follows the page, even
-if the returned page is shorter than the requested count.
-
-Stores first fetch at most `limit + 1` retained `(sequence, encoded length)`
-metadata candidates under one snapshot. After exact page selection, a second
-indexed query in the same transaction hydrates only the selected event JSON
-rows. SQLite and Postgres therefore share page-budget semantics without
-materializing every maximum-sized candidate. The first retained event is always
-selected and hydrated, even when it alone exceeds a caller-supplied page budget.
-
-Clients advance the last returned event to `head` only when `exhausted` is true.
-Otherwise they advance to that event's sequence and request the next page.
-
-## Read authentication
-
-Public `Write Topic` reads need no proof. `Read Topic` and `Read and Write Topic`
-use a short-lived one-use relay challenge:
-
-```ts
-interface ReadChallenge {
-    id: string;
-    nonce: Uint8Array;
-    expiresAt: number;
-}
-```
-
-The client signs canonical JSON:
-
-```ts
-{
-    challengeId: string;
-    nonce: string;
-    topic: RelayTopic;
-    since: string;
-    limit: number;
-    waitMilliseconds: number;
-}
-```
-
-The relay removes the challenge before signature verification. Consequently a
-successful proof, an invalid attempt, or a replay consumes it. The challenge is
-also bound to the topic descriptor and expiration. Issuance and atomic
-consumption use shared relay storage rather than process memory.
-
-## Internal relay access
-
-```ts
-interface TopicAccess {
-    topic: RelayTopic;
-    readSecretKey?: Uint8Array;
-    writeSecretKey?: Uint8Array;
-}
-```
-
-Murmur holds this capability material internally. Request and response
-`Read Topic` events use fresh unlinkable authors. Control and group
-`Read and Write Topic` events use the shared write capability after verifying
-that its derived public key equals `topic.writeKey`. The exact signed event is
-then persisted in the outbox before publication.
-
-There is exactly one `RelayTransport` per stateful Murmur instance. Multi-relay
-ordering, failover, and relay-specific cursors are not protocol concepts. The
-transport validates descriptor shape, event signature, canonical sequence
-encoding, topic identity, sequence range, and designated write author on
-received pages. The stateful engine serializes sync and advances each topic
-cursor transactionally with the event's durable effect.
+Reads and acknowledgements are signed by the recipient identity. After durable
+processing, the client acknowledges through its latest cursor. Acknowledgement
+is monotonic and idempotent while queue state exists. Once an inbox has no
+pending references, the relay may reclaim its row; an absent inbox is an empty
+state, not retained history.

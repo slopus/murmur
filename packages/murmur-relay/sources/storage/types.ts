@@ -1,71 +1,67 @@
-import type { SignedRelayEvent } from "../protocol/index.js";
+import type { SignedDelivery } from "../protocol/index.js";
 
-/** Result of an atomic idempotent publish. */
+/** Maximum expired delivery records removed by one writer transaction. */
+export const RELAY_EXPIRATION_BATCH_ITEMS = 100;
+
+/** Atomic publication result for one sender-scoped delivery ID. */
 export interface PublishOutcome {
-    readonly seq: bigint;
+    readonly eventId: string;
     readonly duplicate: boolean;
 }
 
-/** Durable identity and original outcome of a published event. */
-export interface PublishReceipt {
-    readonly seq: bigint;
-    readonly fingerprint: Uint8Array;
+/** Result of one monotonic queue-prefix acknowledgement. */
+export interface AcknowledgeOutcome {
+    readonly removed: number;
 }
 
-/** Shared one-use protected-read challenge record. */
-export interface StoredReadChallenge {
-    readonly id: string;
-    readonly topicId: string;
-    readonly nonce: Uint8Array;
-    readonly expiresAt: number;
+/** Per-identity queue bounds enforced atomically across a multicast. */
+export interface QueueLimits {
+    readonly maximumItems: number;
+    readonly maximumBytes: number;
+    readonly maximumSenderItems: number;
+    readonly maximumSenderBytes: number;
+    readonly maximumSenderReferences: number;
+    readonly maximumAdmissionReferences: number;
+    readonly maximumGlobalItems: number;
+    readonly maximumGlobalBytes: number;
+    readonly maximumGlobalReferences: number;
 }
 
-/** Allocation bound applied while materializing one event page. */
+/** Allocation bound applied while materializing one queue page. */
 export interface PageReadConstraints {
     readonly maximumEncodedBytes: number;
 }
 
-/** Optional store-boundary instrumentation, primarily for deterministic tests. */
-export interface RelayStoreInstrumentation {
-    readonly eventJsonHydrated: (seq: bigint) => void;
+/** One retained queue reference and its shared delivery. */
+export interface QueuedDelivery {
+    readonly eventId: string;
+    readonly delivery: SignedDelivery;
 }
 
-/** One retained event associated with its never-reused topic sequence. */
-export interface RetainedRelayEvent {
-    readonly seq: bigint;
-    readonly event: SignedRelayEvent;
-}
-
-/**
- * Retained events after a cursor and the current topic head.
- *
- * Sequence gaps are expected after expiration or collapse. `head` is the
- * greatest sequence ever allocated and remains monotonic across those holes.
- */
-export interface EventPage {
-    readonly events: readonly RetainedRelayEvent[];
-    readonly head: bigint;
-    /** Whether no further retained event exists after the returned page. */
+/** One authenticated recipient queue page. */
+export interface QueuePage {
+    readonly deliveries: readonly QueuedDelivery[];
+    readonly head: string | null;
+    readonly acknowledgedThrough: string | null;
     readonly exhausted: boolean;
 }
 
-/** Atomic persistence operations required by the relay service. */
+/** Atomic persistence operations required by the identity-queue relay. */
 export interface RelayStore {
-    issueReadChallenge(
-        challenge: StoredReadChallenge,
+    publish(
+        delivery: SignedDelivery,
         now: number,
-        maximumOutstanding: number,
-    ): Promise<boolean>;
-    consumeReadChallenge(id: string, now: number): Promise<StoredReadChallenge | undefined>;
-    readPublishReceipt(topicId: string, id: string): Promise<PublishReceipt | undefined>;
-    publish(event: SignedRelayEvent, topicId: string, now: number): Promise<PublishOutcome>;
-    readEvents(
-        topicId: string,
-        since: bigint,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<PublishOutcome>;
+    readQueue(
+        recipient: Uint8Array,
+        after: string | null,
         limit: number,
         now: number,
         constraints: PageReadConstraints,
-    ): Promise<EventPage>;
+    ): Promise<QueuePage>;
+    acknowledge(recipient: Uint8Array, through: string, now: number): Promise<AcknowledgeOutcome>;
     pruneExpired(now: number): Promise<number>;
     health(): Promise<void>;
     close(): Promise<void>;

@@ -1,106 +1,69 @@
 # Security
 
-Murmur treats the relay as untrusted ordered storage. The relay sees topic
-descriptors, outer author keys, timing, sizes, expiration, and sequence
-activity. It does not receive topic secrets, identity secrets, profiles,
-friend-control plaintext, group descriptors, MLS application bytes, Welcome
-plaintext, epoch secrets, MLS PublicMessage headers, or Murmur identity
-credentials carried by Commits. Both Commit and application MLS messages are
-hidden in the same outer group ciphertext.
+Murmur protects application content from the relay, not communication metadata.
 
-Murmur has not received an independent security audit. The MLS implementation
-is a tested Murmur profile and RFC 9420 subset, not a claim of complete
-interoperability or a substitute for an audit.
+## Relay visibility
 
-## Guarantees
+The relay sees:
 
-- Friend request and response contents are recipient-confidential,
-  identity-authenticated, and outer-author unlinkable.
-- Friend control content is pairwise encrypted with distinct directional keys
-  and identity-signed.
-- Group membership changes are real TreeKEM Commits.
-- Group relay payloads use a strict versioned AEAD key domain derived from the
-  stable random topic secret, with a random 96-bit nonce and AAD binding the
-  envelope domain and complete topic. The Ed25519 capability secret is not
-  reused directly as an encryption key.
-- The relay cannot parse MLS headers or recover credentials or plaintext from
-  group ciphertext. Exact sizes and timing remain visible and can make a likely
-  Commit/application traffic type inferable.
-- Removed members cannot authenticate or decrypt later inner MLS application
-  events.
-- Every outbound relay event is stored exactly before network access.
-- Ambiguous publication retries the same bytes, ID, author, and signature.
-- MLS ratchets never advance only in RAM: cloned post-state and the exact event
-  commit atomically.
-- Relay order, not publish return order, chooses concurrent Commit winners.
-- Invalid, tampered, and wrong-topic-secret retained events cannot permanently
-  stall a topic.
-- Awaited `close()` and `destroy()` abort convergence, await serialized active
-  work, then zero live identity, topic, and epoch secrets.
+- sender and recipient public identities;
+- exact multicast fanout;
+- delivery sizes, timing, TTL, and per-inbox progress;
+- IP or trusted-ingress admission metadata.
 
-## Signed event age is not replay protection
+The relay does not receive identity roots, KeyPackage private keys, Welcome
+plaintext, MLS epochs, application plaintext, or application history.
 
-A valid event that was never accepted remains publishable regardless of how old
-its `createdAt` is. This is deliberate: offline durable outboxes and clients
-whose clocks are behind the relay must not lose signed work merely because time
-passed before connectivity returned.
+## Trust model
 
-The relay still rejects timestamps more than five minutes in its future and
-rejects an `expiresAt` deadline that has elapsed. Durable `(topic, id)` receipts
-provide idempotency for accepted content and collision detection for changed
-authenticated content. Applications that need a business-level freshness limit
-must encode and authenticate that policy inside the opaque payload; relay event
-age is not a revocation or anti-replay boundary.
+The relay is untrusted for confidentiality and correctness. It can delay, drop,
+reorder across inboxes, replay retained ciphertext, equivocate, or become
+unavailable. It cannot forge a valid sender delivery or decrypt MLS content.
 
-## Collapse is arrival-ordered
+UUIDv7 order is a relay consistency service, not a cryptographic proof. The MLS
+committer rule removes dependence on a shared cross-inbox order. Clients still
+validate exact recipients, epoch, sender, committer control, KeyPackage
+lifetime, and every cryptographic transition.
 
-The relay applies collapse when it accepts a publication. It does not compare
-`createdAt` or inspect an application version, so a delayed publication
-carrying older logical state can arrive later and delete newer retained state
-from the same author and collapse key.
+## Durable client invariants
 
-Applications using collapse must include an authenticated logical version in
-the opaque payload and reject regressions when applying events. This ordering
-belongs above the untrusted relay boundary: letting the relay interpret an
-application version would give it message semantics and would not make a
-malicious relay trustworthy.
+- Persist effects, replay state, and cursor before acknowledging.
+- Persist post-ratchet epochs and exact outboxes before publishing.
+- Adopt Commits only from authenticated queue echoes.
+- Keep active and staged epochs separate until the echo wins.
+- Treat malformed authenticated input as terminal queue progress.
+- Never let application callbacks mutate the `murmur/` storage namespace.
+- Zero temporary secret and plaintext byte arrays in success and error paths.
 
-## Relay and storage limits
-
-- A relay can deny service by refusing, deleting, delaying, or replaying
-  ciphertext. Cryptography does not guarantee delivery or availability.
-- Only events carrying an explicit `expiresAt` are omitted and eligible for
-  pruning after that deadline. Events without `expiresAt` are not age-pruned;
-  topic heads and idempotency receipts are durable, and the current relay does
-  not age-prune topics or receipts.
-- Collapse can delete older retained events from the same topic, author signing
-  key, and collapse key. It leaves stable sequence holes and does not remove the
-  corresponding durable idempotency receipts.
-- A current group member can read and write current group content.
-- Removed members retain the stable relay capability and topic secret, so they
-  can decrypt the outer envelope and inject junk. They lack newer MLS epoch
-  secrets and therefore cannot decrypt or authenticate valid newer-epoch inner
-  content.
-- The outer group key remains stable for the topic-secret lifetime. Stay well
-  below `2^32` randomly nonced envelopes under one topic secret and create a new
-  group before that operational ceiling. Inner MLS contains outer-layer
-  weakness for application PrivateMessages, but PublicMessage Commit headers
-  and credentials rely on the outer layer for relay confidentiality.
+Losing or rolling back the single-device store can lose identity and MLS state.
+The relay cannot reconstruct it. A stale store behind the acknowledged queue
+prefix fails explicitly rather than skipping missing MLS state.
 
 ## Limits
 
-- Public identity keys still need an authenticated out-of-band exchange.
-- Compromise of the single identity root gives both Ed25519 signing and the
-  converted X25519 key-agreement capability; they are intentionally one
-  recovery and compromise domain.
-- The public identity inbox is intentionally linkable to that identity.
-- Invitation verification proves exact retained Commit/Welcome consistency,
-  but a malicious inviter can name its losing fork. Joining therefore trusts an
-  honest inviter/current group member; relay order is not a membership-validity
-  oracle for the joiner.
-- Local storage compromise exposes the identity, friend capabilities,
-  KeyPackage bundles, and MLS checkpoints held there.
-- The relay can observe and correlate topic IDs, outer event author keys,
-  timing, sizes, expiration, collapse-key equality, and sequence activity.
-- The relay can deny service, withhold, reorder, or delete retained data.
-- This implementation has not received an independent cryptographic audit.
+Pending sessions, buffered events, replay entries, proposals, members, outboxes,
+ciphertext, fanout, queue bytes, sender bytes, and global relay storage are all
+bounded. Per-sender reference quotas charge multicast fanout, but identities are
+free to create: relay quotas bound resource usage, not fair availability under
+a Sybil attack. Probabilistic replay overflow can reject legitimate new traffic
+but never exposes a probable replay to the application.
+
+Relay UUIDv7 time is an untrusted ordering input. The inbox processor accepts
+its magnitude only inside a bounded local plausibility window before using it
+for expiry and replay garbage collection. A malicious relay can still delay
+traffic within that window; MLS generation and epoch validation remain the
+cryptographic backstop.
+
+## Deployment requirements
+
+- Terminate TLS before the Node relay.
+- Apply non-Sybil authenticated admission before forwarding and enforce an
+  outstanding-fanout budget per admitted principal. A socket-address rate
+  limit alone is not sufficient for a public relay.
+- Protect the client store as identity and epoch secret material.
+- Back up client state atomically; restoring a stale backup may be
+  unrecoverable.
+- Monitor queue, sender, and global backpressure.
+
+Murmur has not received an independent security audit. Its MLS implementation
+is a tested RFC 9420 profile, not a claim of complete RFC feature coverage.

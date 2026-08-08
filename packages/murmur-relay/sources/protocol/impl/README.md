@@ -1,14 +1,10 @@
 # Protocol implementation
 
-Mechanical transformations for strict wire decoding, canonical event encoding,
-signature verification, and event fingerprinting. Public callers use the
-exports from the parent module.
+Strict identity-queue delivery, read, and acknowledgement codecs plus canonical
+Ed25519 signing bytes. Every decoder rejects unknown fields and non-canonical
+base64url or integer representations.
 
 ```text
-JSON topic/event -> strict field decode -> normalized protocol value
-normalized event -> canonical signing bytes -> Ed25519 verify
-exact event bytes -------------------------> stable fingerprint
+JSON delivery/read/ack -> exact decode -> canonical signed bytes -> verify
+complete signed delivery -------------------------------> fingerprint
 ```
-
-The implementation rejects unknown or ambiguous forms before storage or policy
-code sees them.

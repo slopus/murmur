@@ -1,5 +1,5 @@
 import { ed25519, x25519 } from "@noble/curves/ed25519";
-import { sha256 } from "@noble/hashes/sha256";
+import { sha256 } from "@noble/hashes/sha2";
 import { randomBytes as nobleRandomBytes } from "@noble/hashes/utils";
 import { zeroBytes } from "../utils/index.js";
 import {

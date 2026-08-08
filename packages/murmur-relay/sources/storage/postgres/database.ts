@@ -165,7 +165,7 @@ export class PGliteDatabase implements PostgresDatabase {
         return this.#database.query<Row>(text, parameters(values));
     }
 
-    /** Run one real PGlite transaction, optionally with a repeatable snapshot. */
+    /** Run one real PGlite transaction, optionally with repeatable-read isolation. */
     async transaction<Result>(
         operation: (transaction: PostgresQuery) => Promise<Result>,
         isolation: "read committed" | "repeatable read" = "read committed",

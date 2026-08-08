@@ -6,355 +6,316 @@ import {
 } from "node:sqlite";
 import {
     RelayError,
-    parseSignedRelayEvent,
-    relayEventFingerprint,
-    type SignedRelayEvent,
+    deliveryFingerprint,
+    parseSignedDelivery,
+    type SignedDelivery,
 } from "../../protocol/index.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
+import { nextUuidV7 } from "../../utils/uuidV7.js";
 import {
-    encodeStoredRelayEvent,
-    selectEventPageMetadata,
+    encodeStoredDelivery,
+    selectQueuePageMetadata,
     type StoredPageCandidate,
 } from "../page.js";
+import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
-    EventPage,
+    AcknowledgeOutcome,
     PageReadConstraints,
     PublishOutcome,
-    PublishReceipt,
+    QueuedDelivery,
+    QueueLimits,
+    QueuePage,
     RelayStore,
-    RelayStoreInstrumentation,
-    RetainedRelayEvent,
-    StoredReadChallenge,
 } from "../types.js";
+
+const SQL_VALUE_CHUNK = 5_000;
 
 /** SQLite store construction options for embedding. */
 export interface SqliteRelayStoreOptions {
     readonly database?: DatabaseSync;
-    readonly instrumentation?: RelayStoreInstrumentation;
 }
 
 function record(value: unknown): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
-        throw new Error("Invalid SQLite relay row");
+        throw new Error("Invalid SQLite queue row");
     }
     return value as Record<string, unknown>;
 }
 
 function textColumn(value: unknown, name: string): string {
     if (typeof value !== "string") {
-        throw new Error(`Invalid ${name} in SQLite relay store`);
+        throw new Error(`Invalid ${name} in SQLite queue store`);
     }
     return value;
 }
 
-/** Bounded retained-candidate query kept visible for query-plan regression tests. */
-export const SQLITE_READ_EVENTS_QUERY = `
-    SELECT seq, encoded_bytes
-    FROM murmur_relay_events
-    WHERE topic_id = ? AND seq > ? AND (expires_at IS NULL OR expires_at > ?)
-    ORDER BY seq
-    LIMIT ?`;
-
-/** Build the exact selected-sequence hydration query for tests and store reads. */
-export function sqliteHydrateEventsQuery(count: number): string {
-    if (!Number.isSafeInteger(count) || count < 1) {
-        throw new Error("SQLite hydration count must be a positive safe integer");
-    }
-    return `
-        SELECT seq, event_json
-        FROM murmur_relay_events
-        WHERE topic_id = ? AND seq IN (${Array.from({ length: count }, () => "?").join(", ")})
-        ORDER BY seq`;
+function nullableTextColumn(value: unknown, name: string): string | null {
+    return value === null ? null : textColumn(value, name);
 }
 
-/** Fresh-schema SQLite ordered event store. */
+/** Fresh-schema SQLite identity-queue store. */
 export class SqliteRelayStore implements RelayStore {
     readonly #database: DatabaseSync;
-    readonly #instrumentation: RelayStoreInstrumentation | undefined;
     #closed = false;
 
     constructor(path: string, options: SqliteRelayStoreOptions = {}) {
         this.#database = options.database ?? new DatabaseSync(path);
-        this.#instrumentation = options.instrumentation;
         this.#database.exec("PRAGMA journal_mode = WAL");
         this.#database.exec("PRAGMA foreign_keys = ON");
+        this.#database.exec("PRAGMA busy_timeout = 5000");
         this.#initializeSchema();
     }
 
-    async issueReadChallenge(
-        challenge: StoredReadChallenge,
+    async publish(
+        delivery: SignedDelivery,
         now: number,
-        maximumOutstanding: number,
-    ): Promise<boolean> {
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<PublishOutcome> {
         this.#assertOpen();
+        if (!(admissionPrincipal instanceof Uint8Array) || admissionPrincipal.length !== 32) {
+            throw new Error("Invalid admission principal");
+        }
+        await this.pruneExpired(now);
         this.#database.exec("BEGIN IMMEDIATE");
         try {
-            const deleted = safeNumberColumn(
-                this.#run(
-                    "DELETE FROM murmur_relay_read_challenges WHERE expires_at <= ?",
-                    BigInt(now),
-                ).changes,
+            const fingerprint = deliveryFingerprint(delivery);
+            const existing = this.#get(
+                `SELECT event_id, fingerprint
+                 FROM murmur_queue_deliveries
+                 WHERE sender = ? AND delivery_id = ?`,
+                delivery.sender,
+                delivery.id,
             );
-            if (deleted > 0) {
-                this.#run(
-                    `UPDATE murmur_relay_challenge_state
-                     SET outstanding = MAX(0, outstanding - ?)
-                     WHERE singleton = 1`,
-                    BigInt(deleted),
-                );
-            }
-            const state = this.#requiredGet(
-                "SELECT outstanding FROM murmur_relay_challenge_state WHERE singleton = 1",
-            );
-            if (bigintColumn(state.outstanding) >= BigInt(maximumOutstanding)) {
-                this.#database.exec("COMMIT");
-                return false;
-            }
-            this.#run(
-                `INSERT INTO murmur_relay_read_challenges
-                    (id, topic_id, nonce, expires_at)
-                 VALUES (?, ?, ?, ?)`,
-                challenge.id,
-                challenge.topicId,
-                challenge.nonce,
-                BigInt(challenge.expiresAt),
-            );
-            this.#run(
-                `UPDATE murmur_relay_challenge_state
-                 SET outstanding = outstanding + 1 WHERE singleton = 1`,
-            );
-            this.#database.exec("COMMIT");
-            return true;
-        } catch (error) {
-            this.#rollback();
-            throw error;
-        }
-    }
-
-    async consumeReadChallenge(id: string, now: number): Promise<StoredReadChallenge | undefined> {
-        this.#assertOpen();
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            const row = this.#get(
-                `DELETE FROM murmur_relay_read_challenges
-                 WHERE id = ?
-                 RETURNING id, topic_id, nonce, expires_at`,
-                id,
-            );
-            if (row !== undefined) {
-                this.#run(
-                    `UPDATE murmur_relay_challenge_state
-                     SET outstanding = MAX(0, outstanding - 1)
-                     WHERE singleton = 1`,
-                );
-            }
-            this.#database.exec("COMMIT");
-            if (row === undefined || bigintColumn(row.expires_at) <= BigInt(now)) return undefined;
-            return {
-                id: textColumn(row.id, "challenge id"),
-                topicId: textColumn(row.topic_id, "challenge topic"),
-                nonce: copyBytes(row.nonce, "challenge nonce"),
-                expiresAt: safeNumberColumn(row.expires_at),
-            };
-        } catch (error) {
-            this.#rollback();
-            throw error;
-        }
-    }
-
-    #initializeSchema(): void {
-        const marker = this.#get(
-            `SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name = 'murmur_relay_schema'`,
-        );
-        if (marker === undefined) {
-            const legacy = this.#get(
-                `SELECT name FROM sqlite_master
-                 WHERE type = 'table' AND name LIKE 'murmur_relay_%' LIMIT 1`,
-            );
-            if (legacy !== undefined) {
-                throw new Error("Incompatible legacy SQLite relay schema");
-            }
-        } else {
-            const schema = this.#requiredGet(
-                "SELECT version FROM murmur_relay_schema WHERE singleton = 1",
-            );
-            if (bigintColumn(schema.version) !== 3n) {
-                throw new Error("Unsupported SQLite relay schema version");
-            }
-            return;
-        }
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            this.#database.exec(`
-            CREATE TABLE murmur_relay_schema (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                version INTEGER NOT NULL
-            ) STRICT;
-            INSERT INTO murmur_relay_schema (singleton, version) VALUES (1, 3);
-            CREATE TABLE murmur_relay_topics (
-                id TEXT PRIMARY KEY,
-                head INTEGER NOT NULL CHECK (head >= 0)
-            ) STRICT;
-            CREATE TABLE murmur_relay_receipts (
-                topic_id TEXT NOT NULL REFERENCES murmur_relay_topics(id) ON DELETE CASCADE,
-                id TEXT NOT NULL,
-                seq INTEGER NOT NULL CHECK (seq > 0),
-                fingerprint BLOB NOT NULL,
-                PRIMARY KEY (topic_id, id)
-            ) STRICT;
-            CREATE TABLE murmur_relay_events (
-                topic_id TEXT NOT NULL REFERENCES murmur_relay_topics(id) ON DELETE CASCADE,
-                seq INTEGER NOT NULL CHECK (seq > 0),
-                event_json TEXT NOT NULL,
-                encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes > 0),
-                expires_at INTEGER,
-                author_signing_key BLOB NOT NULL,
-                collapse_key BLOB,
-                PRIMARY KEY (topic_id, seq)
-            ) STRICT;
-            CREATE INDEX murmur_relay_events_page
-                ON murmur_relay_events(topic_id, seq, encoded_bytes, expires_at);
-            CREATE INDEX murmur_relay_events_expiration
-                ON murmur_relay_events(expires_at) WHERE expires_at IS NOT NULL;
-            CREATE INDEX murmur_relay_events_collapse
-                ON murmur_relay_events(topic_id, author_signing_key, collapse_key)
-                WHERE collapse_key IS NOT NULL;
-            CREATE TABLE murmur_relay_read_challenges (
-                id TEXT PRIMARY KEY,
-                topic_id TEXT NOT NULL,
-                nonce BLOB NOT NULL,
-                expires_at INTEGER NOT NULL
-            ) STRICT;
-            CREATE INDEX murmur_relay_challenge_expiration
-                ON murmur_relay_read_challenges(expires_at);
-            CREATE TABLE murmur_relay_challenge_state (
-                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                outstanding INTEGER NOT NULL CHECK (outstanding >= 0)
-            ) STRICT;
-            INSERT INTO murmur_relay_challenge_state (singleton, outstanding)
-                VALUES (1, 0);
-            `);
-            this.#database.exec("COMMIT");
-        } catch (error) {
-            this.#rollback();
-            throw error;
-        }
-    }
-
-    async readPublishReceipt(topicId: string, id: string): Promise<PublishReceipt | undefined> {
-        this.#assertOpen();
-        const row = this.#get(
-            "SELECT seq, fingerprint FROM murmur_relay_receipts WHERE topic_id = ? AND id = ?",
-            topicId,
-            id,
-        );
-        return row === undefined
-            ? undefined
-            : {
-                  seq: bigintColumn(row.seq),
-                  fingerprint: copyBytes(row.fingerprint, "event fingerprint"),
-              };
-    }
-
-    async publish(event: SignedRelayEvent, topicId: string, _now: number): Promise<PublishOutcome> {
-        this.#assertOpen();
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            const fingerprint = relayEventFingerprint(event);
-            const duplicate = this.#get(
-                "SELECT seq, fingerprint FROM murmur_relay_receipts WHERE topic_id = ? AND id = ?",
-                topicId,
-                event.id,
-            );
-            if (duplicate !== undefined) {
-                if (!equalBytes(copyBytes(duplicate.fingerprint, "fingerprint"), fingerprint)) {
-                    throw new RelayError(409, "Event identifier collision", {
+            if (existing !== undefined) {
+                const storedFingerprint = copyBytes(existing.fingerprint, "delivery fingerprint");
+                if (!equalBytes(storedFingerprint, fingerprint)) {
+                    throw new RelayError(409, "Delivery identifier collision", {
                         error: "id_collision",
                     });
                 }
                 this.#database.exec("COMMIT");
-                return { seq: bigintColumn(duplicate.seq), duplicate: true };
+                return {
+                    eventId: textColumn(existing.event_id, "event ID"),
+                    duplicate: true,
+                };
             }
-            this.#run(
-                "INSERT INTO murmur_relay_topics (id, head) VALUES (?, 0) ON CONFLICT DO NOTHING",
-                topicId,
+
+            const encoded = encodeStoredDelivery(delivery);
+            const global = this.#requiredGet(
+                `SELECT last_event_id, pending_items, pending_bytes, pending_references
+                 FROM murmur_queue_global WHERE singleton = 1`,
             );
-            const topic = this.#requiredGet(
-                "SELECT head FROM murmur_relay_topics WHERE id = ?",
-                topicId,
-            );
-            const seq = bigintColumn(topic.head) + 1n;
-            this.#run("UPDATE murmur_relay_topics SET head = ? WHERE id = ?", seq, topicId);
-            if (event.collapseKey !== undefined) {
-                this.#run(
-                    `DELETE FROM murmur_relay_events
-                     WHERE topic_id = ? AND author_signing_key = ? AND collapse_key = ?`,
-                    topicId,
-                    event.author.signingKey,
-                    event.collapseKey,
-                );
+            if (
+                bigintColumn(global.pending_items) + 1n > BigInt(limits.maximumGlobalItems) ||
+                bigintColumn(global.pending_bytes) + BigInt(encoded.encodedBytes) >
+                    BigInt(limits.maximumGlobalBytes) ||
+                bigintColumn(global.pending_references) + BigInt(delivery.recipients.length) >
+                    BigInt(limits.maximumGlobalReferences)
+            ) {
+                throw new RelayError(503, "Relay pending-storage quota exceeded", {
+                    error: "relay_full",
+                });
             }
-            const encoded = encodeStoredRelayEvent(event);
+            const admissionUsage = this.#requiredGet(
+                `SELECT COUNT(*) AS reference_count
+                 FROM murmur_queue_references
+                 WHERE admission_principal = ?`,
+                admissionPrincipal,
+            );
+            if (
+                bigintColumn(admissionUsage.reference_count) + BigInt(delivery.recipients.length) >
+                BigInt(limits.maximumAdmissionReferences)
+            ) {
+                throw new RelayError(429, "Admission-principal fanout quota exceeded", {
+                    error: "admission_full",
+                });
+            }
+            const senderUsage = this.#requiredGet(
+                `SELECT COUNT(*) AS item_count,
+                        COALESCE(SUM(encoded_bytes), 0) AS byte_count,
+                        (SELECT COUNT(*)
+                         FROM murmur_queue_references
+                         WHERE sender = ?) AS reference_count
+                 FROM murmur_queue_deliveries
+                 WHERE sender = ?`,
+                delivery.sender,
+                delivery.sender,
+            );
+            if (
+                bigintColumn(senderUsage.item_count) + 1n > BigInt(limits.maximumSenderItems) ||
+                bigintColumn(senderUsage.byte_count) + BigInt(encoded.encodedBytes) >
+                    BigInt(limits.maximumSenderBytes) ||
+                bigintColumn(senderUsage.reference_count) + BigInt(delivery.recipients.length) >
+                    BigInt(limits.maximumSenderReferences)
+            ) {
+                throw new RelayError(429, "Sender pending-storage quota exceeded", {
+                    error: "sender_full",
+                });
+            }
+            const targetValues = delivery.recipients.map(() => "(?)").join(", ");
+            const recipientUsage = this.#all(
+                `WITH targets(recipient) AS (VALUES ${targetValues})
+                 SELECT targets.recipient,
+                        COALESCE(queue.pending_items, 0) AS item_count,
+                        COALESCE(queue.pending_bytes, 0) AS byte_count
+                 FROM targets
+                 LEFT JOIN murmur_queues AS queue
+                   ON queue.recipient = targets.recipient`,
+                ...delivery.recipients,
+            );
+            if (recipientUsage.length !== delivery.recipients.length) {
+                throw new Error("SQLite recipient usage did not cover every target");
+            }
+            for (const usage of recipientUsage) {
+                if (
+                    bigintColumn(usage.item_count) >= BigInt(limits.maximumItems) ||
+                    bigintColumn(usage.byte_count) + BigInt(encoded.encodedBytes) >
+                        BigInt(limits.maximumBytes)
+                ) {
+                    throw new RelayError(429, "Recipient queue quota exceeded", {
+                        error: "queue_full",
+                    });
+                }
+            }
+
+            const lastEventId =
+                global.last_event_id === null
+                    ? null
+                    : textColumn(global.last_event_id, "last event ID");
+            const eventId = nextUuidV7(now, lastEventId);
             this.#run(
-                `INSERT INTO murmur_relay_events
-                    (topic_id, seq, event_json, encoded_bytes, expires_at,
-                     author_signing_key, collapse_key)
+                `UPDATE murmur_queue_global
+                 SET last_event_id = ?,
+                     pending_items = pending_items + 1,
+                     pending_bytes = pending_bytes + ?,
+                     pending_references = pending_references + ?
+                 WHERE singleton = 1`,
+                eventId,
+                BigInt(encoded.encodedBytes),
+                BigInt(delivery.recipients.length),
+            );
+            this.#run(
+                `INSERT INTO murmur_queue_deliveries
+                    (sender, delivery_id, event_id, fingerprint, delivery_json,
+                     encoded_bytes, expires_at)
                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                topicId,
-                seq,
+                delivery.sender,
+                delivery.id,
+                eventId,
+                fingerprint,
                 encoded.json,
                 BigInt(encoded.encodedBytes),
-                event.expiresAt === undefined ? null : BigInt(event.expiresAt),
-                event.author.signingKey,
-                event.collapseKey ?? null,
+                BigInt(delivery.expiresAt),
             );
+            const queueValues = delivery.recipients.map(() => "(?, ?, NULL, 1, ?)").join(", ");
+            const queueParameters = delivery.recipients.flatMap((recipient) => [
+                recipient,
+                eventId,
+                BigInt(encoded.encodedBytes),
+            ]);
             this.#run(
-                `INSERT INTO murmur_relay_receipts (topic_id, id, seq, fingerprint)
-                 VALUES (?, ?, ?, ?)`,
-                topicId,
-                event.id,
-                seq,
-                fingerprint,
+                `INSERT INTO murmur_queues
+                    (recipient, head, acknowledged_through, pending_items, pending_bytes)
+                 VALUES ${queueValues}
+                 ON CONFLICT (recipient) DO UPDATE SET
+                    head = excluded.head,
+                    pending_items = murmur_queues.pending_items + 1,
+                    pending_bytes = murmur_queues.pending_bytes + excluded.pending_bytes`,
+                ...queueParameters,
+            );
+            const referenceValues = delivery.recipients.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
+            const referenceParameters = delivery.recipients.flatMap((recipient) => [
+                recipient,
+                eventId,
+                delivery.sender,
+                delivery.id,
+                BigInt(encoded.encodedBytes),
+                admissionPrincipal,
+            ]);
+            this.#run(
+                `INSERT INTO murmur_queue_references
+                    (recipient, event_id, sender, delivery_id, encoded_bytes,
+                     admission_principal)
+                 VALUES ${referenceValues}`,
+                ...referenceParameters,
             );
             this.#database.exec("COMMIT");
-            return { seq, duplicate: false };
-        } catch (error) {
+            return { eventId, duplicate: false };
+        } catch (error: unknown) {
             this.#rollback();
             throw error;
         }
     }
 
-    async readEvents(
-        topicId: string,
-        since: bigint,
+    async readQueue(
+        recipient: Uint8Array,
+        after: string | null,
         limit: number,
         now: number,
         constraints: PageReadConstraints,
-    ): Promise<EventPage> {
+    ): Promise<QueuePage> {
         this.#assertOpen();
         this.#database.exec("BEGIN");
         try {
-            const topic = this.#get("SELECT head FROM murmur_relay_topics WHERE id = ?", topicId);
-            if (topic === undefined) {
+            const queue = this.#get(
+                `SELECT head, acknowledged_through
+                 FROM murmur_queues WHERE recipient = ?`,
+                recipient,
+            );
+            if (queue === undefined) {
                 this.#database.exec("COMMIT");
-                return { events: [], head: 0n, exhausted: true };
+                return {
+                    deliveries: [],
+                    head: after,
+                    acknowledgedThrough: after,
+                    exhausted: true,
+                };
             }
-            const rows = this.#all(
-                SQLITE_READ_EVENTS_QUERY,
-                topicId,
-                since,
+            const head = textColumn(queue.head, "queue head");
+            const acknowledgedThrough = nullableTextColumn(
+                queue.acknowledged_through,
+                "acknowledged event ID",
+            );
+            if (acknowledgedThrough !== null && (after === null || after < acknowledgedThrough)) {
+                throw new RelayError(409, "Queue cursor was already trimmed", {
+                    error: "cursor_trimmed",
+                    acknowledgedThrough,
+                });
+            }
+            if (after !== null && after > head) {
+                throw new RelayError(400, "Queue cursor exceeds its head", {
+                    error: "malformed",
+                });
+            }
+
+            const metadata = this.#all(
+                `SELECT reference.event_id, delivery.encoded_bytes
+                 FROM murmur_queue_references AS reference
+                 JOIN murmur_queue_deliveries AS delivery
+                   ON delivery.sender = reference.sender
+                  AND delivery.delivery_id = reference.delivery_id
+                 WHERE reference.recipient = ?
+                   AND (? IS NULL OR reference.event_id > ?)
+                   AND delivery.expires_at > ?
+                 ORDER BY reference.event_id
+                 LIMIT ?`,
+                recipient,
+                after,
+                after,
                 BigInt(now),
                 BigInt(limit + 1),
             );
-            const selection = selectEventPageMetadata(
-                rows.map(
+            const selection = selectQueuePageMetadata(
+                metadata.map(
                     (row): StoredPageCandidate => ({
-                        seq: bigintColumn(row.seq),
+                        eventId: textColumn(row.event_id, "event ID"),
                         encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
-                bigintColumn(topic.head),
+                head,
+                acknowledgedThrough,
+                after,
                 limit,
                 constraints,
             );
@@ -362,33 +323,152 @@ export class SqliteRelayStore implements RelayStore {
                 selection.candidates.length === 0
                     ? []
                     : this.#all(
-                          sqliteHydrateEventsQuery(selection.candidates.length),
-                          topicId,
-                          ...selection.candidates.map(({ seq }) => seq),
+                          `SELECT reference.event_id, delivery.delivery_json
+                           FROM murmur_queue_references AS reference
+                           JOIN murmur_queue_deliveries AS delivery
+                             ON delivery.sender = reference.sender
+                            AND delivery.delivery_id = reference.delivery_id
+                           WHERE reference.recipient = ?
+                             AND reference.event_id IN (${selection.candidates
+                                 .map(() => "?")
+                                 .join(", ")})
+                           ORDER BY reference.event_id`,
+                          recipient,
+                          ...selection.candidates.map(({ eventId }) => eventId),
                       );
             if (hydrated.length !== selection.candidates.length) {
-                throw new Error("SQLite relay hydration did not match selected events");
+                throw new Error("SQLite queue hydration did not match selected references");
             }
-            const events = hydrated.map((row, index): RetainedRelayEvent => {
-                const seq = bigintColumn(row.seq);
-                if (seq !== selection.candidates[index]!.seq) {
-                    throw new Error("SQLite relay hydration order is inconsistent");
+            const deliveries = hydrated.map((row, index): QueuedDelivery => {
+                const eventId = textColumn(row.event_id, "event ID");
+                if (eventId !== selection.candidates[index]!.eventId) {
+                    throw new Error("SQLite queue hydration order is inconsistent");
                 }
-                const eventJson = textColumn(row.event_json, "event JSON");
-                this.#instrumentation?.eventJsonHydrated(seq);
                 return {
-                    seq,
-                    event: parseSignedRelayEvent(JSON.parse(eventJson) as unknown),
+                    eventId,
+                    delivery: parseSignedDelivery(
+                        JSON.parse(textColumn(row.delivery_json, "delivery JSON")) as unknown,
+                    ),
                 };
             });
-            const page: EventPage = {
-                events,
+            this.#database.exec("COMMIT");
+            return {
+                deliveries,
                 head: selection.head,
+                acknowledgedThrough: selection.acknowledgedThrough,
                 exhausted: selection.exhausted,
             };
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
+    }
+
+    async acknowledge(
+        recipient: Uint8Array,
+        through: string,
+        now: number,
+    ): Promise<AcknowledgeOutcome> {
+        this.#assertOpen();
+        await this.pruneExpired(now);
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            const queue = this.#get(
+                `SELECT head, acknowledged_through
+                 FROM murmur_queues WHERE recipient = ?`,
+                recipient,
+            );
+            if (queue === undefined) {
+                this.#database.exec("COMMIT");
+                return { removed: 0 };
+            }
+            const head = textColumn(queue.head, "queue head");
+            const acknowledgedThrough = nullableTextColumn(
+                queue.acknowledged_through,
+                "acknowledged event ID",
+            );
+            if (acknowledgedThrough !== null && through < acknowledgedThrough) {
+                throw new RelayError(409, "Acknowledgement regresses queue progress", {
+                    error: "ack_regression",
+                    acknowledgedThrough,
+                });
+            }
+            if (through > head) {
+                throw new RelayError(409, "Acknowledgement exceeds queue head", {
+                    error: "ack_future",
+                    head,
+                });
+            }
+            const affected = this.#all(
+                `SELECT sender, delivery_id, encoded_bytes
+                 FROM murmur_queue_references
+                 WHERE recipient = ? AND event_id <= ?`,
+                recipient,
+                through,
+            );
+            const removed = safeNumberColumn(
+                this.#run(
+                    `DELETE FROM murmur_queue_references
+                     WHERE recipient = ? AND event_id <= ?`,
+                    recipient,
+                    through,
+                ).changes,
+            );
+            const removedBytes = affected.reduce(
+                (total, row) => total + bigintColumn(row.encoded_bytes),
+                0n,
+            );
+            this.#run(
+                `UPDATE murmur_queues
+                 SET acknowledged_through = ?,
+                     pending_items = pending_items - ?,
+                     pending_bytes = pending_bytes - ?
+                 WHERE recipient = ?`,
+                through,
+                BigInt(removed),
+                removedBytes,
+                recipient,
+            );
+            let orphanedItems = 0n;
+            let orphanedBytes = 0n;
+            for (const row of affected) {
+                const stored = this.#get(
+                    `SELECT encoded_bytes
+                     FROM murmur_queue_deliveries
+                     WHERE sender = ? AND delivery_id = ?`,
+                    copyBytes(row.sender, "delivery sender"),
+                    textColumn(row.delivery_id, "delivery ID"),
+                );
+                const deleted = this.#run(
+                    `DELETE FROM murmur_queue_deliveries
+                     WHERE sender = ? AND delivery_id = ?
+                       AND NOT EXISTS (
+                           SELECT 1 FROM murmur_queue_references AS reference
+                           WHERE reference.sender = murmur_queue_deliveries.sender
+                             AND reference.delivery_id = murmur_queue_deliveries.delivery_id
+                       )`,
+                    copyBytes(row.sender, "delivery sender"),
+                    textColumn(row.delivery_id, "delivery ID"),
+                ).changes;
+                if (deleted === 1n && stored !== undefined) {
+                    orphanedItems += 1n;
+                    orphanedBytes += bigintColumn(stored.encoded_bytes);
+                }
+            }
+            this.#run(
+                `UPDATE murmur_queue_global
+                 SET pending_items = pending_items - ?,
+                     pending_bytes = pending_bytes - ?,
+                     pending_references = pending_references - ?
+                 WHERE singleton = 1`,
+                orphanedItems,
+                orphanedBytes,
+                BigInt(removed),
+            );
+            this.#deleteEmptyQueue(recipient);
             this.#database.exec("COMMIT");
-            return page;
-        } catch (error) {
+            return { removed };
+        } catch (error: unknown) {
             this.#rollback();
             throw error;
         }
@@ -396,12 +476,15 @@ export class SqliteRelayStore implements RelayStore {
 
     async pruneExpired(now: number): Promise<number> {
         this.#assertOpen();
-        return safeNumberColumn(
-            this.#run(
-                "DELETE FROM murmur_relay_events WHERE expires_at IS NOT NULL AND expires_at <= ?",
-                BigInt(now),
-            ).changes,
-        );
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            const removed = this.#pruneExpired(now);
+            this.#database.exec("COMMIT");
+            return removed;
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
     }
 
     async health(): Promise<void> {
@@ -416,38 +499,267 @@ export class SqliteRelayStore implements RelayStore {
         }
     }
 
+    #initializeSchema(): void {
+        const legacy = this.#get(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name LIKE 'murmur_relay_%'
+             LIMIT 1`,
+        );
+        if (legacy !== undefined) {
+            throw new Error("Legacy SQLite relay schema is not supported; use a clean database");
+        }
+        const marker = this.#get(
+            `SELECT name FROM sqlite_master
+             WHERE type = 'table' AND name = 'murmur_queue_schema'`,
+        );
+        if (marker === undefined) {
+            const incomplete = this.#get(
+                `SELECT name FROM sqlite_master
+                 WHERE type = 'table'
+                   AND name LIKE 'murmur_queue_%'
+                 LIMIT 1`,
+            );
+            if (incomplete !== undefined) {
+                throw new Error("Incomplete SQLite queue schema");
+            }
+        } else {
+            const schema = this.#requiredGet(
+                "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
+            );
+            if (bigintColumn(schema.version) !== 2n) {
+                throw new Error("Unsupported SQLite queue schema version");
+            }
+            return;
+        }
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            this.#database.exec(`
+            CREATE TABLE murmur_queue_schema (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                version INTEGER NOT NULL
+            ) STRICT;
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 2);
+            CREATE TABLE murmur_queue_global (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                last_event_id TEXT CHECK (
+                    last_event_id IS NULL OR length(last_event_id) = 36
+                ),
+                pending_items INTEGER NOT NULL CHECK (pending_items >= 0),
+                pending_bytes INTEGER NOT NULL CHECK (pending_bytes >= 0),
+                pending_references INTEGER NOT NULL CHECK (pending_references >= 0)
+            ) STRICT;
+            INSERT INTO murmur_queue_global
+                (singleton, last_event_id, pending_items, pending_bytes, pending_references)
+            VALUES (1, NULL, 0, 0, 0);
+            CREATE TABLE murmur_queues (
+                recipient BLOB PRIMARY KEY CHECK (length(recipient) = 32),
+                head TEXT NOT NULL CHECK (length(head) = 36),
+                acknowledged_through TEXT CHECK (
+                    acknowledged_through IS NULL OR (
+                        length(acknowledged_through) = 36
+                        AND acknowledged_through <= head
+                    )
+                ),
+                pending_items INTEGER NOT NULL CHECK (pending_items >= 0),
+                pending_bytes INTEGER NOT NULL CHECK (pending_bytes >= 0)
+            ) STRICT;
+            CREATE TABLE murmur_queue_deliveries (
+                sender BLOB NOT NULL CHECK (length(sender) = 32),
+                delivery_id TEXT NOT NULL,
+                event_id TEXT NOT NULL UNIQUE CHECK (length(event_id) = 36),
+                fingerprint BLOB NOT NULL CHECK (length(fingerprint) = 32),
+                delivery_json TEXT NOT NULL,
+                encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes > 0),
+                expires_at INTEGER NOT NULL,
+                PRIMARY KEY (sender, delivery_id)
+            ) STRICT;
+            CREATE INDEX murmur_queue_delivery_expiration
+                ON murmur_queue_deliveries(expires_at);
+            CREATE TABLE murmur_queue_references (
+                recipient BLOB NOT NULL REFERENCES murmur_queues(recipient)
+                    ON DELETE CASCADE,
+                event_id TEXT NOT NULL CHECK (length(event_id) = 36),
+                sender BLOB NOT NULL,
+                delivery_id TEXT NOT NULL,
+                encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes > 0),
+                admission_principal BLOB NOT NULL CHECK (length(admission_principal) = 32),
+                PRIMARY KEY (recipient, event_id),
+                FOREIGN KEY (sender, delivery_id)
+                    REFERENCES murmur_queue_deliveries(sender, delivery_id)
+                    ON DELETE CASCADE
+            ) STRICT;
+            CREATE INDEX murmur_queue_reference_delivery
+                ON murmur_queue_references(sender, delivery_id);
+            CREATE INDEX murmur_queue_reference_admission
+                ON murmur_queue_references(admission_principal);
+            `);
+            this.#database.exec("COMMIT");
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
+    }
+
+    #pruneExpired(now: number): number {
+        const usage = this.#requiredGet(
+            `SELECT COUNT(*) AS item_count,
+                    COALESCE(SUM(encoded_bytes), 0) AS byte_count
+             FROM murmur_queue_deliveries
+             WHERE event_id IN (
+                 SELECT event_id FROM murmur_queue_deliveries
+                 WHERE expires_at <= ?
+                 ORDER BY expires_at, event_id
+                 LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+             )`,
+            BigInt(now),
+        );
+        const references = this.#requiredGet(
+            `SELECT COUNT(*) AS reference_count
+             FROM murmur_queue_references AS reference
+             JOIN murmur_queue_deliveries AS delivery
+               ON delivery.sender = reference.sender
+              AND delivery.delivery_id = reference.delivery_id
+             WHERE delivery.event_id IN (
+                 SELECT event_id FROM murmur_queue_deliveries
+                 WHERE expires_at <= ?
+                 ORDER BY expires_at, event_id
+                 LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+             )`,
+            BigInt(now),
+        );
+        const affected = this.#all(
+            `SELECT reference.recipient,
+                    COUNT(reference.event_id) AS item_count,
+                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count
+             FROM murmur_queue_references AS reference
+             JOIN murmur_queue_deliveries AS delivery
+               ON delivery.sender = reference.sender
+              AND delivery.delivery_id = reference.delivery_id
+             WHERE delivery.event_id IN (
+                 SELECT event_id FROM murmur_queue_deliveries
+                 WHERE expires_at <= ?
+                 ORDER BY expires_at, event_id
+                 LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+             )
+             GROUP BY reference.recipient`,
+            BigInt(now),
+        );
+        const removed = safeNumberColumn(
+            this.#run(
+                `DELETE FROM murmur_queue_deliveries
+                 WHERE event_id IN (
+                     SELECT event_id FROM murmur_queue_deliveries
+                     WHERE expires_at <= ?
+                     ORDER BY expires_at, event_id
+                     LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+                 )`,
+                BigInt(now),
+            ).changes,
+        );
+        for (let offset = 0; offset < affected.length; offset += SQL_VALUE_CHUNK) {
+            const chunk = affected.slice(offset, offset + SQL_VALUE_CHUNK);
+            const changeValues = chunk.map(() => "(?, ?, ?)").join(", ");
+            const changeParameters = chunk.flatMap((row) => [
+                copyBytes(row.recipient, "queue recipient"),
+                bigintColumn(row.item_count),
+                bigintColumn(row.byte_count),
+            ]);
+            this.#run(
+                `WITH changes(recipient, item_count, byte_count) AS (
+                     VALUES ${changeValues}
+                 )
+                 UPDATE murmur_queues
+                 SET pending_items = pending_items - (
+                         SELECT item_count FROM changes
+                         WHERE changes.recipient = murmur_queues.recipient
+                     ),
+                     pending_bytes = pending_bytes - (
+                         SELECT byte_count FROM changes
+                         WHERE changes.recipient = murmur_queues.recipient
+                     )
+                 WHERE recipient IN (SELECT recipient FROM changes)`,
+                ...changeParameters,
+            );
+            const recipients = chunk.map((row) => copyBytes(row.recipient, "queue recipient"));
+            const placeholders = recipients.map(() => "?").join(", ");
+            this.#run(
+                `DELETE FROM murmur_queues
+                 WHERE recipient IN (${placeholders})
+                   AND NOT EXISTS (
+                       SELECT 1 FROM murmur_queue_references AS reference
+                       WHERE reference.recipient = murmur_queues.recipient
+                   )`,
+                ...recipients,
+            );
+        }
+        this.#run(
+            `UPDATE murmur_queue_global
+             SET pending_items = pending_items - ?,
+                 pending_bytes = pending_bytes - ?,
+                 pending_references = pending_references - ?
+             WHERE singleton = 1`,
+            bigintColumn(usage.item_count),
+            bigintColumn(usage.byte_count),
+            bigintColumn(references.reference_count),
+        );
+        return removed;
+    }
+
+    #deleteEmptyQueue(recipient: Uint8Array): void {
+        this.#run(
+            `DELETE FROM murmur_queues
+             WHERE recipient = ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM murmur_queue_references AS reference
+                   WHERE reference.recipient = murmur_queues.recipient
+               )`,
+            recipient,
+        );
+    }
+
+    #get(
+        sql: string,
+        ...parameters: readonly SQLInputValue[]
+    ): Record<string, unknown> | undefined {
+        const row = this.#prepare(sql).get(...parameters);
+        return row === undefined ? undefined : record(row);
+    }
+
+    #requiredGet(sql: string, ...parameters: readonly SQLInputValue[]): Record<string, unknown> {
+        const row = this.#get(sql, ...parameters);
+        if (row === undefined) {
+            throw new Error("Missing required SQLite queue row");
+        }
+        return row;
+    }
+
+    #all(sql: string, ...parameters: readonly SQLInputValue[]): readonly Record<string, unknown>[] {
+        return this.#prepare(sql)
+            .all(...parameters)
+            .map(record);
+    }
+
+    #run(sql: string, ...parameters: readonly SQLInputValue[]): StatementResultingChanges {
+        return this.#prepare(sql).run(...parameters);
+    }
+
     #prepare(sql: string): StatementSync {
         const statement = this.#database.prepare(sql);
         statement.setReadBigInts(true);
         return statement;
     }
-    #get(sql: string, ...values: SQLInputValue[]): Record<string, unknown> | undefined {
-        const value = this.#prepare(sql).get(...values);
-        return value === undefined ? undefined : record(value);
-    }
-    #requiredGet(sql: string, ...values: SQLInputValue[]): Record<string, unknown> {
-        const value = this.#get(sql, ...values);
-        if (value === undefined) {
-            throw new Error("Missing SQLite relay row");
-        }
-        return value;
-    }
-    #all(sql: string, ...values: SQLInputValue[]): Record<string, unknown>[] {
-        return this.#prepare(sql)
-            .all(...values)
-            .map(record);
-    }
-    #run(sql: string, ...values: SQLInputValue[]): StatementResultingChanges {
-        return this.#prepare(sql).run(...values);
-    }
+
     #rollback(): void {
         try {
             this.#database.exec("ROLLBACK");
-        } catch {}
+        } catch {
+            // Preserve the original transaction error.
+        }
     }
+
     #assertOpen(): void {
         if (this.#closed) {
-            throw new Error("SQLite relay store is closed");
+            throw new Error("SQLite queue store is closed");
         }
     }
 }
