@@ -1,3 +1,4 @@
+import { sha256 } from "@noble/hashes/sha2";
 import {
     HttpDeliveryTransport,
     type DeliveryFetch,
@@ -10,7 +11,15 @@ import {
     generateIdentityKeyPair,
     type IdentityKeyPair,
 } from "../crypto/index.js";
-import { createDiscoveryBundle, type DiscoveryBundle } from "../identity/discovery/index.js";
+import {
+    DISCOVERY_INVITATION_TTL_MILLISECONDS,
+    HttpDiscoveryTransport,
+    createDiscoveryBundle,
+    parseDiscoveryBundle,
+    serializeDiscoveryBundle,
+    type DiscoveryBundle,
+    type DiscoveryTransport,
+} from "../identity/discovery/index.js";
 import {
     createMlsKeyPackage,
     destroyMlsKeyPackageBundle,
@@ -54,6 +63,7 @@ const DEFAULT_KEY_PACKAGES = 1;
 export interface MurmurClientOptions {
     readonly relay?: string | URL;
     readonly transport?: DeliveryTransport;
+    readonly discoveryTransport?: DiscoveryTransport;
     readonly fetch?: DeliveryFetch;
     readonly store: MurmurStore;
     readonly identity?: IdentityKeyPair;
@@ -65,6 +75,7 @@ export interface MurmurClientOptions {
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
     readonly #engine: SessionEngine;
+    readonly #discoveryTransport: DiscoveryTransport | undefined;
     readonly #now: () => number;
     #closed = false;
     #operationTail: Promise<void> = Promise.resolve();
@@ -74,11 +85,13 @@ export class MurmurClient {
         identity: IdentityKeyPair,
         store: MurmurStore,
         transport: DeliveryTransport,
+        discoveryTransport: DiscoveryTransport | undefined,
         limits: MurmurSessionLimits,
         now: () => number,
     ) {
         this.#identity = identity;
         this.#now = now;
+        this.#discoveryTransport = discoveryTransport;
         this.#engine = new SessionEngine(identity, store, transport, limits, now);
     }
 
@@ -133,10 +146,19 @@ export class MurmurClient {
                     options.relay as string | URL,
                     options.fetch === undefined ? {} : { fetch: options.fetch },
                 );
+            const discoveryTransport =
+                options.discoveryTransport ??
+                (options.relay === undefined
+                    ? undefined
+                    : new HttpDiscoveryTransport(
+                          options.relay,
+                          options.fetch === undefined ? {} : { fetch: options.fetch },
+                      ));
             return new MurmurClient(
                 identity,
                 options.store,
                 transport,
+                discoveryTransport,
                 options.limits ?? {},
                 options.now ?? Date.now,
             );
@@ -154,28 +176,53 @@ export class MurmurClient {
 
     /** Create and durably retain fresh one-use KeyPackages in a signed bundle. */
     async discovery(): Promise<DiscoveryBundle> {
+        return this.#exclusive(() => this.#createDiscovery());
+    }
+
+    /** Upload a five-minute bundle and return its 32-byte SHA-256 lookup capability. */
+    async createInvitation(signal?: AbortSignal): Promise<Uint8Array> {
         return this.#exclusive(async () => {
-            const now = this.#now();
-            const bundles: ReturnType<typeof createMlsKeyPackage>[] = [];
-            const stored: { reference: Uint8Array; bytes: Uint8Array }[] = [];
+            if (this.#discoveryTransport === undefined) {
+                throw new Error("No discovery transport is configured");
+            }
+            const bundle = await this.#createDiscovery();
+            const references = bundle.keyPackages.map(mlsKeyPackageReference);
+            const bytes = serializeDiscoveryBundle(bundle);
             try {
-                for (let index = 0; index < DEFAULT_KEY_PACKAGES; index += 1) {
-                    const bundle = createMlsKeyPackage(this.#identity, Math.floor(now / 1_000));
-                    bundles.push(bundle);
-                    stored.push({
-                        reference: mlsKeyPackageReference(bundle.keyPackage),
-                        bytes: serializeMlsKeyPackageBundle(bundle),
-                    });
+                const outcome = await this.#discoveryTransport.upload(bytes, signal);
+                if (
+                    outcome.expiresAt !== bundle.expiresAt ||
+                    !equalBytes(outcome.digest, sha256(bytes))
+                ) {
+                    throw new Error("Discovery relay returned invalid invitation metadata");
                 }
-                await this.#engine.storeKeyPackages(stored);
-                return createDiscoveryBundle(
-                    this.#identity,
-                    bundles.map((bundle) => bundle.keyPackage),
-                    { createdAt: now, expiresAt: now + 24 * 60 * 60 * 1_000 },
-                );
+                return outcome.digest.slice();
+            } catch (error: unknown) {
+                await this.#engine.deleteKeyPackages(references);
+                throw error;
             } finally {
-                for (const value of stored) zeroBytes(value.bytes);
-                for (const bundle of bundles) destroyMlsKeyPackageBundle(bundle);
+                zeroBytes(bytes);
+            }
+        });
+    }
+
+    /** Download, hash-check, and authenticate a five-minute invitation capability. */
+    async resolveInvitation(digest: Uint8Array, signal?: AbortSignal): Promise<DiscoveryBundle> {
+        return this.#tracked(async () => {
+            if (this.#discoveryTransport === undefined) {
+                throw new Error("No discovery transport is configured");
+            }
+            if (!(digest instanceof Uint8Array) || digest.length !== 32) {
+                throw new Error("Invalid invitation digest");
+            }
+            const bytes = await this.#discoveryTransport.download(digest, signal);
+            try {
+                if (!equalBytes(sha256(bytes), digest)) {
+                    throw new Error("Downloaded invitation digest does not match");
+                }
+                return parseDiscoveryBundle(bytes, { now: this.#now() });
+            } finally {
+                zeroBytes(bytes);
             }
         });
     }
@@ -249,6 +296,37 @@ export class MurmurClient {
         }
         this.#closed = true;
         destroyIdentity(this.#identity);
+    }
+
+    async #createDiscovery(): Promise<DiscoveryBundle> {
+        const now = this.#now();
+        const expiresAt = now + DISCOVERY_INVITATION_TTL_MILLISECONDS;
+        const bundles: ReturnType<typeof createMlsKeyPackage>[] = [];
+        const stored: {
+            reference: Uint8Array;
+            bytes: Uint8Array;
+            expiresAt: number;
+        }[] = [];
+        try {
+            for (let index = 0; index < DEFAULT_KEY_PACKAGES; index += 1) {
+                const bundle = createMlsKeyPackage(this.#identity, Math.floor(now / 1_000));
+                bundles.push(bundle);
+                stored.push({
+                    reference: mlsKeyPackageReference(bundle.keyPackage),
+                    bytes: serializeMlsKeyPackageBundle(bundle),
+                    expiresAt,
+                });
+            }
+            await this.#engine.storeKeyPackages(stored);
+            return createDiscoveryBundle(
+                this.#identity,
+                bundles.map((bundle) => bundle.keyPackage),
+                { createdAt: now, expiresAt },
+            );
+        } finally {
+            for (const value of stored) zeroBytes(value.bytes);
+            for (const bundle of bundles) destroyMlsKeyPackageBundle(bundle);
+        }
     }
 
     #assertOpen(): void {

@@ -47,6 +47,9 @@ export type {
     SignedInboxRead,
 } from "./delivery/index.js";
 export {
+    DISCOVERY_INVITATION_TTL_MILLISECONDS,
+    DiscoveryTransportError,
+    HttpDiscoveryTransport,
     createDiscoveryBundle,
     parseDiscoveryBundle,
     serializeDiscoveryBundle,
@@ -71,6 +74,10 @@ export type {
     DiscoveryBundle,
     DiscoveryBundleOptions,
     DiscoveryBundleValidationOptions,
+    DiscoveryFetch,
+    DiscoveryTransport,
+    DiscoveryUploadOutcome,
+    HttpDiscoveryTransportOptions,
 } from "./identity/discovery/index.js";
 export { MAXIMUM_STORE_SCAN_ITEMS, MemoryMurmurStore } from "./storage/index.js";
 export type { MurmurStore, StoreScanOptions, StoreTransaction } from "./storage/index.js";

@@ -1,8 +1,9 @@
 # Relay HTTP API
 
-The relay accepts canonical JSON over HTTPS. Binary fields are unpadded
-base64url. Timestamps are integer Unix milliseconds. Event cursors are
-lowercase canonical UUIDv7 strings.
+The relay accepts canonical JSON over HTTPS for queue operations. Invitation
+upload and download use the exact canonical discovery-bundle bytes. Binary
+fields inside JSON are unpadded base64url. Timestamps are integer Unix
+milliseconds. Event cursors are lowercase canonical UUIDv7 strings.
 
 The standalone Node host speaks plain HTTP and must be placed behind trusted TLS
 termination in production.
@@ -10,6 +11,40 @@ termination in production.
 ## `GET /health`
 
 Returns `200` when the configured store is reachable.
+
+## `POST /v1/invitations`
+
+Uploads the exact canonical bytes returned by
+`serializeDiscoveryBundle()`, using
+`content-type: application/vnd.slopus.murmur-discovery+json`.
+
+The relay reads only `createdAt` and `expiresAt` to enforce its retention
+policy. It does not authenticate or trust the remaining public bundle; the
+recipient performs complete verification. The signed lifetime and remaining
+relay lifetime must both be no more than five minutes.
+
+Success returns:
+
+```ts
+interface InvitationUploadJson {
+    digest: string; // base64url SHA-256, 32 decoded bytes
+    expiresAt: number;
+    duplicate: boolean;
+}
+```
+
+Re-uploading identical bytes is idempotent and never extends their original
+expiry.
+
+## `GET /v1/invitations/:digest`
+
+Returns the exact unexpired discovery-bundle bytes addressed by one canonical
+base64url SHA-256 digest. There is no listing, identity lookup, prefix lookup,
+or alternate address. Missing and expired digests return
+`404 invitation_not_found`.
+
+Clients must compare SHA-256 of the response with the shared digest before
+parsing, then verify the signed expiry, identity signature, and KeyPackages.
 
 ## `POST /v1/deliveries`
 
@@ -101,8 +136,10 @@ Responses use stable JSON error codes. Important classes include:
 - `401` authentication or time-policy failure;
 - `409` cursor/acknowledgement conflict;
 - `413` encoded body or delivery limit;
-- `429` recipient, sender, or admitted-principal queue backpressure;
-- `503` global queue backpressure, missing admission context, or overload.
+- `429` recipient, sender, admitted-principal queue, or per-principal
+  invitation-cache backpressure;
+- `503` global queue or invitation-cache backpressure, missing admission
+  context, or overload.
 
 Signed reads and acknowledgements are reusable inside their short clock-skew
 window. TLS and ingress admission are mandatory. The bundled host's

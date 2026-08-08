@@ -3,6 +3,7 @@ import { generateIdentityKeyPair } from "../../../crypto/index.js";
 import { createMlsKeyPackage } from "../../../mls/keyPackage/index.js";
 import { utf8Decode, utf8Encode } from "../../../utils/index.js";
 import {
+    DISCOVERY_INVITATION_TTL_MILLISECONDS,
     createDiscoveryBundle,
     parseDiscoveryBundle,
     serializeDiscoveryBundle,
@@ -12,6 +13,15 @@ import {
 const NOW = 1_700_000_000_000;
 
 describe("discovery bundle", () => {
+    test("defaults to the fixed five-minute signed invitation lifetime", () => {
+        const identity = generateIdentityKeyPair();
+        const keyPackage = createMlsKeyPackage(identity, Math.floor(NOW / 1_000), 3_600);
+        const bundle = createDiscoveryBundle(identity, [keyPackage.keyPackage], {
+            createdAt: NOW,
+        });
+        expect(bundle.expiresAt - bundle.createdAt).toBe(DISCOVERY_INVITATION_TTL_MILLISECONDS);
+    });
+
     test("roundtrips current identity-bound KeyPackages", () => {
         const identity = generateIdentityKeyPair();
         const keyPackage = createMlsKeyPackage(identity, Math.floor(NOW / 1_000), 3_600);

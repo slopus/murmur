@@ -52,10 +52,13 @@ describe("published package compatibility", () => {
 const loaded = await import("@slopus/murmur");
 const names = Object.keys(loaded).sort();
 if (JSON.stringify(names) !== JSON.stringify([
+    "DISCOVERY_INVITATION_TTL_MILLISECONDS",
     "DeliveryAcknowledgementFutureError",
     "DeliveryCursorTrimmedError",
     "DeliveryTransportError",
+    "DiscoveryTransportError",
     "HttpDeliveryTransport",
+    "HttpDiscoveryTransport",
     "InboxProcessor",
     "InboxStateRollbackError",
     "MAXIMUM_STORE_SCAN_ITEMS",
@@ -153,12 +156,14 @@ for (const specifier of blocked) {
                 `
 import {
     HttpDeliveryTransport,
+    HttpDiscoveryTransport,
     MemoryMurmurStore,
     MurmurClient,
     destroyIdentity,
     generateIdentityKeyPair,
     type DeliveryFetch,
     type DiscoveryBundle,
+    type DiscoveryTransport,
     type IdentityKeyPair,
     type MurmurClientOptions,
     type MurmurSessionPage,
@@ -168,6 +173,10 @@ import {
 const store: MurmurStore = new MemoryMurmurStore();
 const deliveryFetch: DeliveryFetch = globalThis.fetch;
 const transport = new HttpDeliveryTransport("https://relay.example", { fetch: deliveryFetch });
+const discoveryTransport: DiscoveryTransport = new HttpDiscoveryTransport(
+    "https://relay.example",
+    { fetch: deliveryFetch },
+);
 const identity: IdentityKeyPair = generateIdentityKeyPair();
 const options: MurmurClientOptions = {
     relay: new URL("https://relay.example"),
@@ -179,6 +188,7 @@ const opening: Promise<MurmurClient> = MurmurClient.open(options);
 const page: MurmurSessionPage | undefined = undefined;
 const discovery: DiscoveryBundle | undefined = undefined;
 void transport;
+void discoveryTransport;
 void opening;
 void page;
 void discovery;

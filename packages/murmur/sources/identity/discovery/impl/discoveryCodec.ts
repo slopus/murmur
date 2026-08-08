@@ -25,7 +25,8 @@ const DOMAIN = "murmur.discovery.bundle.v1";
 const MAXIMUM_KEY_PACKAGES = 32;
 const MAXIMUM_KEY_PACKAGE_BYTES = 1024 * 1024;
 const MAXIMUM_BUNDLE_BYTES = 4 * 1024 * 1024;
-const DEFAULT_LIFETIME_MILLISECONDS = 24 * 60 * 60 * 1_000;
+/** Fixed signed lifetime used by ephemeral invitation bundles. */
+export const DISCOVERY_INVITATION_TTL_MILLISECONDS = 5 * 60 * 1_000;
 const DEFAULT_MAXIMUM_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
 interface DiscoveryBundleJson {
@@ -178,7 +179,7 @@ export function createDiscoveryBundle(
         version: 1,
         identityKey: identity.publicKey.slice(),
         createdAt,
-        expiresAt: options.expiresAt ?? createdAt + DEFAULT_LIFETIME_MILLISECONDS,
+        expiresAt: options.expiresAt ?? createdAt + DISCOVERY_INVITATION_TTL_MILLISECONDS,
         keyPackages: keyPackages.map((value) => decodeMlsKeyPackage(encodeMlsKeyPackage(value))),
         signature: new Uint8Array(64),
     };

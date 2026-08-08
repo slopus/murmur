@@ -19,4 +19,7 @@ Murmur engine
 ```
 
 The bounded scan is used for session indexes, outboxes, buffered events, replay
-state, and diagnostics without materializing an entire namespace.
+state, invitation KeyPackage expiries, and diagnostics without materializing an
+entire namespace. Private KeyPackages are deleted when the matching Welcome
+consumes them, or on the next client operation after their five-minute
+invitation expires and before another Welcome is processed.

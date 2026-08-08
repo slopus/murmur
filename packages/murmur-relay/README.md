@@ -19,6 +19,10 @@ TTL, and queue progress. It never sees MLS or application plaintext.
   charges multicast fanout rather than only ciphertext records.
 - Every trusted-ingress principal has an exact outstanding-reference quota.
   References leave that quota when recipients acknowledge or TTL removes them.
+- Signed public discovery bundles may be cached for at most five minutes under
+  the SHA-256 digest of their exact bytes.
+- Invitation lookups are non-enumerable and have separate per-principal and
+  relay-wide item and byte quotas. Re-upload does not extend expiry.
 
 There are no topics, snapshots, retained history, collapse keys, lists, or
 anonymous capability addresses.
@@ -53,6 +57,14 @@ configurable with `MURMUR_RELAY_REQUESTS_PER_MINUTE` and
 `MURMUR_RELAY_TRACKED_ADDRESSES`. The exact outstanding fanout allowed for one
 admitted principal is configured with `MURMUR_RELAY_ADMISSION_REFERENCES`. The
 default is 10,000 references, one percent of the default global ceiling.
+Invitation cache limits are configured with
+`MURMUR_RELAY_INVITATION_BYTES`,
+`MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL`,
+`MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL`,
+`MURMUR_RELAY_GLOBAL_INVITATION_ITEMS`, and
+`MURMUR_RELAY_GLOBAL_INVITATION_BYTES`. Defaults are 16 KiB per bundle, 32
+items and 512 KiB per admitted principal, and 10,000 items or 64 MiB globally.
+The five-minute maximum TTL is not configurable above five minutes.
 
 The queue schema is intentionally incompatible with the former topic relay.
 Startup fails when legacy `murmur_relay_*` tables are present; deploy with a
@@ -64,9 +76,11 @@ ticks rather than building an unbounded maintenance queue.
 
 ## HTTP API
 
-| Method | Route            | Purpose                                   |
-| ------ | ---------------- | ----------------------------------------- |
-| `GET`  | `/health`        | Store health                              |
-| `POST` | `/v1/deliveries` | Publish one atomic encrypted multicast    |
-| `POST` | `/v1/queue/read` | Authenticated queue read or long poll     |
-| `POST` | `/v1/queue/ack`  | Authenticated monotonic queue-prefix trim |
+| Method | Route                     | Purpose                                   |
+| ------ | ------------------------- | ----------------------------------------- |
+| `GET`  | `/health`                 | Store health                              |
+| `POST` | `/v1/invitations`         | Cache exact signed discovery bytes        |
+| `GET`  | `/v1/invitations/:digest` | Fetch unexpired bytes by SHA-256          |
+| `POST` | `/v1/deliveries`          | Publish one atomic encrypted multicast    |
+| `POST` | `/v1/queue/read`          | Authenticated queue read or long poll     |
+| `POST` | `/v1/queue/ack`           | Authenticated monotonic queue-prefix trim |

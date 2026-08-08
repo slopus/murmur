@@ -11,6 +11,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
             const presence = await connection.query<{
                 marker: unknown;
                 queue_state: unknown;
+                invitations: unknown;
                 legacy_schema: unknown;
                 legacy_topics: unknown;
                 legacy_receipts: unknown;
@@ -21,6 +22,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 `SELECT
                     to_regclass('murmur_queue_schema') AS marker,
                     to_regclass('murmur_queue_global') AS queue_state,
+                    to_regclass('murmur_invitations') AS invitations,
                     to_regclass('murmur_relay_schema') AS legacy_schema,
                     to_regclass('murmur_relay_topics') AS legacy_topics,
                     to_regclass('murmur_relay_receipts') AS legacy_receipts,
@@ -42,7 +44,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     "Legacy Postgres relay schema is not supported; use a clean database",
                 );
             }
-            if (row.marker === null && row.queue_state !== null) {
+            if (row.marker === null && (row.queue_state !== null || row.invitations !== null)) {
                 throw new Error("Incomplete Postgres queue schema");
             }
             if (row.marker !== null) {
@@ -50,7 +52,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
                 );
                 const versionRow = version.rows[0];
-                if (versionRow === undefined || bigintColumn(versionRow.version) !== 2n) {
+                if (versionRow === undefined || bigintColumn(versionRow.version) !== 3n) {
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 return;
@@ -60,7 +62,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 2)`,
+                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3)`,
                 `CREATE TABLE murmur_queue_global (
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     last_event_id uuid,
@@ -110,6 +112,20 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     ON murmur_queue_references(sender, delivery_id)`,
                 `CREATE INDEX murmur_queue_reference_admission
                     ON murmur_queue_references(admission_principal)`,
+                `CREATE TABLE murmur_invitations (
+                    digest bytea PRIMARY KEY CHECK (octet_length(digest) = 32),
+                    bundle bytea NOT NULL,
+                    encoded_bytes bigint NOT NULL CHECK (
+                        encoded_bytes > 0 AND octet_length(bundle) = encoded_bytes
+                    ),
+                    expires_at bigint NOT NULL,
+                    admission_principal bytea NOT NULL
+                        CHECK (octet_length(admission_principal) = 32)
+                )`,
+                `CREATE INDEX murmur_invitation_expiration
+                    ON murmur_invitations(expires_at)`,
+                `CREATE INDEX murmur_invitation_admission
+                    ON murmur_invitations(admission_principal)`,
             ];
             await connection.transaction(async (transaction) => {
                 for (const statement of statements) {

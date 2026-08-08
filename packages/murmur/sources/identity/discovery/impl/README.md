@@ -8,3 +8,10 @@ bounds.
 ```text
 strict JSON -> canonical public keys -> KeyPackage verification -> signature
 ```
+
+`discoveryHttpTransport.ts` uploads exact signed bytes to the relay's
+five-minute cache and verifies the SHA-256 digest on both upload and download:
+
+```text
+bundle bytes -> POST -> 32-byte digest -> GET -> digest check -> bundle parser
+```

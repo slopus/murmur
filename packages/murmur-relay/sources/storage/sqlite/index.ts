@@ -20,12 +20,15 @@ import {
 import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
     AcknowledgeOutcome,
+    InvitationLimits,
     PageReadConstraints,
     PublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,
     RelayStore,
+    StoredInvitation,
+    StoreInvitationOutcome,
 } from "../types.js";
 
 const SQL_VALUE_CHUNK = 5_000;
@@ -64,6 +67,108 @@ export class SqliteRelayStore implements RelayStore {
         this.#database.exec("PRAGMA foreign_keys = ON");
         this.#database.exec("PRAGMA busy_timeout = 5000");
         this.#initializeSchema();
+    }
+
+    async storeInvitation(
+        digest: Uint8Array,
+        bundle: Uint8Array,
+        expiresAt: number,
+        now: number,
+        limits: InvitationLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<StoreInvitationOutcome> {
+        this.#assertOpen();
+        if (
+            digest.length !== 32 ||
+            bundle.length < 1 ||
+            admissionPrincipal.length !== 32 ||
+            !Number.isSafeInteger(expiresAt) ||
+            expiresAt <= now
+        ) {
+            throw new Error("Invalid invitation persistence input");
+        }
+        await this.pruneExpired(now);
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            const existing = this.#get(
+                `SELECT bundle, expires_at FROM murmur_invitations WHERE digest = ?`,
+                digest,
+            );
+            if (existing !== undefined) {
+                if (!equalBytes(copyBytes(existing.bundle, "invitation bundle"), bundle)) {
+                    throw new Error("Invitation digest collision");
+                }
+                const storedExpiry = safeNumberColumn(existing.expires_at);
+                this.#database.exec("COMMIT");
+                return { expiresAt: storedExpiry, duplicate: true };
+            }
+            const global = this.#requiredGet(
+                `SELECT COUNT(*) AS item_count,
+                        COALESCE(SUM(encoded_bytes), 0) AS byte_count
+                 FROM murmur_invitations
+                 WHERE expires_at > ?`,
+                BigInt(now),
+            );
+            if (
+                bigintColumn(global.item_count) + 1n > BigInt(limits.maximumGlobalItems) ||
+                bigintColumn(global.byte_count) + BigInt(bundle.length) >
+                    BigInt(limits.maximumGlobalBytes)
+            ) {
+                throw new RelayError(503, "Relay invitation-cache quota exceeded", {
+                    error: "invitation_relay_full",
+                });
+            }
+            const principal = this.#requiredGet(
+                `SELECT COUNT(*) AS item_count,
+                        COALESCE(SUM(encoded_bytes), 0) AS byte_count
+                 FROM murmur_invitations
+                 WHERE admission_principal = ? AND expires_at > ?`,
+                admissionPrincipal,
+                BigInt(now),
+            );
+            if (
+                bigintColumn(principal.item_count) + 1n > BigInt(limits.maximumPrincipalItems) ||
+                bigintColumn(principal.byte_count) + BigInt(bundle.length) >
+                    BigInt(limits.maximumPrincipalBytes)
+            ) {
+                throw new RelayError(429, "Admission-principal invitation quota exceeded", {
+                    error: "invitation_admission_full",
+                });
+            }
+            this.#run(
+                `INSERT INTO murmur_invitations
+                    (digest, bundle, encoded_bytes, expires_at, admission_principal)
+                 VALUES (?, ?, ?, ?, ?)`,
+                digest,
+                bundle,
+                BigInt(bundle.length),
+                BigInt(expiresAt),
+                admissionPrincipal,
+            );
+            this.#database.exec("COMMIT");
+            return { expiresAt, duplicate: false };
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
+    }
+
+    async readInvitation(digest: Uint8Array, now: number): Promise<StoredInvitation | undefined> {
+        this.#assertOpen();
+        if (digest.length !== 32) throw new Error("Invalid invitation digest");
+        const row = this.#get(
+            `SELECT bundle, expires_at
+             FROM murmur_invitations
+             WHERE digest = ? AND expires_at > ?`,
+            digest,
+            BigInt(now),
+        );
+        return row === undefined
+            ? undefined
+            : {
+                  bundle: copyBytes(row.bundle, "invitation bundle"),
+                  expiresAt: safeNumberColumn(row.expires_at),
+              };
     }
 
     async publish(
@@ -478,9 +583,21 @@ export class SqliteRelayStore implements RelayStore {
         this.#assertOpen();
         this.#database.exec("BEGIN IMMEDIATE");
         try {
-            const removed = this.#pruneExpired(now);
+            const removedDeliveries = this.#pruneExpired(now);
+            const removedInvitations = safeNumberColumn(
+                this.#run(
+                    `DELETE FROM murmur_invitations
+                     WHERE digest IN (
+                         SELECT digest FROM murmur_invitations
+                         WHERE expires_at <= ?
+                         ORDER BY expires_at, digest
+                         LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+                     )`,
+                    BigInt(now),
+                ).changes,
+            );
             this.#database.exec("COMMIT");
-            return removed;
+            return removedDeliveries + removedInvitations;
         } catch (error: unknown) {
             this.#rollback();
             throw error;
@@ -516,7 +633,10 @@ export class SqliteRelayStore implements RelayStore {
             const incomplete = this.#get(
                 `SELECT name FROM sqlite_master
                  WHERE type = 'table'
-                   AND name LIKE 'murmur_queue_%'
+                   AND (
+                       name LIKE 'murmur_queue_%'
+                       OR name = 'murmur_invitations'
+                   )
                  LIMIT 1`,
             );
             if (incomplete !== undefined) {
@@ -526,7 +646,7 @@ export class SqliteRelayStore implements RelayStore {
             const schema = this.#requiredGet(
                 "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
             );
-            if (bigintColumn(schema.version) !== 2n) {
+            if (bigintColumn(schema.version) !== 3n) {
                 throw new Error("Unsupported SQLite queue schema version");
             }
             return;
@@ -538,7 +658,7 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 2);
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3);
             CREATE TABLE murmur_queue_global (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 last_event_id TEXT CHECK (
@@ -592,6 +712,21 @@ export class SqliteRelayStore implements RelayStore {
                 ON murmur_queue_references(sender, delivery_id);
             CREATE INDEX murmur_queue_reference_admission
                 ON murmur_queue_references(admission_principal);
+            CREATE TABLE murmur_invitations (
+                digest BLOB PRIMARY KEY CHECK (length(digest) = 32),
+                bundle BLOB NOT NULL,
+                encoded_bytes INTEGER NOT NULL CHECK (
+                    encoded_bytes > 0 AND length(bundle) = encoded_bytes
+                ),
+                expires_at INTEGER NOT NULL,
+                admission_principal BLOB NOT NULL CHECK (
+                    length(admission_principal) = 32
+                )
+            ) STRICT;
+            CREATE INDEX murmur_invitation_expiration
+                ON murmur_invitations(expires_at);
+            CREATE INDEX murmur_invitation_admission
+                ON murmur_invitations(admission_principal);
             `);
             this.#database.exec("COMMIT");
         } catch (error: unknown) {

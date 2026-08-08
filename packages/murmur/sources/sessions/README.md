@@ -4,7 +4,7 @@ The stateful public MLS layer. Two-person and many-person interactions use the
 same opaque session primitive.
 
 ```text
-discovery bundle -> sealed Welcome -> pending session -> activate
+32-byte digest -> discovery bundle -> sealed Welcome -> pending -> activate
                                              |
 identity inbox -> MLS event / Proposal / Commit -> current checkpoint
                                              |

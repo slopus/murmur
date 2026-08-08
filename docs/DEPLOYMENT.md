@@ -46,12 +46,30 @@ MURMUR_RELAY_TRACKED_ADDRESSES=10000
 
 Never trust a forwarding header that clients can supply unchanged.
 
+## Invitation cache
+
+The same admission principal and request limiter apply to invitation uploads
+and downloads. The maximum lifetime is fixed at five minutes. Optional cache
+bounds are:
+
+```bash
+MURMUR_RELAY_INVITATION_BYTES=16384
+MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL=32
+MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL=524288
+MURMUR_RELAY_GLOBAL_INVITATION_ITEMS=10000
+MURMUR_RELAY_GLOBAL_INVITATION_BYTES=67108864
+```
+
+Cached bundles are public signed material, not encrypted application data.
+They are non-enumerable and addressable only by their 32-byte SHA-256 digest.
+
 ## Maintenance
 
-The standalone process starts bounded expiration pruning every ten seconds,
-skips overlapping runs, and drains within a one-second time budget. Publish and
-acknowledgement paths also commit one bounded prune batch before their own
-transaction, so expired backlog cannot permanently block quota recovery.
+The standalone process starts bounded delivery and invitation expiration
+pruning every ten seconds, skips overlapping runs, and drains within a
+one-second time budget. Publish and acknowledgement paths also commit one
+bounded prune batch before their own transaction, so expired backlog cannot
+permanently block quota recovery.
 
 Back up the database as ordinary pending delivery infrastructure. A relay
 restore can replay or lose pending ciphertext; application correctness must

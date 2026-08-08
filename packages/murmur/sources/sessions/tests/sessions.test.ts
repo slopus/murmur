@@ -9,7 +9,11 @@ import {
     type SignedDelivery,
 } from "../../delivery/index.js";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
-import { createDiscoveryBundle } from "../../identity/discovery/index.js";
+import {
+    DISCOVERY_INVITATION_TTL_MILLISECONDS,
+    createDiscoveryBundle,
+    type DiscoveryTransport,
+} from "../../identity/discovery/index.js";
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
 import { MurmurClient, type MurmurSessionLimits } from "../index.js";
@@ -30,9 +34,8 @@ async function client(
     limits: MurmurSessionLimits = {},
 ): Promise<MurmurClient> {
     return MurmurClient.open({
-        transport: new HttpDeliveryTransport("https://relay.test", {
-            fetch: relayFetch(relay),
-        }),
+        relay: "https://relay.test",
+        fetch: relayFetch(relay),
         store,
         limits,
         now: () => NOW,
@@ -40,6 +43,109 @@ async function client(
 }
 
 describe("stateful MLS sessions", () => {
+    test("creates a session from a 32-byte relay-cached invitation digest", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bob = await client(relay);
+        try {
+            const digest = await bob.createInvitation();
+            expect(digest).toHaveLength(32);
+            const resolved = await alice.resolveInvitation(digest);
+            expect(resolved.identityKey).toEqual(bob.identity);
+            expect(resolved.expiresAt - resolved.createdAt).toBe(
+                DISCOVERY_INVITATION_TTL_MILLISECONDS,
+            );
+
+            const session = await alice.createSession({
+                descriptor: utf8Encode("digest invitation"),
+                members: [resolved],
+            });
+            await alice.synchronize();
+            await bob.synchronize();
+            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
+    test("rejects an expired digest and drops its matching private KeyPackage", async () => {
+        let now = NOW;
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const fetch = relayFetch(relay);
+        const bobStore = new MemoryMurmurStore();
+        const alice = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: new MemoryMurmurStore(),
+            now: () => now,
+        });
+        const bob = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: bobStore,
+            now: () => now,
+        });
+        try {
+            const digest = await bob.createInvitation();
+            const resolved = await alice.resolveInvitation(digest);
+            const session = await alice.createSession({
+                descriptor: utf8Encode("expires"),
+                members: [resolved],
+            });
+
+            now += DISCOVERY_INVITATION_TTL_MILLISECONDS;
+            await expect(alice.resolveInvitation(digest)).rejects.toMatchObject({
+                status: 404,
+                code: "invitation_not_found",
+            });
+            await alice.synchronize();
+            const synchronized = await bob.synchronize();
+            expect(synchronized.inbox.rejected).toBe(1);
+            expect(await bob.session(session.id)).toBeUndefined();
+            expect(await bobStore.scan("murmur/key-packages/", { limit: 10 })).toHaveLength(0);
+            expect(await bobStore.scan("murmur/key-package-expiries/", { limit: 10 })).toHaveLength(
+                0,
+            );
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
+    test("drops private KeyPackages when invitation upload fails", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const store = new MemoryMurmurStore();
+        const discoveryTransport: DiscoveryTransport = {
+            upload: async () => {
+                throw new Error("injected invitation upload failure");
+            },
+            download: async () => {
+                throw new Error("unused");
+            },
+        };
+        const bob = await MurmurClient.open({
+            transport: new HttpDeliveryTransport("https://relay.test", {
+                fetch: relayFetch(relay),
+            }),
+            discoveryTransport,
+            store,
+            now: () => NOW,
+        });
+        try {
+            await expect(bob.createInvitation()).rejects.toThrow(
+                "injected invitation upload failure",
+            );
+            expect(await store.scan("murmur/key-packages/", { limit: 10 })).toHaveLength(0);
+            expect(await store.scan("murmur/key-package-expiries/", { limit: 10 })).toHaveLength(0);
+        } finally {
+            bob.close();
+            await relay.close();
+        }
+    });
+
     test("bootstraps pending, activates, and exchanges opaque events", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);

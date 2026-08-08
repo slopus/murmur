@@ -5,12 +5,30 @@
 The relay has exactly one authenticated inbound queue per public identity.
 Murmur assumes one receiver on one active device for each identity. The relay
 stores encrypted deliveries only while at least one recipient reference remains
-unacknowledged and unexpired.
+unacknowledged and unexpired. It also provides a strictly bounded,
+content-addressed cache for signed discovery bundles. A cached bundle is
+available only by the SHA-256 digest of its exact bytes and expires within five
+minutes.
 
 It stores no snapshots, retained history, event-sourced application state,
-lists, anonymous topics, or capability topics. It does not interpret encrypted
-contents. It does learn authenticated sender and recipient identities, exact
-fanout, timing, and queue progress; this metadata exposure is accepted.
+lists, anonymous topics, or capability topics. The invitation cache is not
+enumerable and is not an identity directory. The relay does not interpret
+encrypted delivery contents or trust cached discovery contents. It does learn
+authenticated sender and recipient identities, exact fanout, timing, and queue
+progress; this metadata exposure is accepted.
+
+## Ephemeral invitations
+
+An uploader may place the exact bytes of one signed discovery bundle in the
+relay cache. The relay returns the SHA-256 digest of those bytes. A recipient
+that receives the digest out of band may fetch the bytes, verify that the digest
+matches, and then independently verify the bundle signature, signed expiry, and
+KeyPackages.
+
+The relay never lists cached invitations or resolves them by identity. It
+enforces a hard five-minute lifetime, per-admission-principal item and byte
+quotas, and relay-wide item and byte quotas. Re-uploading the same digest is
+idempotent and does not extend its original expiry.
 
 ## Publishing
 
@@ -53,10 +71,12 @@ record.
 
 ## Bounds
 
-Queues have a quota and a maximum delivery TTL. A full queue creates explicit
-backpressure, and expiration defines the maximum supported offline window.
-These bounds prevent an abandoned identity from consuming storage forever.
-They do not turn the relay into durable history or a recovery system.
+Queues have a quota and a maximum delivery TTL. The invitation cache has
+separate item and byte quotas and a hard five-minute TTL. A full queue or cache
+creates explicit backpressure, and expiration defines the maximum supported
+offline or invitation window. These bounds prevent abandoned state from
+consuming storage forever. They do not turn the relay into durable history, an
+identity directory, or a recovery system.
 
 ## How we know it is done
 
@@ -79,7 +99,10 @@ They do not turn the relay into durable history or a recovery system.
   queue.
 - A delivery record disappears after every recipient reference is acknowledged
   or expires.
+- A signed discovery bundle may be uploaded and fetched only by the SHA-256
+  digest of its exact bytes, is never enumerable by identity, expires within
+  five minutes, and cannot have its lifetime extended by re-upload.
 - Quota and TTL bound abandoned queues and expose backpressure and the maximum
-  offline window.
+  offline window; separate quota and TTL bounds apply to cached invitations.
 - The relay has no retained event history, snapshots, lists, generic topics, or
   anonymous addressing.

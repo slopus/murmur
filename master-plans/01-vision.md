@@ -19,9 +19,10 @@ for old APIs, codecs, relay topics, storage schemas, or the CLI.
 
 There is exactly one relay. Each public identity has one authenticated inbound
 queue, and Murmur assumes one receiver on one active device for that identity.
-The relay stores only encrypted deliveries that remain unacknowledged and
-unexpired. It stores no snapshots, retained history, event-sourced application
-state, lists, or anonymous capability topics.
+The relay stores encrypted deliveries that remain unacknowledged and unexpired.
+It may also hold a signed discovery bundle for at most five minutes under the
+SHA-256 digest of its exact bytes. It stores no snapshots, retained history,
+event-sourced application state, lists, or anonymous capability topics.
 
 Identity-linked sender, recipient, timing, queue, and fanout metadata are an
 accepted tradeoff. Murmur promises encrypted contents, not anonymous routing.
@@ -59,8 +60,10 @@ being added again.
 
 1. **Discovery.** Define and validate a self-contained signed bundle containing
    a public identity and current KeyPackage material without creating a friend
-   relationship. Applications obtain it out of band or through their own
-   discovery service.
+   relationship. An application may share it directly, or upload it to the
+   relay's five-minute content-addressed cache and share only its SHA-256
+   digest. The recipient fetches by that digest and rejects an expired or
+   invalid bundle.
 2. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
    material to the recipient's authenticated queue. The recipient persists it
    as pending and trims the queue before the application later activates it
@@ -77,6 +80,10 @@ being added again.
 - Two identities can discover the material needed to bootstrap an MLS session,
   and the recipient can durably receive it without waiting for the application
   to activate or ignore it.
+- A relay-cached discovery bundle is non-enumerable, addressed only by the
+  SHA-256 digest of its exact bytes, expires within five minutes, and cannot
+  extend the bundle's signed lifetime or the owner's matching private
+  KeyPackage state.
 - A pending session stays cryptographically current under a strict storage
   bound; activation durably hands off buffered events or effects, while ignore
   or overflow terminally rejects and destroys pending secrets and data.

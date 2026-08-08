@@ -6,6 +6,7 @@ import {
     signedDeliveryToJson,
 } from "../protocol/index.js";
 import type { RelayService } from "../relay/index.js";
+import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 
 /** Metadata supplied by a concrete HTTP host. */
 export interface RelayRequestContext {
@@ -96,7 +97,7 @@ function boundedJson(
     });
 }
 
-async function readJson(request: Request, maximumBytes: number): Promise<unknown> {
+async function readBytes(request: Request, maximumBytes: number): Promise<Uint8Array> {
     const declared = request.headers.get("content-length");
     if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maximumBytes)) {
         throw new RelayError(413, "Request body exceeds relay limit", { error: "limit" });
@@ -128,9 +129,18 @@ async function readJson(request: Request, maximumBytes: number): Promise<unknown
         bytes.set(chunk, offset);
         offset += chunk.length;
     }
+    return bytes;
+}
+
+async function readJson(request: Request, maximumBytes: number): Promise<unknown> {
     try {
-        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
-    } catch {
+        return JSON.parse(
+            new TextDecoder("utf-8", { fatal: true }).decode(
+                await readBytes(request, maximumBytes),
+            ),
+        ) as unknown;
+    } catch (error: unknown) {
+        if (error instanceof RelayError) throw error;
         throw new RelayError(400, "Invalid JSON request", { error: "malformed" });
     }
 }
@@ -256,6 +266,47 @@ export function createRelayFetchHandler(
             if (request.method === "GET" && url.pathname === "/health") {
                 await relay.health();
                 return json({ ok: true }, 200, corsHeaders);
+            }
+            if (request.method === "POST" && url.pathname === "/v1/invitations") {
+                if (admissionPrincipal === undefined) {
+                    throw new RelayError(503, "Admission principal is required", {
+                        error: "admission_context_required",
+                    });
+                }
+                const outcome = await relay.storeInvitation(
+                    await readBytes(request, relay.options.maximumInvitationBytes),
+                    admissionPrincipal,
+                );
+                return boundedJson(
+                    {
+                        digest: encodeBase64Url(outcome.digest),
+                        expiresAt: outcome.expiresAt,
+                        duplicate: outcome.duplicate,
+                    },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "GET" && url.pathname.startsWith("/v1/invitations/")) {
+                const encodedDigest = url.pathname.slice("/v1/invitations/".length);
+                let digest: Uint8Array;
+                try {
+                    digest = decodeBase64Url(encodedDigest, 32);
+                } catch {
+                    throw new RelayError(400, "Invalid invitation digest", {
+                        error: "malformed",
+                    });
+                }
+                const invitation = await relay.readInvitation(digest);
+                return new Response(invitation.bundle, {
+                    status: 200,
+                    headers: {
+                        "content-type": "application/vnd.slopus.murmur-discovery+json",
+                        "cache-control": "no-store",
+                        "x-murmur-invitation-expires-at": String(invitation.expiresAt),
+                        ...corsHeaders,
+                    },
+                });
             }
             if (request.method === "POST" && url.pathname === "/v1/deliveries") {
                 const delivery = parseSignedDelivery(

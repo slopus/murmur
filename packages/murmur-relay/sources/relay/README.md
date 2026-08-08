@@ -2,7 +2,8 @@
 
 Validates signed deliveries and signed queue operations, enforces TTL and quota
 policy, delegates atomic multicast and trimming to storage, and orchestrates
-bounded long polling.
+bounded long polling. It also hashes and stores opaque signed discovery bytes
+under a hard five-minute policy without treating cache contents as trusted.
 
 Every publication call must supply an explicit admission principal. The service
 hashes it before storage and never falls back to the free protocol sender
@@ -13,6 +14,7 @@ explicit shared embedding principal.
 signed request -> shape/time/signature policy -> atomic store operation
                                                   |
 empty read -> bounded waiter -> wake hint --------+-> authoritative reread
+bundle bytes -> time bound + SHA-256 -> non-enumerable invitation cache
 ```
 
 Long polls are bounded globally and per recipient identity. Disconnects, relay

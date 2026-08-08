@@ -119,17 +119,21 @@ that most often trip up a change:
 ### Identity and discovery
 
 An identity exposes one Ed25519 public key. Signing and X25519 key agreement are
-derived from one 32-byte root. A signed discovery bundle carries current
-one-use MLS KeyPackages and is exchanged out of band or through an
-application-supplied discovery service. The relay is not a directory.
+derived from one 32-byte root. A signed discovery bundle carries one current
+one-use MLS KeyPackage. Its exact bytes may be exchanged directly or cached at
+the relay for at most five minutes under their SHA-256 digest. Applications
+share the 32-byte digest out of band; the relay cannot enumerate bundles or
+resolve identities and is not a directory.
 
 ### Delivery queues
 
-The relay stores only unacknowledged and unexpired encrypted deliveries. One
-atomic multicast receives one UUIDv7 event ID and one reference in every exact
+The relay stores unacknowledged and unexpired encrypted deliveries plus
+five-minute public invitation bundles addressed only by SHA-256. One atomic
+multicast receives one UUIDv7 event ID and one reference in every exact
 recipient inbox. Event IDs are ordered only within an inbox. Recipient,
-sender-fanout, and global quotas bound storage; production ingress must also
-apply non-Sybil admission because public identities are free to create.
+sender-fanout, invitation-cache, and global quotas bound storage; production
+ingress must also apply non-Sybil admission because public identities are free
+to create.
 
 ### MLS sessions
 

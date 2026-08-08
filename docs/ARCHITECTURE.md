@@ -13,9 +13,10 @@ application
     | replay records and exact outboxes
     | pending-session buffers
     |
-    | HTTPS: signed opaque deliveries, reads, acknowledgements
+    | HTTPS: 32-byte invitation digests + signed opaque delivery
     v
 @slopus/murmur-relay
+    | non-enumerable five-minute discovery cache
     | one queue per recipient identity
     | unacknowledged and unexpired delivery references only
     v
@@ -45,13 +46,19 @@ The relay authenticates identities but does not interpret ciphertext. An
 accepted multicast receives one UUIDv7 event ID and one queue reference per
 recipient. UUID order is guaranteed only inside an individual inbox.
 
+The relay stores a public signed discovery bundle for at most five minutes
+under the SHA-256 digest of its exact bytes. It cannot enumerate invitations or
+resolve an identity; recipients already holding the digest fetch the bytes and
+independently verify the hash, signed expiry, identity signature, and
+KeyPackages.
+
 The relay stores a delivery while at least one queue reference is
 unacknowledged and unexpired. A signed monotonic acknowledgement removes one
 recipient's processed prefix. The last reference removal deletes the delivery.
 TTL, recipient, sender, and global quotas bound pending storage.
 
-The relay has no account registry, discovery directory, application history,
-MLS state, or application-level acknowledgement protocol.
+The relay has no account registry, discovery directory or listing, application
+history, MLS state, or application-level acknowledgement protocol.
 
 ## Session ordering
 

@@ -23,7 +23,13 @@ export type {
     SignedQueueReadJson,
 } from "./protocol/index.js";
 export { InProcessWakeSource, PostgresWakeSource, RelayService } from "./relay/index.js";
-export type { RelayOptions, ResolvedRelayOptions, WakeSource } from "./relay/index.js";
+export type {
+    InvitationDownload,
+    InvitationUploadOutcome,
+    RelayOptions,
+    ResolvedRelayOptions,
+    WakeSource,
+} from "./relay/index.js";
 export {
     PgPoolDatabase,
     PGliteDatabase,
@@ -34,6 +40,7 @@ export {
 } from "./storage/index.js";
 export type {
     AcknowledgeOutcome,
+    InvitationLimits,
     PageReadConstraints,
     PublishOutcome,
     QueuedDelivery,
@@ -42,6 +49,8 @@ export type {
     RelayStore,
     RelayStoreBackend,
     SqliteRelayStoreOptions,
+    StoredInvitation,
+    StoreInvitationOutcome,
 } from "./storage/index.js";
 export { createRelayFetchHandler, parseRelayAllowedOrigins } from "./http/index.js";
 export type { RelayFetchHandler, RelayHttpOptions, RelayRequestContext } from "./http/index.js";

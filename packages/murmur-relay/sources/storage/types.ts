@@ -9,6 +9,26 @@ export interface PublishOutcome {
     readonly duplicate: boolean;
 }
 
+/** Result of storing one content-addressed ephemeral invitation. */
+export interface StoreInvitationOutcome {
+    readonly expiresAt: number;
+    readonly duplicate: boolean;
+}
+
+/** One unexpired opaque invitation returned by its SHA-256 digest. */
+export interface StoredInvitation {
+    readonly bundle: Uint8Array;
+    readonly expiresAt: number;
+}
+
+/** Independent bounds for the five-minute invitation cache. */
+export interface InvitationLimits {
+    readonly maximumPrincipalItems: number;
+    readonly maximumPrincipalBytes: number;
+    readonly maximumGlobalItems: number;
+    readonly maximumGlobalBytes: number;
+}
+
 /** Result of one monotonic queue-prefix acknowledgement. */
 export interface AcknowledgeOutcome {
     readonly removed: number;
@@ -48,6 +68,15 @@ export interface QueuePage {
 
 /** Atomic persistence operations required by the identity-queue relay. */
 export interface RelayStore {
+    storeInvitation(
+        digest: Uint8Array,
+        bundle: Uint8Array,
+        expiresAt: number,
+        now: number,
+        limits: InvitationLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<StoreInvitationOutcome>;
+    readInvitation(digest: Uint8Array, now: number): Promise<StoredInvitation | undefined>;
     publish(
         delivery: SignedDelivery,
         now: number,

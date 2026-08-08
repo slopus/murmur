@@ -1,4 +1,5 @@
 import { PGlite } from "@electric-sql/pglite";
+import { sha256 } from "@noble/hashes/sha2";
 import { DatabaseSync } from "node:sqlite";
 import { describe, expect, test } from "vitest";
 import {
@@ -29,6 +30,12 @@ const LIMITS = {
     maximumGlobalReferences: 1_000,
 };
 const PAGE = { maximumEncodedBytes: 2_000_000 };
+const INVITATION_LIMITS = {
+    maximumPrincipalItems: 2,
+    maximumPrincipalBytes: 1_000,
+    maximumGlobalItems: 3,
+    maximumGlobalBytes: 2_000,
+};
 const ADMISSION_PRINCIPAL = new Uint8Array(32).fill(250);
 
 async function stores(): Promise<readonly RelayStore[]> {
@@ -64,6 +71,121 @@ describe("identity queue store conformance", () => {
             "Legacy Postgres relay schema",
         );
         await postgres.close();
+    });
+
+    test("stores invitations by digest without extending expiry and releases cache quota", async () => {
+        const firstBundle = new TextEncoder().encode("first public invitation");
+        const secondBundle = new TextEncoder().encode("second public invitation");
+        const thirdBundle = new TextEncoder().encode("third public invitation");
+        const firstDigest = sha256(firstBundle);
+        const secondDigest = sha256(secondBundle);
+        const thirdDigest = sha256(thirdBundle);
+        for (const store of await stores()) {
+            try {
+                expect(
+                    await store.storeInvitation(
+                        firstDigest,
+                        firstBundle,
+                        NOW + 10,
+                        NOW,
+                        INVITATION_LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).toEqual({ expiresAt: NOW + 10, duplicate: false });
+                expect(
+                    await store.storeInvitation(
+                        firstDigest,
+                        firstBundle,
+                        NOW + 20,
+                        NOW,
+                        INVITATION_LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).toEqual({ expiresAt: NOW + 10, duplicate: true });
+                expect(await store.readInvitation(firstDigest, NOW)).toEqual({
+                    bundle: firstBundle,
+                    expiresAt: NOW + 10,
+                });
+                await store.storeInvitation(
+                    secondDigest,
+                    secondBundle,
+                    NOW + 20,
+                    NOW,
+                    INVITATION_LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await expect(
+                    store.storeInvitation(
+                        thirdDigest,
+                        thirdBundle,
+                        NOW + 20,
+                        NOW,
+                        INVITATION_LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).rejects.toMatchObject({
+                    status: 429,
+                    body: { error: "invitation_admission_full" },
+                });
+                expect(await store.readInvitation(firstDigest, NOW + 10)).toBeUndefined();
+                expect(await store.pruneExpired(NOW + 10)).toBeGreaterThanOrEqual(1);
+                await expect(
+                    store.storeInvitation(
+                        thirdDigest,
+                        thirdBundle,
+                        NOW + 20,
+                        NOW + 10,
+                        INVITATION_LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).resolves.toMatchObject({ duplicate: false });
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
+    test("does not let an expired cache backlog consume live admission quota", async () => {
+        const backlogLimits = {
+            maximumPrincipalItems: 200,
+            maximumPrincipalBytes: 100_000,
+            maximumGlobalItems: 200,
+            maximumGlobalBytes: 100_000,
+        };
+        const liveLimits = {
+            maximumPrincipalItems: 1,
+            maximumPrincipalBytes: 1_000,
+            maximumGlobalItems: 1,
+            maximumGlobalBytes: 1_000,
+        };
+        for (const store of await stores()) {
+            try {
+                for (let index = 0; index <= 100; index += 1) {
+                    const bundle = new TextEncoder().encode(`expired invitation ${index}`);
+                    await store.storeInvitation(
+                        sha256(bundle),
+                        bundle,
+                        NOW + 1,
+                        NOW,
+                        backlogLimits,
+                        ADMISSION_PRINCIPAL,
+                    );
+                }
+                const live = new TextEncoder().encode("live invitation");
+                await expect(
+                    store.storeInvitation(
+                        sha256(live),
+                        live,
+                        NOW + 2,
+                        NOW + 1,
+                        liveLimits,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).resolves.toEqual({ expiresAt: NOW + 2, duplicate: false });
+            } finally {
+                await store.close();
+            }
+        }
     });
 
     test("atomically multicasts one event ID and trims each recipient independently", async () => {

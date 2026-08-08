@@ -10,9 +10,16 @@ The relay sees:
 - exact multicast fanout;
 - delivery sizes, timing, TTL, and per-inbox progress;
 - IP or trusted-ingress admission metadata.
+- public signed discovery-bundle bytes uploaded to its five-minute cache.
 
 The relay does not receive identity roots, KeyPackage private keys, Welcome
 plaintext, MLS epochs, application plaintext, or application history.
+
+Invitation digests are short-lived bearer capabilities. SHA-256 makes them
+unguessable and detects relay substitution, but anyone who obtains a digest may
+download its public bundle until expiry. The client always verifies the digest,
+signed expiry, identity signature, and KeyPackage signatures; cache presence is
+not authentication.
 
 ## Trust model
 
@@ -64,6 +71,7 @@ cryptographic backstop.
 - Back up client state atomically; restoring a stale backup may be
   unrecoverable.
 - Monitor queue, sender, and global backpressure.
+- Monitor separate invitation-cache item and byte backpressure.
 
 Murmur has not received an independent security audit. Its MLS implementation
 is a tested RFC 9420 profile, not a claim of complete RFC feature coverage.

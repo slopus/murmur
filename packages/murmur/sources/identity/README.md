@@ -9,6 +9,8 @@ identity root -> public identity -> signed discovery bundle
                                 \-> MLS credential/signature binding
 ```
 
-Finding and sharing bundles is application-owned. The relay does not provide a
-directory. Session bootstrap consumes the KeyPackage once and retains the local
-claim through its full KeyPackage lifetime.
+The default path uploads exact signed bytes to the relay's non-enumerable
+five-minute cache and shares only their 32-byte SHA-256 digest. The relay does
+not provide a directory or identity lookup. Session bootstrap consumes the
+private KeyPackage; expiry removes it locally, while a creator retains the
+one-use claim through the public KeyPackage's full lifetime.

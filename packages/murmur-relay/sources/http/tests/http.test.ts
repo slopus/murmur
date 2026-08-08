@@ -1,3 +1,4 @@
+import { sha256 } from "@noble/hashes/sha2";
 import { describe, expect, test } from "vitest";
 import {
     signedDeliveryToJson,
@@ -14,6 +15,7 @@ import {
 } from "../../protocol/tests/helpers.js";
 import { RelayService } from "../../relay/index.js";
 import { SqliteRelayStore } from "../../storage/index.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
 import { createRelayFetchHandler, parseRelayAllowedOrigins } from "../index.js";
 
 const NOW = 10_000;
@@ -29,7 +31,77 @@ function post(path: string, body: unknown, origin?: string): Request {
     });
 }
 
+function invitation(createdAt: number, expiresAt: number, value = "public"): Uint8Array {
+    return new TextEncoder().encode(JSON.stringify({ createdAt, expiresAt, value }));
+}
+
 describe("identity queue HTTP API", () => {
+    test("uploads and downloads a five-minute invitation by its exact digest", async () => {
+        let now = NOW;
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
+        const handler = createRelayFetchHandler(relay, {
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "invitation-tests",
+        });
+        const bundle = invitation(NOW, NOW + 5 * 60_000);
+        const digest = encodeBase64Url(sha256(bundle));
+        const upload = (): Promise<Response> =>
+            handler(
+                new Request("https://relay.example/v1/invitations", {
+                    method: "POST",
+                    headers: {
+                        "content-type": "application/vnd.slopus.murmur-discovery+json",
+                    },
+                    body: bundle.slice(),
+                }),
+            );
+        try {
+            const excessiveLifetime = await handler(
+                new Request("https://relay.example/v1/invitations", {
+                    method: "POST",
+                    body: invitation(NOW, NOW + 5 * 60_000 + 1),
+                }),
+            );
+            expect(excessiveLifetime.status).toBe(400);
+            expect(await excessiveLifetime.json()).toEqual({ error: "malformed" });
+
+            const first = await upload();
+            expect(first.status).toBe(200);
+            expect(await first.json()).toEqual({
+                digest,
+                expiresAt: NOW + 5 * 60_000,
+                duplicate: false,
+            });
+            now += 1;
+            expect(await (await upload()).json()).toEqual({
+                digest,
+                expiresAt: NOW + 5 * 60_000,
+                duplicate: true,
+            });
+            const downloaded = await handler(
+                new Request(`https://relay.example/v1/invitations/${digest}`),
+            );
+            expect(downloaded.status).toBe(200);
+            expect(new Uint8Array(await downloaded.arrayBuffer())).toEqual(bundle);
+            expect(downloaded.headers.get("cache-control")).toBe("no-store");
+
+            now = NOW + 5 * 60_000;
+            const expired = await handler(
+                new Request(`https://relay.example/v1/invitations/${digest}`),
+            );
+            expect(expired.status).toBe(404);
+            expect(await expired.json()).toEqual({ error: "invitation_not_found" });
+
+            const malformedDigest = await handler(
+                new Request("https://relay.example/v1/invitations/not-a-digest"),
+            );
+            expect(malformedDigest.status).toBe(400);
+            expect(await malformedDigest.json()).toEqual({ error: "malformed" });
+        } finally {
+            await relay.close();
+        }
+    });
+
     test("publishes, reads, and acknowledges", async () => {
         const aliceSecret = secret(1);
         const bobSecret = secret(2);

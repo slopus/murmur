@@ -9,16 +9,23 @@ One 32-byte identity root derives one Ed25519 public identity and the X25519
 material used by sealed bootstrap delivery. Internally, keys remain
 `Uint8Array`; base64url is used only at serialization boundaries.
 
-`MurmurClient.discovery()` creates:
+`MurmurClient.createInvitation()` creates:
 
-- one signed, self-contained discovery bundle;
+- one signed, self-contained bundle with a five-minute expiry;
 - one current public MLS KeyPackage in that bundle;
 - the matching one-use private KeyPackage state in the local store.
 
-The application shares the bundle out of band or through its own discovery
-service. The relay is not a directory. A discovery wrapper is short-lived, but
-local one-use claims remain until the KeyPackage's `notAfter` boundary so the
-same KeyPackage cannot be rewrapped and reused.
+The client uploads the exact bundle bytes to the relay's non-enumerable
+five-minute cache and receives their 32-byte SHA-256 digest. The application
+shares only that digest. `resolveInvitation()` fetches the bytes and verifies
+the digest, signed expiry, identity signature, and KeyPackage signatures. The
+relay is not a directory and cannot resolve or enumerate identities.
+
+The prospective member deletes matching private KeyPackage state when its
+Welcome is consumed, or on the next client operation after the five-minute
+invitation expires and before any later Welcome can be processed. A creator's
+durable one-use claim remains until the KeyPackage's `notAfter` boundary so the
+same public KeyPackage cannot be rewrapped and reused.
 
 ## Bootstrap
 

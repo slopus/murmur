@@ -68,9 +68,40 @@ export async function main(): Promise<void> {
         process.env.MURMUR_RELAY_ADMISSION_REFERENCES,
         "MURMUR_RELAY_ADMISSION_REFERENCES",
     );
+    const maximumInvitationBytes = optionalPositiveInteger(
+        process.env.MURMUR_RELAY_INVITATION_BYTES,
+        "MURMUR_RELAY_INVITATION_BYTES",
+    );
+    const maximumInvitationItemsPerAdmissionPrincipal = optionalPositiveInteger(
+        process.env.MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL,
+        "MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL",
+    );
+    const maximumInvitationBytesPerAdmissionPrincipal = optionalPositiveInteger(
+        process.env.MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL,
+        "MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL",
+    );
+    const maximumGlobalInvitationItems = optionalPositiveInteger(
+        process.env.MURMUR_RELAY_GLOBAL_INVITATION_ITEMS,
+        "MURMUR_RELAY_GLOBAL_INVITATION_ITEMS",
+    );
+    const maximumGlobalInvitationBytes = optionalPositiveInteger(
+        process.env.MURMUR_RELAY_GLOBAL_INVITATION_BYTES,
+        "MURMUR_RELAY_GLOBAL_INVITATION_BYTES",
+    );
     const service = new RelayService(
         store,
-        maximumAdmissionReferences === undefined ? {} : { maximumAdmissionReferences },
+        {
+            ...(maximumAdmissionReferences === undefined ? {} : { maximumAdmissionReferences }),
+            ...(maximumInvitationBytes === undefined ? {} : { maximumInvitationBytes }),
+            ...(maximumInvitationItemsPerAdmissionPrincipal === undefined
+                ? {}
+                : { maximumInvitationItemsPerAdmissionPrincipal }),
+            ...(maximumInvitationBytesPerAdmissionPrincipal === undefined
+                ? {}
+                : { maximumInvitationBytesPerAdmissionPrincipal }),
+            ...(maximumGlobalInvitationItems === undefined ? {} : { maximumGlobalInvitationItems }),
+            ...(maximumGlobalInvitationBytes === undefined ? {} : { maximumGlobalInvitationBytes }),
+        },
         wakeSource,
     );
     const maximumRequestsPerMinutePerAddress = optionalPositiveInteger(
@@ -105,7 +136,7 @@ export async function main(): Promise<void> {
             let removed: number;
             do {
                 removed = await service.pruneExpired();
-            } while (removed === RELAY_EXPIRATION_BATCH_ITEMS && Date.now() < deadline);
+            } while (removed >= RELAY_EXPIRATION_BATCH_ITEMS && Date.now() < deadline);
         })()
             .catch((error: unknown) =>
                 logger.error(`relay:prune-failed ${safeErrorSummary(error)}`),

@@ -85,6 +85,7 @@ const OUTBOX_PREFIX = "murmur/session-outbox/";
 const OUTBOX_ORDER_PREFIX = "murmur/session-outbox-order/";
 const OUTBOX_SEQUENCE_KEY = "murmur/session-outbox-sequence";
 const KEY_PACKAGE_PREFIX = "murmur/key-packages/";
+const KEY_PACKAGE_EXPIRY_PREFIX = "murmur/key-package-expiries/";
 const REJECTED_PREFIX = "murmur/rejected-sessions/";
 const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
@@ -153,6 +154,10 @@ function epochOutboxIndexKey(id: Uint8Array, deliveryId: string): string {
 
 function keyPackageKey(reference: Uint8Array): string {
     return `${KEY_PACKAGE_PREFIX}${encodeBase64Url(reference)}`;
+}
+
+function keyPackageExpiryKey(reference: Uint8Array): string {
+    return `${KEY_PACKAGE_EXPIRY_PREFIX}${encodeBase64Url(reference)}`;
 }
 
 function rejectedKey(id: Uint8Array): string {
@@ -386,39 +391,113 @@ export class SessionEngine {
     }
 
     async storeKeyPackages(
-        values: readonly { readonly reference: Uint8Array; readonly bytes: Uint8Array }[],
+        values: readonly {
+            readonly reference: Uint8Array;
+            readonly bytes: Uint8Array;
+            readonly expiresAt: number;
+        }[],
     ): Promise<void> {
         await this.#store.transaction(async (transaction) => {
+            const now = this.#now();
+            await this.#pruneKeyPackages(transaction, now);
             const existing = new Map(await transaction.list(KEY_PACKAGE_PREFIX));
-            for (const [key, bytes] of existing) {
+            for (const bytes of existing.values()) zeroBytes(bytes);
+            const newKeys = new Set<string>();
+            for (const value of values) {
+                if (
+                    value.reference.length !== 32 ||
+                    !Number.isSafeInteger(value.expiresAt) ||
+                    value.expiresAt <= now
+                ) {
+                    throw new Error("Invalid local KeyPackage expiry");
+                }
+                const bundle = deserializeMlsKeyPackageBundle(value.bytes);
                 try {
-                    const bundle = deserializeMlsKeyPackageBundle(bytes);
-                    try {
-                        if (
-                            !verifyMlsKeyPackage(bundle.keyPackage, Math.floor(this.#now() / 1_000))
-                        ) {
-                            await transaction.delete(key);
-                            existing.delete(key);
-                        }
-                    } finally {
-                        destroyMlsKeyPackageBundle(bundle);
+                    if (
+                        !verifyMlsKeyPackage(bundle.keyPackage, Math.floor(now / 1_000)) ||
+                        !equalBytes(mlsKeyPackageReference(bundle.keyPackage), value.reference) ||
+                        BigInt(value.expiresAt) >
+                            (bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n
+                    ) {
+                        throw new Error("Invalid local KeyPackage state");
                     }
                 } finally {
-                    zeroBytes(bytes);
+                    destroyMlsKeyPackageBundle(bundle);
                 }
+                const key = keyPackageKey(value.reference);
+                if (!existing.has(key)) newKeys.add(key);
             }
-            const newKeys = new Set(
-                values
-                    .map(({ reference }) => keyPackageKey(reference))
-                    .filter((key) => !existing.has(key)),
-            );
             if (existing.size + newKeys.size > MAXIMUM_KEY_PACKAGES) {
                 throw new Error("Local KeyPackage capacity exceeded");
             }
             for (const value of values) {
                 await transaction.set(keyPackageKey(value.reference), value.bytes);
+                await setAndZero(
+                    transaction,
+                    keyPackageExpiryKey(value.reference),
+                    utf8Encode(String(value.expiresAt).padStart(16, "0")),
+                );
             }
         });
+    }
+
+    async deleteKeyPackages(references: readonly Uint8Array[]): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            for (const reference of references) {
+                await transaction.delete(keyPackageKey(reference));
+                await transaction.delete(keyPackageExpiryKey(reference));
+            }
+        });
+    }
+
+    async #pruneKeyPackages(transaction: StoreTransaction, now: number): Promise<void> {
+        const packages = await transaction.scan(KEY_PACKAGE_PREFIX, {
+            limit: MAXIMUM_KEY_PACKAGES + 1,
+        });
+        const expiries = await transaction.scan(KEY_PACKAGE_EXPIRY_PREFIX, {
+            limit: MAXIMUM_KEY_PACKAGES + 1,
+        });
+        try {
+            if (packages.size > MAXIMUM_KEY_PACKAGES || expiries.size > MAXIMUM_KEY_PACKAGES) {
+                throw new Error("Local KeyPackage capacity exceeded");
+            }
+            const packageKeys = new Set(packages.keys());
+            const active = new Set<string>();
+            for (const [expiryKey, bytes] of expiries) {
+                const suffix = expiryKey.slice(KEY_PACKAGE_EXPIRY_PREFIX.length);
+                const packageKey = `${KEY_PACKAGE_PREFIX}${suffix}`;
+                const encodedExpiry = utf8Decode(bytes);
+                const expiresAt = /^\d{16}$/.test(encodedExpiry)
+                    ? Number(encodedExpiry)
+                    : Number.NaN;
+                if (
+                    !Number.isSafeInteger(expiresAt) ||
+                    expiresAt <= now ||
+                    !packageKeys.has(packageKey)
+                ) {
+                    await transaction.delete(expiryKey);
+                    await transaction.delete(packageKey);
+                } else {
+                    try {
+                        if (decodeBase64Url(suffix).length !== 32) {
+                            throw new Error("Invalid KeyPackage reference");
+                        }
+                        active.add(packageKey);
+                    } catch {
+                        await transaction.delete(expiryKey);
+                        await transaction.delete(packageKey);
+                    }
+                }
+            }
+            for (const packageKey of packageKeys) {
+                if (!active.has(packageKey)) {
+                    await transaction.delete(packageKey);
+                }
+            }
+        } finally {
+            for (const bytes of packages.values()) zeroBytes(bytes);
+            for (const bytes of expiries.values()) zeroBytes(bytes);
+        }
     }
 
     async #claimDiscovery(
@@ -884,6 +963,9 @@ export class SessionEngine {
     }
 
     async synchronize(options: MurmurSynchronizeOptions = {}): Promise<MurmurSynchronizeResult> {
+        await this.#store.transaction((transaction) =>
+            this.#pruneKeyPackages(transaction, this.#now()),
+        );
         const before = await this.#flushOutboxes(options.signal);
         const inbox = await this.#inbox.synchronize(options);
         const after = await this.#flushOutboxes(options.signal);
@@ -1431,6 +1513,7 @@ export class SessionEngine {
                 );
                 await transaction.set(pendingKey(frame.groupId), new Uint8Array());
                 await transaction.delete(keyPackageKey(frame.keyPackageReference));
+                await transaction.delete(keyPackageExpiryKey(frame.keyPackageReference));
             } catch (error: unknown) {
                 if (error instanceof TerminalInboxDeliveryError || protocolComplete) throw error;
                 throw new TerminalInboxDeliveryError("invalid_bootstrap");

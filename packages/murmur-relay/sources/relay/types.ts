@@ -1,5 +1,11 @@
 /** Relay limits with conservative defaults. */
 export interface RelayOptions {
+    readonly maximumInvitationBytes?: number;
+    readonly maximumInvitationTtlMilliseconds?: number;
+    readonly maximumInvitationItemsPerAdmissionPrincipal?: number;
+    readonly maximumInvitationBytesPerAdmissionPrincipal?: number;
+    readonly maximumGlobalInvitationItems?: number;
+    readonly maximumGlobalInvitationBytes?: number;
     readonly maximumCiphertextBytes?: number;
     readonly maximumRecipients?: number;
     readonly maximumJsonBodyBytes?: number;
@@ -22,6 +28,12 @@ export interface RelayOptions {
 
 /** Fully resolved relay limits. */
 export interface ResolvedRelayOptions {
+    readonly maximumInvitationBytes: number;
+    readonly maximumInvitationTtlMilliseconds: number;
+    readonly maximumInvitationItemsPerAdmissionPrincipal: number;
+    readonly maximumInvitationBytesPerAdmissionPrincipal: number;
+    readonly maximumGlobalInvitationItems: number;
+    readonly maximumGlobalInvitationBytes: number;
     readonly maximumCiphertextBytes: number;
     readonly maximumRecipients: number;
     readonly maximumJsonBodyBytes: number;
@@ -40,6 +52,19 @@ export interface ResolvedRelayOptions {
     readonly maximumLongPollMilliseconds: number;
     readonly maximumConcurrentLongPolls: number;
     readonly maximumConcurrentLongPollsPerIdentity: number;
+}
+
+/** Result of caching one opaque signed discovery bundle. */
+export interface InvitationUploadOutcome {
+    readonly digest: Uint8Array;
+    readonly expiresAt: number;
+    readonly duplicate: boolean;
+}
+
+/** One unexpired invitation fetched by its exact SHA-256 digest. */
+export interface InvitationDownload {
+    readonly bundle: Uint8Array;
+    readonly expiresAt: number;
 }
 
 /** Cross-process signal used only to reduce queue long-poll latency. */

@@ -15,12 +15,15 @@ import {
 import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
     AcknowledgeOutcome,
+    InvitationLimits,
     PageReadConstraints,
     PublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,
     RelayStore,
+    StoredInvitation,
+    StoreInvitationOutcome,
 } from "../types.js";
 import type { PostgresDatabase, PostgresQuery } from "./database.js";
 import { createPostgresRelaySchema } from "./migrations.js";
@@ -68,6 +71,123 @@ export class PostgresRelayStore implements RelayStore {
     static async create(database: PostgresDatabase): Promise<PostgresRelayStore> {
         await createPostgresRelaySchema(database);
         return new PostgresRelayStore(database);
+    }
+
+    async storeInvitation(
+        digest: Uint8Array,
+        bundle: Uint8Array,
+        expiresAt: number,
+        now: number,
+        limits: InvitationLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<StoreInvitationOutcome> {
+        this.#assertOpen();
+        if (
+            digest.length !== 32 ||
+            bundle.length < 1 ||
+            admissionPrincipal.length !== 32 ||
+            !Number.isSafeInteger(expiresAt) ||
+            expiresAt <= now
+        ) {
+            throw new Error("Invalid invitation persistence input");
+        }
+        await this.pruneExpired(now);
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
+            );
+            const existing = await transaction.query<{
+                bundle: unknown;
+                expires_at: unknown;
+            }>(
+                `SELECT bundle, expires_at
+                 FROM murmur_invitations
+                 WHERE digest = $1`,
+                [digest],
+            );
+            const duplicate = existing.rows[0];
+            if (duplicate !== undefined) {
+                if (!equalBytes(copyBytes(duplicate.bundle, "invitation bundle"), bundle)) {
+                    throw new Error("Invitation digest collision");
+                }
+                return {
+                    expiresAt: safeNumberColumn(duplicate.expires_at),
+                    duplicate: true,
+                };
+            }
+            const global = await transaction.query<{
+                item_count: unknown;
+                byte_count: unknown;
+            }>(
+                `SELECT COUNT(*) AS item_count,
+                        COALESCE(SUM(encoded_bytes), 0) AS byte_count
+                 FROM murmur_invitations
+                 WHERE expires_at > $1`,
+                [now.toString()],
+            );
+            const globalRow = global.rows[0];
+            if (globalRow === undefined) throw new Error("Missing invitation global usage");
+            if (
+                bigintColumn(globalRow.item_count) + 1n > BigInt(limits.maximumGlobalItems) ||
+                bigintColumn(globalRow.byte_count) + BigInt(bundle.length) >
+                    BigInt(limits.maximumGlobalBytes)
+            ) {
+                throw new RelayError(503, "Relay invitation-cache quota exceeded", {
+                    error: "invitation_relay_full",
+                });
+            }
+            const principal = await transaction.query<{
+                item_count: unknown;
+                byte_count: unknown;
+            }>(
+                `SELECT COUNT(*) AS item_count,
+                        COALESCE(SUM(encoded_bytes), 0) AS byte_count
+                 FROM murmur_invitations
+                 WHERE admission_principal = $1 AND expires_at > $2`,
+                [admissionPrincipal, now.toString()],
+            );
+            const principalRow = principal.rows[0];
+            if (principalRow === undefined) {
+                throw new Error("Missing invitation principal usage");
+            }
+            if (
+                bigintColumn(principalRow.item_count) + 1n > BigInt(limits.maximumPrincipalItems) ||
+                bigintColumn(principalRow.byte_count) + BigInt(bundle.length) >
+                    BigInt(limits.maximumPrincipalBytes)
+            ) {
+                throw new RelayError(429, "Admission-principal invitation quota exceeded", {
+                    error: "invitation_admission_full",
+                });
+            }
+            await transaction.query(
+                `INSERT INTO murmur_invitations
+                    (digest, bundle, encoded_bytes, expires_at, admission_principal)
+                 VALUES ($1, $2, $3, $4, $5)`,
+                [digest, bundle, bundle.length, expiresAt.toString(), admissionPrincipal],
+            );
+            return { expiresAt, duplicate: false };
+        });
+    }
+
+    async readInvitation(digest: Uint8Array, now: number): Promise<StoredInvitation | undefined> {
+        this.#assertOpen();
+        if (digest.length !== 32) throw new Error("Invalid invitation digest");
+        const result = await this.#database.query<{
+            bundle: unknown;
+            expires_at: unknown;
+        }>(
+            `SELECT bundle, expires_at
+             FROM murmur_invitations
+             WHERE digest = $1 AND expires_at > $2`,
+            [digest, now.toString()],
+        );
+        const row = result.rows[0];
+        return row === undefined
+            ? undefined
+            : {
+                  bundle: copyBytes(row.bundle, "invitation bundle"),
+                  expiresAt: safeNumberColumn(row.expires_at),
+              };
     }
 
     async publish(
@@ -654,7 +774,21 @@ export class PostgresRelayStore implements RelayStore {
                 bigintColumn(usageRow.reference_count).toString(),
             ],
         );
-        return removed.rows.length;
+        const removedInvitations = await transaction.query<{ digest: unknown }>(
+            `WITH expired AS (
+                 SELECT digest
+                 FROM murmur_invitations
+                 WHERE expires_at <= $1
+                 ORDER BY expires_at, digest
+                 LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+             )
+             DELETE FROM murmur_invitations AS invitation
+             USING expired
+             WHERE invitation.digest = expired.digest
+             RETURNING invitation.digest`,
+            [now.toString()],
+        );
+        return removed.rows.length + removedInvitations.rows.length;
     }
 
     #assertOpen(): void {

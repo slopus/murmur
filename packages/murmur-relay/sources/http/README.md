@@ -1,11 +1,12 @@
 # HTTP
 
-Fetch-compatible `/v1/deliveries`, `/v1/queue/read`, and `/v1/queue/ack`
-endpoints with bounded strict JSON and explicit CORS policy. Authentication is
+Fetch-compatible invitation-cache, delivery, queue-read, and queue-ack
+endpoints with bounded bodies and explicit CORS policy. Queue authentication is
 inside each signed protocol body.
 
 ```text
-HTTP body -> byte bound -> exact codec -> relay service -> bounded JSON
+invitation bytes -> SHA-256 address -> five-minute opaque cache
+queue JSON ------> exact codec -----> relay service -> bounded JSON
 remote address -----------------------> fixed-window admission bound
 ```
 
