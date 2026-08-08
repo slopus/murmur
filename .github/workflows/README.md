@@ -9,4 +9,4 @@ vX.Y.Z tag
 ```
 
 `publish.yml` is intentionally tag-driven. The tag must exactly match the
-version in `packages/murmur-core/package.json`.
+version in `packages/murmur/package.json`.

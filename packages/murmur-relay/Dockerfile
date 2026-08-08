@@ -15,10 +15,10 @@ WORKDIR /workspace
 
 COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
-COPY packages/murmur-core/package.json packages/murmur-core/package.json
+COPY packages/murmur/package.json packages/murmur/package.json
 COPY packages/murmur-relay/package.json packages/murmur-relay/package.json
 
-RUN pnpm install --frozen-lockfile --filter @murmur/relay...
+RUN pnpm install --frozen-lockfile --filter @slopus/murmur-relay...
 
 COPY packages/murmur-relay packages/murmur-relay
 
@@ -27,7 +27,7 @@ RUN case "$TARGETARCH" in \
         arm64) bun_target=bun-linux-arm64 ;; \
         *) echo "Unsupported relay image architecture: $TARGETARCH" >&2; exit 1 ;; \
     esac \
-    && pnpm --filter @murmur/relay build:binary -- --target "$bun_target"
+    && pnpm --filter @slopus/murmur-relay build:binary -- --target "$bun_target"
 
 FROM debian:bookworm-slim AS runtime
 

@@ -15,7 +15,7 @@ application
     |
     | HTTPS: signed opaque deliveries, reads, acknowledgements
     v
-@murmur/relay
+@slopus/murmur-relay
     | one queue per recipient identity
     | unacknowledged and unexpired delivery references only
     v

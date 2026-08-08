@@ -6,12 +6,12 @@ Postgres.
 ## SQLite
 
 ```bash
-pnpm --filter @murmur/relay build
+pnpm --filter @slopus/murmur-relay build
 
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
 MURMUR_RELAY_ORIGINS=https://app.example \
-pnpm --filter @murmur/relay start
+pnpm --filter @slopus/murmur-relay start
 ```
 
 SQLite is appropriate for one relay process. The store uses WAL mode,
@@ -23,7 +23,7 @@ foreign-key enforcement, a busy timeout, and bounded write transactions.
 MURMUR_RELAY_STORE=postgres \
 MURMUR_RELAY_DB=postgres://user:password@db.example/murmur \
 MURMUR_RELAY_ORIGINS=https://app.example \
-pnpm --filter @murmur/relay start
+pnpm --filter @slopus/murmur-relay start
 ```
 
 Postgres supports multiple relay processes. LISTEN/NOTIFY reduces long-poll

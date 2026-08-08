@@ -1,6 +1,6 @@
 {
     "name": "@slopus/murmur",
-    "version": "0.2.0",
+    "version": "0.3.0",
     "description": "Stateful MLS sessions over authenticated encrypted delivery queues",
     "keywords": [
         "encrypted-events",
@@ -9,7 +9,7 @@
         "relay",
         "typescript"
     ],
-    "homepage": "https://github.com/slopus/murmur/tree/main/packages/murmur-core#readme",
+    "homepage": "https://github.com/slopus/murmur/tree/main/packages/murmur#readme",
     "bugs": {
         "url": "https://github.com/slopus/murmur/issues"
     },
@@ -18,7 +18,7 @@
     "repository": {
         "type": "git",
         "url": "git+https://github.com/slopus/murmur.git",
-        "directory": "packages/murmur-core"
+        "directory": "packages/murmur"
     },
     "files": [
         "dist",
@@ -47,7 +47,8 @@
         "check": "tsc --noEmit -p tsconfig.json",
         "test": "vitest run --maxWorkers=4 --testTimeout=60000",
         "test:watch": "vitest",
-        "prepack": "pnpm run check && pnpm run build && pnpm run test"
+        "sync-readme": "node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('../../README.md', 'README.md');\"",
+        "prepack": "pnpm run sync-readme && pnpm run check && pnpm run build && pnpm run test"
     },
     "dependencies": {
         "@noble/ciphers": "^1.2.1",
@@ -55,7 +56,7 @@
         "@noble/hashes": "^1.7.1"
     },
     "devDependencies": {
-        "@murmur/relay": "workspace:*",
+        "@slopus/murmur-relay": "workspace:*",
         "esbuild": "^0.28.1",
         "typescript": "^5.9.3",
         "vitest": "^3.2.7"

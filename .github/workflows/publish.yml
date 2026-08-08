@@ -36,7 +36,7 @@ jobs:
               id: release-version
               shell: bash
               run: |
-                  package_version="$(node -p "require('./packages/murmur-core/package.json').version")"
+                  package_version="$(node -p "require('./packages/murmur/package.json').version")"
                   if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
                       echo "Release tag $GITHUB_REF_NAME does not match @slopus/murmur@$package_version" >&2
                       exit 1
@@ -105,7 +105,7 @@ jobs:
               id: npm-version
               shell: bash
               run: |
-                  package_version="$(node -p "require('./packages/murmur-core/package.json').version")"
+                  package_version="$(node -p "require('./packages/murmur/package.json').version")"
                   if pnpm view "@slopus/murmur@$package_version" version --json >/dev/null 2>&1; then
                       echo "exists=true" >> "$GITHUB_OUTPUT"
                   else
@@ -113,7 +113,7 @@ jobs:
                   fi
             - name: Publish @slopus/murmur
               if: steps.npm-version.outputs.exists != 'true'
-              working-directory: packages/murmur-core
+              working-directory: packages/murmur
               run: >-
                   pnpm publish --access public
                   --tag ${{ needs.verify.outputs.npm-tag }}
@@ -184,12 +184,12 @@ jobs:
                       fi
                       release_version="${GITHUB_REF_NAME#v}"
                       printf -v release_notes '%s\n\n%s\n\n%s\n%s\n%s\n\n%s' \
-                          "Murmur $GITHUB_REF_NAME brings the browser-and-Node client and the self-hosted relay together in one versioned release." \
+                          "Murmur $GITHUB_REF_NAME provides stateful MLS sessions over authenticated encrypted identity queues." \
                           "### Get it" \
                           "- npm: \`pnpm add @slopus/murmur@$release_version\`" \
                           "- container: \`ghcr.io/slopus/murmur-relay:$release_version\`" \
                           "- container platforms: Linux amd64 and arm64" \
-                          "The npm package includes stateful friend bootstrap, automatic relay convergence, and opaque MLS group event streams. The container includes the standalone ordered-event relay with an SBOM and provenance."
+                          "The browser-safe npm package includes signed discovery, durable queue processing, and unified two-person or many-person MLS sessions. The container includes the authenticated identity-queue relay with SQLite/Postgres storage, an SBOM, and provenance."
                       gh release create "$GITHUB_REF_NAME" \
                           --verify-tag \
                           --title "Murmur $GITHUB_REF_NAME" \

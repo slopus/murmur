@@ -1,5 +1,5 @@
 {
-    "name": "@murmur/relay",
+    "name": "@slopus/murmur-relay",
     "version": "0.1.0",
     "private": true,
     "description": "Murmur Relay: authenticated encrypted identity queues",

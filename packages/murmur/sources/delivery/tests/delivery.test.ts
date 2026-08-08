@@ -1,4 +1,4 @@
-import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@murmur/relay";
+import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";

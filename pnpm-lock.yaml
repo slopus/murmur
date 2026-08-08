@@ -24,7 +24,7 @@ importers:
         specifier: ^5.8.3
         version: 5.9.3
 
-  packages/murmur-core:
+  packages/murmur:
     dependencies:
       '@noble/ciphers':
         specifier: ^1.2.1
@@ -36,7 +36,7 @@ importers:
         specifier: ^1.7.1
         version: 1.8.0
     devDependencies:
-      '@murmur/relay':
+      '@slopus/murmur-relay':
         specifier: workspace:*
         version: link:../murmur-relay
       esbuild:

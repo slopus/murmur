@@ -2,8 +2,8 @@
 
 ```text
 packages/
-    murmur-core/   @slopus/murmur   published browser-safe library
-    murmur-relay/  @murmur/relay    private Node queue relay
+    murmur/        @slopus/murmur         published browser-safe library
+    murmur-relay/  @slopus/murmur-relay   private Node queue relay
 ```
 
 The core package owns identity, signed discovery, durable delivery processing,

@@ -32,8 +32,8 @@ murmur/
 ├── master-plans/            # Product intent, read these first
 ├── docs/                    # Architecture and protocol reference
 ├── packages/
-│   ├── murmur-core/         # @slopus/murmur, the single published library
-│   └── murmur-relay/        # Dumb relay, HTTP handler, stores, and Node host
+│   ├── murmur/              # @slopus/murmur, the single published library
+│   └── murmur-relay/        # @slopus/murmur-relay, private relay infrastructure
 ├── package.json             # Workspace scripts and shared dev tooling
 ├── pnpm-workspace.yaml
 ├── tsconfig.base.json       # Shared strict TypeScript options
@@ -41,8 +41,8 @@ murmur/
 └── .oxlintrc.json           # Linter config
 ```
 
-`@slopus/murmur` is the only package published to npm. `@murmur/relay` is
-private deployment infrastructure.
+`@slopus/murmur` is the only package published to npm.
+`@slopus/murmur-relay` is private deployment infrastructure.
 
 How code is laid out inside a package is dictated by
 [`master-plans/02-code-organization.md`](master-plans/02-code-organization.md):

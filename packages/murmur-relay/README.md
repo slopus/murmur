@@ -1,4 +1,4 @@
-# `@murmur/relay`
+# `@slopus/murmur-relay`
 
 Private Murmur infrastructure implementing authenticated encrypted identity
 queues. The relay sees sender and recipient identities, exact fanout, timing,
@@ -34,11 +34,11 @@ per-address limiter is only a local safety bound. Do not expose the shown
 acknowledgements are replayable inside their short clock-skew window.
 
 ```bash
-pnpm --filter @murmur/relay build
+pnpm --filter @slopus/murmur-relay build
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
 MURMUR_RELAY_ORIGINS='https://app.example' \
-pnpm --filter @murmur/relay start
+pnpm --filter @slopus/murmur-relay start
 ```
 
 Set `MURMUR_RELAY_STORE=postgres` and provide a Postgres URL in
