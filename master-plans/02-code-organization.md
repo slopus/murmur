@@ -21,7 +21,8 @@ epochs and ratchets belong in `mls`; inbound queues and publication belong in
 discovery belong in `identity`; foundational contact behavior belongs in
 `contacts`; optional typed synchronization capabilities belong in `services`.
 Each service is its own domain within `sources/services` and keeps its typed
-packets, persistence, callbacks, and dependency declarations together. The goal
+packets, persistence, and callbacks together. Services are independent; Murmur
+does not model or validate dependencies between services or sessions. The goal
 is that someone working on a domain knows which module to open and finds all of
 that domain's behavior there.
 

@@ -6,9 +6,9 @@ Murmur is a stateful library for discovering a public identity, bootstrapping
 an MLS session, establishing a built-in contact relationship, and exchanging
 data through typed synchronization services. A two-person interaction and a
 many-person interaction use the same MLS group primitive. Contacts are
-foundational Murmur state. Chat semantics remain an optional service above
-contacts, and the old friend-channel and generic relay-topic machinery are not
-part of Murmur.
+foundational Murmur state. Chat remains an optional independent service, and
+the old friend-channel and generic relay-topic machinery are not part of
+Murmur.
 
 It ships as the browser-safe and Node.js-compatible `@slopus/murmur` library.
 The relay is internal infrastructure. Chat, documents, and other application
@@ -48,12 +48,13 @@ A relay item is acknowledged only after its queue-processing outcome is
 durable. Successful session processing atomically persists Murmur state, replay
 and queue progress, and a bounded opaque application update before
 acknowledgement. One identity-wide synchronization loop routes an inbox-ordered
-batch to contact handling, enabled service callbacks, and the application's
-asynchronous `onUpdates` hook for application-owned updates. Only after all
-relevant asynchronous handling resolves does Murmur atomically drain the whole
-local batch. A thrown handler or crash before that internal commit exposes the
-same stable event IDs again; applications needing durable exactly-once effects
-deduplicate those IDs in their own persistence.
+batch to built-in contact handling, registered session owners, and the relevant
+main sync callbacks. The main sync options include `onUpdates` and typed contact
+lifecycle callbacks, but `onUpdates` is never a fallback for an unclaimed
+session. Only after all relevant asynchronous handling resolves does Murmur
+atomically drain the whole local batch. A thrown handler or crash before that
+internal commit exposes the same stable event IDs again; applications needing
+durable exactly-once effects deduplicate those IDs in their own persistence.
 
 A valid bootstrap becomes a durable pending local bootstrap or session together
 with replay and queue progress before acknowledgement; the application later
@@ -92,12 +93,11 @@ being added again.
    membership changes through the same MLS primitive for two or more members.
 4. **Contacts.** Use a two-person technical MLS session and a mutual typed
    profile hello to establish durable cryptographic proof of contact.
-5. **Synchronization services.** Attach optional typed capabilities to the
-   client. Services own their persistence, callbacks, and session routing,
-   participate automatically in the identity-wide synchronization loop, and
-   may depend on contacts or other services.
-6. **Applications.** Use a generic typed synchronization service or a
-   domain-specific service such as chat, documents, or files.
+5. **Synchronization services.** Register optional independent typed services
+   on the client. Each service may claim a new session from its descriptor and
+   then owns later updates routed through that durable association.
+6. **Applications.** Register typed synchronization services for domains such
+   as chat, documents, or files.
 
 ## How we know it is done
 
@@ -117,18 +117,24 @@ being added again.
 - A two-person contact session becomes durable contact proof only after both
   identities exchange and process their typed profile hellos; rejection
   destroys the pending contact session.
-- Optional strictly typed synchronization services persist their state, route
-  their sessions, and participate in the identity-wide sync loop without
-  requiring applications to dispatch raw updates.
+- Optional strictly typed synchronization services persist their state and
+  participate in the identity-wide sync loop through exactly `onNewSession`
+  and `onUpdate`. A successful new-session claim durably routes later updates
+  to that service.
 - The same MLS session engine works for two and many members, including adding
   and removing members in service-owned sessions.
 - Queue processing survives redelivery and acknowledges only after durably
   recording queue progress and its successful protocol state plus buffered
   update, pending bootstrap, or terminal rejection.
 - One `sync` loop delivers bounded identity-wide batches with stable event IDs
-  to contact handling, enabled service callbacks, or the optional application
-  `onUpdates` hook, and commits a whole batch only after its asynchronous
-  handling resolves; an uncommitted batch is returned again after restart.
+  to built-in contact handling, registered service callbacks, and the relevant
+  optional sync callbacks. Contact lifecycle callbacks include
+  `onContactRequested`, `onContactAdded`, and `onContactRemoved`. Murmur commits
+  and drains a whole batch only after its asynchronous handling resolves; an
+  uncommitted batch is returned again after restart.
+- A session that no registered service claims has its unknown updates durably
+  consumed and acknowledged without a raw `onUpdates` fallback, so it cannot
+  block the identity inbox.
 - Realtime delivery streams exact queued events over authenticated SSE in one
   inbox's UUIDv7 order, reconnects from the durable cursor, and may redeliver
   but cannot replace durable acknowledgement.

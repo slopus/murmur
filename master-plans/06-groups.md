@@ -6,7 +6,7 @@ A two-person interaction and a many-person interaction use the same MLS session
 and group primitive. The MLS engine does not attach chat, document, or other
 application meaning to a session. Its descriptor and application events remain
 opaque at that layer. Higher Murmur layers may durably route a session to the
-built-in contact protocol or to an enabled typed synchronization service.
+built-in contact protocol or to a registered typed synchronization service.
 
 The public API creates a session from an opaque descriptor, sends opaque events,
 and adds or removes members. All ongoing membership control and application
@@ -36,11 +36,20 @@ resolution, current epochs and ratchets, Welcome processing, and session
 lifecycle. Public APIs do not expose that choreography.
 
 Every contact- or service-owned session has a durable routing association.
-Service-owned packets are parsed and verified by their service and dispatched
-through that service's callbacks inside the same identity-wide synchronization
-loop. Applications do not manually route raw updates for those sessions.
-Service-owned group sessions may send packets and add or remove members. The
-technical session proving one contact relationship remains two-person.
+The built-in contact protocol owns its technical sessions internally. For any
+other new session, each registered synchronization service has exactly two
+protocol entry points: `onNewSession`, which receives the descriptor and returns
+whether the service claims the session, and `onUpdate`, which receives later
+updates after a successful claim. Murmur persists the session-to-service owner
+mapping. Services are independent, and Murmur models no dependencies between
+services or sessions. Service-owned group sessions may send packets and add or
+remove members. The technical session proving one contact relationship remains
+two-person.
+
+If no registered service claims a new session, Murmur ignores its unknown
+updates after durably recording replay and queue progress. Those updates are
+acknowledged, cannot block later identity-queue entries, and are not passed to a
+raw application `onUpdates` fallback.
 
 ## Durability
 
@@ -48,12 +57,15 @@ Before acknowledging a successfully processed delivery, the client atomically
 persists the resulting MLS state, replay and queue progress, and a bounded
 opaque application update where applicable. It does not expose its store
 transaction to the consumer. One identity-wide `sync` loop routes an
-inbox-ordered batch to contact handling, enabled service callbacks, and an
-optional asynchronous `onUpdates` hook for application-owned updates. Murmur
-atomically drains that whole local batch only after all asynchronous handling
-resolves. A thrown handler or crash before commit returns the same stable event
-IDs again; durable exactly-once application effects require application-level
-idempotency.
+inbox-ordered batch to contact handling, registered service callbacks, and the
+relevant optional sync callbacks. The sync options include typed contact
+lifecycle callbacks such as `onContactRequested`, `onContactAdded`, and
+`onContactRemoved`, alongside connection and update lifecycle callbacks.
+Contact acceptance or rejection remains an explicit contact action rather than
+a return value invented for a lifecycle callback. Murmur atomically drains that
+whole local batch only after all relevant asynchronous handling resolves. A
+thrown handler or crash before commit returns the same stable event IDs again;
+durable exactly-once application effects require application-level idempotency.
 
 A valid bootstrap instead becomes a durable pending local bootstrap or session
 together with replay and queue progress before acknowledgement; the application
@@ -86,8 +98,11 @@ local state requires restoring a backup or being added again.
 - A caller sends opaque events and adds or removes members without
   application-specific behavior in Murmur or the relay.
 - Contact- and service-owned sessions retain a durable routing association, and
-  enabled services automatically process their typed packets in the one
-  identity-wide synchronization loop.
+  each registered service integrates through exactly `onNewSession` and
+  `onUpdate` in the one identity-wide synchronization loop.
+- Unclaimed session updates are durably ignored and acknowledged without being
+  surfaced through raw `onUpdates`, so unknown sessions cannot block the
+  identity inbox.
 - Ongoing application and control traffic is MLS-protected; there is no friend
   channel or shared relay topic.
 - Every current epoch member, including the publisher, receives each ongoing
@@ -106,9 +121,9 @@ local state requires restoring a backup or being added again.
   the identity-wide update callback, while ignore or overflow destroys pending
   secrets and data and retains replay and rejection state.
 - The public synchronization API owns one inbox loop and optional connection
-  lifecycle hooks; it routes contact and service packets internally, and no
-  application transaction, session-specific drain, or public batch commit
-  exists.
+  and typed contact lifecycle hooks; it routes contact and service packets
+  internally, and no application transaction, session-specific drain, or
+  public batch commit exists.
 - Terminally rejected or quarantined deliveries persist replay and queue
   progress without an application effect before acknowledgement.
 - Restarts preserve bounded pending and locally activated sessions, current MLS

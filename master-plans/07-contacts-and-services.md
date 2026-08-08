@@ -9,13 +9,12 @@ MLS session and the mutual typed profile handshake performed through it. This
 session is contact and control state, not chat.
 
 Capabilities beyond contacts are optional, strictly typed synchronization
-services attached to a Murmur client. A service owns its typed packets and
-events, persistence, callbacks, and sessions. Services may depend on contacts or
-on other services. Each service is explicitly enabled or disabled, and enabled
-dependencies are explicit and validated. Contact and service packets use
-versioned, strictly validated typed JSON envelopes encrypted inside MLS. Future
-chat is one such service depending on contacts, not behavior built into a
-contact.
+services registered on a Murmur client. A service is a class or object with
+exactly two protocol entry points: `onNewSession` and `onUpdate`. Services are
+independent. Murmur does not model or validate dependencies between services or
+sessions. Contact and service packets use versioned, strictly validated typed
+JSON envelopes encrypted inside MLS. Future chat is a separate service, not
+behavior built into a contact.
 
 ## Establishing a contact
 
@@ -45,15 +44,37 @@ restores contacts and service state, so local reads and mutations work offline
 before the relay connects or synchronization begins. Durable offline outboxes
 converge when connectivity returns.
 
-Murmur persists which built-in protocol or synchronization service owns each
-session. One identity-wide synchronization loop routes inbound packets to that
-owner automatically. Each service exposes its own typed callbacks; applications
-do not inspect raw updates to dispatch service-owned sessions.
+Murmur uses the same session-routing concept for built-in contacts and optional
+services, while contacts remain built in rather than becoming a registered
+optional service. When any other new session arrives, Murmur offers its
+descriptor to registered services through `onNewSession`. Returning `true`
+claims the session; returning `false` declines it. A successful claim durably
+records the session-to-service owner mapping, and later updates for that session
+go to the owner's `onUpdate`.
 
-A generic group synchronization service provides the common typed path for
-application domains: it parses and verifies events, persists its protocol
-state, and hands typed events to the application domain. Service-owned sessions
-may send packets and add or remove members.
+If no registered service accepts a new session, Murmur durably consumes and
+acknowledges its unknown updates. They are ignored for now, are not surfaced
+through a raw application `onUpdates` fallback, and cannot block later entries
+in the identity inbox.
+
+Services persist their own typed protocol state in the application-supplied
+`MurmurStore` under Murmur-owned namespaces. Service-owned sessions may send
+packets and add or remove members. Opening the client restores the owner mapping
+and service state before relay connectivity, so local reads and mutations keep
+working offline.
+
+The main synchronization options expose optional typed contact lifecycle
+callbacks, including `onContactRequested`, `onContactAdded`, and
+`onContactRemoved`, with room for further contact lifecycle events. They live
+alongside `onConnected`, `onDisconnected`, `onUpdates`, and other main sync
+callbacks rather than in a separate polling loop. Contact acceptance and
+rejection remain explicit contact actions.
+
+These contact callbacks are asynchronous parts of the ordinary durable batch
+boundary. Murmur commits and drains the relevant contact state or event batch
+only after its callback resolves. Service handling participates in the same
+boundary. If a handler throws or the process crashes first, the same stable
+batch is retried.
 
 ## Verification
 
@@ -78,13 +99,20 @@ its Noble-only runtime dependency boundary.
   typed hello; only mutual hello completion persists a confirmed contact.
 - Confirmed contact state and its two-person technical session survive restart
   and are usable offline before synchronization.
-- Optional strictly typed services declare and validate dependencies, own their
-  persistence and callbacks, and participate automatically in the one
-  identity-wide synchronization loop.
+- Optional strictly typed services are registered on `MurmurClient`, expose
+  exactly `onNewSession` and `onUpdate` to Murmur, own their persistence, and
+  participate automatically in the one identity-wide synchronization loop.
 - Durable session routing prevents applications from manually dispatching raw
   updates for contact- or service-owned sessions.
-- A generic synchronization service supports typed group events and member
-  changes, while future chat remains a separate service depending on contacts.
+- Returning `true` from `onNewSession` durably assigns that session to the
+  service, and later updates reach only its `onUpdate`.
+- An unclaimed session is durably ignored and acknowledged without a raw
+  `onUpdates` fallback or identity-inbox blockage.
+- The main sync options provide typed contact lifecycle callbacks including
+  `onContactRequested`, `onContactAdded`, and `onContactRemoved`; callback
+  failure leaves the relevant durable batch available for retry.
+- Service-owned sessions support typed group events and member changes, while
+  future chat remains a separate independent service.
 - Local integration and production-relay end-to-end tests cover invitation
   expiry, exact acknowledgement and cleanup, restart recovery, and offline
   convergence.
