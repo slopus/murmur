@@ -56,6 +56,38 @@ export {
     serializeDiscoveryBundle,
     verifyDiscoveryBundle,
 } from "./identity/discovery/index.js";
+export {
+    contactSessionDescriptor,
+    decodeContactPacket,
+    decodeContactSessionDescriptor,
+    encodeContactPacket,
+    isContactSessionDescriptor,
+    validateContactProfile,
+} from "./contacts/index.js";
+export type {
+    MurmurContact,
+    MurmurContactAdded,
+    MurmurContactPacket,
+    MurmurContactProfile,
+    MurmurContactProfileValue,
+    MurmurContactRemoved,
+    MurmurContactRequest,
+    MurmurContactRequested,
+} from "./contacts/index.js";
+export {
+    createMurmurServiceSessionDescriptor,
+    createMurmurServiceStorage,
+    validateMurmurServiceRegistration,
+    validateServiceId,
+} from "./services/index.js";
+export type {
+    MurmurService,
+    MurmurServiceJsonValue,
+    MurmurServiceRegistration,
+    MurmurServiceSessionDescriptor,
+    MurmurServiceStorage,
+    MurmurServiceStorageScanOptions,
+} from "./services/index.js";
 export { MurmurClient } from "./sessions/index.js";
 export type {
     CreateMurmurSessionOptions,

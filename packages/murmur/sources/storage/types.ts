@@ -6,7 +6,11 @@ export interface StoreScanOptions {
     readonly limit: number;
 }
 
-/** Atomic value exposed by a storage transaction. */
+/**
+ * Atomic ordered byte key/value view.
+ *
+ * Every Murmur feature is encoded as compound keys over this primitive.
+ */
 export interface StoreTransaction {
     /** Return a defensive byte copy for one key, or `undefined` when absent. */
     get(key: string): Promise<Uint8Array | undefined>;
@@ -14,7 +18,11 @@ export interface StoreTransaction {
     set(key: string, value: Uint8Array): Promise<void>;
     /** Remove one key when present. */
     delete(key: string): Promise<void>;
-    /** Return defensive copies of every entry whose key begins with `prefix`. */
+    /**
+     * Return defensive copies of every entry whose key begins with `prefix`.
+     *
+     * @deprecated Use bounded lexicographic `scan` paging for production work.
+     */
     list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>>;
     /** Return one bounded lexicographically ordered page under `prefix`. */
     scan(prefix: string, options: StoreScanOptions): Promise<ReadonlyMap<string, Uint8Array>>;

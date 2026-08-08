@@ -44,9 +44,11 @@ outboxes have settled. The sender adopts the Commit only from its own identity
 queue echo; a publish response never advances the epoch.
 
 A valid received Welcome creates a bounded `pending` session. MLS protocol
-traffic continues while pending. Application events are buffered but not
-exposed until `activateSession` makes them eligible for the identity-wide update
-loop. `ignoreSession` destroys pending secrets and buffers.
+traffic continues while pending. A built-in contact descriptor keeps its
+profile hello internal until explicit acceptance or rejection. Other
+descriptors are offered to registered services; the first `onNewSession`
+returning `true` becomes the durable owner, while a fully declined session is
+consumed. Manually managed sessions remain pending until `activateSession`.
 
 ## Realtime queue stream
 
@@ -70,9 +72,24 @@ signed acknowledgement, and reconnects from its durable cursor.
 
 Every active-session application event is also indexed locally by that relay
 UUIDv7 ID. One `sync({ onUpdates })` loop reads a bounded cross-session batch in
-inbox order. Murmur waits for the callback and atomically removes the complete
-batch only after it resolves. Missing or failed callbacks leave the batch
-pending; no Murmur storage transaction is exposed.
+inbox order. Registered `onUpdate` handlers and contact lifecycle hooks run
+inside the same cycle; global `onUpdates` sees service-owned updates with their
+stable service ID. Murmur atomically removes the complete batch only after
+every relevant callback resolves. No Murmur storage transaction is exposed.
+
+## Contacts and service packets
+
+The built-in contact descriptor is canonical
+`{"protocol":"murmur.contacts","version":1}`. Its two-person MLS session carries
+only canonical version-1 `hello` profile and `remove` packets. A contact is
+confirmed after both authenticated profile hellos are processed. Profiles are
+bounded JSON and contact state survives restart independently of relay
+connectivity.
+
+Optional services use application-defined typed packets inside ordinary MLS
+application bytes. A stable service ID owns each claimed session durably.
+Service persistence is canonical JSON over the same ordered Murmur key/value
+store under a restricted versioned namespace.
 
 ## MLS sessions
 

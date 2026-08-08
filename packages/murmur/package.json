@@ -46,6 +46,7 @@
         "build": "pnpm run clean && tsc -p tsconfig.build.json",
         "check": "tsc --noEmit -p tsconfig.json",
         "test": "vitest run --maxWorkers=4 --testTimeout=60000",
+        "test:e2e": "vitest run --config vitest.e2e.config.ts --testTimeout=60000",
         "test:watch": "vitest",
         "sync-readme": "node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('../../README.md', 'README.md');\"",
         "prepack": "pnpm run sync-readme && pnpm run check && pnpm run build && pnpm run test"

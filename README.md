@@ -18,8 +18,9 @@ MurmurClient -- signed encrypted multicast --> identity queues
 ```
 
 Two-person and many-person interactions use the same MLS session primitive.
-There is no friendship protocol, anonymous addressing, relay-side session
-state, or server-side message history.
+Murmur includes a mutual-profile contact handshake and optional typed session
+services. There is no anonymous addressing, relay-side session state, or
+server-side message history.
 
 ## Packages
 
@@ -68,7 +69,8 @@ Suppose Alice wants to add Bob:
 3. Alice calls `resolveInvitation()`. Murmur downloads the exact bytes by
    digest, verifies the SHA-256 digest, signed expiry, identity signature, and
    KeyPackage signatures.
-4. Alice passes the verified bundle to `createSession()` or `addMember()`.
+4. Alice passes the verified bundle to `createSession()` or `addMember()`, or
+   uses `requestContact()` to begin the built-in contact handshake.
 5. Murmur creates the MLS Commit and sends Bob a sealed Welcome through Bob's
    authenticated relay queue.
 6. Bob's `sync()` loop receives the Welcome. The new session becomes durable
@@ -126,6 +128,79 @@ Received sessions remain `pending` until the application calls
 MLS protocol state and buffer opaque application events within configured
 bounds without exposing them to the application.
 
+## Built-in contacts
+
+A contact is durable proof that two identities exchanged and accepted profiles
+inside one two-person technical MLS session. The technical session is control
+state, not chat.
+
+```ts
+// Alice shares only this 32-byte digest with Bob.
+const invitation = await alice.createInvitation();
+
+// Bob creates the contact session and queues his encrypted profile hello.
+const request = await bob.requestContact(invitation, {
+    displayName: "Bob",
+    capabilities: ["notes"],
+});
+
+// Alice receives and decrypts Bob's hello while the session is still pending.
+await alice.synchronize(
+    { waitMilliseconds: 0 },
+    {
+        onContactRequested: async (requests) => {
+            console.log(requests[0]!.profile.displayName);
+        },
+    },
+);
+
+// Alice explicitly accepts by queuing her own profile hello.
+await alice.acceptContact(request.id, { displayName: "Alice" });
+```
+
+`contact()`, `contacts()`, and `contactRequests()` read durable local state and
+work offline. `rejectContact(sessionId)` destroys a pending request.
+`removeContact(identity)` sends an authenticated removal through the technical
+session. `onContactRequested`, `onContactAdded`, and `onContactRemoved` are
+optional hooks in the ordinary `sync()`/`synchronize()` update cycle. A thrown
+hook leaves its stable lifecycle event pending for retry.
+
+## Typed synchronization services
+
+Register independent services under stable IDs. A service has exactly
+`onNewSession` and `onUpdate`. The first service returning `true` owns the
+session durably; later updates route only to it. When registered services all
+decline, Murmur consumes the unknown session so it cannot block the inbox.
+
+```ts
+const notesService = {
+    onNewSession: async (session) => new TextDecoder().decode(session.descriptor) === "notes/v1",
+    onUpdate: async (update) => {
+        await applyNotePacket(update.id, update.bytes);
+    },
+};
+
+const murmur = await MurmurClient.open({
+    relay: "https://relay.example",
+    store: durableStore,
+    services: [{ id: "notes", service: notesService }],
+});
+
+const notes = murmur.serviceStorage("notes");
+await notes.set("settings", { notifications: true });
+
+const notesSession = await murmur.createSession({
+    descriptor: new TextEncoder().encode("notes/v1"),
+    members: [peerInvitation],
+    service: "notes",
+});
+```
+
+Service-owned updates are also included in global `onUpdates` with their stable
+`service` ID. Murmur runs every relevant service handler and global hook before
+draining the batch. Service persistence is canonical JSON in a restricted
+namespace; consumer code never receives a Murmur storage transaction.
+
 ## One synchronization loop
 
 `sync()` maintains the identity's one recipient-authenticated SSE connection
@@ -133,10 +208,11 @@ and streams the actual queued encrypted deliveries—not wake notifications.
 Each SSE record contains the relay UUIDv7 event ID and exact sender-signed
 delivery.
 
-Application updates from every active session enter one identity-wide UUIDv7
-order. Murmur passes a bounded batch to `onUpdates`. After the callback
-resolves, Murmur atomically commits the whole batch locally. If it throws or
-the process exits first, the same stable update IDs are offered again.
+Updates from every active session and registered service enter one
+identity-wide UUIDv7 order. Murmur passes a bounded batch to `onUpdates` after
+service handlers run. Contact lifecycle hooks participate in the same cycle.
+Murmur commits locally only after every relevant callback resolves. If one
+throws or the process exits first, the same stable IDs are offered again.
 
 ```ts
 const aliceAbort = new AbortController();
@@ -176,8 +252,9 @@ await Promise.all([aliceRunning, bobRunning]);
 ```
 
 All `sync()` options are optional. Without `abort`, the loop runs until a fatal
-error or process shutdown. Without `onUpdates`, application updates remain
-buffered and uncommitted. Ordering is guaranteed within one identity inbox, not
+error or process shutdown. Registered services and contact lifecycle continue
+without global `onUpdates`; unowned application updates remain buffered until
+that hook is supplied. Ordering is guaranteed within one identity inbox, not
 across different identities. If the connection drops, Murmur calls
 `onDisconnected`, reconnects from its durable cursor, and calls `onConnected`
 after the next successful SSE handshake.

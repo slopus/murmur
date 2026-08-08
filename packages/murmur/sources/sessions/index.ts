@@ -29,7 +29,28 @@ import {
 } from "../mls/index.js";
 import type { MurmurStore } from "../storage/index.js";
 import { equalBytes, zeroBytes } from "../utils/index.js";
-import { SessionEngine, type PreparedUpdates } from "./impl/sessionEngine.js";
+import { ContactEngine, type PreparedContactEvents } from "../contacts/impl/contactEngine.js";
+import {
+    contactSessionDescriptor,
+    encodeContactPacket,
+    isContactSessionDescriptor,
+    type MurmurContact,
+    type MurmurContactProfile,
+    type MurmurContactRequested,
+} from "../contacts/index.js";
+import {
+    createMurmurServiceSessionDescriptor,
+    createMurmurServiceStorage,
+    validateMurmurServiceRegistration,
+    type MurmurService,
+    type MurmurServiceRegistration,
+    type MurmurServiceStorage,
+} from "../services/index.js";
+import {
+    SessionEngine,
+    type PreparedUpdates,
+    type SessionRouteDecision,
+} from "./impl/sessionEngine.js";
 import type {
     CreateMurmurSessionOptions,
     MurmurSession,
@@ -72,12 +93,17 @@ export interface MurmurClientOptions {
     readonly identity?: IdentityKeyPair;
     readonly limits?: MurmurSessionLimits;
     readonly now?: () => number;
+    /** Optional typed services available to claim and process sessions. */
+    readonly services?: readonly MurmurServiceRegistration[];
 }
 
 /** Stateful identity, discovery, bootstrap, and opaque MLS-session facade. */
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
     readonly #engine: SessionEngine;
+    readonly #store: MurmurStore;
+    readonly #contacts: ContactEngine;
+    readonly #services = new Map<string, MurmurService>();
     readonly #discoveryTransport: DiscoveryTransport | undefined;
     readonly #now: () => number;
     #closed = false;
@@ -96,17 +122,32 @@ export class MurmurClient {
         discoveryTransport: DiscoveryTransport | undefined,
         limits: MurmurSessionLimits,
         now: () => number,
+        services: readonly MurmurServiceRegistration[],
     ) {
         this.#identity = identity;
+        this.#store = store;
         this.#now = now;
         this.#discoveryTransport = discoveryTransport;
         this.#engine = new SessionEngine(identity, store, transport, limits, now);
+        this.#contacts = new ContactEngine(store, identity.publicKey, now);
+        for (const registration of services) {
+            this.#services.set(registration.id, registration.service);
+        }
     }
 
     /** Open or create one durable single-device Murmur identity. */
     static async open(options: MurmurClientOptions): Promise<MurmurClient> {
         if ((options.relay === undefined) === (options.transport === undefined)) {
             throw new Error("Provide exactly one relay URL or delivery transport");
+        }
+        const services = options.services ?? [];
+        const serviceIds = new Set<string>();
+        for (const registration of services) {
+            validateMurmurServiceRegistration(registration);
+            if (serviceIds.has(registration.id)) {
+                throw new Error("Murmur service IDs must be unique");
+            }
+            serviceIds.add(registration.id);
         }
         let identity: IdentityKeyPair | undefined;
         try {
@@ -169,6 +210,7 @@ export class MurmurClient {
                 discoveryTransport,
                 options.limits ?? {},
                 options.now ?? Date.now,
+                services,
             );
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
@@ -180,6 +222,28 @@ export class MurmurClient {
     get identity(): Uint8Array {
         this.#assertOpen();
         return this.#identity.publicKey.slice();
+    }
+
+    /** Register one optional typed service under its durable stable ID. */
+    registerService(registration: MurmurServiceRegistration): void {
+        this.#assertOpen();
+        validateMurmurServiceRegistration(registration);
+        if (this.#services.has(registration.id)) {
+            throw new Error("Murmur service is already registered");
+        }
+        this.#services.set(registration.id, registration.service);
+    }
+
+    /** Disable one optional service without changing its durable state. */
+    unregisterService(id: string): void {
+        this.#assertOpen();
+        this.#services.delete(id);
+    }
+
+    /** Open JSON persistence restricted to one service namespace. */
+    serviceStorage(id: string): MurmurServiceStorage {
+        this.#assertOpen();
+        return createMurmurServiceStorage(this.#store, id);
     }
 
     /** Create and durably retain fresh one-use KeyPackages in a signed bundle. */
@@ -235,8 +299,114 @@ export class MurmurClient {
         });
     }
 
+    /** Resolve an invitation and durably begin the built-in mutual contact hello. */
+    async requestContact(
+        invitation: Uint8Array,
+        profile: MurmurContactProfile,
+        signal?: AbortSignal,
+    ): Promise<MurmurSession> {
+        const bundle = await this.resolveInvitation(invitation, signal);
+        const session = await this.#exclusive(() =>
+            this.#engine.create(
+                {
+                    descriptor: contactSessionDescriptor(),
+                    members: [bundle],
+                },
+                { version: 1, owner: "contact" },
+                (transaction, id) =>
+                    this.#contacts.recordOutgoingInTransaction(
+                        transaction,
+                        id,
+                        bundle.identityKey,
+                        profile,
+                    ),
+            ),
+        );
+        this.#signalSync();
+        return session;
+    }
+
+    /** Persist the local profile decision, activate the pending contact, and queue hello. */
+    async acceptContact(sessionId: Uint8Array, profile: MurmurContactProfile): Promise<void> {
+        await this.#exclusive(async () => {
+            const packet = encodeContactPacket({ version: 1, type: "hello", profile });
+            try {
+                await this.#engine.acceptOwnedContact(
+                    sessionId,
+                    packet,
+                    (transaction, deliveryId) =>
+                        this.#contacts.acceptInTransaction(
+                            transaction,
+                            sessionId,
+                            profile,
+                            deliveryId,
+                        ),
+                );
+            } finally {
+                zeroBytes(packet);
+            }
+        });
+        this.#signalSync();
+    }
+
+    /** Reject and destroy one pending contact session. */
+    async rejectContact(sessionId: Uint8Array): Promise<void> {
+        await this.#exclusive(() =>
+            this.#engine.destroyOwned(sessionId, "contact", (transaction) =>
+                this.#contacts.rejectInTransaction(transaction, sessionId),
+            ),
+        );
+    }
+
+    /** Queue a typed removal and retain the contact until its authenticated echo. */
+    async removeContact(identity: Uint8Array): Promise<void> {
+        await this.#exclusive(async () => {
+            const contact = await this.#contacts.contact(identity);
+            if (contact === undefined) throw new Error("Unknown contact");
+            const packet = encodeContactPacket({ version: 1, type: "remove" });
+            try {
+                await this.#engine.sendOwnedContact(
+                    contact.sessionId,
+                    packet,
+                    async (transaction, deliveryId) => {
+                        await this.#contacts.markRemovingInTransaction(
+                            transaction,
+                            identity,
+                            deliveryId,
+                        );
+                    },
+                );
+            } finally {
+                zeroBytes(packet);
+            }
+        });
+        this.#signalSync();
+    }
+
+    /** Read one confirmed contact from durable local state. */
+    async contact(identity: Uint8Array): Promise<MurmurContact | undefined> {
+        return this.#tracked(() => this.#contacts.contact(identity));
+    }
+
+    /** Read the bounded durable contact list without relay connectivity. */
+    async contacts(): Promise<readonly MurmurContact[]> {
+        return this.#tracked(() => this.#contacts.contacts());
+    }
+
+    /** Read validated incoming contact requests awaiting a decision. */
+    async contactRequests(): Promise<readonly MurmurContactRequested[]> {
+        return this.#tracked(() => this.#contacts.requests());
+    }
+
     async createSession(options: CreateMurmurSessionOptions): Promise<MurmurSession> {
-        const session = await this.#exclusive(() => this.#engine.create(options));
+        const owner =
+            options.service === undefined
+                ? undefined
+                : ({ version: 1, owner: "service", serviceId: options.service } as const);
+        if (options.service !== undefined && !this.#services.has(options.service)) {
+            throw new Error("Session service is not registered");
+        }
+        const session = await this.#exclusive(() => this.#engine.create(options, owner));
         this.#signalSync();
         return session;
     }
@@ -299,13 +469,17 @@ export class MurmurClient {
 
     async synchronize(
         options: MurmurSynchronizeOptions = {},
-        lifecycle: Pick<MurmurSyncOptions, "onUpdates"> = {},
+        lifecycle: Pick<
+            MurmurSyncOptions,
+            "onUpdates" | "onContactRequested" | "onContactAdded" | "onContactRemoved"
+        > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
             throw new Error("Cannot page synchronization while SSE sync is active");
         }
         const result = await this.#exclusive(() => this.#engine.synchronize(options));
-        await this.#deliverUpdates(lifecycle.onUpdates);
+        await this.#exclusive(() => this.#queueContactHellos());
+        await this.#deliverUpdates(lifecycle);
         return result;
     }
 
@@ -326,7 +500,7 @@ export class MurmurClient {
         signal.addEventListener("abort", wakeOnAbort, { once: true });
         try {
             await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
-            await this.#deliverUpdates(options.onUpdates);
+            await this.#deliverUpdates(options);
             while (!signal.aborted) {
                 let connected = false;
                 let disconnectedBy: unknown;
@@ -348,7 +522,7 @@ export class MurmurClient {
                         if (outcome.type === "wake") {
                             if (signal.aborted) break;
                             await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
-                            await this.#deliverUpdates(options.onUpdates);
+                            await this.#deliverUpdates(options);
                             continue;
                         }
                         if (outcome.result.done) break;
@@ -358,7 +532,7 @@ export class MurmurClient {
                         if (result.transientPublicationFailures > 0) {
                             this.#scheduleSyncWake(SYNC_RECONNECT_DELAY_MILLISECONDS);
                         }
-                        await this.#deliverUpdates(options.onUpdates);
+                        await this.#deliverUpdates(options);
                         if (signal.aborted) break;
                         next = iterator.next();
                     }
@@ -443,34 +617,144 @@ export class MurmurClient {
         this.#syncWakeResolve = undefined;
     }
 
-    async #deliverUpdates(handler: MurmurSyncOptions["onUpdates"]): Promise<number> {
-        if (handler === undefined) return 0;
+    async #deliverUpdates(
+        lifecycle: Pick<
+            MurmurSyncOptions,
+            "onUpdates" | "onContactRequested" | "onContactAdded" | "onContactRemoved"
+        >,
+    ): Promise<number> {
         if (this.#updatesActive) return 0;
         this.#updatesActive = true;
         this.#pendingOperations += 1;
         let delivered = 0;
         try {
             for (;;) {
+                await this.#exclusive(() => this.#queueContactHellos());
                 const prepared = await this.#exclusive(() => this.#engine.prepareUpdates());
-                if (prepared.updates.length === 0) break;
-                const updates: readonly MurmurUpdate[] = Object.freeze(
-                    prepared.updates.map((update) =>
-                        Object.freeze({
+                const decisions: SessionRouteDecision[] = [];
+                const consumedKeys = new Set<string>();
+                const globalUpdates: MurmurUpdate[] = [];
+                const removedSessions: Uint8Array[] = [];
+                let contactEvents: PreparedContactEvents | undefined;
+                let deferredRoutes = false;
+                let deferredUpdates = false;
+                try {
+                    for (const route of prepared.routes) {
+                        let owner: SessionRouteDecision["owner"] | undefined;
+                        if (
+                            isContactSessionDescriptor(route.session.descriptor) &&
+                            route.session.members.length === 2
+                        ) {
+                            owner = { version: 1, owner: "contact" };
+                        } else {
+                            for (const [serviceId, service] of [...this.#services].sort(
+                                ([left], [right]) => left.localeCompare(right),
+                            )) {
+                                if (
+                                    await service.onNewSession(
+                                        createMurmurServiceSessionDescriptor(route.session),
+                                    )
+                                ) {
+                                    owner = {
+                                        version: 1,
+                                        owner: "service",
+                                        serviceId,
+                                    };
+                                    break;
+                                }
+                            }
+                        }
+                        if (owner === undefined && this.#services.size === 0) {
+                            deferredRoutes = true;
+                        } else {
+                            decisions.push({
+                                key: route.key,
+                                sessionId: route.session.id.slice(),
+                                owner: owner ?? { version: 1, owner: "ignored" },
+                            });
+                        }
+                    }
+                    for (const update of prepared.updates) {
+                        if (update.owner?.owner === "contact") {
+                            if ((await this.#contacts.process(update)) === "remove") {
+                                removedSessions.push(update.sessionId.slice());
+                            }
+                            consumedKeys.add(update.key);
+                            continue;
+                        }
+                        if (update.owner?.owner === "ignored") {
+                            consumedKeys.add(update.key);
+                            continue;
+                        }
+                        if (update.owner === undefined && lifecycle.onUpdates === undefined) {
+                            deferredUpdates = true;
+                            continue;
+                        }
+                        const publicUpdate: MurmurUpdate = Object.freeze({
                             id: update.id,
                             sessionId: update.sessionId.slice(),
                             sender: update.sender.slice(),
                             bytes: update.bytes.slice(),
-                        }),
-                    ),
-                );
-                try {
-                    await handler?.(updates);
-                    await this.#exclusive(() => this.#engine.commitUpdates(prepared));
-                    delivered += updates.length;
+                            ...(update.owner?.owner === "service"
+                                ? { service: update.owner.serviceId }
+                                : {}),
+                        });
+                        if (update.owner?.owner === "service") {
+                            const service = this.#services.get(update.owner.serviceId);
+                            if (service === undefined) {
+                                consumedKeys.add(update.key);
+                                continue;
+                            }
+                            await service.onUpdate(publicUpdate);
+                        }
+                        globalUpdates.push(publicUpdate);
+                        consumedKeys.add(update.key);
+                    }
+                    contactEvents = await this.#contacts.prepareEvents();
+                    if (
+                        decisions.length === 0 &&
+                        consumedKeys.size === 0 &&
+                        contactEvents.keys.length === 0
+                    ) {
+                        break;
+                    }
+                    if (globalUpdates.length > 0) {
+                        await lifecycle.onUpdates?.(Object.freeze(globalUpdates));
+                    }
+                    if (contactEvents.requested.length > 0) {
+                        await lifecycle.onContactRequested?.(contactEvents.requested);
+                    }
+                    if (contactEvents.added.length > 0) {
+                        await lifecycle.onContactAdded?.(contactEvents.added);
+                    }
+                    if (contactEvents.removed.length > 0) {
+                        await lifecycle.onContactRemoved?.(contactEvents.removed);
+                    }
+                    for (const sessionId of removedSessions) {
+                        await this.#exclusive(() =>
+                            this.#engine.destroyOwned(sessionId, "contact"),
+                        );
+                    }
+                    const committedContactEvents = contactEvents;
+                    await this.#exclusive(() =>
+                        this.#engine.commitUpdates(
+                            prepared,
+                            decisions,
+                            consumedKeys,
+                            async (transaction) =>
+                                this.#contacts.deletePreparedEvents(
+                                    transaction,
+                                    committedContactEvents,
+                                ),
+                        ),
+                    );
+                    delivered += consumedKeys.size;
+                    if (deferredRoutes || deferredUpdates) break;
                 } finally {
+                    for (const decision of decisions) zeroBytes(decision.sessionId);
+                    for (const sessionId of removedSessions) zeroBytes(sessionId);
                     this.#zeroPreparedUpdates(prepared);
                 }
-                if (prepared.exhausted) break;
             }
             return delivered;
         } finally {
@@ -480,10 +764,49 @@ export class MurmurClient {
     }
 
     #zeroPreparedUpdates(prepared: PreparedUpdates): void {
+        for (const route of prepared.routes) {
+            zeroBytes(route.session.id);
+            zeroBytes(route.session.descriptor);
+            zeroBytes(route.session.committer);
+            for (const member of route.session.members) zeroBytes(member);
+        }
         for (const update of prepared.updates) {
             zeroBytes(update.sessionId);
             zeroBytes(update.sender);
             zeroBytes(update.bytes);
+        }
+    }
+
+    async #queueContactHellos(): Promise<void> {
+        const handshakes = await this.#contacts.outgoingWithoutHello();
+        for (const handshake of handshakes) {
+            try {
+                if (handshake.localProfile === undefined) continue;
+                const session = await this.#engine.get(handshake.sessionId);
+                if (session?.status !== "active") continue;
+                const packet = encodeContactPacket({
+                    version: 1,
+                    type: "hello",
+                    profile: handshake.localProfile,
+                });
+                try {
+                    await this.#engine.sendOwnedContact(
+                        handshake.sessionId,
+                        packet,
+                        (transaction, deliveryId) =>
+                            this.#contacts.recordLocalHelloInTransaction(
+                                transaction,
+                                handshake.sessionId,
+                                deliveryId,
+                            ),
+                    );
+                } finally {
+                    zeroBytes(packet);
+                }
+            } finally {
+                zeroBytes(handshake.identity);
+                zeroBytes(handshake.sessionId);
+            }
         }
     }
 
@@ -501,7 +824,10 @@ export class MurmurClient {
     }
 
     async #flushSync(milliseconds: number, signal: AbortSignal): Promise<void> {
-        const retry = await this.#exclusive(() => this.#engine.flush(signal));
+        const retry = await this.#exclusive(async () => {
+            await this.#queueContactHellos();
+            return this.#engine.flush(signal);
+        });
         if (retry) {
             this.#scheduleSyncWake(milliseconds);
         } else if (this.#syncRetryTimer !== undefined) {

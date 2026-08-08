@@ -31,6 +31,16 @@ import {
 } from "../../mls/index.js";
 import type { MurmurStore, StoreTransaction } from "../../storage/index.js";
 import {
+    ROUTING_MARKER_PREFIX,
+    decodeSessionRouting,
+    decodeSessionOwner,
+    encodeSessionRouting,
+    encodeSessionOwner,
+    routingMarkerKey,
+    sessionOwnerKey,
+    type SessionOwnerRecord,
+} from "../../services/impl/serviceRecords.js";
+import {
     canonicalJsonBytes,
     concatBytes,
     decodeBase64Url,
@@ -116,8 +126,29 @@ const COMMIT_EXPORT_CONTEXT = utf8Encode("murmur/session-commit/v1");
 /** Internal immutable snapshot backing one identity-wide application batch. */
 export interface PreparedUpdates {
     readonly keys: readonly string[];
-    readonly updates: readonly MurmurUpdate[];
+    readonly routes: readonly PreparedSessionRoute[];
+    readonly updates: readonly PreparedRoutedUpdate[];
     readonly exhausted: boolean;
+}
+
+/** One incoming session whose descriptor still needs an owner decision. */
+export interface PreparedSessionRoute {
+    readonly eventId: string;
+    readonly key: string;
+    readonly session: MurmurSession;
+}
+
+/** One buffered session update and its durable routing owner. */
+export interface PreparedRoutedUpdate extends MurmurUpdate {
+    readonly key: string;
+    readonly owner: SessionOwnerRecord | undefined;
+}
+
+/** Durable owner decision for one prepared incoming session. */
+export interface SessionRouteDecision {
+    readonly key: string;
+    readonly sessionId: Uint8Array;
+    readonly owner: SessionOwnerRecord;
 }
 
 function sessionId(value: Uint8Array): string {
@@ -412,7 +443,15 @@ export class SessionEngine {
         await this.#store.transaction(async (transaction) => {
             const now = this.#now();
             await this.#pruneKeyPackages(transaction, now);
-            const existing = new Map(await transaction.list(KEY_PACKAGE_PREFIX));
+            const existing = new Map(
+                await transaction.scan(KEY_PACKAGE_PREFIX, {
+                    limit: MAXIMUM_KEY_PACKAGES + 1,
+                }),
+            );
+            if (existing.size > MAXIMUM_KEY_PACKAGES) {
+                for (const bytes of existing.values()) zeroBytes(bytes);
+                throw new Error("Local KeyPackage capacity exceeded");
+            }
             for (const bytes of existing.values()) zeroBytes(bytes);
             const newKeys = new Set<string>();
             for (const value of values) {
@@ -557,7 +596,11 @@ export class SessionEngine {
         }
     }
 
-    async create(options: CreateMurmurSessionOptions): Promise<MurmurSession> {
+    async create(
+        options: CreateMurmurSessionOptions,
+        owner?: SessionOwnerRecord,
+        operation?: (transaction: StoreTransaction, id: Uint8Array) => Promise<void>,
+    ): Promise<MurmurSession> {
         if (options.descriptor.length > 1024 * 1024) {
             throw new Error("Session descriptor is too large");
         }
@@ -609,6 +652,10 @@ export class SessionEngine {
                 }
                 await this.#claimDiscovery(transaction, members);
                 await setAndZero(transaction, stateKey(id), encodeSessionRecord(record));
+                if (owner !== undefined) {
+                    await setAndZero(transaction, sessionOwnerKey(id), encodeSessionOwner(owner));
+                }
+                await operation?.(transaction, id);
             });
         } finally {
             epoch.destroy();
@@ -692,36 +739,36 @@ export class SessionEngine {
 
     async activate(id: Uint8Array): Promise<void> {
         await this.#store.transaction(async (transaction) => {
-            const stateBytes = await transaction.get(stateKey(id));
-            if (stateBytes === undefined) throw new Error("Unknown session");
-            const record = decodeSessionRecord(stateBytes);
-            try {
-                if (record.status !== "pending") throw new Error("Session is not pending");
-                let after: string | undefined;
-                const prefix = bufferPrefix(id);
-                for (;;) {
-                    const page = await transaction.scan(prefix, {
-                        ...(after === undefined ? {} : { after }),
-                        limit: OUTBOX_SCAN_ITEMS,
-                    });
-                    if (page.size === 0) break;
-                    for (const [key, bytes] of page) {
-                        after = key;
-                        await transaction.set(applicationUpdateKey(key.slice(prefix.length)), id);
-                        zeroBytes(bytes);
-                    }
-                    if (page.size < OUTBOX_SCAN_ITEMS) break;
-                }
-                await transaction.delete(pendingKey(id));
-                await setAndZero(
-                    transaction,
-                    stateKey(id),
-                    encodeSessionRecord({ ...record, status: "active" }),
-                );
-            } finally {
-                this.#zeroSessionRecord(record);
-                zeroBytes(stateBytes);
+            await this.#activatePending(transaction, id);
+            await this.#deleteRoutingMarkers(transaction, id);
+        });
+    }
+
+    /** Activate one internally owned pending session after an explicit decision. */
+    async activateOwned(id: Uint8Array, expectedOwner: "contact" | "service"): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const owner = await this.#sessionOwner(transaction, id);
+            if (owner === undefined || owner.owner !== expectedOwner) {
+                throw new Error("Session owner does not match");
             }
+            await this.#activatePending(transaction, id);
+        });
+    }
+
+    /** Destroy one internally owned session and retain its rejection marker. */
+    async destroyOwned(
+        id: Uint8Array,
+        expectedOwner: "contact" | "service",
+        operation?: (transaction: StoreTransaction) => Promise<void>,
+    ): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const owner = await this.#sessionOwner(transaction, id);
+            if (owner === undefined || owner.owner !== expectedOwner) {
+                throw new Error("Session owner does not match");
+            }
+            await this.#deleteSession(transaction, id);
+            await this.#rejectSession(transaction, id);
+            await operation?.(transaction);
         });
     }
 
@@ -761,34 +808,99 @@ export class SessionEngine {
 
     async prepareUpdates(): Promise<PreparedUpdates> {
         return this.#store.transaction(async (transaction) => {
-            const keys: string[] = [];
-            const updates: MurmurUpdate[] = [];
-            let after: string | undefined;
-            let exhausted = true;
-            for (;;) {
-                const page = await transaction.scan(APPLICATION_UPDATE_PREFIX, {
-                    ...(after === undefined ? {} : { after }),
-                    limit: OUTBOX_SCAN_ITEMS,
-                });
-                if (page.size === 0) break;
-                let stop = false;
-                for (const [key, indexedSessionId] of page) {
-                    after = key;
+            type Candidate =
+                | { readonly type: "route"; readonly eventId: string; readonly key: string }
+                | {
+                      readonly type: "update";
+                      readonly eventId: string;
+                      readonly key: string;
+                      readonly sessionId: Uint8Array;
+                  };
+            const candidates: Candidate[] = [];
+            const routePage = await transaction.scan(ROUTING_MARKER_PREFIX, {
+                limit: MAXIMUM_UPDATE_BATCH_EVENTS + 1,
+            });
+            try {
+                for (const [key, bytes] of routePage) {
+                    const eventId = key.slice(ROUTING_MARKER_PREFIX.length);
+                    const marker = decodeSessionRouting(bytes);
+                    const stateBytes = await transaction.get(stateKey(marker.sessionId));
+                    if (stateBytes === undefined) {
+                        await transaction.delete(key);
+                        zeroBytes(marker.sessionId);
+                        continue;
+                    }
+                    zeroBytes(stateBytes);
+                    candidates.push({ type: "route", eventId, key });
+                    zeroBytes(marker.sessionId);
+                }
+            } finally {
+                for (const bytes of routePage.values()) zeroBytes(bytes);
+            }
+            const updatePage = await transaction.scan(APPLICATION_UPDATE_PREFIX, {
+                limit: MAXIMUM_UPDATE_BATCH_EVENTS + 1,
+            });
+            try {
+                for (const [key, indexedSessionId] of updatePage) {
                     const eventId = key.slice(APPLICATION_UPDATE_PREFIX.length);
                     const bufferedBytes = await transaction.get(
                         `${bufferPrefix(indexedSessionId)}${eventId}`,
                     );
                     if (bufferedBytes === undefined) {
                         await transaction.delete(key);
-                        zeroBytes(indexedSessionId);
                         continue;
                     }
-                    if (updates.length === MAXIMUM_UPDATE_BATCH_EVENTS) {
-                        exhausted = false;
-                        zeroBytes(bufferedBytes);
-                        zeroBytes(indexedSessionId);
-                        stop = true;
-                        break;
+                    zeroBytes(bufferedBytes);
+                    candidates.push({
+                        type: "update",
+                        eventId,
+                        key,
+                        sessionId: indexedSessionId.slice(),
+                    });
+                }
+            } finally {
+                for (const bytes of updatePage.values()) zeroBytes(bytes);
+            }
+            candidates.sort((left, right) => left.eventId.localeCompare(right.eventId));
+            const selected = candidates.slice(0, MAXIMUM_UPDATE_BATCH_EVENTS);
+            const keys: string[] = [];
+            const routes: PreparedSessionRoute[] = [];
+            const updates: PreparedRoutedUpdate[] = [];
+            try {
+                for (const candidate of selected) {
+                    if (candidate.type === "route") {
+                        const markerBytes = await transaction.get(candidate.key);
+                        if (markerBytes === undefined) continue;
+                        const marker = decodeSessionRouting(markerBytes);
+                        zeroBytes(markerBytes);
+                        const stateBytes = await transaction.get(stateKey(marker.sessionId));
+                        if (stateBytes === undefined) {
+                            await transaction.delete(candidate.key);
+                            zeroBytes(marker.sessionId);
+                            continue;
+                        }
+                        const record = decodeSessionRecord(stateBytes);
+                        const epoch = restoreEpoch(this.#identity, record);
+                        try {
+                            routes.push({
+                                eventId: candidate.eventId,
+                                key: candidate.key,
+                                session: publicSession(record, epoch),
+                            });
+                        } finally {
+                            epoch.destroy();
+                            this.#zeroSessionRecord(record);
+                            zeroBytes(stateBytes);
+                            zeroBytes(marker.sessionId);
+                        }
+                        continue;
+                    }
+                    const bufferedBytes = await transaction.get(
+                        `${bufferPrefix(candidate.sessionId)}${candidate.eventId}`,
+                    );
+                    if (bufferedBytes === undefined) {
+                        await transaction.delete(candidate.key);
+                        continue;
                     }
                     let buffered: ReturnType<typeof decodeBufferedEvent>;
                     try {
@@ -796,29 +908,73 @@ export class SessionEngine {
                     } finally {
                         zeroBytes(bufferedBytes);
                     }
-                    keys.push(key);
+                    keys.push(candidate.key);
                     updates.push({
-                        id: eventId,
-                        sessionId: indexedSessionId.slice(),
+                        id: candidate.eventId,
+                        key: candidate.key,
+                        sessionId: candidate.sessionId.slice(),
                         sender: buffered.sender,
                         bytes: buffered.bytes,
+                        owner: await this.#sessionOwner(transaction, candidate.sessionId),
                     });
-                    zeroBytes(indexedSessionId);
                 }
-                for (const [key, value] of page) {
-                    if (key > (after ?? "")) zeroBytes(value);
+                return {
+                    keys,
+                    routes,
+                    updates,
+                    exhausted:
+                        candidates.length <= MAXIMUM_UPDATE_BATCH_EVENTS &&
+                        routePage.size <= MAXIMUM_UPDATE_BATCH_EVENTS &&
+                        updatePage.size <= MAXIMUM_UPDATE_BATCH_EVENTS,
+                };
+            } finally {
+                for (const candidate of candidates) {
+                    if (candidate.type === "update") zeroBytes(candidate.sessionId);
                 }
-                if (stop || page.size < OUTBOX_SCAN_ITEMS) break;
             }
-            return { keys, updates, exhausted };
         });
     }
 
-    async commitUpdates(prepared: PreparedUpdates): Promise<void> {
+    async commitUpdates(
+        prepared: PreparedUpdates,
+        decisions: readonly SessionRouteDecision[] = [],
+        consumedKeys: ReadonlySet<string> = new Set(prepared.keys),
+        operation?: (transaction: StoreTransaction) => Promise<void>,
+    ): Promise<void> {
         await this.#store.transaction(async (transaction) => {
             const changes = new Map<string, { id: Uint8Array; events: number; bytes: number }>();
             try {
+                for (const decision of decisions) {
+                    const markerBytes = await transaction.get(decision.key);
+                    if (markerBytes === undefined) continue;
+                    const marker = decodeSessionRouting(markerBytes);
+                    try {
+                        if (!equalBytes(marker.sessionId, decision.sessionId)) {
+                            throw new Error("Prepared session route changed before commit");
+                        }
+                        if (decision.owner.owner === "ignored") {
+                            await this.#deleteSession(transaction, decision.sessionId);
+                            await this.#rejectSession(transaction, decision.sessionId);
+                        } else {
+                            await setAndZero(
+                                transaction,
+                                sessionOwnerKey(decision.sessionId),
+                                encodeSessionOwner(decision.owner),
+                            );
+                            if (decision.owner.owner === "contact") {
+                                await this.#indexBuffered(transaction, decision.sessionId);
+                            } else {
+                                await this.#activatePending(transaction, decision.sessionId);
+                            }
+                        }
+                        await transaction.delete(decision.key);
+                    } finally {
+                        zeroBytes(marker.sessionId);
+                        zeroBytes(markerBytes);
+                    }
+                }
                 for (const key of prepared.keys) {
+                    if (!consumedKeys.has(key)) continue;
                     const indexedSessionId = await transaction.get(key);
                     if (indexedSessionId === undefined) continue;
                     try {
@@ -861,7 +1017,12 @@ export class SessionEngine {
                     const record = decodeSessionRecord(stateBytes);
                     try {
                         if (
-                            record.status !== "active" ||
+                            (record.status !== "active" &&
+                                !(
+                                    record.status === "pending" &&
+                                    (await this.#sessionOwner(transaction, change.id))?.owner ===
+                                        "contact"
+                                )) ||
                             record.bufferedEvents < change.events ||
                             record.bufferedBytes < change.bytes
                         ) {
@@ -881,6 +1042,7 @@ export class SessionEngine {
                         zeroBytes(stateBytes);
                     }
                 }
+                await operation?.(transaction);
             } finally {
                 for (const change of changes.values()) {
                     zeroBytes(change.id);
@@ -891,6 +1053,47 @@ export class SessionEngine {
 
     async send(id: Uint8Array, bytes: Uint8Array): Promise<string> {
         return this.#queuePrivate(id, { version: 1, type: "application", bytes }, "application");
+    }
+
+    /** Atomically queue one contact packet with its contact-state mutation. */
+    async sendOwnedContact(
+        id: Uint8Array,
+        bytes: Uint8Array,
+        operation: (transaction: StoreTransaction, deliveryId: string) => Promise<void>,
+    ): Promise<string> {
+        return this.#store.transaction(async (transaction) => {
+            const owner = await this.#sessionOwner(transaction, id);
+            if (owner?.owner !== "contact") throw new Error("Session owner does not match");
+            const deliveryId = await this.#queuePrivate(
+                id,
+                { version: 1, type: "application", bytes },
+                "application",
+                transaction,
+            );
+            await operation(transaction, deliveryId);
+            return deliveryId;
+        });
+    }
+
+    /** Atomically activate one contact request, queue hello, and persist its mutation. */
+    async acceptOwnedContact(
+        id: Uint8Array,
+        bytes: Uint8Array,
+        operation: (transaction: StoreTransaction, deliveryId: string) => Promise<void>,
+    ): Promise<string> {
+        return this.#store.transaction(async (transaction) => {
+            const owner = await this.#sessionOwner(transaction, id);
+            if (owner?.owner !== "contact") throw new Error("Session owner does not match");
+            await this.#activatePending(transaction, id);
+            const deliveryId = await this.#queuePrivate(
+                id,
+                { version: 1, type: "application", bytes },
+                "application",
+                transaction,
+            );
+            await operation(transaction, deliveryId);
+            return deliveryId;
+        });
     }
 
     async add(id: Uint8Array, bundle: DiscoveryBundle): Promise<void> {
@@ -1634,6 +1837,11 @@ export class SessionEngine {
                     }),
                 );
                 await transaction.set(pendingKey(frame.groupId), new Uint8Array());
+                await setAndZero(
+                    transaction,
+                    routingMarkerKey(queued.eventId),
+                    encodeSessionRouting({ version: 1, sessionId: frame.groupId }),
+                );
                 await transaction.delete(keyPackageKey(frame.keyPackageReference));
                 await transaction.delete(keyPackageExpiryKey(frame.keyPackageReference));
             } catch (error: unknown) {
@@ -2003,6 +2211,80 @@ export class SessionEngine {
         }
     }
 
+    async #sessionOwner(
+        transaction: StoreTransaction,
+        id: Uint8Array,
+    ): Promise<SessionOwnerRecord | undefined> {
+        const bytes = await transaction.get(sessionOwnerKey(id));
+        if (bytes === undefined) return undefined;
+        try {
+            return decodeSessionOwner(bytes);
+        } finally {
+            zeroBytes(bytes);
+        }
+    }
+
+    async #deleteRoutingMarkers(transaction: StoreTransaction, id: Uint8Array): Promise<void> {
+        let after: string | undefined;
+        for (;;) {
+            const page = await transaction.scan(ROUTING_MARKER_PREFIX, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, bytes] of page) {
+                after = key;
+                const marker = decodeSessionRouting(bytes);
+                try {
+                    if (equalBytes(marker.sessionId, id)) {
+                        await transaction.delete(key);
+                    }
+                } finally {
+                    zeroBytes(marker.sessionId);
+                    zeroBytes(bytes);
+                }
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
+        }
+    }
+
+    async #indexBuffered(transaction: StoreTransaction, id: Uint8Array): Promise<void> {
+        let after: string | undefined;
+        const prefix = bufferPrefix(id);
+        for (;;) {
+            const page = await transaction.scan(prefix, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, bytes] of page) {
+                after = key;
+                await transaction.set(applicationUpdateKey(key.slice(prefix.length)), id);
+                zeroBytes(bytes);
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
+        }
+    }
+
+    async #activatePending(transaction: StoreTransaction, id: Uint8Array): Promise<void> {
+        const stateBytes = await transaction.get(stateKey(id));
+        if (stateBytes === undefined) throw new Error("Unknown session");
+        const record = decodeSessionRecord(stateBytes);
+        try {
+            if (record.status !== "pending") throw new Error("Session is not pending");
+            await this.#indexBuffered(transaction, id);
+            await transaction.delete(pendingKey(id));
+            await setAndZero(
+                transaction,
+                stateKey(id),
+                encodeSessionRecord({ ...record, status: "active" }),
+            );
+        } finally {
+            this.#zeroSessionRecord(record);
+            zeroBytes(stateBytes);
+        }
+    }
+
     async #buffer(
         transaction: StoreTransaction,
         id: Uint8Array,
@@ -2030,7 +2312,9 @@ export class SessionEngine {
             `${bufferPrefix(id)}${eventId}`,
             encodeBufferedEvent({ version: 1, sender, bytes }),
         );
-        if (record.status === "active") {
+        const owner =
+            record.status === "active" ? undefined : await this.#sessionOwner(transaction, id);
+        if (record.status === "active" || owner?.owner === "contact") {
             await transaction.set(applicationUpdateKey(eventId), id);
         }
         const latestBytes = await transaction.get(stateKey(id));
@@ -2762,6 +3046,8 @@ export class SessionEngine {
         await this.#deletePrefix(transaction, `${SESSION_DATA_PREFIX}${sessionId(id)}/`);
         await transaction.delete(stateKey(id));
         await transaction.delete(pendingKey(id));
+        await transaction.delete(sessionOwnerKey(id));
+        await this.#deleteRoutingMarkers(transaction, id);
         let after: string | undefined;
         for (;;) {
             const page = await transaction.scan(OUTBOX_PREFIX, {

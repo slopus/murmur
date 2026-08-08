@@ -1,5 +1,10 @@
 import type { InboxSyncResult } from "../delivery/index.js";
 import type { DiscoveryBundle } from "../identity/discovery/index.js";
+import type {
+    MurmurContactAdded,
+    MurmurContactRemoved,
+    MurmurContactRequested,
+} from "../contacts/types.js";
 
 /** Stable public view of one local MLS session. */
 export interface MurmurSession {
@@ -18,6 +23,8 @@ export interface MurmurUpdate {
     readonly sessionId: Uint8Array;
     readonly sender: Uint8Array;
     readonly bytes: Uint8Array;
+    /** Stable registered service owner, omitted for unowned sessions. */
+    readonly service?: string;
 }
 
 /** Optional lifecycle configuration for the single identity-wide synchronization loop. */
@@ -35,6 +42,14 @@ export interface MurmurSyncOptions {
      * omitting the hook leaves updates pending.
      */
     readonly onUpdates?: (updates: readonly MurmurUpdate[]) => void | Promise<void>;
+    /** Runs for validated incoming contact requests in the same durable batch. */
+    readonly onContactRequested?: (
+        requests: readonly MurmurContactRequested[],
+    ) => void | Promise<void>;
+    /** Runs when mutual profile hellos establish confirmed contacts. */
+    readonly onContactAdded?: (contacts: readonly MurmurContactAdded[]) => void | Promise<void>;
+    /** Runs when technical contact sessions are removed. */
+    readonly onContactRemoved?: (contacts: readonly MurmurContactRemoved[]) => void | Promise<void>;
 }
 
 /** One MLS-protected member proposal awaiting committer acceptance. */
@@ -62,6 +77,8 @@ export interface CreateMurmurSessionOptions {
     readonly descriptor: Uint8Array;
     /** At least one other member, making the initial MLS group two-or-more. */
     readonly members: readonly DiscoveryBundle[];
+    /** Stable registered service that immediately owns this locally created session. */
+    readonly service?: string;
 }
 
 /** Stateful-session resource limits. */

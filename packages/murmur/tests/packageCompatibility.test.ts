@@ -66,16 +66,23 @@ if (JSON.stringify(names) !== JSON.stringify([
     "MurmurClient",
     "OversizedInboxDeliveryError",
     "TerminalInboxDeliveryError",
+    "contactSessionDescriptor",
     "containsRecipient",
     "createDiscoveryBundle",
+    "createMurmurServiceSessionDescriptor",
+    "createMurmurServiceStorage",
     "createSignedDelivery",
     "createSignedInboxAck",
     "createSignedInboxRead",
+    "decodeContactPacket",
+    "decodeContactSessionDescriptor",
     "decodeIdentityRoot",
     "destroyIdentity",
+    "encodeContactPacket",
     "encodeIdentityRoot",
     "generateIdentityKeyPair",
     "importIdentityKeyPair",
+    "isContactSessionDescriptor",
     "parseDiscoveryBundle",
     "parseInboxPage",
     "parseSignedDelivery",
@@ -83,6 +90,9 @@ if (JSON.stringify(names) !== JSON.stringify([
     "signedDeliveryToJson",
     "signedInboxAckToJson",
     "signedInboxReadToJson",
+    "validateContactProfile",
+    "validateMurmurServiceRegistration",
+    "validateServiceId",
     "validateSignedDelivery",
     "verifyDiscoveryBundle",
     "verifySignedDelivery",
@@ -166,6 +176,8 @@ import {
     type DiscoveryTransport,
     type IdentityKeyPair,
     type MurmurClientOptions,
+    type MurmurContactProfile,
+    type MurmurService,
     type MurmurSyncOptions,
     type MurmurSessionPage,
     type MurmurStore,
@@ -184,7 +196,16 @@ const options: MurmurClientOptions = {
     store,
     fetch: deliveryFetch,
     identity,
+    services: [{
+        id: "notes",
+        service: {
+            onNewSession: async () => true,
+            onUpdate: async () => {},
+        },
+    }],
 };
+const service: MurmurService = options.services![0]!.service;
+const profile: MurmurContactProfile = { displayName: "Alice" };
 const opening: Promise<MurmurClient> = MurmurClient.open(options);
 const syncOptions: MurmurSyncOptions = {
     abort: new AbortController().signal,
@@ -198,6 +219,8 @@ void opening;
 void syncOptions;
 void page;
 void discovery;
+void service;
+void profile;
 destroyIdentity(identity);
 `,
                 "utf8",

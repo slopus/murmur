@@ -1,5 +1,21 @@
 # Storage
 
+Murmur state is built on one ordered byte key/value primitive:
+
+```text
+get(key)
+set(key, bytes)
+delete(key)
+scan(prefix, { after?, limit })
+transaction(async store => ...)
+```
+
+`scan` is lexicographic, prefix-filtered, and page-bounded. Compound durable
+keys use `/` separators because v0.3.3 established that persisted namespace.
+Contacts, services, routing, MLS checkpoints, inbox state, and outboxes are all
+records layered on this same application-supplied `MurmurStore`; none introduces
+another database abstraction.
+
 The core depends on a minimal asynchronous byte key-value store. Browser
 applications can back it with IndexedDB; Node applications can use SQLite. The
 included memory implementation is for tests and ephemeral processes.

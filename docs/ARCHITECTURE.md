@@ -35,13 +35,16 @@ MLS credentials. The supplied `MurmurStore` is authoritative for:
 - sender ratchets and exact publication outboxes;
 - inbox cursor, replay protection, and terminal rejections;
 - accepted proposals, pending-session state, bounded opaque event buffers, and
-  the identity-wide application-update order.
+  the identity-wide application-update order;
+- built-in contacts, session-to-service ownership, and service-scoped JSON.
 
 Application history is not reconstructed from the relay. Murmur never exposes
-its storage transaction to event handlers. Active-session events enter one
-identity-wide UUIDv7-ordered local index. `sync()` invokes `onUpdates` with a
-bounded cross-session batch and atomically removes that batch only after the
-callback resolves.
+its storage transaction to event handlers. All durable client state is compound
+keys over one ordered byte key/value store with bounded lexicographic prefix
+scans. Active-session events enter one identity-wide UUIDv7-ordered local
+index. Contact handling, registered service callbacks, and global `onUpdates`
+participate in one batch; Murmur removes it only after every relevant callback
+resolves.
 
 ## Relay ownership
 
@@ -101,7 +104,8 @@ page or SSE event -> authenticate/decrypt
                   -> persist protocol state + buffered update or rejection + cursor
                   -> commit -> acknowledge through cursor
 
-ordered buffered batch -> await onUpdates(batch)
+ordered buffered batch -> contact + service handlers
+                       -> await lifecycle hooks + onUpdates(batch)
                        -> local commit of the whole batch
 ```
 
