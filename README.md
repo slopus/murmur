@@ -1,301 +1,872 @@
 # Murmur
 
-Murmur is a browser-safe TypeScript library for stateful MLS sessions over one
-deliberately simple relay. The relay stores unacknowledged encrypted deliveries
-in one authenticated queue per public identity, plus public signed invitation
-bundles in a non-enumerable five-minute cache. Durable identity, MLS epochs,
-replay protection, buffered updates, application effects, and history belong to
-the client application.
+[![npm](https://img.shields.io/npm/v/%40slopus%2Fmurmur)](https://www.npmjs.com/package/@slopus/murmur)
+[![license](https://img.shields.io/npm/l/%40slopus%2Fmurmur)](https://github.com/slopus/murmur/blob/main/LICENSE)
+
+Murmur is a browser-safe TypeScript library for stateful [MLS](https://www.rfc-editor.org/rfc/rfc9420)
+sessions over one deliberately simple relay. Two identities discover each
+other through a short-lived signed invitation, bootstrap a forward-secret MLS
+session, and exchange end-to-end encrypted data through typed synchronization
+services. A two-person conversation and a many-person group use the same
+session primitive.
+
+The relay is a disposable delivery buffer: one authenticated encrypted queue
+per public identity plus a non-enumerable five-minute invitation cache. All
+durable protocol state — identity secrets, MLS epochs, replay protection,
+outboxes, and contacts — lives in storage the application supplies. The
+application separately owns its history and effects.
+
+**Murmur is:**
+
+- a stateful client library with one durable identity per store;
+- end-to-end encrypted with MLS (TreeKEM) for two or more members;
+- built-in mutual-profile contacts plus optional typed services;
+- offline-first, with durable outboxes and restart-safe delivery.
+
+**Murmur is not:**
+
+- anonymous: the relay learns sender, recipient, fanout, and timing metadata;
+- server-side history: acknowledged deliveries are gone from the relay;
+- a recovery system: losing the local store loses sessions and contacts;
+- multi-device: one identity has one active receiving device.
 
 ```text
-32-byte invitation digest -> five-minute relay cache -> signed bundle
-                                       |
-                                       v
-MurmurClient -- signed encrypted multicast --> identity queues
-     |                                            |
-     +-- durable MLS checkpoints/outboxes <-------+
-     +-- one identity-wide ordered update loop
+                      out-of-band (QR, deep link, ...)
+     Bob ---------------- 32-byte invitation digest ---------------> Alice
+      |                                                               |
+      | upload signed bundle                        fetch + verify    |
+      v                                                               v
++---------------------------- relay (untrusted) ----------------------------+
+|  five-minute invitation cache        one encrypted queue per identity     |
+|  (content-addressed by SHA-256)      (UUIDv7-ordered, ack-trimmed)        |
++---------------------------------------------------------------------------+
+      ^                    |  atomic multicast to every member  ^
+      | publish + ack      v  (SSE stream or paged read)        | publish + ack
++-------------+                                          +-------------+
+| MurmurClient|  <-- MLS Welcome / Commits / app data --> | MurmurClient|
+|  MurmurStore|      (encrypted; relay never decrypts)    |  MurmurStore|
++-------------+                                          +-------------+
+      |                                                        |
+      +-- one identity-wide sync loop: contacts, services, onUpdates
 ```
 
-Two-person and many-person interactions use the same MLS session primitive.
-Murmur includes a mutual-profile contact handshake and optional typed session
-services. There is no anonymous addressing, relay-side session state, or
-server-side message history.
+- [Install](#install)
+- [Five-minute tour](#five-minute-tour)
+- [Durable storage: `MurmurStore`](#durable-storage-murmurstore)
+- [Identity](#identity)
+- [Invitations and discovery](#invitations-and-discovery)
+- [Contacts](#contacts)
+- [Sessions](#sessions)
+- [Typed synchronization services](#typed-synchronization-services)
+- [The synchronization loop](#the-synchronization-loop)
+- [Durability, offline use, and idempotency](#durability-offline-use-and-idempotency)
+- [Graceful shutdown](#graceful-shutdown)
+- [Security and trust model](#security-and-trust-model)
+- [Running a relay locally](#running-a-relay-locally)
+- [Development](#development)
+- [Compatibility](#compatibility)
 
-## Packages
+## Install
 
-- `@slopus/murmur` — the only published package; ESM-only and browser-safe.
-- `@slopus/murmur-relay` — private Node infrastructure with SQLite and Postgres
-  stores.
-
-## Identity and five-minute invitations
-
-`murmur.identity` is the stable public identifier. It is exactly one 32-byte
-Ed25519 public key:
-
-```ts
-const publicIdentity: Uint8Array = murmur.identity;
+```bash
+pnpm add @slopus/murmur
 ```
 
-The identity alone is not enough to add a member to MLS. MLS also requires
-fresh one-use HPKE and leaf material. Murmur packages that public material into
-a five-minute, identity-signed `DiscoveryBundle`.
+`@slopus/murmur` is ESM-only, side-effect-free, and browser-safe. It runs in
+modern browsers and Node.js 20 or later, and its only runtime dependencies are
+the audited Noble cryptography libraries (`@noble/curves`, `@noble/hashes`,
+`@noble/ciphers`). There are no `node:*` imports and no native modules.
 
-The bundle contains:
+The repository also contains `@slopus/murmur-relay`, the private relay
+infrastructure package. It is not published; you deploy it yourself or run it
+locally for development (see [Running a relay locally](#running-a-relay-locally)).
 
-- the 32-byte public identity;
-- one or more public, one-use MLS KeyPackages;
-- creation and expiration times;
-- an Ed25519 signature binding the complete bundle.
+## Five-minute tour
 
-It contains no private key material. The matching private KeyPackage state is
-persisted only in the prospective member's local `MurmurStore`.
-
-The complete default bundle is about 645 bytes, but it does not need to be
-placed in a QR code. `createInvitation()` uploads the exact signed bytes to the
-relay's non-enumerable five-minute cache and returns their 32-byte SHA-256
-digest. The digest is 43 characters as unpadded base64url and fits comfortably
-in a small QR code or deep link.
-
-### Implementing a digest invitation
-
-Suppose Alice wants to add Bob:
-
-1. Bob calls `createInvitation()`. Murmur creates a fresh KeyPackage, persists
-   its private half locally for five minutes, uploads the signed public bundle,
-   and returns its SHA-256 digest.
-2. Bob sends only that 32-byte digest to Alice through a QR code, deep link,
-   nearby exchange, or another out-of-band path.
-3. Alice calls `resolveInvitation()`. Murmur downloads the exact bytes by
-   digest, verifies the SHA-256 digest, signed expiry, identity signature, and
-   KeyPackage signatures.
-4. Alice passes the verified bundle to `createSession()` or `addMember()`, or
-   uses `requestContact()` to begin the built-in contact handshake.
-5. Murmur creates the MLS Commit and sends Bob a sealed Welcome through Bob's
-   authenticated relay queue.
-6. Bob's `sync()` loop receives the Welcome. The new session becomes durable
-   but remains `pending` until Bob's application activates or ignores it.
+Alice and Bob become contacts. This example uses the in-memory store and a
+local relay; the rest of this guide expands each step and shows how contacts
+then use typed services.
 
 ```ts
 import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";
 
 const alice = await MurmurClient.open({
-    relay: "https://relay.example",
+    relay: "http://127.0.0.1:8787",
     store: new MemoryMurmurStore(),
 });
-
 const bob = await MurmurClient.open({
-    relay: "https://relay.example",
+    relay: "http://127.0.0.1:8787",
     store: new MemoryMurmurStore(),
 });
 
-// Bob uploads one signed five-minute bundle and gets a 32-byte digest.
-const bobInvitationDigest = await bob.createInvitation();
+// 1. Alice uploads a signed five-minute invitation bundle to the relay and
+//    shares only its 32-byte SHA-256 digest with Bob, out of band.
+const digest = await alice.createInvitation();
 
-// The application encodes only this digest in its QR/deep link.
-const scannedDigest = bobInvitationDigest;
-const bobInvite = await alice.resolveInvitation(scannedDigest);
+// 2. Bob resolves the digest, verifies the bundle, creates the two-person
+//    contact session, and queues his encrypted profile hello.
+await bob.requestContact(digest, { displayName: "Bob" });
 
-// Alice creates a two-member MLS session and publishes its Commit + Welcome.
-const session = await alice.createSession({
-    descriptor: new TextEncoder().encode("opaque application metadata"),
-    members: [bobInvite],
-});
-await alice.synchronize();
+// 3. Each bounded cycle publishes outboxes and receives queued deliveries.
+//    Alice explicitly accepts the validated request by sending her own hello.
+let accepted = false;
+for (let attempt = 0; attempt < 5; attempt += 1) {
+    await bob.synchronize();
+    await alice.synchronize(
+        {},
+        {
+            onContactRequested: async (requests) => {
+                for (const request of requests) {
+                    console.log("request from", request.profile.displayName);
+                    if (!accepted) {
+                        await alice.acceptContact(request.sessionId, {
+                            displayName: "Alice",
+                        });
+                        accepted = true;
+                    }
+                }
+            },
+        },
+    );
+    if ((await alice.contacts()).length === 1 && (await bob.contacts()).length === 1) {
+        break;
+    }
+}
 
-// Bob durably receives a pending session, then explicitly accepts it.
-await bob.synchronize();
-await bob.activateSession(session.id);
+console.log((await alice.contacts())[0]!.profile.displayName); // Bob
+console.log((await bob.contacts())[0]!.profile.displayName); // Alice
 ```
 
-Treat each discovery bundle as one-use:
+`synchronize()` is the bounded foreground form of the sync loop, convenient
+for scripts and tests. Real applications run the persistent `sync()` loop
+instead, which keeps one authenticated SSE connection open and delivers
+everything through the same callbacks — see
+[The synchronization loop](#the-synchronization-loop).
 
-- Generate a fresh bundle for each invitation attempt.
-- Do not reuse a bundle for another session or membership operation.
-- Complete the lookup and Welcome within five minutes. If either expires,
-  obtain a fresh digest.
-- Treat the digest as a short-lived bearer capability. It is unguessable, but
-  anyone who receives it can download the public invitation bundle.
-- Murmur deletes the matching private KeyPackage when its Welcome is consumed,
-  or on the next client operation after expiry and before any later Welcome can
-  be processed. Expired Welcomes are rejected.
-- `discovery()`, `serializeDiscoveryBundle()`, and `parseDiscoveryBundle()`
-  remain available when an application deliberately wants to transport the
-  complete self-contained bundle without the relay cache.
+`MemoryMurmurStore` is for tests and examples only: it forgets everything on
+restart, and with it a crash loses your sessions permanently. Production
+applications must supply a durable transactional store, which is the next
+section.
 
-Received sessions remain `pending` until the application calls
-`activateSession()` or `ignoreSession()`. Pending sessions continue processing
-MLS protocol state and buffer opaque application events within configured
-bounds without exposing them to the application.
+## Durable storage: `MurmurStore`
 
-## Built-in contacts
-
-A contact is durable proof that two identities exchanged and accepted profiles
-inside one two-person technical MLS session. The technical session is control
-state, not chat.
+Murmur never talks to a database itself. The application supplies one
+`MurmurStore`, an atomic ordered string-key/byte-value interface, and Murmur
+keeps everything durable inside it under Murmur-owned key namespaces: the
+identity root, MLS epochs and ratchet checkpoints, KeyPackages, pending
+sessions, contacts, service state, outboxes, and replay/queue progress.
 
 ```ts
-// Alice shares only this 32-byte digest with Bob.
-const invitation = await alice.createInvitation();
-
-// Bob creates the contact session and queues his encrypted profile hello.
-const request = await bob.requestContact(invitation, {
-    displayName: "Bob",
-    capabilities: ["notes"],
-});
-
-// Alice receives and decrypts Bob's hello while the session is still pending.
-await alice.synchronize(
-    { waitMilliseconds: 0 },
-    {
-        onContactRequested: async (requests) => {
-            console.log(requests[0]!.profile.displayName);
-        },
-    },
-);
-
-// Alice explicitly accepts by queuing her own profile hello.
-await alice.acceptContact(request.id, { displayName: "Alice" });
+interface MurmurStore {
+    get(key: string): Promise<Uint8Array | undefined>;
+    set(key: string, value: Uint8Array): Promise<void>;
+    delete(key: string): Promise<void>;
+    /** @deprecated Implement for compatibility; Murmur production paths use scan. */
+    list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>>;
+    /** One bounded lexicographically ordered page of entries under a prefix. */
+    scan(
+        prefix: string,
+        options: { after?: string; limit: number },
+    ): Promise<ReadonlyMap<string, Uint8Array>>;
+    /** Run one callback atomically with rollback on throw. No nesting. */
+    transaction<Result>(
+        operation: (transaction: StoreTransaction) => Promise<Result>,
+    ): Promise<Result>;
+}
 ```
 
-`contact()`, `contacts()`, and `contactRequests()` read durable local state and
-work offline. `rejectContact(sessionId)` destroys a pending request.
-`removeContact(identity)` sends an authenticated removal through the technical
-session. `onContactRequested`, `onContactAdded`, and `onContactRemoved` are
-optional hooks in the ordinary `sync()`/`synchronize()` update cycle. A thrown
-hook leaves its stable lifecycle event pending for retry.
+The contract that matters:
+
+- **Transactions are atomic and serialized.** Everything written inside
+  `transaction()` commits together or not at all, and a thrown callback rolls
+  back. Murmur's crash-safety guarantees rest entirely on this.
+- **`scan` is ordered.** It returns at most `limit` entries (up to
+  `MAXIMUM_STORE_SCAN_ITEMS`, 10,000) in lexicographic key order, strictly
+  after the optional `after` key.
+- **Values are bytes.** Return defensive copies; Murmur zeroes buffers it no
+  longer needs.
+
+A realistic minimal Node implementation over `node:sqlite` (Node 22.5+):
+
+```ts
+import { DatabaseSync } from "node:sqlite";
+import type { MurmurStore, StoreScanOptions, StoreTransaction } from "@slopus/murmur";
+
+export class SqliteMurmurStore implements MurmurStore {
+    readonly #database: DatabaseSync;
+    #tail: Promise<unknown> = Promise.resolve();
+
+    constructor(path: string) {
+        this.#database = new DatabaseSync(path);
+        this.#database.exec("PRAGMA journal_mode = WAL");
+        this.#database.exec(
+            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
+        );
+    }
+
+    async get(key: string): Promise<Uint8Array | undefined> {
+        return this.#serialized(() => this.#get(key));
+    }
+
+    async set(key: string, value: Uint8Array): Promise<void> {
+        await this.#serialized(() => this.#set(key, value));
+    }
+
+    async delete(key: string): Promise<void> {
+        await this.#serialized(() => this.#delete(key));
+    }
+
+    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#serialized(() => this.#scan(prefix, { limit: 10_000 }));
+    }
+
+    async scan(
+        prefix: string,
+        options: StoreScanOptions,
+    ): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#serialized(() => this.#scan(prefix, options));
+    }
+
+    async transaction<Result>(
+        operation: (transaction: StoreTransaction) => Promise<Result>,
+    ): Promise<Result> {
+        return this.#serialized(async () => {
+            this.#database.exec("BEGIN IMMEDIATE");
+            try {
+                const result = await operation({
+                    get: async (key) => this.#get(key),
+                    set: async (key, value) => this.#set(key, value),
+                    delete: async (key) => this.#delete(key),
+                    list: async (prefix) => this.#scan(prefix, { limit: 10_000 }),
+                    scan: async (prefix, options) => this.#scan(prefix, options),
+                });
+                this.#database.exec("COMMIT");
+                return result;
+            } catch (error: unknown) {
+                this.#database.exec("ROLLBACK");
+                throw error;
+            }
+        });
+    }
+
+    #get(key: string): Uint8Array | undefined {
+        const row = this.#database.prepare("SELECT value FROM kv WHERE key = ?").get(key) as
+            | { value: Uint8Array }
+            | undefined;
+        return row?.value.slice();
+    }
+
+    #set(key: string, value: Uint8Array): void {
+        this.#database
+            .prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)")
+            .run(key, value.slice());
+    }
+
+    #delete(key: string): void {
+        this.#database.prepare("DELETE FROM kv WHERE key = ?").run(key);
+    }
+
+    #scan(prefix: string, options: StoreScanOptions): ReadonlyMap<string, Uint8Array> {
+        if (
+            !Number.isSafeInteger(options.limit) ||
+            options.limit < 1 ||
+            options.limit > 10_000 ||
+            (options.after !== undefined && !options.after.startsWith(prefix))
+        ) {
+            throw new Error("Invalid Murmur store scan");
+        }
+        const rows = this.#database
+            .prepare("SELECT key, value FROM kv WHERE key >= ? AND key > ? ORDER BY key LIMIT ?")
+            .all(prefix, options.after ?? "", options.limit) as {
+            key: string;
+            value: Uint8Array;
+        }[];
+        const result = new Map<string, Uint8Array>();
+        for (const row of rows) {
+            if (!row.key.startsWith(prefix)) break;
+            result.set(row.key, row.value.slice());
+        }
+        return result;
+    }
+
+    #serialized<Result>(operation: () => Result | Promise<Result>): Promise<Result> {
+        const next = this.#tail.then(operation);
+        this.#tail = next.catch(() => undefined);
+        return next;
+    }
+}
+```
+
+In a browser, back the same interface with IndexedDB. Whatever the backend,
+treat the store as the identity itself: back it up as a whole, never share it
+between two live clients, and never hand-edit Murmur's keys.
+
+## Identity
+
+A Murmur identity is one 32-byte Ed25519 public key derived, together with its
+X25519 agreement key, from one 32-byte secret root. The public key is the
+stable identifier and the address of the identity's relay queue.
+
+`MurmurClient.open()` manages the identity for you:
+
+```ts
+import { MurmurClient } from "@slopus/murmur";
+
+const murmur = await MurmurClient.open({
+    relay: "https://relay.example",
+    store,
+});
+
+const publicIdentity: Uint8Array = murmur.identity; // 32-byte Ed25519 key
+```
+
+- An empty store gets a freshly generated identity, persisted in the store.
+- An existing store reuses its stored identity.
+- To create an identity ahead of time or perform a key-only restore, pass one
+  explicitly. `open()` copies it and throws if it differs from an identity
+  already in the store.
+
+```ts
+import { destroyIdentity, generateIdentityKeyPair, importIdentityKeyPair } from "@slopus/murmur";
+
+const identity = generateIdentityKeyPair();
+// identity.secretKey is the 32-byte root: make your protected backup here.
+const murmur = await MurmurClient.open({ relay, store, identity });
+destroyIdentity(identity); // open() copied it; zero the caller-owned original.
+
+// Key-only restore into a fresh store:
+const restored = importIdentityKeyPair(backedUpSecretRoot);
+const restoredClient = await MurmurClient.open({
+    relay,
+    store: freshStore,
+    identity: restored,
+});
+destroyIdentity(restored);
+```
+
+A backed-up secret root restores the _key_, not the state. MLS epochs live
+only in the store, and the relay keeps no history, so importing the root into
+a fresh store yields an identity that owns its queue but has no sessions or
+contacts. Real recovery means restoring the whole `MurmurStore` backup or
+being invited into sessions again. After a full-store restore, simply call
+`open()` with that restored store; its identity is already present.
+
+Other `MurmurClientOptions`:
+
+- `relay` — the relay base URL. Alternatively pass a custom `transport`
+  (`DeliveryTransport`); exactly one of `relay` or `transport` is required.
+  Custom-transport users must also pass `discoveryTransport` to use
+  `createInvitation()`, `resolveInvitation()`, or `requestContact()`.
+- `fetch` — a fetch implementation override for the built-in HTTP transports.
+- `services` — typed synchronization services, described below.
+- `limits` — `MurmurSessionLimits` bounds on pending sessions, buffered
+  events/bytes per session, members per session, delivery ciphertext size, and
+  durable outboxes.
+- `now` — a clock override, useful in tests.
+
+## Invitations and discovery
+
+Knowing an identity key is not enough to start an MLS session: MLS also needs
+fresh one-use public KeyPackage material. Murmur packages both into a signed
+`DiscoveryBundle` containing the 32-byte identity, one one-use MLS KeyPackage,
+creation and expiry times, and an Ed25519 signature over the whole bundle. A
+bundle is valid for at most five minutes and contains no secrets; the matching
+private KeyPackage state stays in the owner's local store.
+
+The usual flow never ships the bundle itself. `createInvitation()` uploads its
+exact signed bytes to the relay's content-addressed cache and returns their
+32-byte SHA-256 digest. Your application can encode those bytes as 43
+unpadded-base64url characters for a QR code or deep link:
+
+```ts
+// Alice, the inviter:
+const digest: Uint8Array = await alice.createInvitation();
+// encode those 32 bytes into your QR code / deep link / message
+
+// Bob, the invitee, after receiving the digest out of band:
+const bundle = await bob.resolveInvitation(digest);
+```
+
+`resolveInvitation()` downloads the exact bytes by digest and verifies the
+SHA-256 match, the identity signature, the signed expiry, and the KeyPackage
+signatures before returning. The relay cannot enumerate cached bundles or look
+them up by identity — the digest is the only lookup capability, and it expires
+within five minutes of upload.
+
+Treat every invitation as one-use and short-lived:
+
+- Generate a fresh invitation for each attempt; never reuse a bundle for a
+  second session or membership change.
+- Complete resolution and the Welcome within five minutes; if either side
+  times out, start over with a fresh digest.
+- The digest is an unguessable but bearer capability: anyone holding it can
+  fetch the public bundle and attempt a bootstrap. The recipient always stays
+  in control of acceptance.
+- Murmur deletes the private KeyPackage state when its Welcome is consumed.
+  Expired state becomes unusable at expiry, is pruned on the next client
+  operation, and cannot accept an expired Welcome.
+
+When an application wants to transport the complete self-contained bundle
+without the relay cache (a local network exchange, a file), use `discovery()`
+with `serializeDiscoveryBundle()` and `parseDiscoveryBundle()` instead.
+
+## Contacts
+
+Contacts are built into Murmur. A confirmed contact is durable cryptographic
+proof that two identities exchanged and accepted profiles inside one
+two-person technical MLS session. That session is contact and control state —
+chat and other application traffic belong in services with their own sessions.
+
+Continuing the walkthrough: Alice invited Bob with a digest, and Bob requests
+the contact by attaching an application-defined JSON profile:
+
+```ts
+const session = await bob.requestContact(digest, {
+    displayName: "Bob",
+    avatarUrl: "https://example.com/bob.png",
+});
+```
+
+On Alice's side, Murmur decrypts and validates Bob's hello while the contact
+session is still pending, then surfaces the claimed profile for an explicit
+decision. Nothing is activated and no raw update is delivered first:
+
+```ts
+await alice.sync({
+    onContactRequested: async (requests) => {
+        for (const request of requests) {
+            // request.identity, request.sessionId, request.profile
+            if (looksLegitimate(request.profile)) {
+                await alice.acceptContact(request.sessionId, { displayName: "Alice" });
+            } else {
+                await alice.rejectContact(request.sessionId);
+            }
+        }
+    },
+    onContactAdded: async (added) => {
+        for (const { contact } of added) {
+            console.log("confirmed contact", contact.profile.displayName);
+        }
+    },
+    onContactRemoved: async (removed) => {
+        for (const { identity } of removed) {
+            console.log("contact removed");
+        }
+    },
+});
+```
+
+- `acceptContact(sessionId, profile)` sends Alice's own typed hello. Only the
+  mutual hello exchange confirms the contact; both sides then observe
+  `onContactAdded`.
+- `rejectContact(sessionId)` destroys the pending contact session and its
+  secrets. The requester is not notified.
+- `removeContact(identity)` queues an authenticated removal through the
+  technical session; the contact's status is `"removing"` until the removal
+  echoes back, then `onContactRemoved` fires.
+
+Reads are durable, local, and work fully offline:
+
+```ts
+const everyone = await murmur.contacts(); // confirmed contacts
+const one = await murmur.contact(identityKey); // or undefined
+const pending = await murmur.contactRequests(); // awaiting a decision
+```
+
+Each contact carries both profiles (`localProfile` and `profile`) plus the
+identity key and the technical `sessionId`. Profiles are validated,
+size-bounded JSON; their schema beyond that is yours.
+
+## Sessions
+
+Everything conversational in Murmur — two-person or group — is one MLS
+session. A session has an opaque `descriptor` (application-defined bytes that
+name what the session is for), a member list of identity keys, and exactly one
+authenticated _committer_ per epoch who serializes membership changes.
+
+### Creating a session
+
+Creating a session takes the descriptor and one fresh `DiscoveryBundle` per
+initial peer. Murmur creates the MLS group, commits the adds, and publishes
+each new member's encrypted Welcome to their authenticated relay queue:
+
+```ts
+// Each prospective member creates fresh invitation material; Alice resolves it.
+const bobBundle = await alice.resolveInvitation(await bob.createInvitation());
+const carolBundle = await alice.resolveInvitation(await carol.createInvitation());
+
+const session = await alice.createSession({
+    descriptor: new TextEncoder().encode("notes/v1"),
+    members: [bobBundle, carolBundle],
+    service: "notes", // optional: durably owned by this registered service
+});
+// session.id, session.status, session.members, session.committer
+```
+
+The creator is the initial committer. Publication happens through the durable
+outbox: `createSession` returns once the session and its outbound work are
+persisted, and the sync loop performs the actual relay round trips.
+
+### Receiving a session
+
+A valid inbound Welcome becomes a durable _pending_ session before its relay
+item is acknowledged, and Murmur routes it:
+
+- A two-person session with the contact descriptor goes to the built-in
+  contact flow above.
+- Any other new session is offered to registered services through
+  `onNewSession`. A claim activates the session and durably routes all later
+  updates to that service. If services are registered and every one declines,
+  the session is durably ignored so it can never block the identity inbox.
+- With no services registered, the session stays pending and the application
+  decides explicitly:
+
+```ts
+await bob.activateSession(session.id); // start receiving its updates
+await bob.ignoreSession(session.id); // terminally reject and destroy it
+```
+
+While pending, Murmur keeps processing the session's MLS protocol traffic so
+its epoch stays current, and buffers its application events within the
+configured bounds without exposing them. Activation releases the buffered
+events through the ordinary sync loop; ignoring (or overflowing the pending
+bound) destroys the pending secrets and buffered data while keeping enough
+replay state to make retries harmless.
+
+### Sending data
+
+```ts
+const deliveryId = await alice.send(session.id, encodePacket(payload));
+```
+
+`send` persists the encrypted delivery in the durable outbox and returns; the
+sync loop publishes it as one atomic multicast to every current member's
+queue, including Alice's own. Every member — the sender included — adopts the
+delivery from its authenticated queue echo, which is why senders also see
+their own messages in `onUpdates`. Payload bytes are opaque to Murmur and the
+relay; versioned typed encoding is the application's or service's job.
+
+### Membership and the committer
+
+```ts
+const daveBundle = await alice.resolveInvitation(await dave.createInvitation());
+await alice.addMember(session.id, daveBundle);
+await alice.removeMember(session.id, carolIdentity); // 32-byte identity key
+```
+
+Each epoch has exactly one committer, recorded in MLS-protected state. When
+the caller is the committer, `addMember`/`removeMember` create the Commit
+directly. Any other member's call becomes an MLS _proposal_ delivered to the
+whole group; the committer reviews and applies proposals:
+
+```ts
+// On the committer:
+const proposals = await alice.proposals(session.id);
+await alice.acceptProposals(
+    session.id,
+    proposals.map((proposal) => proposal.id),
+);
+
+// Hand the role to Bob for future epochs:
+await alice.transferCommitter(session.id, bobIdentity);
+```
+
+Publish success only stages a Commit — even the committer adopts it from its
+own queue echo, so relay order never arbitrates concurrent Commits. If the
+committer's device is lost, application traffic in the current epoch keeps
+working, but membership changes block until the remaining members bootstrap a
+replacement session. Transfer the committer role deliberately in groups whose
+membership must outlive any single device.
+
+`abandonSession(id)` destroys a session stuck on a blocked local membership
+operation, and `issues()` lists durable session and publication diagnostics.
+`session(id)` and `sessions({ after, limit })` read local session state.
 
 ## Typed synchronization services
 
-Register independent services under stable IDs. A service has exactly
-`onNewSession` and `onUpdate`. The first service returning `true` owns the
-session durably; later updates route only to it. When registered services all
-decline, Murmur consumes the unknown session so it cannot block the inbox.
+Services are how applications build domains — chat, documents, files — on top
+of sessions. A service is an object with exactly two protocol entry points:
+
+```ts
+interface MurmurService {
+    /** Return true to durably claim a newly observed session. */
+    onNewSession(descriptor: MurmurServiceSessionDescriptor): boolean | Promise<boolean>;
+    /** Receive every later update for sessions this service owns. */
+    onUpdate(update: MurmurUpdate): void | Promise<void>;
+}
+```
+
+Register services with stable IDs at open time (or later with
+`registerService`); IDs must be unique because they are the durable routing
+key:
 
 ```ts
 const notesService = {
     onNewSession: async (session) => new TextDecoder().decode(session.descriptor) === "notes/v1",
     onUpdate: async (update) => {
+        // update.id (stable), update.sessionId, update.sender, update.bytes
         await applyNotePacket(update.id, update.bytes);
     },
 };
 
 const murmur = await MurmurClient.open({
     relay: "https://relay.example",
-    store: durableStore,
+    store,
     services: [{ id: "notes", service: notesService }],
 });
-
-const notes = murmur.serviceStorage("notes");
-await notes.set("settings", { notifications: true });
-
-const notesSession = await murmur.createSession({
-    descriptor: new TextEncoder().encode("notes/v1"),
-    members: [peerInvitation],
-    service: "notes",
-});
 ```
 
-Service-owned updates are also included in global `onUpdates` with their stable
-`service` ID. Murmur runs every relevant service handler and global hook before
-draining the batch. Service persistence is canonical JSON in a restricted
-namespace; consumer code never receives a Murmur storage transaction.
+When a new session arrives, registered services are offered its descriptor in
+service-ID order. The first `true` claims it: Murmur persists the
+session-to-service mapping, activates the session, and from then on routes its
+updates only to that service's `onUpdate`. Locally created sessions can be
+assigned an owner up front with `createSession({ ..., service: "notes" })`.
+Services are independent; Murmur models no dependencies between services or
+sessions, and future chat is simply another service.
 
-## One synchronization loop
-
-`sync()` maintains the identity's one recipient-authenticated SSE connection
-and streams the actual queued encrypted deliveries—not wake notifications.
-Each SSE record contains the relay UUIDv7 event ID and exact sender-signed
-delivery.
-
-Updates from every active session and registered service enter one
-identity-wide UUIDv7 order. Murmur passes a bounded batch to `onUpdates` after
-service handlers run. Contact lifecycle hooks participate in the same cycle.
-Murmur commits locally only after every relevant callback resolves. If one
-throws or the process exits first, the same stable IDs are offered again.
+Service-owned sessions use the ordinary session API — `send`, `addMember`,
+`removeMember`, committer transfer — so a service can run two-person and group
+sessions alike:
 
 ```ts
-const aliceAbort = new AbortController();
-const bobAbort = new AbortController();
-let markDelivered!: () => void;
-const delivered = new Promise<void>((resolve) => {
-    markDelivered = resolve;
+const notesSession = await murmur.createSession({
+    descriptor: new TextEncoder().encode("notes/v1"),
+    members: [bobBundle, carolBundle],
+    service: "notes",
 });
-
-const aliceRunning = alice.sync({
-    abort: aliceAbort.signal,
-    onUpdates: async (updates) => {
-        // Alice also receives her own session deliveries.
-        applyToAliceState(updates);
-    },
-});
-const bobRunning = bob.sync({
-    abort: bobAbort.signal,
-    onConnected: () => console.log("Bob connected"),
-    onDisconnected: (error) => console.log("Bob disconnected", error),
-    onUpdates: async (updates) => {
-        // Route by update.sessionId and decode update.bytes however the app wants.
-        applyToBobState(updates);
-        await persistBobState();
-        markDelivered(); // Murmur commits this complete batch after return.
-    },
-});
-
-// Durable local outboxes wake sync() and publish automatically.
-await alice.send(session.id, new TextEncoder().encode("realtime hello"));
-await delivered;
-
-// Stop during application shutdown.
-aliceAbort.abort();
-bobAbort.abort();
-await Promise.all([aliceRunning, bobRunning]);
+await murmur.send(notesSession.id, encodeNotePacket({ type: "insert", text: "hi" }));
 ```
 
-All `sync()` options are optional. Without `abort`, the loop runs until a fatal
-error or process shutdown. Registered services and contact lifecycle continue
-without global `onUpdates`; unowned application updates remain buffered until
-that hook is supplied. Ordering is guaranteed within one identity inbox, not
-across different identities. If the connection drops, Murmur calls
-`onDisconnected`, reconnects from its durable cursor, and calls `onConnected`
-after the next successful SSE handshake.
+Each service also gets private durable JSON persistence in the application's
+store, namespaced by service ID:
 
-The relay item itself is acknowledged after Murmur durably buffers its protocol
-outcome. The later `onUpdates` commit is local application handoff: it never
-exposes a `MurmurStore` transaction and performs no relay round trip.
-Applications that persist effects outside `MurmurStore` should use each
-update's stable `id` for idempotency. `synchronize()` remains as a bounded
-foreground fallback.
+```ts
+const storage = murmur.serviceStorage("notes");
+await storage.set("settings", { notifications: true });
+const settings = await storage.get("settings");
+const page = await storage.scan("documents/", { limit: 100 });
+```
 
-`MemoryMurmurStore` is for tests and examples. Production applications must
-provide a durable transactional `MurmurStore`.
+Values are canonical JSON up to one MiB; scans return 1–256 ordered entries
+per page. Service state restores before relay connectivity, so service reads
+and local mutations work offline. Murmur never exposes its underlying storage
+transaction to service or application code.
 
-## Compatibility and upgrades
+`unregisterService(id)` removes the handler without touching its durable
+service state or owner mappings. It is not a pause mechanism: updates arriving
+for that service's already-owned sessions are acknowledged and discarded while
+the handler is absent, and registering it again does not replay them. Unregister
+only when that loss is intentional.
 
-Murmur v0.3.3 and relay schema v3 are the compatibility baseline. Releases
-after that baseline preserve the public `@slopus/murmur` API and wire formats,
-and they keep persisted client state readable or migrate it. Relay schema
-upgrades migrate existing databases in place without deleting pending
-deliveries or requiring a clean database.
+## The synchronization loop
 
-The older pre-v0.3 friendship, topic, retained-event, storage, and CLI formats
-remain unsupported.
+One identity-wide loop drives everything: it maintains the recipient-
+authenticated SSE connection, publishes durable outboxes, processes the inbox
+in UUIDv7 order, and fans batches out to contact handling, service handlers,
+and the optional global callbacks.
+
+```ts
+const abort = new AbortController();
+
+const running = murmur.sync({
+    abort: abort.signal,
+    onConnected: () => console.log("SSE connected"),
+    onDisconnected: (error) => console.log("SSE dropped", error),
+    onUpdates: async (updates) => {
+        for (const update of updates) {
+            // A service-owned update already ran through that service's
+            // onUpdate. Handle only ownerless application updates here.
+            if (update.service !== undefined) continue;
+            await applyToApplicationState(update);
+        }
+    },
+    onContactRequested: async (requests) => {
+        /* ... */
+    },
+    onContactAdded: async (contacts) => {
+        /* ... */
+    },
+    onContactRemoved: async (contacts) => {
+        /* ... */
+    },
+});
+```
+
+What the loop guarantees:
+
+- **The stream carries real data.** SSE delivers each exact queued encrypted
+  delivery with its relay UUIDv7 event ID — it is not a wake-only channel.
+  Ordering is guaranteed within one identity's inbox, never across identities.
+- **Acknowledgement follows durability.** A relay item is acknowledged only
+  after its processing outcome — new MLS state, replay and queue progress, and
+  any buffered application update — is atomically persisted. A crash before
+  that simply causes harmless redelivery.
+- **Callbacks gate the local batch.** Murmur runs every relevant service
+  handler and callback for a batch, and commits and drains that batch only
+  after they all resolve. A thrown handler or a crash re-delivers the same
+  batch with the same stable event IDs after restart.
+- **Outbound work wakes the loop.** `send`, `createSession`, membership
+  changes, and contact actions persist durable outboxes and signal the running
+  loop, which publishes them and retries transient relay failures with
+  backoff.
+- **Reconnection is automatic.** On a dropped or transiently failing
+  connection the loop calls `onDisconnected`, waits briefly, reconnects from
+  the durable cursor, and calls `onConnected` again. Non-transient errors
+  (other than network failures, HTTP 429, and 5xx) end the loop with a thrown
+  error.
+
+All options are optional. Contacts and registered services keep flowing even
+without a global `onUpdates`; updates for sessions with no owner stay durably
+buffered until an `onUpdates` hook exists to receive them. Aborting the signal
+ends the loop; `await` the returned promise to know it has fully stopped.
+
+Install services and lifecycle callbacks before starting synchronization.
+Service-owned updates are intentionally also visible in global `onUpdates`
+with `update.service` set; do not apply them a second time there. If a contact
+lifecycle callback is omitted, its durable contact state is still queryable
+through `contacts()` or `contactRequests()`, but that lifecycle event is not
+replayed when a callback is registered later.
+
+`synchronize(options?, callbacks?)` is the bounded foreground alternative: one
+publish-and-drain cycle with an optional long-poll (`waitMilliseconds`) that
+returns an observable `MurmurSynchronizeResult`. It cannot run while `sync()`
+is active.
+
+## Durability, offline use, and idempotency
+
+Murmur is offline-first. Opening a client restores identity, contacts,
+sessions, and service state from the store before any relay contact, so local
+reads and mutations work immediately. Sends and membership changes made
+offline persist as durable outboxes and publish when connectivity returns.
+Unacknowledged inbound deliveries wait in the relay queue within its quota and
+TTL — the queue bound defines the maximum supported offline window, not an
+archive.
+
+Delivery to the application is _at-least-once with stable IDs_. Murmur
+deduplicates protocol-level redelivery internally, but an application callback
+that ran without its batch committing (a throw, a crash, a power cut) will see
+the same updates again. If your effects live outside the `MurmurStore` — a
+database, a filesystem, an outbound API call — key them on the stable
+`update.id`:
+
+```ts
+onUpdates: async (updates) => {
+    for (const update of updates) {
+        await database.transaction(async (tx) => {
+            if (await tx.hasProcessed(update.id)) return; // seen before a crash
+            await tx.apply(update.bytes);
+            await tx.markProcessed(update.id);
+        });
+    }
+},
+```
+
+The same applies to contact lifecycle events and service `onUpdate` calls:
+each carries a stable `id` precisely so replays are cheap to detect.
+
+## Graceful shutdown
+
+Stop the loop, wait for it, then close:
+
+```ts
+const abort = new AbortController();
+const running = murmur.sync({ abort: abort.signal, onUpdates });
+
+process.on("SIGTERM", async () => {
+    abort.abort(); // ends the SSE loop at a safe point
+    await running; // wait for in-flight batch handling to finish
+    murmur.close(); // zeroes in-memory identity secrets
+});
+```
+
+`close()` destroys in-memory secret material only — all durable state remains
+in the application's store, ready for the next `open()`. It throws if called
+while operations are still pending, which is a signal to abort and await the
+sync loop first. Because every acknowledgement follows durable persistence, a
+hard kill at any point is safe: the next start resumes from the durable
+cursor, republishes pending outboxes, and re-offers any uncommitted batch.
+
+## Security and trust model
+
+- **End-to-end encryption.** Session traffic is MLS-protected with forward
+  secrecy and post-compromise security through TreeKEM epochs. The relay
+  stores and forwards ciphertext it cannot read, and cached discovery bundles
+  contain only public, signed material.
+- **Authenticated queues.** Publishing is sender-signed and reading or
+  acknowledging a queue requires signatures from the recipient identity. The
+  relay cannot forge a valid delivery or recipient acknowledgement, though an
+  untrusted relay can still delay or drop traffic.
+- **Metadata is not hidden.** The relay learns authenticated sender and
+  recipient identities, exact multicast fanout, timing, sizes, and queue
+  progress. Murmur promises encrypted contents, not anonymous routing; if you
+  need metadata privacy, Murmur is the wrong layer for it.
+- **Invitations are bearer capabilities.** A digest or bundle lets anyone who
+  holds it _attempt_ a bootstrap. Acceptance always remains with the
+  recipient: contact requests need an explicit accept, ownerless sessions may
+  require explicit activation, and pending state is strictly bounded against
+  flooding.
+- **No recovery from the relay.** Acknowledged deliveries are deleted; the
+  relay is never history. A lost store means lost sessions — plan real
+  backups of the application store.
+- **One device per identity.** Running two live clients against one identity's
+  queue splits the cursor and corrupts delivery; don't share stores or roots
+  between concurrent processes.
+- **Operational hygiene.** Keys are `Uint8Array`s that Murmur zeroes when
+  finished (`close()` zeroes the identity); never log them. Public identities
+  are free to create, so a production relay deployment needs its own
+  non-Sybil admission control in front of ingress.
+
+Murmur is a `0.x` project and has not received an independent security audit.
+
+## Running a relay locally
+
+The relay is a small Node service (Node 22.5+) with SQLite and Postgres
+backends. From this repository:
+
+```bash
+pnpm install
+pnpm --filter @slopus/murmur-relay build
+MURMUR_RELAY_STORE=sqlite \
+MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+MURMUR_RELAY_ORIGINS='http://localhost:5173' \
+pnpm --filter @slopus/murmur-relay start
+```
+
+Point `MurmurClient.open({ relay: "http://127.0.0.1:8787", ... })` at it and
+the whole walkthrough above runs locally. Set `MURMUR_RELAY_STORE=postgres`
+with a Postgres URL in `MURMUR_RELAY_DB` for the Postgres backend.
+
+The standalone process speaks plain HTTP and is meant for local development.
+Production deployments require TLS termination and an admission boundary that
+authenticates non-Sybil principals — see the
+[relay README](https://github.com/slopus/murmur/blob/main/packages/murmur-relay/README.md)
+and [deployment notes](https://github.com/slopus/murmur/blob/main/docs/DEPLOYMENT.md)
+for quotas, environment variables, and operational logging.
 
 ## Development
 
 ```bash
 pnpm install
-pnpm format
-pnpm lint
+pnpm format       # oxfmt --write .
+pnpm lint         # oxlint
 pnpm typecheck
-pnpm test
+pnpm test         # vitest across the workspace, real stores and a real relay
 pnpm build
 ```
 
-Read the
+Deeper reference material lives in the repository docs:
 [architecture](https://github.com/slopus/murmur/blob/main/docs/ARCHITECTURE.md),
 [protocol](https://github.com/slopus/murmur/blob/main/docs/PROTOCOL.md),
 [relay API](https://github.com/slopus/murmur/blob/main/docs/RELAY_API.md), and
-[security notes](https://github.com/slopus/murmur/blob/main/docs/SECURITY.md)
-before integrating.
+[security notes](https://github.com/slopus/murmur/blob/main/docs/SECURITY.md).
 
-> Murmur is a `0.x` project and has not received an independent security audit.
+## Compatibility
+
+Murmur v0.3.3 and relay schema v3 are the compatibility baseline. From that
+release onward, public `@slopus/murmur` APIs and wire formats stay
+backward-compatible, persisted client state remains readable or is migrated,
+and relay schema upgrades migrate existing databases in place without deleting
+pending data or requiring a clean database.
+
+Pre-v0.3 friendship, topic, retained-event, storage, and CLI formats remain
+unsupported.
