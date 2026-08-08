@@ -5,7 +5,7 @@ Browser-safe relay transport and the durable identity-inbox processor.
 ```text
 signed page read --\
                     +-> queued ciphertext -> store transaction -> signed ack
-signed SSE stream -/                         | effect/rejection |
+signed SSE stream -/                         | buffer/rejection |
                                               | cursor advance   |
                                               +------------------+
 ```
@@ -15,14 +15,16 @@ stream backpressure, and processes one record at a time. It is not a wake-only
 channel. Reconnect uses a freshly signed request after the durable local cursor,
 so anything committed but not acknowledged may be replayed safely.
 
-The processor never acknowledges before the effect or terminal rejection and
-cursor commit atomically. A crash after the local commit causes a harmless
-acknowledgement retry. Relay queues are delivery buffers, never application
-history. Sender-scoped delivery IDs remain replay-protected until their signed
-expiration; the bounded replay index applies backpressure instead of evicting
-live protection. At exact-index capacity, new IDs are terminally rejected into
-a fixed-size, time-bucketed probabilistic replay filter. Its only error mode is
-a false-positive rejection; it never exposes a probable replay to application
+The processor never acknowledges before the protocol state plus buffered update
+or terminal rejection and cursor commit atomically. A crash after the local
+commit causes a harmless acknowledgement retry. Consumer callbacks run later
+through the identity-wide session sync loop and never receive this transaction.
+Relay queues are delivery buffers, never application history. Sender-scoped
+delivery IDs remain replay-protected until their signed expiration; the bounded
+replay index applies backpressure instead of evicting live protection. At
+exact-index capacity, new IDs are terminally rejected into a fixed-size,
+time-bucketed probabilistic replay filter. Its only error mode is a
+false-positive rejection; it never exposes a probable replay to application
 code or blocks the queue.
 
 Replay expiry and overflow epochs advance from the relay-assigned UUIDv7 event

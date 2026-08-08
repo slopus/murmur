@@ -32,6 +32,7 @@ export type {
     CreateInboxReadOptions,
     DeliveryFetch,
     DeliveryPublishOutcome,
+    DeliveryStreamHooks,
     DeliveryTransport,
     InboxDelivery,
     InboxDeliveryHandler,

@@ -29,38 +29,38 @@ import {
 } from "../mls/index.js";
 import type { MurmurStore } from "../storage/index.js";
 import { equalBytes, zeroBytes } from "../utils/index.js";
-import { SessionEngine } from "./impl/sessionEngine.js";
+import { SessionEngine, type PreparedUpdates } from "./impl/sessionEngine.js";
 import type {
     CreateMurmurSessionOptions,
     MurmurSession,
-    MurmurSessionEventHandler,
     MurmurSessionIssue,
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionProposal,
-    MurmurRealtimeOptions,
+    MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
+    MurmurUpdate,
 } from "./types.js";
 
 export type {
     CreateMurmurSessionOptions,
     MurmurSession,
-    MurmurSessionEvent,
-    MurmurSessionEventHandler,
     MurmurSessionIssue,
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionProposal,
-    MurmurRealtimeOptions,
+    MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
+    MurmurUpdate,
 } from "./types.js";
 
 const IDENTITY_KEY = "murmur/identity/root";
 const DEFAULT_KEY_PACKAGES = 1;
+const SYNC_RECONNECT_DELAY_MILLISECONDS = 1_000;
 
 /** Construction inputs for the stateful Murmur MLS client. */
 export interface MurmurClientOptions {
@@ -83,10 +83,11 @@ export class MurmurClient {
     #closed = false;
     #operationTail: Promise<void> = Promise.resolve();
     #pendingOperations = 0;
-    #realtimeActive = false;
-    #realtimeWakePending = false;
-    #realtimeWakeResolve: (() => void) | undefined;
-    #realtimeRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    #syncActive = false;
+    #syncWakePending = false;
+    #syncWakeResolve: (() => void) | undefined;
+    #syncRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    #updatesActive = false;
 
     private constructor(
         identity: IdentityKeyPair,
@@ -236,7 +237,7 @@ export class MurmurClient {
 
     async createSession(options: CreateMurmurSessionOptions): Promise<MurmurSession> {
         const session = await this.#exclusive(() => this.#engine.create(options));
-        this.#signalRealtime();
+        this.#signalSync();
         return session;
     }
 
@@ -248,8 +249,9 @@ export class MurmurClient {
         return this.#tracked(() => this.#engine.list(options));
     }
 
-    async activateSession(id: Uint8Array, handler: MurmurSessionEventHandler): Promise<number> {
-        return this.#exclusive(() => this.#engine.activate(id, handler));
+    async activateSession(id: Uint8Array): Promise<void> {
+        await this.#exclusive(() => this.#engine.activate(id));
+        this.#signalSync();
     }
 
     async ignoreSession(id: Uint8Array): Promise<void> {
@@ -263,23 +265,23 @@ export class MurmurClient {
 
     async send(id: Uint8Array, bytes: Uint8Array): Promise<string> {
         const deliveryId = await this.#exclusive(() => this.#engine.send(id, bytes));
-        this.#signalRealtime();
+        this.#signalSync();
         return deliveryId;
     }
 
     async addMember(id: Uint8Array, bundle: DiscoveryBundle): Promise<void> {
         await this.#exclusive(() => this.#engine.add(id, bundle));
-        this.#signalRealtime();
+        this.#signalSync();
     }
 
     async removeMember(id: Uint8Array, identity: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.remove(id, identity));
-        this.#signalRealtime();
+        this.#signalSync();
     }
 
     async transferCommitter(id: Uint8Array, identity: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.transferCommitter(id, identity));
-        this.#signalRealtime();
+        this.#signalSync();
     }
 
     async proposals(id: Uint8Array): Promise<readonly MurmurSessionProposal[]> {
@@ -288,22 +290,23 @@ export class MurmurClient {
 
     async acceptProposals(id: Uint8Array, proposalIds: readonly string[]): Promise<void> {
         await this.#exclusive(() => this.#engine.acceptProposals(id, proposalIds));
-        this.#signalRealtime();
+        this.#signalSync();
     }
 
     async issues(): Promise<readonly MurmurSessionIssue[]> {
         return this.#tracked(() => this.#engine.issues());
     }
 
-    async drain(id: Uint8Array, handler: MurmurSessionEventHandler): Promise<number> {
-        return this.#exclusive(() => this.#engine.drain(id, handler));
-    }
-
-    async synchronize(options: MurmurSynchronizeOptions = {}): Promise<MurmurSynchronizeResult> {
-        if (this.#realtimeActive) {
-            throw new Error("Cannot page synchronization while realtime SSE is active");
+    async synchronize(
+        options: MurmurSynchronizeOptions = {},
+        lifecycle: Pick<MurmurSyncOptions, "onUpdates"> = {},
+    ): Promise<MurmurSynchronizeResult> {
+        if (this.#syncActive) {
+            throw new Error("Cannot page synchronization while SSE sync is active");
         }
-        return this.#exclusive(() => this.#engine.synchronize(options));
+        const result = await this.#exclusive(() => this.#engine.synchronize(options));
+        await this.#deliverUpdates(lifecycle.onUpdates);
+        return result;
     }
 
     /**
@@ -312,52 +315,56 @@ export class MurmurClient {
      * Streamed deliveries are transactionally processed and acknowledged in
      * inbox order. Durable outbound work wakes this loop for publication.
      */
-    async realtime(options: MurmurRealtimeOptions): Promise<void> {
+    async sync(options: MurmurSyncOptions = {}): Promise<void> {
         this.#assertOpen();
-        if (this.#realtimeActive) throw new Error("Murmur realtime synchronization is active");
-        const reconnectDelayMilliseconds = options.reconnectDelayMilliseconds ?? 1_000;
-        if (
-            !Number.isSafeInteger(reconnectDelayMilliseconds) ||
-            reconnectDelayMilliseconds < 100 ||
-            reconnectDelayMilliseconds > 60_000
-        ) {
-            throw new Error("Realtime reconnect delay must be between 100ms and 60 seconds");
-        }
-        if (options.signal.aborted) return;
-        this.#realtimeActive = true;
+        if (this.#syncActive) throw new Error("Murmur synchronization is active");
+        const signal = options.abort ?? new AbortController().signal;
+        if (signal.aborted) return;
+        this.#syncActive = true;
         this.#pendingOperations += 1;
-        const wakeOnAbort = (): void => this.#signalRealtime();
-        options.signal.addEventListener("abort", wakeOnAbort, { once: true });
+        const wakeOnAbort = (): void => this.#signalSync();
+        signal.addEventListener("abort", wakeOnAbort, { once: true });
         try {
-            await this.#flushRealtime(reconnectDelayMilliseconds, options.signal);
-            while (!options.signal.aborted) {
-                const stream = this.#engine.streamInbox({ signal: options.signal });
+            await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
+            await this.#deliverUpdates(options.onUpdates);
+            while (!signal.aborted) {
+                let connected = false;
+                let disconnectedBy: unknown;
+                const stream = this.#engine.streamInbox({
+                    signal,
+                    onConnected: async () => {
+                        connected = true;
+                        await options.onConnected?.();
+                    },
+                });
                 const iterator = stream[Symbol.asyncIterator]();
                 let next = iterator.next();
                 try {
                     for (;;) {
                         const outcome = await Promise.race([
                             next.then((result) => ({ type: "event" as const, result })),
-                            this.#waitRealtimeWake().then(() => ({ type: "wake" as const })),
+                            this.#waitSyncWake().then(() => ({ type: "wake" as const })),
                         ]);
                         if (outcome.type === "wake") {
-                            if (options.signal.aborted) break;
-                            await this.#flushRealtime(reconnectDelayMilliseconds, options.signal);
+                            if (signal.aborted) break;
+                            await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
+                            await this.#deliverUpdates(options.onUpdates);
                             continue;
                         }
                         if (outcome.result.done) break;
                         const result = await this.#exclusive(() =>
-                            this.#engine.completeStreamEvent(outcome.result.value, options.signal),
+                            this.#engine.completeStreamEvent(outcome.result.value, signal),
                         );
                         if (result.transientPublicationFailures > 0) {
-                            this.#scheduleRealtimeWake(reconnectDelayMilliseconds);
+                            this.#scheduleSyncWake(SYNC_RECONNECT_DELAY_MILLISECONDS);
                         }
-                        await options.onSynchronize?.(result);
-                        if (options.signal.aborted) break;
+                        await this.#deliverUpdates(options.onUpdates);
+                        if (signal.aborted) break;
                         next = iterator.next();
                     }
                 } catch (error: unknown) {
-                    if (options.signal.aborted) break;
+                    disconnectedBy = error;
+                    if (signal.aborted) break;
                     if (
                         !(error instanceof DeliveryTransportError) ||
                         (error.status !== 0 && error.status !== 429 && error.status < 500)
@@ -365,20 +372,24 @@ export class MurmurClient {
                         throw error;
                     }
                 } finally {
-                    await iterator.return?.();
+                    try {
+                        await iterator.return?.();
+                    } finally {
+                        if (connected) await options.onDisconnected?.(disconnectedBy);
+                    }
                 }
-                if (!options.signal.aborted) {
-                    await this.#realtimeDelay(reconnectDelayMilliseconds, options.signal);
+                if (!signal.aborted) {
+                    await this.#syncDelay(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
                 }
             }
         } finally {
-            options.signal.removeEventListener("abort", wakeOnAbort);
-            this.#realtimeActive = false;
-            this.#realtimeWakePending = false;
-            this.#realtimeWakeResolve = undefined;
-            if (this.#realtimeRetryTimer !== undefined) {
-                clearTimeout(this.#realtimeRetryTimer);
-                this.#realtimeRetryTimer = undefined;
+            signal.removeEventListener("abort", wakeOnAbort);
+            this.#syncActive = false;
+            this.#syncWakePending = false;
+            this.#syncWakeResolve = undefined;
+            if (this.#syncRetryTimer !== undefined) {
+                clearTimeout(this.#syncRetryTimer);
+                this.#syncRetryTimer = undefined;
             }
             this.#pendingOperations -= 1;
         }
@@ -425,45 +436,89 @@ export class MurmurClient {
         }
     }
 
-    #signalRealtime(): void {
-        if (!this.#realtimeActive) return;
-        this.#realtimeWakePending = true;
-        this.#realtimeWakeResolve?.();
-        this.#realtimeWakeResolve = undefined;
+    #signalSync(): void {
+        if (!this.#syncActive) return;
+        this.#syncWakePending = true;
+        this.#syncWakeResolve?.();
+        this.#syncWakeResolve = undefined;
     }
 
-    #waitRealtimeWake(): Promise<void> {
-        if (this.#realtimeWakePending) {
-            this.#realtimeWakePending = false;
+    async #deliverUpdates(handler: MurmurSyncOptions["onUpdates"]): Promise<number> {
+        if (handler === undefined) return 0;
+        if (this.#updatesActive) return 0;
+        this.#updatesActive = true;
+        this.#pendingOperations += 1;
+        let delivered = 0;
+        try {
+            for (;;) {
+                const prepared = await this.#exclusive(() => this.#engine.prepareUpdates());
+                if (prepared.updates.length === 0) break;
+                const updates: readonly MurmurUpdate[] = Object.freeze(
+                    prepared.updates.map((update) =>
+                        Object.freeze({
+                            id: update.id,
+                            sessionId: update.sessionId.slice(),
+                            sender: update.sender.slice(),
+                            bytes: update.bytes.slice(),
+                        }),
+                    ),
+                );
+                try {
+                    await handler?.(updates);
+                    await this.#exclusive(() => this.#engine.commitUpdates(prepared));
+                    delivered += updates.length;
+                } finally {
+                    this.#zeroPreparedUpdates(prepared);
+                }
+                if (prepared.exhausted) break;
+            }
+            return delivered;
+        } finally {
+            this.#pendingOperations -= 1;
+            this.#updatesActive = false;
+        }
+    }
+
+    #zeroPreparedUpdates(prepared: PreparedUpdates): void {
+        for (const update of prepared.updates) {
+            zeroBytes(update.sessionId);
+            zeroBytes(update.sender);
+            zeroBytes(update.bytes);
+        }
+    }
+
+    #waitSyncWake(): Promise<void> {
+        if (this.#syncWakePending) {
+            this.#syncWakePending = false;
             return Promise.resolve();
         }
         return new Promise<void>((resolve) => {
-            this.#realtimeWakeResolve = () => {
-                this.#realtimeWakePending = false;
+            this.#syncWakeResolve = () => {
+                this.#syncWakePending = false;
                 resolve();
             };
         });
     }
 
-    async #flushRealtime(milliseconds: number, signal: AbortSignal): Promise<void> {
+    async #flushSync(milliseconds: number, signal: AbortSignal): Promise<void> {
         const retry = await this.#exclusive(() => this.#engine.flush(signal));
         if (retry) {
-            this.#scheduleRealtimeWake(milliseconds);
-        } else if (this.#realtimeRetryTimer !== undefined) {
-            clearTimeout(this.#realtimeRetryTimer);
-            this.#realtimeRetryTimer = undefined;
+            this.#scheduleSyncWake(milliseconds);
+        } else if (this.#syncRetryTimer !== undefined) {
+            clearTimeout(this.#syncRetryTimer);
+            this.#syncRetryTimer = undefined;
         }
     }
 
-    #scheduleRealtimeWake(milliseconds: number): void {
-        if (this.#realtimeRetryTimer !== undefined || !this.#realtimeActive) return;
-        this.#realtimeRetryTimer = setTimeout(() => {
-            this.#realtimeRetryTimer = undefined;
-            this.#signalRealtime();
+    #scheduleSyncWake(milliseconds: number): void {
+        if (this.#syncRetryTimer !== undefined || !this.#syncActive) return;
+        this.#syncRetryTimer = setTimeout(() => {
+            this.#syncRetryTimer = undefined;
+            this.#signalSync();
         }, milliseconds);
     }
 
-    #realtimeDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
+    #syncDelay(milliseconds: number, signal: AbortSignal): Promise<void> {
         return new Promise((resolve) => {
             const finish = (): void => {
                 clearTimeout(timeout);

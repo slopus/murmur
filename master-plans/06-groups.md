@@ -36,21 +36,27 @@ lifecycle. Public APIs do not expose that choreography.
 ## Durability
 
 Before acknowledging a successfully processed delivery, the client atomically
-persists the resulting MLS state, replay and queue progress, and the
-application-owned effect or history where applicable. A valid bootstrap instead
-becomes a durable pending local bootstrap or session together with replay and
-queue progress before acknowledgement; the application later activates or
-ignores it locally. While pending, Murmur continues processing MLS protocol
-traffic so the session stays current and durably buffers opaque application
-events or effects without exposing them. Each item is acknowledged after that
-pending state, buffer, replay, and queue progress are durable, without waiting
-for the application.
+persists the resulting MLS state, replay and queue progress, and a bounded
+opaque application update where applicable. It does not expose its store
+transaction to the consumer. One identity-wide `sync` loop calls an optional
+asynchronous `onUpdates` hook with an inbox-ordered batch spanning all sessions.
+Murmur atomically drains that whole local batch only after the hook resolves. A
+thrown hook or crash before commit returns the same stable event IDs again;
+durable exactly-once application effects require application-level idempotency.
 
-Pending state and buffered data are strictly bounded. Activation hands
-buffered events or effects through the ordinary durable application boundary.
-Ignore or overflow terminally rejects the pending session, destroys its secrets
-and buffered data, and retains enough replay and rejection state to make
-retries harmless. It does not claim to reverse sender-created membership.
+A valid bootstrap instead becomes a durable pending local bootstrap or session
+together with replay and queue progress before acknowledgement; the application
+later activates or ignores it locally. While pending, Murmur continues
+processing MLS protocol traffic so the session stays current and durably
+buffers opaque application events without exposing them. Each item is
+acknowledged after that pending state, buffer, replay, and queue progress are
+durable, without waiting for the application.
+
+Pending state and buffered data are strictly bounded. Activation makes buffered
+events visible to the same identity-wide update loop. Ignore or overflow
+terminally rejects the pending session, destroys its secrets and buffered data,
+and retains enough replay and rejection state to make retries harmless. It does
+not claim to reverse sender-created membership.
 
 A malformed, unauthenticatable, undecryptable, unsupported, ignored during
 queue processing, or otherwise terminal delivery is durably rejected or
@@ -74,16 +80,18 @@ local state requires restoring a backup or being added again.
 - Exactly one authenticated epoch committer serializes MLS Proposals into
   Commits. Publish success only stages a Commit, and relay order never resolves
   Commit conflicts.
-- Successful protocol state and any application effects are durable before
-  queue acknowledgement.
+- Successful protocol state and any buffered application update are durable
+  before queue acknowledgement.
 - A valid bootstrap becomes durable pending local state before acknowledgement,
   and the later activate-or-ignore decision does not block the queue.
-- A pending session stays current and buffers opaque application events or
-  effects without exposure; every queue item remains independently processable
-  and trimmable.
-- Pending storage is strictly bounded. Activation durably hands off buffered
-  events or effects, while ignore or overflow destroys pending secrets and data
-  and retains replay and rejection state.
+- A pending session stays current and buffers opaque application events without
+  exposure; every queue item remains independently processable and trimmable.
+- Pending storage is strictly bounded. Activation exposes buffered events to
+  the identity-wide update callback, while ignore or overflow destroys pending
+  secrets and data and retains replay and rejection state.
+- The public synchronization API owns one inbox loop and optional connection
+  lifecycle hooks; no application transaction, session-specific drain, or
+  public batch commit exists.
 - Terminally rejected or quarantined deliveries persist replay and queue
   progress without an application effect before acknowledgement.
 - Restarts preserve bounded pending and locally activated sessions, current MLS

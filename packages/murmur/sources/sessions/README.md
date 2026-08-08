@@ -7,15 +7,19 @@ same opaque session primitive.
 32-byte digest -> discovery bundle -> sealed Welcome -> pending -> activate
                                              |
 identity inbox -> MLS event / Proposal / Commit -> current checkpoint
+       |                                     |
+       +---- UUIDv7 global update index -----+
                                              |
-                                      bounded event buffer
+                              one identity-wide onUpdates batch
 ```
 
 Relay queues are delivery buffers. Session checkpoints, outboxes, replay state,
 pending decisions, and bounded opaque buffers live in the application-supplied
 transactional store.
 
-`MurmurClient.realtime()` maintains one signed SSE connection, processes exact
-queue events through the same durable inbox boundary, reconnects from the local
-cursor, and wakes on locally queued outboxes. `synchronize()` remains the
-bounded foreground alternative.
+`MurmurClient.sync({ ... })` maintains one signed SSE connection, processes
+exact queue events through the durable inbox boundary, reconnects from the
+local cursor, and wakes on locally queued outboxes. Application events from all
+active sessions enter one UUIDv7-ordered index. `onUpdates` receives bounded
+identity-wide batches; Murmur atomically removes a whole batch only after the
+callback resolves. `synchronize()` remains the bounded foreground alternative.

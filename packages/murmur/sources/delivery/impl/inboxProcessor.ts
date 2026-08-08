@@ -253,6 +253,7 @@ export class InboxProcessor {
                 this.#dependencies.transport,
                 request,
                 options.signal,
+                options.onConnected === undefined ? {} : { onConnected: options.onConnected },
             )) {
                 const result = await this.#exclusive(async () => {
                     cursor = await this.cursor();

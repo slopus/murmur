@@ -6,8 +6,8 @@ recipient-authenticated SSE connection. `deliverySse.ts` strictly parses
 heartbeats and exact delivery records with per-event and heartbeat-timeout
 bounds. `inboxProcessor.ts` serializes page or stream processing and enforces
 durable-before-ack behavior. `storeTransactionStage.ts` isolates tentative
-application writes so a terminal handler rejection commits no partial
-application effect.
+internal handler writes so a terminal classification commits no partial
+protocol effect. Consumer code never receives this transaction.
 
 ```text
 page JSON / SSE <-> HTTP transport <-> InboxProcessor <-> MurmurStore transaction

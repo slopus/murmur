@@ -16,7 +16,7 @@ import {
 } from "../../identity/discovery/index.js";
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
-import { MurmurClient, type MurmurSessionLimits } from "../index.js";
+import { MurmurClient, type MurmurSessionLimits, type MurmurUpdate } from "../index.js";
 
 const NOW = 1_700_000_000_000;
 
@@ -40,6 +40,32 @@ async function client(
         limits,
         now: () => NOW,
     });
+}
+
+async function activate(
+    value: MurmurClient,
+    id: Uint8Array,
+    process?: (update: MurmurUpdate) => void | Promise<void>,
+): Promise<number> {
+    await value.activateSession(id);
+    return process === undefined ? 0 : consume(value, process);
+}
+
+async function consume(
+    value: MurmurClient,
+    process: (update: MurmurUpdate) => void | Promise<void>,
+): Promise<number> {
+    let consumed = 0;
+    await value.synchronize(
+        { waitMilliseconds: 0 },
+        {
+            onUpdates: async (updates) => {
+                for (const update of updates) await process(update);
+                consumed += updates.length;
+            },
+        },
+    );
+    return consumed;
 }
 
 describe("stateful MLS sessions", () => {
@@ -87,20 +113,28 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             const received: string[] = [];
             let finishFirst!: () => void;
             const firstComplete = new Promise<void>((resolve) => {
                 finishFirst = resolve;
             });
-            aliceRealtime = alice.realtime({ signal: aliceController.signal });
-            bobRealtime = bob.realtime({
-                signal: bobController.signal,
-                onSynchronize: async () => {
-                    await bob.drain(session.id, async (_transaction, event) => {
-                        received.push(utf8Decode(event.bytes));
-                    });
+            let connected = 0;
+            let disconnected = 0;
+            aliceRealtime = alice.sync({ abort: aliceController.signal });
+            bobRealtime = bob.sync({
+                abort: bobController.signal,
+                onConnected: () => {
+                    connected += 1;
+                },
+                onDisconnected: () => {
+                    disconnected += 1;
+                },
+                onUpdates: async (updates) => {
+                    for (const update of updates) {
+                        received.push(utf8Decode(update.bytes));
+                    }
                     if (received.length === 1) {
                         bobController.abort();
                         finishFirst();
@@ -125,17 +159,18 @@ describe("stateful MLS sessions", () => {
             }
             await bobRealtime;
             expect(received).toEqual(["first"]);
+            expect({ connected, disconnected }).toEqual({ connected: 1, disconnected: 1 });
 
             let finishSecond!: () => void;
             const secondComplete = new Promise<void>((resolve) => {
                 finishSecond = resolve;
             });
-            resumed = bob.realtime({
-                signal: resumedController.signal,
-                onSynchronize: async () => {
-                    await bob.drain(session.id, async (_transaction, event) => {
-                        received.push(utf8Decode(event.bytes));
-                    });
+            resumed = bob.sync({
+                abort: resumedController.signal,
+                onUpdates: async (updates) => {
+                    for (const update of updates) {
+                        received.push(utf8Decode(update.bytes));
+                    }
                     if (received.length === 2) {
                         aliceController.abort();
                         resumedController.abort();
@@ -250,6 +285,59 @@ describe("stateful MLS sessions", () => {
         }
     });
 
+    test("delivers one identity-wide ordered batch across sessions", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bob = await client(relay);
+        try {
+            const first = await alice.createSession({
+                descriptor: utf8Encode("first session"),
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize();
+            await bob.synchronize();
+            await bob.activateSession(first.id);
+
+            const second = await alice.createSession({
+                descriptor: utf8Encode("second session"),
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize();
+            await bob.synchronize();
+            await bob.activateSession(second.id);
+
+            await alice.send(first.id, utf8Encode("first update"));
+            await alice.send(second.id, utf8Encode("second update"));
+            await alice.synchronize();
+
+            const batches: (readonly MurmurUpdate[])[] = [];
+            await bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onUpdates: async (updates) => {
+                        batches.push(updates);
+                    },
+                },
+            );
+            expect(batches).toHaveLength(1);
+            expect(batches[0]!.map((update) => utf8Decode(update.bytes))).toEqual([
+                "first update",
+                "second update",
+            ]);
+            expect(batches[0]!.map((update) => encodeBase64Url(update.sessionId))).toEqual([
+                encodeBase64Url(first.id),
+                encodeBase64Url(second.id),
+            ]);
+            expect(batches[0]![0]!.id < batches[0]![1]!.id).toBe(true);
+            expect(await bob.session(first.id)).toMatchObject({ bufferedEvents: 0 });
+            expect(await bob.session(second.id)).toMatchObject({ bufferedEvents: 0 });
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
     test("bootstraps pending, activates, and exchanges opaque events", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
@@ -280,9 +368,9 @@ describe("stateful MLS sessions", () => {
             });
 
             const received: string[] = [];
-            await bob.activateSession(created.id, async (transaction, event) => {
+            await activate(bob, created.id, async (event) => {
                 received.push(utf8Decode(event.bytes));
-                await transaction.set("application/last", event.bytes);
+                await bobStore.set("application/last", event.bytes);
             });
             expect(received).toEqual(["hello"]);
             expect(utf8Decode((await bobStore.get("application/last"))!)).toBe("hello");
@@ -373,7 +461,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             await alice.addMember(session.id, await carol.discovery());
             await alice.synchronize();
@@ -382,14 +470,14 @@ describe("stateful MLS sessions", () => {
             expect((await alice.session(session.id))?.members).toHaveLength(3);
             expect((await bob.session(session.id))?.members).toHaveLength(3);
             expect((await carol.session(session.id))?.status).toBe("pending");
-            await carol.activateSession(session.id, async () => undefined);
+            await activate(carol, session.id);
 
             await bob.send(session.id, utf8Encode("from bob"));
             await bob.synchronize();
             await alice.synchronize();
             await carol.synchronize();
             const carolEvents: string[] = [];
-            await carol.drain(session.id, async (_transaction, event) => {
+            await consume(carol, async (event) => {
                 carolEvents.push(utf8Decode(event.bytes));
             });
             expect(carolEvents).toEqual(["from bob"]);
@@ -452,7 +540,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             failPublish = true;
             await expect(alice.send(session.id, utf8Encode("durable"))).resolves.toEqual(
@@ -472,7 +560,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             const received: string[] = [];
-            await bob.drain(session.id, async (_transaction, event) => {
+            await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["durable"]);
@@ -506,7 +594,7 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("activates buffered effects atomically through an application-only view", async () => {
+    test("automatically commits a batch only after onUpdates resolves", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
         const bobStore = new MemoryMurmurStore();
@@ -522,21 +610,41 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
 
-            await expect(
-                bob.activateSession(session.id, async (transaction, event) => {
-                    await transaction.set("application/staged", event.bytes);
-                    await transaction.set("murmur/identity/root", event.bytes);
-                }),
-            ).rejects.toThrow("cannot mutate");
-            expect(await bobStore.get("application/staged")).toBeUndefined();
+            await bob.activateSession(session.id);
+            await bob.synchronize({ waitMilliseconds: 0 });
             expect(await bob.session(session.id)).toMatchObject({
-                status: "pending",
+                status: "active",
+                bufferedEvents: 1,
+            });
+            let firstId: string | undefined;
+            await expect(
+                bob.synchronize(
+                    { waitMilliseconds: 0 },
+                    {
+                        onUpdates: async (updates) => {
+                            expect(updates).toHaveLength(1);
+                            firstId = updates[0]!.id;
+                            await bobStore.set("application/staged", updates[0]!.bytes);
+                            throw new Error("application update failed");
+                        },
+                    },
+                ),
+            ).rejects.toThrow("application update failed");
+            expect(await bob.session(session.id)).toMatchObject({
+                status: "active",
                 bufferedEvents: 1,
             });
 
-            await bob.activateSession(session.id, async (transaction, event) => {
-                await transaction.set("application/staged", event.bytes);
-            });
+            let replayId: string | undefined;
+            await bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onUpdates: async (updates) => {
+                        replayId = updates[0]?.id;
+                    },
+                },
+            );
+            expect(replayId).toBe(firstId);
             expect(utf8Decode((await bobStore.get("application/staged"))!)).toBe("buffered");
             expect(await bob.session(session.id)).toMatchObject({
                 status: "active",
@@ -562,7 +670,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             await alice.send(session.id, utf8Encode("first"));
             await alice.send(session.id, utf8Encode("second"));
@@ -573,7 +681,7 @@ describe("stateful MLS sessions", () => {
                 bufferedEvents: 1,
             });
             const events: string[] = [];
-            await bob.drain(session.id, async (_transaction, event) => {
+            await consume(bob, async (event) => {
                 events.push(utf8Decode(event.bytes));
             });
             expect(events).toEqual(["first"]);
@@ -622,7 +730,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             await alice.addMember(session.id, await carol.discovery());
             await alice.synchronize();
@@ -631,7 +739,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
 
             const events: string[] = [];
-            await alice.drain(session.id, async (_transaction, event) => {
+            await consume(alice, async (event) => {
                 events.push(utf8Decode(event.bytes));
             });
             expect(events).toEqual(["from prior epoch"]);
@@ -718,7 +826,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             const corruptedId = await alice.send(session.id, utf8Encode("corrupted"));
             await aliceStore.set(`murmur/session-outbox/${corruptedId}`, new Uint8Array([1, 2, 3]));
@@ -746,7 +854,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             const received: string[] = [];
-            await bob.drain(session.id, async (_transaction, event) => {
+            await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["healthy"]);
@@ -869,7 +977,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             await alice.transferCommitter(session.id, bob.identity);
             const outboxes = await aliceStore.scan("murmur/session-outbox/", {
@@ -929,7 +1037,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             await alice.transferCommitter(session.id, bob.identity);
             const key = `murmur/session-states/${encodeBase64Url(session.id)}`;
@@ -985,7 +1093,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(damaged.id, async () => undefined);
+            await activate(bob, damaged.id);
 
             const healthy = await alice.createSession({
                 descriptor: utf8Encode("healthy state"),
@@ -993,7 +1101,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await carol.synchronize();
-            await carol.activateSession(healthy.id, async () => undefined);
+            await activate(carol, healthy.id);
 
             await aliceStore.set(
                 `murmur/session-states/${encodeBase64Url(damaged.id)}`,
@@ -1008,7 +1116,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await carol.synchronize();
             const received: string[] = [];
-            await carol.drain(healthy.id, async (_transaction, event) => {
+            await consume(carol, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["still delivered"]);
@@ -1053,7 +1161,7 @@ describe("stateful MLS sessions", () => {
             await ciphertextConstrained.synchronize();
             await bob.synchronize();
             const received: string[] = [];
-            await bob.activateSession(session.id, async (_transaction, event) => {
+            await activate(bob, session.id, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["small"]);
@@ -1081,12 +1189,12 @@ describe("stateful MLS sessions", () => {
             });
             expect((await alice.synchronize()).transientPublicationFailures).toBe(0);
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
             await alice.send(session.id, utf8Encode("accepted"));
             await alice.synchronize();
             await bob.synchronize();
             const events: string[] = [];
-            await bob.drain(session.id, async (_transaction, event) => {
+            await consume(bob, async (event) => {
                 events.push(utf8Decode(event.bytes));
             });
             expect(events).toEqual(["accepted"]);
@@ -1196,8 +1304,8 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             await carol.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
-            await carol.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
+            await activate(carol, session.id);
 
             await alice.removeMember(session.id, carol.identity);
             const sendId = await alice.send(session.id, utf8Encode("before remove"));
@@ -1211,7 +1319,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             const received: string[] = [];
-            await bob.drain(session.id, async (_transaction, event) => {
+            await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["before remove"]);
@@ -1292,8 +1400,8 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             await carol.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
-            await carol.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
+            await activate(carol, session.id);
 
             await alice.removeMember(session.id, carol.identity);
             await alice.synchronize();
@@ -1303,7 +1411,7 @@ describe("stateful MLS sessions", () => {
             const outcome = await alice.synchronize();
             expect(outcome.inbox.rejected).toBe(1);
             const events: string[] = [];
-            await alice.drain(session.id, async (_transaction, event) => {
+            await consume(alice, async (event) => {
                 events.push(utf8Decode(event.bytes));
             });
             expect(events).toEqual([]);
@@ -1469,7 +1577,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             await bob.synchronize();
-            await bob.activateSession(session.id, async () => undefined);
+            await activate(bob, session.id);
 
             const expected = Array.from(
                 { length: 70 },
@@ -1504,7 +1612,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             const received: string[] = [];
-            await bob.drain(session.id, async (_transaction, event) => {
+            await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(expected);

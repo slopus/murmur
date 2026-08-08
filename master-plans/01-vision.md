@@ -29,26 +29,33 @@ accepted tradeoff. Murmur promises encrypted contents, not anonymous routing.
 
 ## Ownership of state
 
-The application supplies transactional persistence and owns application
-history and effects. Murmur owns identity secrets, current MLS epoch and
-ratchet checkpoints, KeyPackages, Welcomes, outboxes, replay and queue progress,
-pending-session buffers, session lifecycle, and synchronization. For realtime
-receiving, the relay streams the exact queued encrypted deliveries over one
-recipient-authenticated SSE connection in inbox UUIDv7 order. The application
-still acknowledges only after Murmur has durably processed each event.
+The application supplies transactional persistence for Murmur and owns
+application history and effects, but Murmur never exposes its storage
+transaction to application code. Murmur owns identity secrets, current MLS
+epoch and ratchet checkpoints, KeyPackages, Welcomes, outboxes, replay and queue
+progress, pending-session buffers, session lifecycle, and synchronization. For
+realtime receiving, the relay streams the exact queued encrypted deliveries
+over one recipient-authenticated SSE connection in inbox UUIDv7 order.
 
 A relay item is acknowledged only after its queue-processing outcome is
-durable. Successful processing atomically persists Murmur state, replay and
-queue progress, and the application-owned effect or history where applicable.
-A valid bootstrap instead becomes a durable pending local bootstrap or session
-together with replay and queue progress before acknowledgement; the application
-later activates or ignores it locally. While pending, Murmur continues advancing
-its MLS state and durably buffers opaque application events or effects without
-exposing them, so later queue items can also be acknowledged without waiting.
-Pending state and buffered data are strictly bounded. Activation hands buffered
-events or effects through the ordinary durable application boundary; ignore or
-overflow terminally rejects the session and destroys pending secrets and data
-while retaining replay and rejection state.
+durable. Successful session processing atomically persists Murmur state, replay
+and queue progress, and a bounded opaque application update before
+acknowledgement. One identity-wide synchronization loop later calls the
+application's asynchronous `onUpdates` hook with an inbox-ordered batch spanning
+all sessions. After the hook resolves, Murmur atomically drains the whole batch
+from local storage. A thrown hook or crash before that internal commit exposes
+the same stable event IDs again; applications needing durable exactly-once
+effects deduplicate those IDs in their own persistence.
+
+A valid bootstrap becomes a durable pending local bootstrap or session together
+with replay and queue progress before acknowledgement; the application later
+activates or ignores it locally. While pending, Murmur continues advancing its
+MLS state and durably buffers opaque application events without exposing them,
+so later queue items can also be acknowledged without waiting. Pending state
+and buffered data are strictly bounded. Activation makes its buffered events
+visible to the same identity-wide `onUpdates` loop; ignore or overflow
+terminally rejects the session and destroys pending secrets and data while
+retaining replay and rejection state.
 
 Malformed, unauthenticatable, undecryptable, unsupported, ignored during queue
 processing, or otherwise terminal deliveries are durably rejected or
@@ -79,7 +86,8 @@ being added again.
 ## How we know it is done
 
 - `@slopus/murmur` opens with one relay and application-supplied transactional
-  persistence in a browser or Node.js process.
+  persistence in a browser or Node.js process without exposing storage
+  transactions through its session API.
 - Two identities can discover the material needed to bootstrap an MLS session,
   and the recipient can durably receive it without waiting for the application
   to activate or ignore it.
@@ -93,8 +101,12 @@ being added again.
 - The same opaque MLS session API works for two and many members, including
   adding and removing members.
 - Queue processing survives redelivery and acknowledges only after durably
-  recording queue progress and its successful state and effects, pending
-  bootstrap, or terminal rejection.
+  recording queue progress and its successful protocol state plus buffered
+  update, pending bootstrap, or terminal rejection.
+- One `sync` loop delivers bounded identity-wide batches with stable event IDs
+  to an optional asynchronous `onUpdates` hook and commits a whole batch only
+  after that hook resolves; an uncommitted batch is returned again after
+  restart.
 - Realtime delivery streams exact queued events over authenticated SSE in one
   inbox's UUIDv7 order, reconnects from the durable cursor, and may redeliver
   but cannot replace durable acknowledgement.

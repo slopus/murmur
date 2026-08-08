@@ -2,7 +2,6 @@ import {
     DeliveryTransportError,
     InboxProcessor,
     MURMUR_INTERNAL_INBOX_HANDLER,
-    StagedStoreTransaction,
     TerminalInboxDeliveryError,
     createSignedDelivery,
     type DeliveryTransport,
@@ -44,8 +43,6 @@ import {
 import type {
     CreateMurmurSessionOptions,
     MurmurSession,
-    MurmurSessionEvent,
-    MurmurSessionEventHandler,
     MurmurSessionIssue,
     MurmurSessionLimits,
     MurmurSessionListOptions,
@@ -53,6 +50,7 @@ import type {
     MurmurSessionProposal,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
+    MurmurUpdate,
 } from "../types.js";
 import {
     decodeBootstrapFrame,
@@ -94,6 +92,7 @@ const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
 const USED_DISCOVERY_PREFIX = "murmur/used-discovery/";
 const BOOTSTRAP_INDEX_PREFIX = "murmur/bootstrap-outboxes/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
+const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
 const DEFAULT_MAXIMUM_PENDING = 64;
 const DEFAULT_MAXIMUM_BUFFERED_EVENTS = 1_000;
 const DEFAULT_MAXIMUM_BUFFERED_BYTES = 16 * 1024 * 1024;
@@ -106,13 +105,20 @@ const MAXIMUM_USED_DISCOVERY = 1_024;
 const MAXIMUM_PROPOSALS_PER_SESSION = 256;
 const MAXIMUM_COMMIT_PROPOSALS = 64;
 const SESSION_LIST_LIMIT = 256;
-const BUFFER_SCAN_ITEMS = 64;
+const MAXIMUM_UPDATE_BATCH_EVENTS = 256;
 const OUTBOX_SCAN_ITEMS = 64;
 const PREVIOUS_EPOCH_GRACE_MILLISECONDS = 5 * 60 * 1_000;
 const PREVIOUS_EPOCH_MESSAGES = 64;
 const DELIVERY_TTL_MILLISECONDS = 29 * 24 * 60 * 60 * 1_000;
 const COMMIT_EXPORT_LABEL = "murmur session commit";
 const COMMIT_EXPORT_CONTEXT = utf8Encode("murmur/session-commit/v1");
+
+/** Internal immutable snapshot backing one identity-wide application batch. */
+export interface PreparedUpdates {
+    readonly keys: readonly string[];
+    readonly updates: readonly MurmurUpdate[];
+    readonly exhausted: boolean;
+}
 
 function sessionId(value: Uint8Array): string {
     return encodeBase64Url(value);
@@ -132,6 +138,10 @@ function stateKey(id: Uint8Array): string {
 
 function bufferPrefix(id: Uint8Array): string {
     return `${SESSION_DATA_PREFIX}${sessionId(id)}/buffer/`;
+}
+
+function applicationUpdateKey(eventId: string): string {
+    return `${APPLICATION_UPDATE_PREFIX}${eventId}`;
 }
 
 function proposalPrefix(id: Uint8Array): string {
@@ -680,8 +690,39 @@ export class SessionEngine {
         };
     }
 
-    async activate(id: Uint8Array, handler: MurmurSessionEventHandler): Promise<number> {
-        return this.#deliverBuffered(id, "pending", handler);
+    async activate(id: Uint8Array): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const stateBytes = await transaction.get(stateKey(id));
+            if (stateBytes === undefined) throw new Error("Unknown session");
+            const record = decodeSessionRecord(stateBytes);
+            try {
+                if (record.status !== "pending") throw new Error("Session is not pending");
+                let after: string | undefined;
+                const prefix = bufferPrefix(id);
+                for (;;) {
+                    const page = await transaction.scan(prefix, {
+                        ...(after === undefined ? {} : { after }),
+                        limit: OUTBOX_SCAN_ITEMS,
+                    });
+                    if (page.size === 0) break;
+                    for (const [key, bytes] of page) {
+                        after = key;
+                        await transaction.set(applicationUpdateKey(key.slice(prefix.length)), id);
+                        zeroBytes(bytes);
+                    }
+                    if (page.size < OUTBOX_SCAN_ITEMS) break;
+                }
+                await transaction.delete(pendingKey(id));
+                await setAndZero(
+                    transaction,
+                    stateKey(id),
+                    encodeSessionRecord({ ...record, status: "active" }),
+                );
+            } finally {
+                this.#zeroSessionRecord(record);
+                zeroBytes(stateBytes);
+            }
+        });
     }
 
     async ignore(id: Uint8Array): Promise<void> {
@@ -718,76 +759,132 @@ export class SessionEngine {
         });
     }
 
-    async drain(id: Uint8Array, handler: MurmurSessionEventHandler): Promise<number> {
-        return this.#deliverBuffered(id, "active", handler);
+    async prepareUpdates(): Promise<PreparedUpdates> {
+        return this.#store.transaction(async (transaction) => {
+            const keys: string[] = [];
+            const updates: MurmurUpdate[] = [];
+            let after: string | undefined;
+            let exhausted = true;
+            for (;;) {
+                const page = await transaction.scan(APPLICATION_UPDATE_PREFIX, {
+                    ...(after === undefined ? {} : { after }),
+                    limit: OUTBOX_SCAN_ITEMS,
+                });
+                if (page.size === 0) break;
+                let stop = false;
+                for (const [key, indexedSessionId] of page) {
+                    after = key;
+                    const eventId = key.slice(APPLICATION_UPDATE_PREFIX.length);
+                    const bufferedBytes = await transaction.get(
+                        `${bufferPrefix(indexedSessionId)}${eventId}`,
+                    );
+                    if (bufferedBytes === undefined) {
+                        await transaction.delete(key);
+                        zeroBytes(indexedSessionId);
+                        continue;
+                    }
+                    if (updates.length === MAXIMUM_UPDATE_BATCH_EVENTS) {
+                        exhausted = false;
+                        zeroBytes(bufferedBytes);
+                        zeroBytes(indexedSessionId);
+                        stop = true;
+                        break;
+                    }
+                    let buffered: ReturnType<typeof decodeBufferedEvent>;
+                    try {
+                        buffered = decodeBufferedEvent(bufferedBytes);
+                    } finally {
+                        zeroBytes(bufferedBytes);
+                    }
+                    keys.push(key);
+                    updates.push({
+                        id: eventId,
+                        sessionId: indexedSessionId.slice(),
+                        sender: buffered.sender,
+                        bytes: buffered.bytes,
+                    });
+                    zeroBytes(indexedSessionId);
+                }
+                for (const [key, value] of page) {
+                    if (key > (after ?? "")) zeroBytes(value);
+                }
+                if (stop || page.size < OUTBOX_SCAN_ITEMS) break;
+            }
+            return { keys, updates, exhausted };
+        });
     }
 
-    async #deliverBuffered(
-        id: Uint8Array,
-        requiredStatus: "pending" | "active",
-        handler: MurmurSessionEventHandler,
-    ): Promise<number> {
-        return this.#store.transaction(async (transaction) => {
-            const stateBytes = await transaction.get(stateKey(id));
-            if (stateBytes === undefined) throw new Error("Unknown session");
-            const record = decodeSessionRecord(stateBytes);
-            const staged = new StagedStoreTransaction(transaction);
+    async commitUpdates(prepared: PreparedUpdates): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const changes = new Map<string, { id: Uint8Array; events: number; bytes: number }>();
             try {
-                if (record.status !== requiredStatus) {
-                    throw new Error(
-                        requiredStatus === "pending"
-                            ? "Session is not pending"
-                            : "Session is not active",
-                    );
-                }
-                let after: string | undefined;
-                let delivered = 0;
-                for (;;) {
-                    const events = await transaction.scan(bufferPrefix(id), {
-                        ...(after === undefined ? {} : { after }),
-                        limit: BUFFER_SCAN_ITEMS,
-                    });
-                    if (events.size === 0) break;
-                    for (const [key, bytes] of events) {
-                        const buffered = decodeBufferedEvent(bytes);
-                        try {
-                            const event: MurmurSessionEvent = {
-                                sessionId: id.slice(),
-                                sender: buffered.sender,
-                                bytes: buffered.bytes,
-                            };
-                            await handler(staged, event);
-                        } finally {
-                            zeroBytes(buffered.sender);
-                            zeroBytes(buffered.bytes);
-                            zeroBytes(bytes);
+                for (const key of prepared.keys) {
+                    const indexedSessionId = await transaction.get(key);
+                    if (indexedSessionId === undefined) continue;
+                    try {
+                        const eventId = key.slice(APPLICATION_UPDATE_PREFIX.length);
+                        const bufferedKey = `${bufferPrefix(indexedSessionId)}${eventId}`;
+                        const bufferedBytes = await transaction.get(bufferedKey);
+                        if (bufferedBytes === undefined) {
+                            await transaction.delete(key);
+                            continue;
                         }
-                        await transaction.delete(key);
-                        after = key;
-                        delivered += 1;
+                        let buffered: ReturnType<typeof decodeBufferedEvent> | undefined;
+                        try {
+                            buffered = decodeBufferedEvent(bufferedBytes);
+                            const decoded = buffered;
+                            const encodedId = sessionId(indexedSessionId);
+                            const change = changes.get(encodedId) ?? {
+                                id: indexedSessionId.slice(),
+                                events: 0,
+                                bytes: 0,
+                            };
+                            change.events += 1;
+                            change.bytes += decoded.bytes.length;
+                            changes.set(encodedId, change);
+                            await transaction.delete(bufferedKey);
+                            await transaction.delete(key);
+                        } finally {
+                            if (buffered !== undefined) {
+                                zeroBytes(buffered.sender);
+                                zeroBytes(buffered.bytes);
+                            }
+                            zeroBytes(bufferedBytes);
+                        }
+                    } finally {
+                        zeroBytes(indexedSessionId);
                     }
                 }
-                await staged.commit();
-                if (requiredStatus === "pending") {
-                    await transaction.delete(pendingKey(id));
+                for (const change of changes.values()) {
+                    const stateBytes = await transaction.get(stateKey(change.id));
+                    if (stateBytes === undefined) continue;
+                    const record = decodeSessionRecord(stateBytes);
+                    try {
+                        if (
+                            record.status !== "active" ||
+                            record.bufferedEvents < change.events ||
+                            record.bufferedBytes < change.bytes
+                        ) {
+                            throw new Error("Invalid application update accounting");
+                        }
+                        await setAndZero(
+                            transaction,
+                            stateKey(change.id),
+                            encodeSessionRecord({
+                                ...record,
+                                bufferedEvents: record.bufferedEvents - change.events,
+                                bufferedBytes: record.bufferedBytes - change.bytes,
+                            }),
+                        );
+                    } finally {
+                        this.#zeroSessionRecord(record);
+                        zeroBytes(stateBytes);
+                    }
                 }
-                await setAndZero(
-                    transaction,
-                    stateKey(id),
-                    encodeSessionRecord({
-                        ...record,
-                        status: "active",
-                        bufferedEvents: 0,
-                        bufferedBytes: 0,
-                    }),
-                );
-                return delivered;
-            } catch (error: unknown) {
-                staged.discard();
-                throw error;
             } finally {
-                this.#zeroSessionRecord(record);
-                zeroBytes(stateBytes);
+                for (const change of changes.values()) {
+                    zeroBytes(change.id);
+                }
             }
         });
     }
@@ -1933,6 +2030,9 @@ export class SessionEngine {
             `${bufferPrefix(id)}${eventId}`,
             encodeBufferedEvent({ version: 1, sender, bytes }),
         );
+        if (record.status === "active") {
+            await transaction.set(applicationUpdateKey(eventId), id);
+        }
         const latestBytes = await transaction.get(stateKey(id));
         if (latestBytes === undefined) return;
         const latest = decodeSessionRecord(latestBytes);
@@ -2644,6 +2744,21 @@ export class SessionEngine {
     }
 
     async #deleteSession(transaction: StoreTransaction, id: Uint8Array): Promise<void> {
+        let bufferedAfter: string | undefined;
+        const bufferedPrefix = bufferPrefix(id);
+        for (;;) {
+            const page = await transaction.scan(bufferedPrefix, {
+                ...(bufferedAfter === undefined ? {} : { after: bufferedAfter }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, value] of page) {
+                bufferedAfter = key;
+                await transaction.delete(applicationUpdateKey(key.slice(bufferedPrefix.length)));
+                zeroBytes(value);
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
+        }
         await this.#deletePrefix(transaction, `${SESSION_DATA_PREFIX}${sessionId(id)}/`);
         await transaction.delete(stateKey(id));
         await transaction.delete(pendingKey(id));

@@ -8,7 +8,7 @@ import { zeroBytes } from "../../utils/index.js";
 const RESERVED_PREFIX = "murmur/";
 
 /**
- * Isolated write overlay for application effects inside one outer transaction.
+ * Isolated internal handler-write overlay inside one outer transaction.
  *
  * Terminal classification discards the overlay while successful processing
  * flushes it into the outer transaction before queue progress is persisted.

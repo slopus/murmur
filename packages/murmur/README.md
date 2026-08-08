@@ -4,8 +4,8 @@ Murmur is a browser-safe TypeScript library for stateful MLS sessions over one
 deliberately simple relay. The relay stores unacknowledged encrypted deliveries
 in one authenticated queue per public identity, plus public signed invitation
 bundles in a non-enumerable five-minute cache. Durable identity, MLS epochs,
-replay protection, application effects, and history belong to the client
-application.
+replay protection, buffered updates, application effects, and history belong to
+the client application.
 
 ```text
 32-byte invitation digest -> five-minute relay cache -> signed bundle
@@ -14,7 +14,7 @@ application.
 MurmurClient -- signed encrypted multicast --> identity queues
      |                                            |
      +-- durable MLS checkpoints/outboxes <-------+
-     +-- application-owned event durability
+     +-- one identity-wide ordered update loop
 ```
 
 Two-person and many-person interactions use the same MLS session primitive.
@@ -71,8 +71,8 @@ Suppose Alice wants to add Bob:
 4. Alice passes the verified bundle to `createSession()` or `addMember()`.
 5. Murmur creates the MLS Commit and sends Bob a sealed Welcome through Bob's
    authenticated relay queue.
-6. Bob calls `synchronize()`. The new session becomes durable but remains
-   `pending` until Bob's application activates or ignores it.
+6. Bob's `sync()` loop receives the Welcome. The new session becomes durable
+   but remains `pending` until Bob's application activates or ignores it.
 
 ```ts
 import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";
@@ -103,16 +103,7 @@ await alice.synchronize();
 
 // Bob durably receives a pending session, then explicitly accepts it.
 await bob.synchronize();
-await bob.activateSession(session.id, async (transaction, event) => {
-    await transaction.set("application/latest-message", event.bytes);
-});
-
-await alice.send(session.id, new TextEncoder().encode("hello Bob"));
-await alice.synchronize();
-await bob.synchronize();
-await bob.drain(session.id, async (transaction, event) => {
-    await transaction.set("application/latest-message", event.bytes);
-});
+await bob.activateSession(session.id);
 ```
 
 Treat each discovery bundle as one-use:
@@ -135,48 +126,68 @@ Received sessions remain `pending` until the application calls
 MLS protocol state and buffer opaque application events within configured
 bounds without exposing them to the application.
 
-## Realtime SSE synchronization
+## One synchronization loop
 
-`realtime()` maintains one recipient-authenticated SSE connection and streams
-the actual queued encrypted deliveries—not wake notifications. Each SSE record
-contains the relay UUIDv7 event ID and exact sender-signed delivery. Events are
-processed one at a time in inbox order, committed locally, and only then
-acknowledged.
+`sync()` maintains the identity's one recipient-authenticated SSE connection
+and streams the actual queued encrypted deliveries—not wake notifications.
+Each SSE record contains the relay UUIDv7 event ID and exact sender-signed
+delivery.
+
+Application updates from every active session enter one identity-wide UUIDv7
+order. Murmur passes a bounded batch to `onUpdates`. After the callback
+resolves, Murmur atomically commits the whole batch locally. If it throws or
+the process exits first, the same stable update IDs are offered again.
 
 ```ts
-const aliceRealtime = new AbortController();
-const bobRealtime = new AbortController();
+const aliceAbort = new AbortController();
+const bobAbort = new AbortController();
 let markDelivered!: () => void;
 const delivered = new Promise<void>((resolve) => {
     markDelivered = resolve;
 });
 
-const aliceRunning = alice.realtime({ signal: aliceRealtime.signal });
-const bobRunning = bob.realtime({
-    signal: bobRealtime.signal,
-    onSynchronize: async () => {
-        await bob.drain(session.id, async (transaction, event) => {
-            await transaction.set("application/latest-message", event.bytes);
-        });
-        markDelivered();
+const aliceRunning = alice.sync({
+    abort: aliceAbort.signal,
+    onUpdates: async (updates) => {
+        // Alice also receives her own session deliveries.
+        applyToAliceState(updates);
+    },
+});
+const bobRunning = bob.sync({
+    abort: bobAbort.signal,
+    onConnected: () => console.log("Bob connected"),
+    onDisconnected: (error) => console.log("Bob disconnected", error),
+    onUpdates: async (updates) => {
+        // Route by update.sessionId and decode update.bytes however the app wants.
+        applyToBobState(updates);
+        await persistBobState();
+        markDelivered(); // Murmur commits this complete batch after return.
     },
 });
 
-// Durable local outboxes wake the realtime worker and publish automatically.
+// Durable local outboxes wake sync() and publish automatically.
 await alice.send(session.id, new TextEncoder().encode("realtime hello"));
 await delivered;
 
 // Stop during application shutdown.
-aliceRealtime.abort();
-bobRealtime.abort();
+aliceAbort.abort();
+bobAbort.abort();
 await Promise.all([aliceRunning, bobRunning]);
 ```
 
-Ordering is guaranteed only within one identity inbox. If the connection drops,
-Murmur reconnects from its durable cursor. An event committed locally but not
-yet acknowledged may be streamed again; replay protection prevents duplicate
-application effects. `synchronize()` remains available for bounded foreground
-cycles and environments that do not support streaming.
+All `sync()` options are optional. Without `abort`, the loop runs until a fatal
+error or process shutdown. Without `onUpdates`, application updates remain
+buffered and uncommitted. Ordering is guaranteed within one identity inbox, not
+across different identities. If the connection drops, Murmur calls
+`onDisconnected`, reconnects from its durable cursor, and calls `onConnected`
+after the next successful SSE handshake.
+
+The relay item itself is acknowledged after Murmur durably buffers its protocol
+outcome. The later `onUpdates` commit is local application handoff: it never
+exposes a `MurmurStore` transaction and performs no relay round trip.
+Applications that persist effects outside `MurmurStore` should use each
+update's stable `id` for idempotency. `synchronize()` remains as a bounded
+foreground fallback.
 
 `MemoryMurmurStore` is for tests and examples. Production applications must
 provide a durable transactional `MurmurStore`.

@@ -1,6 +1,5 @@
 import type { InboxSyncResult } from "../delivery/index.js";
 import type { DiscoveryBundle } from "../identity/discovery/index.js";
-import type { StoreTransaction } from "../storage/index.js";
 
 /** Stable public view of one local MLS session. */
 export interface MurmurSession {
@@ -12,11 +11,30 @@ export interface MurmurSession {
     readonly bufferedEvents: number;
 }
 
-/** One opaque application event ready for application-owned durability. */
-export interface MurmurSessionEvent {
+/** One opaque application update from the identity's ordered inbox. */
+export interface MurmurUpdate {
+    /** Stable relay event ID for application-level idempotency. */
+    readonly id: string;
     readonly sessionId: Uint8Array;
     readonly sender: Uint8Array;
     readonly bytes: Uint8Array;
+}
+
+/** Optional lifecycle configuration for the single identity-wide synchronization loop. */
+export interface MurmurSyncOptions {
+    /** Stops the persistent loop when aborted. Without it, sync runs until a fatal error. */
+    readonly abort?: AbortSignal;
+    /** Runs after one SSE connection completes its HTTP handshake. */
+    readonly onConnected?: () => void | Promise<void>;
+    /** Runs when that connection closes, before reconnect or final shutdown. */
+    readonly onDisconnected?: (error?: unknown) => void | Promise<void>;
+    /**
+     * Runs for one ordered application-update batch.
+     *
+     * Murmur commits the whole batch after this hook resolves. Throwing or
+     * omitting the hook leaves updates pending.
+     */
+    readonly onUpdates?: (updates: readonly MurmurUpdate[]) => void | Promise<void>;
 }
 
 /** One MLS-protected member proposal awaiting committer acceptance. */
@@ -38,12 +56,6 @@ export interface MurmurSessionPage {
     readonly sessions: readonly MurmurSession[];
     readonly cursor: string | null;
 }
-
-/** Transactional application callback used while draining buffered events. */
-export type MurmurSessionEventHandler = (
-    transaction: StoreTransaction,
-    event: MurmurSessionEvent,
-) => Promise<void>;
 
 /** Construction inputs for one new local session. */
 export interface CreateMurmurSessionOptions {
@@ -70,16 +82,6 @@ export interface MurmurSynchronizeOptions {
     readonly limit?: number;
     readonly waitMilliseconds?: number;
     readonly signal?: AbortSignal;
-}
-
-/** Persistent SSE synchronization policy. */
-export interface MurmurRealtimeOptions {
-    /** Required cancellation boundary for the persistent connection. */
-    readonly signal: AbortSignal;
-    /** Delay before reconnecting a closed or transiently failed stream. */
-    readonly reconnectDelayMilliseconds?: number;
-    /** Called after each streamed delivery is durable and acknowledged. */
-    readonly onSynchronize?: (result: MurmurSynchronizeResult) => void | Promise<void>;
 }
 
 /** One durable session or publication diagnostic retained by Murmur. */

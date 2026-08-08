@@ -80,8 +80,9 @@ every directory. Read that plan before adding files.
 2. **Base64url is only for serialization** - use encodeBase64Url/decodeBase64Url
    at wire and storage boundaries only
 3. **Errors throw** - no null returns for cryptographic failures
-4. **The application owns durability** - commit effects, MLS state, replay
-   state, and cursor first; acknowledge the delivery afterward
+4. **The application owns effects** - Murmur durably buffers updates before
+   acknowledgement, calls the identity-wide `onUpdates` hook, and drains a
+   whole batch only after the hook resolves
 5. **The relay is untrusted and dumb** - never add message semantics to it
 6. **One queue per public identity** - queue addresses are canonical Ed25519
    identity keys, not anonymous topics or arbitrary routing labels

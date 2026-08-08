@@ -34,11 +34,14 @@ MLS credentials. The supplied `MurmurStore` is authoritative for:
 - active, creating, and pending MLS checkpoints;
 - sender ratchets and exact publication outboxes;
 - inbox cursor, replay protection, and terminal rejections;
-- accepted proposals, pending-session state, and bounded opaque event buffers.
+- accepted proposals, pending-session state, bounded opaque event buffers, and
+  the identity-wide application-update order.
 
-Application history is not reconstructed from the relay. Event handlers run
-inside the same application transaction that hands data across the Murmur
-durability boundary.
+Application history is not reconstructed from the relay. Murmur never exposes
+its storage transaction to event handlers. Active-session events enter one
+identity-wide UUIDv7-ordered local index. `sync()` invokes `onUpdates` with a
+bounded cross-session batch and atomically removes that batch only after the
+callback resolves.
 
 ## Relay ownership
 
@@ -91,14 +94,19 @@ continue.
 
 ## Processing boundary
 
-Inbox processing follows one invariant:
+Inbox processing and application handoff follow two related invariants:
 
 ```text
 page or SSE event -> authenticate/decrypt
-                  -> persist effect or terminal rejection + cursor
+                  -> persist protocol state + buffered update or rejection + cursor
                   -> commit -> acknowledge through cursor
+
+ordered buffered batch -> await onUpdates(batch)
+                       -> local commit of the whole batch
 ```
 
 A crash before the local commit leaves the relay item pending. A crash after
-the local commit causes only acknowledgement retry. Terminal malformed data is
-durably rejected so it cannot block the identity queue.
+that commit causes only acknowledgement retry. Separately, a thrown
+`onUpdates` callback or crash before its batch commit leaves the same stable
+update IDs pending locally. Terminal malformed data is durably rejected so it
+cannot block the identity queue.

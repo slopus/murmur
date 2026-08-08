@@ -40,12 +40,16 @@ reconnects from durable progress. SSE receipt never authorizes deletion.
 
 ## Durable client invariants
 
-- Persist effects, replay state, and cursor before acknowledging.
+- Persist protocol effects, buffered updates, replay state, and cursor before
+  acknowledging.
+- Commit one identity-wide update batch only after `onUpdates` resolves; use
+  stable update IDs when application persistence needs idempotency.
 - Persist post-ratchet epochs and exact outboxes before publishing.
 - Adopt Commits only from authenticated queue echoes.
 - Keep active and staged epochs separate until the echo wins.
 - Treat malformed authenticated input as terminal queue progress.
-- Never let application callbacks mutate the `murmur/` storage namespace.
+- Never expose the `murmur/` storage namespace or transaction to application
+  callbacks.
 - Zero temporary secret and plaintext byte arrays in success and error paths.
 
 Losing or rolling back the single-device store can lose identity and MLS state.

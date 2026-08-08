@@ -8,6 +8,7 @@ import type {
     SignedDelivery,
     SignedInboxAck,
     SignedInboxRead,
+    DeliveryStreamHooks,
 } from "../types.js";
 import {
     parseInboxPage,
@@ -220,7 +221,11 @@ export class HttpDeliveryTransport implements DeliveryTransport {
     }
 
     /** Stream exact queued deliveries over one recipient-authenticated SSE response. */
-    async *stream(request: SignedInboxRead, signal?: AbortSignal): AsyncGenerator<InboxDelivery> {
+    async *stream(
+        request: SignedInboxRead,
+        signal?: AbortSignal,
+        hooks: DeliveryStreamHooks = {},
+    ): AsyncGenerator<InboxDelivery> {
         if (request.waitMilliseconds !== 0) {
             throw new Error("Delivery event streams require a zero wait duration");
         }
@@ -252,6 +257,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
                 throw new Error("Relay returned an invalid delivery event stream");
             }
             clearTimeout(timeout);
+            await hooks.onConnected?.();
             yield* decodeDeliveryEventStream(
                 response,
                 controller,

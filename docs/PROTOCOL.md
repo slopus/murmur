@@ -41,8 +41,8 @@ queue echo; a publish response never advances the epoch.
 
 A valid received Welcome creates a bounded `pending` session. MLS protocol
 traffic continues while pending. Application events are buffered but not
-exposed until `activateSession` applies them through an application transaction.
-`ignoreSession` destroys pending secrets and buffers.
+exposed until `activateSession` makes them eligible for the identity-wide update
+loop. `ignoreSession` destroys pending secrets and buffers.
 
 ## Realtime queue stream
 
@@ -63,6 +63,12 @@ comment heartbeats without advancing progress. It may buffer, disconnect,
 repeat, delay, or omit events; SSE receipt is never acknowledgement. Murmur
 processes one record through the ordinary durable queue transaction, sends a
 signed acknowledgement, and reconnects from its durable cursor.
+
+Every active-session application event is also indexed locally by that relay
+UUIDv7 ID. One `sync({ onUpdates })` loop reads a bounded cross-session batch in
+inbox order. Murmur waits for the callback and atomically removes the complete
+batch only after it resolves. Missing or failed callbacks leave the batch
+pending; no Murmur storage transaction is exposed.
 
 ## MLS sessions
 
@@ -97,8 +103,8 @@ therefore persist sender-plus-delivery-ID replay state. Exact records are
 bounded; capacity overflow enters a bounded probabilistic filter whose only
 error is rejecting a new delivery. A separate rotating terminal filter
 amortizes repeated invalid-input authentication work without accumulating
-forever. Replay state and cursor progress commit with the application effect or
-terminal rejection.
+forever. Replay state and cursor progress commit with the buffered application
+update or terminal rejection.
 
 Relay UUIDv7 event IDs provide a monotonic per-inbox cursor and processing-time
 floor. Implausible event times reject the page without durable mutation.

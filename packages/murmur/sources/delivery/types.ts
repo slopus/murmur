@@ -56,6 +56,11 @@ export interface InboxPage {
 /** Browser-safe fetch signature used by the HTTP delivery transport. */
 export type DeliveryFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+/** Optional lifecycle hooks for opening one delivery event stream. */
+export interface DeliveryStreamHooks {
+    readonly onConnected?: () => void | Promise<void>;
+}
+
 /** Relay-neutral queue operations used by the stateful inbox processor. */
 export interface DeliveryTransport {
     publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
@@ -65,7 +70,11 @@ export interface DeliveryTransport {
         signal?: AbortSignal,
     ): Promise<{ readonly removed: number }>;
     /** Stream exact queued events in recipient inbox order when supported. */
-    stream?(request: SignedInboxRead, signal?: AbortSignal): AsyncIterable<InboxDelivery>;
+    stream?(
+        request: SignedInboxRead,
+        signal?: AbortSignal,
+        hooks?: DeliveryStreamHooks,
+    ): AsyncIterable<InboxDelivery>;
 }
 
 /** Inputs for one exact sender-signed delivery. */
@@ -113,6 +122,7 @@ export interface InboxSyncOptions {
 /** One recipient SSE session; a signal is required to define its lifetime. */
 export interface InboxStreamOptions {
     readonly signal: AbortSignal;
+    readonly onConnected?: () => void | Promise<void>;
 }
 
 /** Durable terminal-rejection summary. */

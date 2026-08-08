@@ -64,10 +64,12 @@ redelivered but is not skipped.
 
 Downloading or streaming is not delivery. A successfully processed item
 atomically persists current MLS state, replay and queue progress, and any
-application-owned effect or history before acknowledgement. A malformed,
-unauthenticatable, undecryptable, unsupported, ignored, or otherwise terminal
-item is instead durably rejected or quarantined with replay and queue progress
-and no application effect before acknowledgement.
+bounded opaque application update before acknowledgement. The application
+receives those updates later through its identity-wide synchronization
+callback. A malformed, unauthenticatable, undecryptable, unsupported, ignored,
+or otherwise terminal item is instead durably rejected or quarantined with
+replay and queue progress and no buffered application update before
+acknowledgement.
 
 Acknowledgement is signed by the recipient and advances monotonically and
 idempotently through an inbox UUIDv7 cursor. A crash before acknowledgement
