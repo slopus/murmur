@@ -86,8 +86,11 @@ every directory. Read that plan before adding files.
 5. **The relay is untrusted and dumb** - never add message semantics to it
 6. **One queue per public identity** - queue addresses are canonical Ed25519
    identity keys, not anonymous topics or arbitrary routing labels
-7. **No compatibility layer** - previous topic, friendship, and retained-event
-   formats are unsupported and legacy relay databases must fail fast
+7. **Compatibility starts at v0.3.3** - pre-v0.3 topic, friendship, and
+   retained-event formats remain unsupported. From v0.3.3 and relay schema v3
+   onward, preserve public APIs and wire formats, read or migrate persisted
+   client state, and migrate relay schemas in place without deleting pending
+   data or requiring a clean database
 
 ## Testing
 

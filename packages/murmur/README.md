@@ -192,6 +192,17 @@ foreground fallback.
 `MemoryMurmurStore` is for tests and examples. Production applications must
 provide a durable transactional `MurmurStore`.
 
+## Compatibility and upgrades
+
+Murmur v0.3.3 and relay schema v3 are the compatibility baseline. Releases
+after that baseline preserve the public `@slopus/murmur` API and wire formats,
+and they keep persisted client state readable or migrate it. Relay schema
+upgrades migrate existing databases in place without deleting pending
+deliveries or requiring a clean database.
+
+The older pre-v0.3 friendship, topic, retained-event, storage, and CLI formats
+remain unsupported.
+
 ## Development
 
 ```bash

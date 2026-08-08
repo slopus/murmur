@@ -31,6 +31,16 @@ SSE streams across processes; durable reads always come from tables, so
 notifications are not data. Write paths serialize through the global
 quota/UUID row.
 
+## Upgrades
+
+Murmur v0.3.3 and relay schema v3 are the compatibility baseline. Every later
+relay release must migrate an existing SQLite database or Postgres schema in
+place while preserving pending deliveries and invitations. Do not introduce an
+upgrade that requires operators to delete relay data or provision a clean
+database.
+
+Pre-v0.3 topic-relay schemas remain unsupported.
+
 ## Startup verification and logs
 
 The process checks its dependencies before listening for traffic. SQLite must

@@ -12,8 +12,12 @@ It ships as the browser-safe and Node.js-compatible `@slopus/murmur` library.
 The relay is internal infrastructure, and application protocols such as chat
 and documents live above the library.
 
-This remains a clean 0.x rewrite. There is no compatibility or migration work
-for old APIs, codecs, relay topics, storage schemas, or the CLI.
+The pre-v0.3 rewrite remains a clean break: its APIs, codecs, relay topics,
+storage schemas, and CLI are unsupported. Version 0.3.3 is the compatibility
+baseline. From that release onward, public library APIs and wire formats remain
+backward-compatible, persisted client state remains readable or is migrated,
+and relay schemas migrate in place without deleting pending data or requiring a
+clean database.
 
 ## One relay and one receiver
 

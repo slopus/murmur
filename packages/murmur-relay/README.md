@@ -68,9 +68,11 @@ Invitation cache limits are configured with
 items and 512 KiB per admitted principal, and 10,000 items or 64 MiB globally.
 The five-minute maximum TTL is not configurable above five minutes.
 
-The queue schema is intentionally incompatible with the former topic relay.
-Startup fails when legacy `murmur_relay_*` tables are present; deploy with a
-clean SQLite database or Postgres schema rather than retaining old ciphertext.
+Relay schema v3, shipped with Murmur v0.3.3, is the compatibility baseline.
+Future schema versions migrate an existing SQLite database or Postgres schema
+in place and preserve pending deliveries and invitations. Upgrading from this
+baseline never requires a clean database. Pre-v0.3 `murmur_relay_*` topic
+schemas remain unsupported.
 
 The standalone process drains expired data every ten seconds in fixed
 transactions, continuing for at most one second per tick. It skips overlapping

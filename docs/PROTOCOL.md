@@ -1,7 +1,11 @@
 # Protocol
 
-All current formats are version `1`. Previous Murmur friendship, topic, and
-event-log formats are intentionally unsupported.
+All current formats are version `1`. Murmur v0.3.3 is their compatibility
+baseline: later releases preserve these public wire formats and read or migrate
+persisted client state. Relay schema v3 is the matching storage baseline, and
+later schemas migrate in place without deleting pending relay data. Previous
+Murmur friendship, topic, and event-log formats remain intentionally
+unsupported.
 
 ## Identity and discovery
 

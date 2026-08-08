@@ -29,6 +29,11 @@ storage ceiling.
 Multicast target creation, quota reads, reference insertion, head updates, and
 wake publication are set-based SQL rather than one statement per recipient.
 
+Schema version 3 is the compatibility baseline. Later schema versions migrate
+SQLite and Postgres stores in place while retaining pending deliveries,
+references, and invitations; an upgrade must not require a clean database.
+Pre-v0.3 topic-relay schemas remain unsupported.
+
 Only pending, unexpired data is authoritative. Empty queue metadata is deleted,
 so the relay does not retain recipient tombstones or historical cursors.
 Unknown empty inboxes echo the caller's `after` cursor and reveal no global

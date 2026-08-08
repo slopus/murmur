@@ -17,6 +17,11 @@ encrypted delivery contents or trust cached discovery contents. It does learn
 authenticated sender and recipient identities, exact fanout, timing, and queue
 progress; this metadata exposure is accepted.
 
+Version 0.3.3 and relay schema version 3 are the compatibility baseline. Every
+later relay schema upgrade migrates in place without deleting pending data or
+requiring a clean database. Pre-v0.3 topic, friendship, and retained-event
+schemas remain unsupported.
+
 ## Ephemeral invitations
 
 An uploader may place the exact bytes of one signed discovery bundle in the
@@ -115,5 +120,7 @@ identity directory, or a recovery system.
   five minutes, and cannot have its lifetime extended by re-upload.
 - Quota and TTL bound abandoned queues and expose backpressure and the maximum
   offline window; separate quota and TTL bounds apply to cached invitations.
+- Every schema upgrade after version 3 migrates in place and preserves pending
+  relay data; operators are not required to start from a clean database.
 - The relay has no retained event history, snapshots, lists, generic topics, or
   anonymous addressing.
