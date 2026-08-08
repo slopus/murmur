@@ -1,59 +1,84 @@
-# Groups
+# MLS sessions
 
 ## Destination
 
-In Murmur, a two-person interaction and a many-person interaction use the same
-MLS group primitive. Murmur does not know whether the group represents a chat,
-a document, or anything else; those semantics belong above the library.
+A two-person interaction and a many-person interaction use the same MLS session
+and group primitive. Murmur does not know whether a session represents chat, a
+document, or anything else. Its descriptor and application events are opaque.
 
-The friend channel remains a separate pairwise bootstrap and control channel,
-not a chat and not an MLS group. The sequence is: establish the friend channel,
-send a private invitation and the material needed to start or join the group,
-then begin the MLS group.
+The public API creates a session from an opaque descriptor, sends opaque events,
+and adds or removes members. All ongoing membership control and application
+data travel inside MLS. A newly added member receives the MLS Welcome and
+initial material through its authenticated identity queue.
 
-A group is fundamentally an MLS-protected ordered event stream. It uses a
-`Read and Write Topic` derived from a secret known to the group. This plan does
-not choose how that topic is derived or rotated.
+## Ordering and delivery
 
-Every group has an opaque descriptor that lets a client determine what the
-group represents. This plan does not define the descriptor's contents.
+Each outbound MLS delivery has one verifiably bound recipient set containing
+every current epoch member, including the publisher. The relay publishes one
+ciphertext atomically to every recipient queue with one shared order.
 
-## The group API
+Publishing a Commit, including receiving publish success, only stages it and
+never advances or adopts an epoch. Every member, including its publisher,
+processes the Commit from its relay echo in shared queue order. The first valid
+current-epoch Commit in that order wins, and competing operations replan
+against the resulting epoch.
 
-Creating a group means providing its descriptor. The public API then lets a
-caller send opaque events and add or remove people. These operations stay
-primitive and simple.
+Murmur owns synchronization, outbox retry, replay protection, Commit
+resolution, current epochs and ratchets, Welcome processing, and session
+lifecycle. Public APIs do not expose that choreography.
 
-Inviting or adding someone includes sending that person a special private
-message through the friend channel, telling them that they were added and
-carrying the material needed to start or join the group. This plan does not
-define the exact welcome or payload.
+## Durability
 
-## Unknown groups and synchronization
+Before acknowledging a successfully processed delivery, the client atomically
+persists the resulting MLS state, replay and queue progress, and the
+application-owned effect or history where applicable. A valid bootstrap instead
+becomes a durable pending local bootstrap or session together with replay and
+queue progress before acknowledgement; the application later activates or
+ignores it locally. While pending, Murmur continues processing MLS protocol
+traffic so the session stays current and durably buffers opaque application
+events or effects without exposing them. Each item is acknowledged after that
+pending state, buffer, replay, and queue progress are durable, without waiting
+for the application.
 
-A client may ignore the application meaning of a group it does not understand.
-It must still synchronize and retain that group's MLS state and events, so that
-a later upgraded client can understand the group.
+Pending state and buffered data are strictly bounded. Activation hands
+buffered events or effects through the ordinary durable application boundary.
+Ignore or overflow terminally rejects the pending session, destroys its secrets
+and buffered data, and retains enough replay and rejection state to make
+retries harmless. It does not claim to reverse sender-created membership.
 
-The public group API should not expose Murmur's synchronization choreography.
-The stateful library owns group synchronization, MLS epochs, and durable group
-state through application-provided persistence. Exact scheduling is an
-implementation choice. This plan deliberately does not specify the descriptor
-contents, application event contents, or scheduling design.
+A malformed, unauthenticatable, undecryptable, unsupported, ignored during
+queue processing, or otherwise terminal delivery is durably rejected or
+quarantined with replay and queue progress and no application effect before
+acknowledgement. The application owns application history; Murmur retains
+current protocol state rather than an event-sourced copy of the session.
+
+A client cannot reconstruct a session from the relay after trimming. Losing
+local state requires restoring a backup or being added again.
 
 ## How we know it is done
 
-- Two-person and many-person interactions use the same opaque descriptor-based
-  MLS group stream primitive.
-- The non-MLS friend channel delivers the private invitation and material
-  needed before the MLS group begins.
-- A caller creates a group by supplying an opaque descriptor, then sends opaque
-  events and adds or removes people through a primitive public API.
-- The group uses an MLS-protected ordered event stream on a shared
-  `Read and Write Topic`.
-- A person added to a group receives a private message telling them they were
-  added.
-- A client that does not understand a group's application meaning still keeps
-  its MLS state and events synchronized for a later upgraded client.
-- The stateful library owns synchronization and durable MLS group state without
-  exposing choreography through the public group API.
+- The same opaque descriptor-based MLS API works for two and many members.
+- A caller sends opaque events and adds or removes members without
+  application-specific behavior in Murmur or the relay.
+- Ongoing application and control traffic is MLS-protected; there is no friend
+  channel or shared relay topic.
+- Every current epoch member, including the publisher, receives each ongoing
+  MLS delivery in one common relay order.
+- Publish success only stages a Commit. The first valid current-epoch Commit in
+  relay echo order wins, and competing operations replan.
+- Successful protocol state and any application effects are durable before
+  queue acknowledgement.
+- A valid bootstrap becomes durable pending local state before acknowledgement,
+  and the later activate-or-ignore decision does not block the queue.
+- A pending session stays current and buffers opaque application events or
+  effects without exposure; every queue item remains independently processable
+  and trimmable.
+- Pending storage is strictly bounded. Activation durably hands off buffered
+  events or effects, while ignore or overflow destroys pending secrets and data
+  and retains replay and rejection state.
+- Terminally rejected or quarantined deliveries persist replay and queue
+  progress without an application effect before acknowledgement.
+- Restarts preserve bounded pending and locally activated sessions, current MLS
+  state, outboxes, replay, and queue progress through application-supplied
+  persistence.
+- The relay is never treated as session history or recovery storage.

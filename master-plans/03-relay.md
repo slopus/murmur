@@ -2,98 +2,86 @@
 
 ## Destination
 
-The relay does one simple job: it stores key-bound topics. A topic has one
-ordered store of events. The relay retains messages and history so that clients
-holding the same keys can come back later and download everything they need.
+The relay has exactly one authenticated inbound queue per public identity.
+Murmur assumes one receiver on one active device for each identity. The relay
+stores encrypted deliveries only while at least one recipient reference remains
+unacknowledged and unexpired.
 
-Nothing else belongs in the relay. It does not understand what the stored data
-means and does not link Murmur identities.
+It stores no snapshots, retained history, event-sourced application state,
+lists, anonymous topics, or capability topics. It does not interpret encrypted
+contents. It does learn authenticated sender and recipient identities, exact
+fanout, timing, and queue progress; this metadata exposure is accepted.
 
-## Topic authorization
+## Publishing
 
-Read and write authorization are independent capabilities bound to keys. Every
-durable write is signed.
+Every publication has a stable delivery ID, one ciphertext, and an exact
+recipient set. Publication is atomic: the relay assigns one shared order to the
+delivery and inserts one queue reference for every recipient, or inserts
+nothing. It is idempotent while the delivery record or any queue reference
+remains, so retrying that delivery ID does not append another delivery.
 
-There are three topic types:
+After every reference is acknowledged or expires, the relay removes the
+ciphertext and forgets the delivery ID. A later retry may therefore be enqueued
+again. Recipient-side durable replay protection must make that redelivery
+harmless.
 
-- A `Write Topic` requires the designated key for writes.
-- A `Read Topic` allows writes by any correctly signing author, but reading or
-  listening requires proof by signature from the designated key.
-- A `Read and Write Topic` requires designated key authorization for both
-  writing and reading or listening.
+Every recipient of a multicast observes that same relay order. This common
+order is required so clients resolve concurrent MLS Commits consistently. For
+every ongoing MLS delivery, the exact recipient set contains every current
+epoch member, including the publisher, and is bound in a way recipients can
+verify.
 
-An inbox is an application of a `Read Topic`, not another topic type.
+Publishing a Commit, including receiving publish success, only stages it; it
+never advances or adopts the publisher's epoch. Every member, including the
+publisher, processes the relay echo through its own queue in shared order. The
+first valid current-epoch Commit in that order wins, and competing operations
+replan against the resulting epoch. Exact authentication, signatures, and wire
+encoding remain implementation details.
 
-Topics are named, but their identity and address include the exact topic type,
-the relevant authorization public key or keys, and the topic name. The same
-name under different keys or a different type is a different topic. Different
-names under the same type and authorization key or keys are also different
-topics. Each has its own ordered events and history.
+## Receiving and trimming
 
-One authorization key may deliberately scope and authorize several separately
-named topic streams. This key reuse is the intended namespace model. The relay
-can correlate topics in the same capability-key namespace, but it still cannot
-link that capability key to a Murmur identity.
+A recipient reads its queue in relay order. Downloading is not delivery. A
+successfully processed item atomically persists current MLS state, replay and
+queue progress, and any application-owned effect or history before
+acknowledgement. A malformed, unauthenticatable, undecryptable, unsupported,
+ignored, or otherwise terminal item is instead durably rejected or quarantined
+with replay and queue progress and no application effect before
+acknowledgement.
 
-These topic keys are relay capabilities, not Murmur identities, and the relay
-does not link them to Murmur identities. The exact request challenge, key
-derivation, signature exchange, and wire mechanics remain unspecified.
+Acknowledgement is signed by the recipient and advances monotonically and
+idempotently through a queue sequence. A crash before acknowledgement causes
+expected redelivery. An acknowledgement removes that recipient's queue
+reference; once all references are gone, the relay removes the ciphertext
+record.
 
-## Topic state and retention
+## Bounds
 
-Each topic has exactly one ordered event store. There are no snapshots and no
-separate lists.
-
-Each event may optionally specify an expiration. An event without an expiration
-is durable. Clients recover by reading the retained events in order.
-
-The client may supply an opaque `collapse key` on an event. When a new event is
-written, all older events in that same topic carrying the same collapse key are
-removed atomically. Recovery therefore sees only the newest event for that key.
-The relay does not interpret the collapse key or the event contents.
-
-For example, an edited message carries the complete replacement message with
-the same collapse key, so the earlier version does not need to remain.
-
-## The first version
-
-The first version has no external account or Murmur identity authorization. We
-assume people will generally behave honestly instead of designing the protocol
-around abuse from the start.
-
-If an open relay is abused, we can stop accepting writes to it while leaving
-the existing data readable, move clients to a newer authorized relay, or ban
-the abuse. That possibility is not a reason to link identities now.
-
-The relay is deliberately not a maximal-privacy or maximal-anonymity system.
-The goal is simpler: we do not want to surveil people or see their data because
-it is none of our business.
-
-## Later authorization
-
-An operator may later choose to require additional external authorization, such
-as GitHub. Topics on that relay could then be bound to the authorized external
-identity or account. We leave this out for now, but expect it may become useful
-if a fully anonymous relay is too open.
+Queues have a quota and a maximum delivery TTL. A full queue creates explicit
+backpressure, and expiration defines the maximum supported offline window.
+These bounds prevent an abandoned identity from consuming storage forever.
+They do not turn the relay into durable history or a recovery system.
 
 ## How we know it is done
 
-- Clients holding a topic's required read capability can retrieve its retained
-  ordered events, including after coming back later.
-- Every durable write is signed, and read and write capabilities are enforced
-  independently.
-- A `Write Topic`, `Read Topic`, and `Read and Write Topic` enforce their
-  designated capabilities independently.
-- A topic is identified by its exact type, relevant authorization public key or
-  keys, and name. One key may authorize several names, and every name has
-  a separate ordered event store.
-- An event is durable unless it specifies an expiration.
-- A new event with a collapse key atomically removes older events in the same
-  topic with that key.
-- An inbox uses a `Read Topic`: it accepts any correctly signed write but
-  exposes its contents only to the designated read capability.
-- The relay stores and serves topic state without understanding its contents or
-  linking Murmur identities.
-- The initial relay works without external account authorization.
-- No application behavior beyond this storage role is implemented in the
-  relay.
+- Each public identity has one authenticated ordered inbound queue.
+- A stable delivery ID and exact recipient set produce one all-or-nothing
+  multicast with a shared relay order.
+- A delivery ID is deduplicated while its record or any queue reference
+  remains; after the relay forgets it, durable recipient replay protection
+  handles a late retry.
+- All common recipients observe concurrent deliveries in the same order.
+- Every ongoing MLS delivery includes the publisher and every other current
+  epoch member. Publish success never adopts a Commit; relay echo order chooses
+  the first valid current-epoch Commit and competing operations replan.
+- Queue reads may redeliver until the recipient durably processes and
+  acknowledges them.
+- Terminally rejected or quarantined deliveries persist replay and queue
+  progress without an application effect, so they do not block the queue.
+- Acknowledgement is recipient-signed, monotonic, idempotent, and trims the
+  queue.
+- A delivery record disappears after every recipient reference is acknowledged
+  or expires.
+- Quota and TTL bound abandoned queues and expose backpressure and the maximum
+  offline window.
+- The relay has no retained event history, snapshots, lists, generic topics, or
+  anonymous addressing.

@@ -15,11 +15,11 @@ an asynchronous `main` function and invoke it immediately.
 ## Domain modules
 
 Code is organized into modules by domain. The boundary is practical rather than
-rigid: everything concerned with keys, ratchets, and encryption belongs in
-`crypto`; reaching a peer over a wire belongs in `transport`; the relay's own
-behavior belongs in `relay`; profiles and contacts belong in `identity`. The goal
-is that someone working on a domain knows which module to open and finds all of
-that domain's behavior there.
+rigid: everything concerned with keys and encryption belongs in `crypto`; MLS
+epochs and ratchets belong in `mls`; inbound queues and publication belong in
+`delivery`; the relay's own behavior belongs in `relay`; public identity and
+discovery belong in `identity`. The goal is that someone working on a domain
+knows which module to open and finds all of that domain's behavior there.
 
 Modules may call one another. Their dependencies should preferably form a rough
 tree, with higher-level modules calling lower-level ones, but this is not a folder
@@ -43,15 +43,15 @@ growing collection of cryptographic behavior belongs in a `crypto` module.
 A module will commonly have an `index.ts` and a `types.ts`. Its top level holds
 the important functions, classes, and entry points that it exports or that a
 reader needs in order to understand what the module does. This does not require
-inventing a facade: a `transport` or `relay` module may simply expose useful
+inventing a facade: a `delivery` or `relay` module may simply expose useful
 operations, while a `session` module may expose several classes and functions.
 
 Everything below that level belongs in an `impl` directory. `impl` holds
 secondary work and small mechanical helpers that are not important when first
 reading the program. It does not need an elaborate internal hierarchy or a strict
 file order, but its files must be named predictably. Prefer the entity first and
-the operation second, as in `topicCreateDescriptor.ts`, following the same naming
-style as persistence operations so related files sort together.
+the operation second, as in `deliveryValidateRecipients.ts`, following the same
+naming style as persistence operations so related files sort together.
 
 ## Tests
 
