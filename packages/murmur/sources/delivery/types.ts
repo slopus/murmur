@@ -64,6 +64,8 @@ export interface DeliveryTransport {
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<{ readonly removed: number }>;
+    /** Stream exact queued events in recipient inbox order when supported. */
+    stream?(request: SignedInboxRead, signal?: AbortSignal): AsyncIterable<InboxDelivery>;
 }
 
 /** Inputs for one exact sender-signed delivery. */
@@ -106,6 +108,11 @@ export interface InboxSyncOptions {
     readonly limit?: number;
     readonly waitMilliseconds?: number;
     readonly signal?: AbortSignal;
+}
+
+/** One recipient SSE session; a signal is required to define its lifetime. */
+export interface InboxStreamOptions {
+    readonly signal: AbortSignal;
 }
 
 /** Durable terminal-rejection summary. */

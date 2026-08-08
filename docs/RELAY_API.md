@@ -110,6 +110,26 @@ Event IDs increase lexicographically within this inbox. They are not a global
 group order. Reads exclude expired deliveries without requiring destructive
 cleanup in the read transaction.
 
+## `POST /v1/queue/events`
+
+Opens one recipient-authenticated SSE response using the same
+`SignedQueueReadJson` body with `waitMilliseconds: 0` and `limit: 1`. The
+response is `text/event-stream`; it emits exact queued deliveries:
+
+```text
+id: 019...
+event: delivery
+data: {"eventId":"019...","delivery":{...SignedDeliveryJson}}
+
+```
+
+Records are pull-driven and ordered by UUIDv7 within this inbox. `: keepalive`
+comments prevent idle intermediary timeouts and do not represent queue
+progress. The stream's in-memory cursor advances through emitted records, while
+the durable recipient cursor advances only through signed acknowledgement.
+Reconnect with a freshly signed request whose `after` is the durable cursor.
+Unacknowledged records may therefore be redelivered.
+
 ## `POST /v1/queue/ack`
 
 Trims one durably processed prefix:

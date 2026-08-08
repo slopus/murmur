@@ -13,7 +13,7 @@ application
     | replay records and exact outboxes
     | pending-session buffers
     |
-    | HTTPS: 32-byte invitation digests + signed opaque delivery
+    | HTTPS: invitation digests + signed delivery + ordered SSE
     v
 @slopus/murmur-relay
     | non-enumerable five-minute discovery cache
@@ -57,6 +57,12 @@ unacknowledged and unexpired. A signed monotonic acknowledgement removes one
 recipient's processed prefix. The last reference removal deletes the delivery.
 TTL, recipient, sender, and global quotas bound pending storage.
 
+Realtime receiving uses one recipient-signed SSE connection. The stream carries
+each exact queued delivery with its UUIDv7 ID, applies transport backpressure,
+and advances its in-memory emission cursor in inbox order. The durable client
+cursor remains authoritative: reconnect starts there, and acknowledgement still
+occurs only after local processing commits.
+
 The relay has no account registry, discovery directory or listing, application
 history, MLS state, or application-level acknowledgement protocol.
 
@@ -88,8 +94,9 @@ continue.
 Inbox processing follows one invariant:
 
 ```text
-read -> authenticate/decrypt -> persist effect or terminal rejection + cursor
-     -> commit -> acknowledge through cursor
+page or SSE event -> authenticate/decrypt
+                  -> persist effect or terminal rejection + cursor
+                  -> commit -> acknowledge through cursor
 ```
 
 A crash before the local commit leaves the relay item pending. A crash after

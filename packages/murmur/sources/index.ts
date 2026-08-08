@@ -67,6 +67,7 @@ export type {
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionProposal,
+    MurmurRealtimeOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
 } from "./sessions/index.js";

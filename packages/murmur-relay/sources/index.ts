@@ -26,6 +26,7 @@ export { InProcessWakeSource, PostgresWakeSource, RelayService } from "./relay/i
 export type {
     InvitationDownload,
     InvitationUploadOutcome,
+    QueueEventSubscription,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,

@@ -146,6 +146,57 @@ describe("identity queue HTTP API", () => {
         }
     });
 
+    test("streams exact queued deliveries as ordered SSE records", async () => {
+        const aliceSecret = secret(31);
+        const bobSecret = secret(32);
+        const bob = identity(bobSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const handler = createRelayFetchHandler(relay, {
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "sse-tests",
+        });
+        const controller = new AbortController();
+        try {
+            const response = await handler(
+                new Request("https://relay.example/v1/queue/events", {
+                    method: "POST",
+                    headers: {
+                        accept: "text/event-stream",
+                        "content-type": "application/json",
+                    },
+                    body: JSON.stringify(
+                        signedQueueReadToJson(signedRead(bobSecret, { now: NOW, limit: 1 })),
+                    ),
+                    signal: controller.signal,
+                }),
+            );
+            expect(response.status).toBe(200);
+            expect(response.headers.get("content-type")).toContain("text/event-stream");
+            const reader = response.body!.getReader();
+            expect(new TextDecoder().decode((await reader.read()).value)).toBe("retry: 1000\n\n");
+            const delivery = signedDelivery(aliceSecret, recipients(bob), {
+                id: 31,
+                now: NOW,
+            });
+            const published = await relay.publish(delivery, "sse-tests");
+            const encoded = new TextDecoder().decode((await reader.read()).value);
+            expect(encoded).toContain(`id: ${published.eventId}\nevent: delivery\ndata: `);
+            const data = encoded
+                .split("\n")
+                .find((line) => line.startsWith("data: "))
+                ?.slice("data: ".length);
+            expect(JSON.parse(data!)).toEqual({
+                eventId: published.eventId,
+                delivery: signedDeliveryToJson(delivery),
+            });
+            controller.abort();
+            await reader.cancel();
+        } finally {
+            controller.abort();
+            await relay.close();
+        }
+    });
+
     test("enforces exact CORS origins and bounded JSON", async () => {
         expect(parseRelayAllowedOrigins("https://app.example")).toEqual(["https://app.example"]);
         expect(() => parseRelayAllowedOrigins("https://app.example/")).toThrow("invalid origin");

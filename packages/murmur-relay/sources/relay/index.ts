@@ -12,6 +12,7 @@ import {
 import type {
     AcknowledgeOutcome,
     PublishOutcome,
+    QueuedDelivery,
     QueuePage,
     RelayStore,
 } from "../storage/index.js";
@@ -21,6 +22,7 @@ import { InProcessWakeSource } from "./impl/wakeInProcess.js";
 import type {
     InvitationDownload,
     InvitationUploadOutcome,
+    QueueEventSubscription,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,
@@ -31,6 +33,7 @@ export { PostgresWakeSource } from "./impl/wakePostgres.js";
 export type {
     InvitationDownload,
     InvitationUploadOutcome,
+    QueueEventSubscription,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,
@@ -43,10 +46,12 @@ const HARD_MAXIMUM_INVITATION_TTL_MILLISECONDS = 5 * 60 * 1_000;
 const HARD_MAXIMUM_INVITATION_BYTES = 64 * 1024;
 const HARD_MAXIMUM_RECIPIENTS = 1_024;
 const HARD_MAXIMUM_QUEUE_ITEMS = 25_000;
+const QUEUE_STREAM_HEARTBEAT_MILLISECONDS = 15_000;
 
 interface Waiter {
-    readonly resolve: () => void;
+    readonly resolve: (reason: "wake" | "timeout") => void;
     readonly reject: (error: Error) => void;
+    readonly counted: boolean;
 }
 
 function positiveInteger(value: number, name: string): number {
@@ -200,7 +205,10 @@ export class RelayService {
     readonly #options: ResolvedRelayOptions;
     readonly #wakeSubscription: Promise<void>;
     readonly #waiters = new Map<string, Set<Waiter>>();
+    readonly #streamCounts = new Map<string, number>();
+    readonly #streamClosers = new Set<() => void>();
     #waiterCount = 0;
+    #streamCount = 0;
     #closed = false;
 
     constructor(
@@ -356,21 +364,7 @@ export class RelayService {
         maximumEncodedBytes: number = Number.MAX_SAFE_INTEGER,
     ): Promise<QueuePage> {
         this.#assertOpen();
-        this.#validateRequestTime(request.createdAt);
-        if (!verifyQueueReadSignature(request)) {
-            throw new RelayError(401, "Invalid queue-read signature", {
-                error: "unauthorized",
-            });
-        }
-        if (
-            request.limit < 1 ||
-            request.limit > this.#options.maximumDeliveriesPerRead ||
-            request.waitMilliseconds > this.#options.maximumLongPollMilliseconds ||
-            !Number.isSafeInteger(maximumEncodedBytes) ||
-            maximumEncodedBytes < 1
-        ) {
-            throw new RelayError(400, "Invalid queue read", { error: "malformed" });
-        }
+        this.#validateQueueRead(request, maximumEncodedBytes, false);
         const constraints = { maximumEncodedBytes };
         const now = this.#now();
         let page = await this.#store.readQueue(
@@ -384,6 +378,11 @@ export class RelayService {
             return page;
         }
         const queueId = encodeBase64Url(request.recipient);
+        if (signal?.aborted === true) {
+            throw new RelayError(400, "Queue read aborted", {
+                error: "aborted",
+            });
+        }
         await this.#wakeSubscription.catch(() => {
             throw new RelayError(503, "Queue wake subscription is unavailable", {
                 error: "overloaded",
@@ -412,6 +411,70 @@ export class RelayService {
         } finally {
             wait.cancel();
         }
+    }
+
+    /**
+     * Authenticate and open one pull-driven SSE source for an identity queue.
+     *
+     * Each non-null item is an exact queued delivery in that inbox's UUIDv7
+     * order. Null items are transport heartbeats and carry no queue progress.
+     */
+    async openQueueEventStream(
+        request: SignedQueueRead,
+        signal?: AbortSignal,
+    ): Promise<QueueEventSubscription> {
+        this.#assertOpen();
+        this.#validateQueueRead(request, Number.MAX_SAFE_INTEGER, true);
+        await this.#wakeSubscription.catch(() => {
+            throw new RelayError(503, "Queue wake subscription is unavailable", {
+                error: "overloaded",
+            });
+        });
+        const queueId = encodeBase64Url(request.recipient);
+        if (this.#waiterCount + this.#streamCount >= this.#options.maximumConcurrentLongPolls) {
+            throw new RelayError(503, "Too many concurrent queue receivers", {
+                error: "overloaded",
+            });
+        }
+        if (
+            (this.#waiters.get(queueId)?.size ?? 0) + (this.#streamCounts.get(queueId) ?? 0) >=
+            this.#options.maximumConcurrentLongPollsPerIdentity
+        ) {
+            throw new RelayError(429, "Too many concurrent receivers for identity", {
+                error: "rate_limited",
+            });
+        }
+        const controller = new AbortController();
+        const forwardAbort = (): void => controller.abort(signal?.reason);
+        signal?.addEventListener("abort", forwardAbort, { once: true });
+        if (signal?.aborted === true) {
+            signal.removeEventListener("abort", forwardAbort);
+            throw new RelayError(400, "Queue event stream aborted", {
+                error: "aborted",
+            });
+        }
+        this.#streamCount += 1;
+        this.#streamCounts.set(queueId, (this.#streamCounts.get(queueId) ?? 0) + 1);
+        let closed = false;
+        const close = (): void => {
+            if (closed) return;
+            closed = true;
+            signal?.removeEventListener("abort", forwardAbort);
+            controller.abort(new Error("Queue event stream closed"));
+            this.#streamCount -= 1;
+            const remaining = (this.#streamCounts.get(queueId) ?? 1) - 1;
+            if (remaining === 0) {
+                this.#streamCounts.delete(queueId);
+            } else {
+                this.#streamCounts.set(queueId, remaining);
+            }
+            this.#streamClosers.delete(close);
+        };
+        this.#streamClosers.add(close);
+        return {
+            events: this.#queueEvents(request, queueId, controller.signal, close),
+            close,
+        };
     }
 
     /** Authenticate and trim one durably processed queue prefix. */
@@ -448,6 +511,7 @@ export class RelayService {
         }
         this.#waiters.clear();
         this.#waiterCount = 0;
+        for (const close of Array.from(this.#streamClosers)) close();
         await this.#wakeSource.close();
         await this.#store.close();
     }
@@ -462,6 +526,84 @@ export class RelayService {
             throw new RelayError(401, "Signed request violates relay time policy", {
                 error: "unauthorized",
             });
+        }
+    }
+
+    #validateQueueRead(
+        request: SignedQueueRead,
+        maximumEncodedBytes: number,
+        stream: boolean,
+    ): void {
+        this.#validateRequestTime(request.createdAt);
+        if (!verifyQueueReadSignature(request)) {
+            throw new RelayError(401, "Invalid queue-read signature", {
+                error: "unauthorized",
+            });
+        }
+        if (
+            request.limit < 1 ||
+            request.limit > this.#options.maximumDeliveriesPerRead ||
+            request.waitMilliseconds > this.#options.maximumLongPollMilliseconds ||
+            (stream && (request.waitMilliseconds !== 0 || request.limit !== 1)) ||
+            !Number.isSafeInteger(maximumEncodedBytes) ||
+            maximumEncodedBytes < 1
+        ) {
+            throw new RelayError(400, "Invalid queue read", { error: "malformed" });
+        }
+    }
+
+    async *#queueEvents(
+        request: SignedQueueRead,
+        queueId: string,
+        signal: AbortSignal,
+        close: () => void,
+    ): AsyncGenerator<QueuedDelivery | null> {
+        let after = request.after;
+        const constraints = { maximumEncodedBytes: Number.MAX_SAFE_INTEGER };
+        try {
+            while (!signal.aborted) {
+                let page = await this.#store.readQueue(
+                    request.recipient,
+                    after,
+                    request.limit,
+                    this.#now(),
+                    constraints,
+                );
+                if (page.deliveries.length > 0) {
+                    for (const queued of page.deliveries) {
+                        if (after !== null && queued.eventId <= after) {
+                            throw new Error("Queue store returned an out-of-order stream event");
+                        }
+                        after = queued.eventId;
+                        yield queued;
+                    }
+                    continue;
+                }
+                const wait = this.#registerWait(
+                    queueId,
+                    QUEUE_STREAM_HEARTBEAT_MILLISECONDS,
+                    signal,
+                    false,
+                );
+                try {
+                    page = await this.#store.readQueue(
+                        request.recipient,
+                        after,
+                        request.limit,
+                        this.#now(),
+                        constraints,
+                    );
+                    if (page.deliveries.length > 0) continue;
+                    const reason = await wait.promise;
+                    if (!signal.aborted && reason === "timeout") yield null;
+                } finally {
+                    wait.cancel();
+                }
+            }
+        } catch (error: unknown) {
+            if (!signal.aborted) throw error;
+        } finally {
+            close();
         }
     }
 
@@ -482,16 +624,25 @@ export class RelayService {
         queueId: string,
         milliseconds: number,
         signal?: AbortSignal,
-    ): { readonly promise: Promise<void>; readonly cancel: () => void } {
+        enforceLimits: boolean = true,
+    ): {
+        readonly promise: Promise<"wake" | "timeout">;
+        readonly cancel: () => void;
+    } {
         this.#assertOpen();
-        if (this.#waiterCount >= this.#options.maximumConcurrentLongPolls) {
+        if (
+            enforceLimits &&
+            this.#waiterCount + this.#streamCount >= this.#options.maximumConcurrentLongPolls
+        ) {
             throw new RelayError(503, "Too many concurrent long polls", {
                 error: "overloaded",
             });
         }
         if (
-            (this.#waiters.get(queueId)?.size ?? 0) >=
-            this.#options.maximumConcurrentLongPollsPerIdentity
+            enforceLimits &&
+            Array.from(this.#waiters.get(queueId) ?? []).filter(({ counted }) => counted).length >=
+                this.#options.maximumConcurrentLongPollsPerIdentity -
+                    (this.#streamCounts.get(queueId) ?? 0)
         ) {
             throw new RelayError(429, "Too many concurrent long polls for identity", {
                 error: "rate_limited",
@@ -509,13 +660,14 @@ export class RelayService {
             const waiters = this.#waiters.get(queueId);
             waiters?.delete(waiter);
             if (waiters?.size === 0) this.#waiters.delete(queueId);
-            this.#waiterCount -= 1;
+            if (waiter.counted) this.#waiterCount -= 1;
         };
-        const promise = new Promise<void>((resolve, reject) => {
+        const promise = new Promise<"wake" | "timeout">((resolve, reject) => {
             waiter = {
-                resolve: () => {
+                counted: enforceLimits,
+                resolve: (reason) => {
                     finish();
-                    resolve();
+                    resolve(reason);
                 },
                 reject: (error) => {
                     finish();
@@ -528,8 +680,8 @@ export class RelayService {
                 this.#waiters.set(queueId, waiters);
             }
             waiters.add(waiter);
-            this.#waiterCount += 1;
-            timer = setTimeout(waiter.resolve, milliseconds);
+            if (waiter.counted) this.#waiterCount += 1;
+            timer = setTimeout(() => waiter.resolve("timeout"), milliseconds);
             const abort = (): void =>
                 waiter.reject(
                     new RelayError(400, "Queue read aborted", {
@@ -546,13 +698,13 @@ export class RelayService {
             }
         });
         void promise.catch(() => undefined);
-        return { promise, cancel: () => waiter.resolve() };
+        return { promise, cancel: () => waiter.resolve("wake") };
     }
 
     #wake(queueId: string): void {
         const waiters = this.#waiters.get(queueId);
         if (waiters === undefined) return;
-        for (const waiter of Array.from(waiters)) waiter.resolve();
+        for (const waiter of Array.from(waiters)) waiter.resolve("wake");
     }
 
     #assertOpen(): void {

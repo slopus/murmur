@@ -3,7 +3,8 @@
 ```text
 invitation bytes -> digest/TTL policy -> bounded opaque cache
 queue protocol --> relay policy ------> atomic queue storage
-                          \-----------> Fetch and Node hosts
+                          \-----------> page JSON / ordered SSE
+                                        Fetch and Node hosts
 ```
 
 The relay stores one encrypted delivery record plus one queue reference per

@@ -2,7 +2,7 @@
 
 ```text
 crypto/              one-root Ed25519/X25519 identity primitives
-delivery/            signed queue wire format, HTTP transport, inbox processor
+delivery/            signed pages/SSE, HTTP transport, durable inbox processor
 identity/discovery/  signed KeyPackage bundles and digest-cache transport
 mls/                 browser-safe RFC 9420 profile
 sessions/            public stateful MLS coordinator
@@ -11,5 +11,5 @@ utils/               bounded serialization and byte utilities
 index.ts             root package exports
 ```
 
-The public façade is `MurmurClient` in `sessions/`. Delivery queues are
-transport buffers; durable protocol state always crosses `storage/`.
+The public façade is `MurmurClient` in `sessions/`. Delivery queues and ordered
+SSE are transport buffers; durable protocol state always crosses `storage/`.

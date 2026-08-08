@@ -1,12 +1,12 @@
 # HTTP
 
-Fetch-compatible invitation-cache, delivery, queue-read, and queue-ack
-endpoints with bounded bodies and explicit CORS policy. Queue authentication is
-inside each signed protocol body.
+Fetch-compatible invitation-cache, delivery, queue-read, ordered SSE, and
+queue-ack endpoints with bounded bodies and explicit CORS policy. Queue
+authentication is inside each signed protocol body.
 
 ```text
 invitation bytes -> SHA-256 address -> five-minute opaque cache
-queue JSON ------> exact codec -----> relay service -> bounded JSON
+queue JSON ------> exact codec -----> relay service -> bounded JSON / SSE
 remote address -----------------------> fixed-window admission bound
 ```
 
@@ -36,3 +36,8 @@ previously accepted delivery is larger than the current response budget, the
 relay returns `413 delivery_too_large` with its `eventId` and inbox progress so
 the client can durably quarantine that terminal item and advance without
 head-of-line blocking.
+
+`POST /v1/queue/events` requires a signed zero-wait queue read and returns one
+pull-driven `delivery` SSE record per exact queue event. Comment heartbeats do
+not advance progress. Disconnect and response cancellation close the relay
+subscription.

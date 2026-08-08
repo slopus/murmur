@@ -166,6 +166,7 @@ import {
     type DiscoveryTransport,
     type IdentityKeyPair,
     type MurmurClientOptions,
+    type MurmurRealtimeOptions,
     type MurmurSessionPage,
     type MurmurStore,
 } from "@slopus/murmur";
@@ -185,11 +186,15 @@ const options: MurmurClientOptions = {
     identity,
 };
 const opening: Promise<MurmurClient> = MurmurClient.open(options);
+const realtime: MurmurRealtimeOptions = {
+    signal: new AbortController().signal,
+};
 const page: MurmurSessionPage | undefined = undefined;
 const discovery: DiscoveryBundle | undefined = undefined;
 void transport;
 void discoveryTransport;
 void opening;
+void realtime;
 void page;
 void discovery;
 destroyIdentity(identity);

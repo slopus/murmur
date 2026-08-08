@@ -55,13 +55,19 @@ and wire encoding remain implementation details.
 
 ## Receiving and trimming
 
-A recipient reads its queue in relay order. Downloading is not delivery. A
-successfully processed item atomically persists current MLS state, replay and
-queue progress, and any application-owned effect or history before
-acknowledgement. A malformed, unauthenticatable, undecryptable, unsupported,
-ignored, or otherwise terminal item is instead durably rejected or quarantined
-with replay and queue progress and no application effect before
-acknowledgement.
+A recipient reads its queue in relay order either through a bounded page or one
+recipient-signed SSE connection. SSE carries each exact queued encrypted
+delivery with its UUIDv7 event ID in that inbox's order; it is not merely a wake
+signal. The stream cursor advances only through emitted events. Reconnecting
+starts from the recipient's durable cursor, so an unacknowledged event may be
+redelivered but is not skipped.
+
+Downloading or streaming is not delivery. A successfully processed item
+atomically persists current MLS state, replay and queue progress, and any
+application-owned effect or history before acknowledgement. A malformed,
+unauthenticatable, undecryptable, unsupported, ignored, or otherwise terminal
+item is instead durably rejected or quarantined with replay and queue progress
+and no application effect before acknowledgement.
 
 Acknowledgement is signed by the recipient and advances monotonically and
 idempotently through an inbox UUIDv7 cursor. A crash before acknowledgement
@@ -93,6 +99,9 @@ identity directory, or a recovery system.
   serializes them before publication.
 - Queue reads may redeliver until the recipient durably processes and
   acknowledges them.
+- Recipient-authenticated SSE streams the exact queued deliveries in one
+  inbox's UUIDv7 order, applies backpressure, and reconnects from durable queue
+  progress without changing acknowledgement semantics.
 - Terminally rejected or quarantined deliveries persist replay and queue
   progress without an application effect, so they do not block the queue.
 - Acknowledgement is recipient-signed, monotonic, idempotent, and trims the

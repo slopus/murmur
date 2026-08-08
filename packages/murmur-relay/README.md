@@ -12,6 +12,8 @@ TTL, and queue progress. It never sees MLS or application plaintext.
 - One queue reference per exact recipient.
 - Sender-scoped delivery IDs deduplicate while any reference remains.
 - Signed reads prove ownership of the recipient identity.
+- Recipient-authenticated SSE emits each exact queued delivery in inbox UUIDv7
+  order with pull-driven backpressure.
 - Signed monotonic acknowledgements trim one processed queue prefix.
 - A delivery disappears after every reference is acknowledged or it expires.
 - Per-recipient, per-sender, and relay-wide item/byte/reference quotas make
@@ -83,4 +85,5 @@ ticks rather than building an unbounded maintenance queue.
 | `GET`  | `/v1/invitations/:digest` | Fetch unexpired bytes by SHA-256          |
 | `POST` | `/v1/deliveries`          | Publish one atomic encrypted multicast    |
 | `POST` | `/v1/queue/read`          | Authenticated queue read or long poll     |
+| `POST` | `/v1/queue/events`        | Ordered recipient-authenticated SSE       |
 | `POST` | `/v1/queue/ack`           | Authenticated monotonic queue-prefix trim |

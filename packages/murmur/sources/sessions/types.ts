@@ -72,6 +72,16 @@ export interface MurmurSynchronizeOptions {
     readonly signal?: AbortSignal;
 }
 
+/** Persistent SSE synchronization policy. */
+export interface MurmurRealtimeOptions {
+    /** Required cancellation boundary for the persistent connection. */
+    readonly signal: AbortSignal;
+    /** Delay before reconnecting a closed or transiently failed stream. */
+    readonly reconnectDelayMilliseconds?: number;
+    /** Called after each streamed delivery is durable and acknowledged. */
+    readonly onSynchronize?: (result: MurmurSynchronizeResult) => void | Promise<void>;
+}
+
 /** One durable session or publication diagnostic retained by Murmur. */
 export interface MurmurSessionIssue {
     readonly id: string;

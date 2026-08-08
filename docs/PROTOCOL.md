@@ -44,6 +44,26 @@ traffic continues while pending. Application events are buffered but not
 exposed until `activateSession` applies them through an application transaction.
 `ignoreSession` destroys pending secrets and buffers.
 
+## Realtime queue stream
+
+`POST /v1/queue/events` authenticates with the same domain-separated signed
+queue-read object as a bounded read, with `waitMilliseconds: 0`. A successful
+response requires `limit: 1` for one-event storage backpressure and is
+`text/event-stream`. Each delivery record is:
+
+```text
+id: <lowercase UUIDv7>
+event: delivery
+data: {"eventId":"<same UUIDv7>","delivery":<SignedDeliveryJson>}
+
+```
+
+The relay emits records in that recipient inbox's UUIDv7 order and sends
+comment heartbeats without advancing progress. It may buffer, disconnect,
+repeat, delay, or omit events; SSE receipt is never acknowledgement. Murmur
+processes one record through the ordinary durable queue transaction, sends a
+signed acknowledgement, and reconnects from its durable cursor.
+
 ## MLS sessions
 
 Two-member and many-member sessions use the same RFC 9420 profile:

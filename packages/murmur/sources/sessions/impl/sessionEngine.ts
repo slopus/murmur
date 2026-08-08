@@ -7,6 +7,8 @@ import {
     createSignedDelivery,
     type DeliveryTransport,
     type InboxDelivery,
+    type InboxStreamOptions,
+    type InboxSyncResult,
 } from "../../delivery/index.js";
 import { openBox, sealBox, type IdentityKeyPair } from "../../crypto/index.js";
 import type { DiscoveryBundle } from "../../identity/discovery/index.js";
@@ -969,20 +971,43 @@ export class SessionEngine {
         const before = await this.#flushOutboxes(options.signal);
         const inbox = await this.#inbox.synchronize(options);
         const after = await this.#flushOutboxes(options.signal);
+        return this.#synchronizationResult(inbox, [before, after]);
+    }
+
+    streamInbox(options: InboxStreamOptions): AsyncIterable<InboxSyncResult> {
+        return this.#inbox.stream(options);
+    }
+
+    async flush(signal?: AbortSignal): Promise<boolean> {
+        await this.#store.transaction((transaction) =>
+            this.#pruneKeyPackages(transaction, this.#now()),
+        );
+        return (await this.#flushOutboxes(signal)).transientFailureIds.size > 0;
+    }
+
+    async completeStreamEvent(
+        inbox: InboxSyncResult,
+        signal?: AbortSignal,
+    ): Promise<MurmurSynchronizeResult> {
+        return this.#synchronizationResult(inbox, [await this.#flushOutboxes(signal)]);
+    }
+
+    async #synchronizationResult(
+        inbox: InboxSyncResult,
+        publications: readonly FlushOutboxResult[],
+    ): Promise<MurmurSynchronizeResult> {
         const pendingOutboxes = (
             await this.#store.scan(OUTBOX_PREFIX, {
                 limit: this.#limits.maximumOutboxes,
             })
         ).size;
-        const publishedIds = new Set([...before.publishedIds, ...after.publishedIds]);
-        const transientFailureIds = new Set([
-            ...before.transientFailureIds,
-            ...after.transientFailureIds,
-        ]);
-        const terminalFailureIds = new Set([
-            ...before.terminalFailureIds,
-            ...after.terminalFailureIds,
-        ]);
+        const publishedIds = new Set(publications.flatMap(({ publishedIds }) => [...publishedIds]));
+        const transientFailureIds = new Set(
+            publications.flatMap(({ transientFailureIds }) => [...transientFailureIds]),
+        );
+        const terminalFailureIds = new Set(
+            publications.flatMap(({ terminalFailureIds }) => [...terminalFailureIds]),
+        );
         return {
             inbox,
             published: publishedIds.size,

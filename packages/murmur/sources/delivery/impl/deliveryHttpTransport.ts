@@ -3,6 +3,7 @@ import type {
     DeliveryFetch,
     DeliveryPublishOutcome,
     DeliveryTransport,
+    InboxDelivery,
     InboxPage,
     SignedDelivery,
     SignedInboxAck,
@@ -14,6 +15,7 @@ import {
     signedInboxAckToJson,
     signedInboxReadToJson,
 } from "./deliveryCodec.js";
+import { decodeDeliveryEventStream } from "./deliverySse.js";
 
 const DEFAULT_MAXIMUM_RESPONSE_BYTES = 16 * 1024 * 1024;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
@@ -75,6 +77,7 @@ export interface HttpDeliveryTransportOptions {
     readonly fetch?: DeliveryFetch;
     readonly maximumResponseBytes?: number;
     readonly requestTimeoutMilliseconds?: number;
+    readonly streamHeartbeatTimeoutMilliseconds?: number;
 }
 
 function object(value: unknown): Record<string, unknown> {
@@ -144,6 +147,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
     readonly #fetch: DeliveryFetch;
     readonly #maximumResponseBytes: number;
     readonly #requestTimeoutMilliseconds: number;
+    readonly #streamHeartbeatTimeoutMilliseconds: number;
 
     constructor(baseUrl: string | URL, options: HttpDeliveryTransportOptions = {}) {
         this.#baseUrl = new URL(baseUrl);
@@ -153,6 +157,8 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
         this.#maximumResponseBytes = options.maximumResponseBytes ?? DEFAULT_MAXIMUM_RESPONSE_BYTES;
         this.#requestTimeoutMilliseconds = options.requestTimeoutMilliseconds ?? 45_000;
+        this.#streamHeartbeatTimeoutMilliseconds =
+            options.streamHeartbeatTimeoutMilliseconds ?? 45_000;
         if (!Number.isSafeInteger(this.#maximumResponseBytes) || this.#maximumResponseBytes < 1) {
             throw new Error("Maximum relay response bytes must be a positive safe integer");
         }
@@ -162,6 +168,13 @@ export class HttpDeliveryTransport implements DeliveryTransport {
             this.#requestTimeoutMilliseconds > 5 * 60 * 1_000
         ) {
             throw new Error("Relay request timeout must be between 1ms and 5 minutes");
+        }
+        if (
+            !Number.isSafeInteger(this.#streamHeartbeatTimeoutMilliseconds) ||
+            this.#streamHeartbeatTimeoutMilliseconds < 1_000 ||
+            this.#streamHeartbeatTimeoutMilliseconds > 5 * 60 * 1_000
+        ) {
+            throw new Error("Stream heartbeat timeout must be between 1 second and 5 minutes");
         }
     }
 
@@ -206,6 +219,65 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         return { removed: value.removed };
     }
 
+    /** Stream exact queued deliveries over one recipient-authenticated SSE response. */
+    async *stream(request: SignedInboxRead, signal?: AbortSignal): AsyncGenerator<InboxDelivery> {
+        if (request.waitMilliseconds !== 0) {
+            throw new Error("Delivery event streams require a zero wait duration");
+        }
+        const controller = new AbortController();
+        const forwardAbort = (): void => controller.abort(signal?.reason);
+        if (signal?.aborted === true) {
+            forwardAbort();
+        } else {
+            signal?.addEventListener("abort", forwardAbort, { once: true });
+        }
+        const timeout = setTimeout(() => {
+            controller.abort(new Error("Delivery event stream connection timed out"));
+        }, this.#requestTimeoutMilliseconds);
+        try {
+            const response = await this.#fetch(new URL("/v1/queue/events", this.#baseUrl), {
+                method: "POST",
+                headers: {
+                    accept: "text/event-stream",
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify(signedInboxReadToJson(request)),
+                signal: controller.signal,
+            });
+            if (!response.ok) {
+                const value = await boundedResponseJson(response, this.#maximumResponseBytes);
+                this.#throwFailure(response, value);
+            }
+            if (!response.headers.get("content-type")?.startsWith("text/event-stream")) {
+                throw new Error("Relay returned an invalid delivery event stream");
+            }
+            clearTimeout(timeout);
+            yield* decodeDeliveryEventStream(
+                response,
+                controller,
+                this.#maximumResponseBytes,
+                this.#streamHeartbeatTimeoutMilliseconds,
+            );
+        } catch (error: unknown) {
+            if (signal?.aborted === true) return;
+            if (error instanceof DeliveryTransportError) throw error;
+            if (
+                controller.signal.aborted ||
+                error instanceof TypeError ||
+                (error instanceof Error &&
+                    (error.message === "Delivery event stream heartbeat timed out" ||
+                        error.message === "Delivery event stream connection timed out"))
+            ) {
+                throw new DeliveryTransportError(0, "stream_disconnected");
+            }
+            throw error;
+        } finally {
+            clearTimeout(timeout);
+            signal?.removeEventListener("abort", forwardAbort);
+            controller.abort(new Error("Delivery event stream closed"));
+        }
+    }
+
     async #post(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
         const controller = new AbortController();
         const forwardAbort = (): void => controller.abort(signal?.reason);
@@ -232,6 +304,10 @@ export class HttpDeliveryTransport implements DeliveryTransport {
             signal?.removeEventListener("abort", forwardAbort);
         }
         if (response.ok) return value;
+        this.#throwFailure(response, value);
+    }
+
+    #throwFailure(response: Response, value: unknown): never {
         const failure = object(value);
         if (
             response.status === 413 &&

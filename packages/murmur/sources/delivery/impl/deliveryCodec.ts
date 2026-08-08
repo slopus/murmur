@@ -15,6 +15,7 @@ import {
 import type {
     CreateDeliveryOptions,
     CreateInboxReadOptions,
+    InboxDelivery,
     SignedDelivery,
     SignedInboxAck,
     SignedInboxRead,
@@ -358,20 +359,23 @@ export function parseInboxPage(
         throw new Error("Invalid inbox page");
     }
     return {
-        deliveries: input.deliveries.map((entry) => {
-            const queued = object(entry, "queued delivery");
-            exact(queued, ["eventId", "delivery"], "queued delivery");
-            return {
-                eventId: validateUuid(queued.eventId, "relay event ID"),
-                delivery: parseSignedDeliveryValue(queued.delivery, false),
-            };
-        }),
+        deliveries: input.deliveries.map(parseInboxDelivery),
         head: input.head === null ? null : validateUuid(input.head, "inbox head"),
         acknowledgedThrough:
             input.acknowledgedThrough === null
                 ? null
                 : validateUuid(input.acknowledgedThrough, "acknowledged event ID"),
         exhausted: input.exhausted,
+    };
+}
+
+/** Strictly decode one queued delivery from a relay page or SSE event. */
+export function parseInboxDelivery(value: unknown): InboxDelivery {
+    const queued = object(value, "queued delivery");
+    exact(queued, ["eventId", "delivery"], "queued delivery");
+    return {
+        eventId: validateUuid(queued.eventId, "relay event ID"),
+        delivery: parseSignedDeliveryValue(queued.delivery, false),
     };
 }
 

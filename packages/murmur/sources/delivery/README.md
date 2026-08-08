@@ -3,11 +3,17 @@
 Browser-safe relay transport and the durable identity-inbox processor.
 
 ```text
-signed read -> queued ciphertext -> store transaction -> signed acknowledgement
-                                   | effect/rejection |
-                                   | cursor advance   |
-                                   +------------------+
+signed page read --\
+                    +-> queued ciphertext -> store transaction -> signed ack
+signed SSE stream -/                         | effect/rejection |
+                                              | cursor advance   |
+                                              +------------------+
 ```
+
+The SSE path carries the exact queued delivery and UUIDv7 event ID, applies
+stream backpressure, and processes one record at a time. It is not a wake-only
+channel. Reconnect uses a freshly signed request after the durable local cursor,
+so anything committed but not acknowledged may be replayed safely.
 
 The processor never acknowledges before the effect or terminal rejection and
 cursor commit atomically. A crash after the local commit causes a harmless

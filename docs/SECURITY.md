@@ -9,7 +9,8 @@ The relay sees:
 - sender and recipient public identities;
 - exact multicast fanout;
 - delivery sizes, timing, TTL, and per-inbox progress;
-- IP or trusted-ingress admission metadata.
+- IP or trusted-ingress admission metadata;
+- the lifetime and timing of recipient SSE connections;
 - public signed discovery-bundle bytes uploaded to its five-minute cache.
 
 The relay does not receive identity roots, KeyPackage private keys, Welcome
@@ -31,6 +32,11 @@ UUIDv7 order is a relay consistency service, not a cryptographic proof. The MLS
 committer rule removes dependence on a shared cross-inbox order. Clients still
 validate exact recipients, epoch, sender, committer control, KeyPackage
 lifetime, and every cryptographic transition.
+
+SSE transports the same untrusted signed deliveries as bounded queue reads. A
+stream is authenticated once when opened and must use TLS. It can replay,
+truncate, delay, or reorder records; the client validates strict inbox order and
+reconnects from durable progress. SSE receipt never authorizes deletion.
 
 ## Durable client invariants
 

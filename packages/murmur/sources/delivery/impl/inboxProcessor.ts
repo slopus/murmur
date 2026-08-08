@@ -14,6 +14,7 @@ import type {
     InboxProcessorDependencies,
     InboxProcessorOptions,
     InboxRejection,
+    InboxStreamOptions,
     InboxSyncOptions,
     InboxSyncResult,
 } from "../types.js";
@@ -153,6 +154,7 @@ export class InboxProcessor {
     readonly #now: () => number;
     readonly #allowMurmurMutations: boolean;
     #tail: Promise<void> = Promise.resolve();
+    #streamActive = false;
 
     constructor(
         dependencies: InboxProcessorDependencies,
@@ -212,7 +214,69 @@ export class InboxProcessor {
      * Concurrent calls on one processor instance are serialized.
      */
     async synchronize(options: InboxSyncOptions = {}): Promise<InboxSyncResult> {
+        if (this.#streamActive) {
+            throw new Error("Cannot page an inbox while its event stream is active");
+        }
         return this.#exclusive(async () => this.#synchronize(options));
+    }
+
+    /** Process and acknowledge exact queued events from one authenticated SSE stream. */
+    async *stream(options: InboxStreamOptions): AsyncGenerator<InboxSyncResult> {
+        if (this.#streamActive) {
+            throw new Error("Inbox event stream is already active");
+        }
+        const openStream = this.#dependencies.transport.stream;
+        if (openStream === undefined) {
+            throw new Error("Delivery transport does not support event streaming");
+        }
+        this.#streamActive = true;
+        try {
+            let cursor = await this.cursor();
+            if (cursor !== null) {
+                await this.#pruneReplay(relayEventTime(cursor));
+                try {
+                    await this.#acknowledge(cursor, options.signal);
+                } catch (error: unknown) {
+                    if (error instanceof DeliveryCursorTrimmedError) {
+                        throw new InboxStateRollbackError(cursor, error.acknowledgedThrough);
+                    }
+                    throw error;
+                }
+            }
+            const request = createSignedInboxRead(this.#dependencies.identity, {
+                after: cursor,
+                limit: 1,
+                waitMilliseconds: 0,
+                createdAt: this.#requestTime(),
+            });
+            for await (const queued of openStream.call(
+                this.#dependencies.transport,
+                request,
+                options.signal,
+            )) {
+                const result = await this.#exclusive(async () => {
+                    cursor = await this.cursor();
+                    if (cursor !== null && queued.eventId <= cursor) {
+                        throw new Error("Relay returned an out-of-order inbox stream");
+                    }
+                    const processingNow = relayEventTime(queued.eventId);
+                    this.#validateRelayEventTime(queued.eventId, this.#requestTime());
+                    const outcome = await this.#process(queued, cursor, processingNow);
+                    cursor = queued.eventId;
+                    await this.#pruneReplay(processingNow);
+                    await this.#acknowledge(cursor, options.signal);
+                    return {
+                        processed: outcome === "processed" ? 1 : 0,
+                        rejected: outcome === "rejected" ? 1 : 0,
+                        cursor,
+                        exhausted: false,
+                    } satisfies InboxSyncResult;
+                });
+                yield result;
+            }
+        } finally {
+            this.#streamActive = false;
+        }
     }
 
     async #synchronize(options: InboxSyncOptions): Promise<InboxSyncResult> {

@@ -26,9 +26,10 @@ MURMUR_RELAY_ORIGINS=https://app.example \
 pnpm --filter @slopus/murmur-relay start
 ```
 
-Postgres supports multiple relay processes. LISTEN/NOTIFY reduces long-poll
-latency; durable reads always come from tables, so notifications are not data.
-Write paths serialize through the global quota/UUID row.
+Postgres supports multiple relay processes. LISTEN/NOTIFY wakes long polls and
+SSE streams across processes; durable reads always come from tables, so
+notifications are not data. Write paths serialize through the global
+quota/UUID row.
 
 ## Network boundary
 
@@ -45,6 +46,11 @@ MURMUR_RELAY_TRACKED_ADDRESSES=10000
 ```
 
 Never trust a forwarding header that clients can supply unchanged.
+
+The reverse proxy must support long-lived unbuffered SSE responses on
+`POST /v1/queue/events`. Disable response buffering and compression for
+`text/event-stream`, allow at least 45 seconds of idle time, and preserve
+disconnect propagation. The relay emits a heartbeat every 15 seconds.
 
 ## Invitation cache
 

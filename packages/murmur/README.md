@@ -135,6 +135,49 @@ Received sessions remain `pending` until the application calls
 MLS protocol state and buffer opaque application events within configured
 bounds without exposing them to the application.
 
+## Realtime SSE synchronization
+
+`realtime()` maintains one recipient-authenticated SSE connection and streams
+the actual queued encrypted deliveries—not wake notifications. Each SSE record
+contains the relay UUIDv7 event ID and exact sender-signed delivery. Events are
+processed one at a time in inbox order, committed locally, and only then
+acknowledged.
+
+```ts
+const aliceRealtime = new AbortController();
+const bobRealtime = new AbortController();
+let markDelivered!: () => void;
+const delivered = new Promise<void>((resolve) => {
+    markDelivered = resolve;
+});
+
+const aliceRunning = alice.realtime({ signal: aliceRealtime.signal });
+const bobRunning = bob.realtime({
+    signal: bobRealtime.signal,
+    onSynchronize: async () => {
+        await bob.drain(session.id, async (transaction, event) => {
+            await transaction.set("application/latest-message", event.bytes);
+        });
+        markDelivered();
+    },
+});
+
+// Durable local outboxes wake the realtime worker and publish automatically.
+await alice.send(session.id, new TextEncoder().encode("realtime hello"));
+await delivered;
+
+// Stop during application shutdown.
+aliceRealtime.abort();
+bobRealtime.abort();
+await Promise.all([aliceRunning, bobRunning]);
+```
+
+Ordering is guaranteed only within one identity inbox. If the connection drops,
+Murmur reconnects from its durable cursor. An event committed locally but not
+yet acknowledged may be streamed again; replay protection prevents duplicate
+application effects. `synchronize()` remains available for bounded foreground
+cycles and environments that do not support streaming.
+
 `MemoryMurmurStore` is for tests and examples. Production applications must
 provide a durable transactional `MurmurStore`.
 

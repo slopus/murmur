@@ -1,3 +1,5 @@
+import type { QueuedDelivery } from "../storage/index.js";
+
 /** Relay limits with conservative defaults. */
 export interface RelayOptions {
     readonly maximumInvitationBytes?: number;
@@ -65,6 +67,12 @@ export interface InvitationUploadOutcome {
 export interface InvitationDownload {
     readonly bundle: Uint8Array;
     readonly expiresAt: number;
+}
+
+/** One pull-driven recipient SSE subscription; `null` represents a heartbeat. */
+export interface QueueEventSubscription {
+    readonly events: AsyncIterable<QueuedDelivery | null>;
+    close(): void;
 }
 
 /** Cross-process signal used only to reduce queue long-poll latency. */

@@ -5,7 +5,7 @@ import {
     parseSignedQueueRead,
     signedDeliveryToJson,
 } from "../protocol/index.js";
-import type { RelayService } from "../relay/index.js";
+import type { QueueEventSubscription, RelayService } from "../relay/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 
 /** Metadata supplied by a concrete HTTP host. */
@@ -92,6 +92,66 @@ function boundedJson(
         headers: {
             "content-type": "application/json; charset=utf-8",
             "cache-control": "no-store",
+            ...headers,
+        },
+    });
+}
+
+function queueEventResponse(
+    subscription: QueueEventSubscription,
+    signal: AbortSignal,
+    headers: Readonly<Record<string, string>>,
+): Response {
+    const iterator = subscription.events[Symbol.asyncIterator]();
+    let initialized = false;
+    const body = new ReadableStream<Uint8Array>({
+        async pull(controller) {
+            if (!initialized) {
+                initialized = true;
+                controller.enqueue(textEncoder.encode("retry: 1000\n\n"));
+                return;
+            }
+            try {
+                const next = await iterator.next();
+                if (next.done) {
+                    subscription.close();
+                    controller.close();
+                    return;
+                }
+                if (next.value === null) {
+                    controller.enqueue(textEncoder.encode(": keepalive\n\n"));
+                    return;
+                }
+                const data = JSON.stringify({
+                    eventId: next.value.eventId,
+                    delivery: signedDeliveryToJson(next.value.delivery),
+                });
+                controller.enqueue(
+                    textEncoder.encode(
+                        `id: ${next.value.eventId}\nevent: delivery\ndata: ${data}\n\n`,
+                    ),
+                );
+            } catch (error: unknown) {
+                subscription.close();
+                if (signal.aborted) {
+                    controller.close();
+                } else {
+                    controller.error(error);
+                }
+            }
+        },
+        async cancel() {
+            subscription.close();
+            await iterator.return?.();
+        },
+    });
+    return new Response(body, {
+        status: 200,
+        headers: {
+            "content-type": "text/event-stream; charset=utf-8",
+            "cache-control": "no-store",
+            connection: "keep-alive",
+            "x-accel-buffering": "no",
             ...headers,
         },
     });
@@ -355,6 +415,13 @@ export function createRelayFetchHandler(
                         acknowledgedThrough: page.acknowledgedThrough,
                     },
                 );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/queue/events") {
+                const read = parseSignedQueueRead(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const subscription = await relay.openQueueEventStream(read, request.signal);
+                return queueEventResponse(subscription, request.signal, corsHeaders);
             }
             if (request.method === "POST" && url.pathname === "/v1/queue/ack") {
                 const acknowledgement = parseSignedQueueAck(

@@ -130,10 +130,12 @@ resolve identities and is not a directory.
 The relay stores unacknowledged and unexpired encrypted deliveries plus
 five-minute public invitation bundles addressed only by SHA-256. One atomic
 multicast receives one UUIDv7 event ID and one reference in every exact
-recipient inbox. Event IDs are ordered only within an inbox. Recipient,
-sender-fanout, invitation-cache, and global quotas bound storage; production
-ingress must also apply non-Sybil admission because public identities are free
-to create.
+recipient inbox. Recipient-authenticated SSE carries each exact queued delivery
+in that inbox's UUIDv7 order; it is not a wake-only channel, and durable signed
+acknowledgement remains separate. Event IDs are ordered only within an inbox.
+Recipient, sender-fanout, invitation-cache, and global quotas bound storage;
+production ingress must also apply non-Sybil admission because public
+identities are free to create.
 
 ### MLS sessions
 

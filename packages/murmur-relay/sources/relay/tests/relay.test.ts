@@ -164,6 +164,61 @@ describe("identity queue relay", () => {
         }
     });
 
+    test("streams exact queued deliveries in recipient UUIDv7 order", async () => {
+        const aliceSecret = secret(51);
+        const bobSecret = secret(52);
+        const bob = identity(bobSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const controller = new AbortController();
+        try {
+            await expect(
+                relay.openQueueEventStream(
+                    signedRead(bobSecret, { now: NOW, limit: 1, waitMilliseconds: 1 }),
+                ),
+            ).rejects.toMatchObject({ status: 400 });
+            const subscription = await relay.openQueueEventStream(
+                signedRead(bobSecret, { now: NOW, limit: 1 }),
+                controller.signal,
+            );
+            await expect(
+                relay.openQueueEventStream(signedRead(bobSecret, { now: NOW, limit: 1 })),
+            ).rejects.toMatchObject({ status: 429 });
+            const iterator = subscription.events[Symbol.asyncIterator]();
+            const waiting = iterator.next();
+            await Promise.resolve();
+            const firstDelivery = signedDelivery(aliceSecret, recipients(bob), {
+                id: 51,
+                now: NOW,
+            });
+            const secondDelivery = signedDelivery(aliceSecret, recipients(bob), {
+                id: 52,
+                now: NOW,
+            });
+            const firstPublished = await relay.publish(firstDelivery, "relay-tests");
+            const secondPublished = await relay.publish(secondDelivery, "relay-tests");
+            expect(await waiting).toEqual({
+                done: false,
+                value: {
+                    eventId: firstPublished.eventId,
+                    delivery: firstDelivery,
+                },
+            });
+            expect(await iterator.next()).toEqual({
+                done: false,
+                value: {
+                    eventId: secondPublished.eventId,
+                    delivery: secondDelivery,
+                },
+            });
+            expect(secondPublished.eventId > firstPublished.eventId).toBe(true);
+            subscription.close();
+            await expect(iterator.next()).resolves.toMatchObject({ done: true });
+        } finally {
+            controller.abort();
+            await relay.close();
+        }
+    });
+
     test("expired queue data disappears and acknowledgement becomes a no-op", async () => {
         let now = NOW;
         const aliceSecret = secret(7);

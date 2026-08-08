@@ -32,7 +32,10 @@ accepted tradeoff. Murmur promises encrypted contents, not anonymous routing.
 The application supplies transactional persistence and owns application
 history and effects. Murmur owns identity secrets, current MLS epoch and
 ratchet checkpoints, KeyPackages, Welcomes, outboxes, replay and queue progress,
-pending-session buffers, session lifecycle, and synchronization.
+pending-session buffers, session lifecycle, and synchronization. For realtime
+receiving, the relay streams the exact queued encrypted deliveries over one
+recipient-authenticated SSE connection in inbox UUIDv7 order. The application
+still acknowledges only after Murmur has durably processed each event.
 
 A relay item is acknowledged only after its queue-processing outcome is
 durable. Successful processing atomically persists Murmur state, replay and
@@ -92,5 +95,8 @@ being added again.
 - Queue processing survives redelivery and acknowledges only after durably
   recording queue progress and its successful state and effects, pending
   bootstrap, or terminal rejection.
+- Realtime delivery streams exact queued events over authenticated SSE in one
+  inbox's UUIDv7 order, reconnects from the durable cursor, and may redeliver
+  but cannot replace durable acknowledgement.
 - No friend state machine, friend channel, generic topic API, CLI, or
   chat-specific protocol remains.

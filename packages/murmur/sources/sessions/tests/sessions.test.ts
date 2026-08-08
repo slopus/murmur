@@ -70,6 +70,110 @@ describe("stateful MLS sessions", () => {
         }
     });
 
+    test("streams realtime events in order and publishes local outboxes without polling", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bob = await client(relay);
+        const aliceController = new AbortController();
+        const bobController = new AbortController();
+        const resumedController = new AbortController();
+        let aliceRealtime: Promise<void> | undefined;
+        let bobRealtime: Promise<void> | undefined;
+        let resumed: Promise<void> | undefined;
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("realtime SSE"),
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize();
+            await bob.synchronize();
+            await bob.activateSession(session.id, async () => undefined);
+
+            const received: string[] = [];
+            let finishFirst!: () => void;
+            const firstComplete = new Promise<void>((resolve) => {
+                finishFirst = resolve;
+            });
+            aliceRealtime = alice.realtime({ signal: aliceController.signal });
+            bobRealtime = bob.realtime({
+                signal: bobController.signal,
+                onSynchronize: async () => {
+                    await bob.drain(session.id, async (_transaction, event) => {
+                        received.push(utf8Decode(event.bytes));
+                    });
+                    if (received.length === 1) {
+                        bobController.abort();
+                        finishFirst();
+                    }
+                },
+            });
+            await alice.send(session.id, utf8Encode("first"));
+            await alice.send(session.id, utf8Encode("second"));
+            let timeout: ReturnType<typeof setTimeout> | undefined;
+            try {
+                await Promise.race([
+                    firstComplete,
+                    new Promise<never>((_resolve, reject) => {
+                        timeout = setTimeout(
+                            () => reject(new Error("First realtime SSE connection timed out")),
+                            5_000,
+                        );
+                    }),
+                ]);
+            } finally {
+                if (timeout !== undefined) clearTimeout(timeout);
+            }
+            await bobRealtime;
+            expect(received).toEqual(["first"]);
+
+            let finishSecond!: () => void;
+            const secondComplete = new Promise<void>((resolve) => {
+                finishSecond = resolve;
+            });
+            resumed = bob.realtime({
+                signal: resumedController.signal,
+                onSynchronize: async () => {
+                    await bob.drain(session.id, async (_transaction, event) => {
+                        received.push(utf8Decode(event.bytes));
+                    });
+                    if (received.length === 2) {
+                        aliceController.abort();
+                        resumedController.abort();
+                        finishSecond();
+                    }
+                },
+            });
+            timeout = undefined;
+            try {
+                await Promise.race([
+                    secondComplete,
+                    new Promise<never>((_resolve, reject) => {
+                        timeout = setTimeout(
+                            () => reject(new Error("Resumed realtime SSE connection timed out")),
+                            5_000,
+                        );
+                    }),
+                ]);
+            } finally {
+                if (timeout !== undefined) clearTimeout(timeout);
+            }
+            await Promise.all([aliceRealtime, resumed]);
+            expect(received).toEqual(["first", "second"]);
+        } finally {
+            aliceController.abort();
+            bobController.abort();
+            resumedController.abort();
+            await Promise.allSettled(
+                [aliceRealtime, bobRealtime, resumed].filter(
+                    (value): value is Promise<void> => value !== undefined,
+                ),
+            );
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
     test("rejects an expired digest and drops its matching private KeyPackage", async () => {
         let now = NOW;
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
