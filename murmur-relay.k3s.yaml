@@ -20,7 +20,7 @@ metadata:
     namespace: default
     labels:
         app.kubernetes.io/name: murmur-relay
-        app.kubernetes.io/version: 0.3.0
+        app.kubernetes.io/version: 0.3.1
 spec:
     replicas: 1
     revisionHistoryLimit: 2
@@ -33,7 +33,7 @@ spec:
         metadata:
             labels:
                 app.kubernetes.io/name: murmur-relay
-                app.kubernetes.io/version: 0.3.0
+                app.kubernetes.io/version: 0.3.1
         spec:
             automountServiceAccountToken: false
             enableServiceLinks: false
@@ -48,7 +48,7 @@ spec:
                     type: RuntimeDefault
             containers:
                 - name: relay
-                  image: ghcr.io/slopus/murmur-relay:0.3.0
+                  image: ghcr.io/slopus/murmur-relay:0.3.1
                   imagePullPolicy: IfNotPresent
                   securityContext:
                       allowPrivilegeEscalation: false

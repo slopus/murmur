@@ -101,6 +101,7 @@ jobs:
                   node-version: 24
                   cache: pnpm
             - run: pnpm install --frozen-lockfile
+            - run: pnpm --filter @slopus/murmur-relay build
             - name: Check whether npm version already exists
               id: npm-version
               shell: bash
