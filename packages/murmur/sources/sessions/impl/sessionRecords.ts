@@ -271,7 +271,14 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
     const hasConsumedProposalKeys = input.consumedProposalKeys !== null;
     const hasBootstrapDeliveryIds = input.bootstrapDeliveryIds !== null;
     if (
-        ((input.kind === "application" || input.kind === "proposal") &&
+        (input.kind === "application" &&
+            (!hasApplicationData ||
+                hasStagedEpoch ||
+                hasNextCommitter ||
+                hasRetainPreviousEpoch ||
+                hasConsumedProposalKeys ||
+                hasBootstrapDeliveryIds)) ||
+        (input.kind === "proposal" &&
             (!hasApplicationData ||
                 hasStagedEpoch ||
                 hasNextCommitter ||

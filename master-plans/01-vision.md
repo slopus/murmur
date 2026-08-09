@@ -44,6 +44,15 @@ progress, pending-session buffers, session lifecycle, and synchronization. For
 realtime receiving, the relay streams the exact queued encrypted deliveries
 over one recipient-authenticated SSE connection in inbox UUIDv7 order.
 
+Every local session operation works offline and completes against durable local
+state before Murmur lazily shares its outboxes with the relay. Relay
+connectivity, peer presence, session creation, pending local activation, and a
+staged membership Commit never make `send` wait or reject. A send made while a
+Commit is staged encrypts immediately with the staged post-Commit epoch,
+durably advances that staged ratchet, and is ordered after its prerequisite
+Welcome and Commit. The sender still adopts the Commit as its active epoch only
+from its authenticated queue echo; adoption is not permission to send.
+
 A relay item is acknowledged only after its queue-processing outcome is
 durable. Successful session processing atomically persists Murmur state, replay
 and queue progress, and a bounded opaque application update before
@@ -123,6 +132,10 @@ being added again.
   to that service.
 - The same MLS session engine works for two and many members, including adding
   and removing members in service-owned sessions.
+- Every session operation works from durable local state while offline. No
+  session or synchronization state blocks `send`; sends against a staged
+  membership epoch are encrypted and persisted immediately, survive restart,
+  and publish only after their prerequisite Welcome and Commit.
 - Queue processing survives redelivery and acknowledges only after durably
   recording queue progress and its successful protocol state plus buffered
   update, pending bootstrap, or terminal rejection.

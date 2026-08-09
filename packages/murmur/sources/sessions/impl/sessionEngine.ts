@@ -103,6 +103,7 @@ const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
 const USED_DISCOVERY_PREFIX = "murmur/used-discovery/";
 const BOOTSTRAP_INDEX_PREFIX = "murmur/bootstrap-outboxes/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
+const POST_COMMIT_OUTBOX_INDEX_PREFIX = "murmur/post-commit-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
 const DEFAULT_MAXIMUM_PENDING = 64;
 const DEFAULT_MAXIMUM_BUFFERED_EVENTS = 1_000;
@@ -202,6 +203,10 @@ function bootstrapIndexKey(parentCommitId: string, deliveryId: string): string {
 
 function epochOutboxIndexKey(id: Uint8Array, deliveryId: string): string {
     return `${EPOCH_OUTBOX_INDEX_PREFIX}${sessionId(id)}/${deliveryId}`;
+}
+
+function postCommitOutboxIndexKey(parentCommitId: string, deliveryId: string): string {
+    return `${POST_COMMIT_OUTBOX_INDEX_PREFIX}${parentCommitId}/${deliveryId}`;
 }
 
 function keyPackageKey(reference: Uint8Array): string {
@@ -1461,16 +1466,47 @@ export class SessionEngine {
             const bytes = await transaction.get(stateKey(id));
             if (bytes === undefined) throw new Error("Unknown session");
             const record = decodeSessionRecord(bytes);
-            if (
-                record.status !== "active" ||
-                (record.stagedCommitId !== undefined && kind !== "application")
-            ) {
-                throw new Error("Session cannot send while pending or committing");
-            }
-            const epoch = restoreEpoch(this.#identity, record);
+            let parentCommitId: string | undefined;
+            let parentBytes: Uint8Array | undefined;
+            let parent: SessionOutboxRecord | undefined;
+            let epoch: MlsEpochState | undefined;
             let applicationData: Uint8Array | undefined;
             let checkpoint: Uint8Array | undefined;
             try {
+                if (record.status === "removed") throw new Error("Unknown session");
+                if (record.stagedCommitId === undefined) {
+                    if (record.status === "creating") {
+                        throw new Error("Creating session is missing its staged epoch");
+                    }
+                    epoch = restoreEpoch(this.#identity, record);
+                } else {
+                    if (kind !== "application") {
+                        throw new Error("Session cannot queue a proposal while committing");
+                    }
+                    parentCommitId = record.stagedCommitId;
+                    parentBytes = await transaction.get(outboxKey(parentCommitId));
+                    if (parentBytes === undefined) {
+                        throw new Error("Session staged Commit is missing");
+                    }
+                    parent = decodeOutboxRecord(parentBytes);
+                    if (
+                        parent.kind !== "commit" ||
+                        parent.stagedEpoch === undefined ||
+                        parent.delivery.id !== parentCommitId ||
+                        !equalBytes(parent.sessionId, id)
+                    ) {
+                        throw new Error("Session staged Commit is invalid");
+                    }
+                    epoch = MlsEpochState.deserialize(parent.stagedEpoch, {
+                        localSigningSecretKey: this.#identity.secretKey,
+                        authenticateCredential: authenticateMurmurMlsCredential,
+                        minimumPersistenceGeneration: 0n,
+                    });
+                    const minimumGeneration = record.generation + 1n;
+                    if (epoch.persistenceGeneration < minimumGeneration) {
+                        epoch.rebasePersistenceGeneration(minimumGeneration);
+                    }
+                }
                 const members = activeMembers(epoch);
                 if (members.length > this.#limits.maximumMembersPerSession) {
                     throw new Error("Session exceeds the configured member limit");
@@ -1499,15 +1535,23 @@ export class SessionEngine {
                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
                 });
                 checkpoint = epoch.serialize();
-                await setAndZero(
-                    transaction,
-                    stateKey(id),
-                    encodeSessionRecord({
-                        ...record,
-                        epoch: checkpoint,
-                        generation: epoch.persistenceGeneration,
-                    }),
-                );
+                if (parent === undefined) {
+                    await setAndZero(
+                        transaction,
+                        stateKey(id),
+                        encodeSessionRecord({
+                            ...record,
+                            epoch: checkpoint,
+                            generation: epoch.persistenceGeneration,
+                        }),
+                    );
+                } else {
+                    await setAndZero(
+                        transaction,
+                        outboxKey(parent.delivery.id),
+                        encodeOutboxRecord({ ...parent, stagedEpoch: checkpoint }),
+                    );
+                }
                 const order = await this.#nextOutboxOrder(transaction);
                 await setAndZero(
                     transaction,
@@ -1520,15 +1564,26 @@ export class SessionEngine {
                         sessionId: id,
                         delivery,
                         applicationData,
+                        ...(parentCommitId === undefined ? {} : { parentCommitId }),
                     }),
                 );
                 await transaction.set(outboxOrderKey(order, delivery.id), new Uint8Array());
-                await transaction.set(epochOutboxIndexKey(id, delivery.id), new Uint8Array());
+                if (parentCommitId === undefined) {
+                    await transaction.set(epochOutboxIndexKey(id, delivery.id), new Uint8Array());
+                } else {
+                    await transaction.set(
+                        postCommitOutboxIndexKey(parentCommitId, delivery.id),
+                        new Uint8Array(),
+                    );
+                }
                 return delivery.id;
             } finally {
-                epoch.destroy();
+                epoch?.destroy();
                 this.#zeroSessionRecord(record);
                 zeroBytes(bytes);
+                if (parent?.stagedEpoch !== undefined) zeroBytes(parent.stagedEpoch);
+                if (parent?.applicationData !== undefined) zeroBytes(parent.applicationData);
+                if (parentBytes !== undefined) zeroBytes(parentBytes);
                 if (applicationData !== undefined) zeroBytes(applicationData);
                 if (checkpoint !== undefined) zeroBytes(checkpoint);
             }
@@ -1978,7 +2033,10 @@ export class SessionEngine {
                 });
                 let checkpoint: Uint8Array | undefined;
                 try {
-                    next.rebasePersistenceGeneration(record.generation + 1n);
+                    const minimumGeneration = record.generation + 1n;
+                    if (next.persistenceGeneration < minimumGeneration) {
+                        next.rebasePersistenceGeneration(minimumGeneration);
+                    }
                     const {
                         stagedCommitId: _stagedCommitId,
                         previousEpoch: _previousEpoch,
@@ -2012,6 +2070,11 @@ export class SessionEngine {
                     for (const key of outbox.consumedProposalKeys ?? []) {
                         await transaction.delete(key);
                     }
+                    await this.#activatePostCommitOutboxes(
+                        transaction,
+                        queued.delivery.id,
+                        outbox.sessionId,
+                    );
                 } finally {
                     next.destroy();
                     zeroBytes(outbox.stagedEpoch);
@@ -2045,6 +2108,11 @@ export class SessionEngine {
             await transaction.delete(outboxOrderKey(outbox.order, queued.delivery.id));
             if (outbox.kind === "application" || outbox.kind === "proposal") {
                 await transaction.delete(epochOutboxIndexKey(outbox.sessionId, queued.delivery.id));
+                if (outbox.parentCommitId !== undefined) {
+                    await transaction.delete(
+                        postCommitOutboxIndexKey(outbox.parentCommitId, queued.delivery.id),
+                    );
+                }
             }
         } finally {
             this.#zeroSessionRecord(record);
@@ -2479,13 +2547,10 @@ export class SessionEngine {
 
     async #flushOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
         const publishedIds = new Set<string>();
+        const publishedCommitIds = new Set<string>();
         const transientFailureIds = new Set<string>();
         const terminalFailureIds = await this.#preflightMembershipOutboxes();
-        const phases: readonly (readonly SessionOutboxRecord["kind"][])[] = [
-            ["bootstrap"],
-            ["application", "proposal"],
-            ["commit"],
-        ];
+        const phases = ["bootstrap", "current", "commit", "post-commit"] as const;
         for (const phase of phases) {
             const blockedSessions = new Set<string>();
             let after: string | undefined;
@@ -2515,7 +2580,17 @@ export class SessionEngine {
                             continue;
                         }
                         const decodedRecord = record;
-                        if (!phase.includes(decodedRecord.kind)) continue;
+                        const matchesPhase =
+                            (phase === "bootstrap" && decodedRecord.kind === "bootstrap") ||
+                            (phase === "current" &&
+                                (decodedRecord.kind === "application" ||
+                                    decodedRecord.kind === "proposal") &&
+                                decodedRecord.parentCommitId === undefined) ||
+                            (phase === "commit" && decodedRecord.kind === "commit") ||
+                            (phase === "post-commit" &&
+                                decodedRecord.kind === "application" &&
+                                decodedRecord.parentCommitId !== undefined);
+                        if (!matchesPhase) continue;
                         const encodedSessionId = sessionId(decodedRecord.sessionId);
                         if (
                             (decodedRecord.kind === "application" ||
@@ -2538,6 +2613,12 @@ export class SessionEngine {
                                 continue;
                             }
                         }
+                        if (
+                            phase === "post-commit" &&
+                            !publishedCommitIds.has(decodedRecord.parentCommitId!)
+                        ) {
+                            continue;
+                        }
                         if (decodedRecord.delivery.expiresAt <= this.#now()) {
                             if (
                                 decodedRecord.kind === "commit" ||
@@ -2554,6 +2635,9 @@ export class SessionEngine {
                         try {
                             await this.#transport.publish(decodedRecord.delivery, signal);
                             publishedIds.add(decodedRecord.delivery.id);
+                            if (decodedRecord.kind === "commit") {
+                                publishedCommitIds.add(decodedRecord.delivery.id);
+                            }
                             if (decodedRecord.kind === "bootstrap") {
                                 await this.#store.transaction(async (transaction) => {
                                     await transaction.delete(key);
@@ -3085,6 +3169,11 @@ export class SessionEngine {
                         record.delivery.id,
                         delivery.id,
                     );
+                    await this.#movePostCommitIndexParent(
+                        transaction,
+                        record.delivery.id,
+                        delivery.id,
+                    );
                 } finally {
                     this.#zeroSessionRecord(session);
                     zeroBytes(stateBytes);
@@ -3111,6 +3200,11 @@ export class SessionEngine {
             await transaction.delete(outboxOrderKey(record.order, record.delivery.id));
             if (record.kind === "application" || record.kind === "proposal") {
                 await transaction.delete(epochOutboxIndexKey(record.sessionId, record.delivery.id));
+                if (record.parentCommitId !== undefined) {
+                    await transaction.delete(
+                        postCommitOutboxIndexKey(record.parentCommitId, record.delivery.id),
+                    );
+                }
             }
             await this.#quarantine(
                 transaction,
@@ -3121,6 +3215,61 @@ export class SessionEngine {
                 record.operationId,
             );
         });
+    }
+
+    async #activatePostCommitOutboxes(
+        transaction: StoreTransaction,
+        commitId: string,
+        id: Uint8Array,
+    ): Promise<void> {
+        const prefix = `${POST_COMMIT_OUTBOX_INDEX_PREFIX}${commitId}/`;
+        let after: string | undefined;
+        for (;;) {
+            const page = await transaction.scan(prefix, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, indexValue] of page) {
+                after = key;
+                const deliveryId = key.slice(prefix.length);
+                const bytes = await transaction.get(outboxKey(deliveryId));
+                if (bytes === undefined) {
+                    await transaction.delete(key);
+                    zeroBytes(indexValue);
+                    continue;
+                }
+                let dependent: SessionOutboxRecord | undefined;
+                try {
+                    dependent = decodeOutboxRecord(bytes);
+                    if (
+                        dependent.kind !== "application" ||
+                        dependent.parentCommitId !== commitId ||
+                        !equalBytes(dependent.sessionId, id)
+                    ) {
+                        throw new Error("Invalid post-Commit application outbox");
+                    }
+                    const { parentCommitId: _parentCommitId, ...activated } = dependent;
+                    await setAndZero(
+                        transaction,
+                        outboxKey(deliveryId),
+                        encodeOutboxRecord(activated),
+                    );
+                    await transaction.set(epochOutboxIndexKey(id, deliveryId), new Uint8Array());
+                    await transaction.delete(key);
+                } finally {
+                    if (dependent?.stagedEpoch !== undefined) {
+                        zeroBytes(dependent.stagedEpoch);
+                    }
+                    if (dependent?.applicationData !== undefined) {
+                        zeroBytes(dependent.applicationData);
+                    }
+                    zeroBytes(bytes);
+                    zeroBytes(indexValue);
+                }
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
+        }
     }
 
     async #deleteSession(transaction: StoreTransaction, id: Uint8Array): Promise<void> {
@@ -3166,6 +3315,10 @@ export class SessionEngine {
                             await this.#deletePrefix(
                                 transaction,
                                 `${BOOTSTRAP_INDEX_PREFIX}${outbox.delivery.id}/`,
+                            );
+                        } else if (outbox.parentCommitId !== undefined) {
+                            await transaction.delete(
+                                postCommitOutboxIndexKey(outbox.parentCommitId, outbox.delivery.id),
                             );
                         }
                     }
@@ -3249,6 +3402,64 @@ export class SessionEngine {
         }
     }
 
+    async #movePostCommitIndexParent(
+        transaction: StoreTransaction,
+        previousCommitId: string,
+        nextCommitId: string,
+    ): Promise<void> {
+        const previousPrefix = `${POST_COMMIT_OUTBOX_INDEX_PREFIX}${previousCommitId}/`;
+        let after: string | undefined;
+        for (;;) {
+            const page = await transaction.scan(previousPrefix, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, indexValue] of page) {
+                after = key;
+                const deliveryId = key.slice(previousPrefix.length);
+                const bytes = await transaction.get(outboxKey(deliveryId));
+                if (bytes === undefined) {
+                    await transaction.delete(key);
+                    zeroBytes(indexValue);
+                    continue;
+                }
+                const dependent = decodeOutboxRecord(bytes);
+                try {
+                    if (
+                        dependent.kind !== "application" ||
+                        dependent.parentCommitId !== previousCommitId
+                    ) {
+                        throw new Error("Invalid post-Commit outbox dependency");
+                    }
+                    await setAndZero(
+                        transaction,
+                        outboxKey(deliveryId),
+                        encodeOutboxRecord({
+                            ...dependent,
+                            parentCommitId: nextCommitId,
+                        }),
+                    );
+                    await transaction.set(
+                        postCommitOutboxIndexKey(nextCommitId, deliveryId),
+                        indexValue,
+                    );
+                    await transaction.delete(key);
+                } finally {
+                    if (dependent.stagedEpoch !== undefined) {
+                        zeroBytes(dependent.stagedEpoch);
+                    }
+                    if (dependent.applicationData !== undefined) {
+                        zeroBytes(dependent.applicationData);
+                    }
+                    zeroBytes(bytes);
+                    zeroBytes(indexValue);
+                }
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
+        }
+    }
+
     async #reconcileCorruptOutbox(
         transaction: StoreTransaction,
         deliveryId: string,
@@ -3256,6 +3467,11 @@ export class SessionEngine {
         await this.#deleteIndexEntriesByDeliveryId(
             transaction,
             EPOCH_OUTBOX_INDEX_PREFIX,
+            deliveryId,
+        );
+        await this.#deleteIndexEntriesByDeliveryId(
+            transaction,
+            POST_COMMIT_OUTBOX_INDEX_PREFIX,
             deliveryId,
         );
         const parentCommitIds = await this.#bootstrapParentCommitIds(transaction, deliveryId);
@@ -3449,6 +3665,7 @@ export class SessionEngine {
     ): Promise<void> {
         await transaction.delete(outboxKey(commitId));
         await this.#deleteIndexEntriesByDeliveryId(transaction, OUTBOX_ORDER_PREFIX, commitId);
+        await this.#deletePostCommitOutboxes(transaction, commitId);
         const prefix = `${BOOTSTRAP_INDEX_PREFIX}${commitId}/`;
         let after: string | undefined;
         for (;;) {
@@ -3468,6 +3685,51 @@ export class SessionEngine {
                 );
                 await transaction.delete(key);
                 zeroBytes(value);
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
+        }
+    }
+
+    async #deletePostCommitOutboxes(
+        transaction: StoreTransaction,
+        commitId: string,
+    ): Promise<void> {
+        const prefix = `${POST_COMMIT_OUTBOX_INDEX_PREFIX}${commitId}/`;
+        let after: string | undefined;
+        for (;;) {
+            const page = await transaction.scan(prefix, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, indexValue] of page) {
+                after = key;
+                const deliveryId = key.slice(prefix.length);
+                const bytes = await transaction.get(outboxKey(deliveryId));
+                if (bytes !== undefined) {
+                    let record: SessionOutboxRecord | undefined;
+                    try {
+                        record = decodeOutboxRecord(bytes);
+                        await transaction.delete(outboxOrderKey(record.order, record.delivery.id));
+                    } catch {
+                        await this.#deleteIndexEntriesByDeliveryId(
+                            transaction,
+                            OUTBOX_ORDER_PREFIX,
+                            deliveryId,
+                        );
+                    } finally {
+                        if (record?.stagedEpoch !== undefined) {
+                            zeroBytes(record.stagedEpoch);
+                        }
+                        if (record?.applicationData !== undefined) {
+                            zeroBytes(record.applicationData);
+                        }
+                        zeroBytes(bytes);
+                    }
+                    await transaction.delete(outboxKey(deliveryId));
+                }
+                await transaction.delete(key);
+                zeroBytes(indexValue);
             }
             if (page.size < OUTBOX_SCAN_ITEMS) break;
         }

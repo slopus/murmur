@@ -317,7 +317,10 @@ export class MurmurClient {
             if (existing !== undefined) {
                 try {
                     const existingSession = await this.#engine.get(existing.sessionId);
-                    if (existingSession !== undefined) return existingSession;
+                    if (existingSession !== undefined) {
+                        await this.#queueContactHellos();
+                        return existingSession;
+                    }
                     await this.#contacts.reject(existing.sessionId);
                 } finally {
                     zeroBytes(existing.identity);
@@ -325,8 +328,9 @@ export class MurmurClient {
                 }
             }
             const created = await this.#createContactAdmission(CONTACT_ADMISSION_GENERATION);
+            let createdSession: MurmurSession;
             try {
-                return await this.#engine.create(
+                createdSession = await this.#engine.create(
                     {
                         descriptor: contactSessionDescriptor(),
                         members: [bundle],
@@ -347,6 +351,8 @@ export class MurmurClient {
             } finally {
                 for (const reference of created.references) zeroBytes(reference);
             }
+            await this.#queueContactHellos();
+            return createdSession;
         });
         this.#signalSync();
         return session;
@@ -523,6 +529,12 @@ export class MurmurClient {
         await this.#exclusive(() => this.#engine.abandon(id));
     }
 
+    /**
+     * Encrypt and durably queue application bytes without waiting for relay or peer state.
+     *
+     * Sends made while a membership Commit is staged use its post-Commit epoch and publish
+     * only after that Commit's Welcome dependencies.
+     */
     async send(id: Uint8Array, bytes: Uint8Array): Promise<string> {
         const deliveryId = await this.#exclusive(() => this.#engine.send(id, bytes));
         this.#signalSync();
@@ -955,8 +967,6 @@ export class MurmurClient {
                 ) {
                     continue;
                 }
-                const session = await this.#engine.get(handshake.sessionId);
-                if (session?.status !== "active") continue;
                 const packet = encodeContactPacket({
                     version: 2,
                     type: "hello",

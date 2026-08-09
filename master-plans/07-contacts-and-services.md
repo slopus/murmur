@@ -44,6 +44,13 @@ contacts and routing state, so local reads and Murmur mutations work offline
 before the relay connects or synchronization begins. Durable offline outboxes
 converge when connectivity returns.
 
+Services always mutate and send from local durable state first. Creating a
+service group, changing its membership, and sending any number of service
+packets require neither relay connectivity nor an online peer. A packet sent
+while the group Commit is staged is encrypted immediately for that staged epoch
+and durably ordered after the Commit; the service does not wait for group
+activation or a remote acknowledgement.
+
 Murmur uses the same session-routing concept for built-in contacts and optional
 services, while contacts remain built in rather than becoming a registered
 optional service. When any other new session arrives, Murmur offers its
@@ -114,6 +121,10 @@ its Noble-only runtime dependency boundary.
   failure leaves the relevant durable batch available for retry.
 - Service-owned sessions support typed group events and member changes, while
   future chat remains a separate independent service.
+- Service groups can be created, changed, and sent to entirely offline.
+  Creating, pending, committing, and disconnected states never block service
+  sends; their durable outboxes converge in dependency order when the relay is
+  reachable.
 - Local integration and production-relay end-to-end tests cover invitation
   expiry, exact acknowledgement and cleanup, restart recovery, and offline
   convergence.

@@ -1,8 +1,15 @@
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
-import type { DeliveryFetch } from "../../delivery/index.js";
+import {
+    HttpDeliveryTransport,
+    type DeliveryFetch,
+    type DeliveryTransport,
+    type SignedDelivery,
+} from "../../delivery/index.js";
+import { HttpDiscoveryTransport } from "../../identity/discovery/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import { MurmurClient } from "../../sessions/index.js";
+import { encodeBase64Url } from "../../utils/index.js";
 import type { MurmurContactAdded, MurmurContactRemoved, MurmurContactRequested } from "../index.js";
 
 const NOW = 1_700_000_000_000;
@@ -103,6 +110,119 @@ describe("built-in contacts", () => {
         }
     });
 
+    test("queues the contact hello offline and relays the full handshake after restart", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const fetch = relayFetch(relay);
+        const requesterStore = new MemoryMurmurStore();
+        const published: SignedDelivery[] = [];
+        const base = new HttpDeliveryTransport("https://relay.test", { fetch });
+        const transport: DeliveryTransport = {
+            publish: async (delivery, signal) => {
+                published.push(delivery);
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+        };
+        const discoveryTransport = new HttpDiscoveryTransport("https://relay.test", {
+            fetch,
+        });
+        const invited = await MurmurClient.open({
+            transport,
+            discoveryTransport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        let requester = await MurmurClient.open({
+            transport,
+            discoveryTransport,
+            store: requesterStore,
+            now: () => NOW,
+        });
+        try {
+            const session = await requester.requestContact(await invited.createInvitation(), {
+                name: "Requester",
+            });
+            expect(published).toEqual([]);
+            expect(await requester.session(session.id)).toMatchObject({
+                status: "creating",
+            });
+            expect(
+                (
+                    await requesterStore.scan("murmur/session-outbox/", {
+                        limit: 10,
+                    })
+                ).size,
+            ).toBe(3);
+            expect(
+                (
+                    await requesterStore.scan("murmur/post-commit-outboxes/", {
+                        limit: 10,
+                    })
+                ).size,
+            ).toBe(1);
+
+            const requesterIdentity = requester.identity;
+            requester.close();
+            requester = await MurmurClient.open({
+                transport,
+                discoveryTransport,
+                store: requesterStore,
+                now: () => NOW,
+            });
+            expect(await requester.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                published: 3,
+                pendingOutboxes: 0,
+            });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2]);
+            expect(
+                published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
+            ).toEqual([
+                [encodeBase64Url(invited.identity)],
+                [encodeBase64Url(requesterIdentity)],
+                [encodeBase64Url(invited.identity), encodeBase64Url(requesterIdentity)].sort(),
+            ]);
+
+            const requests: MurmurContactRequested[] = [];
+            await invited.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onContactRequested: async (events) => {
+                        requests.push(...events);
+                    },
+                },
+            );
+            expect(requests).toHaveLength(1);
+            expect(requests[0]).toMatchObject({
+                sessionId: session.id,
+                identity: requesterIdentity,
+                profile: { name: "Requester" },
+            });
+
+            await invited.acceptContact(session.id, { name: "Invited" });
+            expect(published).toHaveLength(3);
+            await invited.synchronize({ waitMilliseconds: 0 });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2, 2]);
+            expect(published[3]?.recipients.map(encodeBase64Url).sort()).toEqual(
+                [encodeBase64Url(invited.identity), encodeBase64Url(requesterIdentity)].sort(),
+            );
+
+            await requester.synchronize({ waitMilliseconds: 0 });
+            expect(await invited.contact(requesterIdentity)).toMatchObject({
+                status: "active",
+                profile: { name: "Requester" },
+            });
+            expect(await requester.contact(invited.identity)).toMatchObject({
+                status: "active",
+                profile: { name: "Invited" },
+            });
+        } finally {
+            invited.close();
+            requester.close();
+            await relay.close();
+        }
+    }, 20_000);
+
     test("creates an N-person service group from contacts and exchanges messages", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const fetch = relayFetch(relay);
@@ -140,6 +260,10 @@ describe("built-in contacts", () => {
                 contacts: [bob.identity, carol.identity],
                 service: "chat",
             });
+            await expect(
+                alice.send(group.id, new TextEncoder().encode("hello group")),
+            ).resolves.toEqual(expect.any(String));
+            expect(received.size).toBe(0);
             for (let index = 0; index < 8; index += 1) {
                 await alice.synchronize({ waitMilliseconds: 0 });
                 await bob.synchronize({ waitMilliseconds: 0 });
@@ -152,7 +276,6 @@ describe("built-in contacts", () => {
                 }
             }
 
-            await alice.send(group.id, new TextEncoder().encode("hello group"));
             for (let index = 0; index < 17; index += 1) {
                 await alice.synchronize({ waitMilliseconds: 0 });
                 await bob.synchronize({ waitMilliseconds: 0 });

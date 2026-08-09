@@ -69,6 +69,93 @@ async function consume(
 }
 
 describe("stateful MLS sessions", () => {
+    test("queues initial group messages offline and relays Welcome, Commit, then messages after restart", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const aliceStore = new MemoryMurmurStore();
+        const published: SignedDelivery[] = [];
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        const recording: DeliveryTransport = {
+            publish: async (delivery, signal) => {
+                published.push(delivery);
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+        };
+        let alice = await MurmurClient.open({
+            transport: recording,
+            store: aliceStore,
+            now: () => NOW,
+        });
+        const bob = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("offline group"),
+                members: [await bob.discovery()],
+            });
+            const first = await alice.send(session.id, utf8Encode("first offline"));
+            const second = await alice.send(session.id, utf8Encode("second offline"));
+
+            expect(published).toEqual([]);
+            expect(await alice.session(session.id)).toMatchObject({ status: "creating" });
+            expect(
+                (
+                    await aliceStore.scan("murmur/session-outbox/", {
+                        limit: 10,
+                    })
+                ).size,
+            ).toBe(4);
+            expect(
+                (
+                    await aliceStore.scan("murmur/post-commit-outboxes/", {
+                        limit: 10,
+                    })
+                ).size,
+            ).toBe(2);
+
+            const aliceIdentity = alice.identity;
+            alice.close();
+            alice = await MurmurClient.open({
+                transport: recording,
+                store: aliceStore,
+                now: () => NOW,
+            });
+
+            expect(await alice.synchronize()).toMatchObject({
+                published: 4,
+                pendingOutboxes: 0,
+                transientPublicationFailures: 0,
+                terminalPublicationFailures: 0,
+            });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2, 2]);
+            expect(published.slice(2).map((delivery) => delivery.id)).toEqual([first, second]);
+            expect(
+                published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
+            ).toEqual([
+                [encodeBase64Url(bob.identity)],
+                [encodeBase64Url(aliceIdentity)],
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
+            ]);
+
+            await bob.synchronize({ waitMilliseconds: 0 });
+            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
+            const received: string[] = [];
+            expect(
+                await activate(bob, session.id, async (update) => {
+                    received.push(utf8Decode(update.bytes));
+                }),
+            ).toBe(2);
+            expect(received).toEqual(["first offline", "second offline"]);
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
     test("creates a session from a 32-byte relay-cached invitation digest", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
@@ -359,12 +446,22 @@ describe("stateful MLS sessions", () => {
             });
             expect(utf8Decode(pending!.descriptor)).toBe("opaque descriptor");
 
+            await expect(bob.send(created.id, utf8Encode("from pending"))).resolves.toEqual(
+                expect.any(String),
+            );
+            await bob.synchronize({ waitMilliseconds: 0 });
+            const aliceReceived: string[] = [];
+            await consume(alice, async (event) => {
+                aliceReceived.push(utf8Decode(event.bytes));
+            });
+            expect(aliceReceived).toEqual(["from pending"]);
+
             await alice.send(created.id, utf8Encode("hello"));
             await alice.synchronize();
             await bob.synchronize();
             expect(await bob.session(created.id)).toMatchObject({
                 status: "pending",
-                bufferedEvents: 1,
+                bufferedEvents: 2,
             });
 
             const received: string[] = [];
@@ -372,7 +469,7 @@ describe("stateful MLS sessions", () => {
                 received.push(utf8Decode(event.bytes));
                 await bobStore.set("application/last", event.bytes);
             });
-            expect(received).toEqual(["hello"]);
+            expect(received).toEqual(["from pending", "hello"]);
             expect(utf8Decode((await bobStore.get("application/last"))!)).toBe("hello");
         } finally {
             alice.close();
@@ -504,6 +601,79 @@ describe("stateful MLS sessions", () => {
             await bob.synchronize();
             expect((await alice.session(session.id))?.committer).toEqual(bob.identity);
             expect((await bob.session(session.id))?.committer).toEqual(bob.identity);
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            await relay.close();
+        }
+    });
+
+    test("queues a post-add message offline and relays it only after Welcome and Commit", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const published: SignedDelivery[] = [];
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        const transport: DeliveryTransport = {
+            publish: async (delivery, signal) => {
+                published.push(delivery);
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+        };
+        const alice = await MurmurClient.open({
+            transport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        const bob = await client(relay);
+        const carol = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("offline add"),
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+            published.length = 0;
+
+            await alice.addMember(session.id, await carol.discovery());
+            const messageId = await alice.send(session.id, utf8Encode("welcome carol"));
+            expect(published).toEqual([]);
+
+            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                published: 3,
+                pendingOutboxes: 0,
+            });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2]);
+            expect(published[2]?.id).toBe(messageId);
+            expect(
+                published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
+            ).toEqual([
+                [encodeBase64Url(carol.identity)],
+                [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
+                [
+                    encodeBase64Url(alice.identity),
+                    encodeBase64Url(bob.identity),
+                    encodeBase64Url(carol.identity),
+                ].sort(),
+            ]);
+
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            const bobReceived: string[] = [];
+            const carolReceived: string[] = [];
+            await consume(bob, async (update) => {
+                bobReceived.push(utf8Decode(update.bytes));
+            });
+            await activate(carol, session.id, async (update) => {
+                carolReceived.push(utf8Decode(update.bytes));
+            });
+            expect(bobReceived).toEqual(["welcome carol"]);
+            expect(carolReceived).toEqual(["welcome carol"]);
         } finally {
             alice.close();
             bob.close();
@@ -1205,8 +1375,9 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("never publishes an Add Commit after its Welcome fails terminally", async () => {
+    test("queues a creating-session message while its Welcome publication is blocked", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const aliceStore = new MemoryMurmurStore();
         const base = new HttpDeliveryTransport("https://relay.test", {
             fetch: relayFetch(relay),
         });
@@ -1223,7 +1394,7 @@ describe("stateful MLS sessions", () => {
         };
         const alice = await MurmurClient.open({
             transport: welcomeFailing,
-            store: new MemoryMurmurStore(),
+            store: aliceStore,
             now: () => NOW,
         });
         const bob = await client(relay);
@@ -1249,13 +1420,19 @@ describe("stateful MLS sessions", () => {
                 status: "creating",
                 members: [alice.identity],
             });
-            await expect(alice.send(session.id, utf8Encode("too soon"))).rejects.toThrow(
-                "cannot send",
-            );
+            const queued = await alice.send(session.id, utf8Encode("queued while offline"));
+            expect(queued).toEqual(expect.any(String));
+            expect(
+                (
+                    await aliceStore.scan("murmur/post-commit-outboxes/", {
+                        limit: 10,
+                    })
+                ).size,
+            ).toBe(1);
 
             failWelcome = false;
             expect(await alice.synchronize()).toMatchObject({
-                published: 2,
+                published: 3,
                 pendingOutboxes: 0,
             });
             await bob.synchronize();
@@ -1265,6 +1442,11 @@ describe("stateful MLS sessions", () => {
             expect(await bob.session(session.id)).toMatchObject({
                 status: "pending",
             });
+            const received: string[] = [];
+            await activate(bob, session.id, async (update) => {
+                received.push(utf8Decode(update.bytes));
+            });
+            expect(received).toEqual(["queued while offline"]);
         } finally {
             alice.close();
             bob.close();
@@ -1272,7 +1454,7 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("never lets a Commit overtake a transient current-epoch application", async () => {
+    test("relays a staged application after its membership Commit", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const base = new HttpDeliveryTransport("https://relay.test", {
             fetch: relayFetch(relay),
@@ -1308,13 +1490,13 @@ describe("stateful MLS sessions", () => {
             await activate(carol, session.id);
 
             await alice.removeMember(session.id, carol.identity);
-            const sendId = await alice.send(session.id, utf8Encode("before remove"));
+            const sendId = await alice.send(session.id, utf8Encode("after remove"));
             expect(sendId).toEqual(expect.any(String));
             failPrivateOnce = true;
             expect(await alice.synchronize()).toMatchObject({
-                published: 1,
+                published: 2,
                 transientPublicationFailures: 1,
-                pendingOutboxes: 2,
+                pendingOutboxes: 1,
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1322,7 +1504,7 @@ describe("stateful MLS sessions", () => {
             await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
-            expect(received).toEqual(["before remove"]);
+            expect(received).toEqual(["after remove"]);
             expect((await bob.session(session.id))?.members).toHaveLength(2);
         } finally {
             alice.close();

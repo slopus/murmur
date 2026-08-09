@@ -31,6 +31,16 @@ Commits. Losing the current committer can block membership changes until local
 state is restored or the remaining members bootstrap a replacement session;
 application traffic in the current epoch remains usable.
 
+The public API never uses relay connectivity, peer presence, session creation,
+pending local activation, or a staged membership Commit as permission to send.
+Every send encrypts and persists immediately against durable local state. If a
+Commit is staged, the send uses and advances the staged post-Commit epoch
+without adopting it, and its outbox records the Commit dependency. Murmur
+publishes older current-epoch work first, then every required Welcome and the
+Commit, then the staged-epoch application work. A restart preserves both
+ratchets and this dependency order. The other members may remain offline
+through the entire operation.
+
 Murmur owns synchronization, outbox retry, replay protection, Commit
 resolution, current epochs and ratchets, Welcome processing, and session
 lifecycle. Public APIs do not expose that choreography.
@@ -111,6 +121,11 @@ local state requires restoring a backup or being added again.
 - Exactly one authenticated epoch committer serializes MLS Proposals into
   Commits. Publish success only stages a Commit, and relay order never resolves
   Commit conflicts.
+- No session lifecycle or synchronization state blocks an application send.
+  Sends during creation, pending local activation, or a staged membership
+  change encrypt and persist immediately; staged-epoch sends publish after
+  their Welcome and Commit prerequisites without waiting for peer presence or
+  the sender's own Commit echo.
 - Successful protocol state and any buffered application update are durable
   before queue acknowledgement.
 - A valid bootstrap becomes durable pending local state before acknowledgement,
@@ -127,6 +142,6 @@ local state requires restoring a backup or being added again.
 - Terminally rejected or quarantined deliveries persist replay and queue
   progress without an application effect before acknowledgement.
 - Restarts preserve bounded pending and locally activated sessions, current MLS
-  state, outboxes, replay, and queue progress through application-supplied
-  persistence.
+  and staged epoch state, dependency-ordered outboxes, replay, and queue
+  progress through application-supplied persistence.
 - The relay is never treated as session history or recovery storage.

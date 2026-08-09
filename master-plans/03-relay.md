@@ -58,6 +58,14 @@ Commits through their authenticated epoch committer before publication;
 non-committers publish MLS Proposals instead. Exact authentication, signatures,
 and wire encoding remain implementation details.
 
+Publication never waits for a recipient to be online. Murmur may create an
+entire dependency-ordered outbox while offline, including Welcome deliveries, a
+Commit, and application deliveries encrypted for the staged post-Commit epoch.
+When the relay becomes reachable, Murmur publishes each recipient's
+prerequisites before the deliveries that depend on them. The relay durably
+queues those accepted deliveries within its configured bounds; recipient
+consumption is not part of sender publication.
+
 ## Receiving and trimming
 
 A recipient reads its queue in relay order either through a bounded page or one
@@ -104,6 +112,9 @@ identity directory, or a recovery system.
 - Every ongoing MLS delivery includes the publisher and every other current
   epoch member. The relay does not arbitrate Commits; the MLS epoch committer
   serializes them before publication.
+- A sender may durably prepare Welcome, Commit, and post-Commit application
+  deliveries entirely offline. Later publication preserves their dependency
+  order and never waits for any recipient to connect or consume them.
 - Queue reads may redeliver until the recipient durably processes and
   acknowledges them.
 - Recipient-authenticated SSE streams the exact queued deliveries in one

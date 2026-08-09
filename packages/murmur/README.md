@@ -668,6 +668,14 @@ delivery from its authenticated queue echo, which is why senders also see
 their own messages in `onUpdates`. Payload bytes are opaque to Murmur and the
 relay; versioned typed encoding is the application's or service's job.
 
+Do not wait for `session.status === "active"` before sending. `send()` also
+works immediately after `createSession()` and while a membership Commit from
+`addMember()` or `removeMember()` is still staged. Murmur encrypts those
+packets with the staged post-Commit epoch, advances that ratchet durably, and
+records the dependency. Once connected, it publishes any required Welcomes,
+then the Commit, then the dependent packets. The whole sequence survives a
+restart and never waits for another member to connect.
+
 ### Membership and the committer
 
 ```ts
