@@ -13,14 +13,19 @@ two-person contact session -- hello(profile) --> pending request
       +<------------- hello(profile) -- accept -----+
       |
       v
-durable confirmed contact
+durable confirmed contact + offline MLS admission inventory
 ```
 
-The session descriptor and packets are canonical, versioned JSON encrypted
-inside MLS. A packet is either a profile `hello` or a contact `remove`.
-Application profiles may contain bounded JSON data only. Codec functions return
-defensive immutable values.
+The version-2 hello carries the application profile, fifteen per-contact one-use
+MLS KeyPackages, and one reusable last-resort KeyPackage. The one-use pool is
+consumed when this contact is added to service sessions. A refill request is
+queued before depletion; the last-resort package remains usable repeatedly
+while the peer is offline, and a response rotates the complete inventory.
+
+The technical session carries canonical `hello`, `admission_request`,
+`admission_response`, and `remove` packets encrypted inside MLS. Application
+profiles remain bounded JSON. Codec functions return defensive immutable
+values.
 
 Durable record codecs live in `impl/`. They use a separate
-`murmur/contacts/v1/` namespace so the v0.3.3 session record format remains
-unchanged.
+`murmur/contacts/v2/` namespace.

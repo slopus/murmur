@@ -96,6 +96,7 @@ const OUTBOX_ORDER_PREFIX = "murmur/session-outbox-order/";
 const OUTBOX_SEQUENCE_KEY = "murmur/session-outbox-sequence";
 const KEY_PACKAGE_PREFIX = "murmur/key-packages/";
 const KEY_PACKAGE_EXPIRY_PREFIX = "murmur/key-package-expiries/";
+const KEY_PACKAGE_REUSABLE_PREFIX = "murmur/key-package-reusable/";
 const REJECTED_PREFIX = "murmur/rejected-sessions/";
 const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
@@ -108,7 +109,7 @@ const DEFAULT_MAXIMUM_BUFFERED_EVENTS = 1_000;
 const DEFAULT_MAXIMUM_BUFFERED_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAXIMUM_MEMBERS = 256;
 const DEFAULT_MAXIMUM_CIPHERTEXT_BYTES = 1024 * 1024;
-const MAXIMUM_KEY_PACKAGES = 128;
+const MAXIMUM_KEY_PACKAGES = 8_192;
 const DEFAULT_MAXIMUM_OUTBOXES = 1_000;
 const MAXIMUM_REJECTED_SESSIONS = 256;
 const MAXIMUM_USED_DISCOVERY = 1_024;
@@ -149,6 +150,14 @@ export interface SessionRouteDecision {
     readonly key: string;
     readonly sessionId: Uint8Array;
     readonly owner: SessionOwnerRecord;
+}
+
+/** Authenticated public admission material supplied by the built-in contact layer. */
+export interface SessionMemberMaterial {
+    readonly identity: Uint8Array;
+    readonly keyPackage: MlsKeyPackage;
+    /** Present only for public discovery, whose one-use claim is tracked separately. */
+    readonly discovery?: DiscoveryBundle;
 }
 
 function sessionId(value: Uint8Array): string {
@@ -201,6 +210,10 @@ function keyPackageKey(reference: Uint8Array): string {
 
 function keyPackageExpiryKey(reference: Uint8Array): string {
     return `${KEY_PACKAGE_EXPIRY_PREFIX}${encodeBase64Url(reference)}`;
+}
+
+function keyPackageReusableKey(reference: Uint8Array): string {
+    return `${KEY_PACKAGE_REUSABLE_PREFIX}${encodeBase64Url(reference)}`;
 }
 
 function rejectedKey(id: Uint8Array): string {
@@ -438,6 +451,7 @@ export class SessionEngine {
             readonly reference: Uint8Array;
             readonly bytes: Uint8Array;
             readonly expiresAt: number;
+            readonly reusable?: boolean;
         }[],
     ): Promise<void> {
         await this.#store.transaction(async (transaction) => {
@@ -488,6 +502,11 @@ export class SessionEngine {
                     keyPackageExpiryKey(value.reference),
                     utf8Encode(String(value.expiresAt).padStart(16, "0")),
                 );
+                if (value.reusable === true) {
+                    await transaction.set(keyPackageReusableKey(value.reference), new Uint8Array());
+                } else {
+                    await transaction.delete(keyPackageReusableKey(value.reference));
+                }
             }
         });
     }
@@ -497,6 +516,7 @@ export class SessionEngine {
             for (const reference of references) {
                 await transaction.delete(keyPackageKey(reference));
                 await transaction.delete(keyPackageExpiryKey(reference));
+                await transaction.delete(keyPackageReusableKey(reference));
             }
         });
     }
@@ -508,8 +528,15 @@ export class SessionEngine {
         const expiries = await transaction.scan(KEY_PACKAGE_EXPIRY_PREFIX, {
             limit: MAXIMUM_KEY_PACKAGES + 1,
         });
+        const reusable = await transaction.scan(KEY_PACKAGE_REUSABLE_PREFIX, {
+            limit: MAXIMUM_KEY_PACKAGES + 1,
+        });
         try {
-            if (packages.size > MAXIMUM_KEY_PACKAGES || expiries.size > MAXIMUM_KEY_PACKAGES) {
+            if (
+                packages.size > MAXIMUM_KEY_PACKAGES ||
+                expiries.size > MAXIMUM_KEY_PACKAGES ||
+                reusable.size > MAXIMUM_KEY_PACKAGES
+            ) {
                 throw new Error("Local KeyPackage capacity exceeded");
             }
             const packageKeys = new Set(packages.keys());
@@ -528,6 +555,7 @@ export class SessionEngine {
                 ) {
                     await transaction.delete(expiryKey);
                     await transaction.delete(packageKey);
+                    await transaction.delete(`${KEY_PACKAGE_REUSABLE_PREFIX}${suffix}`);
                 } else {
                     try {
                         if (decodeBase64Url(suffix).length !== 32) {
@@ -537,17 +565,28 @@ export class SessionEngine {
                     } catch {
                         await transaction.delete(expiryKey);
                         await transaction.delete(packageKey);
+                        await transaction.delete(`${KEY_PACKAGE_REUSABLE_PREFIX}${suffix}`);
                     }
                 }
             }
             for (const packageKey of packageKeys) {
                 if (!active.has(packageKey)) {
                     await transaction.delete(packageKey);
+                    await transaction.delete(
+                        `${KEY_PACKAGE_REUSABLE_PREFIX}${packageKey.slice(KEY_PACKAGE_PREFIX.length)}`,
+                    );
+                }
+            }
+            for (const reusableKey of reusable.keys()) {
+                const suffix = reusableKey.slice(KEY_PACKAGE_REUSABLE_PREFIX.length);
+                if (!active.has(`${KEY_PACKAGE_PREFIX}${suffix}`)) {
+                    await transaction.delete(reusableKey);
                 }
             }
         } finally {
             for (const bytes of packages.values()) zeroBytes(bytes);
             for (const bytes of expiries.values()) zeroBytes(bytes);
+            for (const bytes of reusable.values()) zeroBytes(bytes);
         }
     }
 
@@ -597,14 +636,31 @@ export class SessionEngine {
     }
 
     async create(
-        options: CreateMurmurSessionOptions,
+        options: Pick<CreateMurmurSessionOptions, "descriptor"> & {
+            readonly members: readonly (DiscoveryBundle | SessionMemberMaterial)[];
+        },
         owner?: SessionOwnerRecord,
         operation?: (transaction: StoreTransaction, id: Uint8Array) => Promise<void>,
     ): Promise<MurmurSession> {
         if (options.descriptor.length > 1024 * 1024) {
             throw new Error("Session descriptor is too large");
         }
-        const members = options.members;
+        const members: SessionMemberMaterial[] = options.members.map((member) => {
+            if ("keyPackage" in member) {
+                return member;
+            }
+            if (
+                member.keyPackages.length !== 1 ||
+                !verifyDiscoveryBundle(member, { now: this.#now() })
+            ) {
+                throw new Error("Invalid session member discovery bundle");
+            }
+            return {
+                identity: member.identityKey,
+                keyPackage: member.keyPackages[0]!,
+                discovery: member,
+            };
+        });
         if (members.length < 1) {
             throw new Error("A session requires at least two members");
         }
@@ -614,21 +670,28 @@ export class SessionEngine {
         const memberIdentities = new Set<string>();
         for (const member of members) {
             if (
-                member.keyPackages.length !== 1 ||
-                !verifyDiscoveryBundle(member, { now: this.#now() })
+                member.identity.length !== 32 ||
+                !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
+                !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity) ||
+                !equalBytes(member.keyPackage.leafNode.credential.identity, member.identity)
             ) {
-                throw new Error("Invalid session member discovery bundle");
+                throw new Error("Invalid session member KeyPackage");
             }
-            const identity = encodeBase64Url(member.identityKey);
+            const identity = encodeBase64Url(member.identity);
             if (
-                equalBytes(member.identityKey, this.#identity.publicKey) ||
+                equalBytes(member.identity, this.#identity.publicKey) ||
                 memberIdentities.has(identity)
             ) {
                 throw new Error("Session members must be distinct");
             }
             memberIdentities.add(identity);
         }
-        const discoveryClaims = members.map((member) => usedDiscoveryKey(member.keyPackages[0]!));
+        const discoveryMembers = members
+            .map((member) => member.discovery)
+            .filter((member): member is DiscoveryBundle => member !== undefined);
+        const discoveryClaims = discoveryMembers.map((member) =>
+            usedDiscoveryKey(member.keyPackages[0]!),
+        );
         const epoch = createMlsGroup(this.#identity);
         const id = epoch.groupId;
         let checkpoint: Uint8Array | undefined;
@@ -650,7 +713,7 @@ export class SessionEngine {
                     zeroBytes(existingState);
                     throw new Error("Session already exists");
                 }
-                await this.#claimDiscovery(transaction, members);
+                await this.#claimDiscovery(transaction, discoveryMembers);
                 await setAndZero(transaction, stateKey(id), encodeSessionRecord(record));
                 if (owner !== undefined) {
                     await setAndZero(transaction, sessionOwnerKey(id), encodeSessionOwner(owner));
@@ -665,9 +728,9 @@ export class SessionEngine {
             try {
                 await this.#prepareCommit(
                     id,
-                    members.map((bundle) => ({
-                        identity: bundle.identityKey,
-                        keyPackage: bundle.keyPackages[0]!,
+                    members.map((member) => ({
+                        identity: member.identity,
+                        keyPackage: member.keyPackage,
                     })),
                     [],
                     [],
@@ -1096,12 +1159,34 @@ export class SessionEngine {
         });
     }
 
-    async add(id: Uint8Array, bundle: DiscoveryBundle): Promise<void> {
+    async add(
+        id: Uint8Array,
+        input: DiscoveryBundle | SessionMemberMaterial,
+        operation?: (transaction: StoreTransaction) => Promise<void>,
+    ): Promise<void> {
+        let member: SessionMemberMaterial;
+        if ("keyPackage" in input) {
+            member = input;
+        } else {
+            if (
+                input.keyPackages.length !== 1 ||
+                !verifyDiscoveryBundle(input, { now: this.#now() })
+            ) {
+                throw new Error("Invalid Add discovery bundle");
+            }
+            member = {
+                identity: input.identityKey,
+                keyPackage: input.keyPackages[0]!,
+                discovery: input,
+            };
+        }
         if (
-            bundle.keyPackages.length !== 1 ||
-            !verifyDiscoveryBundle(bundle, { now: this.#now() })
+            member.identity.length !== 32 ||
+            !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
+            !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity) ||
+            !equalBytes(member.keyPackage.leafNode.credential.identity, member.identity)
         ) {
-            throw new Error("Invalid Add discovery bundle");
+            throw new Error("Invalid Add KeyPackage");
         }
         await this.#store.transaction(async (transaction) => {
             const stateBytes = await transaction.get(stateKey(id));
@@ -1119,11 +1204,14 @@ export class SessionEngine {
             if (session === undefined || session.status !== "active") {
                 throw new Error("Unknown active session");
             }
-            await this.#claimDiscovery(transaction, [bundle]);
+            if (member.discovery !== undefined) {
+                await this.#claimDiscovery(transaction, [member.discovery]);
+            }
+            await operation?.(transaction);
             if (equalBytes(session.committer, this.#identity.publicKey)) {
                 await this.#prepareCommit(
                     id,
-                    [{ identity: bundle.identityKey, keyPackage: bundle.keyPackages[0]! }],
+                    [{ identity: member.identity, keyPackage: member.keyPackage }],
                     [],
                     [],
                     undefined,
@@ -1132,7 +1220,7 @@ export class SessionEngine {
             } else {
                 await this.#queuePrivate(
                     id,
-                    { version: 1, type: "proposal_add", keyPackage: bundle.keyPackages[0]! },
+                    { version: 1, type: "proposal_add", keyPackage: member.keyPackage },
                     "proposal",
                     transaction,
                 );
@@ -1761,6 +1849,11 @@ export class SessionEngine {
             if (bundleBytes === undefined) {
                 throw new TerminalInboxDeliveryError("unknown_key_package");
             }
+            const reusableBytes = await transaction.get(
+                keyPackageReusableKey(frame.keyPackageReference),
+            );
+            const reusable = reusableBytes !== undefined;
+            if (reusableBytes !== undefined) zeroBytes(reusableBytes);
             let bundle: ReturnType<typeof deserializeMlsKeyPackageBundle>;
             try {
                 bundle = deserializeMlsKeyPackageBundle(bundleBytes);
@@ -1842,8 +1935,11 @@ export class SessionEngine {
                     routingMarkerKey(queued.eventId),
                     encodeSessionRouting({ version: 1, sessionId: frame.groupId }),
                 );
-                await transaction.delete(keyPackageKey(frame.keyPackageReference));
-                await transaction.delete(keyPackageExpiryKey(frame.keyPackageReference));
+                if (!reusable) {
+                    await transaction.delete(keyPackageKey(frame.keyPackageReference));
+                    await transaction.delete(keyPackageExpiryKey(frame.keyPackageReference));
+                    await transaction.delete(keyPackageReusableKey(frame.keyPackageReference));
+                }
             } catch (error: unknown) {
                 if (error instanceof TerminalInboxDeliveryError || protocolComplete) throw error;
                 throw new TerminalInboxDeliveryError("invalid_bootstrap");

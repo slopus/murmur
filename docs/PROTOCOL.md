@@ -1,11 +1,7 @@
 # Protocol
 
-All current formats are version `1`. Murmur v0.3.3 is their compatibility
-baseline: later releases preserve these public wire formats and read or migrate
-persisted client state. Relay schema v3 is the matching storage baseline, and
-later schemas migrate in place without deleting pending relay data. Previous
-Murmur friendship, topic, and event-log formats remain intentionally
-unsupported.
+Relay, discovery, delivery, and MLS session formats are version `1`. The
+built-in contact protocol and its persisted records are version `2`.
 
 ## Identity and discovery
 
@@ -50,6 +46,11 @@ descriptors are offered to registered services; the first `onNewSession`
 returning `true` becomes the durable owner, while a fully declined session is
 consumed. Manually managed sessions remain pending until `activateSession`.
 
+Service sessions normally name confirmed contact identities rather than public
+discovery bundles. Murmur consumes one cached admission KeyPackage from every
+contact and creates the complete group without requiring those contacts to be
+online.
+
 ## Realtime queue stream
 
 `POST /v1/queue/events` authenticates with the same domain-separated signed
@@ -80,11 +81,21 @@ every relevant callback resolves. No Murmur storage transaction is exposed.
 ## Contacts and service packets
 
 The built-in contact descriptor is canonical
-`{"protocol":"murmur.contacts","version":1}`. Its two-person MLS session carries
-only canonical version-1 `hello` profile and `remove` packets. A contact is
-confirmed after both authenticated profile hellos are processed. Profiles are
-bounded JSON and contact state survives restart independently of relay
-connectivity.
+`{"protocol":"murmur.contacts","version":2}`. Its two-person MLS session carries
+canonical `hello`, `admission_request`, `admission_response`, and `remove`
+packets. Each hello includes a bounded application profile, fifteen identity-bound
+one-use MLS KeyPackages, and one long-lived reusable last-resort KeyPackage.
+A contact is confirmed after both authenticated profile/admission hellos are
+processed.
+
+Creating or extending a service group consumes one remote one-use package. At
+the low watermark Murmur durably queues a refill request through the contact
+session. If the contact is offline and the pool empties, the last-resort
+KeyPackage may bootstrap multiple independent groups; its matching private
+bundle is deliberately retained after each Welcome. Every last-resort use also
+requests a refill. A response replaces the remote inventory and rotates the
+fallback. This prioritizes offline availability while ordinary operation keeps
+the stronger deletion-after-one-Welcome property.
 
 Optional services use application-defined typed packets inside ordinary MLS
 application bytes. A stable service ID owns each claimed session durably.

@@ -7,20 +7,20 @@ import {
     utf8Decode,
     type JsonValue,
 } from "../../utils/index.js";
-import type { MurmurContactProfile } from "../types.js";
-import { validateContactProfile } from "./contactCodec.js";
+import type { MurmurContactAdmission, MurmurContactProfile } from "../types.js";
+import { validateContactAdmission, validateContactProfile } from "./contactCodec.js";
 
-export const CONTACT_IDENTITY_PREFIX = "murmur/contacts/v1/by-identity/";
-export const CONTACT_SESSION_PREFIX = "murmur/contacts/v1/by-session/";
-export const CONTACT_HANDSHAKE_PREFIX = "murmur/contacts/v1/handshakes/";
-export const CONTACT_EVENT_PREFIX = "murmur/contacts/v1/events/";
+export const CONTACT_IDENTITY_PREFIX = "murmur/contacts/v2/by-identity/";
+export const CONTACT_SESSION_PREFIX = "murmur/contacts/v2/by-session/";
+export const CONTACT_HANDSHAKE_PREFIX = "murmur/contacts/v2/handshakes/";
+export const CONTACT_EVENT_PREFIX = "murmur/contacts/v2/events/";
 
 const DELIVERY_ID = /^[A-Za-z0-9_-]{32}$/;
 const EVENT_ID = /^[A-Za-z0-9_-]{1,128}$/;
 const MAXIMUM_RECORD_BYTES = 96 * 1024;
 
 export interface ContactRecord {
-    readonly version: 1;
+    readonly version: 2;
     readonly identity: Uint8Array;
     readonly sessionId: Uint8Array;
     readonly localProfile: MurmurContactProfile;
@@ -28,10 +28,15 @@ export interface ContactRecord {
     readonly status: "active" | "removing";
     readonly confirmedAt: number;
     readonly removeDeliveryId?: string;
+    readonly localAdmissionGeneration: number;
+    readonly remoteAdmission: MurmurContactAdmission;
+    readonly refillNeeded: boolean;
+    readonly refillRequestDeliveryId?: string;
+    readonly supplyRequestEventId?: string;
 }
 
 export interface ContactHandshakeRecord {
-    readonly version: 1;
+    readonly version: 2;
     readonly direction: "incoming" | "outgoing";
     readonly identity: Uint8Array;
     readonly sessionId: Uint8Array;
@@ -42,11 +47,13 @@ export interface ContactHandshakeRecord {
     readonly remoteHelloProcessed: boolean;
     readonly requestEventId?: string;
     readonly createdAt: number;
+    readonly localAdmission?: MurmurContactAdmission;
+    readonly remoteAdmission?: MurmurContactAdmission;
 }
 
 export type ContactEventRecord =
     | {
-          readonly version: 1;
+          readonly version: 2;
           readonly type: "requested";
           readonly id: string;
           readonly identity: Uint8Array;
@@ -54,7 +61,7 @@ export type ContactEventRecord =
           readonly profile: MurmurContactProfile;
       }
     | {
-          readonly version: 1;
+          readonly version: 2;
           readonly type: "added";
           readonly id: string;
           readonly identity: Uint8Array;
@@ -63,7 +70,7 @@ export type ContactEventRecord =
           readonly profile: MurmurContactProfile;
       }
     | {
-          readonly version: 1;
+          readonly version: 2;
           readonly type: "removed";
           readonly id: string;
           readonly identity: Uint8Array;
@@ -166,6 +173,19 @@ function nullableProfile(value: unknown): MurmurContactProfile | undefined {
     return value === null ? undefined : validateContactProfile(value);
 }
 
+function admissionJson(admission: MurmurContactAdmission): JsonValue {
+    const value = validateContactAdmission(admission);
+    return {
+        generation: value.generation,
+        oneTimeKeyPackages: value.oneTimeKeyPackages.map(encodeBase64Url),
+        lastResortKeyPackage: encodeBase64Url(value.lastResortKeyPackage),
+    };
+}
+
+function nullableAdmission(value: unknown): MurmurContactAdmission | undefined {
+    return value === null ? undefined : validateContactAdmission(value);
+}
+
 function keyBytes(value: Uint8Array, minimum: number, maximum: number, name: string): string {
     if (value.length < minimum || value.length > maximum) {
         throw new Error(`Invalid ${name}`);
@@ -213,16 +233,22 @@ export function contactEventKey(id: string): string {
 /** Encode one confirmed contact record. */
 export function encodeContactRecord(record: ContactRecord): Uint8Array {
     if (
-        record.version !== 1 ||
+        record.version !== 2 ||
         (record.status !== "active" && record.status !== "removing") ||
         !Number.isSafeInteger(record.confirmedAt) ||
         record.confirmedAt < 0 ||
-        (record.removeDeliveryId !== undefined && !DELIVERY_ID.test(record.removeDeliveryId))
+        (record.removeDeliveryId !== undefined && !DELIVERY_ID.test(record.removeDeliveryId)) ||
+        !Number.isSafeInteger(record.localAdmissionGeneration) ||
+        record.localAdmissionGeneration < 1 ||
+        typeof record.refillNeeded !== "boolean" ||
+        (record.refillRequestDeliveryId !== undefined &&
+            !DELIVERY_ID.test(record.refillRequestDeliveryId)) ||
+        (record.supplyRequestEventId !== undefined && !EVENT_ID.test(record.supplyRequestEventId))
     ) {
         throw new Error("Invalid contact record");
     }
     return canonicalJsonBytes({
-        version: 1,
+        version: 2,
         identity: identityKeyBytes(record.identity, "contact identity"),
         sessionId: keyBytes(record.sessionId, 32, 32, "contact session"),
         localProfile: profileJson(record.localProfile),
@@ -230,6 +256,11 @@ export function encodeContactRecord(record: ContactRecord): Uint8Array {
         status: record.status,
         confirmedAt: record.confirmedAt,
         removeDeliveryId: record.removeDeliveryId ?? null,
+        localAdmissionGeneration: record.localAdmissionGeneration,
+        remoteAdmission: admissionJson(record.remoteAdmission),
+        refillNeeded: record.refillNeeded,
+        refillRequestDeliveryId: record.refillRequestDeliveryId ?? null,
+        supplyRequestEventId: record.supplyRequestEventId ?? null,
     });
 }
 
@@ -247,15 +278,39 @@ export function decodeContactRecord(value: Uint8Array): ContactRecord {
             "status",
             "confirmedAt",
             "removeDeliveryId",
+            "localAdmissionGeneration",
+            "remoteAdmission",
+            "refillNeeded",
+            "refillRequestDeliveryId",
+            "supplyRequestEventId",
         ],
         "contact record",
     );
-    if (input.version !== 1 || (input.status !== "active" && input.status !== "removing")) {
+    if (
+        input.version !== 2 ||
+        (input.status !== "active" && input.status !== "removing") ||
+        typeof input.refillNeeded !== "boolean"
+    ) {
         throw new Error("Invalid contact record");
     }
     const removeDeliveryId = optionalDeliveryId(input.removeDeliveryId, "contact removal delivery");
+    const refillRequestDeliveryId = optionalDeliveryId(
+        input.refillRequestDeliveryId,
+        "contact refill request delivery",
+    );
+    const supplyRequestEventId = optionalEventId(
+        input.supplyRequestEventId,
+        "contact supply request event",
+    );
+    const localAdmissionGeneration = timestamp(
+        input.localAdmissionGeneration,
+        "local contact admission generation",
+    );
+    if (localAdmissionGeneration < 1) {
+        throw new Error("Invalid local contact admission generation");
+    }
     return {
-        version: 1,
+        version: 2,
         identity: identityBytes(input.identity, "contact identity"),
         sessionId: bytes(input.sessionId, 32, 32, "contact session"),
         localProfile: validateContactProfile(input.localProfile),
@@ -263,13 +318,18 @@ export function decodeContactRecord(value: Uint8Array): ContactRecord {
         status: input.status,
         confirmedAt: timestamp(input.confirmedAt, "contact confirmation time"),
         ...(removeDeliveryId === undefined ? {} : { removeDeliveryId }),
+        localAdmissionGeneration,
+        remoteAdmission: validateContactAdmission(input.remoteAdmission),
+        refillNeeded: input.refillNeeded,
+        ...(refillRequestDeliveryId === undefined ? {} : { refillRequestDeliveryId }),
+        ...(supplyRequestEventId === undefined ? {} : { supplyRequestEventId }),
     };
 }
 
 /** Encode one in-progress contact handshake. */
 export function encodeContactHandshakeRecord(record: ContactHandshakeRecord): Uint8Array {
     if (
-        record.version !== 1 ||
+        record.version !== 2 ||
         (record.direction !== "incoming" && record.direction !== "outgoing") ||
         (record.localHelloDeliveryId !== undefined &&
             !DELIVERY_ID.test(record.localHelloDeliveryId)) ||
@@ -280,7 +340,7 @@ export function encodeContactHandshakeRecord(record: ContactHandshakeRecord): Ui
         throw new Error("Invalid contact handshake");
     }
     return canonicalJsonBytes({
-        version: 1,
+        version: 2,
         direction: record.direction,
         identity: identityKeyBytes(record.identity, "contact identity"),
         sessionId: keyBytes(record.sessionId, 32, 32, "contact session"),
@@ -292,6 +352,10 @@ export function encodeContactHandshakeRecord(record: ContactHandshakeRecord): Ui
         remoteHelloProcessed: record.remoteHelloProcessed,
         requestEventId: record.requestEventId ?? null,
         createdAt: record.createdAt,
+        localAdmission:
+            record.localAdmission === undefined ? null : admissionJson(record.localAdmission),
+        remoteAdmission:
+            record.remoteAdmission === undefined ? null : admissionJson(record.remoteAdmission),
     });
 }
 
@@ -312,11 +376,13 @@ export function decodeContactHandshakeRecord(value: Uint8Array): ContactHandshak
             "remoteHelloProcessed",
             "requestEventId",
             "createdAt",
+            "localAdmission",
+            "remoteAdmission",
         ],
         "contact handshake",
     );
     if (
-        input.version !== 1 ||
+        input.version !== 2 ||
         (input.direction !== "incoming" && input.direction !== "outgoing") ||
         typeof input.localHelloProcessed !== "boolean" ||
         typeof input.remoteHelloProcessed !== "boolean"
@@ -330,8 +396,10 @@ export function decodeContactHandshakeRecord(value: Uint8Array): ContactHandshak
         "contact hello delivery",
     );
     const requestEventId = optionalEventId(input.requestEventId, "contact request event");
+    const localAdmission = nullableAdmission(input.localAdmission);
+    const remoteAdmission = nullableAdmission(input.remoteAdmission);
     return {
-        version: 1,
+        version: 2,
         direction: input.direction,
         identity: identityBytes(input.identity, "contact identity"),
         sessionId: bytes(input.sessionId, 32, 32, "contact session"),
@@ -342,16 +410,18 @@ export function decodeContactHandshakeRecord(value: Uint8Array): ContactHandshak
         remoteHelloProcessed: input.remoteHelloProcessed,
         ...(requestEventId === undefined ? {} : { requestEventId }),
         createdAt: timestamp(input.createdAt, "contact handshake creation time"),
+        ...(localAdmission === undefined ? {} : { localAdmission }),
+        ...(remoteAdmission === undefined ? {} : { remoteAdmission }),
     };
 }
 
 /** Encode one durable contact lifecycle callback record. */
 export function encodeContactEventRecord(record: ContactEventRecord): Uint8Array {
-    if (record.version !== 1 || !EVENT_ID.test(record.id)) {
+    if (record.version !== 2 || !EVENT_ID.test(record.id)) {
         throw new Error("Invalid contact event");
     }
     const common = {
-        version: 1,
+        version: 2,
         type: record.type,
         id: record.id,
         identity: identityKeyBytes(record.identity, "contact identity"),
@@ -382,11 +452,11 @@ export function decodeContactEventRecord(value: Uint8Array): ContactEventRecord 
             ["version", "type", "id", "identity", "sessionId", "profile"],
             "contact request event",
         );
-        if (input.version !== 1) {
+        if (input.version !== 2) {
             throw new Error("Invalid contact request event");
         }
         return {
-            version: 1,
+            version: 2,
             type: "requested",
             id: eventId(input.id, "contact event identifier"),
             identity: identityBytes(input.identity, "contact identity"),
@@ -400,11 +470,11 @@ export function decodeContactEventRecord(value: Uint8Array): ContactEventRecord 
             ["version", "type", "id", "identity", "sessionId", "localProfile", "profile"],
             "contact added event",
         );
-        if (input.version !== 1) {
+        if (input.version !== 2) {
             throw new Error("Invalid contact added event");
         }
         return {
-            version: 1,
+            version: 2,
             type: "added",
             id: eventId(input.id, "contact event identifier"),
             identity: identityBytes(input.identity, "contact identity"),
@@ -415,11 +485,11 @@ export function decodeContactEventRecord(value: Uint8Array): ContactEventRecord 
     }
     if (input.type === "removed") {
         exact(input, ["version", "type", "id", "identity", "sessionId"], "contact removed event");
-        if (input.version !== 1) {
+        if (input.version !== 2) {
             throw new Error("Invalid contact removed event");
         }
         return {
-            version: 1,
+            version: 2,
             type: "removed",
             id: eventId(input.id, "contact event identifier"),
             identity: identityBytes(input.identity, "contact identity"),

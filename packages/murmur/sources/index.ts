@@ -57,15 +57,20 @@ export {
     verifyDiscoveryBundle,
 } from "./identity/discovery/index.js";
 export {
+    CONTACT_ADMISSION_LOW_WATERMARK,
+    CONTACT_ADMISSION_MAXIMUM_KEY_PACKAGES,
+    CONTACT_ADMISSION_TARGET_KEY_PACKAGES,
     contactSessionDescriptor,
     decodeContactPacket,
     decodeContactSessionDescriptor,
     encodeContactPacket,
     isContactSessionDescriptor,
+    validateContactAdmission,
     validateContactProfile,
 } from "./contacts/index.js";
 export type {
     MurmurContact,
+    MurmurContactAdmission,
     MurmurContactAdded,
     MurmurContactPacket,
     MurmurContactProfile,

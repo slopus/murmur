@@ -1,18 +1,32 @@
-import { canonicalJsonBytes, equalBytes, utf8Decode, type JsonValue } from "../../utils/index.js";
+import { decodeMlsKeyPackage, encodeMlsKeyPackage, verifyMlsKeyPackage } from "../../mls/index.js";
+import {
+    canonicalJsonBytes,
+    decodeBase64Url,
+    encodeBase64Url,
+    equalBytes,
+    utf8Decode,
+    type JsonValue,
+} from "../../utils/index.js";
 import type {
+    MurmurContactAdmission,
     MurmurContactPacket,
     MurmurContactProfile,
     MurmurContactProfileValue,
 } from "../types.js";
 
 const CONTACT_PROTOCOL = "murmur.contacts";
-const CONTACT_VERSION = 1;
+const CONTACT_VERSION = 2;
 const MAXIMUM_DESCRIPTOR_BYTES = 128;
 const MAXIMUM_PACKET_BYTES = 32 * 1024;
+const MAXIMUM_KEY_PACKAGE_BYTES = 4 * 1024;
 const MAXIMUM_PROFILE_DEPTH = 16;
 const MAXIMUM_PROFILE_NODES = 1_024;
 const MAXIMUM_CONTAINER_ITEMS = 128;
 const MAXIMUM_STRING_CHARACTERS = 4_096;
+
+export const CONTACT_ADMISSION_TARGET_KEY_PACKAGES = 15;
+export const CONTACT_ADMISSION_LOW_WATERMARK = 5;
+export const CONTACT_ADMISSION_MAXIMUM_KEY_PACKAGES = 32;
 
 const DESCRIPTOR = canonicalJsonBytes({
     protocol: CONTACT_PROTOCOL,
@@ -159,6 +173,86 @@ export function validateContactProfile(value: unknown): MurmurContactProfile {
     return cloneValue(value, 0, { nodes: 0 }) as MurmurContactProfile;
 }
 
+function keyPackageBytes(value: unknown, name: string): Uint8Array {
+    if (typeof value !== "string") throw new Error(`Invalid ${name}`);
+    const bytes = decodeBase64Url(value);
+    if (bytes.length < 1 || bytes.length > MAXIMUM_KEY_PACKAGE_BYTES) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const keyPackage = decodeMlsKeyPackage(bytes);
+    if (
+        !verifyMlsKeyPackage(keyPackage, null) ||
+        !equalBytes(encodeMlsKeyPackage(keyPackage), bytes) ||
+        encodeBase64Url(bytes) !== value
+    ) {
+        throw new Error(`Invalid ${name}`);
+    }
+    return bytes;
+}
+
+/** Return a strict defensive copy of one contact admission inventory. */
+export function validateContactAdmission(value: unknown): MurmurContactAdmission {
+    const input = object(value, "contact admission");
+    exact(input, ["generation", "oneTimeKeyPackages", "lastResortKeyPackage"], "contact admission");
+    if (
+        typeof input.generation !== "number" ||
+        !Number.isSafeInteger(input.generation) ||
+        input.generation < 1 ||
+        !Array.isArray(input.oneTimeKeyPackages) ||
+        input.oneTimeKeyPackages.length > CONTACT_ADMISSION_MAXIMUM_KEY_PACKAGES
+    ) {
+        throw new Error("Invalid contact admission");
+    }
+    const oneTimeKeyPackages = input.oneTimeKeyPackages.map((entry, index) =>
+        entry instanceof Uint8Array
+            ? keyPackageBytes(
+                  encodeBase64Url(entry),
+                  `contact admission KeyPackage ${String(index)}`,
+              )
+            : keyPackageBytes(entry, `contact admission KeyPackage ${String(index)}`),
+    );
+    const lastResortKeyPackage =
+        input.lastResortKeyPackage instanceof Uint8Array
+            ? keyPackageBytes(
+                  encodeBase64Url(input.lastResortKeyPackage),
+                  "contact last-resort KeyPackage",
+              )
+            : keyPackageBytes(input.lastResortKeyPackage, "contact last-resort KeyPackage");
+    const encoded = [
+        ...oneTimeKeyPackages.map(encodeBase64Url),
+        encodeBase64Url(lastResortKeyPackage),
+    ];
+    if (new Set(encoded).size !== encoded.length) {
+        throw new Error("Duplicate contact admission KeyPackage");
+    }
+    return Object.freeze({
+        generation: input.generation,
+        oneTimeKeyPackages: Object.freeze(oneTimeKeyPackages),
+        lastResortKeyPackage,
+    });
+}
+
+function admissionJson(admission: MurmurContactAdmission): JsonValue {
+    const value = validateContactAdmission(admission);
+    return {
+        generation: value.generation,
+        oneTimeKeyPackages: value.oneTimeKeyPackages.map(encodeBase64Url),
+        lastResortKeyPackage: encodeBase64Url(value.lastResortKeyPackage),
+    };
+}
+
+function suppliedAdmission(value: unknown): MurmurContactAdmission {
+    const admission = validateContactAdmission(value);
+    if (admission.oneTimeKeyPackages.length !== CONTACT_ADMISSION_TARGET_KEY_PACKAGES) {
+        throw new Error("Contact admission supply must contain fifteen one-use KeyPackages");
+    }
+    return admission;
+}
+
+function suppliedAdmissionJson(admission: MurmurContactAdmission): JsonValue {
+    return admissionJson(suppliedAdmission(admission));
+}
+
 /** Return the one canonical descriptor identifying technical contact sessions. */
 export function contactSessionDescriptor(): Uint8Array {
     return DESCRIPTOR.slice();
@@ -185,6 +279,7 @@ export function encodeContactPacket(packet: MurmurContactPacket): Uint8Array {
     if (packet.type === "hello") {
         const profile = validateContactProfile(packet.profile);
         encoded = canonicalJsonBytes({
+            admission: suppliedAdmissionJson(packet.admission),
             profile: profile as unknown as JsonValue,
             type: "hello",
             version: CONTACT_VERSION,
@@ -192,6 +287,21 @@ export function encodeContactPacket(packet: MurmurContactPacket): Uint8Array {
     } else if (packet.type === "remove") {
         encoded = canonicalJsonBytes({
             type: "remove",
+            version: CONTACT_VERSION,
+        });
+    } else if (packet.type === "admission_request") {
+        if (!Number.isSafeInteger(packet.generation) || packet.generation < 0) {
+            throw new Error("Invalid contact admission request");
+        }
+        encoded = canonicalJsonBytes({
+            generation: packet.generation,
+            type: "admission_request",
+            version: CONTACT_VERSION,
+        });
+    } else if (packet.type === "admission_response") {
+        encoded = canonicalJsonBytes({
+            admission: suppliedAdmissionJson(packet.admission),
+            type: "admission_response",
             version: CONTACT_VERSION,
         });
     } else {
@@ -210,11 +320,12 @@ export function decodeContactPacket(value: Uint8Array): MurmurContactPacket {
         throw new Error("Unsupported contact packet version");
     }
     if (input.type === "hello") {
-        exact(input, ["profile", "type", "version"], "contact hello");
+        exact(input, ["admission", "profile", "type", "version"], "contact hello");
         return Object.freeze({
             version: CONTACT_VERSION,
             type: "hello",
             profile: validateContactProfile(input.profile),
+            admission: suppliedAdmission(input.admission),
         });
     }
     if (input.type === "remove") {
@@ -222,6 +333,29 @@ export function decodeContactPacket(value: Uint8Array): MurmurContactPacket {
         return Object.freeze({
             version: CONTACT_VERSION,
             type: "remove",
+        });
+    }
+    if (input.type === "admission_request") {
+        exact(input, ["generation", "type", "version"], "contact admission request");
+        if (
+            typeof input.generation !== "number" ||
+            !Number.isSafeInteger(input.generation) ||
+            input.generation < 0
+        ) {
+            throw new Error("Invalid contact admission request");
+        }
+        return Object.freeze({
+            version: CONTACT_VERSION,
+            type: "admission_request",
+            generation: input.generation,
+        });
+    }
+    if (input.type === "admission_response") {
+        exact(input, ["admission", "type", "version"], "contact admission response");
+        return Object.freeze({
+            version: CONTACT_VERSION,
+            type: "admission_response",
+            admission: suppliedAdmission(input.admission),
         });
     }
     throw new Error("Unsupported contact packet type");

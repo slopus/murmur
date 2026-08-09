@@ -46,14 +46,32 @@ export interface MurmurContactRemoved {
     readonly sessionId: Uint8Array;
 }
 
+/** Public MLS admission material cached for one confirmed contact relationship. */
+export interface MurmurContactAdmission {
+    readonly generation: number;
+    readonly oneTimeKeyPackages: readonly Uint8Array[];
+    readonly lastResortKeyPackage: Uint8Array;
+}
+
 /** Versioned packet carried by a technical contact session. */
 export type MurmurContactPacket =
     | {
-          readonly version: 1;
+          readonly version: 2;
           readonly type: "hello";
           readonly profile: MurmurContactProfile;
+          readonly admission: MurmurContactAdmission;
       }
     | {
-          readonly version: 1;
+          readonly version: 2;
           readonly type: "remove";
+      }
+    | {
+          readonly version: 2;
+          readonly type: "admission_request";
+          readonly generation: number;
+      }
+    | {
+          readonly version: 2;
+          readonly type: "admission_response";
+          readonly admission: MurmurContactAdmission;
       };

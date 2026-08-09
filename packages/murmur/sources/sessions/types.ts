@@ -72,14 +72,24 @@ export interface MurmurSessionPage {
     readonly cursor: string | null;
 }
 
-/** Construction inputs for one new local session. */
-export interface CreateMurmurSessionOptions {
+interface CreateMurmurSessionCommonOptions {
     readonly descriptor: Uint8Array;
-    /** At least one other member, making the initial MLS group two-or-more. */
-    readonly members: readonly DiscoveryBundle[];
     /** Stable registered service that immediately owns this locally created session. */
     readonly service?: string;
 }
+
+/** Construction inputs for one new local session. */
+export type CreateMurmurSessionOptions =
+    | (CreateMurmurSessionCommonOptions & {
+          /** Confirmed contact identities admitted from their cached KeyPackages. */
+          readonly contacts: readonly Uint8Array[];
+          readonly members?: never;
+      })
+    | (CreateMurmurSessionCommonOptions & {
+          /** Direct discovery material used by low-level bootstrap workflows. */
+          readonly members: readonly DiscoveryBundle[];
+          readonly contacts?: never;
+      });
 
 /** Stateful-session resource limits. */
 export interface MurmurSessionLimits {

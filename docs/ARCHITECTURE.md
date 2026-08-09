@@ -38,6 +38,12 @@ MLS credentials. The supplied `MurmurStore` is authoritative for:
   the identity-wide application-update order;
 - built-in contacts, session-to-service ownership, and service-scoped JSON.
 
+Each confirmed contact also owns an offline admission inventory: fifteen
+one-use public KeyPackages from the peer plus one reusable last-resort package.
+The matching private bundles live only in the peer's store. Group creation
+consumes cached material locally, queues refill before depletion, and can reuse
+the fallback while that peer is offline.
+
 Application history is not reconstructed from the relay. Murmur never exposes
 its storage transaction to event handlers. All durable client state is compound
 keys over one ordered byte key/value store with bounded lexicographic prefix

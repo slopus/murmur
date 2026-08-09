@@ -22,6 +22,15 @@ download its public bundle until expiry. The client always verifies the digest,
 signed expiry, identity signature, and KeyPackage signatures; cache presence is
 not authentication.
 
+Confirmed contacts exchange fifteen one-use KeyPackages and one reusable
+last-resort KeyPackage inside their authenticated technical session. Normal
+group admission deletes private KeyPackage material after one Welcome. The
+fallback deliberately remains available across multiple Welcomes so an offline
+contact can always be added after the one-use pool is exhausted. Compromise of
+that retained fallback can therefore expose captured Welcomes addressed to it;
+the tradeoff is explicit availability rather than deletion-based Welcome
+forward secrecy. Refill rotates the fallback when the contact reconnects.
+
 ## Trust model
 
 The relay is untrusted for confidentiality and correctness. It can delay, drop,

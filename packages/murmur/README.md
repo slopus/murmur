@@ -56,6 +56,7 @@ application separately owns its history and effects.
 - [Identity](#identity)
 - [Invitations and discovery](#invitations-and-discovery)
 - [Contacts](#contacts)
+- [Build a group messenger](#build-a-group-messenger)
 - [Sessions](#sessions)
 - [Typed synchronization services](#typed-synchronization-services)
 - [The synchronization loop](#the-synchronization-loop)
@@ -64,7 +65,7 @@ application separately owns its history and effects.
 - [Security and trust model](#security-and-trust-model)
 - [Running a relay locally](#running-a-relay-locally)
 - [Development](#development)
-- [Compatibility](#compatibility)
+- [Protocol versions](#protocol-versions)
 
 ## Install
 
@@ -383,8 +384,8 @@ unpadded-base64url characters for a QR code or deep link:
 const digest: Uint8Array = await alice.createInvitation();
 // encode those 32 bytes into your QR code / deep link / message
 
-// Bob, the invitee, after receiving the digest out of band:
-const bundle = await bob.resolveInvitation(digest);
+// Bob, after receiving the digest out of band:
+await bob.requestContact(digest, { displayName: "Bob" });
 ```
 
 `resolveInvitation()` downloads the exact bytes by digest and verifies the
@@ -395,8 +396,8 @@ within five minutes of upload.
 
 Treat every invitation as one-use and short-lived:
 
-- Generate a fresh invitation for each attempt; never reuse a bundle for a
-  second session or membership change.
+- Generate a fresh invitation for each initial contact attempt. Established
+  contacts exchange later group-admission material automatically.
 - Complete resolution and the Welcome within five minutes; if either side
   times out, start over with a fresh digest.
 - The digest is an unguessable but bearer capability: anyone holding it can
@@ -477,6 +478,248 @@ Each contact carries both profiles (`localProfile` and `profile`) plus the
 identity key and the technical `sessionId`. Profiles are validated,
 size-bounded JSON; their schema beyond that is yours.
 
+## Build a group messenger
+
+A messenger is one typed service plus one service-owned MLS session per
+conversation. Contacts are the address book and admission layer; the technical
+contact session itself is never used for chat.
+
+Murmur and the chat service own different parts:
+
+| Murmur owns                          | Your chat service owns                          |
+| ------------------------------------ | ----------------------------------------------- |
+| identity keys and confirmed contacts | group title and application group ID            |
+| cached offline group-admission keys  | message packet schema                           |
+| MLS epochs and membership changes    | message persistence and pagination              |
+| encrypted outboxes, replay, and sync | edits, reactions, receipts, and ordering policy |
+
+### 1. Implement the service
+
+This minimal service claims descriptors for `chat.v1`, validates text-message
+packets, and stores each message under the stable relay event ID. Using
+`update.id` as the key makes replay after a crash idempotent.
+
+```ts
+import {
+    createMurmurServiceStorage,
+    type MurmurService,
+    type MurmurServiceSessionDescriptor,
+    type MurmurServiceStorage,
+    type MurmurUpdate,
+} from "@slopus/murmur";
+
+const CHAT_SERVICE_ID = "chat.v1";
+const encoder = new TextEncoder();
+const decoder = new TextDecoder("utf-8", { fatal: true });
+
+type ChatGroup = {
+    version: 1;
+    service: "chat";
+    groupId: string;
+    title: string;
+};
+
+type ChatPacket = {
+    version: 1;
+    type: "message";
+    messageId: string;
+    sentAt: number;
+    text: string;
+};
+
+function bytesKey(bytes: Uint8Array): string {
+    return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+function encodeJson(value: ChatGroup | ChatPacket): Uint8Array {
+    return encoder.encode(JSON.stringify(value));
+}
+
+function decodeObject(bytes: Uint8Array): Record<string, unknown> | undefined {
+    try {
+        const value: unknown = JSON.parse(decoder.decode(bytes));
+        return value !== null && typeof value === "object" && !Array.isArray(value)
+            ? (value as Record<string, unknown>)
+            : undefined;
+    } catch {
+        return undefined;
+    }
+}
+
+function decodeGroup(bytes: Uint8Array): ChatGroup | undefined {
+    const value = decodeObject(bytes);
+    return value?.version === 1 &&
+        value.service === "chat" &&
+        typeof value.groupId === "string" &&
+        value.groupId.length > 0 &&
+        typeof value.title === "string" &&
+        value.title.length <= 120
+        ? (value as ChatGroup)
+        : undefined;
+}
+
+function decodePacket(bytes: Uint8Array): ChatPacket | undefined {
+    const value = decodeObject(bytes);
+    return value?.version === 1 &&
+        value.type === "message" &&
+        typeof value.messageId === "string" &&
+        typeof value.sentAt === "number" &&
+        Number.isSafeInteger(value.sentAt) &&
+        typeof value.text === "string" &&
+        value.text.length <= 4_000
+        ? (value as ChatPacket)
+        : undefined;
+}
+
+class ChatService implements MurmurService {
+    constructor(private readonly storage: MurmurServiceStorage) {}
+
+    async onNewSession(session: MurmurServiceSessionDescriptor): Promise<boolean> {
+        const group = decodeGroup(session.descriptor);
+        if (group === undefined) return false;
+        await this.rememberGroup(session.id, group);
+        return true; // claims and activates this incoming session
+    }
+
+    async onUpdate(update: MurmurUpdate): Promise<void> {
+        const packet = decodePacket(update.bytes);
+        if (packet === undefined) return; // unsupported packets have no effect
+        const session = bytesKey(update.sessionId);
+        await this.storage.set(`messages/${session}/${update.id}`, {
+            eventId: update.id,
+            sender: bytesKey(update.sender),
+            ...packet,
+        });
+    }
+
+    async rememberGroup(sessionId: Uint8Array, group: ChatGroup): Promise<void> {
+        await this.storage.set(`groups/${bytesKey(sessionId)}`, group);
+    }
+
+    async messagePage(
+        sessionId: Uint8Array,
+        after?: string,
+    ): Promise<ReadonlyMap<string, unknown>> {
+        const prefix = `messages/${bytesKey(sessionId)}/`;
+        return this.storage.scan(prefix, {
+            ...(after === undefined ? {} : { after }),
+            limit: 100,
+        });
+    }
+}
+```
+
+Create the service-scoped storage before opening the client, register the
+service before synchronization starts, and reuse the same durable
+`MurmurStore`:
+
+```ts
+const chatStorage = createMurmurServiceStorage(store, CHAT_SERVICE_ID);
+const chat = new ChatService(chatStorage);
+
+const murmur = await MurmurClient.open({
+    relay: "https://relay.example",
+    store,
+    services: [{ id: CHAT_SERVICE_ID, service: chat }],
+});
+
+const abort = new AbortController();
+const running = murmur.sync({ abort: abort.signal });
+```
+
+Every participant must register the same service ID. An incoming descriptor
+that `onNewSession` accepts is automatically activated and durably assigned to
+that service.
+
+### 2. Start a group with N people
+
+First establish ordinary Murmur contacts. Contact hellos automatically exchange
+fifteen one-use MLS KeyPackages plus a reusable last-resort package. Murmur
+refills that inventory in the background, so starting a group does not require
+the other people to be online or exchange new invitation links.
+
+For N total people, the creator supplies the identities of the other N−1
+confirmed contacts:
+
+```ts
+const descriptor: ChatGroup = {
+    version: 1,
+    service: "chat",
+    groupId: globalThis.crypto.randomUUID(),
+    title: "Weekend plans",
+};
+
+// Alice + Bob + Carol = a three-person MLS group.
+const group = await alice.createSession({
+    descriptor: encodeJson(descriptor),
+    contacts: [bobIdentity, carolIdentity],
+    service: CHAT_SERVICE_ID,
+});
+
+// onNewSession runs only for receivers, so the creator records local metadata.
+await aliceChat.rememberGroup(group.id, descriptor);
+```
+
+`createSession()` consumes one cached admission package per contact and
+durably queues the Welcomes. Bob and Carol may be completely offline. Normal
+packages are one-use; refill begins at five remaining. If the fifteen-package
+pool is exhausted before a response arrives, Murmur reuses that contact's
+last-resort package and keeps requesting a rotated inventory. Group creation
+does not wait for the contact to reconnect.
+
+### 3. Send and receive messages
+
+The application encodes its typed packet and sends it through the group
+session:
+
+```ts
+const message: ChatPacket = {
+    version: 1,
+    type: "message",
+    messageId: globalThis.crypto.randomUUID(),
+    sentAt: Date.now(),
+    text: "Dinner at seven?",
+};
+
+await alice.send(group.id, encodeJson(message));
+```
+
+`send()` only needs local durable storage. The running sync loop publishes the
+outbox when connected. Every member, including Alice, receives the encrypted
+echo through `ChatService.onUpdate`, so the same persistence path records sent
+and received messages.
+
+```ts
+const page = await aliceChat.messagePage(group.id);
+for (const message of page.values()) {
+    console.log(message);
+}
+```
+
+Service-owned updates are also visible in global `onUpdates` with
+`update.service === "chat.v1"`. Treat that as observation; do not apply the
+message a second time there.
+
+### 4. Change membership
+
+Adding another confirmed contact also consumes its cached admission material
+and works while that contact is offline:
+
+```ts
+await alice.addMember(group.id, daveIdentity);
+await alice.removeMember(group.id, carolIdentity);
+```
+
+The epoch committer applies the change directly. Calls from another member
+create authenticated proposals; the committer lists them with `proposals()` and
+accepts them with `acceptProposals()`.
+
+Relay order is defined per identity inbox, not globally across every member.
+For a basic messenger, local inbox order is enough. If concurrent messages must
+render in exactly the same order everywhere, put a Lamport counter or another
+deterministic merge rule in `ChatPacket`; that policy belongs to the chat
+service rather than Murmur.
+
 ## Sessions
 
 Everything conversational in Murmur — two-person or group — is one MLS
@@ -486,18 +729,15 @@ authenticated _committer_ per epoch who serializes membership changes.
 
 ### Creating a session
 
-Creating a session takes the descriptor and one fresh `DiscoveryBundle` per
-initial peer. Murmur creates the MLS group, commits the adds, and publishes
-each new member's encrypted Welcome to their authenticated relay queue:
+Creating a session takes the descriptor and at least one confirmed contact.
+Murmur consumes cached admission material, creates the MLS group, commits the
+adds, and publishes each new member's encrypted Welcome to their authenticated
+relay queue:
 
 ```ts
-// Each prospective member creates fresh invitation material; Alice resolves it.
-const bobBundle = await alice.resolveInvitation(await bob.createInvitation());
-const carolBundle = await alice.resolveInvitation(await carol.createInvitation());
-
 const session = await alice.createSession({
     descriptor: new TextEncoder().encode("notes/v1"),
-    members: [bobBundle, carolBundle],
+    contacts: [bobIdentity, carolIdentity],
     service: "notes", // optional: durably owned by this registered service
 });
 // session.id, session.status, session.members, session.committer
@@ -549,8 +789,7 @@ relay; versioned typed encoding is the application's or service's job.
 ### Membership and the committer
 
 ```ts
-const daveBundle = await alice.resolveInvitation(await dave.createInvitation());
-await alice.addMember(session.id, daveBundle);
+await alice.addMember(session.id, daveIdentity);
 await alice.removeMember(session.id, carolIdentity); // 32-byte identity key
 ```
 
@@ -631,7 +870,7 @@ sessions alike:
 ```ts
 const notesSession = await murmur.createSession({
     descriptor: new TextEncoder().encode("notes/v1"),
-    members: [bobBundle, carolBundle],
+    contacts: [bobIdentity, carolIdentity],
     service: "notes",
 });
 await murmur.send(notesSession.id, encodeNotePacket({ type: "insert", text: "hi" }));
@@ -805,6 +1044,11 @@ cursor, republishes pending outboxes, and re-offers any uncommitted batch.
   recipient: contact requests need an explicit accept, ownerless sessions may
   require explicit activation, and pending state is strictly bounded against
   flooding.
+- **Offline contact admission is an availability tradeoff.** Contacts normally
+  use one-use KeyPackages, but retain one reusable last-resort package so group
+  creation cannot be blocked by an offline peer. Compromise of that retained
+  fallback can expose captured Welcomes encrypted to it; refill rotates it when
+  the contact reconnects.
 - **No recovery from the relay.** Acknowledged deliveries are deleted; the
   relay is never history. A lost store means lost sessions — plan real
   backups of the application store.
@@ -860,13 +1104,8 @@ Deeper reference material lives in the repository docs:
 [relay API](https://github.com/slopus/murmur/blob/main/docs/RELAY_API.md), and
 [security notes](https://github.com/slopus/murmur/blob/main/docs/SECURITY.md).
 
-## Compatibility
+## Protocol versions
 
-Murmur v0.3.3 and relay schema v3 are the compatibility baseline. From that
-release onward, public `@slopus/murmur` APIs and wire formats stay
-backward-compatible, persisted client state remains readable or is migrated,
-and relay schema upgrades migrate existing databases in place without deleting
-pending data or requiring a clean database.
-
-Pre-v0.3 friendship, topic, retained-event, storage, and CLI formats remain
-unsupported.
+Murmur v0.4 uses contact protocol and contact storage version 2. It is a clean
+break from the v0.3 contact format. Relay schema v3 remains unchanged because
+the relay stores only opaque deliveries and invitation bytes.

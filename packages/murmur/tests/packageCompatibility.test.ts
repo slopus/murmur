@@ -52,6 +52,9 @@ describe("published package compatibility", () => {
 const loaded = await import("@slopus/murmur");
 const names = Object.keys(loaded).sort();
 if (JSON.stringify(names) !== JSON.stringify([
+    "CONTACT_ADMISSION_LOW_WATERMARK",
+    "CONTACT_ADMISSION_MAXIMUM_KEY_PACKAGES",
+    "CONTACT_ADMISSION_TARGET_KEY_PACKAGES",
     "DISCOVERY_INVITATION_TTL_MILLISECONDS",
     "DeliveryAcknowledgementFutureError",
     "DeliveryCursorTrimmedError",
@@ -90,6 +93,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "signedDeliveryToJson",
     "signedInboxAckToJson",
     "signedInboxReadToJson",
+    "validateContactAdmission",
     "validateContactProfile",
     "validateMurmurServiceRegistration",
     "validateServiceId",
