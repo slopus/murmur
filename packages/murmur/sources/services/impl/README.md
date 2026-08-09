@@ -1,13 +1,14 @@
 # Service internals
 
-Mechanical persistence used by the optional service layer.
+Mechanical validation and routing persistence used by the optional service
+layer.
 
 ```text
-service id -> encoded namespace -> canonical JSON values
+service id -> strict stable identifier
 session id -> session owner
 event UUID -> routed-session marker
 ```
 
-`serviceStorage.ts` validates stable IDs, relative keys, JSON bounds, and scan
-bounds. `serviceRecords.ts` owns strict versioned codecs for durable routing.
-Decoders reject unknown fields and non-canonical JSON.
+`serviceId.ts` validates stable IDs. `serviceRecords.ts` owns strict versioned
+codecs for Murmur's durable routing. Decoders reject unknown fields and
+non-canonical JSON. Custom-service application state is outside this module.

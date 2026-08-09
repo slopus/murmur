@@ -81,17 +81,13 @@ export type {
 } from "./contacts/index.js";
 export {
     createMurmurServiceSessionDescriptor,
-    createMurmurServiceStorage,
     validateMurmurServiceRegistration,
     validateServiceId,
 } from "./services/index.js";
 export type {
     MurmurService,
-    MurmurServiceJsonValue,
     MurmurServiceRegistration,
     MurmurServiceSessionDescriptor,
-    MurmurServiceStorage,
-    MurmurServiceStorageScanOptions,
 } from "./services/index.js";
 export { MurmurClient } from "./sessions/index.js";
 export type {

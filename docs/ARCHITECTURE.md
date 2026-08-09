@@ -36,7 +36,7 @@ MLS credentials. The supplied `MurmurStore` is authoritative for:
 - inbox cursor, replay protection, and terminal rejections;
 - accepted proposals, pending-session state, bounded opaque event buffers, and
   the identity-wide application-update order;
-- built-in contacts, session-to-service ownership, and service-scoped JSON.
+- built-in contacts and session-to-service ownership.
 
 Each confirmed contact also owns an offline admission inventory: fifteen
 one-use public KeyPackages from the peer plus one reusable last-resort package.
@@ -50,7 +50,8 @@ keys over one ordered byte key/value store with bounded lexicographic prefix
 scans. Active-session events enter one identity-wide UUIDv7-ordered local
 index. Contact handling, registered service callbacks, and global `onUpdates`
 participate in one batch; Murmur removes it only after every relevant callback
-resolves.
+resolves. Custom services own any application persistence separately from
+`MurmurStore`.
 
 ## Relay ownership
 

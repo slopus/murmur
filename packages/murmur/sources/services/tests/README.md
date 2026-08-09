@@ -1,8 +1,7 @@
 # Service tests
 
-Public service registration, descriptor copying, and scoped JSON persistence
-tests.
+Public service registration, descriptor copying, and durable routing tests.
 
 ```text
-service API -> memory store -> isolated versioned namespace
+service API -> callback routing -> durable owner record
 ```

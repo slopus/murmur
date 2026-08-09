@@ -48,11 +48,9 @@ import {
 } from "../contacts/index.js";
 import {
     createMurmurServiceSessionDescriptor,
-    createMurmurServiceStorage,
     validateMurmurServiceRegistration,
     type MurmurService,
     type MurmurServiceRegistration,
-    type MurmurServiceStorage,
 } from "../services/index.js";
 import {
     SessionEngine,
@@ -116,7 +114,6 @@ export interface MurmurClientOptions {
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
     readonly #engine: SessionEngine;
-    readonly #store: MurmurStore;
     readonly #contacts: ContactEngine;
     readonly #services = new Map<string, MurmurService>();
     readonly #discoveryTransport: DiscoveryTransport | undefined;
@@ -140,7 +137,6 @@ export class MurmurClient {
         services: readonly MurmurServiceRegistration[],
     ) {
         this.#identity = identity;
-        this.#store = store;
         this.#now = now;
         this.#discoveryTransport = discoveryTransport;
         this.#engine = new SessionEngine(identity, store, transport, limits, now);
@@ -253,12 +249,6 @@ export class MurmurClient {
     unregisterService(id: string): void {
         this.#assertOpen();
         this.#services.delete(id);
-    }
-
-    /** Open JSON persistence restricted to one service namespace. */
-    serviceStorage(id: string): MurmurServiceStorage {
-        this.#assertOpen();
-        return createMurmurServiceStorage(this.#store, id);
     }
 
     /** Create and durably retain fresh one-use KeyPackages in a signed bundle. */

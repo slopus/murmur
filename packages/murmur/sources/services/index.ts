@@ -1,15 +1,12 @@
 import type { MurmurSession } from "../sessions/types.js";
-import { validateServiceId } from "./impl/serviceStorage.js";
+import { validateServiceId } from "./impl/serviceId.js";
 import type { MurmurServiceRegistration, MurmurServiceSessionDescriptor } from "./types.js";
 
-export { createMurmurServiceStorage, validateServiceId } from "./impl/serviceStorage.js";
+export { validateServiceId } from "./impl/serviceId.js";
 export type {
     MurmurService,
-    MurmurServiceJsonValue,
     MurmurServiceRegistration,
     MurmurServiceSessionDescriptor,
-    MurmurServiceStorage,
-    MurmurServiceStorageScanOptions,
 } from "./types.js";
 
 /** Validate one service registration before it participates in durable routing. */

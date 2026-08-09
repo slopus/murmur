@@ -155,7 +155,7 @@ Murmur never talks to a database itself. The application supplies one
 `MurmurStore`, an atomic ordered string-key/byte-value interface, and Murmur
 keeps everything durable inside it under Murmur-owned key namespaces: the
 identity root, MLS epochs and ratchet checkpoints, KeyPackages, pending
-sessions, contacts, service state, outboxes, and replay/queue progress.
+sessions, contacts, session routing, outboxes, and replay/queue progress.
 
 ```ts
 interface MurmurStore {
@@ -187,120 +187,10 @@ The contract that matters:
 - **Values are bytes.** Return defensive copies; Murmur zeroes buffers it no
   longer needs.
 
-A realistic minimal Node implementation over `node:sqlite` (Node 22.5+):
-
-```ts
-import { DatabaseSync } from "node:sqlite";
-import type { MurmurStore, StoreScanOptions, StoreTransaction } from "@slopus/murmur";
-
-export class SqliteMurmurStore implements MurmurStore {
-    readonly #database: DatabaseSync;
-    #tail: Promise<unknown> = Promise.resolve();
-
-    constructor(path: string) {
-        this.#database = new DatabaseSync(path);
-        this.#database.exec("PRAGMA journal_mode = WAL");
-        this.#database.exec(
-            "CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value BLOB NOT NULL)",
-        );
-    }
-
-    async get(key: string): Promise<Uint8Array | undefined> {
-        return this.#serialized(() => this.#get(key));
-    }
-
-    async set(key: string, value: Uint8Array): Promise<void> {
-        await this.#serialized(() => this.#set(key, value));
-    }
-
-    async delete(key: string): Promise<void> {
-        await this.#serialized(() => this.#delete(key));
-    }
-
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#serialized(() => this.#scan(prefix, { limit: 10_000 }));
-    }
-
-    async scan(
-        prefix: string,
-        options: StoreScanOptions,
-    ): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#serialized(() => this.#scan(prefix, options));
-    }
-
-    async transaction<Result>(
-        operation: (transaction: StoreTransaction) => Promise<Result>,
-    ): Promise<Result> {
-        return this.#serialized(async () => {
-            this.#database.exec("BEGIN IMMEDIATE");
-            try {
-                const result = await operation({
-                    get: async (key) => this.#get(key),
-                    set: async (key, value) => this.#set(key, value),
-                    delete: async (key) => this.#delete(key),
-                    list: async (prefix) => this.#scan(prefix, { limit: 10_000 }),
-                    scan: async (prefix, options) => this.#scan(prefix, options),
-                });
-                this.#database.exec("COMMIT");
-                return result;
-            } catch (error: unknown) {
-                this.#database.exec("ROLLBACK");
-                throw error;
-            }
-        });
-    }
-
-    #get(key: string): Uint8Array | undefined {
-        const row = this.#database.prepare("SELECT value FROM kv WHERE key = ?").get(key) as
-            | { value: Uint8Array }
-            | undefined;
-        return row?.value.slice();
-    }
-
-    #set(key: string, value: Uint8Array): void {
-        this.#database
-            .prepare("INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)")
-            .run(key, value.slice());
-    }
-
-    #delete(key: string): void {
-        this.#database.prepare("DELETE FROM kv WHERE key = ?").run(key);
-    }
-
-    #scan(prefix: string, options: StoreScanOptions): ReadonlyMap<string, Uint8Array> {
-        if (
-            !Number.isSafeInteger(options.limit) ||
-            options.limit < 1 ||
-            options.limit > 10_000 ||
-            (options.after !== undefined && !options.after.startsWith(prefix))
-        ) {
-            throw new Error("Invalid Murmur store scan");
-        }
-        const rows = this.#database
-            .prepare("SELECT key, value FROM kv WHERE key >= ? AND key > ? ORDER BY key LIMIT ?")
-            .all(prefix, options.after ?? "", options.limit) as {
-            key: string;
-            value: Uint8Array;
-        }[];
-        const result = new Map<string, Uint8Array>();
-        for (const row of rows) {
-            if (!row.key.startsWith(prefix)) break;
-            result.set(row.key, row.value.slice());
-        }
-        return result;
-    }
-
-    #serialized<Result>(operation: () => Result | Promise<Result>): Promise<Result> {
-        const next = this.#tail.then(operation);
-        this.#tail = next.catch(() => undefined);
-        return next;
-    }
-}
-```
-
-In a browser, back the same interface with IndexedDB. Whatever the backend,
-treat the store as the identity itself: back it up as a whole, never share it
-between two live clients, and never hand-edit Murmur's keys.
+Use a durable adapter appropriate for your runtime. Treat the store as the
+Murmur identity itself: back it up as a whole, never share it between two live
+clients, and never hand-edit Murmur's keys. Custom services do not receive or
+store application state in `MurmurStore`; they own any persistence separately.
 
 ## Identity
 
@@ -496,15 +386,13 @@ Murmur and the chat service own different parts:
 ### 1. Implement the service
 
 This minimal service claims descriptors for `chat.v1`, validates text-message
-packets, and stores each message under the stable relay event ID. Using
-`update.id` as the key makes replay after a crash idempotent.
+packets, and hands them to the application with the stable relay event ID.
+Applications that persist messages should deduplicate on `update.id`.
 
 ```ts
 import {
-    createMurmurServiceStorage,
     type MurmurService,
     type MurmurServiceSessionDescriptor,
-    type MurmurServiceStorage,
     type MurmurUpdate,
 } from "@slopus/murmur";
 
@@ -526,6 +414,19 @@ type ChatPacket = {
     sentAt: number;
     text: string;
 };
+
+type ReceivedChatMessage = ChatPacket & {
+    eventId: string;
+    session: string;
+    sender: string;
+};
+
+interface ChatApplication {
+    onGroup(session: string, group: ChatGroup): void | Promise<void>;
+    onMessage(message: ReceivedChatMessage): void | Promise<void>;
+}
+
+declare const chatApplication: ChatApplication;
 
 function bytesKey(bytes: Uint8Array): string {
     return Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
@@ -572,50 +473,34 @@ function decodePacket(bytes: Uint8Array): ChatPacket | undefined {
 }
 
 class ChatService implements MurmurService {
-    constructor(private readonly storage: MurmurServiceStorage) {}
+    constructor(private readonly application: ChatApplication) {}
 
     async onNewSession(session: MurmurServiceSessionDescriptor): Promise<boolean> {
         const group = decodeGroup(session.descriptor);
         if (group === undefined) return false;
-        await this.rememberGroup(session.id, group);
+        await this.application.onGroup(bytesKey(session.id), group);
         return true; // claims and activates this incoming session
     }
 
     async onUpdate(update: MurmurUpdate): Promise<void> {
         const packet = decodePacket(update.bytes);
         if (packet === undefined) return; // unsupported packets have no effect
-        const session = bytesKey(update.sessionId);
-        await this.storage.set(`messages/${session}/${update.id}`, {
+        await this.application.onMessage({
             eventId: update.id,
+            session: bytesKey(update.sessionId),
             sender: bytesKey(update.sender),
             ...packet,
-        });
-    }
-
-    async rememberGroup(sessionId: Uint8Array, group: ChatGroup): Promise<void> {
-        await this.storage.set(`groups/${bytesKey(sessionId)}`, group);
-    }
-
-    async messagePage(
-        sessionId: Uint8Array,
-        after?: string,
-    ): Promise<ReadonlyMap<string, unknown>> {
-        const prefix = `messages/${bytesKey(sessionId)}/`;
-        return this.storage.scan(prefix, {
-            ...(after === undefined ? {} : { after }),
-            limit: 100,
         });
     }
 }
 ```
 
-Create the service-scoped storage before opening the client, register the
-service before synchronization starts, and reuse the same durable
-`MurmurStore`:
+Connect the service to your application, register it before synchronization
+starts, and let the application persist messages however it chooses. Murmur
+does not provide or pass storage to the service:
 
 ```ts
-const chatStorage = createMurmurServiceStorage(store, CHAT_SERVICE_ID);
-const chat = new ChatService(chatStorage);
+const chat = new ChatService(chatApplication);
 
 const murmur = await MurmurClient.open({
     relay: "https://relay.example",
@@ -657,7 +542,7 @@ const group = await alice.createSession({
 });
 
 // onNewSession runs only for receivers, so the creator records local metadata.
-await aliceChat.rememberGroup(group.id, descriptor);
+await chatApplication.onGroup(bytesKey(group.id), descriptor);
 ```
 
 `createSession()` consumes one cached admission package per contact and
@@ -684,17 +569,10 @@ const message: ChatPacket = {
 await alice.send(group.id, encodeJson(message));
 ```
 
-`send()` only needs local durable storage. The running sync loop publishes the
-outbox when connected. Every member, including Alice, receives the encrypted
-echo through `ChatService.onUpdate`, so the same persistence path records sent
-and received messages.
-
-```ts
-const page = await aliceChat.messagePage(group.id);
-for (const message of page.values()) {
-    console.log(message);
-}
-```
+`send()` only needs Murmur's local durable state. The running sync loop
+publishes the outbox when connected. Every member, including Alice, receives
+the encrypted echo through `ChatService.onUpdate`, so `ChatApplication` handles
+sent and received messages through one path.
 
 Service-owned updates are also visible in global `onUpdates` with
 `update.service === "chat.v1"`. Treat that as observation; do not apply the
@@ -876,25 +754,15 @@ const notesSession = await murmur.createSession({
 await murmur.send(notesSession.id, encodeNotePacket({ type: "insert", text: "hi" }));
 ```
 
-Each service also gets private durable JSON persistence in the application's
-store, namespaced by service ID:
+Murmur provides no service storage. A custom service owns application state
+through whatever persistence its application chooses; `MurmurStore` remains
+private to the engine and built-in Murmur domains. Murmur durably stores only
+the session-to-service routing association.
 
-```ts
-const storage = murmur.serviceStorage("notes");
-await storage.set("settings", { notifications: true });
-const settings = await storage.get("settings");
-const page = await storage.scan("documents/", { limit: 100 });
-```
-
-Values are canonical JSON up to one MiB; scans return 1–256 ordered entries
-per page. Service state restores before relay connectivity, so service reads
-and local mutations work offline. Murmur never exposes its underlying storage
-transaction to service or application code.
-
-`unregisterService(id)` removes the handler without touching its durable
-service state or owner mappings. It is not a pause mechanism: updates arriving
-for that service's already-owned sessions are acknowledged and discarded while
-the handler is absent, and registering it again does not replay them. Unregister
+`unregisterService(id)` removes the handler without touching Murmur's durable
+owner mappings. It is not a pause mechanism: updates arriving for that
+service's already-owned sessions are acknowledged and discarded while the
+handler is absent, and registering it again does not replay them. Unregister
 only when that loss is intentional.
 
 ## The synchronization loop
@@ -974,8 +842,8 @@ is active.
 ## Durability, offline use, and idempotency
 
 Murmur is offline-first. Opening a client restores identity, contacts,
-sessions, and service state from the store before any relay contact, so local
-reads and mutations work immediately. Sends and membership changes made
+sessions, and service routing from the store before any relay contact, so
+Murmur reads and mutations work immediately. Sends and membership changes made
 offline persist as durable outboxes and publish when connectivity returns.
 Unacknowledged inbound deliveries wait in the relay queue within its quota and
 TTL — the queue bound defines the maximum supported offline window, not an
@@ -984,24 +852,10 @@ archive.
 Delivery to the application is _at-least-once with stable IDs_. Murmur
 deduplicates protocol-level redelivery internally, but an application callback
 that ran without its batch committing (a throw, a crash, a power cut) will see
-the same updates again. If your effects live outside the `MurmurStore` — a
-database, a filesystem, an outbound API call — key them on the stable
-`update.id`:
-
-```ts
-onUpdates: async (updates) => {
-    for (const update of updates) {
-        await database.transaction(async (tx) => {
-            if (await tx.hasProcessed(update.id)) return; // seen before a crash
-            await tx.apply(update.bytes);
-            await tx.markProcessed(update.id);
-        });
-    }
-},
-```
-
-The same applies to contact lifecycle events and service `onUpdate` calls:
-each carries a stable `id` precisely so replays are cheap to detect.
+the same updates again. Custom-service effects live outside `MurmurStore`, so
+deduplicate them using the stable `update.id`. The same applies to contact
+lifecycle events and service `onUpdate` calls: each carries a stable `id`
+precisely so replays are cheap to detect.
 
 ## Graceful shutdown
 

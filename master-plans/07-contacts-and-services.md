@@ -37,10 +37,10 @@ own services and sessions.
 
 ## Persistence, routing, and offline use
 
-Contact lists, profiles, relationship state, service state, session routing,
-and offline outboxes use the application-supplied `MurmurStore` under
-Murmur-owned namespaces. They survive restart. Opening the client immediately
-restores contacts and service state, so local reads and mutations work offline
+Contact lists, profiles, relationship state, session routing, and offline
+outboxes use the application-supplied `MurmurStore` under Murmur-owned
+namespaces. They survive restart. Opening the client immediately restores
+contacts and routing state, so local reads and Murmur mutations work offline
 before the relay connects or synchronization begins. Durable offline outboxes
 converge when connectivity returns.
 
@@ -57,11 +57,11 @@ acknowledges its unknown updates. They are ignored for now, are not surfaced
 through a raw application `onUpdates` fallback, and cannot block later entries
 in the identity inbox.
 
-Services persist their own typed protocol state in the application-supplied
-`MurmurStore` under Murmur-owned namespaces. Service-owned sessions may send
-packets and add or remove members. Opening the client restores the owner mapping
-and service state before relay connectivity, so local reads and mutations keep
-working offline.
+Custom services own their persistence independently of `MurmurStore`. Murmur
+does not provide service storage or expose its store to services. Service-owned
+sessions may send packets and add or remove members. Opening the client restores
+the Murmur-owned session owner mapping; each service restores any application
+state it needs through its own persistence.
 
 The main synchronization options expose optional typed contact lifecycle
 callbacks, including `onContactRequested`, `onContactAdded`, and
@@ -100,8 +100,9 @@ its Noble-only runtime dependency boundary.
 - Confirmed contact state and its two-person technical session survive restart
   and are usable offline before synchronization.
 - Optional strictly typed services are registered on `MurmurClient`, expose
-  exactly `onNewSession` and `onUpdate` to Murmur, own their persistence, and
-  participate automatically in the one identity-wide synchronization loop.
+  exactly `onNewSession` and `onUpdate` to Murmur, own persistence outside
+  `MurmurStore`, and participate automatically in the one identity-wide
+  synchronization loop.
 - Durable session routing prevents applications from manually dispatching raw
   updates for contact- or service-owned sessions.
 - Returning `true` from `onNewSession` durably assigns that session to the

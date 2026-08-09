@@ -73,7 +73,6 @@ if (JSON.stringify(names) !== JSON.stringify([
     "containsRecipient",
     "createDiscoveryBundle",
     "createMurmurServiceSessionDescriptor",
-    "createMurmurServiceStorage",
     "createSignedDelivery",
     "createSignedInboxAck",
     "createSignedInboxRead",

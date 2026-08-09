@@ -12,8 +12,6 @@ service.onNewSession() -- false --> next service / ignored
          true
           v
 durable session owner ------> service.onUpdate(update)
-          |
-          +------ scoped canonical-JSON state
 ```
 
 Each registration uses an explicit stable ID. Murmur never derives persistence
@@ -25,6 +23,6 @@ Claimed updates also appear in the identity-wide global `onUpdates` batch with
 the stable service ID. Murmur drains the batch only after the service handlers
 and global hook resolve.
 
-`createMurmurServiceStorage` restricts persistence to versioned
-`murmur/services/v1/<encoded-service-id>/state/` keys. It exposes only canonical
-JSON and never the underlying Murmur transaction.
+Murmur persists only the session-to-service owner mapping. Custom services own
+any application state through persistence they choose; Murmur does not provide
+service storage or expose `MurmurStore` to them.
