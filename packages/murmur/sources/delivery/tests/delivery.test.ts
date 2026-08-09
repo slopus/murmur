@@ -10,6 +10,7 @@ import {
     OversizedInboxDeliveryError,
     TerminalInboxDeliveryError,
     DeliveryCursorTrimmedError,
+    DeliveryTransportError,
     createSignedDelivery,
     createSignedInboxRead,
     parseInboxPage,
@@ -389,6 +390,23 @@ describe("delivery client", () => {
             requestTimeoutMilliseconds: 5,
         });
         await expect(transport.publish(delivery)).rejects.toThrow("timed out");
+    });
+
+    test("classifies a malformed event-stream response as retryable", async () => {
+        const identity = generateIdentityKeyPair();
+        const transport = new HttpDeliveryTransport("https://relay.test", {
+            fetch: async () =>
+                new Response("route unavailable", {
+                    status: 404,
+                    headers: { "content-type": "text/plain" },
+                }),
+        });
+        const stream = transport.stream(
+            createSignedInboxRead(identity, { createdAt: NOW, waitMilliseconds: 0 }),
+        );
+        const error = await stream.next().catch((value: unknown) => value);
+        expect(error).toBeInstanceOf(DeliveryTransportError);
+        expect(error).toMatchObject({ status: 0, code: "invalid_response" });
     });
 
     test("terminally drains new IDs when the exact replay index is full", async () => {

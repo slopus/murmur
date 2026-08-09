@@ -49,6 +49,60 @@ async function establishContact(
 }
 
 describe("built-in contacts", () => {
+    test("persists one outgoing request when the same invitation is submitted twice", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const fetch = relayFetch(relay);
+        const requesterStore = new MemoryMurmurStore();
+        const invited = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        let requester = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: requesterStore,
+            now: () => NOW,
+        });
+        try {
+            const invitation = await invited.createInvitation();
+            const [first, second] = await Promise.all([
+                requester.requestContact(invitation, { name: "Requester" }),
+                requester.requestContact(invitation, { name: "Requester" }),
+            ]);
+            expect(second.id).toEqual(first.id);
+            expect(await requester.outgoingContactRequests()).toEqual([
+                {
+                    createdAt: NOW,
+                    identity: invited.identity,
+                    sessionId: first.id,
+                },
+            ]);
+
+            const requesterIdentity = requester.identity;
+            requester.close();
+            requester = await MurmurClient.open({
+                relay: "https://relay.test",
+                fetch,
+                store: requesterStore,
+                now: () => NOW,
+            });
+            expect(requester.identity).toEqual(requesterIdentity);
+            expect(await requester.outgoingContactRequests()).toEqual([
+                {
+                    createdAt: NOW,
+                    identity: invited.identity,
+                    sessionId: first.id,
+                },
+            ]);
+        } finally {
+            invited.close();
+            requester.close();
+            await relay.close();
+        }
+    });
+
     test("creates an N-person service group from contacts and exchanges messages", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const fetch = relayFetch(relay);

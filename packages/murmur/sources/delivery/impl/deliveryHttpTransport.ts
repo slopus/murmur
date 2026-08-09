@@ -250,20 +250,30 @@ export class HttpDeliveryTransport implements DeliveryTransport {
                 signal: controller.signal,
             });
             if (!response.ok) {
-                const value = await boundedResponseJson(response, this.#maximumResponseBytes);
+                let value: unknown;
+                try {
+                    value = await boundedResponseJson(response, this.#maximumResponseBytes);
+                } catch {
+                    throw new DeliveryTransportError(0, "invalid_response");
+                }
                 this.#throwFailure(response, value);
             }
             if (!response.headers.get("content-type")?.startsWith("text/event-stream")) {
-                throw new Error("Relay returned an invalid delivery event stream");
+                throw new DeliveryTransportError(0, "invalid_stream");
             }
             clearTimeout(timeout);
             await hooks.onConnected?.();
-            yield* decodeDeliveryEventStream(
-                response,
-                controller,
-                this.#maximumResponseBytes,
-                this.#streamHeartbeatTimeoutMilliseconds,
-            );
+            try {
+                yield* decodeDeliveryEventStream(
+                    response,
+                    controller,
+                    this.#maximumResponseBytes,
+                    this.#streamHeartbeatTimeoutMilliseconds,
+                );
+            } catch (error: unknown) {
+                if (controller.signal.aborted) throw error;
+                throw new DeliveryTransportError(0, "invalid_stream");
+            }
         } catch (error: unknown) {
             if (signal?.aborted === true) return;
             if (error instanceof DeliveryTransportError) throw error;

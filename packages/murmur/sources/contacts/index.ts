@@ -20,4 +20,5 @@ export type {
     MurmurContactRemoved,
     MurmurContactRequest,
     MurmurContactRequested,
+    MurmurOutgoingContactRequest,
 } from "./types.js";

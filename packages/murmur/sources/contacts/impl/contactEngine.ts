@@ -14,6 +14,7 @@ import type {
     MurmurContactProfile,
     MurmurContactRemoved,
     MurmurContactRequested,
+    MurmurOutgoingContactRequest,
 } from "../types.js";
 import {
     CONTACT_ADMISSION_LOW_WATERMARK,
@@ -92,6 +93,14 @@ function publicContact(record: ContactRecord): MurmurContact {
         localProfile: record.localProfile,
         profile: record.profile,
         status: record.status,
+    });
+}
+
+function publicOutgoingRequest(record: ContactHandshakeRecord): MurmurOutgoingContactRequest {
+    return Object.freeze({
+        identity: record.identity.slice(),
+        sessionId: record.sessionId.slice(),
+        createdAt: record.createdAt,
     });
 }
 
@@ -814,6 +823,50 @@ export class ContactEngine {
                             profile: record.remoteProfile,
                         }),
                     );
+                }
+            } finally {
+                zeroBytes(record.identity);
+                zeroBytes(record.sessionId);
+                zeroBytes(bytes);
+            }
+        }
+        return Object.freeze(requests);
+    }
+
+    async outgoingRequest(identity: Uint8Array): Promise<MurmurOutgoingContactRequest | undefined> {
+        const page = await this.#store.scan(CONTACT_HANDSHAKE_PREFIX, {
+            limit: CONTACT_SCAN_LIMIT,
+        });
+        let request: MurmurOutgoingContactRequest | undefined;
+        for (const bytes of page.values()) {
+            const record = decodeContactHandshakeRecord(bytes);
+            try {
+                if (
+                    request === undefined &&
+                    record.direction === "outgoing" &&
+                    equalBytes(record.identity, identity)
+                ) {
+                    request = publicOutgoingRequest(record);
+                }
+            } finally {
+                zeroBytes(record.identity);
+                zeroBytes(record.sessionId);
+                zeroBytes(bytes);
+            }
+        }
+        return request;
+    }
+
+    async outgoingRequests(): Promise<readonly MurmurOutgoingContactRequest[]> {
+        const page = await this.#store.scan(CONTACT_HANDSHAKE_PREFIX, {
+            limit: CONTACT_SCAN_LIMIT,
+        });
+        const requests: MurmurOutgoingContactRequest[] = [];
+        for (const bytes of page.values()) {
+            const record = decodeContactHandshakeRecord(bytes);
+            try {
+                if (record.direction === "outgoing") {
+                    requests.push(publicOutgoingRequest(record));
                 }
             } finally {
                 zeroBytes(record.identity);

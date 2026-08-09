@@ -78,6 +78,7 @@ export type {
     MurmurContactRemoved,
     MurmurContactRequest,
     MurmurContactRequested,
+    MurmurOutgoingContactRequest,
 } from "./contacts/index.js";
 export {
     createMurmurServiceSessionDescriptor,

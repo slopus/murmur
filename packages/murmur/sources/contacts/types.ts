@@ -28,6 +28,13 @@ export interface MurmurContactRequest {
     readonly profile: MurmurContactProfile;
 }
 
+/** One durable outgoing contact handshake awaiting the remote decision. */
+export interface MurmurOutgoingContactRequest {
+    readonly identity: Uint8Array;
+    readonly sessionId: Uint8Array;
+    readonly createdAt: number;
+}
+
 /** Contact-request lifecycle update delivered by the identity-wide sync loop. */
 export interface MurmurContactRequested extends MurmurContactRequest {}
 

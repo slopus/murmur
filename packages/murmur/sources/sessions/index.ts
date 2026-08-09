@@ -45,6 +45,7 @@ import {
     type MurmurContactAdmission,
     type MurmurContactProfile,
     type MurmurContactRequested,
+    type MurmurOutgoingContactRequest,
 } from "../contacts/index.js";
 import {
     createMurmurServiceSessionDescriptor,
@@ -312,6 +313,17 @@ export class MurmurClient {
     ): Promise<MurmurSession> {
         const bundle = await this.resolveInvitation(invitation, signal);
         const session = await this.#exclusive(async () => {
+            const existing = await this.#contacts.outgoingRequest(bundle.identityKey);
+            if (existing !== undefined) {
+                try {
+                    const existingSession = await this.#engine.get(existing.sessionId);
+                    if (existingSession !== undefined) return existingSession;
+                    await this.#contacts.reject(existing.sessionId);
+                } finally {
+                    zeroBytes(existing.identity);
+                    zeroBytes(existing.sessionId);
+                }
+            }
             const created = await this.#createContactAdmission(CONTACT_ADMISSION_GENERATION);
             try {
                 return await this.#engine.create(
@@ -422,6 +434,11 @@ export class MurmurClient {
     /** Read validated incoming contact requests awaiting a decision. */
     async contactRequests(): Promise<readonly MurmurContactRequested[]> {
         return this.#tracked(() => this.#contacts.requests());
+    }
+
+    /** Read durable outgoing contact requests awaiting the remote decision. */
+    async outgoingContactRequests(): Promise<readonly MurmurOutgoingContactRequest[]> {
+        return this.#tracked(() => this.#contacts.outgoingRequests());
     }
 
     /**

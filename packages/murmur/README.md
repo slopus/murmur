@@ -361,12 +361,16 @@ Reads are durable, local, and work fully offline:
 ```ts
 const everyone = await murmur.contacts(); // confirmed contacts
 const one = await murmur.contact(identityKey); // or undefined
-const pending = await murmur.contactRequests(); // awaiting a decision
+const incoming = await murmur.contactRequests(); // awaiting this identity's decision
+const outgoing = await murmur.outgoingContactRequests(); // awaiting the remote decision
 ```
 
 Each contact carries both profiles (`localProfile` and `profile`) plus the
 identity key and the technical `sessionId`. Profiles are validated,
-size-bounded JSON; their schema beyond that is yours.
+size-bounded JSON; their schema beyond that is yours. Outgoing requests are
+durable and survive reopening the same store. Repeating `requestContact()` for
+an identity that already has an outgoing handshake returns that existing
+session instead of creating another request.
 
 ## Build a group messenger
 
