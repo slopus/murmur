@@ -4,6 +4,17 @@ on:
     push:
         tags:
             - "v*"
+    workflow_dispatch:
+        inputs:
+            release-tag:
+                description: Existing release tag to publish
+                required: true
+                type: string
+            library-only:
+                description: Skip the relay image when recovering a library publication
+                required: true
+                default: false
+                type: boolean
 
 concurrency:
     group: release-${{ github.ref }}
@@ -12,6 +23,7 @@ concurrency:
 env:
     IMAGE_NAME: ghcr.io/slopus/murmur-relay
     PNPM_VERSION: 10.28.1
+    RELEASE_TAG: ${{ inputs['release-tag'] || github.ref_name }}
 
 jobs:
     verify:
@@ -24,6 +36,8 @@ jobs:
             prerelease: ${{ steps.release-version.outputs.prerelease }}
         steps:
             - uses: actions/checkout@v4
+              with:
+                  ref: ${{ env.RELEASE_TAG }}
             - uses: pnpm/action-setup@v4
               with:
                   version: ${{ env.PNPM_VERSION }}
@@ -37,8 +51,8 @@ jobs:
               shell: bash
               run: |
                   package_version="$(node -p "require('./packages/murmur/package.json').version")"
-                  if [ "$GITHUB_REF_NAME" != "v$package_version" ]; then
-                      echo "Release tag $GITHUB_REF_NAME does not match @slopus/murmur@$package_version" >&2
+                  if [ "$RELEASE_TAG" != "v$package_version" ]; then
+                      echo "Release tag $RELEASE_TAG does not match @slopus/murmur@$package_version" >&2
                       exit 1
                   fi
                   if [[ "$package_version" == *-* ]]; then
@@ -93,6 +107,8 @@ jobs:
             id-token: write
         steps:
             - uses: actions/checkout@v4
+              with:
+                  ref: ${{ env.RELEASE_TAG }}
             - uses: pnpm/action-setup@v4
               with:
                   version: ${{ env.PNPM_VERSION }}
@@ -102,6 +118,7 @@ jobs:
                   cache: pnpm
             - run: pnpm install --frozen-lockfile
             - run: pnpm --filter @slopus/murmur-relay build
+            - run: pnpm --filter @slopus/murmur build
             - name: Check whether npm version already exists
               id: npm-version
               shell: bash
@@ -118,17 +135,20 @@ jobs:
               run: >-
                   pnpm publish --access public
                   --tag ${{ needs.verify.outputs.npm-tag }}
-                  --provenance --no-git-checks
+                  --provenance --no-git-checks --ignore-scripts
 
     publish-container:
         name: Publish relay container
         needs: verify
+        if: ${{ inputs['library-only'] != true }}
         runs-on: ubuntu-latest
         permissions:
             contents: read
             packages: write
         steps:
             - uses: actions/checkout@v4
+              with:
+                  ref: ${{ env.RELEASE_TAG }}
             - uses: docker/setup-qemu-action@v3
             - uses: docker/setup-buildx-action@v3
             - name: Log in to GitHub Container Registry
@@ -167,6 +187,11 @@ jobs:
             - verify
             - publish-library
             - publish-container
+        if: >-
+            ${{ always() && needs.verify.result == 'success' &&
+            needs.publish-library.result == 'success' &&
+            (needs.publish-container.result == 'success' ||
+            needs.publish-container.result == 'skipped') }}
         runs-on: ubuntu-latest
         permissions:
             contents: write
@@ -178,22 +203,22 @@ jobs:
                   IS_PRERELEASE: ${{ needs.verify.outputs.prerelease }}
               shell: bash
               run: |
-                  if ! gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+                  if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
                       release_flags=()
                       if [ "$IS_PRERELEASE" = "true" ]; then
                           release_flags+=(--prerelease)
                       fi
-                      release_version="${GITHUB_REF_NAME#v}"
+                      release_version="${RELEASE_TAG#v}"
                       printf -v release_notes '%s\n\n%s\n\n%s\n%s\n%s\n\n%s' \
-                          "Murmur $GITHUB_REF_NAME provides stateful MLS sessions over authenticated encrypted identity queues." \
+                          "Murmur $RELEASE_TAG provides stateful MLS sessions over authenticated encrypted identity queues." \
                           "### Get it" \
                           "- npm: \`pnpm add @slopus/murmur@$release_version\`" \
                           "- container: \`ghcr.io/slopus/murmur-relay:$release_version\`" \
                           "- container platforms: Linux amd64 and arm64" \
                           "The browser-safe npm package includes signed discovery, durable queue processing, and unified two-person or many-person MLS sessions. The container includes the authenticated identity-queue relay with SQLite/Postgres storage, an SBOM, and provenance."
-                      gh release create "$GITHUB_REF_NAME" \
+                      gh release create "$RELEASE_TAG" \
                           --verify-tag \
-                          --title "Murmur $GITHUB_REF_NAME" \
+                          --title "Murmur $RELEASE_TAG" \
                           --notes "$release_notes" \
                           --generate-notes \
                           "${release_flags[@]}"
