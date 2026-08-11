@@ -14,3 +14,6 @@ version in `packages/murmur/package.json`.
 Its manual dispatch accepts an existing release tag for recovery. Library-only
 recovery skips an already-published relay image while retaining GitHub's npm
 trusted publishing and provenance.
+
+When an environment permits only tag deployments, a `vX.Y.Z-recovery` tag runs
+the same library-only recovery for the existing `vX.Y.Z` release.

@@ -34,6 +34,7 @@ jobs:
         outputs:
             npm-tag: ${{ steps.release-version.outputs.npm-tag }}
             prerelease: ${{ steps.release-version.outputs.prerelease }}
+            release-tag: ${{ steps.release-version.outputs.release-tag }}
         steps:
             - uses: actions/checkout@v4
               with:
@@ -51,10 +52,12 @@ jobs:
               shell: bash
               run: |
                   package_version="$(node -p "require('./packages/murmur/package.json').version")"
-                  if [ "$RELEASE_TAG" != "v$package_version" ]; then
-                      echo "Release tag $RELEASE_TAG does not match @slopus/murmur@$package_version" >&2
+                  release_tag="${RELEASE_TAG%-recovery}"
+                  if [ "$release_tag" != "v$package_version" ]; then
+                      echo "Release tag $release_tag does not match @slopus/murmur@$package_version" >&2
                       exit 1
                   fi
+                  echo "release-tag=$release_tag" >> "$GITHUB_OUTPUT"
                   if [[ "$package_version" == *-* ]]; then
                       echo "npm-tag=next" >> "$GITHUB_OUTPUT"
                       echo "prerelease=true" >> "$GITHUB_OUTPUT"
@@ -140,7 +143,9 @@ jobs:
     publish-container:
         name: Publish relay container
         needs: verify
-        if: ${{ inputs['library-only'] != true }}
+        if: >-
+            ${{ inputs['library-only'] != true &&
+            !endsWith(github.ref_name, '-recovery') }}
         runs-on: ubuntu-latest
         permissions:
             contents: read
@@ -201,6 +206,7 @@ jobs:
                   GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
                   GH_REPO: ${{ github.repository }}
                   IS_PRERELEASE: ${{ needs.verify.outputs.prerelease }}
+                  RELEASE_TAG: ${{ needs.verify.outputs.release-tag }}
               shell: bash
               run: |
                   if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
