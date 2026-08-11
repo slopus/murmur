@@ -1,6 +1,6 @@
 {
     "name": "@slopus/murmur",
-    "version": "0.4.2",
+    "version": "0.4.3",
     "description": "Stateful MLS sessions over authenticated encrypted delivery queues",
     "keywords": [
         "encrypted-events",
