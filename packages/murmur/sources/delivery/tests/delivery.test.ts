@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import { utf8Decode, utf8Encode } from "../../utils/index.js";
+import { signedDeliveryToJson } from "../impl/deliveryCodec.js";
 import {
     HttpDeliveryTransport,
     InboxProcessor,
@@ -407,6 +408,53 @@ describe("delivery client", () => {
         const error = await stream.next().catch((value: unknown) => value);
         expect(error).toBeInstanceOf(DeliveryTransportError);
         expect(error).toMatchObject({ status: 0, code: "invalid_response" });
+    });
+
+    test("does not wait for event-stream reader cancellation to settle", async () => {
+        const identity = generateIdentityKeyPair();
+        const eventId = relayEventId(8);
+        const delivery = createSignedDelivery(
+            identity,
+            [identity.publicKey],
+            utf8Encode("streamed"),
+            { createdAt: NOW, expiresAt: NOW + 60_000 },
+        );
+        let cancellationStarted = false;
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(
+                    utf8Encode(
+                        `event: delivery\nid: ${eventId}\ndata: ${JSON.stringify({
+                            eventId,
+                            delivery: signedDeliveryToJson(delivery),
+                        })}\n\n`,
+                    ),
+                );
+            },
+            cancel() {
+                cancellationStarted = true;
+                return new Promise<void>(() => undefined);
+            },
+        });
+        const transport = new HttpDeliveryTransport("https://relay.test", {
+            fetch: async () =>
+                new Response(body, { headers: { "content-type": "text/event-stream" } }),
+        });
+        const stream = transport.stream(
+            createSignedInboxRead(identity, { createdAt: NOW, waitMilliseconds: 0 }),
+        );
+
+        await expect(stream.next()).resolves.toMatchObject({
+            done: false,
+            value: { eventId },
+        });
+        const closeOutcome = await Promise.race([
+            stream.return(undefined).then(() => "closed"),
+            new Promise<string>((resolve) => setTimeout(() => resolve("timed-out"), 100)),
+        ]);
+
+        expect(closeOutcome).toBe("closed");
+        expect(cancellationStarted).toBe(true);
     });
 
     test("terminally drains new IDs when the exact replay index is full", async () => {
