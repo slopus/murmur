@@ -2,8 +2,11 @@ import { sha256 } from "@noble/hashes/sha2";
 import {
     DeliveryTransportError,
     HttpDeliveryTransport,
+    WebSocketDeliveryTransport,
     type DeliveryFetch,
+    type RelaySessionProvider,
     type DeliveryTransport,
+    type WebSocketDeliveryTransportOptions,
 } from "../delivery/index.js";
 import {
     decodeIdentityRoot,
@@ -101,6 +104,9 @@ interface CreatedContactAdmission {
 export interface MurmurClientOptions {
     readonly relay?: string | URL;
     readonly transport?: DeliveryTransport;
+    /** Application-authenticated issuer for an additive negotiated WebSocket relay. */
+    readonly sessionProvider?: RelaySessionProvider;
+    readonly webSocket?: WebSocketDeliveryTransportOptions;
     readonly discoveryTransport?: DiscoveryTransport;
     readonly fetch?: DeliveryFetch;
     readonly store: MurmurStore;
@@ -149,8 +155,15 @@ export class MurmurClient {
 
     /** Open or create one durable single-device Murmur identity. */
     static async open(options: MurmurClientOptions): Promise<MurmurClient> {
-        if ((options.relay === undefined) === (options.transport === undefined)) {
-            throw new Error("Provide exactly one relay URL or delivery transport");
+        const deliveryChoices = [
+            options.relay !== undefined,
+            options.transport !== undefined,
+            options.sessionProvider !== undefined,
+        ].filter(Boolean).length;
+        if (deliveryChoices !== 1) {
+            throw new Error(
+                "Provide exactly one relay URL, delivery transport, or relay-session provider",
+            );
         }
         const services = options.services ?? [];
         const serviceIds = new Set<string>();
@@ -203,10 +216,16 @@ export class MurmurClient {
             if (identity === undefined) throw new Error("Murmur identity did not open");
             const transport =
                 options.transport ??
-                new HttpDeliveryTransport(
-                    options.relay as string | URL,
-                    options.fetch === undefined ? {} : { fetch: options.fetch },
-                );
+                (options.sessionProvider === undefined
+                    ? new HttpDeliveryTransport(
+                          options.relay as string | URL,
+                          options.fetch === undefined ? {} : { fetch: options.fetch },
+                      )
+                    : new WebSocketDeliveryTransport(
+                          identity,
+                          options.sessionProvider,
+                          options.webSocket,
+                      ));
             const discoveryTransport =
                 options.discoveryTransport ??
                 (options.relay === undefined

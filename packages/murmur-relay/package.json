@@ -27,6 +27,8 @@
     "scripts": {
         "build": "pnpm run clean && tsc -p tsconfig.build.json",
         "build:binary": "bun scripts/buildBinary.ts",
+        "cloudflare:deploy": "pnpm dlx wrangler@4 deploy --config wrangler.jsonc",
+        "cloudflare:dev": "pnpm dlx wrangler@4 dev --config wrangler.jsonc",
         "check": "tsc --noEmit -p tsconfig.json",
         "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
         "start": "node dist/main.js",

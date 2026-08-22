@@ -1,0 +1,647 @@
+import { sha256 } from "@noble/hashes/sha2";
+import {
+    RelayError,
+    deliveryFingerprint,
+    parseSignedDelivery,
+    parseSignedQueueAck,
+    parseSignedQueueRead,
+    signedDeliveryToJson,
+    verifyQueueAckSignature,
+    verifyQueueReadSignature,
+    type SignedDelivery,
+    type SignedDeliveryJson,
+    type SignedQueueAck,
+    type SignedQueueRead,
+} from "../protocol/index.js";
+import { verifyRelaySessionToken } from "../session/index.js";
+import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
+import { equalBytes } from "../utils/bytes.js";
+import { isUuidV7 } from "../utils/uuidV7.js";
+import { relaySessionTokenFromWebSocketProtocols } from "../websocket/index.js";
+import {
+    MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS,
+    MAXIMUM_MESSAGE_BYTES,
+    MAXIMUM_QUEUE_BYTES,
+    MAXIMUM_QUEUE_ITEMS,
+    STREAM_HEARTBEAT_MILLISECONDS,
+    decodeStoredDelivery,
+    deliveryFrame,
+    encodedDeliveryBytes,
+    exact,
+    heartbeatFrame,
+    object,
+    parseTokenSecret,
+    requestFrame,
+    responseFrame,
+    send,
+    textEncoder,
+    websocketPair,
+    websocketResponse,
+    type InboxMetadata,
+    type StoredDeliveryRecord,
+} from "./impl/cloudflareCodec.js";
+import type {
+    CloudflareServerWebSocket,
+    CloudflareWebSocketAttachment,
+    DurableObjectStateLike,
+    DurableObjectTransactionLike,
+    MurmurCloudflareEnvironment,
+} from "./types.js";
+
+const META_KEY = "inbox:meta";
+const EVENT_PREFIX = "inbox:event:";
+const EXPIRY_PREFIX = "inbox:expiry:";
+const SENDER_PREFIX = "inbox:sender:";
+const PRINCIPAL_PREFIX = "inbox:principal:";
+const FANOUT_OBJECT_NAME = "global-v1";
+const MAXIMUM_SENDER_ITEMS = 1_000;
+const MAXIMUM_SENDER_BYTES = 256 * 1024 * 1024;
+const MAXIMUM_ADMISSION_REFERENCES = 10_000;
+const PRUNE_BATCH = 100;
+
+interface UsageCounter {
+    readonly items: number;
+    readonly bytes: number;
+}
+
+interface InboxExpiryRecord {
+    readonly eventKey: string;
+}
+
+interface QueuePageBody {
+    readonly deliveries: readonly {
+        readonly eventId: string;
+        readonly delivery: SignedDeliveryJson;
+    }[];
+    readonly head: string | null;
+    readonly acknowledgedThrough: string | null;
+    readonly exhausted: boolean;
+}
+
+function eventKey(eventId: string): string {
+    return `${EVENT_PREFIX}${eventId}`;
+}
+
+function expiryKey(expiresAt: number, eventId: string): string {
+    return `${EXPIRY_PREFIX}${expiresAt.toString().padStart(16, "0")}:${eventId}`;
+}
+
+function emptyMetadata(): InboxMetadata {
+    return {
+        head: null,
+        acknowledgedThrough: null,
+        pendingItems: 0,
+        pendingBytes: 0,
+    };
+}
+
+function json(body: unknown, status: number): Response {
+    return new Response(JSON.stringify(body), {
+        status,
+        headers: {
+            "content-type": "application/json; charset=utf-8",
+            "cache-control": "no-store",
+        },
+    });
+}
+
+async function requestJson(request: Request): Promise<unknown> {
+    const declared = request.headers.get("content-length");
+    if (
+        declared !== null &&
+        (!/^\d+$/.test(declared) || Number(declared) > MAXIMUM_MESSAGE_BYTES)
+    ) {
+        throw new RelayError(413, "Inbox request exceeds limit", { error: "limit" });
+    }
+    const bytes = new Uint8Array(await request.arrayBuffer());
+    if (bytes.length > MAXIMUM_MESSAGE_BYTES) {
+        throw new RelayError(413, "Inbox request exceeds limit", { error: "limit" });
+    }
+    try {
+        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+    } catch {
+        throw new RelayError(400, "Invalid inbox JSON", { error: "malformed" });
+    }
+}
+
+function attachment(socket: CloudflareServerWebSocket): CloudflareWebSocketAttachment {
+    const value = socket.deserializeAttachment();
+    if (value === null) throw new Error("Missing WebSocket attachment");
+    return value;
+}
+
+function assertDevice(encodedDevice: string, identity: Uint8Array): void {
+    let device: Uint8Array;
+    try {
+        device = decodeBase64Url(encodedDevice, 32);
+    } catch {
+        throw new RelayError(401, "Invalid socket device", { error: "unauthorized" });
+    }
+    if (!equalBytes(device, identity)) {
+        throw new RelayError(403, "Ticket does not authorize this device", {
+            error: "forbidden",
+        });
+    }
+}
+
+/** One device inbox and its hibernating negotiated WebSocket sessions. */
+export class MurmurInboxDurableObject {
+    readonly #state: DurableObjectStateLike;
+    readonly #environment: MurmurCloudflareEnvironment;
+
+    constructor(state: DurableObjectStateLike, environment: MurmurCloudflareEnvironment) {
+        this.#state = state;
+        this.#environment = environment;
+    }
+
+    /** Accept authenticated sockets or idempotent internal fanout insertions. */
+    async fetch(request: Request): Promise<Response> {
+        const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v2/insert") {
+            try {
+                const input = object(await requestJson(request));
+                exact(input, ["eventId", "recipient", "delivery", "admissionPrincipal"]);
+                if (
+                    typeof input.eventId !== "string" ||
+                    !isUuidV7(input.eventId) ||
+                    typeof input.recipient !== "string" ||
+                    typeof input.admissionPrincipal !== "string" ||
+                    input.admissionPrincipal.length < 1 ||
+                    input.admissionPrincipal.length > 255
+                ) {
+                    throw new RelayError(400, "Invalid inbox insertion", {
+                        error: "malformed",
+                    });
+                }
+                const recipient = decodeBase64Url(input.recipient, 32);
+                const delivery = parseSignedDelivery(input.delivery);
+                if (!delivery.recipients.some((value) => equalBytes(value, recipient))) {
+                    throw new RelayError(400, "Delivery omits target inbox", {
+                        error: "malformed",
+                    });
+                }
+                const duplicate = await this.#insert(
+                    recipient,
+                    input.eventId,
+                    delivery,
+                    input.admissionPrincipal,
+                );
+                return json({ duplicate }, 200);
+            } catch (error: unknown) {
+                if (error instanceof RelayError) return json(error.body, error.status);
+                return json({ error: "internal" }, 500);
+            }
+        }
+        if (
+            request.method !== "GET" ||
+            url.pathname !== "/v2/connect" ||
+            request.headers.get("upgrade")?.toLowerCase() !== "websocket"
+        ) {
+            return json({ error: "not_found" }, 404);
+        }
+        try {
+            const token = relaySessionTokenFromWebSocketProtocols(
+                request.headers.get("sec-websocket-protocol"),
+            );
+            const claims = verifyRelaySessionToken(
+                parseTokenSecret(this.#environment.MURMUR_RELAY_TOKEN_SECRET),
+                token,
+                { expectedEndpoint: this.#environment.MURMUR_RELAY_ENDPOINT },
+            );
+            const pair = websocketPair();
+            pair.server.serializeAttachment({
+                device: encodeBase64Url(claims.device),
+                admissionPrincipal: claims.admissionPrincipal,
+                expiresAt: claims.expiresAt,
+            });
+            this.#state.acceptWebSocket(pair.server);
+            await this.#scheduleAt(claims.expiresAt);
+            return websocketResponse(pair.client);
+        } catch (error: unknown) {
+            if (error instanceof RelayError) return json(error.body, error.status);
+            return json({ error: "internal" }, 500);
+        }
+    }
+
+    /** Process one strict request from a hibernated socket. */
+    async webSocketMessage(
+        socket: CloudflareServerWebSocket,
+        message: string | ArrayBuffer,
+    ): Promise<void> {
+        let id = "invalid";
+        try {
+            if (typeof message !== "string") {
+                throw new RelayError(400, "Binary WebSocket messages are unsupported", {
+                    error: "malformed",
+                });
+            }
+            const frame = requestFrame(message);
+            id = frame.id;
+            const authorization = attachment(socket);
+            if (authorization.started === true) {
+                throw new RelayError(400, "WebSocket accepts exactly one request", {
+                    error: "malformed",
+                });
+            }
+            socket.serializeAttachment({ ...authorization, started: true });
+            if (frame.operation === "publish") {
+                const delivery = parseSignedDelivery(frame.body);
+                assertDevice(authorization.device, delivery.sender);
+                const fanoutId = this.#environment.MURMUR_FANOUT.idFromName(FANOUT_OBJECT_NAME);
+                const response = await this.#environment.MURMUR_FANOUT.get(fanoutId).fetch(
+                    new Request("https://murmur.internal/v2/publish", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({
+                            delivery: signedDeliveryToJson(delivery),
+                            admissionPrincipal: authorization.admissionPrincipal,
+                        }),
+                    }),
+                );
+                send(socket, responseFrame(frame.id, response.status, await response.json()));
+                return;
+            }
+            if (frame.operation === "read") {
+                const read = parseSignedQueueRead(frame.body);
+                this.#authorizeRead(authorization.device, read, false);
+                const page = await this.#read(read);
+                const encoded = responseFrame(frame.id, 200, page);
+                if (textEncoder.encode(encoded).length > MAXIMUM_MESSAGE_BYTES) {
+                    send(
+                        socket,
+                        responseFrame(frame.id, 413, {
+                            error: "delivery_too_large",
+                            eventId: page.deliveries[0]?.eventId ?? null,
+                            head: page.head,
+                            acknowledgedThrough: page.acknowledgedThrough,
+                        }),
+                    );
+                } else {
+                    send(socket, encoded);
+                }
+                return;
+            }
+            if (frame.operation === "acknowledge") {
+                const acknowledgement = parseSignedQueueAck(frame.body);
+                this.#authorizeAck(authorization.device, acknowledgement);
+                send(
+                    socket,
+                    responseFrame(frame.id, 200, await this.#acknowledge(acknowledgement)),
+                );
+                return;
+            }
+            const read = parseSignedQueueRead(frame.body);
+            this.#authorizeRead(authorization.device, read, true);
+            const page = await this.#read(read);
+            socket.serializeAttachment({
+                ...authorization,
+                started: true,
+                streamId: frame.id,
+                after: read.after,
+            });
+            send(socket, responseFrame(frame.id, 200, { connected: true }));
+            for (const queued of page.deliveries) {
+                send(socket, deliveryFrame(frame.id, queued.eventId, queued.delivery));
+                socket.serializeAttachment({
+                    ...attachment(socket),
+                    after: queued.eventId,
+                });
+            }
+            await this.#scheduleHeartbeat();
+            await this.#scheduleAt(authorization.expiresAt);
+        } catch (error: unknown) {
+            if (error instanceof RelayError) {
+                send(socket, responseFrame(id, error.status, error.body));
+            } else {
+                send(socket, responseFrame(id, 500, { error: "internal" }));
+            }
+        }
+    }
+
+    /** Release a socket after Cloudflare reports its peer closure. */
+    webSocketClose(socket: CloudflareServerWebSocket): void {
+        socket.close(1000, "closed");
+    }
+
+    /** Close a hibernated socket after Cloudflare reports a transport error. */
+    webSocketError(socket: CloudflareServerWebSocket): void {
+        socket.close(1011, "socket error");
+    }
+
+    /** Send stream heartbeats and enforce the ticket's maximum socket lifetime. */
+    async alarm(): Promise<void> {
+        const now = Date.now();
+        await this.#pruneExpired(now);
+        let active = false;
+        for (const socket of this.#state.getWebSockets()) {
+            try {
+                const value = attachment(socket);
+                if (value.expiresAt <= now) {
+                    socket.close(1008, "ticket expired");
+                    continue;
+                }
+                await this.#scheduleAt(value.expiresAt);
+                if (value.streamId !== undefined) {
+                    send(socket, heartbeatFrame(value.streamId));
+                    active = true;
+                }
+            } catch {
+                socket.close(1011, "heartbeat failed");
+            }
+        }
+        if (active) await this.#scheduleAt(now + STREAM_HEARTBEAT_MILLISECONDS);
+        const expirations = await this.#state.storage.list<InboxExpiryRecord>({
+            prefix: EXPIRY_PREFIX,
+            limit: 1,
+        });
+        const key = expirations.keys().next().value as string | undefined;
+        if (key !== undefined) {
+            const expiresAt = Number(key.slice(EXPIRY_PREFIX.length, EXPIRY_PREFIX.length + 16));
+            if (Number.isSafeInteger(expiresAt)) await this.#scheduleAt(expiresAt);
+        }
+    }
+
+    async #insert(
+        recipient: Uint8Array,
+        eventId: string,
+        delivery: SignedDelivery,
+        admissionPrincipal: string,
+    ): Promise<boolean> {
+        await this.#pruneExpired(Date.now());
+        const encodedBytes = encodedDeliveryBytes(delivery);
+        const senderCounter = `${SENDER_PREFIX}${encodeBase64Url(delivery.sender)}`;
+        const principalCounter = `${PRINCIPAL_PREFIX}${encodeBase64Url(
+            sha256(textEncoder.encode(admissionPrincipal)),
+        )}`;
+        const expires = expiryKey(delivery.expiresAt, eventId);
+        const duplicate = await this.#state.storage.transaction(async (transaction) => {
+            const key = eventKey(eventId);
+            const existing = await transaction.get<StoredDeliveryRecord>(key);
+            if (existing !== undefined) {
+                const stored = decodeStoredDelivery(existing.delivery);
+                if (!equalBytes(deliveryFingerprint(stored), deliveryFingerprint(delivery))) {
+                    throw new RelayError(409, "Event identifier collision", {
+                        error: "id_collision",
+                    });
+                }
+                return true;
+            }
+            const metadata = (await transaction.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+            if (metadata.head !== null && eventId <= metadata.head) {
+                throw new RelayError(409, "Inbox event order regressed", {
+                    error: "event_order",
+                });
+            }
+            const sender = (await transaction.get<UsageCounter>(senderCounter)) ?? {
+                items: 0,
+                bytes: 0,
+            };
+            const principal = (await transaction.get<UsageCounter>(principalCounter)) ?? {
+                items: 0,
+                bytes: 0,
+            };
+            if (
+                metadata.pendingItems + 1 > MAXIMUM_QUEUE_ITEMS ||
+                metadata.pendingBytes + encodedBytes > MAXIMUM_QUEUE_BYTES
+            ) {
+                throw new RelayError(429, "Device inbox is full", { error: "queue_full" });
+            }
+            if (
+                sender.items + 1 > MAXIMUM_SENDER_ITEMS ||
+                sender.bytes + encodedBytes > MAXIMUM_SENDER_BYTES
+            ) {
+                throw new RelayError(429, "Sender quota is full", {
+                    error: "sender_queue_full",
+                });
+            }
+            if (principal.items + 1 > MAXIMUM_ADMISSION_REFERENCES) {
+                throw new RelayError(429, "Admission quota is full", {
+                    error: "admission_queue_full",
+                });
+            }
+            const record: StoredDeliveryRecord = {
+                eventId,
+                delivery: signedDeliveryToJson(delivery),
+                encodedBytes,
+                senderCounter,
+                principalCounter,
+                expiryKey: expires,
+            };
+            await transaction.put(key, record);
+            await transaction.put<InboxExpiryRecord>(expires, { eventKey: key });
+            await transaction.put<InboxMetadata>(META_KEY, {
+                ...metadata,
+                head: eventId,
+                pendingItems: metadata.pendingItems + 1,
+                pendingBytes: metadata.pendingBytes + encodedBytes,
+            });
+            await transaction.put<UsageCounter>(senderCounter, {
+                items: sender.items + 1,
+                bytes: sender.bytes + encodedBytes,
+            });
+            await transaction.put<UsageCounter>(principalCounter, {
+                items: principal.items + 1,
+                bytes: principal.bytes + encodedBytes,
+            });
+            return false;
+        });
+        this.#broadcast(eventId, signedDeliveryToJson(delivery));
+        await this.#scheduleAt(delivery.expiresAt);
+        return duplicate;
+    }
+
+    async #read(read: SignedQueueRead): Promise<QueuePageBody> {
+        await this.#pruneExpired(Date.now());
+        const metadata =
+            (await this.#state.storage.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+        if (
+            metadata.acknowledgedThrough !== null &&
+            (read.after === null || read.after < metadata.acknowledgedThrough)
+        ) {
+            throw new RelayError(409, "Queue cursor was already trimmed", {
+                error: "cursor_trimmed",
+                acknowledgedThrough: metadata.acknowledgedThrough,
+            });
+        }
+        const entries = await this.#state.storage.list<StoredDeliveryRecord>({
+            prefix: EVENT_PREFIX,
+            ...(read.after === null ? {} : { startAfter: eventKey(read.after) }),
+            limit: read.limit + 1,
+        });
+        const values = [...entries.values()];
+        const selected: StoredDeliveryRecord[] = [];
+        let bytes = 256;
+        for (const value of values.slice(0, read.limit)) {
+            const next = bytes + value.encodedBytes + 128;
+            if (selected.length > 0 && next > MAXIMUM_MESSAGE_BYTES) break;
+            selected.push(value);
+            bytes = next;
+        }
+        return {
+            deliveries: selected.map((value) => ({
+                eventId: value.eventId,
+                delivery: value.delivery,
+            })),
+            head: metadata.head,
+            acknowledgedThrough: metadata.acknowledgedThrough,
+            exhausted: values.length <= selected.length,
+        };
+    }
+
+    async #acknowledge(acknowledgement: SignedQueueAck): Promise<{ readonly removed: number }> {
+        return this.#state.storage.transaction(async (transaction) => {
+            const metadata = (await transaction.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+            if (metadata.head === null) return { removed: 0 };
+            if (acknowledgement.through > metadata.head) {
+                throw new RelayError(409, "Acknowledgement exceeds inbox head", {
+                    error: "ack_future",
+                    head: metadata.head,
+                });
+            }
+            if (
+                metadata.acknowledgedThrough !== null &&
+                acknowledgement.through < metadata.acknowledgedThrough
+            ) {
+                throw new RelayError(409, "Acknowledgement regressed", {
+                    error: "ack_regression",
+                    acknowledgedThrough: metadata.acknowledgedThrough,
+                });
+            }
+            const entries = await transaction.list<StoredDeliveryRecord>({
+                prefix: EVENT_PREFIX,
+                end: `${eventKey(acknowledgement.through)}\uffff`,
+            });
+            await this.#deleteRecords(transaction, [...entries.entries()]);
+            const removedBytes = [...entries.values()].reduce(
+                (total, value) => total + value.encodedBytes,
+                0,
+            );
+            await transaction.put<InboxMetadata>(META_KEY, {
+                ...metadata,
+                acknowledgedThrough: acknowledgement.through,
+                pendingItems: Math.max(0, metadata.pendingItems - entries.size),
+                pendingBytes: Math.max(0, metadata.pendingBytes - removedBytes),
+            });
+            return { removed: entries.size };
+        });
+    }
+
+    async #pruneExpired(now: number): Promise<number> {
+        const expirations = await this.#state.storage.list<InboxExpiryRecord>({
+            prefix: EXPIRY_PREFIX,
+            end: `${EXPIRY_PREFIX}${(now + 1).toString().padStart(16, "0")}`,
+            limit: PRUNE_BATCH,
+        });
+        if (expirations.size === 0) return 0;
+        return this.#state.storage.transaction(async (transaction) => {
+            const records: [string, StoredDeliveryRecord][] = [];
+            for (const expiration of expirations.values()) {
+                const record = await transaction.get<StoredDeliveryRecord>(expiration.eventKey);
+                if (record !== undefined) records.push([expiration.eventKey, record]);
+            }
+            await this.#deleteRecords(transaction, records);
+            await transaction.delete([...expirations.keys()]);
+            const metadata = (await transaction.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+            const removedBytes = records.reduce(
+                (total, [, value]) => total + value.encodedBytes,
+                0,
+            );
+            await transaction.put<InboxMetadata>(META_KEY, {
+                ...metadata,
+                pendingItems: Math.max(0, metadata.pendingItems - records.length),
+                pendingBytes: Math.max(0, metadata.pendingBytes - removedBytes),
+            });
+            return records.length;
+        });
+    }
+
+    async #deleteRecords(
+        transaction: DurableObjectTransactionLike,
+        records: readonly [string, StoredDeliveryRecord][],
+    ): Promise<void> {
+        const counters = new Map<string, UsageCounter>();
+        for (const [key, value] of records) {
+            await transaction.delete([key, value.expiryKey]);
+            for (const counterKey of [value.senderCounter, value.principalCounter]) {
+                const current = counters.get(counterKey) ??
+                    (await transaction.get<UsageCounter>(counterKey)) ?? {
+                        items: 0,
+                        bytes: 0,
+                    };
+                counters.set(counterKey, {
+                    items: Math.max(0, current.items - 1),
+                    bytes: Math.max(0, current.bytes - value.encodedBytes),
+                });
+            }
+        }
+        for (const [key, counter] of counters) {
+            if (counter.items === 0) await transaction.delete(key);
+            else await transaction.put(key, counter);
+        }
+    }
+
+    #authorizeRead(device: string, read: SignedQueueRead, stream: boolean): void {
+        assertDevice(device, read.recipient);
+        this.#validateRequestTime(read.createdAt);
+        if (!verifyQueueReadSignature(read)) {
+            throw new RelayError(401, "Invalid queue-read signature", {
+                error: "unauthorized",
+            });
+        }
+        if (
+            read.limit < 1 ||
+            read.limit > 256 ||
+            read.waitMilliseconds < 0 ||
+            read.waitMilliseconds > 30_000 ||
+            (stream && (read.limit !== 1 || read.waitMilliseconds !== 0))
+        ) {
+            throw new RelayError(400, "Invalid queue read", { error: "malformed" });
+        }
+    }
+
+    #authorizeAck(device: string, acknowledgement: SignedQueueAck): void {
+        assertDevice(device, acknowledgement.recipient);
+        this.#validateRequestTime(acknowledgement.createdAt);
+        if (!verifyQueueAckSignature(acknowledgement)) {
+            throw new RelayError(401, "Invalid queue acknowledgement", {
+                error: "unauthorized",
+            });
+        }
+    }
+
+    #validateRequestTime(createdAt: number): void {
+        if (Math.abs(createdAt - Date.now()) > MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS) {
+            throw new RelayError(401, "Signed request violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+    }
+
+    #broadcast(eventId: string, delivery: SignedDeliveryJson): void {
+        for (const socket of this.#state.getWebSockets()) {
+            try {
+                const value = attachment(socket);
+                if (
+                    value.streamId !== undefined &&
+                    (value.after === null || value.after === undefined || eventId > value.after)
+                ) {
+                    send(socket, deliveryFrame(value.streamId, eventId, delivery));
+                    socket.serializeAttachment({ ...value, after: eventId });
+                }
+            } catch {
+                socket.close(1011, "stream delivery failed");
+            }
+        }
+    }
+
+    async #scheduleHeartbeat(): Promise<void> {
+        await this.#scheduleAt(Date.now() + STREAM_HEARTBEAT_MILLISECONDS);
+    }
+
+    async #scheduleAt(scheduled: number): Promise<void> {
+        const current = await this.#state.storage.getAlarm();
+        if (current === null || scheduled < current) {
+            await this.#state.storage.setAlarm(scheduled);
+        }
+    }
+}

@@ -15,6 +15,13 @@ stream backpressure, and processes one record at a time. It is not a wake-only
 channel. Reconnect uses a freshly signed request after the durable local cursor,
 so anything committed but not acknowledged may be replayed safely.
 
+The additive WebSocket path first asks an application-authenticated
+`RelaySessionProvider` for a short-lived endpoint and token. The request proves
+control of this device's Murmur root. The ticket authenticates routing, while
+publish, read, and acknowledgement frames retain their device signatures. The
+client refreshes expiring tickets and reconnects streams from the same durable
+cursor. Legacy HTTP/SSE construction remains unchanged.
+
 The processor never acknowledges before the protocol state plus buffered update
 or terminal rejection and cursor commit atomically. A crash after the local
 commit causes a harmless acknowledgement retry. Consumer callbacks run later

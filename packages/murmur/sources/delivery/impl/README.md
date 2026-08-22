@@ -1,5 +1,10 @@
 # Delivery implementation
 
+`deliveryHttpTransport.ts` preserves the v1 HTTP/SSE transport.
+`deliveryNegotiation.ts` signs temporary-session requests and validates routed
+WebSocket tickets. `deliveryWebSocketTransport.ts` implements the additive v1
+WebSocket framing while keeping every queue operation device-signed.
+
 `deliveryCodec.ts` owns the exact relay-compatible signed wire format.
 `deliveryHttpTransport.ts` implements bounded fetch requests and the
 recipient-authenticated SSE connection. `deliverySse.ts` strictly parses

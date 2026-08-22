@@ -1,0 +1,172 @@
+import { ed25519 } from "@noble/curves/ed25519";
+import { describe, expect, test } from "vitest";
+import { RelayService } from "../../relay/index.js";
+import { SqliteRelayStore } from "../../storage/index.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
+import { canonicalJson } from "../../utils/canonicalJson.js";
+import { RelayWebSocketSession, type RelayWebSocketPeer } from "../../websocket/index.js";
+import {
+    identity,
+    recipients,
+    secret,
+    signedDelivery,
+    signedRead,
+} from "../../protocol/tests/helpers.js";
+import {
+    createRelaySessionFetchHandler,
+    createRelaySessionToken,
+    verifyRelaySessionToken,
+} from "../index.js";
+
+const NOW = 1_720_000_000_000;
+const ENDPOINT = "wss://relay.test/v2/connect";
+const TOKEN_SECRET = new Uint8Array(32).fill(19);
+const textEncoder = new TextEncoder();
+
+function sessionProof(secretKey: Uint8Array): Record<string, unknown> {
+    const unsigned = {
+        version: 1 as const,
+        device: encodeBase64Url(identity(secretKey)),
+        createdAt: NOW,
+        nonce: encodeBase64Url(new Uint8Array(24).fill(8)),
+    };
+    const prefix = textEncoder.encode("murmur.relay.session.v1\0");
+    const body = canonicalJson(unsigned);
+    const signingBytes = new Uint8Array(prefix.length + body.length);
+    signingBytes.set(prefix);
+    signingBytes.set(body, prefix.length);
+    return {
+        ...unsigned,
+        signature: encodeBase64Url(ed25519.sign(signingBytes, secretKey)),
+    };
+}
+
+class CapturingPeer implements RelayWebSocketPeer {
+    readonly messages: string[] = [];
+    closed = false;
+
+    send(message: string): void {
+        this.messages.push(message);
+    }
+
+    close(): void {
+        this.closed = true;
+    }
+}
+
+describe("negotiated relay sessions", () => {
+    test("lets the application authorize a device and issues an endpoint-bound token", async () => {
+        const aliceSecret = secret(1);
+        const handler = createRelaySessionFetchHandler({
+            tokenSecret: TOKEN_SECRET,
+            now: () => NOW,
+            authorize: async (request, proof) =>
+                request.headers.get("authorization") === "Bearer user-session" &&
+                proof.device.every((byte, index) => byte === identity(aliceSecret)[index])
+                    ? { endpoint: ENDPOINT, admissionPrincipal: "account-42" }
+                    : undefined,
+        });
+        const response = await handler(
+            new Request("https://app.test/v2/murmur-session", {
+                method: "POST",
+                headers: {
+                    authorization: "Bearer user-session",
+                    "content-type": "application/json",
+                },
+                body: JSON.stringify(sessionProof(aliceSecret)),
+            }),
+        );
+        expect(response.status).toBe(200);
+        const ticket = (await response.json()) as {
+            readonly token: string;
+            readonly expiresAt: number;
+        };
+        const claims = verifyRelaySessionToken(TOKEN_SECRET, ticket.token, {
+            now: NOW,
+            expectedEndpoint: ENDPOINT,
+        });
+        expect(claims.device).toEqual(identity(aliceSecret));
+        expect(claims.admissionPrincipal).toBe("account-42");
+        expect(ticket.expiresAt).toBe(NOW + 5 * 60 * 1_000);
+        const tampered = `${ticket.token.startsWith("A") ? "B" : "A"}${ticket.token.slice(1)}`;
+        expect(() =>
+            verifyRelaySessionToken(TOKEN_SECRET, tampered, {
+                now: NOW,
+            }),
+        ).toThrow("Invalid relay-session token");
+    });
+
+    test("binds every WebSocket operation to the ticket device", async () => {
+        const aliceSecret = secret(1);
+        const bobSecret = secret(2);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        try {
+            const token = createRelaySessionToken(TOKEN_SECRET, {
+                device: identity(aliceSecret),
+                endpoint: ENDPOINT,
+                admissionPrincipal: "account-42",
+                issuedAt: NOW,
+                expiresAt: NOW + 60_000,
+                nonce: new Uint8Array(24).fill(3),
+            });
+            const claims = verifyRelaySessionToken(TOKEN_SECRET, token, { now: NOW });
+            const peer = new CapturingPeer();
+            const session = new RelayWebSocketSession({ relay, claims, peer });
+            const delivery = signedDelivery(aliceSecret, recipients(identity(bobSecret)), {
+                now: NOW,
+                expiresAt: NOW + 60_000,
+            });
+            await session.receive(
+                JSON.stringify({
+                    version: 1,
+                    id: "AAAAAAAAAAAAAAAAAAAAAAAA",
+                    operation: "publish",
+                    body: {
+                        version: delivery.version,
+                        id: delivery.id,
+                        sender: encodeBase64Url(delivery.sender),
+                        recipients: delivery.recipients.map(encodeBase64Url),
+                        createdAt: delivery.createdAt,
+                        expiresAt: delivery.expiresAt,
+                        ciphertext: encodeBase64Url(delivery.ciphertext),
+                        signature: encodeBase64Url(delivery.signature),
+                    },
+                }),
+            );
+            expect(JSON.parse(peer.messages[0]!) as unknown).toMatchObject({
+                status: 200,
+                body: { duplicate: false },
+            });
+
+            const unauthorizedPeer = new CapturingPeer();
+            const unauthorized = new RelayWebSocketSession({
+                relay,
+                claims,
+                peer: unauthorizedPeer,
+            });
+            const read = signedRead(bobSecret, { now: NOW });
+            await unauthorized.receive(
+                JSON.stringify({
+                    version: 1,
+                    id: "BBBBBBBBBBBBBBBBBBBBBBBB",
+                    operation: "read",
+                    body: {
+                        version: read.version,
+                        recipient: encodeBase64Url(read.recipient),
+                        after: read.after,
+                        limit: read.limit,
+                        waitMilliseconds: read.waitMilliseconds,
+                        createdAt: read.createdAt,
+                        signature: encodeBase64Url(read.signature),
+                    },
+                }),
+            );
+            expect(JSON.parse(unauthorizedPeer.messages[0]!) as unknown).toMatchObject({
+                status: 403,
+                body: { error: "forbidden" },
+            });
+        } finally {
+            await relay.close();
+        }
+    });
+});

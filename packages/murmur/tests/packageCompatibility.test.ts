@@ -62,6 +62,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "DiscoveryTransportError",
     "HttpDeliveryTransport",
     "HttpDiscoveryTransport",
+    "HttpRelaySessionProvider",
     "InboxProcessor",
     "InboxStateRollbackError",
     "MAXIMUM_STORE_SCAN_ITEMS",
@@ -69,6 +70,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "MurmurClient",
     "OversizedInboxDeliveryError",
     "TerminalInboxDeliveryError",
+    "WebSocketDeliveryTransport",
     "contactSessionDescriptor",
     "containsRecipient",
     "createDiscoveryBundle",
@@ -76,6 +78,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "createSignedDelivery",
     "createSignedInboxAck",
     "createSignedInboxRead",
+    "createSignedRelaySessionRequest",
     "decodeContactPacket",
     "decodeContactSessionDescriptor",
     "decodeIdentityRoot",
@@ -87,11 +90,14 @@ if (JSON.stringify(names) !== JSON.stringify([
     "isContactSessionDescriptor",
     "parseDiscoveryBundle",
     "parseInboxPage",
+    "parseRelaySessionTicket",
     "parseSignedDelivery",
+    "parseSignedRelaySessionRequest",
     "serializeDiscoveryBundle",
     "signedDeliveryToJson",
     "signedInboxAckToJson",
     "signedInboxReadToJson",
+    "signedRelaySessionRequestToJson",
     "validateContactAdmission",
     "validateContactProfile",
     "validateMurmurServiceRegistration",
@@ -99,6 +105,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "validateSignedDelivery",
     "verifyDiscoveryBundle",
     "verifySignedDelivery",
+    "verifySignedRelaySessionRequest",
 ])) {
     throw new Error(\`Unexpected runtime exports: \${names.join(", ")}\`);
 }
@@ -170,8 +177,10 @@ for (const specifier of blocked) {
 import {
     HttpDeliveryTransport,
     HttpDiscoveryTransport,
+    HttpRelaySessionProvider,
     MemoryMurmurStore,
     MurmurClient,
+    WebSocketDeliveryTransport,
     destroyIdentity,
     generateIdentityKeyPair,
     type DeliveryFetch,
@@ -184,6 +193,9 @@ import {
     type MurmurSyncOptions,
     type MurmurSessionPage,
     type MurmurStore,
+    type RelaySessionProvider,
+    type RelaySessionTicket,
+    type SignedRelaySessionRequest,
 } from "@slopus/murmur";
 
 const store: MurmurStore = new MemoryMurmurStore();
@@ -194,6 +206,13 @@ const discoveryTransport: DiscoveryTransport = new HttpDiscoveryTransport(
     { fetch: deliveryFetch },
 );
 const identity: IdentityKeyPair = generateIdentityKeyPair();
+const sessionProvider: RelaySessionProvider = new HttpRelaySessionProvider(
+    "https://app.example/murmur/session",
+    { fetch: deliveryFetch },
+);
+const negotiatedOptions: MurmurClientOptions = { sessionProvider, store };
+const ticket: RelaySessionTicket | undefined = undefined;
+const proof: SignedRelaySessionRequest | undefined = undefined;
 const options: MurmurClientOptions = {
     relay: new URL("https://relay.example"),
     store,
@@ -224,6 +243,10 @@ void page;
 void discovery;
 void service;
 void profile;
+void negotiatedOptions;
+void ticket;
+void proof;
+void WebSocketDeliveryTransport;
 destroyIdentity(identity);
 `,
                 "utf8",

@@ -1,0 +1,194 @@
+import { describe, expect, test } from "vitest";
+import { signedDeliveryToJson } from "../../protocol/index.js";
+import { identity, recipients, secret, signedDelivery } from "../../protocol/tests/helpers.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
+import { MurmurFanoutDurableObject } from "../fanoutDurableObject.js";
+import { MurmurInboxDurableObject } from "../inboxDurableObject.js";
+import type {
+    CloudflareServerWebSocket,
+    DurableObjectIdLike,
+    DurableObjectListOptions,
+    DurableObjectNamespaceLike,
+    DurableObjectStateLike,
+    DurableObjectStorageLike,
+    DurableObjectStubLike,
+    DurableObjectTransactionLike,
+    MurmurCloudflareEnvironment,
+} from "../types.js";
+
+class MemoryStorage implements DurableObjectStorageLike {
+    readonly values = new Map<string, unknown>();
+    alarm: number | null = null;
+
+    async get<T>(key: string): Promise<T | undefined> {
+        return this.values.get(key) as T | undefined;
+    }
+
+    async put<T>(key: string, value: T): Promise<void> {
+        this.values.set(key, structuredClone(value));
+    }
+
+    async delete(key: string | readonly string[]): Promise<boolean | number> {
+        if (typeof key === "string") return this.values.delete(key);
+        let removed = 0;
+        for (const item of key) if (this.values.delete(item)) removed += 1;
+        return removed;
+    }
+
+    async list<T>(options: DurableObjectListOptions = {}): Promise<Map<string, T>> {
+        const result = new Map<string, T>();
+        const keys = [...this.values.keys()].sort();
+        for (const key of keys) {
+            if (options.prefix !== undefined && !key.startsWith(options.prefix)) continue;
+            if (options.startAfter !== undefined && key <= options.startAfter) continue;
+            if (options.end !== undefined && key >= options.end) continue;
+            result.set(key, structuredClone(this.values.get(key)) as T);
+            if (options.limit !== undefined && result.size >= options.limit) break;
+        }
+        return result;
+    }
+
+    async transaction<T>(
+        closure: (transaction: DurableObjectTransactionLike) => Promise<T>,
+    ): Promise<T> {
+        return closure(this);
+    }
+
+    async getAlarm(): Promise<number | null> {
+        return this.alarm;
+    }
+
+    async setAlarm(scheduledTime: number): Promise<void> {
+        this.alarm = scheduledTime;
+    }
+}
+
+class MemoryState implements DurableObjectStateLike {
+    readonly storage = new MemoryStorage();
+    readonly sockets: CloudflareServerWebSocket[] = [];
+
+    acceptWebSocket(socket: CloudflareServerWebSocket): void {
+        this.sockets.push(socket);
+    }
+
+    getWebSockets(): readonly CloudflareServerWebSocket[] {
+        return this.sockets;
+    }
+
+    waitUntil(_promise: Promise<unknown>): void {}
+}
+
+class NamedId implements DurableObjectIdLike {
+    constructor(readonly name: string) {}
+
+    toString(): string {
+        return this.name;
+    }
+}
+
+class InboxNamespace implements DurableObjectNamespaceLike {
+    readonly states = new Map<string, MemoryState>();
+    readonly objects = new Map<string, MurmurInboxDurableObject>();
+    failNameOnce: string | undefined;
+    #environment: MurmurCloudflareEnvironment | undefined;
+
+    setEnvironment(environment: MurmurCloudflareEnvironment): void {
+        this.#environment = environment;
+    }
+
+    idFromName(name: string): DurableObjectIdLike {
+        return new NamedId(name);
+    }
+
+    get(id: DurableObjectIdLike): DurableObjectStubLike {
+        const name = id.toString();
+        return {
+            fetch: async (request) => {
+                if (this.failNameOnce === name) {
+                    this.failNameOnce = undefined;
+                    return Response.json({ error: "overloaded" }, { status: 503 });
+                }
+                let object = this.objects.get(name);
+                if (object === undefined) {
+                    const state = new MemoryState();
+                    this.states.set(name, state);
+                    object = new MurmurInboxDurableObject(state, this.#environment!);
+                    this.objects.set(name, object);
+                }
+                return object.fetch(request);
+            },
+        };
+    }
+}
+
+const unusedNamespace: DurableObjectNamespaceLike = {
+    idFromName: (name) => new NamedId(name),
+    get: () => ({ fetch: async () => Response.json({ error: "unused" }, { status: 500 }) }),
+};
+
+describe("Cloudflare durable fanout", () => {
+    test("retries a partial manifest before inserting a later event", async () => {
+        const now = Date.now();
+        const alice = secret(1);
+        const bob = identity(secret(2));
+        const carol = identity(secret(3));
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanoutState = new MemoryState();
+        const fanout = new MurmurFanoutDurableObject(fanoutState, environment);
+        const first = signedDelivery(alice, recipients(bob, carol), {
+            id: 1,
+            now,
+            expiresAt: now + 60_000,
+        });
+        const second = signedDelivery(alice, recipients(bob), {
+            id: 2,
+            now,
+            expiresAt: now + 60_000,
+        });
+        const publish = (delivery: typeof first): Promise<Response> =>
+            fanout.fetch(
+                new Request("https://murmur.internal/v2/publish", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                        delivery: signedDeliveryToJson(delivery),
+                        admissionPrincipal: "account-1",
+                    }),
+                }),
+            );
+        const firstOutcome = (await (await publish(first)).json()) as {
+            readonly eventId: string;
+        };
+        const secondOutcome = (await (await publish(second)).json()) as {
+            readonly eventId: string;
+        };
+        const bobName = encodeBase64Url(bob);
+        const carolName = encodeBase64Url(carol);
+        inboxes.failNameOnce = bobName;
+
+        await fanout.alarm();
+        expect(
+            await inboxes.states.get(carolName)?.storage.get(`inbox:event:${firstOutcome.eventId}`),
+        ).toBeDefined();
+        expect(inboxes.states.get(bobName)).toBeUndefined();
+        expect(
+            await inboxes.states
+                .get(carolName)
+                ?.storage.get(`inbox:event:${secondOutcome.eventId}`),
+        ).toBeUndefined();
+
+        await fanout.alarm();
+        const bobStorage = inboxes.states.get(bobName)?.storage;
+        expect(await bobStorage?.get(`inbox:event:${firstOutcome.eventId}`)).toBeDefined();
+        expect(await bobStorage?.get(`inbox:event:${secondOutcome.eventId}`)).toBeDefined();
+        expect(firstOutcome.eventId < secondOutcome.eventId).toBe(true);
+        expect((await fanoutState.storage.list({ prefix: "fanout:pending:" })).size).toBe(0);
+    });
+});

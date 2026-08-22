@@ -56,6 +56,75 @@ export interface InboxPage {
 /** Browser-safe fetch signature used by the HTTP delivery transport. */
 export type DeliveryFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
 
+/** Signed proof used when requesting a short-lived negotiated relay session. */
+export interface SignedRelaySessionRequest {
+    readonly version: 1;
+    readonly device: Uint8Array;
+    readonly createdAt: number;
+    readonly nonce: Uint8Array;
+    readonly signature: Uint8Array;
+}
+
+/** Protocol and endpoint selected by an application authentication server. */
+export interface RelaySessionTicket {
+    readonly version: 1;
+    readonly protocol: "murmur-websocket-v1";
+    readonly endpoint: string;
+    readonly token: string;
+    readonly expiresAt: number;
+}
+
+/** Application-provided session issuer, normally backed by its authenticated server. */
+export interface RelaySessionProvider {
+    issue(request: SignedRelaySessionRequest, signal?: AbortSignal): Promise<RelaySessionTicket>;
+}
+
+/** Minimal WebSocket message event used by the browser-safe transport seam. */
+export interface DeliveryWebSocketMessageEvent {
+    readonly data: unknown;
+}
+
+/** Minimal close event used by the browser-safe transport seam. */
+export interface DeliveryWebSocketCloseEvent {
+    readonly code: number;
+    readonly reason: string;
+    readonly wasClean: boolean;
+}
+
+/** Browser-compatible WebSocket surface required by the negotiated transport. */
+export interface DeliveryWebSocket {
+    readonly readyState: number;
+    onopen: (() => void) | null;
+    onmessage: ((event: DeliveryWebSocketMessageEvent) => void) | null;
+    onerror: (() => void) | null;
+    onclose: ((event: DeliveryWebSocketCloseEvent) => void) | null;
+    send(data: string): void;
+    close(code?: number, reason?: string): void;
+}
+
+/** Factory used to open a WebSocket without imposing a runtime dependency. */
+export type DeliveryWebSocketFactory = (
+    url: string,
+    protocols: readonly string[],
+) => DeliveryWebSocket;
+
+/** Fetch-backed temporary-session provider policy. */
+export interface HttpRelaySessionProviderOptions {
+    readonly fetch?: DeliveryFetch;
+    readonly maximumResponseBytes?: number;
+    readonly requestTimeoutMilliseconds?: number;
+}
+
+/** Negotiated WebSocket transport policy. */
+export interface WebSocketDeliveryTransportOptions {
+    readonly webSocketFactory?: DeliveryWebSocketFactory;
+    readonly now?: () => number;
+    readonly requestTimeoutMilliseconds?: number;
+    readonly streamHeartbeatTimeoutMilliseconds?: number;
+    readonly maximumMessageBytes?: number;
+    readonly ticketRefreshSkewMilliseconds?: number;
+}
+
 /** Optional lifecycle hooks for opening one delivery event stream. */
 export interface DeliveryStreamHooks {
     readonly onConnected?: () => void | Promise<void>;

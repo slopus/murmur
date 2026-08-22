@@ -211,6 +211,25 @@ const murmur = await MurmurClient.open({
 const publicIdentity: Uint8Array = murmur.identity; // 32-byte Ed25519 key
 ```
 
+For an application-authenticated WebSocket endpoint, pass a session provider
+instead of the legacy relay URL:
+
+```ts
+import { HttpRelaySessionProvider, MurmurClient } from "@slopus/murmur";
+
+const sessionProvider = new HttpRelaySessionProvider("https://app.example/murmur/session", {
+    fetch: authenticatedFetch,
+});
+
+const murmur = await MurmurClient.open({ sessionProvider, store });
+```
+
+The application endpoint returns a short-lived token, the selected
+`murmur-websocket-v1` protocol, and a `wss:` endpoint. Each physical device must
+use its own Murmur store and identity root. Multi-device accounts authorize
+several independent device identities; those devices participate in MLS as
+ordinary distinct members rather than sharing sender state.
+
 - An empty store gets a freshly generated identity, persisted in the store.
 - An existing store reuses its stored identity.
 - To create an identity ahead of time or perform a key-only restore, pass one

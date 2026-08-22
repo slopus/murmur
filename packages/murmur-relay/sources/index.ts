@@ -61,3 +61,39 @@ export {
     listenNodeRelayServer,
 } from "./server/index.js";
 export type { NodeRelayCloseOptions, NodeRelayServerOptions } from "./server/index.js";
+export {
+    createRelaySessionFetchHandler,
+    createRelaySessionToken,
+    parseSignedRelaySessionRequest,
+    verifyRelaySessionRequest,
+    verifyRelaySessionToken,
+} from "./session/index.js";
+export type {
+    CreateRelaySessionTokenOptions,
+    RelaySessionAuthorizer,
+    RelaySessionClaims,
+    RelaySessionIssuerOptions,
+    RelaySessionRoute,
+    SignedRelaySessionRequest,
+    SignedRelaySessionRequestJson,
+    VerifyRelaySessionTokenOptions,
+} from "./session/index.js";
+export {
+    RelayWebSocketSession,
+    authenticateRelayWebSocket,
+    relaySessionTokenFromWebSocketProtocols,
+} from "./websocket/index.js";
+export { DurableFanoutCoordinator } from "./fanout/index.js";
+export type {
+    DurableFanoutCoordinatorOptions,
+    DurableFanoutStore,
+    FanoutRetryOutcome,
+    FanoutRetryScheduler,
+    FanoutTarget,
+    PendingFanoutManifest,
+} from "./fanout/index.js";
+export type {
+    RelayWebSocketAuthenticationOptions,
+    RelayWebSocketPeer,
+    RelayWebSocketSessionOptions,
+} from "./websocket/index.js";

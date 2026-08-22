@@ -1,0 +1,26 @@
+{
+    "name": "murmur-relay",
+    "main": "sources/cloudflare/main.ts",
+    "compatibility_date": "2025-04-01",
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "MURMUR_INBOXES",
+                "class_name": "MurmurInboxDurableObject",
+            },
+            {
+                "name": "MURMUR_FANOUT",
+                "class_name": "MurmurFanoutDurableObject",
+            },
+        ],
+    },
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": ["MurmurInboxDurableObject", "MurmurFanoutDurableObject"],
+        },
+    ],
+    "vars": {
+        "MURMUR_RELAY_ENDPOINT": "wss://relay.example.com/v2/connect",
+    },
+}

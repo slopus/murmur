@@ -3,6 +3,30 @@
 The standalone relay requires Node 22.5 or later and supports SQLite or
 Postgres.
 
+## Cloudflare Durable Objects
+
+The alternative negotiated transport is deployed from
+`packages/murmur-relay/wrangler.jsonc`. It uses one Durable Object per device
+inbox plus one deployment-wide Durable Object for UUIDv7 sequencing and durable
+ordered fanout retry. The public Worker is the required ingress; clients do not
+address a Durable Object instance directly.
+
+Set the exact public `wss:` URL in `MURMUR_RELAY_ENDPOINT`, then provision the
+same 32-byte-or-longer base64url HMAC secret in the relay Worker and the
+application server:
+
+```bash
+cd packages/murmur-relay
+pnpm dlx wrangler@4 secret put MURMUR_RELAY_TOKEN_SECRET
+pnpm cloudflare:deploy
+```
+
+The application server mounts `createRelaySessionFetchHandler`. Its
+`authorize` callback authenticates the user, verifies that the signed device
+key belongs to that account, and returns the Worker endpoint plus a stable
+admission principal. The handler's token secret is server configuration and is
+never sent to a client.
+
 ## SQLite
 
 ```bash

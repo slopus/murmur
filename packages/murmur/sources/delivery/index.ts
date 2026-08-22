@@ -7,6 +7,16 @@ export {
 } from "./impl/deliveryHttpTransport.js";
 export type { HttpDeliveryTransportOptions } from "./impl/deliveryHttpTransport.js";
 export {
+    HttpRelaySessionProvider,
+    createSignedRelaySessionRequest,
+    parseRelaySessionTicket,
+    parseSignedRelaySessionRequest,
+    signedRelaySessionRequestToJson,
+    verifySignedRelaySessionRequest,
+} from "./impl/deliveryNegotiation.js";
+export type { SignedRelaySessionRequestJson } from "./impl/deliveryNegotiation.js";
+export { WebSocketDeliveryTransport } from "./impl/deliveryWebSocketTransport.js";
+export {
     InboxProcessor,
     InboxStateRollbackError,
     MURMUR_INTERNAL_INBOX_HANDLER,
@@ -34,6 +44,11 @@ export type {
     DeliveryPublishOutcome,
     DeliveryStreamHooks,
     DeliveryTransport,
+    DeliveryWebSocket,
+    DeliveryWebSocketCloseEvent,
+    DeliveryWebSocketFactory,
+    DeliveryWebSocketMessageEvent,
+    HttpRelaySessionProviderOptions,
     InboxDelivery,
     InboxDeliveryHandler,
     InboxPage,
@@ -43,7 +58,11 @@ export type {
     InboxStreamOptions,
     InboxSyncOptions,
     InboxSyncResult,
+    RelaySessionProvider,
+    RelaySessionTicket,
     SignedDelivery,
     SignedInboxAck,
     SignedInboxRead,
+    SignedRelaySessionRequest,
+    WebSocketDeliveryTransportOptions,
 } from "./types.js";

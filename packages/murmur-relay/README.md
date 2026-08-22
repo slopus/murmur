@@ -4,10 +4,26 @@ Private Murmur infrastructure implementing authenticated encrypted identity
 queues. The relay sees sender and recipient identities, exact fanout, timing,
 TTL, and queue progress. It never sees MLS or application plaintext.
 
+## Cloudflare Durable Objects
+
+The additive WebSocket deployment uses one inbox Durable Object per device and
+one deployment-wide sequencing/fanout Durable Object. Configure the exact
+public `MURMUR_RELAY_ENDPOINT` in `wrangler.jsonc`, install the shared ticket
+secret with `pnpm dlx wrangler@4 secret put MURMUR_RELAY_TOKEN_SECRET`, and run
+`pnpm cloudflare:deploy` from this package.
+
+The application server issues tickets with `createRelaySessionFetchHandler`.
+Its authorization callback must authenticate the user and verify that the
+requested device key belongs to that account. Return the configured Worker
+endpoint and a stable admission principal from that callback.
+
 ## Contract
 
 - One ordered inbound queue per public identity.
-- One relay-assigned UUIDv7 event ID per atomic multicast.
+- The legacy HTTP relay assigns one UUIDv7 event ID per atomic multicast.
+- Negotiated publication durably records one globally sequenced fanout manifest
+  before acceptance, then retries idempotent per-device insertion until every
+  target completes or the signed delivery expires.
 - Event IDs are time ordered and strictly monotonic within each inbox.
 - One queue reference per exact recipient.
 - Sender-scoped delivery IDs deduplicate while any reference remains.
@@ -28,6 +44,10 @@ TTL, and queue progress. It never sees MLS or application plaintext.
 
 There are no topics, snapshots, retained history, collapse keys, lists, or
 anonymous capability addresses.
+
+Each application device uses an independent Murmur root, MLS leaf, local store,
+and inbox. An application account may authorize several such device keys, but
+the relay never stores their secret material and does not merge their MLS state.
 
 ## Run
 
