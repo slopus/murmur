@@ -3,8 +3,10 @@
 ## Destination
 
 There is no friend channel. Given a verified discovery bundle, Murmur creates
-an MLS session and atomically publishes the Welcome and initial material to the
-recipient's authenticated inbound queue.
+an MLS session and publishes the Welcome and initial material to the
+recipient's authenticated device inbox. The legacy relay keeps its atomic
+publication contract. A negotiated endpoint first durably records publication
+and then completes every idempotent target insertion through ordered retry.
 
 The recipient authenticates and decrypts a valid bootstrap and atomically
 persists it as a durable pending local bootstrap or session together with replay
@@ -27,7 +29,7 @@ afterward.
 
 A bootstrap routed to the built-in contact protocol is handled differently.
 Murmur internally decrypts and validates its typed profile hello while the
-two-person contact session is still pending, then exposes the claimed contact
+two-device contact session is still pending, then exposes the claimed contact
 profile for an accept-or-reject decision. The application does not activate the
 session or receive a raw update first. Rejection destroys the pending contact
 session. Acceptance sends the local typed profile hello; only the mutual hello
@@ -62,8 +64,9 @@ details.
 
 - A verified discovery bundle is sufficient to create and deliver an MLS
   bootstrap.
-- Initial delivery uses the same atomic publication and bounded relay
-  idempotency as every other delivery.
+- Initial delivery uses the selected relay protocol's ordinary bounded
+  publication: atomic multicast for the legacy relay, or durable ordered fanout
+  retry and per-target idempotency for a negotiated endpoint.
 - A valid authenticated bootstrap and its replay and queue progress become
   durable pending local state before its relay item is acknowledged.
 - Pending sessions continue processing protocol traffic and durably buffer

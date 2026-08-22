@@ -9,17 +9,24 @@ opaque at that layer. Higher Murmur layers may durably route a session to the
 built-in contact protocol or to a registered typed synchronization service.
 
 The public API creates a session from an opaque descriptor, sends opaque events,
-and adds or removes members. All ongoing membership control and application
-data travel inside MLS. A newly added member receives the MLS Welcome and
-initial material through its authenticated identity queue.
+and adds or removes device members. All ongoing membership control and
+application data travel inside MLS. One application user may authorize several
+devices, but every device is a distinct MLS member with its own credential,
+ratchets, durable store, and authenticated inbox. Adding or removing one user's
+devices uses ordinary MLS membership changes for those device identities. A
+newly added device receives the MLS Welcome and initial material through its
+authenticated inbox.
 
 ## Ordering and delivery
 
 Each outbound MLS delivery has one verifiably bound recipient set containing
-every current epoch member, including the publisher. The relay publishes one
-ciphertext atomically to every recipient queue with one UUIDv7 event ID. Event
-IDs are monotonic within each inbox; the session never assumes ordering across
-different inboxes.
+every current epoch device member, including the publisher. The legacy relay
+publishes one ciphertext atomically to every recipient queue with one UUIDv7
+event ID. A negotiated relay durably accepts one fanout manifest and completes
+idempotent per-device insertion in event order, retrying failures without a
+cross-endpoint transaction. Event IDs are monotonic within each inbox; the
+session never assumes ordering across different inboxes or simultaneous fanout
+completion.
 
 Each epoch has exactly one authenticated committer recorded in MLS-protected
 session state. Only that member may publish a Commit for the epoch. Other
@@ -54,7 +61,7 @@ updates after a successful claim. Murmur persists the session-to-service owner
 mapping. Services are independent, and Murmur models no dependencies between
 services or sessions. Service-owned group sessions may send packets and add or
 remove members. The technical session proving one contact relationship remains
-two-person.
+two-device.
 
 If no registered service claims a new session, Murmur ignores its unknown
 updates after durably recording replay and queue progress. Those updates are
@@ -115,9 +122,10 @@ local state requires restoring a backup or being added again.
   identity inbox.
 - Ongoing application and control traffic is MLS-protected; there is no friend
   channel or shared relay topic.
-- Every current epoch member, including the publisher, receives each ongoing
-  MLS delivery with the same UUIDv7 event ID; ordering is guaranteed only
-  within an individual inbox.
+- Every current epoch device member, including the publisher, receives each
+  ongoing MLS delivery with the same UUIDv7 event ID. Legacy publication is
+  atomic; negotiated publication durably retries ordered idempotent target
+  insertion. Ordering is guaranteed only within an individual inbox.
 - Exactly one authenticated epoch committer serializes MLS Proposals into
   Commits. Publish success only stages a Commit, and relay order never resolves
   Commit conflicts.

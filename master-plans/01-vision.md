@@ -2,13 +2,13 @@
 
 ## Vision
 
-Murmur is a stateful library for discovering a public identity, bootstrapping
-an MLS session, establishing a built-in contact relationship, and exchanging
-data through typed synchronization services. A two-person interaction and a
-many-person interaction use the same MLS group primitive. Contacts are
-foundational Murmur state. Chat remains an optional independent service, and
-the old friend-channel and generic relay-topic machinery are not part of
-Murmur.
+Murmur is a stateful library for discovering a public device identity,
+bootstrapping an MLS session, establishing a built-in contact relationship,
+and exchanging data through typed synchronization services. A two-person
+interaction and a many-person interaction use the same MLS group primitive.
+Contacts are foundational Murmur state. Chat remains an optional independent
+service, and the old friend-channel and generic relay-topic machinery are not
+part of Murmur.
 
 It ships as the browser-safe and Node.js-compatible `@slopus/murmur` library.
 The relay is internal infrastructure. Chat, documents, and other application
@@ -22,17 +22,35 @@ backward-compatible, persisted client state remains readable or is migrated,
 and relay schemas migrate in place without deleting pending data or requiring a
 clean database.
 
-## One relay and one receiver
+## Relay transports and device identities
 
-There is exactly one relay. Each public identity has one authenticated inbound
-queue, and Murmur assumes one receiver on one active device for that identity.
+The existing relay protocol remains supported unchanged: one public device
+identity has one authenticated inbound queue, bounded HTTP reads, and one
+signed SSE receiver. Applications may continue configuring that relay directly.
+
+An additive negotiated protocol supports independent devices. A main server
+authenticates an application user, verifies that the user controls one Murmur
+device identity, and issues a short-lived token naming the assigned endpoint
+and transport protocol. The endpoint may be the main server or a stateful edge
+object reached through its public ingress. The first negotiated transport uses
+an authenticated WebSocket.
+
+One application user may authorize multiple device identities. Every device
+has its own identity root, MLS leaf and ratchets, durable Murmur store, and
+authenticated inbox; devices never share one identity root or sender state.
+The server may retain the bounded user-to-device routing needed to issue tokens
+and deliver traffic, but it does not become a discovery directory or receive
+device secrets.
+
 The relay stores encrypted deliveries that remain unacknowledged and unexpired.
 It may also hold a signed discovery bundle for at most five minutes under the
-SHA-256 digest of its exact bytes. It stores no snapshots, retained history,
-event-sourced application state, lists, or anonymous capability topics.
+SHA-256 digest of its exact bytes. It stores no snapshots, retained chat
+history, event-sourced application state, anonymous capability topics, or MLS
+state.
 
-Identity-linked sender, recipient, timing, queue, and fanout metadata are an
-accepted tradeoff. Murmur promises encrypted contents, not anonymous routing.
+User admission, device, endpoint, sender, recipient, timing, queue, and fanout
+metadata are an accepted tradeoff. Murmur promises encrypted contents, not
+anonymous routing.
 
 ## Ownership of state
 
@@ -41,8 +59,9 @@ application history and effects, but Murmur never exposes its storage
 transaction to application code. Murmur owns identity secrets, current MLS
 epoch and ratchet checkpoints, KeyPackages, Welcomes, outboxes, replay and queue
 progress, pending-session buffers, session lifecycle, and synchronization. For
-realtime receiving, the relay streams the exact queued encrypted deliveries
-over one recipient-authenticated SSE connection in inbox UUIDv7 order.
+realtime receiving, the configured transport streams the exact queued
+encrypted deliveries over the device's authenticated SSE or WebSocket
+connection in inbox UUIDv7 order.
 
 Every local session operation works offline and completes against durable local
 state before Murmur lazily shares its outboxes with the relay. Relay
@@ -88,34 +107,42 @@ being added again.
 
 ## The layers, in order
 
-1. **Discovery.** Define and validate a self-contained signed bundle containing
-   a public identity and current KeyPackage material without creating a friend
-   relationship. An application may share it directly, or upload it to the
-   relay's five-minute content-addressed cache and share only its SHA-256
+1. **Admission and routing.** Continue supporting a directly configured legacy
+   relay, or ask the application authentication server for a short-lived token
+   that binds one authorized device identity to an endpoint and transport.
+2. **Discovery.** Define and validate a self-contained signed bundle containing
+   a public device identity and current KeyPackage material without creating a
+   friend relationship. An application may share it directly, or upload it to
+   the relay's five-minute content-addressed cache and share only its SHA-256
    digest. The recipient fetches by that digest and rejects an expired or
    invalid bundle.
-2. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
+3. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
    material to the recipient's authenticated queue. The recipient persists it
    as pending and trims the queue before generic application acceptance or
    built-in contact handling.
-3. **MLS sessions.** Send opaque descriptors, application events, and
+4. **MLS sessions.** Send opaque descriptors, application events, and
    membership changes through the same MLS primitive for two or more members.
-4. **Contacts.** Use a two-person technical MLS session and a mutual typed
+5. **Contacts.** Use a two-device technical MLS session and a mutual typed
    profile hello to establish durable cryptographic proof of contact.
-5. **Synchronization services.** Register optional independent typed services
+6. **Synchronization services.** Register optional independent typed services
    on the client. Each service may claim a new session from its descriptor and
    then owns later updates routed through that durable association.
-6. **Applications.** Register typed synchronization services for domains such
+7. **Applications.** Register typed synchronization services for domains such
    as chat, documents, or files.
 
 ## How we know it is done
 
-- `@slopus/murmur` opens with one relay and application-supplied transactional
-  persistence in a browser or Node.js process without exposing storage
-  transactions through its session API.
-- Two identities can discover the material needed to bootstrap an MLS session,
-  and the recipient can durably receive it without waiting for the application
-  to activate or ignore it.
+- `@slopus/murmur` opens with a directly configured legacy relay or a negotiated
+  short-lived device token and application-supplied transactional persistence
+  in a browser or Node.js process without exposing storage transactions through
+  its session API.
+- A negotiated token binds one independently keyed device identity to its
+  endpoint and declares the transport protocol. The first new protocol carries
+  authenticated inbox traffic over WebSocket while the HTTP/SSE protocol stays
+  compatible.
+- Two device identities can discover the material needed to bootstrap an MLS
+  session, and the recipient can durably receive it without waiting for the
+  application to activate or ignore it.
 - A relay-cached discovery bundle is non-enumerable, addressed only by the
   SHA-256 digest of its exact bytes, expires within five minutes, and cannot
   extend the bundle's signed lifetime or the owner's matching private
@@ -123,7 +150,7 @@ being added again.
 - A pending session stays cryptographically current under a strict storage
   bound; activation durably hands off buffered events or effects, while ignore
   or overflow terminally rejects and destroys pending secrets and data.
-- A two-person contact session becomes durable contact proof only after both
+- A two-device contact session becomes durable contact proof only after both
   identities exchange and process their typed profile hellos; rejection
   destroys the pending contact session.
 - Optional strictly typed synchronization services persist their state and
@@ -148,8 +175,9 @@ being added again.
 - A session that no registered service claims has its unknown updates durably
   consumed and acknowledged without a raw `onUpdates` fallback, so it cannot
   block the identity inbox.
-- Realtime delivery streams exact queued events over authenticated SSE in one
-  inbox's UUIDv7 order, reconnects from the durable cursor, and may redeliver
-  but cannot replace durable acknowledgement.
+- Realtime delivery streams exact queued events over the negotiated
+  authenticated SSE or WebSocket transport in one device inbox's UUIDv7 order,
+  reconnects from the durable cursor, and may redeliver but cannot replace
+  durable acknowledgement.
 - No legacy friend state machine, friend channel, generic topic API, CLI, or
   built-in chat-specific protocol remains.

@@ -4,7 +4,7 @@
 
 Contacts are a built-in, foundational part of Murmur. They are not an optional
 plugin and do not restore the pre-v0.3 friend-channel, topic, or retained-event
-design. A confirmed contact is represented by a durable two-person technical
+design. A confirmed contact is represented by a durable two-device technical
 MLS session and the mutual typed profile handshake performed through it. This
 session is contact and control state, not chat.
 
@@ -18,10 +18,11 @@ behavior built into a contact.
 
 ## Establishing a contact
 
-One identity uploads its signed five-minute discovery bundle to the relay and
-shares the returned 32-byte SHA-256 digest out of band. The other identity
-resolves and verifies it, accepts the invitation material, creates a two-person
-technical MLS session, and sends a typed hello containing its profile.
+One device identity uploads its signed five-minute discovery bundle to the
+relay and shares the returned 32-byte SHA-256 digest out of band. The other
+device identity resolves and verifies it, accepts the invitation material,
+creates a two-device technical MLS session, and sends a typed hello containing
+its profile.
 
 Murmur receives, decrypts, and validates that hello while the contact session is
 pending. It exposes the profile for a contact decision without first activating
@@ -31,9 +32,11 @@ its own typed profile hello. Only after both hellos are durably processed does
 Murmur persist the confirmed contact and retain the technical session as
 cryptographic proof of contact.
 
-A confirmed contact session remains two-person. It may carry strictly typed
+A confirmed contact session remains two-device. It may carry strictly typed
 contact and control packets, but chat and other application domains use their
-own services and sessions.
+own services and sessions. Other devices owned by either application user are
+independent identities and join appropriate service sessions through ordinary
+MLS membership changes rather than by sharing roots or ratchets.
 
 ## Persistence, routing, and offline use
 
@@ -91,10 +94,11 @@ than mocked services. An explicit end-to-end suite also exercises the deployed
 production relay with ephemeral identities. It must acknowledge and clean up
 every delivery it creates and allow cached invitation entries to expire.
 
-The v0.3.3 compatibility baseline remains intact: public APIs and wire formats
-stay backward-compatible, persisted client state is read or migrated, and relay
-schemas migrate in place. The published library remains browser-safe and keeps
-its Noble-only runtime dependency boundary.
+The v0.3.3 compatibility baseline remains intact: existing public APIs, direct
+relay configuration, HTTP/SSE wire formats, and persisted client state stay
+backward-compatible. Negotiated tokens, endpoints, and WebSocket delivery are
+additive. Relay schemas migrate in place, and the published library remains
+browser-safe with its Noble-only runtime dependency boundary.
 
 ## How we know it is done
 
@@ -104,7 +108,7 @@ its Noble-only runtime dependency boundary.
   its contact session is pending.
 - Rejection destroys the pending contact session; acceptance sends the local
   typed hello; only mutual hello completion persists a confirmed contact.
-- Confirmed contact state and its two-person technical session survive restart
+- Confirmed contact state and its two-device technical session survive restart
   and are usable offline before synchronization.
 - Optional strictly typed services are registered on `MurmurClient`, expose
   exactly `onNewSession` and `onUpdate` to Murmur, own persistence outside

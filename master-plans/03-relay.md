@@ -2,20 +2,32 @@
 
 ## Destination
 
-The relay has exactly one authenticated inbound queue per public identity.
-Murmur assumes one receiver on one active device for each identity. The relay
-stores encrypted deliveries only while at least one recipient reference remains
-unacknowledged and unexpired. It also provides a strictly bounded,
+The legacy relay keeps exactly one authenticated inbound queue per public
+identity, bounded HTTP reads, and one recipient-authenticated SSE receiver. Its
+public API and wire format remain supported.
+
+The negotiated relay has one authenticated inbox per independently keyed
+device identity. A main server authenticates an application user and verifies
+control of the device identity before issuing a short-lived token that names
+the selected endpoint and protocol. The endpoint may be that server or a
+stateful edge object behind public ingress. One user may authorize multiple
+device identities, but each device has its own root, MLS state, durable store,
+queue progress, and receiver.
+
+The relay stores encrypted deliveries only while at least one target reference
+remains unacknowledged and unexpired. It also provides a strictly bounded,
 content-addressed cache for signed discovery bundles. A cached bundle is
 available only by the SHA-256 digest of its exact bytes and expires within five
 minutes.
 
-It stores no snapshots, retained history, event-sourced application state,
-lists, anonymous topics, or capability topics. The invitation cache is not
-enumerable and is not an identity directory. The relay does not interpret
-encrypted delivery contents or trust cached discovery contents. It does learn
-authenticated sender and recipient identities, exact fanout, timing, and queue
-progress; this metadata exposure is accepted.
+It stores no snapshots, retained chat history, event-sourced application state,
+anonymous topics, capability topics, or MLS state. The invitation cache is not
+enumerable and is not an identity directory. The negotiated authentication
+server retains only the account, device, endpoint, and protocol routing needed
+for admission and delivery. The relay does not interpret encrypted delivery
+contents or trust cached discovery contents. It does learn authenticated user
+admission, device, sender, recipient, exact fanout, timing, and queue progress;
+this metadata exposure is accepted.
 
 Version 0.3.3 and relay schema version 3 are the compatibility baseline. Every
 later relay schema upgrade migrates in place without deleting pending data or
@@ -37,26 +49,42 @@ idempotent and does not extend its original expiry.
 
 ## Publishing
 
-Every publication has a stable delivery ID, one ciphertext, and an exact
-recipient set. Publication is atomic: the relay assigns one UUIDv7 event ID and
-inserts one queue reference with that ID for every recipient, or inserts
-nothing. UUIDv7 event IDs are time ordered and strictly monotonic within each
-inbox. There is no numeric or public global sequence, and order across different
-inboxes is not a relay guarantee. Publication is idempotent while the delivery
-record or any queue reference remains, so retrying that delivery ID does not
-append another delivery.
+Every publication has a stable delivery ID, one ciphertext, and an exact device
+recipient set. Under the legacy protocol, publication stays atomic: the relay
+assigns one UUIDv7 event ID and inserts one queue reference with that ID for
+every recipient, or inserts nothing.
 
-After every reference is acknowledged or expires, the relay removes the
-ciphertext and forgets the delivery ID. A later retry may therefore be enqueued
-again. Recipient-side durable replay protection must make that redelivery
-harmless.
+Negotiated publication does not require a transaction spanning endpoints. The
+accepting endpoint durably records one fanout manifest with the shared event ID,
+exact target device inboxes, ciphertext, expiry, and per-target progress before
+reporting acceptance. It then inserts the delivery idempotently into every
+target inbox and durably retries incomplete targets until all succeed or the
+delivery expires. Each target drains fanout in event order, so a later event
+cannot overtake an earlier retry and become an unfillable inbox gap. Process or
+endpoint failure may delay a subset but does not turn a partial attempt into a
+completed fanout.
+
+UUIDv7 event IDs are time ordered and strictly monotonic within each inbox.
+There is no numeric or public global sequence, and order across different
+inboxes is not a relay guarantee. Publication and each target insertion are
+idempotent while the delivery record, manifest, or any queue reference remains,
+so retries do not append another delivery.
+
+After every negotiated target has been inserted and every resulting reference
+is acknowledged or expires, the relay removes the ciphertext and fanout
+manifest and forgets the delivery ID. The legacy relay removes its delivery
+after every reference is acknowledged or expires as before. A later retry may
+therefore be enqueued again. Recipient-side durable replay protection must make
+that redelivery harmless.
 
 For every ongoing MLS delivery, the exact recipient set contains every current
-epoch member, including the publisher, and is bound in a way recipients can
-verify. The relay never resolves concurrent MLS Commits. MLS sessions serialize
-Commits through their authenticated epoch committer before publication;
-non-committers publish MLS Proposals instead. Exact authentication, signatures,
-and wire encoding remain implementation details.
+device member, including the publishing device, and is bound in a way
+recipients can verify. Multiple devices owned by one application user are
+independent MLS members with independent credentials and state. The relay never
+resolves concurrent MLS Commits. MLS sessions serialize Commits through their
+authenticated epoch committer before publication; non-committers publish MLS
+Proposals instead. Exact authentication, token format, signatures, and wire
+encoding remain implementation details.
 
 Publication never waits for a recipient to be online. Murmur may create an
 entire dependency-ordered outbox while offline, including Welcome deliveries, a
@@ -68,11 +96,13 @@ consumption is not part of sender publication.
 
 ## Receiving and trimming
 
-A recipient reads its queue in relay order either through a bounded page or one
-recipient-signed SSE connection. SSE carries each exact queued encrypted
-delivery with its UUIDv7 event ID in that inbox's order; it is not merely a wake
-signal. The stream cursor advances only through emitted events. Reconnecting
-starts from the recipient's durable cursor, so an unacknowledged event may be
+A legacy recipient reads its queue in relay order either through a bounded page
+or one recipient-signed SSE connection. A negotiated device connects to the
+endpoint and protocol named by its temporary token; the first negotiated
+protocol is an authenticated WebSocket. Both transports carry each exact queued
+encrypted delivery with its UUIDv7 event ID in that inbox's order rather than a
+wake hint. The stream cursor advances only through emitted events. Reconnecting
+starts from the device's durable cursor, so an unacknowledged event may be
 redelivered but is not skipped.
 
 Downloading or streaming is not delivery. A successfully processed item
@@ -95,15 +125,24 @@ record.
 Queues have a quota and a maximum delivery TTL. The invitation cache has
 separate item and byte quotas and a hard five-minute TTL. A full queue or cache
 creates explicit backpressure, and expiration defines the maximum supported
-offline or invitation window. These bounds prevent abandoned state from
-consuming storage forever. They do not turn the relay into durable history, an
-identity directory, or a recovery system.
+offline or invitation window. Fanout manifests and their retry work are bounded
+by the same delivery expiry plus separate item and byte quotas. These bounds
+prevent abandoned state from consuming storage forever. They do not turn the
+relay into durable history, an identity directory, or a recovery system.
 
 ## How we know it is done
 
-- Each public identity has one authenticated ordered inbound queue.
-- A stable delivery ID and exact recipient set produce one all-or-nothing
-  multicast with one shared UUIDv7 event ID.
+- The legacy HTTP/SSE protocol remains supported with one authenticated ordered
+  inbound queue per public identity and its existing wire contract.
+- The negotiated protocol gives each independently keyed device identity one
+  authenticated ordered inbox and one short-lived token naming its endpoint and
+  protocol.
+- A legacy stable delivery ID and exact recipient set still produce one
+  all-or-nothing multicast with one shared UUIDv7 event ID.
+- A negotiated publication becomes durable before acceptance and uses one
+  shared event ID plus idempotent, ordered per-target insertion. It retries
+  partial fanout without a cross-endpoint transaction until every target is
+  complete or the delivery expires.
 - UUIDv7 event IDs are time ordered and monotonic within one inbox. The relay
   exposes no numeric global sequence and promises no order across inboxes.
 - A delivery ID is deduplicated while its record or any queue reference
@@ -117,9 +156,10 @@ identity directory, or a recovery system.
   order and never waits for any recipient to connect or consume them.
 - Queue reads may redeliver until the recipient durably processes and
   acknowledges them.
-- Recipient-authenticated SSE streams the exact queued deliveries in one
-  inbox's UUIDv7 order, applies backpressure, and reconnects from durable queue
-  progress without changing acknowledgement semantics.
+- Recipient-authenticated SSE and negotiated WebSocket transport stream the
+  exact queued deliveries in one device inbox's UUIDv7 order, apply
+  backpressure, and reconnect from durable queue progress without changing
+  acknowledgement semantics.
 - Terminally rejected or quarantined deliveries persist replay and queue
   progress without an application effect, so they do not block the queue.
 - Acknowledgement is recipient-signed, monotonic, idempotent, and trims the
@@ -129,9 +169,10 @@ identity directory, or a recovery system.
 - A signed discovery bundle may be uploaded and fetched only by the SHA-256
   digest of its exact bytes, is never enumerable by identity, expires within
   five minutes, and cannot have its lifetime extended by re-upload.
-- Quota and TTL bound abandoned queues and expose backpressure and the maximum
-  offline window; separate quota and TTL bounds apply to cached invitations.
+- Quota and TTL bound abandoned queues and incomplete fanout, expose
+  backpressure and the maximum offline window, and separately bound cached
+  invitations.
 - Every schema upgrade after version 3 migrates in place and preserves pending
   relay data; operators are not required to start from a clean database.
-- The relay has no retained event history, snapshots, lists, generic topics, or
-  anonymous addressing.
+- The relay has no retained event history, snapshots, public identity or
+  application lists, generic topics, or anonymous addressing.
