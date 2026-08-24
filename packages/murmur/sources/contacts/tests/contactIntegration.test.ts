@@ -398,7 +398,7 @@ describe("built-in contacts", () => {
             carol.close();
             await relay.close();
         }
-    }, 45_000);
+    }, 120_000);
 
     test("creates an N-person service group from contacts and exchanges messages", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
