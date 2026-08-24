@@ -1,0 +1,13 @@
+// Assets-only Worker: no `main`, no bindings, no server state.
+//
+// Cloudflare serves `sources/` directly and applies `sources/_headers`. The
+// expected workers.dev URL is https://murmur.<account>.workers.dev.
+{
+    "name": "murmur",
+    "compatibility_date": "2025-04-01",
+    "assets": {
+        "directory": "./sources",
+        "html_handling": "auto-trailing-slash",
+        "not_found_handling": "404-page",
+    },
+}

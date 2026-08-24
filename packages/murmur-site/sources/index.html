@@ -1,0 +1,873 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="utf-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1" />
+        <title>Murmur — stateful MLS sessions over a disposable relay</title>
+        <meta
+            name="description"
+            content="Murmur is a browser-safe TypeScript library for stateful MLS (RFC 9420) sessions. Durable state lives in your storage; the relay is an untrusted delivery buffer that stores ciphertext it cannot read."
+        />
+        <meta name="color-scheme" content="light dark" />
+        <link rel="stylesheet" href="/site.css" />
+        <!-- Loaded without defer so the stored appearance is applied before first paint. -->
+        <script src="/site.js"></script>
+    </head>
+    <body>
+        <a class="skip-link" href="#main">Skip to content</a>
+
+        <header class="chrome">
+            <div class="chrome-inner">
+                <a class="wordmark" href="#top">Murmur</a>
+                <nav class="chrome-nav" aria-label="Sections">
+                    <a href="#how-it-works">How it works</a>
+                    <a href="#cryptography">Cryptography</a>
+                    <a href="#relay">Relay</a>
+                    <a href="#services">Services</a>
+                    <a href="#install">Install</a>
+                </nav>
+                <div class="chrome-actions">
+                    <span class="pill" aria-label="Package version">v0.4.5</span>
+                    <button
+                        type="button"
+                        class="button button-ghost button-small"
+                        id="appearance-toggle"
+                        aria-pressed="false"
+                    >
+                        Dark
+                    </button>
+                    <a
+                        class="button button-ghost button-small"
+                        href="https://github.com/slopus/murmur"
+                        rel="noreferrer"
+                        >GitHub</a
+                    >
+                </div>
+            </div>
+        </header>
+
+        <main id="main">
+            <section class="section section-hero" id="top" aria-labelledby="hero-title">
+                <div class="measure">
+                    <h1 id="hero-title">Encrypted sessions that outlive the connection.</h1>
+                    <p class="lede">
+                        Murmur is a browser-safe TypeScript library for stateful
+                        <abbr title="Messaging Layer Security">MLS</abbr> sessions over one
+                        deliberately simple relay. Two identities discover each other through a
+                        short-lived signed invitation, bootstrap a forward-secret session, and
+                        exchange end-to-end encrypted data through typed synchronization services. A
+                        two-person conversation and a twenty-person group are the same primitive.
+                    </p>
+
+                    <div class="install-strip">
+                        <code id="install-command">pnpm add @slopus/murmur</code>
+                        <button
+                            type="button"
+                            class="button button-ghost button-small"
+                            id="copy-install"
+                        >
+                            Copy
+                        </button>
+                        <span class="visually-hidden" id="copy-status" role="status"></span>
+                    </div>
+
+                    <p class="cta-row">
+                        <a
+                            class="button button-primary"
+                            href="https://github.com/slopus/murmur/blob/main/docs/PROTOCOL.md"
+                            rel="noreferrer"
+                            >Read the protocol</a
+                        >
+                        <a
+                            class="button button-ghost"
+                            href="https://www.npmjs.com/package/@slopus/murmur"
+                            rel="noreferrer"
+                            >View on npm</a
+                        >
+                    </p>
+
+                    <p class="micro">
+                        ESM-only · side-effect-free · browsers and Node.js 20+ · three Noble
+                        dependencies · MIT
+                    </p>
+
+                    <figure class="figure">
+                        <svg
+                            class="diagram"
+                            viewBox="0 0 720 232"
+                            role="img"
+                            aria-labelledby="topology-title topology-desc"
+                        >
+                            <title id="topology-title">Murmur topology</title>
+                            <desc id="topology-desc">
+                                Two Murmur clients exchange a 32-byte invitation digest out of band.
+                                Each client holds its own durable store. Both publish to and read
+                                from an untrusted relay in the middle, which holds only encrypted
+                                deliveries it cannot read and a five-minute invitation cache.
+                            </desc>
+                            <g
+                                fill="none"
+                                stroke="currentColor"
+                                stroke-width="1"
+                                vector-effect="non-scaling-stroke"
+                            >
+                                <rect x="8" y="8" width="180" height="56" rx="8" />
+                                <rect x="532" y="8" width="180" height="56" rx="8" />
+                                <rect x="8" y="96" width="704" height="72" rx="8" />
+                                <rect x="8" y="196" width="180" height="28" rx="6" />
+                                <rect x="532" y="196" width="180" height="28" rx="6" />
+                                <path d="M98 64 L98 96" />
+                                <path d="M622 64 L622 96" />
+                                <path d="M98 168 L98 196" />
+                                <path d="M622 168 L622 196" />
+                            </g>
+                            <path
+                                d="M188 36 L532 36"
+                                fill="none"
+                                stroke="var(--text-link)"
+                                stroke-width="1"
+                                stroke-dasharray="4 4"
+                                vector-effect="non-scaling-stroke"
+                            />
+                            <text class="diagram-label" x="98" y="32" text-anchor="middle">
+                                MurmurClient (Alice)
+                            </text>
+                            <text class="diagram-note" x="98" y="50" text-anchor="middle">
+                                identity · MLS epochs
+                            </text>
+                            <text class="diagram-label" x="622" y="32" text-anchor="middle">
+                                MurmurClient (Bob)
+                            </text>
+                            <text class="diagram-note" x="622" y="50" text-anchor="middle">
+                                identity · MLS epochs
+                            </text>
+                            <text class="diagram-accent" x="360" y="30" text-anchor="middle">
+                                32-byte invitation digest, out of band
+                            </text>
+                            <text class="diagram-label" x="360" y="126" text-anchor="middle">
+                                relay (untrusted)
+                            </text>
+                            <text class="diagram-note" x="360" y="146" text-anchor="middle">
+                                encrypted deliveries it cannot read · five-minute invitation cache
+                            </text>
+                            <text class="diagram-note" x="98" y="215" text-anchor="middle">
+                                MurmurStore
+                            </text>
+                            <text class="diagram-note" x="622" y="215" text-anchor="middle">
+                                MurmurStore
+                            </text>
+                        </svg>
+                        <figcaption class="micro">
+                            Durable protocol state lives in the application's store. The relay is a
+                            delivery buffer, never session state or history.
+                        </figcaption>
+                    </figure>
+                </div>
+            </section>
+
+            <section class="section" id="scope" aria-labelledby="scope-title">
+                <div class="measure">
+                    <h2 id="scope-title">What Murmur is, and what it isn't</h2>
+                    <div class="ledger">
+                        <div class="ledger-column">
+                            <h3 class="ledger-title">Murmur is</h3>
+                            <ul class="list">
+                                <li>
+                                    a stateful client library with one durable identity per store;
+                                </li>
+                                <li>
+                                    end-to-end encrypted with MLS (TreeKEM) for two or more members;
+                                </li>
+                                <li>
+                                    built-in mutual-profile contacts plus optional typed services;
+                                </li>
+                                <li>
+                                    offline-first, with durable outboxes and restart-safe delivery.
+                                </li>
+                            </ul>
+                        </div>
+                        <div class="ledger-column">
+                            <h3 class="ledger-title">Murmur is not</h3>
+                            <ul class="list">
+                                <li>
+                                    anonymous: the relay learns sender, recipient, fanout, and
+                                    timing metadata;
+                                </li>
+                                <li>
+                                    server-side history: acknowledged deliveries are gone from the
+                                    relay;
+                                </li>
+                                <li>
+                                    a recovery system: losing the local store loses sessions and
+                                    contacts;
+                                </li>
+                                <li>multi-device: one identity has one active receiving device.</li>
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="how-it-works" aria-labelledby="how-it-works-title">
+                <div class="measure">
+                    <h2 id="how-it-works-title">How it works</h2>
+                    <p class="lede">
+                        Four steps. Nothing in them requires an account, a directory, or a server
+                        that understands your data.
+                    </p>
+
+                    <ol class="steps">
+                        <li class="step">
+                            <p class="step-index">01</p>
+                            <div class="step-body">
+                                <h3>Identity</h3>
+                                <p>
+                                    An identity is one 32-byte Ed25519 public key, derived together
+                                    with its X25519 agreement key from a single 32-byte secret root.
+                                    That public key is both the stable identifier and the address of
+                                    the identity's relay queue. There is no username, no
+                                    registration, and no directory that can resolve one.
+                                </p>
+                                <p class="caption">
+                                    <code>MurmurClient.open({ relay, store })</code> generates the
+                                    identity into an empty store, or reuses the one already there.
+                                </p>
+                            </div>
+                        </li>
+                        <li class="step">
+                            <p class="step-index">02</p>
+                            <div class="step-body">
+                                <h3>Invitation</h3>
+                                <p>
+                                    Knowing an identity key is not enough to start an MLS session:
+                                    MLS also needs fresh one-use public KeyPackage material.
+                                    <code>createInvitation()</code> signs a self-contained bundle —
+                                    the identity, one one-use KeyPackage, creation and expiry times
+                                    — uploads its exact bytes to the relay's content-addressed
+                                    cache, and returns their 32-byte SHA-256 digest. You share only
+                                    the digest, out of band.
+                                </p>
+                                <p class="caption">
+                                    A bundle is valid for at most five minutes and contains no
+                                    secrets. The relay cannot enumerate cached bundles or resolve an
+                                    identity to one; the digest is the only lookup capability.
+                                </p>
+                            </div>
+                        </li>
+                        <li class="step">
+                            <p class="step-index">03</p>
+                            <div class="step-body">
+                                <h3>Session</h3>
+                                <p>
+                                    Resolving the digest verifies the hash, the signed expiry, the
+                                    identity signature, and the KeyPackage signatures, then
+                                    bootstraps an MLS session. Every membership change is a Commit.
+                                    Exactly one authenticated epoch committer serializes Commits;
+                                    other members submit proposals. The sender adopts its own Commit
+                                    only from its authenticated queue echo, never from a successful
+                                    publish — so relay ordering never arbitrates concurrent Commits.
+                                </p>
+                                <p class="caption">
+                                    Two-person and many-person sessions use the same forward-secret
+                                    TreeKEM session. There is no separate direct-message path.
+                                </p>
+                            </div>
+                        </li>
+                        <li class="step">
+                            <p class="step-index">04</p>
+                            <div class="step-body">
+                                <h3>Synchronization</h3>
+                                <p>
+                                    One identity-wide loop holds the authenticated realtime
+                                    connection open, publishes durable outboxes, and processes the
+                                    inbox in UUIDv7 order. A relay item is acknowledged only after
+                                    its outcome — new MLS state, replay and queue progress, and any
+                                    buffered application update — has atomically committed to your
+                                    store. A crash before that is a harmless redelivery.
+                                </p>
+                                <p class="caption">
+                                    The realtime channel carries each exact queued delivery with its
+                                    event ID over authenticated SSE or WebSocket. It is not a
+                                    wake-only signal, and receipt is never acknowledgement.
+                                </p>
+                            </div>
+                        </li>
+                    </ol>
+                </div>
+            </section>
+
+            <section class="section" id="contacts" aria-labelledby="contacts-title">
+                <div class="measure">
+                    <h2 id="contacts-title">Invitations and contacts</h2>
+                    <p class="lede">
+                        A confirmed contact is durable cryptographic proof that two identities
+                        exchanged and accepted profiles inside one two-person MLS session.
+                    </p>
+
+                    <p>
+                        Murmur has no separate "friendship" object. The mutual contact handshake
+                        <em>is</em> the relationship, and it is proven rather than asserted: the
+                        requester attaches an application-defined profile,
+                        <code>acceptContact()</code> replies with the accepter's own typed hello,
+                        and only that mutual exchange confirms the contact on both sides.
+                        <code>rejectContact()</code> destroys the pending session and its secrets,
+                        and does not notify the requester.
+                    </p>
+
+                    <div class="panel">
+                        <h3>Groups work while everyone else is offline</h3>
+                        <p>
+                            Each contact hello carries fifteen one-use MLS KeyPackages plus one
+                            reusable last-resort package, refilled in the background. Creating a
+                            group consumes that cached admission material locally — no new
+                            invitation link, no round trip, and no waiting for anyone to reconnect.
+                        </p>
+                        <p class="caption">
+                            The retained last-resort package is a deliberate availability tradeoff.
+                            Compromising it can expose Welcomes captured under it; ordinary one-use
+                            packages keep the stronger delete-after-one-Welcome property, and refill
+                            rotates the fallback when the contact reconnects.
+                        </p>
+                    </div>
+
+                    <h3>Invitations are bearer capabilities</h3>
+                    <p>
+                        Anyone holding a digest can fetch the public bundle and
+                        <em>attempt</em> a bootstrap; acceptance always stays with the recipient.
+                        The creator can revoke with <code>revokeInvitation(digest)</code> or
+                        <code>revokeInvitations()</code>, authorized by a private revocation key
+                        that never leaves the local store. Revocation is idempotent, is not
+                        retroactive session termination, and depends on a reachable relay: a failed
+                        attempt destroys the local one-use KeyPackage and retries after restart, but
+                        cannot un-cache remote bytes before their five-minute expiry.
+                    </p>
+                </div>
+            </section>
+
+            <section class="section" id="cryptography" aria-labelledby="cryptography-title">
+                <div class="measure">
+                    <h2 id="cryptography-title">Cryptography</h2>
+                    <p class="lede">
+                        One cipher suite profile, imported by every MLS domain in the codebase
+                        rather than chosen independently per call site.
+                    </p>
+
+                    <div class="table-wrap">
+                        <table class="table">
+                            <caption class="visually-hidden">
+                                Cryptographic primitives used by Murmur
+                            </caption>
+                            <tbody>
+                                <tr>
+                                    <th scope="row">Protocol</th>
+                                    <td>
+                                        MLS,
+                                        <a
+                                            href="https://www.rfc-editor.org/rfc/rfc9420"
+                                            rel="noreferrer"
+                                            >RFC 9420</a
+                                        >
+                                        — TreeKEM with Add, Remove, Commit, Welcome, and
+                                        PrivateMessage
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Cipher suite</th>
+                                    <td><code>0x0001</code></td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">HPKE</th>
+                                    <td>
+                                        DHKEM(X25519, HKDF-SHA-256), base mode per
+                                        <a
+                                            href="https://www.rfc-editor.org/rfc/rfc9180"
+                                            rel="noreferrer"
+                                            >RFC 9180</a
+                                        >
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Key agreement</th>
+                                    <td>
+                                        X25519,
+                                        <a
+                                            href="https://www.rfc-editor.org/rfc/rfc7748"
+                                            rel="noreferrer"
+                                            >RFC 7748</a
+                                        >
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Key derivation</th>
+                                    <td>
+                                        HKDF-SHA-256,
+                                        <a
+                                            href="https://www.rfc-editor.org/rfc/rfc5869"
+                                            rel="noreferrer"
+                                            >RFC 5869</a
+                                        >, MLS-labeled with the mandatory
+                                        <code>"MLS 1.0 "</code> prefix
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">AEAD</th>
+                                    <td>
+                                        AES-128-GCM for HPKE and MLS content protection; AES-256-GCM
+                                        for sealed bootstrap boxes
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Signatures</th>
+                                    <td>
+                                        Ed25519,
+                                        <a
+                                            href="https://www.rfc-editor.org/rfc/rfc8032"
+                                            rel="noreferrer"
+                                            >RFC 8032</a
+                                        >
+                                        — LeafNode, Commit, delivery, and discovery signatures
+                                    </td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Credential</th>
+                                    <td>BasicCredential bound to the Murmur identity key</td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Hash</th>
+                                    <td>SHA-256, also used for the 32-byte invitation digest</td>
+                                </tr>
+                                <tr>
+                                    <th scope="row">Implementation</th>
+                                    <td>
+                                        <a
+                                            href="https://github.com/paulmillr/noble-curves"
+                                            rel="noreferrer"
+                                            >@noble/curves</a
+                                        >,
+                                        <a
+                                            href="https://github.com/paulmillr/noble-hashes"
+                                            rel="noreferrer"
+                                            >@noble/hashes</a
+                                        >, and
+                                        <a
+                                            href="https://github.com/paulmillr/noble-ciphers"
+                                            rel="noreferrer"
+                                            >@noble/ciphers</a
+                                        >. No native modules and no <code>node:*</code> imports.
+                                    </td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+
+                    <ul class="list">
+                        <li>
+                            <strong>Forward secrecy and post-compromise security</strong> come from
+                            TreeKEM epoch advancement, not from a per-message ratchet bolted on top.
+                        </li>
+                        <li>
+                            <strong>Queues are authenticated.</strong> Publishing is sender-signed;
+                            reading and acknowledging a queue require signatures from the recipient
+                            identity.
+                        </li>
+                        <li>
+                            <strong>Keys are <code>Uint8Array</code> throughout.</strong> Base64url
+                            appears only at wire and storage boundaries. Murmur zeroes buffers it no
+                            longer needs, and <code>close()</code> zeroes the in-memory identity.
+                        </li>
+                    </ul>
+
+                    <div class="notice">
+                        <p>
+                            Murmur is a <code>0.x</code> project and
+                            <strong>has not received an independent security audit</strong>. Its MLS
+                            implementation is a tested RFC 9420 profile, not a claim of complete RFC
+                            feature coverage.
+                        </p>
+                    </div>
+                </div>
+            </section>
+
+            <section class="section" id="relay" aria-labelledby="relay-title">
+                <div class="measure">
+                    <h2 id="relay-title">The relay is untrusted, and dumb on purpose</h2>
+                    <p class="lede">
+                        Murmur protects application content from the relay, not communication
+                        metadata. Being exact about that distinction is the point.
+                    </p>
+
+                    <div class="ledger">
+                        <div class="ledger-column">
+                            <h3 class="ledger-title">The relay sees</h3>
+                            <ul class="list">
+                                <li>sender and recipient public identities;</li>
+                                <li>exact multicast fanout;</li>
+                                <li>delivery sizes, timing, TTL, and per-inbox progress;</li>
+                                <li>IP or trusted-ingress admission metadata;</li>
+                                <li>the lifetime and timing of recipient connections;</li>
+                                <li>public signed discovery bundles in its five-minute cache.</li>
+                            </ul>
+                        </div>
+                        <div class="ledger-column">
+                            <h3 class="ledger-title">The relay never receives</h3>
+                            <ul class="list">
+                                <li>identity roots;</li>
+                                <li>KeyPackage private keys;</li>
+                                <li>Welcome plaintext;</li>
+                                <li>MLS epochs;</li>
+                                <li>application plaintext;</li>
+                                <li>application history.</li>
+                            </ul>
+                        </div>
+                    </div>
+
+                    <h3>What a hostile relay can and cannot do</h3>
+                    <ul class="list">
+                        <li>
+                            <strong>It can</strong> delay, drop, reorder across inboxes, replay
+                            retained ciphertext, equivocate, or become unavailable.
+                        </li>
+                        <li>
+                            <strong>It cannot</strong> forge a valid sender delivery, forge a
+                            recipient acknowledgement, or decrypt MLS content.
+                        </li>
+                        <li>
+                            <strong>It does not have</strong> an account registry, a discovery
+                            directory or listing, application history, MLS state, or any
+                            application-level acknowledgement protocol.
+                        </li>
+                    </ul>
+
+                    <p class="callout">
+                        If you need metadata privacy, Murmur is the wrong layer for it.
+                    </p>
+                </div>
+            </section>
+
+            <section class="section" id="durability" aria-labelledby="durability-title">
+                <div class="measure">
+                    <h2 id="durability-title">Offline durability</h2>
+                    <p class="lede">
+                        <code>send()</code> never waits for the network, for a peer, or for an
+                        epoch.
+                    </p>
+
+                    <p>
+                        Opening a client restores identity, contacts, sessions, and service routing
+                        from the store before any relay contact, so reads and mutations work
+                        immediately. Sends and membership changes made offline persist as durable
+                        outboxes and publish when connectivity returns. A send issued while a
+                        membership Commit is still staged is encrypted with the staged post-Commit
+                        epoch, durably advances that ratchet, and is published only after its
+                        prerequisite Welcome and Commit — surviving a restart in between.
+                    </p>
+
+                    <ul class="list">
+                        <li>
+                            <strong>Persist, then acknowledge.</strong> Never the reverse. A crash
+                            before the commit leaves the item pending at the relay and it is simply
+                            redelivered.
+                        </li>
+                        <li>
+                            <strong>Callbacks gate the batch.</strong> Murmur commits and drains a
+                            batch only after every relevant service handler and lifecycle callback
+                            resolves. A thrown handler re-delivers the same batch with the same
+                            stable event IDs.
+                        </li>
+                        <li>
+                            <strong>At-least-once with stable IDs.</strong> Deduplicate on
+                            <code>update.id</code> for effects that live outside the store.
+                        </li>
+                    </ul>
+
+                    <h3>The storage contract</h3>
+                    <p>
+                        Murmur never talks to a database itself. The application supplies one
+                        <code>MurmurStore</code>: an atomic, ordered, string-key/byte-value
+                        interface. Transactions are atomic and serialized, <code>scan</code> returns
+                        a bounded page in lexicographic key order, and values are bytes.
+                        Crash-safety rests entirely on that contract. Unacknowledged inbound
+                        deliveries wait in the relay queue within its quota and TTL — that bound is
+                        the maximum supported offline window, not an archive.
+                    </p>
+                </div>
+            </section>
+
+            <section class="section" id="services" aria-labelledby="services-title">
+                <div class="measure">
+                    <h2 id="services-title">Typed synchronization services</h2>
+                    <p class="lede">
+                        A service claims sessions from their descriptor and owns every later update.
+                        Chat is just a service, and so is everything else.
+                    </p>
+
+                    <div class="tabs">
+                        <div class="tablist" role="tablist" aria-label="Code examples">
+                            <button
+                                type="button"
+                                role="tab"
+                                id="tab-service"
+                                aria-controls="panel-service"
+                                aria-selected="true"
+                                class="tab"
+                            >
+                                service.ts
+                            </button>
+                            <button
+                                type="button"
+                                role="tab"
+                                id="tab-open"
+                                aria-controls="panel-open"
+                                aria-selected="false"
+                                tabindex="-1"
+                                class="tab"
+                            >
+                                open.ts
+                            </button>
+                            <button
+                                type="button"
+                                role="tab"
+                                id="tab-group"
+                                aria-controls="panel-group"
+                                aria-selected="false"
+                                tabindex="-1"
+                                class="tab"
+                            >
+                                group.ts
+                            </button>
+                            <button
+                                type="button"
+                                role="tab"
+                                id="tab-sync"
+                                aria-controls="panel-sync"
+                                aria-selected="false"
+                                tabindex="-1"
+                                class="tab"
+                            >
+                                sync.ts
+                            </button>
+                        </div>
+
+                        <div
+                            role="tabpanel"
+                            id="panel-service"
+                            aria-labelledby="tab-service"
+                            tabindex="0"
+                        >
+                            <pre class="code"><code>import type {
+    MurmurService,
+    MurmurServiceSessionDescriptor,
+    MurmurUpdate,
+} from "@slopus/murmur";
+
+class ChatService implements MurmurService {
+    // Return true to durably claim a newly observed session.
+    onNewSession(session: MurmurServiceSessionDescriptor): boolean {
+        return decoder.decode(session.descriptor) === "chat.v1";
+    }
+
+    // Receive every later update for sessions this service owns.
+    async onUpdate(update: MurmurUpdate): Promise&lt;void&gt; {
+        const packet = decodePacket(update.bytes);
+        if (packet === undefined) return; // unsupported packets have no effect
+        await application.onMessage({ eventId: update.id, ...packet });
+    }
+}</code></pre>
+                        </div>
+
+                        <div
+                            role="tabpanel"
+                            id="panel-open"
+                            aria-labelledby="tab-open"
+                            tabindex="0"
+                            hidden
+                        >
+                            <pre class="code"><code>import { MurmurClient } from "@slopus/murmur";
+
+const murmur = await MurmurClient.open({
+    relay: "https://relay.example",
+    store, // your transactional MurmurStore
+    services: [{ id: "chat.v1", service: new ChatService() }],
+});
+
+const publicIdentity: Uint8Array = murmur.identity; // 32-byte Ed25519 key</code></pre>
+                        </div>
+
+                        <div
+                            role="tabpanel"
+                            id="panel-group"
+                            aria-labelledby="tab-group"
+                            tabindex="0"
+                            hidden
+                        >
+                            <pre
+                                class="code"
+                            ><code>// Alice + Bob + Carol, from cached admission material.
+// Bob and Carol may be completely offline.
+const group = await alice.createSession({
+    descriptor: encodeJson({ version: 1, service: "chat", title: "Weekend plans" }),
+    contacts: [bobIdentity, carolIdentity],
+    service: "chat.v1",
+});
+
+await alice.send(group.id, encodeJson({ type: "message", text: "Dinner at seven?" }));
+await alice.addMember(group.id, daveIdentity);</code></pre>
+                        </div>
+
+                        <div
+                            role="tabpanel"
+                            id="panel-sync"
+                            aria-labelledby="tab-sync"
+                            tabindex="0"
+                            hidden
+                        >
+                            <pre class="code"><code>const abort = new AbortController();
+
+const running = murmur.sync({
+    abort: abort.signal,
+    onContactRequested: async (requests) =&gt; {
+        for (const request of requests) {
+            await murmur.acceptContact(request.sessionId, { displayName: "Alice" });
+        }
+    },
+    onUpdates: async (updates) =&gt; {
+        for (const update of updates) {
+            // Service-owned updates already ran through that service's onUpdate.
+            if (update.service !== undefined) continue;
+            await applyToApplicationState(update);
+        }
+    },
+});</code></pre>
+                        </div>
+                    </div>
+
+                    <ul class="list">
+                        <li>
+                            Registered services are offered a new descriptor in service-ID order;
+                            the first <code>true</code> claims the session, and that routing is
+                            persisted.
+                        </li>
+                        <li>
+                            Service-owned updates are also visible in global
+                            <code>onUpdates</code> with <code>update.service</code> set. Treat that
+                            as observation — do not apply the update a second time.
+                        </li>
+                        <li>
+                            Murmur stores only the session-to-service routing. A service owns its
+                            own application persistence.
+                        </li>
+                    </ul>
+                </div>
+            </section>
+
+            <section class="section" id="limits" aria-labelledby="limits-title">
+                <div class="measure">
+                    <h2 id="limits-title">Where this ends</h2>
+                    <ul class="list">
+                        <li>No independent security audit at <code>0.x</code>.</li>
+                        <li>
+                            Metadata is visible to the relay; Murmur promises encrypted contents,
+                            not anonymous routing.
+                        </li>
+                        <li>
+                            One active receiving device per identity. Two live clients against one
+                            queue split the cursor and corrupt delivery.
+                        </li>
+                        <li>
+                            No history and no recovery from the relay. A restored secret root
+                            recovers the key, not the sessions — back up the whole store.
+                        </li>
+                        <li>
+                            Invitation digests are bearer capabilities, and revocation depends on a
+                            reachable relay.
+                        </li>
+                        <li>
+                            The last-resort KeyPackage trades Welcome forward secrecy for offline
+                            availability.
+                        </li>
+                        <li>
+                            A production relay needs its own non-Sybil admission control: public
+                            identities are free to create, so quotas bound resource usage, not fair
+                            availability under a Sybil attack.
+                        </li>
+                        <li>
+                            The relay is private infrastructure. There is no hosted public relay and
+                            no account — you deploy it.
+                        </li>
+                    </ul>
+                </div>
+            </section>
+
+            <section class="section" id="install" aria-labelledby="install-title">
+                <div class="measure">
+                    <h2 id="install-title">Install</h2>
+                    <pre class="code"><code>pnpm add @slopus/murmur</code></pre>
+
+                    <h3>Run a relay locally</h3>
+                    <pre class="code"><code>pnpm install
+pnpm --filter @slopus/murmur-relay build
+
+MURMUR_RELAY_STORE=sqlite \
+MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+MURMUR_RELAY_ORIGINS='http://localhost:5173' \
+pnpm --filter @slopus/murmur-relay start</code></pre>
+                    <p class="caption">
+                        Point <code>MurmurClient.open({ relay: "http://127.0.0.1:8787" })</code> at
+                        it. The standalone process speaks plain HTTP and is meant for local
+                        development; production deployments require TLS termination and an admission
+                        boundary that authenticates non-Sybil principals.
+                    </p>
+
+                    <h3>Reference</h3>
+                    <ul class="link-list">
+                        <li>
+                            <a
+                                href="https://github.com/slopus/murmur/blob/main/docs/ARCHITECTURE.md"
+                                rel="noreferrer"
+                                >Architecture</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="https://github.com/slopus/murmur/blob/main/docs/PROTOCOL.md"
+                                rel="noreferrer"
+                                >Protocol</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="https://github.com/slopus/murmur/blob/main/docs/RELAY_API.md"
+                                rel="noreferrer"
+                                >Relay API</a
+                            >
+                        </li>
+                        <li>
+                            <a
+                                href="https://github.com/slopus/murmur/blob/main/docs/SECURITY.md"
+                                rel="noreferrer"
+                                >Security</a
+                            >
+                        </li>
+                    </ul>
+                </div>
+            </section>
+        </main>
+
+        <footer class="site-footer">
+            <div class="measure footer-inner">
+                <p class="micro">
+                    <a href="https://github.com/slopus/murmur" rel="noreferrer">GitHub</a> ·
+                    <a href="https://www.npmjs.com/package/@slopus/murmur" rel="noreferrer">npm</a>
+                    ·
+                    <a href="https://github.com/slopus/murmur/blob/main/LICENSE" rel="noreferrer"
+                        >MIT</a
+                    >
+                </p>
+                <p class="micro">
+                    <code>@slopus/murmur</code> · relay schema v4 · contact protocol v2 · no
+                    analytics, no third-party requests
+                </p>
+            </div>
+        </footer>
+    </body>
+</html>

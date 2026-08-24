@@ -1,0 +1,24 @@
+# Static response headers applied by Cloudflare Workers static assets.
+#
+# The site loads nothing from another origin, so the policy can deny every
+# fetch directive by default and allow only same-origin script and style.
+# `_headers` is a configuration file: Cloudflare consumes it and never serves it.
+
+/*
+  Content-Security-Policy: default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; font-src 'self'; connect-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; object-src 'none'
+  Strict-Transport-Security: max-age=63072000; includeSubDomains
+  X-Content-Type-Options: nosniff
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+  Permissions-Policy: accelerometer=(), camera=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()
+  X-Frame-Options: DENY
+
+/site.css
+  Cache-Control: public, max-age=3600
+
+/site.js
+  Cache-Control: public, max-age=3600
+
+/index.html
+  Cache-Control: public, max-age=0, must-revalidate

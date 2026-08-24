@@ -1,0 +1,13 @@
+{
+    "name": "@slopus/murmur-site",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Murmur landing page: static assets served by an assets-only Cloudflare Worker",
+    "license": "MIT",
+    "type": "module",
+    "scripts": {
+        "cloudflare:deploy:production": "wrangler deploy --config wrangler.production.jsonc",
+        "cloudflare:dev:production": "wrangler dev --config wrangler.production.jsonc",
+        "test": "node --test \"tests/**/*.test.js\""
+    }
+}
