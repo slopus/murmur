@@ -1,5 +1,5 @@
 {
-    "name": "murmur-relay",
+    "name": "murmur-relay-staging",
     "main": "sources/cloudflare/main.ts",
     "compatibility_date": "2025-04-01",
     "durable_objects": {
@@ -21,6 +21,6 @@
         },
     ],
     "vars": {
-        "MURMUR_RELAY_ENDPOINT": "wss://relay.example.com/v2/connect",
+        "MURMUR_RELAY_ENDPOINT": "wss://murmur-relay-staging.bulka-llc.workers.dev/v2/connect",
     },
 }

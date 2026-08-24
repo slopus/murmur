@@ -7,10 +7,13 @@ TTL, and queue progress. It never sees MLS or application plaintext.
 ## Cloudflare Durable Objects
 
 The additive WebSocket deployment uses one inbox Durable Object per device and
-one deployment-wide sequencing/fanout Durable Object. Configure the exact
-public `MURMUR_RELAY_ENDPOINT` in `wrangler.jsonc`, install the shared ticket
-secret with `pnpm dlx wrangler@4 secret put MURMUR_RELAY_TOKEN_SECRET`, and run
-`pnpm cloudflare:deploy` from this package.
+one deployment-wide sequencing/fanout Durable Object. Production and staging
+are isolated by `wrangler.production.jsonc` and `wrangler.staging.jsonc`, with
+separate Worker names, Durable Object namespaces, endpoints, and ticket
+secrets. Configure each exact public `MURMUR_RELAY_ENDPOINT`, install its shared
+ticket secret with `wrangler secret put MURMUR_RELAY_TOKEN_SECRET --config
+<config>`, and run `pnpm cloudflare:deploy:production` or
+`pnpm cloudflare:deploy:staging` from this package.
 
 The application server issues tickets with `createRelaySessionFetchHandler`.
 Its authorization callback must authenticate the user and verify that the

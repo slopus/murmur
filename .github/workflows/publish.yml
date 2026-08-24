@@ -48,6 +48,10 @@ jobs:
                       echo "prerelease=false" >> "$GITHUB_OUTPUT"
                   fi
             - run: pnpm test
+            - name: Test deployed staging relay
+              env:
+                  MURMUR_RELAY_STAGING_TOKEN_SECRET: ${{ secrets.MURMUR_RELAY_STAGING_TOKEN_SECRET }}
+              run: pnpm test:staging
             - run: pnpm typecheck
             - run: pnpm lint
             - run: pnpm format:check

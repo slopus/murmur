@@ -5,20 +5,24 @@ Postgres.
 
 ## Cloudflare Durable Objects
 
-The alternative negotiated transport is deployed from
-`packages/murmur-relay/wrangler.jsonc`. It uses one Durable Object per device
-inbox plus one deployment-wide Durable Object for UUIDv7 sequencing and durable
-ordered fanout retry. The public Worker is the required ingress; clients do not
-address a Durable Object instance directly.
+The alternative negotiated transport has isolated production and staging
+deployments configured in `packages/murmur-relay/wrangler.production.jsonc`
+and `packages/murmur-relay/wrangler.staging.jsonc`. Each deployment uses one
+Durable Object per device inbox plus one deployment-wide Durable Object for
+UUIDv7 sequencing and durable ordered fanout retry. The public Worker is the
+required ingress; clients do not address a Durable Object instance directly.
 
-Set the exact public `wss:` URL in `MURMUR_RELAY_ENDPOINT`, then provision the
-same 32-byte-or-longer base64url HMAC secret in the relay Worker and the
-application server:
+Set the exact public `wss:` URL in each deployment's `MURMUR_RELAY_ENDPOINT`,
+then provision a 32-byte-or-longer base64url HMAC secret in that relay Worker
+and the corresponding application server. Production and staging use separate
+secrets:
 
 ```bash
 cd packages/murmur-relay
-pnpm dlx wrangler@4 secret put MURMUR_RELAY_TOKEN_SECRET
-pnpm cloudflare:deploy
+wrangler secret put MURMUR_RELAY_TOKEN_SECRET --config wrangler.production.jsonc
+pnpm cloudflare:deploy:production
+wrangler secret put MURMUR_RELAY_TOKEN_SECRET --config wrangler.staging.jsonc
+pnpm cloudflare:deploy:staging
 ```
 
 The application server mounts `createRelaySessionFetchHandler`. Its
@@ -26,6 +30,12 @@ The application server mounts `createRelaySessionFetchHandler`. Its
 key belongs to that account, and returns the Worker endpoint plus a stable
 admission principal. The handler's token secret is server configuration and is
 never sent to a client.
+
+The staging deployment is the permanent remote integration target. Run
+`pnpm test:staging` from the repository root with
+`MURMUR_RELAY_STAGING_TOKEN_SECRET` set to the protected staging capability.
+GitHub verifies staging on every non-fork pull request, every `main` push, and
+every release before publication.
 
 ## SQLite
 
