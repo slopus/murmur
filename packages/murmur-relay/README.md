@@ -40,7 +40,11 @@ endpoint and a stable admission principal from that callback.
 - Signed public discovery bundles may be cached for at most five minutes under
   the SHA-256 digest of their exact bytes.
 - Invitation lookups are non-enumerable and have separate per-principal and
-  relay-wide item and byte quotas. Re-upload does not extend expiry.
+  relay-wide item and byte quotas. Re-upload does not extend expiry, and a live
+  revocation tombstone rejects re-upload entirely.
+- Owner-authorized uploads bind an invitation to a separate public revocation
+  key. Signed single/all revocation replaces live rows with bounded expiring
+  tombstones, so public bundle bytes cannot resurrect a revoked digest.
 
 There are no topics, snapshots, retained history, collapse keys, lists, or
 anonymous capability addresses.
@@ -83,16 +87,24 @@ Invitation cache limits are configured with
 `MURMUR_RELAY_INVITATION_BYTES`,
 `MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL`,
 `MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL`,
+`MURMUR_RELAY_INVITATION_ITEMS_PER_REVOCATION_KEY`,
 `MURMUR_RELAY_GLOBAL_INVITATION_ITEMS`, and
 `MURMUR_RELAY_GLOBAL_INVITATION_BYTES`. Defaults are 16 KiB per bundle, 32
-items and 512 KiB per admitted principal, and 10,000 items or 64 MiB globally.
-The five-minute maximum TTL is not configurable above five minutes.
+items and 512 KiB per admitted principal, 32 items per revocation authority,
+and 10,000 items or 64 MiB globally. The five-minute maximum TTL is not
+configurable above five minutes.
+
+The Cloudflare negotiated WebSocket Worker does not implement the HTTP
+invitation cache. Applications using it must configure a compatible external
+`DiscoveryTransport`; deploying the Worker alone does not provide invitation
+revocation.
 
 Relay schema v3, shipped with Murmur v0.3.3, is the compatibility baseline.
-Future schema versions migrate an existing SQLite database or Postgres schema
-in place and preserve pending deliveries and invitations. Upgrading from this
-baseline never requires a clean database. Pre-v0.3 `murmur_relay_*` topic
-schemas remain unsupported.
+The current schema v4 migrates an existing SQLite database or Postgres schema
+in place and preserves pending deliveries and invitations while adding public
+revocation metadata and expiring tombstones. Upgrading from the baseline never
+requires a clean database. Pre-v0.3 `murmur_relay_*` topic schemas remain
+unsupported.
 
 The standalone process drains expired data every ten seconds in fixed
 transactions, continuing for at most one second per tick. It skips overlapping
@@ -128,7 +140,9 @@ boot ends with `relay:ready` followed by `relay:maintenance-ready`.
 | Method | Route                     | Purpose                                   |
 | ------ | ------------------------- | ----------------------------------------- |
 | `GET`  | `/health`                 | Store health                              |
-| `POST` | `/v1/invitations`         | Cache exact signed discovery bytes        |
+| `POST` | `/v1/invitations`         | Cache legacy unrevocable discovery bytes  |
+| `POST` | `/v1/invitations/owned`   | Cache owner-authorized revocable bytes    |
+| `POST` | `/v1/invitations/revoke`  | Revoke one or all owner invitations       |
 | `GET`  | `/v1/invitations/:digest` | Fetch unexpired bytes by SHA-256          |
 | `POST` | `/v1/deliveries`          | Publish one atomic encrypted multicast    |
 | `POST` | `/v1/queue/read`          | Authenticated queue read or long poll     |

@@ -5,7 +5,14 @@ import type {
     DiscoveryTransport,
     DiscoveryUploadOutcome,
     HttpDiscoveryTransportOptions,
+    InvitationRevocationOutcome,
+    InvitationUploadAuthorization,
+    SignedInvitationRevocation,
 } from "../types.js";
+import {
+    invitationUploadAuthorizationJson,
+    signedInvitationRevocationJson,
+} from "./invitationAuthorization.js";
 
 const DEFAULT_MAXIMUM_RESPONSE_BYTES = 64 * 1024;
 
@@ -112,28 +119,31 @@ export class HttpDiscoveryTransport implements DiscoveryTransport {
             },
             signal,
         );
-        const value = this.#responseJson(response, bytes);
-        if (!response.ok) this.#throwResponse(response.status, value);
-        const outcome = object(value);
-        exact(outcome, ["digest", "expiresAt", "duplicate"]);
-        if (
-            typeof outcome.digest !== "string" ||
-            typeof outcome.expiresAt !== "number" ||
-            !Number.isSafeInteger(outcome.expiresAt) ||
-            typeof outcome.duplicate !== "boolean"
-        ) {
-            throw new Error("Invalid discovery relay response");
+        return this.#uploadOutcome(response, bytes, bundle);
+    }
+
+    async uploadOwned(
+        bundle: Uint8Array,
+        authorization: InvitationUploadAuthorization,
+        signal?: AbortSignal,
+    ): Promise<DiscoveryUploadOutcome> {
+        if (!(bundle instanceof Uint8Array) || bundle.length < 1) {
+            throw new Error("Invalid discovery bundle bytes");
         }
-        const digest = decodeBase64Url(outcome.digest);
-        if (digest.length !== 32) throw new Error("Invalid discovery relay response");
-        if (!equalBytes(digest, sha256(bundle))) {
-            throw new Error("Discovery relay returned the wrong bundle digest");
-        }
-        return {
-            digest,
-            expiresAt: outcome.expiresAt,
-            duplicate: outcome.duplicate,
-        };
+        const { response, bytes } = await this.#requestBytes(
+            "/v1/invitations/owned",
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    version: 1,
+                    bundle: encodeBase64Url(bundle),
+                    authorization: invitationUploadAuthorizationJson(authorization),
+                }),
+            },
+            signal,
+        );
+        return this.#uploadOutcome(response, bytes, bundle);
     }
 
     async download(digest: Uint8Array, signal?: AbortSignal): Promise<Uint8Array> {
@@ -152,6 +162,34 @@ export class HttpDiscoveryTransport implements DiscoveryTransport {
             throw new Error("Downloaded invitation digest does not match");
         }
         return bytes;
+    }
+
+    async revoke(
+        request: SignedInvitationRevocation,
+        signal?: AbortSignal,
+    ): Promise<InvitationRevocationOutcome> {
+        const { response, bytes } = await this.#requestBytes(
+            "/v1/invitations/revoke",
+            {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(signedInvitationRevocationJson(request)),
+            },
+            signal,
+        );
+        const value = this.#responseJson(response, bytes);
+        if (!response.ok) this.#throwResponse(response.status, value);
+        const outcome = object(value);
+        exact(outcome, ["revoked"]);
+        if (
+            typeof outcome.revoked !== "number" ||
+            !Number.isSafeInteger(outcome.revoked) ||
+            outcome.revoked < 0 ||
+            outcome.revoked > 32
+        ) {
+            throw new Error("Invalid discovery relay response");
+        }
+        return Object.freeze({ revoked: outcome.revoked });
     }
 
     async #requestBytes(
@@ -191,6 +229,35 @@ export class HttpDiscoveryTransport implements DiscoveryTransport {
             if (response.ok) throw new Error("Invalid discovery relay response JSON");
             return { error: "unknown" };
         }
+    }
+
+    #uploadOutcome(
+        response: Response,
+        bytes: Uint8Array,
+        bundle: Uint8Array,
+    ): DiscoveryUploadOutcome {
+        const value = this.#responseJson(response, bytes);
+        if (!response.ok) this.#throwResponse(response.status, value);
+        const outcome = object(value);
+        exact(outcome, ["digest", "expiresAt", "duplicate"]);
+        if (
+            typeof outcome.digest !== "string" ||
+            typeof outcome.expiresAt !== "number" ||
+            !Number.isSafeInteger(outcome.expiresAt) ||
+            typeof outcome.duplicate !== "boolean"
+        ) {
+            throw new Error("Invalid discovery relay response");
+        }
+        const digest = decodeBase64Url(outcome.digest);
+        if (digest.length !== 32) throw new Error("Invalid discovery relay response");
+        if (!equalBytes(digest, sha256(bundle))) {
+            throw new Error("Discovery relay returned the wrong bundle digest");
+        }
+        return {
+            digest,
+            expiresAt: outcome.expiresAt,
+            duplicate: outcome.duplicate,
+        };
     }
 
     #throwResponse(status: number, value: unknown): never {

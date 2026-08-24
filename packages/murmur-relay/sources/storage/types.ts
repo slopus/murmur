@@ -27,6 +27,12 @@ export interface InvitationLimits {
     readonly maximumPrincipalBytes: number;
     readonly maximumGlobalItems: number;
     readonly maximumGlobalBytes: number;
+    readonly maximumRevocationKeyItems: number;
+}
+
+/** Result of atomically replacing live invitations with bounded revocation tombstones. */
+export interface RevokeInvitationsOutcome {
+    readonly revoked: number;
 }
 
 /** Result of one monotonic queue-prefix acknowledgement. */
@@ -75,8 +81,15 @@ export interface RelayStore {
         now: number,
         limits: InvitationLimits,
         admissionPrincipal: Uint8Array,
+        revocationKey?: Uint8Array,
     ): Promise<StoreInvitationOutcome>;
     readInvitation(digest: Uint8Array, now: number): Promise<StoredInvitation | undefined>;
+    revokeInvitations(
+        revocationKey: Uint8Array,
+        digest: Uint8Array | null,
+        now: number,
+        maximumItems: number,
+    ): Promise<RevokeInvitationsOutcome>;
     publish(
         delivery: SignedDelivery,
         now: number,

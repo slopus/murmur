@@ -297,6 +297,34 @@ const digest: Uint8Array = await alice.createInvitation();
 await bob.requestContact(digest, { displayName: "Bob" });
 ```
 
+Every invitation created through Murmur's built-in HTTP discovery transport is
+registered with a separate durable revocation authority. Its private key stays
+only in Alice's `MurmurStore`; neither the invitation nor its digest contains
+it. Alice can invalidate one invitation or every still-live invitation created
+by this store:
+
+```ts
+await alice.revokeInvitation(digest);
+await alice.revokeInvitations();
+```
+
+Both operations are idempotent. A successful call removes the relay cache row,
+leaves an expiring anti-resurrection tombstone, and destroys matching unused
+private KeyPackages locally. A digest holder cannot revoke: the relay requires
+a signature from the private revocation authority registered by the invitation
+owner. Revocation does not tear down a session that already completed its
+Welcome.
+
+Revocation requires a reachable compatible discovery relay. If the request
+fails, Murmur still destroys the local one-use KeyPackage and durably remembers
+the pending revocation for retry after restart, so a later Welcome cannot
+establish a new session. The public bundle may nevertheless continue resolving
+from the relay until the authenticated retry succeeds or its five-minute expiry
+arrives. Applications must treat a rejected revocation call as not yet globally
+visible. Custom discovery transports support revocation only when they
+implement both `uploadOwned` and `revoke`; legacy `upload`-only invitations
+cannot be revoked through Murmur.
+
 `resolveInvitation()` downloads the exact bytes by digest and verifies the
 SHA-256 match, the identity signature, the signed expiry, and the KeyPackage
 signatures before returning. The relay cannot enumerate cached bundles or look
@@ -358,6 +386,11 @@ await alice.sync({
             console.log("confirmed contact", contact.profile.displayName);
         }
     },
+    onContactUpdated: async (updated) => {
+        for (const { contact } of updated) {
+            console.log("updated contact", contact.profile.displayName);
+        }
+    },
     onContactRemoved: async (removed) => {
         for (const { identity } of removed) {
             console.log("contact removed");
@@ -390,6 +423,22 @@ size-bounded JSON; their schema beyond that is yours. Outgoing requests are
 durable and survive reopening the same store. Repeating `requestContact()` for
 an identity that already has an outgoing handshake returns that existing
 session instead of creating another request.
+
+Replace the profile visible to every established contact with one atomic
+operation:
+
+```ts
+await murmur.updateContactProfile({
+    displayName: "Alice",
+    avatarUrl: "https://example.com/alice-v2.png",
+});
+```
+
+The new local profile, a monotonic revision, and one authenticated MLS outbox
+per active contact commit in the same store transaction. Publication therefore
+survives disconnection and restart. Recipients durably replace `contact.profile`
+and receive `onContactUpdated`; duplicate or reordered revisions are ignored.
+Contacts already removed or in the `"removing"` state are not targeted.
 
 ## Build a group messenger
 
@@ -824,6 +873,9 @@ const running = murmur.sync({
     onContactAdded: async (contacts) => {
         /* ... */
     },
+    onContactUpdated: async (contacts) => {
+        /* ... */
+    },
     onContactRemoved: async (contacts) => {
         /* ... */
     },
@@ -844,9 +896,9 @@ What the loop guarantees:
   after they all resolve. A thrown handler or a crash re-delivers the same
   batch with the same stable event IDs after restart.
 - **Outbound work wakes the loop.** `send`, `createSession`, membership
-  changes, and contact actions persist durable outboxes and signal the running
-  loop, which publishes them and retries transient relay failures with
-  backoff.
+  changes, profile refreshes, and contact actions persist durable outboxes and
+  signal the running loop, which publishes them and retries transient relay
+  failures with backoff.
 - **Reconnection is automatic.** On a dropped or transiently failing
   connection the loop calls `onDisconnected`, waits briefly, reconnects from
   the durable cursor, and calls `onConnected` again. Non-transient errors
@@ -929,6 +981,10 @@ cursor, republishes pending outboxes, and re-offers any uncommitted batch.
   recipient: contact requests need an explicit accept, ownerless sessions may
   require explicit activation, and pending state is strictly bounded against
   flooding.
+- **Revocation is owner-authorized but relay-dependent.** Invitation digests
+  contain no revocation secret. A failed offline revocation destroys local
+  one-use keys but cannot remove a remote cache row until retry; an established
+  session is outside invitation revocation.
 - **Offline contact admission is an availability tradeoff.** Contacts normally
   use one-use KeyPackages, but retain one reusable last-resort package so group
   creation cannot be blocked by an offline peer. Compromise of that retained
@@ -992,5 +1048,6 @@ Deeper reference material lives in the repository docs:
 ## Protocol versions
 
 Murmur v0.4 uses contact protocol and contact storage version 2. It is a clean
-break from the v0.3 contact format. Relay schema v3 remains unchanged because
-the relay stores only opaque deliveries and invitation bytes.
+break from the v0.3 contact format. Relay schema v4 adds owner-authorized
+invitation metadata and expiring revocation tombstones. SQLite and Postgres
+migrate schema v3 in place without deleting pending deliveries or invitations.

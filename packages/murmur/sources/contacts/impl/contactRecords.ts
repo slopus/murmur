@@ -14,6 +14,7 @@ export const CONTACT_IDENTITY_PREFIX = "murmur/contacts/v2/by-identity/";
 export const CONTACT_SESSION_PREFIX = "murmur/contacts/v2/by-session/";
 export const CONTACT_HANDSHAKE_PREFIX = "murmur/contacts/v2/handshakes/";
 export const CONTACT_EVENT_PREFIX = "murmur/contacts/v2/events/";
+export const CONTACT_LOCAL_PROFILE_KEY = "murmur/contacts/v2/local-profile";
 
 const DELIVERY_ID = /^[A-Za-z0-9_-]{32}$/;
 const EVENT_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -25,6 +26,8 @@ export interface ContactRecord {
     readonly sessionId: Uint8Array;
     readonly localProfile: MurmurContactProfile;
     readonly profile: MurmurContactProfile;
+    readonly localProfileRevision: number;
+    readonly remoteProfileRevision: number;
     readonly status: "active" | "removing";
     readonly confirmedAt: number;
     readonly removeDeliveryId?: string;
@@ -51,6 +54,12 @@ export interface ContactHandshakeRecord {
     readonly remoteAdmission?: MurmurContactAdmission;
 }
 
+export interface ContactLocalProfileRecord {
+    readonly version: 1;
+    readonly revision: number;
+    readonly profile: MurmurContactProfile;
+}
+
 export type ContactEventRecord =
     | {
           readonly version: 2;
@@ -75,6 +84,15 @@ export type ContactEventRecord =
           readonly id: string;
           readonly identity: Uint8Array;
           readonly sessionId: Uint8Array;
+      }
+    | {
+          readonly version: 2;
+          readonly type: "updated";
+          readonly id: string;
+          readonly identity: Uint8Array;
+          readonly sessionId: Uint8Array;
+          readonly localProfile: MurmurContactProfile;
+          readonly profile: MurmurContactProfile;
       };
 
 function object(value: unknown, name: string): Record<string, unknown> {
@@ -237,6 +255,10 @@ export function encodeContactRecord(record: ContactRecord): Uint8Array {
         (record.status !== "active" && record.status !== "removing") ||
         !Number.isSafeInteger(record.confirmedAt) ||
         record.confirmedAt < 0 ||
+        !Number.isSafeInteger(record.localProfileRevision) ||
+        record.localProfileRevision < 0 ||
+        !Number.isSafeInteger(record.remoteProfileRevision) ||
+        record.remoteProfileRevision < 0 ||
         (record.removeDeliveryId !== undefined && !DELIVERY_ID.test(record.removeDeliveryId)) ||
         !Number.isSafeInteger(record.localAdmissionGeneration) ||
         record.localAdmissionGeneration < 1 ||
@@ -253,6 +275,8 @@ export function encodeContactRecord(record: ContactRecord): Uint8Array {
         sessionId: keyBytes(record.sessionId, 32, 32, "contact session"),
         localProfile: profileJson(record.localProfile),
         profile: profileJson(record.profile),
+        localProfileRevision: record.localProfileRevision,
+        remoteProfileRevision: record.remoteProfileRevision,
         status: record.status,
         confirmedAt: record.confirmedAt,
         removeDeliveryId: record.removeDeliveryId ?? null,
@@ -267,6 +291,9 @@ export function encodeContactRecord(record: ContactRecord): Uint8Array {
 /** Decode one strict confirmed contact record. */
 export function decodeContactRecord(value: Uint8Array): ContactRecord {
     const input = parse(value, "contact record");
+    const hasProfileRevisions =
+        Object.hasOwn(input, "localProfileRevision") ||
+        Object.hasOwn(input, "remoteProfileRevision");
     exact(
         input,
         [
@@ -275,6 +302,7 @@ export function decodeContactRecord(value: Uint8Array): ContactRecord {
             "sessionId",
             "localProfile",
             "profile",
+            ...(hasProfileRevisions ? ["localProfileRevision", "remoteProfileRevision"] : []),
             "status",
             "confirmedAt",
             "removeDeliveryId",
@@ -315,6 +343,12 @@ export function decodeContactRecord(value: Uint8Array): ContactRecord {
         sessionId: bytes(input.sessionId, 32, 32, "contact session"),
         localProfile: validateContactProfile(input.localProfile),
         profile: validateContactProfile(input.profile),
+        localProfileRevision: hasProfileRevisions
+            ? timestamp(input.localProfileRevision, "local contact profile revision")
+            : 0,
+        remoteProfileRevision: hasProfileRevisions
+            ? timestamp(input.remoteProfileRevision, "remote contact profile revision")
+            : 0,
         status: input.status,
         confirmedAt: timestamp(input.confirmedAt, "contact confirmation time"),
         ...(removeDeliveryId === undefined ? {} : { removeDeliveryId }),
@@ -323,6 +357,33 @@ export function decodeContactRecord(value: Uint8Array): ContactRecord {
         refillNeeded: input.refillNeeded,
         ...(refillRequestDeliveryId === undefined ? {} : { refillRequestDeliveryId }),
         ...(supplyRequestEventId === undefined ? {} : { supplyRequestEventId }),
+    };
+}
+
+/** Encode the identity-wide local profile and its monotonic publication revision. */
+export function encodeContactLocalProfileRecord(record: ContactLocalProfileRecord): Uint8Array {
+    if (record.version !== 1 || !Number.isSafeInteger(record.revision) || record.revision < 1) {
+        throw new Error("Invalid local contact profile record");
+    }
+    return canonicalJsonBytes({
+        version: 1,
+        revision: record.revision,
+        profile: profileJson(record.profile),
+    });
+}
+
+/** Decode the identity-wide local profile publication record. */
+export function decodeContactLocalProfileRecord(value: Uint8Array): ContactLocalProfileRecord {
+    const input = parse(value, "local contact profile record");
+    exact(input, ["version", "revision", "profile"], "local contact profile record");
+    const revision = timestamp(input.revision, "local contact profile revision");
+    if (input.version !== 1 || revision < 1) {
+        throw new Error("Invalid local contact profile record");
+    }
+    return {
+        version: 1,
+        revision,
+        profile: validateContactProfile(input.profile),
     };
 }
 
@@ -440,6 +501,13 @@ export function encodeContactEventRecord(record: ContactEventRecord): Uint8Array
             profile: profileJson(record.profile),
         });
     }
+    if (record.type === "updated") {
+        return canonicalJsonBytes({
+            ...common,
+            localProfile: profileJson(record.localProfile),
+            profile: profileJson(record.profile),
+        });
+    }
     return canonicalJsonBytes(common);
 }
 
@@ -476,6 +544,25 @@ export function decodeContactEventRecord(value: Uint8Array): ContactEventRecord 
         return {
             version: 2,
             type: "added",
+            id: eventId(input.id, "contact event identifier"),
+            identity: identityBytes(input.identity, "contact identity"),
+            sessionId: bytes(input.sessionId, 32, 32, "contact session"),
+            localProfile: validateContactProfile(input.localProfile),
+            profile: validateContactProfile(input.profile),
+        };
+    }
+    if (input.type === "updated") {
+        exact(
+            input,
+            ["version", "type", "id", "identity", "sessionId", "localProfile", "profile"],
+            "contact updated event",
+        );
+        if (input.version !== 2) {
+            throw new Error("Invalid contact updated event");
+        }
+        return {
+            version: 2,
+            type: "updated",
             id: eventId(input.id, "contact event identifier"),
             identity: identityBytes(input.identity, "contact identity"),
             sessionId: bytes(input.sessionId, 32, 32, "contact session"),

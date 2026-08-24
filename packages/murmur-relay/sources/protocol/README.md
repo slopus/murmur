@@ -1,17 +1,25 @@
 # Relay protocol
 
-Signed identity-addressed multicast deliveries, signed queue reads, and signed
-monotonic queue acknowledgements.
+Signed identity-addressed multicast deliveries, signed queue reads, signed
+monotonic queue acknowledgements, and owner-authorized invitation lifecycle
+operations.
 
 ```text
 sender identity --signs--> delivery(recipient identities, ciphertext, TTL)
 recipient identity --signs--> read(after UUIDv7, limit, wait)
 recipient identity --signs--> ack(through)
+invitation identity --signs--> upload(digest, expiry, revocation public key)
+revocation key ------signs--> revoke(digest or all)
 ```
 
 Each signature has a distinct domain prefix. Ed25519 identities must be
 canonical, prime-order public points. Delivery recipients are sorted and unique
 so every signer and verifier covers exactly one encoding.
+
+Invitation upload and revocation signatures also use distinct canonical
+domains. The invitation identity authorizes only the public revocation key; its
+private root never crosses the client boundary. Revocation bodies are
+idempotent and reveal no private capability.
 
 Read and acknowledgement signatures are reusable within the configured clock
 skew; their timestamps prevent indefinite replay, not one-use replay. TLS is

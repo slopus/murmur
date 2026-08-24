@@ -64,3 +64,30 @@ export interface SignedQueueAckJson {
     readonly createdAt: number;
     readonly signature: string;
 }
+
+/** Owner signature binding exact invitation bytes to a separate revocation key. */
+export interface InvitationUploadAuthorization {
+    readonly version: 1;
+    readonly owner: Uint8Array;
+    readonly revocationKey: Uint8Array;
+    readonly digest: Uint8Array;
+    readonly expiresAt: number;
+    readonly createdAt: number;
+    readonly signature: Uint8Array;
+}
+
+/** Parsed owner-authorized invitation upload wrapper. */
+export interface OwnedInvitationUpload {
+    readonly version: 1;
+    readonly bundle: Uint8Array;
+    readonly authorization: InvitationUploadAuthorization;
+}
+
+/** Single- or authority-wide invitation revocation request. */
+export interface SignedInvitationRevocation {
+    readonly version: 1;
+    readonly revocationKey: Uint8Array;
+    readonly digest: Uint8Array | null;
+    readonly createdAt: number;
+    readonly signature: Uint8Array;
+}

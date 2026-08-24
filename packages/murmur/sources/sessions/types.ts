@@ -4,6 +4,7 @@ import type {
     MurmurContactAdded,
     MurmurContactRemoved,
     MurmurContactRequested,
+    MurmurContactUpdated,
 } from "../contacts/types.js";
 
 /** Stable public view of one local MLS session. */
@@ -48,6 +49,8 @@ export interface MurmurSyncOptions {
     ) => void | Promise<void>;
     /** Runs when mutual profile hellos establish confirmed contacts. */
     readonly onContactAdded?: (contacts: readonly MurmurContactAdded[]) => void | Promise<void>;
+    /** Runs when an established contact publishes a newer authenticated profile. */
+    readonly onContactUpdated?: (contacts: readonly MurmurContactUpdated[]) => void | Promise<void>;
     /** Runs when technical contact sessions are removed. */
     readonly onContactRemoved?: (contacts: readonly MurmurContactRemoved[]) => void | Promise<void>;
 }

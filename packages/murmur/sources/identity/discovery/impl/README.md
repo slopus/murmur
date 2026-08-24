@@ -15,3 +15,8 @@ five-minute cache and verifies the SHA-256 digest on both upload and download:
 ```text
 bundle bytes -> POST -> 32-byte digest -> GET -> digest check -> bundle parser
 ```
+
+`invitationAuthorization.ts` creates domain-separated owner upload signatures
+and separate revocation-key signatures. `invitationState.ts` retains at most 32
+digest-to-KeyPackage mappings, marks revocation pending before local key
+deletion, and resumes that deletion when the same store reopens.

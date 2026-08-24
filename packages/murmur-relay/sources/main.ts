@@ -95,6 +95,10 @@ export async function main(): Promise<void> {
             process.env.MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL,
             "MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL",
         );
+        const maximumInvitationItemsPerRevocationKey = optionalPositiveInteger(
+            process.env.MURMUR_RELAY_INVITATION_ITEMS_PER_REVOCATION_KEY,
+            "MURMUR_RELAY_INVITATION_ITEMS_PER_REVOCATION_KEY",
+        );
         const maximumGlobalInvitationItems = optionalPositiveInteger(
             process.env.MURMUR_RELAY_GLOBAL_INVITATION_ITEMS,
             "MURMUR_RELAY_GLOBAL_INVITATION_ITEMS",
@@ -136,6 +140,9 @@ export async function main(): Promise<void> {
                 ...(maximumInvitationBytesPerAdmissionPrincipal === undefined
                     ? {}
                     : { maximumInvitationBytesPerAdmissionPrincipal }),
+                ...(maximumInvitationItemsPerRevocationKey === undefined
+                    ? {}
+                    : { maximumInvitationItemsPerRevocationKey }),
                 ...(maximumGlobalInvitationItems === undefined
                     ? {}
                     : { maximumGlobalInvitationItems }),

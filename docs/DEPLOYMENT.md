@@ -63,6 +63,11 @@ place while preserving pending deliveries and invitations. Do not introduce an
 upgrade that requires operators to delete relay data or provision a clean
 database.
 
+The current standalone relay uses schema v4. Startup migrates v3 in place by
+adding nullable invitation revocation authorities and an expiring tombstone
+table; pending v3 invitations remain readable and may be owner-upgraded on an
+exact authenticated re-upload.
+
 Pre-v0.3 topic-relay schemas remain unsupported.
 
 ## Startup verification and logs
@@ -125,20 +130,33 @@ bounds are:
 MURMUR_RELAY_INVITATION_BYTES=16384
 MURMUR_RELAY_INVITATION_ITEMS_PER_PRINCIPAL=32
 MURMUR_RELAY_INVITATION_BYTES_PER_PRINCIPAL=524288
+MURMUR_RELAY_INVITATION_ITEMS_PER_REVOCATION_KEY=32
 MURMUR_RELAY_GLOBAL_INVITATION_ITEMS=10000
 MURMUR_RELAY_GLOBAL_INVITATION_BYTES=67108864
 ```
 
 Cached bundles are public signed material, not encrypted application data.
 They are non-enumerable and addressable only by their 32-byte SHA-256 digest.
+Owner-authorized registration and revocation use
+`POST /v1/invitations/owned` and `POST /v1/invitations/revoke`; ensure proxies
+forward both routes and do not log their bodies or URLs containing digests.
+Revocation tombstones retain only public authority metadata until the original
+five-minute expiry and count toward item quotas.
+
+The negotiated Cloudflare WebSocket Worker is delivery infrastructure and does
+not implement the HTTP invitation cache. Deploying that Worker alone does not
+enable invitation revocation. Applications using negotiated delivery must also
+configure a compatible `DiscoveryTransport` backed by the standalone HTTP
+routes (or equivalent owner-authorized storage) if reset must invalidate cached
+invitations.
 
 ## Maintenance
 
-The standalone process starts bounded delivery and invitation expiration
-pruning every ten seconds, skips overlapping runs, and drains within a
-one-second time budget. Publish and acknowledgement paths also commit one
-bounded prune batch before their own transaction, so expired backlog cannot
-permanently block quota recovery.
+The standalone process starts bounded delivery, invitation, and revocation-
+tombstone expiration pruning every ten seconds, skips overlapping runs, and
+drains within a one-second time budget. Publish and acknowledgement paths also
+commit one bounded prune batch before their own transaction, so expired backlog
+cannot permanently block quota recovery.
 
 Back up the database as ordinary pending delivery infrastructure. A relay
 restore can replay or lose pending ciphertext; application correctness must

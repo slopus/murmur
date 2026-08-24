@@ -6,7 +6,7 @@ import {
     mlsKeyPackageReference,
     verifyMlsKeyPackage,
 } from "../../mls/index.js";
-import { equalBytes, zeroBytes } from "../../utils/index.js";
+import { canonicalJsonBytes, equalBytes, zeroBytes, type JsonValue } from "../../utils/index.js";
 import type {
     MurmurContactAdmission,
     MurmurContact,
@@ -14,6 +14,7 @@ import type {
     MurmurContactProfile,
     MurmurContactRemoved,
     MurmurContactRequested,
+    MurmurContactUpdated,
     MurmurOutgoingContactRequest,
 } from "../types.js";
 import {
@@ -26,21 +27,37 @@ import {
     CONTACT_EVENT_PREFIX,
     CONTACT_HANDSHAKE_PREFIX,
     CONTACT_IDENTITY_PREFIX,
+    CONTACT_LOCAL_PROFILE_KEY,
     contactEventKey,
     contactHandshakeKey,
     contactIdentityKey,
     contactSessionKey,
     decodeContactEventRecord,
     decodeContactHandshakeRecord,
+    decodeContactLocalProfileRecord,
     decodeContactRecord,
     encodeContactEventRecord,
     encodeContactHandshakeRecord,
+    encodeContactLocalProfileRecord,
     encodeContactRecord,
     type ContactHandshakeRecord,
     type ContactRecord,
 } from "./contactRecords.js";
 
 const CONTACT_SCAN_LIMIT = 256;
+
+/** One active contact included in an atomic local profile publication. */
+export interface ContactProfileUpdateTarget {
+    readonly identity: Uint8Array;
+    readonly sessionId: Uint8Array;
+}
+
+/** Bounded immutable local profile mutation prepared before its MLS transaction. */
+export interface PreparedContactProfileUpdate {
+    readonly revision: number;
+    readonly profile: MurmurContactProfile;
+    readonly targets: readonly ContactProfileUpdateTarget[];
+}
 
 /** One cached contact KeyPackage selected for a new MLS membership. */
 export interface ContactAdmissionSelection {
@@ -71,6 +88,7 @@ export interface PreparedContactEvents {
     readonly keys: readonly string[];
     readonly requested: readonly MurmurContactRequested[];
     readonly added: readonly MurmurContactAdded[];
+    readonly updated: readonly MurmurContactUpdated[];
     readonly removed: readonly MurmurContactRemoved[];
 }
 
@@ -125,6 +143,17 @@ function validateAdmissionIdentity(
         ) {
             throw new Error("Contact admission identity does not match");
         }
+    }
+}
+
+function equalProfiles(left: MurmurContactProfile, right: MurmurContactProfile): boolean {
+    const leftBytes = canonicalJsonBytes(left as unknown as JsonValue);
+    const rightBytes = canonicalJsonBytes(right as unknown as JsonValue);
+    try {
+        return equalBytes(leftBytes, rightBytes);
+    } finally {
+        zeroBytes(leftBytes);
+        zeroBytes(rightBytes);
     }
 }
 
@@ -304,6 +333,56 @@ export class ContactEngine {
                         remove = true;
                         return;
                     }
+                    if (packet.type === "profile_update") {
+                        if (contact === undefined) {
+                            throw new Error("Contact profile update has no confirmed contact");
+                        }
+                        const fromSelf = equalBytes(update.sender, this.#identity);
+                        if (!fromSelf && !equalBytes(update.sender, contact.identity)) {
+                            throw new Error("Contact profile update sender does not match");
+                        }
+                        if (contact.status !== "active") return;
+                        const currentRevision = fromSelf
+                            ? contact.localProfileRevision
+                            : contact.remoteProfileRevision;
+                        const currentProfile = fromSelf ? contact.localProfile : contact.profile;
+                        if (packet.revision < currentRevision) return;
+                        if (packet.revision === currentRevision) {
+                            if (!equalProfiles(packet.profile, currentProfile)) {
+                                throw new Error("Conflicting contact profile revision");
+                            }
+                            return;
+                        }
+                        const next: ContactRecord = {
+                            ...contact,
+                            ...(fromSelf
+                                ? {
+                                      localProfile: packet.profile,
+                                      localProfileRevision: packet.revision,
+                                  }
+                                : {
+                                      profile: packet.profile,
+                                      remoteProfileRevision: packet.revision,
+                                  }),
+                        };
+                        await writeContact(transaction, next);
+                        if (!fromSelf) {
+                            await setAndZero(
+                                transaction,
+                                contactEventKey(update.id),
+                                encodeContactEventRecord({
+                                    version: 2,
+                                    type: "updated",
+                                    id: update.id,
+                                    identity: next.identity,
+                                    sessionId: next.sessionId,
+                                    localProfile: next.localProfile,
+                                    profile: next.profile,
+                                }),
+                            );
+                        }
+                        return;
+                    }
                     if (
                         packet.type === "admission_request" ||
                         packet.type === "admission_response"
@@ -443,6 +522,8 @@ export class ContactEngine {
                             sessionId: next.sessionId,
                             localProfile: next.localProfile,
                             profile: next.remoteProfile,
+                            localProfileRevision: 0,
+                            remoteProfileRevision: 0,
                             status: "active",
                             confirmedAt: this.#now(),
                             localAdmissionGeneration: next.localAdmission.generation,
@@ -742,6 +823,104 @@ export class ContactEngine {
         );
     }
 
+    /** Prepare one bounded profile replacement for every currently active contact. */
+    async prepareProfileUpdate(
+        profile: MurmurContactProfile,
+    ): Promise<PreparedContactProfileUpdate> {
+        const localProfile = validateContactProfile(profile);
+        const storedProfile = await this.#store.get(CONTACT_LOCAL_PROFILE_KEY);
+        let previousRevision = 0;
+        try {
+            if (storedProfile !== undefined) {
+                previousRevision = decodeContactLocalProfileRecord(storedProfile).revision;
+            }
+        } finally {
+            if (storedProfile !== undefined) zeroBytes(storedProfile);
+        }
+        if (previousRevision >= Number.MAX_SAFE_INTEGER) {
+            throw new Error("Contact profile revision exhausted");
+        }
+        const page = await this.#store.scan(CONTACT_IDENTITY_PREFIX, {
+            limit: CONTACT_SCAN_LIMIT + 1,
+        });
+        const targets: ContactProfileUpdateTarget[] = [];
+        try {
+            if (page.size > CONTACT_SCAN_LIMIT) {
+                throw new Error("Contact profile update exceeds the contact bound");
+            }
+            for (const bytes of page.values()) {
+                const record = decodeContactRecord(bytes);
+                try {
+                    if (record.status === "active") {
+                        targets.push(
+                            Object.freeze({
+                                identity: record.identity.slice(),
+                                sessionId: record.sessionId.slice(),
+                            }),
+                        );
+                    }
+                } finally {
+                    zeroBytes(record.identity);
+                    zeroBytes(record.sessionId);
+                }
+            }
+        } finally {
+            for (const bytes of page.values()) zeroBytes(bytes);
+        }
+        return Object.freeze({
+            revision: previousRevision + 1,
+            profile: localProfile,
+            targets: Object.freeze(targets),
+        });
+    }
+
+    /** Commit the local profile and every mirrored active-contact record atomically. */
+    async commitProfileUpdateInTransaction(
+        transaction: StoreTransaction,
+        prepared: PreparedContactProfileUpdate,
+    ): Promise<void> {
+        const storedProfile = await transaction.get(CONTACT_LOCAL_PROFILE_KEY);
+        try {
+            const previousRevision =
+                storedProfile === undefined
+                    ? 0
+                    : decodeContactLocalProfileRecord(storedProfile).revision;
+            if (previousRevision + 1 !== prepared.revision) {
+                throw new Error("Contact profile changed before publication");
+            }
+        } finally {
+            if (storedProfile !== undefined) zeroBytes(storedProfile);
+        }
+        for (const target of prepared.targets) {
+            const bytes = await transaction.get(contactIdentityKey(target.identity));
+            if (bytes === undefined) throw new Error("Contact changed before profile publication");
+            const record = decodeContactRecord(bytes);
+            try {
+                if (record.status !== "active" || !equalBytes(record.sessionId, target.sessionId)) {
+                    throw new Error("Contact changed before profile publication");
+                }
+                await writeContact(transaction, {
+                    ...record,
+                    localProfile: prepared.profile,
+                    localProfileRevision: prepared.revision,
+                });
+            } finally {
+                zeroBytes(record.identity);
+                zeroBytes(record.sessionId);
+                zeroBytes(bytes);
+            }
+        }
+        await setAndZero(
+            transaction,
+            CONTACT_LOCAL_PROFILE_KEY,
+            encodeContactLocalProfileRecord({
+                version: 1,
+                revision: prepared.revision,
+                profile: prepared.profile,
+            }),
+        );
+    }
+
     /** Persist contact removal intent inside a caller-owned Murmur transaction. */
     async markRemovingInTransaction(
         transaction: StoreTransaction,
@@ -884,6 +1063,7 @@ export class ContactEngine {
         const keys: string[] = [];
         const requested: MurmurContactRequested[] = [];
         const added: MurmurContactAdded[] = [];
+        const updated: MurmurContactUpdated[] = [];
         const removed: MurmurContactRemoved[] = [];
         for (const [key, bytes] of page) {
             const event = decodeContactEventRecord(bytes);
@@ -900,6 +1080,19 @@ export class ContactEngine {
                     );
                 } else if (event.type === "added") {
                     added.push(
+                        Object.freeze({
+                            id: event.id,
+                            contact: Object.freeze({
+                                identity: event.identity.slice(),
+                                sessionId: event.sessionId.slice(),
+                                localProfile: event.localProfile,
+                                profile: event.profile,
+                                status: "active",
+                            }),
+                        }),
+                    );
+                } else if (event.type === "updated") {
+                    updated.push(
                         Object.freeze({
                             id: event.id,
                             contact: Object.freeze({
@@ -930,6 +1123,7 @@ export class ContactEngine {
             keys,
             requested: Object.freeze(requested),
             added: Object.freeze(added),
+            updated: Object.freeze(updated),
             removed: Object.freeze(removed),
         };
     }

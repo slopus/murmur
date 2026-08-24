@@ -80,6 +80,18 @@ describe("contact codec", () => {
             type: "admission_request",
             generation: 1,
         });
+        const profileUpdate = encodeContactPacket({
+            version: 2,
+            type: "profile_update",
+            revision: 3,
+            profile: { name: "Alice Updated" },
+        });
+        expect(decodeContactPacket(profileUpdate)).toEqual({
+            version: 2,
+            type: "profile_update",
+            revision: 3,
+            profile: { name: "Alice Updated" },
+        });
     });
 
     it("rejects alternate encodings, extra fields, and unsupported packets", () => {
@@ -109,6 +121,13 @@ describe("contact codec", () => {
         expect(() => decodeContactPacket(utf8Encode('{"type":"remove","version":1}'))).toThrow(
             "Unsupported contact packet version",
         );
+        expect(() =>
+            decodeContactPacket(
+                utf8Encode(
+                    '{"profile":{"name":"Alice"},"revision":0,"type":"profile_update","version":2}',
+                ),
+            ),
+        ).toThrow("Invalid contact profile revision");
     });
 
     it("bounds, clones, and freezes profiles recursively", () => {

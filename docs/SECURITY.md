@@ -16,11 +16,31 @@ The relay sees:
 The relay does not receive identity roots, KeyPackage private keys, Welcome
 plaintext, MLS epochs, application plaintext, or application history.
 
-Invitation digests are short-lived bearer capabilities. SHA-256 makes them
-unguessable and detects relay substitution, but anyone who obtains a digest may
+For revocable invitations it also sees the invitation owner's public identity,
+a separate public revocation key, and signatures authorizing registration and
+revocation. The private revocation root remains in the creator's store. Relay
+logs must never include invitation digests, bundle bytes, authorization bodies,
+or revocation signatures.
+
+Invitation digests are short-lived bearer capabilities. Signed bundles contain
+unpredictable cryptographic material, making their 32-byte digests infeasible to
+guess; SHA-256 also detects relay substitution. Anyone who obtains a digest may
 download its public bundle until expiry. The client always verifies the digest,
 signed expiry, identity signature, and KeyPackage signatures; cache presence is
 not authentication.
+
+Possessing a digest grants download but not revocation. The owner signature
+binds an exact digest and expiry to a separate revocation public key, and the
+relay accepts revocation only under that key. A live revocation creates an
+expiring tombstone so replaying the public invitation bytes cannot resurrect
+the cache entry. Revocation is not retroactive session termination.
+
+If the relay is unavailable, the creator immediately destroys matching unused
+private KeyPackages and retains a durable pending revocation. That prevents a
+new Welcome from completing at the creator, but no client-side action can make
+an unreachable relay stop serving already-cached public bytes. Global cache
+invalidation therefore occurs only after authenticated retry or five-minute
+expiry.
 
 Confirmed contacts exchange fifteen one-use KeyPackages and one reusable
 last-resort KeyPackage inside their authenticated technical session. Normal
@@ -54,6 +74,10 @@ reconnects from durable progress. SSE receipt never authorizes deletion.
 - Commit one identity-wide update batch only after `onUpdates` resolves; use
   stable update IDs when application persistence needs idempotency.
 - Persist post-ratchet epochs and exact outboxes before publishing.
+- Commit a local contact profile revision, all active-contact mirrors, and all
+  corresponding outboxes in one transaction.
+- Persist invitation revocation authority and pending local key destruction
+  across restart; never serialize the private authority into an invitation.
 - Adopt Commits only from authenticated queue echoes.
 - Keep active and staged epochs separate until the echo wins.
 - Treat malformed authenticated input as terminal queue progress.
@@ -90,7 +114,8 @@ cryptographic backstop.
 - Back up client state atomically; restoring a stale backup may be
   unrecoverable.
 - Monitor queue, sender, and global backpressure.
-- Monitor separate invitation-cache item and byte backpressure.
+- Monitor separate invitation-cache item, byte, revocation-authority, and
+  tombstone backpressure.
 
 Murmur has not received an independent security audit. Its MLS implementation
 is a tested RFC 9420 profile, not a claim of complete RFC feature coverage.

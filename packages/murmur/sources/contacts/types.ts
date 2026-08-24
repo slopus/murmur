@@ -53,6 +53,13 @@ export interface MurmurContactRemoved {
     readonly sessionId: Uint8Array;
 }
 
+/** Contact-profile replacement delivered by the identity-wide sync loop. */
+export interface MurmurContactUpdated {
+    /** Stable identifier used to deduplicate callback effects. */
+    readonly id: string;
+    readonly contact: MurmurContact;
+}
+
 /** Public MLS admission material cached for one confirmed contact relationship. */
 export interface MurmurContactAdmission {
     readonly generation: number;
@@ -71,6 +78,12 @@ export type MurmurContactPacket =
     | {
           readonly version: 2;
           readonly type: "remove";
+      }
+    | {
+          readonly version: 2;
+          readonly type: "profile_update";
+          readonly revision: number;
+          readonly profile: MurmurContactProfile;
       }
     | {
           readonly version: 2;

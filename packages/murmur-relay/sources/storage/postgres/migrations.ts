@@ -12,6 +12,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 marker: unknown;
                 queue_state: unknown;
                 invitations: unknown;
+                invitation_revocations: unknown;
                 legacy_schema: unknown;
                 legacy_topics: unknown;
                 legacy_receipts: unknown;
@@ -23,6 +24,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     to_regclass('murmur_queue_schema') AS marker,
                     to_regclass('murmur_queue_global') AS queue_state,
                     to_regclass('murmur_invitations') AS invitations,
+                    to_regclass('murmur_invitation_revocations') AS invitation_revocations,
                     to_regclass('murmur_relay_schema') AS legacy_schema,
                     to_regclass('murmur_relay_topics') AS legacy_topics,
                     to_regclass('murmur_relay_receipts') AS legacy_receipts,
@@ -44,7 +46,12 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     "Legacy Postgres relay schema is not supported; use a clean database",
                 );
             }
-            if (row.marker === null && (row.queue_state !== null || row.invitations !== null)) {
+            if (
+                row.marker === null &&
+                (row.queue_state !== null ||
+                    row.invitations !== null ||
+                    row.invitation_revocations !== null)
+            ) {
                 throw new Error("Incomplete Postgres queue schema");
             }
             if (row.marker !== null) {
@@ -52,7 +59,54 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
                 );
                 const versionRow = version.rows[0];
-                if (versionRow === undefined || bigintColumn(versionRow.version) !== 3n) {
+                if (versionRow === undefined) {
+                    throw new Error("Unsupported Postgres queue schema version");
+                }
+                const schemaVersion = bigintColumn(versionRow.version);
+                if (schemaVersion === 3n) {
+                    if (row.invitation_revocations !== null) {
+                        throw new Error("Incomplete Postgres queue schema");
+                    }
+                    await connection.transaction(async (transaction) => {
+                        await transaction.query(
+                            `ALTER TABLE murmur_invitations ADD COLUMN revocation_key bytea
+                             CHECK (
+                                revocation_key IS NULL OR octet_length(revocation_key) = 32
+                             )`,
+                        );
+                        await transaction.query(
+                            `CREATE INDEX murmur_invitation_revocation_key
+                             ON murmur_invitations(revocation_key)`,
+                        );
+                        await transaction.query(
+                            `CREATE TABLE murmur_invitation_revocations (
+                                digest bytea PRIMARY KEY CHECK (octet_length(digest) = 32),
+                                revocation_key bytea NOT NULL
+                                    CHECK (octet_length(revocation_key) = 32),
+                                expires_at bigint NOT NULL,
+                                admission_principal bytea NOT NULL
+                                    CHECK (octet_length(admission_principal) = 32)
+                             )`,
+                        );
+                        await transaction.query(
+                            `CREATE INDEX murmur_invitation_revocation_expiration
+                             ON murmur_invitation_revocations(expires_at)`,
+                        );
+                        await transaction.query(
+                            `CREATE INDEX murmur_invitation_revocation_authority
+                             ON murmur_invitation_revocations(revocation_key)`,
+                        );
+                        await transaction.query(
+                            `CREATE INDEX murmur_invitation_revocation_admission
+                             ON murmur_invitation_revocations(admission_principal)`,
+                        );
+                        await transaction.query(
+                            "UPDATE murmur_queue_schema SET version = 4 WHERE singleton = 1",
+                        );
+                    });
+                    return;
+                }
+                if (schemaVersion !== 4n || row.invitation_revocations === null) {
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 return;
@@ -62,7 +116,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3)`,
+                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 4)`,
                 `CREATE TABLE murmur_queue_global (
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     last_event_id uuid,
@@ -120,12 +174,30 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     ),
                     expires_at bigint NOT NULL,
                     admission_principal bytea NOT NULL
-                        CHECK (octet_length(admission_principal) = 32)
+                        CHECK (octet_length(admission_principal) = 32),
+                    revocation_key bytea
+                        CHECK (revocation_key IS NULL OR octet_length(revocation_key) = 32)
                 )`,
                 `CREATE INDEX murmur_invitation_expiration
                     ON murmur_invitations(expires_at)`,
                 `CREATE INDEX murmur_invitation_admission
                     ON murmur_invitations(admission_principal)`,
+                `CREATE INDEX murmur_invitation_revocation_key
+                    ON murmur_invitations(revocation_key)`,
+                `CREATE TABLE murmur_invitation_revocations (
+                    digest bytea PRIMARY KEY CHECK (octet_length(digest) = 32),
+                    revocation_key bytea NOT NULL
+                        CHECK (octet_length(revocation_key) = 32),
+                    expires_at bigint NOT NULL,
+                    admission_principal bytea NOT NULL
+                        CHECK (octet_length(admission_principal) = 32)
+                )`,
+                `CREATE INDEX murmur_invitation_revocation_expiration
+                    ON murmur_invitation_revocations(expires_at)`,
+                `CREATE INDEX murmur_invitation_revocation_authority
+                    ON murmur_invitation_revocations(revocation_key)`,
+                `CREATE INDEX murmur_invitation_revocation_admission
+                    ON murmur_invitation_revocations(admission_principal)`,
             ];
             await connection.transaction(async (transaction) => {
                 for (const statement of statements) {

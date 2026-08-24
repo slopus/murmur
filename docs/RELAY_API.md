@@ -34,7 +34,70 @@ interface InvitationUploadJson {
 ```
 
 Re-uploading identical bytes is idempotent and never extends their original
-expiry.
+expiry unless a live revocation tombstone exists, in which case the relay
+returns `410 invitation_revoked`. This compatibility route does not register
+revocation authority; new Murmur clients use the owner-authorized route below.
+
+## `POST /v1/invitations/owned`
+
+Registers one exact invitation with a separate revocation public key:
+
+```ts
+interface OwnedInvitationUploadJson {
+    version: 1;
+    bundle: string; // base64url exact canonical discovery bytes
+    authorization: {
+        version: 1;
+        owner: string; // canonical 32-byte Ed25519 invitation identity
+        revocationKey: string; // canonical 32-byte Ed25519 public key
+        digest: string; // SHA-256 of bundle
+        expiresAt: number; // exact signed bundle expiry
+        createdAt: number;
+        signature: string; // 64-byte Ed25519 signature by owner
+    };
+}
+```
+
+The owner signature covers `"murmur.relay.invitation-upload.v1\0"` followed by
+canonical JSON of every authorization field except `signature`. The relay also
+checks the bundle's claimed identity, digest, expiry, authorization clock skew,
+and canonical public keys. Success returns `InvitationUploadJson` from the
+legacy route. An exact row uploaded first through the compatibility route may
+be upgraded idempotently by its owner; a conflicting authority is rejected.
+
+The private revocation key is never transmitted. The public key and
+authorization are cache metadata, not part of the invitation recipients fetch.
+
+## `POST /v1/invitations/revoke`
+
+Revokes one invitation, or every unexpired invitation registered under one
+authority:
+
+```ts
+interface SignedInvitationRevocationJson {
+    version: 1;
+    revocationKey: string;
+    digest: string | null; // null means all rows for this authority
+    createdAt: number;
+    signature: string;
+}
+```
+
+The signature covers `"murmur.relay.invitation-revocation.v1\0"` followed by
+canonical JSON of every field except `signature`. It must fall within the
+configured authentication-skew window. Success returns `{ "revoked": number }`.
+Client redemption creates no relay state, so revocation remains valid after a
+matching private KeyPackage was consumed. Missing, expired, and already
+revoked rows are idempotent and return zero when no live cache row changed. A
+live row or tombstone registered to another authority returns
+`401 invitation_revocation_unauthorized`.
+
+Revocation atomically replaces each live row with a tombstone under its exact
+digest and original expiry. The tombstone blocks re-upload resurrection, counts
+toward item and admission bounds, and is pruned at expiry. Each authority-wide
+scan page is capped by `maximumInvitationItemsPerRevocationKey` (32 by default),
+including when a lower runtime bound must drain rows admitted under an earlier
+configuration.
 
 ## `GET /v1/invitations/:digest`
 
@@ -42,6 +105,9 @@ Returns the exact unexpired discovery-bundle bytes addressed by one canonical
 base64url SHA-256 digest. There is no listing, identity lookup, prefix lookup,
 or alternate address. Missing and expired digests return
 `404 invitation_not_found`.
+
+Revoked digests use the same `404 invitation_not_found` response and reveal no
+bundle bytes.
 
 Clients must compare SHA-256 of the response with the shared digest before
 parsing, then verify the signed expiry, identity signature, and KeyPackages.
@@ -155,6 +221,8 @@ Responses use stable JSON error codes. Important classes include:
 - `400` malformed or invalid signed input;
 - `401` authentication or time-policy failure;
 - `409` cursor/acknowledgement conflict;
+- `410 invitation_revoked` when public bytes try to resurrect a live
+  revocation tombstone;
 - `413` encoded body or delivery limit;
 - `429` recipient, sender, admitted-principal queue, or per-principal
   invitation-cache backpressure;

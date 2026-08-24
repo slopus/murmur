@@ -7,10 +7,15 @@ import {
     type SignedDelivery,
 } from "../../delivery/index.js";
 import { HttpDiscoveryTransport } from "../../identity/discovery/index.js";
-import { MemoryMurmurStore } from "../../storage/index.js";
+import { MemoryMurmurStore, type MurmurStore } from "../../storage/index.js";
 import { MurmurClient } from "../../sessions/index.js";
 import { encodeBase64Url } from "../../utils/index.js";
-import type { MurmurContactAdded, MurmurContactRemoved, MurmurContactRequested } from "../index.js";
+import type {
+    MurmurContactAdded,
+    MurmurContactRemoved,
+    MurmurContactRequested,
+    MurmurContactUpdated,
+} from "../index.js";
 
 const NOW = 1_700_000_000_000;
 
@@ -222,6 +227,178 @@ describe("built-in contacts", () => {
             await relay.close();
         }
     }, 20_000);
+
+    test("refreshes contact profiles online and after restart without targeting removal", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const fetch = relayFetch(relay);
+        const aliceBacking = new MemoryMurmurStore();
+        let failNextProfileTransaction = false;
+        const aliceStore: MurmurStore = {
+            get: (key) => aliceBacking.get(key),
+            set: (key, value) => aliceBacking.set(key, value),
+            delete: (key) => aliceBacking.delete(key),
+            list: (prefix) => aliceBacking.list(prefix),
+            scan: (prefix, options) => aliceBacking.scan(prefix, options),
+            transaction: (operation) =>
+                aliceBacking.transaction(async (transaction) => {
+                    const result = await operation(transaction);
+                    if (failNextProfileTransaction) {
+                        failNextProfileTransaction = false;
+                        throw new Error("injected contact profile commit failure");
+                    }
+                    return result;
+                }),
+        };
+        const bobStore = new MemoryMurmurStore();
+        const carolStore = new MemoryMurmurStore();
+        let alice = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: aliceStore,
+            now: () => NOW,
+        });
+        const bob = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: bobStore,
+            now: () => NOW,
+        });
+        const carol = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: carolStore,
+            now: () => NOW,
+        });
+        try {
+            await establishContact(alice, bob, "Alice", "Bob");
+            await establishContact(alice, carol, "Alice", "Carol");
+
+            failNextProfileTransaction = true;
+            await expect(alice.updateContactProfile({ name: "Rolled Back" })).rejects.toThrow(
+                "injected contact profile commit failure",
+            );
+            expect(await alice.contact(bob.identity)).toMatchObject({
+                localProfile: { name: "Alice" },
+            });
+            expect(await alice.contact(carol.identity)).toMatchObject({
+                localProfile: { name: "Alice" },
+            });
+            expect((await aliceStore.scan("murmur/session-outbox/", { limit: 10 })).size).toBe(0);
+
+            await alice.updateContactProfile({ name: "Alice Online", presence: "available" });
+            expect(await alice.contact(bob.identity)).toMatchObject({
+                localProfile: { name: "Alice Online", presence: "available" },
+            });
+            expect(await alice.contact(carol.identity)).toMatchObject({
+                localProfile: { name: "Alice Online", presence: "available" },
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            const online: MurmurContactUpdated[] = [];
+            await bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onContactUpdated: async (events) => {
+                        online.push(...events);
+                    },
+                },
+            );
+            expect(online).toHaveLength(1);
+            expect(online[0]?.contact).toMatchObject({
+                identity: alice.identity,
+                profile: { name: "Alice Online", presence: "available" },
+            });
+            expect(await bob.contact(alice.identity)).toMatchObject({
+                profile: { name: "Alice Online", presence: "available" },
+            });
+            const carolOnline: MurmurContactUpdated[] = [];
+            await carol.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onContactUpdated: async (events) => {
+                        carolOnline.push(...events);
+                    },
+                },
+            );
+            expect(carolOnline).toHaveLength(1);
+            expect(await carol.contact(alice.identity)).toMatchObject({
+                profile: { name: "Alice Online", presence: "available" },
+            });
+
+            await alice.updateContactProfile({ name: "Alice Offline", presence: "away" });
+            expect((await aliceStore.scan("murmur/session-outbox/", { limit: 10 })).size).toBe(2);
+            const aliceIdentity = alice.identity;
+            alice.close();
+            alice = await MurmurClient.open({
+                relay: "https://relay.test",
+                fetch,
+                store: aliceStore,
+                now: () => NOW,
+            });
+            expect(alice.identity).toEqual(aliceIdentity);
+            expect(await alice.contact(bob.identity)).toMatchObject({
+                localProfile: { name: "Alice Offline", presence: "away" },
+            });
+            expect(await alice.contact(carol.identity)).toMatchObject({
+                localProfile: { name: "Alice Offline", presence: "away" },
+            });
+            expect((await aliceStore.scan("murmur/session-outbox/", { limit: 10 })).size).toBe(2);
+
+            await alice.synchronize({ waitMilliseconds: 0 });
+            const afterRestart: MurmurContactUpdated[] = [];
+            await bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onContactUpdated: async (events) => {
+                        afterRestart.push(...events);
+                    },
+                },
+            );
+            expect(afterRestart).toHaveLength(1);
+            expect(afterRestart[0]?.contact.profile).toEqual({
+                name: "Alice Offline",
+                presence: "away",
+            });
+            expect(await bob.contact(aliceIdentity)).toMatchObject({
+                profile: { name: "Alice Offline", presence: "away" },
+            });
+            const carolAfterRestart: MurmurContactUpdated[] = [];
+            await carol.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onContactUpdated: async (events) => {
+                        carolAfterRestart.push(...events);
+                    },
+                },
+            );
+            expect(carolAfterRestart).toHaveLength(1);
+            expect(await carol.contact(aliceIdentity)).toMatchObject({
+                profile: { name: "Alice Offline", presence: "away" },
+            });
+            await bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onContactUpdated: async (events) => {
+                        afterRestart.push(...events);
+                    },
+                },
+            );
+            expect(afterRestart).toHaveLength(1);
+
+            await bob.removeContact(aliceIdentity);
+            const removalOutboxes = (await bobStore.scan("murmur/session-outbox/", { limit: 10 }))
+                .size;
+            await bob.updateContactProfile({ name: "Bob Removing" });
+            expect((await bobStore.scan("murmur/session-outbox/", { limit: 10 })).size).toBe(
+                removalOutboxes,
+            );
+            expect(await bob.contact(aliceIdentity)).toMatchObject({ status: "removing" });
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            await relay.close();
+        }
+    }, 45_000);
 
     test("creates an N-person service group from contacts and exchanges messages", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);

@@ -35,6 +35,7 @@ const INVITATION_LIMITS = {
     maximumPrincipalBytes: 1_000,
     maximumGlobalItems: 3,
     maximumGlobalBytes: 2_000,
+    maximumRevocationKeyItems: 2,
 };
 const ADMISSION_PRINCIPAL = new Uint8Array(32).fill(250);
 
@@ -71,6 +72,94 @@ describe("identity queue store conformance", () => {
             "Legacy Postgres relay schema",
         );
         await postgres.close();
+    });
+
+    test("migrates schema v3 invitation rows in place on both backends", async () => {
+        const bundle = new TextEncoder().encode("pending v3 invitation");
+        const digest = sha256(bundle);
+
+        const sqlite = new DatabaseSync(":memory:");
+        sqlite.exec(`
+            CREATE TABLE murmur_queue_schema (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                version INTEGER NOT NULL
+            ) STRICT;
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3);
+            CREATE TABLE murmur_invitations (
+                digest BLOB PRIMARY KEY CHECK (length(digest) = 32),
+                bundle BLOB NOT NULL,
+                encoded_bytes INTEGER NOT NULL,
+                expires_at INTEGER NOT NULL,
+                admission_principal BLOB NOT NULL CHECK (length(admission_principal) = 32)
+            ) STRICT;
+        `);
+        sqlite
+            .prepare(
+                `INSERT INTO murmur_invitations
+                    (digest, bundle, encoded_bytes, expires_at, admission_principal)
+                 VALUES (?, ?, ?, ?, ?)`,
+            )
+            .run(digest, bundle, BigInt(bundle.length), BigInt(NOW + 10), ADMISSION_PRINCIPAL);
+        const sqliteStore = new SqliteRelayStore(":memory:", { database: sqlite });
+        expect(await sqliteStore.readInvitation(digest, NOW)).toEqual({
+            bundle,
+            expiresAt: NOW + 10,
+        });
+        expect(sqlite.prepare("SELECT version FROM murmur_queue_schema").get()).toMatchObject({
+            version: 4,
+        });
+        expect(
+            sqlite
+                .prepare(
+                    `SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name = 'murmur_invitation_revocations'`,
+                )
+                .get(),
+        ).toMatchObject({ name: "murmur_invitation_revocations" });
+        await sqliteStore.close();
+
+        const postgres = new PGlite();
+        await postgres.exec(`
+            CREATE TABLE murmur_queue_schema (
+                singleton bigint PRIMARY KEY CHECK (singleton = 1),
+                version bigint NOT NULL
+            );
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3);
+            CREATE TABLE murmur_queue_global (
+                singleton bigint PRIMARY KEY,
+                last_event_id uuid
+            );
+            CREATE TABLE murmur_invitations (
+                digest bytea PRIMARY KEY CHECK (octet_length(digest) = 32),
+                bundle bytea NOT NULL,
+                encoded_bytes bigint NOT NULL,
+                expires_at bigint NOT NULL,
+                admission_principal bytea NOT NULL
+            );
+        `);
+        await postgres.query(
+            `INSERT INTO murmur_invitations
+                (digest, bundle, encoded_bytes, expires_at, admission_principal)
+             VALUES ($1, $2, $3, $4, $5)`,
+            [digest, bundle, bundle.length, NOW + 10, ADMISSION_PRINCIPAL],
+        );
+        const postgresStore = await PostgresRelayStore.create(new PGliteDatabase(postgres));
+        expect(await postgresStore.readInvitation(digest, NOW)).toEqual({
+            bundle,
+            expiresAt: NOW + 10,
+        });
+        expect(
+            (await postgres.query<{ version: unknown }>("SELECT version FROM murmur_queue_schema"))
+                .rows[0],
+        ).toMatchObject({ version: 4 });
+        expect(
+            (
+                await postgres.query<{ name: unknown }>(
+                    `SELECT to_regclass('murmur_invitation_revocations') AS name`,
+                )
+            ).rows[0],
+        ).toMatchObject({ name: "murmur_invitation_revocations" });
+        await postgresStore.close();
     });
 
     test("stores invitations by digest without extending expiry and releases cache quota", async () => {
@@ -145,18 +234,169 @@ describe("identity queue store conformance", () => {
         }
     });
 
+    test("authorizes bounded single and authority-wide invitation revocation", async () => {
+        const limits = {
+            maximumPrincipalItems: 8,
+            maximumPrincipalBytes: 8_000,
+            maximumGlobalItems: 8,
+            maximumGlobalBytes: 8_000,
+            maximumRevocationKeyItems: 3,
+        };
+        const authority = new Uint8Array(32).fill(41);
+        const attacker = new Uint8Array(32).fill(42);
+        const firstBundle = new TextEncoder().encode("first revocable invitation");
+        const secondBundle = new TextEncoder().encode("second revocable invitation");
+        const expiredBundle = new TextEncoder().encode("expired revocable invitation");
+        const overflowBundle = new TextEncoder().encode("overflow revocable invitation");
+        const firstDigest = sha256(firstBundle);
+        const secondDigest = sha256(secondBundle);
+        const expiredDigest = sha256(expiredBundle);
+        const overflowDigest = sha256(overflowBundle);
+        for (const store of await stores()) {
+            try {
+                await store.storeInvitation(
+                    firstDigest,
+                    firstBundle,
+                    NOW + 10,
+                    NOW,
+                    limits,
+                    ADMISSION_PRINCIPAL,
+                    authority,
+                );
+                await store.storeInvitation(
+                    secondDigest,
+                    secondBundle,
+                    NOW + 10,
+                    NOW,
+                    limits,
+                    ADMISSION_PRINCIPAL,
+                    authority,
+                );
+                await expect(
+                    store.revokeInvitations(attacker, firstDigest, NOW, 3),
+                ).rejects.toMatchObject({
+                    status: 401,
+                    body: { error: "invitation_revocation_unauthorized" },
+                });
+
+                expect(await store.revokeInvitations(authority, firstDigest, NOW, 3)).toEqual({
+                    revoked: 1,
+                });
+                expect(await store.readInvitation(firstDigest, NOW)).toBeUndefined();
+                expect(await store.revokeInvitations(authority, firstDigest, NOW, 3)).toEqual({
+                    revoked: 0,
+                });
+                await expect(
+                    store.revokeInvitations(attacker, firstDigest, NOW, 3),
+                ).rejects.toMatchObject({ status: 401 });
+                await expect(
+                    store.storeInvitation(
+                        firstDigest,
+                        firstBundle,
+                        NOW + 10,
+                        NOW,
+                        limits,
+                        ADMISSION_PRINCIPAL,
+                        authority,
+                    ),
+                ).rejects.toMatchObject({
+                    status: 410,
+                    body: { error: "invitation_revoked" },
+                });
+
+                expect(await store.revokeInvitations(authority, null, NOW, 3)).toEqual({
+                    revoked: 1,
+                });
+                expect(await store.revokeInvitations(authority, null, NOW, 3)).toEqual({
+                    revoked: 0,
+                });
+                expect(await store.readInvitation(secondDigest, NOW)).toBeUndefined();
+
+                await store.storeInvitation(
+                    expiredDigest,
+                    expiredBundle,
+                    NOW + 1,
+                    NOW,
+                    limits,
+                    ADMISSION_PRINCIPAL,
+                    authority,
+                );
+                await expect(
+                    store.storeInvitation(
+                        overflowDigest,
+                        overflowBundle,
+                        NOW + 10,
+                        NOW,
+                        limits,
+                        ADMISSION_PRINCIPAL,
+                        authority,
+                    ),
+                ).rejects.toMatchObject({
+                    status: 429,
+                    body: { error: "invitation_revocation_authority_full" },
+                });
+                expect(await store.revokeInvitations(authority, expiredDigest, NOW + 1, 3)).toEqual(
+                    { revoked: 0 },
+                );
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
+    test("pages authority-wide revocation after its configured bound is lowered", async () => {
+        const limits = {
+            maximumPrincipalItems: 3,
+            maximumPrincipalBytes: 8_000,
+            maximumGlobalItems: 3,
+            maximumGlobalBytes: 8_000,
+            maximumRevocationKeyItems: 3,
+        };
+        const authority = new Uint8Array(32).fill(43);
+        for (const store of await stores()) {
+            try {
+                const digests: Uint8Array[] = [];
+                for (let index = 0; index < 3; index += 1) {
+                    const bundle = new TextEncoder().encode(`revocable invitation ${index}`);
+                    const digest = sha256(bundle);
+                    digests.push(digest);
+                    await store.storeInvitation(
+                        digest,
+                        bundle,
+                        NOW + 10,
+                        NOW,
+                        limits,
+                        ADMISSION_PRINCIPAL,
+                        authority,
+                    );
+                }
+
+                expect(await store.revokeInvitations(authority, null, NOW, 1)).toEqual({
+                    revoked: 3,
+                });
+                for (const digest of digests) {
+                    expect(await store.readInvitation(digest, NOW)).toBeUndefined();
+                }
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
     test("does not let an expired cache backlog consume live admission quota", async () => {
         const backlogLimits = {
             maximumPrincipalItems: 200,
             maximumPrincipalBytes: 100_000,
             maximumGlobalItems: 200,
             maximumGlobalBytes: 100_000,
+            maximumRevocationKeyItems: 200,
         };
         const liveLimits = {
             maximumPrincipalItems: 1,
             maximumPrincipalBytes: 1_000,
             maximumGlobalItems: 1,
             maximumGlobalBytes: 1_000,
+            maximumRevocationKeyItems: 1,
         };
         for (const store of await stores()) {
             try {

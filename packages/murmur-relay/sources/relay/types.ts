@@ -8,6 +8,7 @@ export interface RelayOptions {
     readonly maximumInvitationBytesPerAdmissionPrincipal?: number;
     readonly maximumGlobalInvitationItems?: number;
     readonly maximumGlobalInvitationBytes?: number;
+    readonly maximumInvitationItemsPerRevocationKey?: number;
     readonly maximumCiphertextBytes?: number;
     readonly maximumRecipients?: number;
     readonly maximumJsonBodyBytes?: number;
@@ -36,6 +37,7 @@ export interface ResolvedRelayOptions {
     readonly maximumInvitationBytesPerAdmissionPrincipal: number;
     readonly maximumGlobalInvitationItems: number;
     readonly maximumGlobalInvitationBytes: number;
+    readonly maximumInvitationItemsPerRevocationKey: number;
     readonly maximumCiphertextBytes: number;
     readonly maximumRecipients: number;
     readonly maximumJsonBodyBytes: number;
@@ -67,6 +69,11 @@ export interface InvitationUploadOutcome {
 export interface InvitationDownload {
     readonly bundle: Uint8Array;
     readonly expiresAt: number;
+}
+
+/** Result of one owner-authorized invitation revocation transaction. */
+export interface InvitationRevocationOutcome {
+    readonly revoked: number;
 }
 
 /** One pull-driven recipient SSE subscription; `null` represents a heartbeat. */

@@ -21,6 +21,23 @@ shares only that digest. `resolveInvitation()` fetches the bytes and verifies
 the digest, signed expiry, identity signature, and KeyPackage signatures. The
 relay is not a directory and cannot resolve or enumerate identities.
 
+Revocable cache registration uses a second durable Ed25519 root generated for
+the Murmur store. The invitation identity signs a domain-separated canonical
+authorization binding its exact digest and expiry to that revocation public
+key. The private revocation root is never included in the discovery bundle or
+returned to recipients. `revokeInvitation()` signs one digest;
+`revokeInvitations()` signs `digest: null` for every unexpired row registered to
+that authority. Relay replacement of a live row with an expiring tombstone is
+atomic and prevents re-upload of the same public bytes until their original
+expiry.
+
+Before sending a revocation request, the client durably marks the affected
+invitation records and destroys their unused private KeyPackages. Failed relay
+requests remain pending across restart and are safe to retry. Until a retry
+reaches the relay, a cached public bundle can still resolve even though its
+Welcome can no longer consume local private state. Revocation never removes an
+already established MLS session.
+
 The prospective member deletes matching private KeyPackage state when its
 Welcome is consumed, or on the next client operation after the five-minute
 invitation expires and before any later Welcome can be processed. A creator's
@@ -83,10 +100,19 @@ every relevant callback resolves. No Murmur storage transaction is exposed.
 The built-in contact descriptor is canonical
 `{"protocol":"murmur.contacts","version":2}`. Its two-person MLS session carries
 canonical `hello`, `admission_request`, `admission_response`, and `remove`
-packets. Each hello includes a bounded application profile, fifteen identity-bound
-one-use MLS KeyPackages, and one long-lived reusable last-resort KeyPackage.
-A contact is confirmed after both authenticated profile/admission hellos are
-processed.
+packets, plus a canonical `profile_update` carrying a positive monotonic
+revision and bounded replacement profile. Each hello includes a bounded
+application profile, fifteen identity-bound one-use MLS KeyPackages, and one
+long-lived reusable last-resort KeyPackage. A contact is confirmed after both
+authenticated profile/admission hellos are processed.
+
+`updateContactProfile()` commits the identity-wide local profile revision,
+every active contact's mirrored local profile, and all corresponding technical
+session outboxes in one store transaction. Recipients authenticate the MLS
+sender, accept only a greater remote revision, and durably emit one
+`onContactUpdated` lifecycle event. Equal identical revisions and lower
+revisions are no-ops; equal conflicting revisions are rejected. Removing and
+removed contacts are excluded.
 
 Creating or extending a service group consumes one remote one-use package. At
 the low watermark Murmur durably queues a refill request through the contact

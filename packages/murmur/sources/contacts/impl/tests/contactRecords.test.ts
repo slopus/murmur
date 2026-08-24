@@ -65,7 +65,9 @@ describe("contact records", () => {
             identity,
             sessionId,
             localProfile: { name: "Alice" },
+            localProfileRevision: 0,
             profile: { name: "Bob", tags: ["friend"] },
+            remoteProfileRevision: 0,
             status: "removing",
             confirmedAt: 123,
             removeDeliveryId: deliveryId,
@@ -133,6 +135,15 @@ describe("contact records", () => {
                 id: eventId,
                 identity,
                 sessionId,
+            },
+            {
+                version: 2,
+                type: "updated",
+                id: eventId,
+                identity,
+                sessionId,
+                localProfile: { name: "Alice" },
+                profile: { name: "Bob Updated" },
             },
         ];
         for (const record of records) {

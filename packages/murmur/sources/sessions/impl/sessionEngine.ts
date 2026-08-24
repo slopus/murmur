@@ -1143,6 +1143,45 @@ export class SessionEngine {
         });
     }
 
+    /** Atomically queue one packet to each bounded active contact and mutate contact state. */
+    async sendOwnedContacts(
+        packets: readonly { readonly id: Uint8Array; readonly bytes: Uint8Array }[],
+        operation: (transaction: StoreTransaction, deliveryIds: readonly string[]) => Promise<void>,
+    ): Promise<readonly string[]> {
+        if (packets.length > 256) throw new Error("Contact packet batch exceeds the contact bound");
+        const sessionIds = packets.map(({ id }) => encodeBase64Url(id));
+        if (new Set(sessionIds).size !== sessionIds.length) {
+            throw new Error("Contact packet batch contains duplicate sessions");
+        }
+        return this.#store.transaction(async (transaction) => {
+            const outboxCount = (
+                await transaction.scan(OUTBOX_PREFIX, {
+                    limit: this.#limits.maximumOutboxes,
+                })
+            ).size;
+            if (outboxCount > this.#limits.maximumOutboxes - packets.length) {
+                throw new Error("Local session outbox capacity exceeded");
+            }
+            for (const packet of packets) {
+                const owner = await this.#sessionOwner(transaction, packet.id);
+                if (owner?.owner !== "contact") throw new Error("Session owner does not match");
+            }
+            const deliveryIds: string[] = [];
+            for (const packet of packets) {
+                deliveryIds.push(
+                    await this.#queuePrivate(
+                        packet.id,
+                        { version: 1, type: "application", bytes: packet.bytes },
+                        "application",
+                        transaction,
+                    ),
+                );
+            }
+            await operation(transaction, deliveryIds);
+            return Object.freeze(deliveryIds);
+        });
+    }
+
     /** Atomically activate one contact request, queue hello, and persist its mutation. */
     async acceptOwnedContact(
         id: Uint8Array,

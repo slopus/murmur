@@ -1,5 +1,7 @@
 import {
     RelayError,
+    parseOwnedInvitationUpload,
+    parseSignedInvitationRevocation,
     parseSignedDelivery,
     parseSignedQueueAck,
     parseSignedQueueRead,
@@ -343,6 +345,41 @@ export function createRelayFetchHandler(
                         expiresAt: outcome.expiresAt,
                         duplicate: outcome.duplicate,
                     },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/invitations/owned") {
+                if (admissionPrincipal === undefined) {
+                    throw new RelayError(503, "Admission principal is required", {
+                        error: "admission_context_required",
+                    });
+                }
+                const upload = parseOwnedInvitationUpload(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const outcome = await relay.storeOwnedInvitation(
+                    upload.bundle,
+                    upload.authorization,
+                    admissionPrincipal,
+                );
+                return boundedJson(
+                    {
+                        digest: encodeBase64Url(outcome.digest),
+                        expiresAt: outcome.expiresAt,
+                        duplicate: outcome.duplicate,
+                    },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/invitations/revoke") {
+                const revocation = parseSignedInvitationRevocation(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const outcome = await relay.revokeInvitations(revocation);
+                return boundedJson(
+                    { revoked: outcome.revoked },
                     relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );

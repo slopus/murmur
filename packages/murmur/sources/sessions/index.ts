@@ -18,12 +18,16 @@ import {
 import {
     DISCOVERY_INVITATION_TTL_MILLISECONDS,
     HttpDiscoveryTransport,
+    createInvitationUploadAuthorization,
+    createSignedInvitationRevocation,
     createDiscoveryBundle,
     parseDiscoveryBundle,
     serializeDiscoveryBundle,
     type DiscoveryBundle,
     type DiscoveryTransport,
+    type DiscoveryUploadOutcome,
 } from "../identity/discovery/index.js";
+import { InvitationState } from "../identity/discovery/impl/invitationState.js";
 import {
     createMlsKeyPackage,
     decodeMlsKeyPackage,
@@ -90,6 +94,7 @@ export type {
 } from "./types.js";
 
 const IDENTITY_KEY = "murmur/identity/root";
+const INVITATION_REVOCATION_KEY = "murmur/invitations/revocation-root";
 const DEFAULT_KEY_PACKAGES = 1;
 const CONTACT_ADMISSION_GENERATION = 1;
 const LAST_RESORT_KEY_PACKAGE_LIFETIME_SECONDS = 10 * 365 * 24 * 60 * 60;
@@ -120,6 +125,8 @@ export interface MurmurClientOptions {
 /** Stateful identity, discovery, bootstrap, and opaque MLS-session facade. */
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
+    readonly #invitationRevocation: IdentityKeyPair;
+    readonly #invitations: InvitationState;
     readonly #engine: SessionEngine;
     readonly #contacts: ContactEngine;
     readonly #services = new Map<string, MurmurService>();
@@ -136,6 +143,7 @@ export class MurmurClient {
 
     private constructor(
         identity: IdentityKeyPair,
+        invitationRevocation: IdentityKeyPair,
         store: MurmurStore,
         transport: DeliveryTransport,
         discoveryTransport: DiscoveryTransport | undefined,
@@ -144,9 +152,11 @@ export class MurmurClient {
         services: readonly MurmurServiceRegistration[],
     ) {
         this.#identity = identity;
+        this.#invitationRevocation = invitationRevocation;
         this.#now = now;
         this.#discoveryTransport = discoveryTransport;
         this.#engine = new SessionEngine(identity, store, transport, limits, now);
+        this.#invitations = new InvitationState(store, now);
         this.#contacts = new ContactEngine(store, identity.publicKey, now);
         for (const registration of services) {
             this.#services.set(registration.id, registration.service);
@@ -175,6 +185,7 @@ export class MurmurClient {
             serviceIds.add(registration.id);
         }
         let identity: IdentityKeyPair | undefined;
+        let invitationRevocation: IdentityKeyPair | undefined;
         try {
             await options.store.transaction(async (transaction) => {
                 const stored = await transaction.get(IDENTITY_KEY);
@@ -191,29 +202,49 @@ export class MurmurClient {
                                 "Stored Murmur identity differs from supplied identity",
                             );
                         }
-                        return;
                     } finally {
                         zeroBytes(stored);
                     }
-                }
-                if (options.identity === undefined) {
-                    identity = generateIdentityKeyPair();
                 } else {
-                    const encoded = encodeIdentityRoot(options.identity);
+                    if (options.identity === undefined) {
+                        identity = generateIdentityKeyPair();
+                    } else {
+                        const encoded = encodeIdentityRoot(options.identity);
+                        try {
+                            identity = decodeIdentityRoot(encoded);
+                        } finally {
+                            zeroBytes(encoded);
+                        }
+                    }
+                    const encoded = encodeIdentityRoot(identity);
                     try {
-                        identity = decodeIdentityRoot(encoded);
+                        await transaction.set(IDENTITY_KEY, encoded);
                     } finally {
                         zeroBytes(encoded);
                     }
                 }
-                const encoded = encodeIdentityRoot(identity);
-                try {
-                    await transaction.set(IDENTITY_KEY, encoded);
-                } finally {
-                    zeroBytes(encoded);
+
+                const storedRevocation = await transaction.get(INVITATION_REVOCATION_KEY);
+                if (storedRevocation === undefined) {
+                    invitationRevocation = generateIdentityKeyPair();
+                    const encoded = encodeIdentityRoot(invitationRevocation);
+                    try {
+                        await transaction.set(INVITATION_REVOCATION_KEY, encoded);
+                    } finally {
+                        zeroBytes(encoded);
+                    }
+                } else {
+                    try {
+                        invitationRevocation = decodeIdentityRoot(storedRevocation);
+                    } finally {
+                        zeroBytes(storedRevocation);
+                    }
                 }
             });
             if (identity === undefined) throw new Error("Murmur identity did not open");
+            if (invitationRevocation === undefined) {
+                throw new Error("Murmur invitation revocation authority did not open");
+            }
             const transport =
                 options.transport ??
                 (options.sessionProvider === undefined
@@ -234,8 +265,9 @@ export class MurmurClient {
                           options.relay,
                           options.fetch === undefined ? {} : { fetch: options.fetch },
                       ));
-            return new MurmurClient(
+            const client = new MurmurClient(
                 identity,
+                invitationRevocation,
                 options.store,
                 transport,
                 discoveryTransport,
@@ -243,8 +275,18 @@ export class MurmurClient {
                 options.now ?? Date.now,
                 services,
             );
+            const pendingReferences = await client.#invitations.pendingReferences();
+            try {
+                if (pendingReferences.length > 0) {
+                    await client.#engine.deleteKeyPackages(pendingReferences);
+                }
+            } finally {
+                for (const reference of pendingReferences) zeroBytes(reference);
+            }
+            return client;
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
+            if (invitationRevocation !== undefined) destroyIdentity(invitationRevocation);
             throw error;
         }
     }
@@ -282,25 +324,97 @@ export class MurmurClient {
             if (this.#discoveryTransport === undefined) {
                 throw new Error("No discovery transport is configured");
             }
+            const transport = this.#discoveryTransport;
             const bundle = await this.#createDiscovery();
             const references = bundle.keyPackages.map(mlsKeyPackageReference);
             const bytes = serializeDiscoveryBundle(bundle);
+            const digest = sha256(bytes);
+            const revocable = transport.uploadOwned !== undefined && transport.revoke !== undefined;
+            let authorization: ReturnType<typeof createInvitationUploadAuthorization> | undefined;
             try {
-                const outcome = await this.#discoveryTransport.upload(bytes, signal);
-                if (
-                    outcome.expiresAt !== bundle.expiresAt ||
-                    !equalBytes(outcome.digest, sha256(bytes))
-                ) {
+                if (revocable) {
+                    await this.#invitations.record(digest, references, bundle.expiresAt);
+                    authorization = createInvitationUploadAuthorization(
+                        this.#identity,
+                        this.#invitationRevocation,
+                        digest,
+                        bundle.expiresAt,
+                        this.#now(),
+                    );
+                }
+                let outcome: DiscoveryUploadOutcome;
+                if (authorization === undefined) {
+                    outcome = await transport.upload(bytes, signal);
+                } else {
+                    if (transport.uploadOwned === undefined) {
+                        throw new Error(
+                            "Discovery transport does not support revocable invitations",
+                        );
+                    }
+                    outcome = await transport.uploadOwned(bytes, authorization, signal);
+                }
+                if (outcome.expiresAt !== bundle.expiresAt || !equalBytes(outcome.digest, digest)) {
                     throw new Error("Discovery relay returned invalid invitation metadata");
                 }
                 return outcome.digest.slice();
             } catch (error: unknown) {
-                await this.#engine.deleteKeyPackages(references);
+                const cleanupErrors: unknown[] = [];
+                let pendingMarked = false;
+                if (revocable) {
+                    try {
+                        const pendingReferences = await this.#invitations.begin(digest);
+                        try {
+                            pendingMarked = true;
+                        } finally {
+                            for (const reference of pendingReferences) zeroBytes(reference);
+                        }
+                    } catch (cleanupError: unknown) {
+                        cleanupErrors.push(cleanupError);
+                    }
+                }
+                let keysDeleted = false;
+                try {
+                    await this.#engine.deleteKeyPackages(references);
+                    keysDeleted = true;
+                } catch (cleanupError: unknown) {
+                    cleanupErrors.push(cleanupError);
+                }
+                if (revocable && pendingMarked && keysDeleted) {
+                    try {
+                        await this.#invitations.complete(digest);
+                    } catch (cleanupError: unknown) {
+                        cleanupErrors.push(cleanupError);
+                    }
+                }
+                if (cleanupErrors.length > 0) {
+                    throw new AggregateError(
+                        [error, ...cleanupErrors],
+                        "Invitation creation failed and local cleanup did not complete",
+                    );
+                }
                 throw error;
             } finally {
                 zeroBytes(bytes);
+                zeroBytes(digest);
+                for (const reference of references) zeroBytes(reference);
+                if (authorization !== undefined) {
+                    zeroBytes(authorization.owner);
+                    zeroBytes(authorization.revocationKey);
+                    zeroBytes(authorization.digest);
+                    zeroBytes(authorization.signature);
+                }
             }
         });
+    }
+
+    /** Revoke one owner-created relay invitation idempotently. */
+    async revokeInvitation(invitation: Uint8Array, signal?: AbortSignal): Promise<void> {
+        await this.#revokeInvitations(invitation, signal);
+    }
+
+    /** Revoke every outstanding relay invitation under this durable authority. */
+    async revokeInvitations(signal?: AbortSignal): Promise<void> {
+        await this.#revokeInvitations(null, signal);
     }
 
     /** Download, hash-check, and authenticate a five-minute invitation capability. */
@@ -441,6 +555,36 @@ export class MurmurClient {
                 );
             } finally {
                 zeroBytes(packet);
+            }
+        });
+        this.#signalSync();
+    }
+
+    /** Atomically replace and publish the local profile to every active contact. */
+    async updateContactProfile(profile: MurmurContactProfile): Promise<void> {
+        await this.#exclusive(async () => {
+            const prepared = await this.#contacts.prepareProfileUpdate(profile);
+            const packet = encodeContactPacket({
+                version: 2,
+                type: "profile_update",
+                revision: prepared.revision,
+                profile: prepared.profile,
+            });
+            try {
+                await this.#engine.sendOwnedContacts(
+                    prepared.targets.map((target) => ({
+                        id: target.sessionId,
+                        bytes: packet,
+                    })),
+                    (transaction) =>
+                        this.#contacts.commitProfileUpdateInTransaction(transaction, prepared),
+                );
+            } finally {
+                zeroBytes(packet);
+                for (const target of prepared.targets) {
+                    zeroBytes(target.identity);
+                    zeroBytes(target.sessionId);
+                }
             }
         });
         this.#signalSync();
@@ -615,7 +759,11 @@ export class MurmurClient {
         options: MurmurSynchronizeOptions = {},
         lifecycle: Pick<
             MurmurSyncOptions,
-            "onUpdates" | "onContactRequested" | "onContactAdded" | "onContactRemoved"
+            | "onUpdates"
+            | "onContactRequested"
+            | "onContactAdded"
+            | "onContactUpdated"
+            | "onContactRemoved"
         > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
@@ -721,6 +869,39 @@ export class MurmurClient {
         }
         this.#closed = true;
         destroyIdentity(this.#identity);
+        destroyIdentity(this.#invitationRevocation);
+    }
+
+    async #revokeInvitations(digest: Uint8Array | null, signal?: AbortSignal): Promise<void> {
+        await this.#exclusive(async () => {
+            if (this.#discoveryTransport?.revoke === undefined) {
+                throw new Error(
+                    "Invitation revocation is not supported by the discovery transport",
+                );
+            }
+            if (digest !== null && (!(digest instanceof Uint8Array) || digest.length !== 32)) {
+                throw new Error("Invalid invitation digest");
+            }
+            const references = await this.#invitations.begin(digest);
+            try {
+                if (references.length > 0) await this.#engine.deleteKeyPackages(references);
+            } finally {
+                for (const reference of references) zeroBytes(reference);
+            }
+            const request = createSignedInvitationRevocation(
+                this.#invitationRevocation,
+                digest,
+                this.#now(),
+            );
+            try {
+                await this.#discoveryTransport.revoke(request, signal);
+            } finally {
+                zeroBytes(request.revocationKey);
+                if (request.digest !== null) zeroBytes(request.digest);
+                zeroBytes(request.signature);
+            }
+            await this.#invitations.complete(digest);
+        });
     }
 
     async #createContactAdmission(generation: number): Promise<CreatedContactAdmission> {
@@ -818,7 +999,11 @@ export class MurmurClient {
     async #deliverUpdates(
         lifecycle: Pick<
             MurmurSyncOptions,
-            "onUpdates" | "onContactRequested" | "onContactAdded" | "onContactRemoved"
+            | "onUpdates"
+            | "onContactRequested"
+            | "onContactAdded"
+            | "onContactUpdated"
+            | "onContactRemoved"
         >,
     ): Promise<number> {
         if (this.#updatesActive) return 0;
@@ -924,6 +1109,9 @@ export class MurmurClient {
                     }
                     if (contactEvents.added.length > 0) {
                         await lifecycle.onContactAdded?.(contactEvents.added);
+                    }
+                    if (contactEvents.updated.length > 0) {
+                        await lifecycle.onContactUpdated?.(contactEvents.updated);
                     }
                     if (contactEvents.removed.length > 0) {
                         await lifecycle.onContactRemoved?.(contactEvents.removed);

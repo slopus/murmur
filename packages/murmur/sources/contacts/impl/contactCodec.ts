@@ -289,6 +289,16 @@ export function encodeContactPacket(packet: MurmurContactPacket): Uint8Array {
             type: "remove",
             version: CONTACT_VERSION,
         });
+    } else if (packet.type === "profile_update") {
+        if (!Number.isSafeInteger(packet.revision) || packet.revision < 1) {
+            throw new Error("Invalid contact profile revision");
+        }
+        encoded = canonicalJsonBytes({
+            profile: validateContactProfile(packet.profile) as unknown as JsonValue,
+            revision: packet.revision,
+            type: "profile_update",
+            version: CONTACT_VERSION,
+        });
     } else if (packet.type === "admission_request") {
         if (!Number.isSafeInteger(packet.generation) || packet.generation < 0) {
             throw new Error("Invalid contact admission request");
@@ -333,6 +343,22 @@ export function decodeContactPacket(value: Uint8Array): MurmurContactPacket {
         return Object.freeze({
             version: CONTACT_VERSION,
             type: "remove",
+        });
+    }
+    if (input.type === "profile_update") {
+        exact(input, ["profile", "revision", "type", "version"], "contact profile update");
+        if (
+            typeof input.revision !== "number" ||
+            !Number.isSafeInteger(input.revision) ||
+            input.revision < 1
+        ) {
+            throw new Error("Invalid contact profile revision");
+        }
+        return Object.freeze({
+            version: CONTACT_VERSION,
+            type: "profile_update",
+            revision: input.revision,
+            profile: validateContactProfile(input.profile),
         });
     }
     if (input.type === "admission_request") {

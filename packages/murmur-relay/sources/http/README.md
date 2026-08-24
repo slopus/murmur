@@ -5,7 +5,8 @@ queue-ack endpoints with bounded bodies and explicit CORS policy. Queue
 authentication is inside each signed protocol body.
 
 ```text
-invitation bytes -> SHA-256 address -> five-minute opaque cache
+invitation bytes + owner authorization -> SHA-256 address -> five-minute cache
+signed revocation ---------------------> expiring anti-resurrection tombstone
 queue JSON ------> exact codec -----> relay service -> bounded JSON / SSE
 remote address -----------------------> fixed-window admission bound
 ```
@@ -41,3 +42,10 @@ head-of-line blocking.
 pull-driven `delivery` SSE record per exact queue event. Comment heartbeats do
 not advance progress. Disconnect and response cancellation close the relay
 subscription.
+
+New clients use `POST /v1/invitations/owned` and
+`POST /v1/invitations/revoke`. Their JSON parsers enforce exact fields,
+canonical base64url keys, bounded bodies, signature clocks, and owner binding.
+The legacy raw-byte upload remains additive compatibility and produces an
+unrevocable row. Request bodies, invitation digests, and revocation signatures
+must not be logged by hosts or proxies.

@@ -6,6 +6,10 @@ export {
     verifyDiscoveryBundle,
 } from "./impl/discoveryCodec.js";
 export { DiscoveryTransportError, HttpDiscoveryTransport } from "./impl/discoveryHttpTransport.js";
+export {
+    createInvitationUploadAuthorization,
+    createSignedInvitationRevocation,
+} from "./impl/invitationAuthorization.js";
 export type {
     DiscoveryFetch,
     DiscoveryBundle,
@@ -14,4 +18,7 @@ export type {
     DiscoveryTransport,
     DiscoveryUploadOutcome,
     HttpDiscoveryTransportOptions,
+    InvitationRevocationOutcome,
+    InvitationUploadAuthorization,
+    SignedInvitationRevocation,
 } from "./types.js";

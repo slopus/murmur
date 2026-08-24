@@ -309,6 +309,9 @@ describe("identity queue relay", () => {
             async readInvitation() {
                 throw new Error("Unused");
             },
+            async revokeInvitations() {
+                throw new Error("Unused");
+            },
             async publish(
                 _delivery: SignedDelivery,
                 _now: number,

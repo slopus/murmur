@@ -22,10 +22,17 @@ consumed when this contact is added to service sessions. A refill request is
 queued before depletion; the last-resort package remains usable repeatedly
 while the peer is offline, and a response rotates the complete inventory.
 
-The technical session carries canonical `hello`, `admission_request`,
-`admission_response`, and `remove` packets encrypted inside MLS. Application
-profiles remain bounded JSON. Codec functions return defensive immutable
-values.
+The technical session carries canonical `hello`, `profile_update`,
+`admission_request`, `admission_response`, and `remove` packets encrypted inside
+MLS. Profile updates carry monotonic revisions; recipients ignore duplicates
+and older revisions, durably replace the peer profile, and emit
+`onContactUpdated`. Application profiles remain bounded JSON. Codec functions
+return defensive immutable values.
+
+`updateContactProfile(profile)` atomically changes the identity-wide local
+profile, mirrors it into every active contact, and queues one technical-session
+outbox per target. Removing and removed contacts are excluded, while queued
+updates survive crashes and disconnection.
 
 Durable record codecs live in `impl/`. They use a separate
 `murmur/contacts/v2/` namespace.

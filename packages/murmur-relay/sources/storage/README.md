@@ -7,6 +7,7 @@ publication transaction.
 
 ```text
 signed bundle -> SHA-256 digest -> five-minute invitation row
+owner revoke -> digest tombstone -> reject fetch/re-upload until expiry
 delivery -> monotonic UUIDv7 -> recipient inbox references
 ack prefix ----------------> delete one recipient's references
 no references / expiration -> delete delivery
@@ -15,7 +16,16 @@ empty inbox ---------------> delete queue metadata
 
 Invitation rows are separate from delivery counters. They have indexed expiry
 and admission-principal columns and independent per-principal and global item
-and byte bounds. Equal digests are idempotent and retain their first expiry.
+and byte bounds. Owner-authorized rows also index a separate 32-byte public
+revocation key with a fixed per-authority item bound. Equal live digests are
+idempotent and retain their first expiry; a live tombstone rejects the digest.
+
+Revocation atomically copies the digest, revocation key, original expiry, and
+admission principal into a tombstone before deleting the bundle. Tombstones
+contain no secrets, count toward item/principal/authority bounds, prevent exact
+public-byte resurrection, and disappear at original expiry. Single and
+authority-wide selection is indexed and capped; no unbounded table scan is
+used.
 
 The global singleton maintains exact pending delivery, encoded-byte, and
 reference counters. Every nonempty inbox row also maintains exact pending item
@@ -29,10 +39,11 @@ storage ceiling.
 Multicast target creation, quota reads, reference insertion, head updates, and
 wake publication are set-based SQL rather than one statement per recipient.
 
-Schema version 3 is the compatibility baseline. Later schema versions migrate
-SQLite and Postgres stores in place while retaining pending deliveries,
-references, and invitations; an upgrade must not require a clean database.
-Pre-v0.3 topic-relay schemas remain unsupported.
+Schema version 3 is the compatibility baseline. Version 4 migrates SQLite and
+Postgres stores in place while retaining pending deliveries, references, and
+invitations, then adds invitation revocation metadata and tombstones. An
+upgrade must not require a clean database. Pre-v0.3 topic-relay schemas remain
+unsupported.
 
 Only pending, unexpired data is authoritative. Empty queue metadata is deleted,
 so the relay does not retain recipient tombstones or historical cursors.
@@ -46,5 +57,5 @@ selected from bounded UUID and encoded-length metadata. Acknowledgement removes
 orphaned shared ciphertexts transactionally. Expiration commits as an
 independent writer transaction before publish or acknowledgement policy can
 reject, so retries always drain backlog. It tracks affected recipients, removes
-at most 100 deliveries and 100 invitations per transaction, and batches
-empty-inbox cleanup.
+at most 100 deliveries, 100 invitations, and 100 revocation tombstones per
+transaction, and batches empty-inbox cleanup.

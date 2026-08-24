@@ -1,6 +1,8 @@
 import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
+    verifyInvitationRevocationSignature,
+    verifyInvitationUploadAuthorization,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
     verifyQueueAckSignature,
@@ -8,6 +10,8 @@ import {
     type SignedDelivery,
     type SignedQueueAck,
     type SignedQueueRead,
+    type InvitationUploadAuthorization,
+    type SignedInvitationRevocation,
 } from "../protocol/index.js";
 import type {
     AcknowledgeOutcome,
@@ -17,10 +21,12 @@ import type {
     RelayStore,
 } from "../storage/index.js";
 import { encodeBase64Url } from "../utils/base64Url.js";
-import { validateInvitationTimes } from "./impl/invitationValidate.js";
+import { equalBytes } from "../utils/bytes.js";
+import { invitationOwner, validateInvitationTimes } from "./impl/invitationValidate.js";
 import { InProcessWakeSource } from "./impl/wakeInProcess.js";
 import type {
     InvitationDownload,
+    InvitationRevocationOutcome,
     InvitationUploadOutcome,
     QueueEventSubscription,
     RelayOptions,
@@ -32,6 +38,7 @@ export { InProcessWakeSource } from "./impl/wakeInProcess.js";
 export { PostgresWakeSource } from "./impl/wakePostgres.js";
 export type {
     InvitationDownload,
+    InvitationRevocationOutcome,
     InvitationUploadOutcome,
     QueueEventSubscription,
     RelayOptions,
@@ -86,6 +93,10 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
         maximumGlobalInvitationBytes: positiveInteger(
             options.maximumGlobalInvitationBytes ?? 64 * MEBIBYTE,
             "Maximum global invitation bytes",
+        ),
+        maximumInvitationItemsPerRevocationKey: positiveInteger(
+            options.maximumInvitationItemsPerRevocationKey ?? 32,
+            "Maximum invitation items per revocation key",
         ),
         maximumCiphertextBytes: positiveInteger(
             options.maximumCiphertextBytes ?? MEBIBYTE,
@@ -171,6 +182,7 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
         resolved.maximumInvitationBytes > resolved.maximumGlobalInvitationBytes ||
         resolved.maximumInvitationItemsPerAdmissionPrincipal >
             resolved.maximumGlobalInvitationItems ||
+        resolved.maximumInvitationItemsPerRevocationKey > resolved.maximumGlobalInvitationItems ||
         resolved.maximumInvitationBytesPerAdmissionPrincipal > resolved.maximumGlobalInvitationBytes
     ) {
         throw new Error("Invitation cache limits are inconsistent");
@@ -235,6 +247,23 @@ export class RelayService {
         bundle: Uint8Array,
         admissionPrincipal: string,
     ): Promise<InvitationUploadOutcome> {
+        return this.#storeInvitation(bundle, admissionPrincipal);
+    }
+
+    /** Cache one invitation after verifying its owner's separate revocation authority. */
+    async storeOwnedInvitation(
+        bundle: Uint8Array,
+        authorization: InvitationUploadAuthorization,
+        admissionPrincipal: string,
+    ): Promise<InvitationUploadOutcome> {
+        return this.#storeInvitation(bundle, admissionPrincipal, authorization);
+    }
+
+    async #storeInvitation(
+        bundle: Uint8Array,
+        admissionPrincipal: string,
+        authorization?: InvitationUploadAuthorization,
+    ): Promise<InvitationUploadOutcome> {
         this.#assertOpen();
         if (!(bundle instanceof Uint8Array) || bundle.length < 1) {
             throw new RelayError(400, "Invalid invitation bundle", { error: "malformed" });
@@ -259,6 +288,34 @@ export class RelayService {
             });
         }
         const digest = sha256(bundle);
+        let revocationKey: Uint8Array | undefined;
+        if (authorization !== undefined) {
+            let owner: Uint8Array;
+            try {
+                owner = invitationOwner(bundle);
+            } catch {
+                throw new RelayError(400, "Invalid invitation owner", { error: "malformed" });
+            }
+            try {
+                if (
+                    !equalBytes(owner, authorization.owner) ||
+                    !equalBytes(digest, authorization.digest) ||
+                    authorization.expiresAt !== expiresAt ||
+                    authorization.createdAt >
+                        now + this.#options.maximumAuthenticationSkewMilliseconds ||
+                    authorization.createdAt <
+                        now - this.#options.maximumAuthenticationSkewMilliseconds ||
+                    !verifyInvitationUploadAuthorization(authorization)
+                ) {
+                    throw new RelayError(401, "Invalid invitation owner authorization", {
+                        error: "unauthorized",
+                    });
+                }
+                revocationKey = authorization.revocationKey;
+            } finally {
+                owner.fill(0);
+            }
+        }
         const outcome = await this.#store.storeInvitation(
             digest,
             bundle,
@@ -269,10 +326,35 @@ export class RelayService {
                 maximumPrincipalBytes: this.#options.maximumInvitationBytesPerAdmissionPrincipal,
                 maximumGlobalItems: this.#options.maximumGlobalInvitationItems,
                 maximumGlobalBytes: this.#options.maximumGlobalInvitationBytes,
+                maximumRevocationKeyItems: this.#options.maximumInvitationItemsPerRevocationKey,
             },
             this.#digestAdmissionPrincipal(admissionPrincipal),
+            revocationKey,
         );
         return { digest, expiresAt: outcome.expiresAt, duplicate: outcome.duplicate };
+    }
+
+    /** Authenticate and atomically revoke one or all live invitations for one authority. */
+    async revokeInvitations(
+        request: SignedInvitationRevocation,
+    ): Promise<InvitationRevocationOutcome> {
+        this.#assertOpen();
+        const now = this.#now();
+        if (
+            request.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
+            request.createdAt < now - this.#options.maximumAuthenticationSkewMilliseconds ||
+            !verifyInvitationRevocationSignature(request)
+        ) {
+            throw new RelayError(401, "Invalid invitation revocation authorization", {
+                error: "unauthorized",
+            });
+        }
+        return this.#store.revokeInvitations(
+            request.revocationKey,
+            request.digest,
+            now,
+            this.#options.maximumInvitationItemsPerRevocationKey,
+        );
     }
 
     /** Fetch one unexpired opaque bundle by its exact SHA-256 digest. */

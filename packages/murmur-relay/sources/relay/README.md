@@ -4,7 +4,9 @@ Validates signed deliveries and signed queue operations, enforces TTL and quota
 policy, delegates atomic multicast and trimming to storage, and orchestrates
 bounded long polling plus pull-driven ordered SSE. It also hashes and stores
 opaque signed discovery bytes under a hard five-minute policy without treating
-cache contents as trusted.
+cache contents as trusted. Owner-authorized registration binds exact bytes to a
+separate revocation public key; signed revocation delegates bounded tombstone
+replacement to storage.
 
 Every publication call must supply an explicit admission principal. The service
 hashes it before storage and never falls back to the free protocol sender
@@ -15,7 +17,8 @@ explicit shared embedding principal.
 signed request -> shape/time/signature policy -> atomic store operation
                                                   |
 empty read/stream -> bounded waiter -> wake hint -+-> authoritative reread
-bundle bytes -> time bound + SHA-256 -> non-enumerable invitation cache
+bundle + owner auth -> time/signature/SHA-256 -> invitation cache
+revocation signature -------------------------> one/all tombstones
 ```
 
 Long polls and persistent streams share global and per-recipient concurrency

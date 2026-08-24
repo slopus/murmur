@@ -189,12 +189,14 @@ import {
     type IdentityKeyPair,
     type MurmurClientOptions,
     type MurmurContactProfile,
+    type MurmurContactUpdated,
     type MurmurService,
     type MurmurSyncOptions,
     type MurmurSessionPage,
     type MurmurStore,
     type RelaySessionProvider,
     type RelaySessionTicket,
+    type SignedInvitationRevocation,
     type SignedRelaySessionRequest,
 } from "@slopus/murmur";
 
@@ -213,6 +215,7 @@ const sessionProvider: RelaySessionProvider = new HttpRelaySessionProvider(
 const negotiatedOptions: MurmurClientOptions = { sessionProvider, store };
 const ticket: RelaySessionTicket | undefined = undefined;
 const proof: SignedRelaySessionRequest | undefined = undefined;
+const revocation: SignedInvitationRevocation | undefined = undefined;
 const options: MurmurClientOptions = {
     relay: new URL("https://relay.example"),
     store,
@@ -232,6 +235,12 @@ const opening: Promise<MurmurClient> = MurmurClient.open(options);
 const syncOptions: MurmurSyncOptions = {
     abort: new AbortController().signal,
     onUpdates: async (updates) => void updates,
+    onContactUpdated: async (updates: readonly MurmurContactUpdated[]) => void updates,
+};
+const exerciseSharing = async (client: MurmurClient): Promise<void> => {
+    await client.updateContactProfile(profile);
+    await client.revokeInvitation(new Uint8Array(32));
+    await client.revokeInvitations();
 };
 const page: MurmurSessionPage | undefined = undefined;
 const discovery: DiscoveryBundle | undefined = undefined;
@@ -246,6 +255,8 @@ void profile;
 void negotiatedOptions;
 void ticket;
 void proof;
+void revocation;
+void exerciseSharing;
 void WebSocketDeliveryTransport;
 destroyIdentity(identity);
 `,

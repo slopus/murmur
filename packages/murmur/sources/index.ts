@@ -95,6 +95,7 @@ export type {
     MurmurContactRemoved,
     MurmurContactRequest,
     MurmurContactRequested,
+    MurmurContactUpdated,
     MurmurOutgoingContactRequest,
 } from "./contacts/index.js";
 export {
@@ -130,6 +131,9 @@ export type {
     DiscoveryTransport,
     DiscoveryUploadOutcome,
     HttpDiscoveryTransportOptions,
+    InvitationRevocationOutcome,
+    InvitationUploadAuthorization,
+    SignedInvitationRevocation,
 } from "./identity/discovery/index.js";
 export { MAXIMUM_STORE_SCAN_ITEMS, MemoryMurmurStore } from "./storage/index.js";
 export type { MurmurStore, StoreScanOptions, StoreTransaction } from "./storage/index.js";

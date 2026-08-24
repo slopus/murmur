@@ -1,6 +1,6 @@
 {
     "name": "@slopus/murmur",
-    "version": "0.4.4",
+    "version": "0.4.5",
     "description": "Stateful MLS sessions over authenticated encrypted delivery queues",
     "keywords": [
         "encrypted-events",
@@ -50,10 +50,11 @@
         "test:contact-handshake-offline": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'queues the contact hello offline and relays the full handshake after restart' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:contact-offline": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'creates groups while a contact is offline, reuses fallback, and refills' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:contact-outgoing": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'persists one outgoing request when the same invitation is submitted twice' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
+        "test:contact-profile": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'refreshes contact profiles online and after restart without targeting removal' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:contact-removal": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'establishes mutual proof, restores offline, and removes the contact' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:contact-retry": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'retries a requested callback and explicitly rejects the pending session' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:e2e": "vitest run --config vitest.e2e.config.ts --testTimeout=60000",
-        "test:integration": "pnpm run test:contact-outgoing && pnpm run test:contact-handshake-offline && pnpm run test:contact-group && pnpm run test:contact-offline && pnpm run test:contact-removal && pnpm run test:contact-retry",
+        "test:integration": "pnpm run test:contact-outgoing && pnpm run test:contact-handshake-offline && pnpm run test:contact-profile && pnpm run test:contact-group && pnpm run test:contact-offline && pnpm run test:contact-removal && pnpm run test:contact-retry",
         "test:unit": "vitest run --maxWorkers=1 --no-file-parallelism --testTimeout=120000 --exclude sources/contacts/tests/contactIntegration.test.ts",
         "test:watch": "vitest",
         "sync-readme": "node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('../../README.md', 'README.md');\"",

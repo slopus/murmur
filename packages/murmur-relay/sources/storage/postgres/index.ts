@@ -22,6 +22,7 @@ import type {
     QueueLimits,
     QueuePage,
     RelayStore,
+    RevokeInvitationsOutcome,
     StoredInvitation,
     StoreInvitationOutcome,
 } from "../types.js";
@@ -80,12 +81,14 @@ export class PostgresRelayStore implements RelayStore {
         now: number,
         limits: InvitationLimits,
         admissionPrincipal: Uint8Array,
+        revocationKey?: Uint8Array,
     ): Promise<StoreInvitationOutcome> {
         this.#assertOpen();
         if (
             digest.length !== 32 ||
             bundle.length < 1 ||
             admissionPrincipal.length !== 32 ||
+            (revocationKey !== undefined && revocationKey.length !== 32) ||
             !Number.isSafeInteger(expiresAt) ||
             expiresAt <= now
         ) {
@@ -96,11 +99,22 @@ export class PostgresRelayStore implements RelayStore {
             await transaction.query(
                 "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
             );
+            const revoked = await transaction.query<{ digest: unknown }>(
+                `SELECT digest FROM murmur_invitation_revocations
+                 WHERE digest = $1 AND expires_at > $2`,
+                [digest, now.toString()],
+            );
+            if (revoked.rows[0] !== undefined) {
+                throw new RelayError(410, "Invitation has been revoked", {
+                    error: "invitation_revoked",
+                });
+            }
             const existing = await transaction.query<{
                 bundle: unknown;
                 expires_at: unknown;
+                revocation_key: unknown;
             }>(
-                `SELECT bundle, expires_at
+                `SELECT bundle, expires_at, revocation_key
                  FROM murmur_invitations
                  WHERE digest = $1`,
                 [digest],
@@ -109,6 +123,31 @@ export class PostgresRelayStore implements RelayStore {
             if (duplicate !== undefined) {
                 if (!equalBytes(copyBytes(duplicate.bundle, "invitation bundle"), bundle)) {
                     throw new Error("Invitation digest collision");
+                }
+                if (revocationKey !== undefined) {
+                    if (duplicate.revocation_key === null) {
+                        await this.#assertRevocationKeyCapacity(
+                            transaction,
+                            revocationKey,
+                            now,
+                            limits,
+                            1,
+                        );
+                        await transaction.query(
+                            `UPDATE murmur_invitations
+                             SET revocation_key = $1 WHERE digest = $2`,
+                            [revocationKey, digest],
+                        );
+                    } else if (
+                        !equalBytes(
+                            copyBytes(duplicate.revocation_key, "invitation revocation key"),
+                            revocationKey,
+                        )
+                    ) {
+                        throw new RelayError(409, "Invitation revocation authority conflicts", {
+                            error: "invitation_revocation_authority_conflict",
+                        });
+                    }
                 }
                 return {
                     expiresAt: safeNumberColumn(duplicate.expires_at),
@@ -119,10 +158,12 @@ export class PostgresRelayStore implements RelayStore {
                 item_count: unknown;
                 byte_count: unknown;
             }>(
-                `SELECT COUNT(*) AS item_count,
-                        COALESCE(SUM(encoded_bytes), 0) AS byte_count
-                 FROM murmur_invitations
-                 WHERE expires_at > $1`,
+                `SELECT
+                    (SELECT COUNT(*) FROM murmur_invitations WHERE expires_at > $1) +
+                    (SELECT COUNT(*) FROM murmur_invitation_revocations
+                     WHERE expires_at > $1) AS item_count,
+                    (SELECT COALESCE(SUM(encoded_bytes), 0)
+                     FROM murmur_invitations WHERE expires_at > $1) AS byte_count`,
                 [now.toString()],
             );
             const globalRow = global.rows[0];
@@ -140,10 +181,14 @@ export class PostgresRelayStore implements RelayStore {
                 item_count: unknown;
                 byte_count: unknown;
             }>(
-                `SELECT COUNT(*) AS item_count,
-                        COALESCE(SUM(encoded_bytes), 0) AS byte_count
-                 FROM murmur_invitations
-                 WHERE admission_principal = $1 AND expires_at > $2`,
+                `SELECT
+                    (SELECT COUNT(*) FROM murmur_invitations
+                     WHERE admission_principal = $1 AND expires_at > $2) +
+                    (SELECT COUNT(*) FROM murmur_invitation_revocations
+                     WHERE admission_principal = $1 AND expires_at > $2) AS item_count,
+                    (SELECT COALESCE(SUM(encoded_bytes), 0)
+                     FROM murmur_invitations
+                     WHERE admission_principal = $1 AND expires_at > $2) AS byte_count`,
                 [admissionPrincipal, now.toString()],
             );
             const principalRow = principal.rows[0];
@@ -159,11 +204,22 @@ export class PostgresRelayStore implements RelayStore {
                     error: "invitation_admission_full",
                 });
             }
+            if (revocationKey !== undefined) {
+                await this.#assertRevocationKeyCapacity(transaction, revocationKey, now, limits, 1);
+            }
             await transaction.query(
                 `INSERT INTO murmur_invitations
-                    (digest, bundle, encoded_bytes, expires_at, admission_principal)
-                 VALUES ($1, $2, $3, $4, $5)`,
-                [digest, bundle, bundle.length, expiresAt.toString(), admissionPrincipal],
+                    (digest, bundle, encoded_bytes, expires_at, admission_principal,
+                     revocation_key)
+                 VALUES ($1, $2, $3, $4, $5, $6)`,
+                [
+                    digest,
+                    bundle,
+                    bundle.length,
+                    expiresAt.toString(),
+                    admissionPrincipal,
+                    revocationKey ?? null,
+                ],
             );
             return { expiresAt, duplicate: false };
         });
@@ -188,6 +244,130 @@ export class PostgresRelayStore implements RelayStore {
                   bundle: copyBytes(row.bundle, "invitation bundle"),
                   expiresAt: safeNumberColumn(row.expires_at),
               };
+    }
+
+    async revokeInvitations(
+        revocationKey: Uint8Array,
+        digest: Uint8Array | null,
+        now: number,
+        maximumItems: number,
+    ): Promise<RevokeInvitationsOutcome> {
+        this.#assertOpen();
+        if (
+            revocationKey.length !== 32 ||
+            (digest !== null && digest.length !== 32) ||
+            !Number.isSafeInteger(now) ||
+            !Number.isSafeInteger(maximumItems) ||
+            maximumItems < 1
+        ) {
+            throw new Error("Invalid invitation revocation input");
+        }
+        await this.pruneExpired(now);
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
+            );
+            if (digest !== null) {
+                const active = await transaction.query<{
+                    revocation_key: unknown;
+                    expires_at: unknown;
+                    admission_principal: unknown;
+                }>(
+                    `SELECT revocation_key, expires_at, admission_principal
+                     FROM murmur_invitations
+                     WHERE digest = $1 AND expires_at > $2`,
+                    [digest, now.toString()],
+                );
+                const invitation = active.rows[0];
+                if (invitation !== undefined) {
+                    if (
+                        invitation.revocation_key === null ||
+                        !equalBytes(
+                            copyBytes(invitation.revocation_key, "invitation revocation key"),
+                            revocationKey,
+                        )
+                    ) {
+                        throw new RelayError(401, "Invitation revocation is unauthorized", {
+                            error: "invitation_revocation_unauthorized",
+                        });
+                    }
+                    await transaction.query(
+                        `INSERT INTO murmur_invitation_revocations
+                            (digest, revocation_key, expires_at, admission_principal)
+                         VALUES ($1, $2, $3, $4)
+                         ON CONFLICT (digest) DO NOTHING`,
+                        [
+                            digest,
+                            revocationKey,
+                            safeNumberColumn(invitation.expires_at).toString(),
+                            copyBytes(invitation.admission_principal, "admission principal"),
+                        ],
+                    );
+                    const removed = await transaction.query<{ digest: unknown }>(
+                        `DELETE FROM murmur_invitations WHERE digest = $1 RETURNING digest`,
+                        [digest],
+                    );
+                    return { revoked: removed.rows.length };
+                }
+                const revoked = await transaction.query<{ revocation_key: unknown }>(
+                    `SELECT revocation_key FROM murmur_invitation_revocations
+                     WHERE digest = $1 AND expires_at > $2`,
+                    [digest, now.toString()],
+                );
+                const tombstone = revoked.rows[0];
+                if (
+                    tombstone !== undefined &&
+                    !equalBytes(
+                        copyBytes(tombstone.revocation_key, "invitation revocation key"),
+                        revocationKey,
+                    )
+                ) {
+                    throw new RelayError(401, "Invitation revocation is unauthorized", {
+                        error: "invitation_revocation_unauthorized",
+                    });
+                }
+                return { revoked: 0 };
+            }
+            let revoked = 0;
+            while (true) {
+                const active = await transaction.query<{
+                    digest: unknown;
+                    expires_at: unknown;
+                    admission_principal: unknown;
+                }>(
+                    `SELECT digest, expires_at, admission_principal
+                     FROM murmur_invitations
+                     WHERE revocation_key = $1 AND expires_at > $2
+                     ORDER BY expires_at, digest
+                     LIMIT $3`,
+                    [revocationKey, now.toString(), maximumItems],
+                );
+                if (active.rows.length === 0) break;
+                for (const invitation of active.rows) {
+                    const invitationDigest = copyBytes(invitation.digest, "invitation digest");
+                    await transaction.query(
+                        `INSERT INTO murmur_invitation_revocations
+                            (digest, revocation_key, expires_at, admission_principal)
+                         VALUES ($1, $2, $3, $4)
+                         ON CONFLICT (digest) DO NOTHING`,
+                        [
+                            invitationDigest,
+                            revocationKey,
+                            safeNumberColumn(invitation.expires_at).toString(),
+                            copyBytes(invitation.admission_principal, "admission principal"),
+                        ],
+                    );
+                    const removed = await transaction.query<{ digest: unknown }>(
+                        `DELETE FROM murmur_invitations
+                         WHERE digest = $1 AND revocation_key = $2
+                         RETURNING digest`,
+                        [invitationDigest, revocationKey],
+                    );
+                    revoked += removed.rows.length;
+                }
+            }
+            return { revoked };
+        });
     }
 
     async publish(
@@ -665,6 +845,33 @@ export class PostgresRelayStore implements RelayStore {
         );
     }
 
+    async #assertRevocationKeyCapacity(
+        transaction: PostgresQuery,
+        revocationKey: Uint8Array,
+        now: number,
+        limits: InvitationLimits,
+        addedItems: number,
+    ): Promise<void> {
+        const usage = await transaction.query<{ item_count: unknown }>(
+            `SELECT
+                (SELECT COUNT(*) FROM murmur_invitations
+                 WHERE revocation_key = $1 AND expires_at > $2) +
+                (SELECT COUNT(*) FROM murmur_invitation_revocations
+                 WHERE revocation_key = $1 AND expires_at > $2) AS item_count`,
+            [revocationKey, now.toString()],
+        );
+        const row = usage.rows[0];
+        if (row === undefined) throw new Error("Missing revocation-authority usage");
+        if (
+            bigintColumn(row.item_count) + BigInt(addedItems) >
+            BigInt(limits.maximumRevocationKeyItems)
+        ) {
+            throw new RelayError(429, "Invitation revocation-authority quota exceeded", {
+                error: "invitation_revocation_authority_full",
+            });
+        }
+    }
+
     async #pruneExpired(transaction: PostgresQuery, now: number): Promise<number> {
         const usage = await transaction.query<{
             item_count: unknown;
@@ -788,7 +995,23 @@ export class PostgresRelayStore implements RelayStore {
              RETURNING invitation.digest`,
             [now.toString()],
         );
-        return removed.rows.length + removedInvitations.rows.length;
+        const removedRevocations = await transaction.query<{ digest: unknown }>(
+            `WITH expired AS (
+                 SELECT digest
+                 FROM murmur_invitation_revocations
+                 WHERE expires_at <= $1
+                 ORDER BY expires_at, digest
+                 LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
+             )
+             DELETE FROM murmur_invitation_revocations AS revocation
+             USING expired
+             WHERE revocation.digest = expired.digest
+             RETURNING revocation.digest`,
+            [now.toString()],
+        );
+        return (
+            removed.rows.length + removedInvitations.rows.length + removedRevocations.rows.length
+        );
     }
 
     #assertOpen(): void {

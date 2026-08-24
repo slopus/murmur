@@ -22,6 +22,7 @@ export type {
     QueuedDelivery,
     QueueLimits,
     QueuePage,
+    RevokeInvitationsOutcome,
     RelayStore,
     StoredInvitation,
     StoreInvitationOutcome,

@@ -30,6 +30,8 @@ root. The same identity authenticates discovery bundles, relay operations, and
 MLS credentials. The supplied `MurmurStore` is authoritative for:
 
 - the identity root;
+- the separate invitation-revocation root and bounded digest-to-KeyPackage
+  records;
 - unused private KeyPackages;
 - active, creating, and pending MLS checkpoints;
 - sender ratchets and exact publication outboxes;
@@ -37,6 +39,11 @@ MLS credentials. The supplied `MurmurStore` is authoritative for:
 - accepted proposals, pending-session state, bounded opaque event buffers, and
   the identity-wide application-update order;
 - built-in contacts and session-to-service ownership.
+
+An identity-wide contact profile revision is mirrored into every active
+contact record. Updating it and queuing one MLS outbox for every active
+technical contact session is one transaction, so local reads can never observe
+a published revision without its durable outbound work.
 
 Each confirmed contact also owns an offline admission inventory: fifteen
 one-use public KeyPackages from the peer plus one reusable last-resort package.
@@ -64,6 +71,12 @@ under the SHA-256 digest of its exact bytes. It cannot enumerate invitations or
 resolve an identity; recipients already holding the digest fetch the bytes and
 independently verify the hash, signed expiry, identity signature, and
 KeyPackages.
+
+For owner-authorized uploads it additionally stores the public revocation key.
+Revocation replaces a live invitation with a bounded tombstone carrying only
+digest, public authority, original expiry, and admission principal. Tombstones
+block public re-upload resurrection, count toward item quotas, and are pruned
+at expiry; they contain no private capability.
 
 The relay stores a delivery while at least one queue reference is
 unacknowledged and unexpired. A signed monotonic acknowledgement removes one

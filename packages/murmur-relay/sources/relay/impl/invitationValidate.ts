@@ -1,3 +1,5 @@
+import { decodeBase64Url, encodeBase64Url } from "../../utils/base64Url.js";
+
 interface InvitationTimes {
     readonly createdAt: number;
     readonly expiresAt: number;
@@ -46,4 +48,23 @@ export function validateInvitationTimes(
         throw new Error("Invitation bundle violates relay time policy");
     }
     return { createdAt, expiresAt };
+}
+
+/** Read the signed bundle's claimed identity for owner-authorized cache registration. */
+export function invitationOwner(bundle: Uint8Array): Uint8Array {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bundle)) as unknown;
+    } catch {
+        throw new Error("Invalid invitation bundle JSON");
+    }
+    const value = object(parsed);
+    if (value.version !== 1 || typeof value.identityKey !== "string") {
+        throw new Error("Invalid invitation owner");
+    }
+    const owner = decodeBase64Url(value.identityKey, 32);
+    if (encodeBase64Url(owner) !== value.identityKey) {
+        throw new Error("Invalid invitation owner");
+    }
+    return owner;
 }
