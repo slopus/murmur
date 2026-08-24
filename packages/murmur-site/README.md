@@ -15,6 +15,7 @@ packages/murmur-site/
 │   ├── 404.html                 not-found page, same shell
 │   ├── site.css                 Happy's desktop roles, light and dark
 │   ├── site.js                  appearance, tabs, copy — nothing else
+│   ├── .assetsignore            excludes source docs from deployment
 │   └── _headers                 static response headers (CSP, HSTS, ...)
 └── tests/                       node:test assertions over those files
 ```
@@ -83,7 +84,9 @@ bindings, no Durable Objects, no environment variables, no server state. The
 Worker name is `murmur`, so the expected preview URL is
 `https://murmur.<account>.workers.dev`.
 
-Cloudflare consumes `sources/_headers` as configuration and never serves it. It
-applies a content security policy that permits same-origin script and style and
-denies everything else, plus HSTS, `nosniff`, `no-referrer`, `X-Frame-Options`,
-and a `Permissions-Policy` that turns off every device capability.
+Cloudflare consumes `sources/_headers` and `sources/.assetsignore` as
+configuration and never serves either one. The ignore file keeps source
+documentation out of the public manifest. The headers apply a content security
+policy that permits same-origin script and style and denies everything else,
+plus HSTS, `nosniff`, `no-referrer`, `X-Frame-Options`, and a
+`Permissions-Policy` that turns off every device capability.

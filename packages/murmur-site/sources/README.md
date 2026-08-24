@@ -1,13 +1,14 @@
 # sources
 
-The deployed asset directory. Cloudflare serves these files verbatim; there is
-no build step, so what is here is what a browser receives.
+The deployed asset directory. Cloudflare serves the site files verbatim; there
+is no build step. `.assetsignore` excludes this directory README from the public
+manifest.
 
 ```text
 request
    |
    v
-Cloudflare static assets  <-- _headers (configuration, never served)
+Cloudflare static assets  <-- _headers and .assetsignore (configuration, never served)
    |
    +-- /            -> index.html --> /site.css --> /site.js
    +-- /<anything>  -> 404.html   --> /site.css

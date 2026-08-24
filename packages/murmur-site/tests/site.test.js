@@ -57,6 +57,7 @@ describe("package layout", () => {
 
     test("sources contains only the expected static assets", () => {
         assert.deepEqual(readdirSync(sourcesRoot).sort(), [
+            ".assetsignore",
             "404.html",
             "README.md",
             "_headers",
@@ -76,6 +77,10 @@ describe("worker configuration", () => {
         assert.equal(config.main, undefined, "an assets-only Worker must not declare a script");
         assert.equal(config.assets.directory, "./sources");
         assert.equal(config.assets.not_found_handling, "404-page");
+    });
+
+    test("excludes source documentation from the public asset manifest", () => {
+        assert.equal(read("sources/.assetsignore").trim(), "README.md");
     });
 
     test("declares no bindings, secrets, or server state", () => {

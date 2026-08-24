@@ -17,7 +17,8 @@ markup is hand-written and stable.
 ## What is covered
 
 ```text
-package layout        private package, no dependencies, README per directory
+package layout        private package, no dependencies, README per directory,
+                      source README excluded from the public asset manifest
 worker configuration  assets-only, named "murmur", no bindings or server state
 security headers      CSP directives, HSTS, nosniff, referrer, frame options
                       + proof the pages contain no inline script or style
