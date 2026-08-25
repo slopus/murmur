@@ -18,8 +18,19 @@ export interface MurmurSession {
     readonly status: "creating" | "pending" | "active" | "removed";
     readonly descriptor: Uint8Array;
     readonly members: readonly Uint8Array[];
-    readonly committer: Uint8Array;
+    /** Immutable role owner account. */
+    readonly owner: Uint8Array;
+    /** Admin accounts, including the owner. */
+    readonly admins: readonly Uint8Array[];
+    /** Membership and role-assignment policies. */
+    readonly policies: MurmurSessionPolicies;
     readonly bufferedEvents: number;
+}
+
+/** Owner-controlled policies for one role-managed session. */
+export interface MurmurSessionPolicies {
+    readonly adminsAssignAdmins: boolean;
+    readonly anyoneCanAddMembers: boolean;
 }
 
 /** One opaque application update from the identity's ordered inbox. */
@@ -68,14 +79,6 @@ export interface MurmurSyncOptions {
     ) => void | Promise<void>;
 }
 
-/** One MLS-protected member proposal awaiting committer acceptance. */
-export interface MurmurSessionProposal {
-    readonly id: string;
-    readonly type: "add" | "remove";
-    readonly proposer: Uint8Array;
-    readonly identity: Uint8Array;
-}
-
 /** Bounded session-list query. */
 export interface MurmurSessionListOptions {
     readonly after?: string;
@@ -92,6 +95,10 @@ interface CreateMurmurSessionCommonOptions {
     readonly descriptor: Uint8Array;
     /** Stable registered service that immediately owns this locally created session. */
     readonly service?: string;
+    /** Whether admins may grant admin to another member. Defaults to false. */
+    readonly adminsAssignAdmins?: boolean;
+    /** Whether any member may add a new member account. Defaults to false. */
+    readonly anyoneCanAddMembers?: boolean;
 }
 
 /** Construction inputs for one new local session. */
@@ -120,7 +127,7 @@ export interface MurmurSessionLimits {
     readonly maximumOutboxes?: number;
 }
 
-/** One synchronization request for delivery, outbox, and proposal convergence. */
+/** One synchronization request for delivery, outbox, and intent convergence. */
 export interface MurmurSynchronizeOptions {
     readonly limit?: number;
     readonly waitMilliseconds?: number;
@@ -132,7 +139,7 @@ export interface MurmurSessionIssue {
     readonly id: string;
     readonly code: string;
     readonly sessionId?: Uint8Array;
-    readonly kind?: "application" | "proposal" | "commit" | "bootstrap" | "session";
+    readonly kind?: "application" | "commit" | "bootstrap" | "session";
     readonly operationId?: string;
 }
 

@@ -36,7 +36,7 @@ MLS credentials. The supplied `MurmurStore` is authoritative for:
 - active, creating, and pending MLS checkpoints;
 - sender ratchets and exact publication outboxes;
 - inbox cursor, replay protection, and terminal rejections;
-- accepted proposals, pending-session state, bounded opaque event buffers, and
+- asynchronous role and membership intents, pending-session state, bounded opaque event buffers, and
   the identity-wide application-update order;
 - built-in contacts and session-to-service ownership.
 
@@ -94,10 +94,12 @@ history, MLS state, or application-level acknowledgement protocol.
 
 ## Session ordering
 
-Independent recipient queues do not provide one total order across a group.
-Murmur therefore records one epoch committer. Members may send proposals, but
-only the current committer accepts proposals and creates the next Commit.
-Committer identity and transfer are bound into MLS authenticated data.
+Every Commit carries the complete owner, admin, and policy state in MLS
+authenticated data. Any current member may create a Commit, but each recipient
+deterministically validates the change against the role state of the epoch it
+extends. One relay multicast receives one shared UUIDv7 event ID in every
+recipient inbox, so the first valid Commit for an epoch wins identically for
+all retained members. There is no session-level committer role.
 
 Membership publication is an operation:
 
@@ -111,9 +113,12 @@ publish Commit only after all Welcome markers
 adopt only from the sender's own queue echo
 ```
 
-Application and proposal outboxes are durably ordered per client. A transient
-head failure blocks later records for the same session while unrelated sessions
-continue.
+Membership and role APIs persist bounded intents before network I/O. A losing
+concurrent Commit is cancelled when the earlier relay event arrives; dependent
+application outboxes are re-encrypted against the winning epoch and the intent
+is retried, including a replacement Welcome for a pending joiner. Application
+and control outboxes are durably ordered per client. A transient head failure
+blocks later records for the same session while unrelated sessions continue.
 
 ## Processing boundary
 

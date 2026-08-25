@@ -88,7 +88,9 @@ function fixture(groupSecret = bytes(101)): Fixture {
             status: "active",
             descriptor: utf8Encode("private group session"),
             members: [accountA, accountB],
-            committer: bytes(152),
+            owner: accountA,
+            admins: [accountA],
+            policies: { adminsAssignAdmins: false, anyoneCanAddMembers: false },
         },
         rolesAB: [
             { accountIdentifier: accountA, role: "owner" },

@@ -262,10 +262,11 @@
                                     Resolving the digest verifies the hash, the signed expiry, the
                                     identity signature, and the KeyPackage signatures, then
                                     bootstraps an MLS session. Every membership change is a Commit.
-                                    Exactly one authenticated epoch committer serializes Commits;
-                                    other members submit proposals. The sender adopts its own Commit
-                                    only from its authenticated queue echo, never from a successful
-                                    publish — so relay ordering never arbitrates concurrent Commits.
+                                    Every epoch authenticates an owner, admins, and membership
+                                    policies. Any current member may publish a role-authorized
+                                    Commit. The first valid shared relay event wins a concurrent
+                                    race, and even its sender adopts it only from the authenticated
+                                    queue echo, never from a successful publish.
                                 </p>
                                 <p class="caption">
                                     Two-person and many-person sessions use the same forward-secret

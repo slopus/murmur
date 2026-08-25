@@ -108,7 +108,10 @@ export interface PrivateGroupStateClientOptions {
 /** Inputs shared by initial and successor canonical record construction. */
 export interface PrivateGroupRecordContent {
     readonly attributes: Uint8Array;
-    readonly session: Pick<MurmurSession, "id" | "status" | "descriptor" | "members" | "committer">;
+    readonly session: Pick<
+        MurmurSession,
+        "id" | "status" | "descriptor" | "members" | "owner" | "admins" | "policies"
+    >;
     readonly roles: readonly PrivateGroupAccountRole[];
 }
 

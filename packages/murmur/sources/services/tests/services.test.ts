@@ -34,18 +34,22 @@ describe("Murmur services", () => {
             id: new Uint8Array(32).fill(1),
             descriptor: new Uint8Array([2, 3]),
             members: [new Uint8Array(32).fill(4), new Uint8Array(32).fill(5)],
-            committer: new Uint8Array(32).fill(4),
+            owner: new Uint8Array(32).fill(4),
+            admins: [new Uint8Array(32).fill(4)],
+            policies: { adminsAssignAdmins: false, anyoneCanAddMembers: false },
         };
         const descriptor = createMurmurServiceSessionDescriptor(original);
         descriptor.id[0] = 99;
         descriptor.descriptor[0] = 99;
         descriptor.members[0]![0] = 99;
-        descriptor.committer[0] = 99;
+        descriptor.owner[0] = 99;
+        descriptor.admins[0]![0] = 99;
 
         expect(original.id[0]).toBe(1);
         expect(original.descriptor[0]).toBe(2);
         expect(original.members[0]![0]).toBe(4);
-        expect(original.committer[0]).toBe(4);
+        expect(original.owner[0]).toBe(4);
+        expect(original.admins[0]![0]).toBe(4);
         expect(Object.isFrozen(descriptor)).toBe(true);
         expect(Object.isFrozen(descriptor.members)).toBe(true);
     });

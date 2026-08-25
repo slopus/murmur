@@ -75,7 +75,7 @@ Promise<PrivateGroupAcceptedState>` — token-authorized service round
   for parent links and fork detection.
 - `privateGroupMlsStateDigest(content): Uint8Array` — hash of the
   authenticated session snapshot (session ID, descriptor, logical members,
-  committer) that ties a revision to real MLS state.
+  owner, admins, and policies) that ties a revision to real MLS state.
 
 ### Credential authority adapter (`impl/credentialAuthority.ts`)
 

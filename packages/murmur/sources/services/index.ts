@@ -1,4 +1,5 @@
 import type { MurmurSession } from "../sessions/types.js";
+import { equalBytes } from "../utils/index.js";
 import { validateServiceId } from "./impl/serviceId.js";
 import type { MurmurServiceRegistration, MurmurServiceSessionDescriptor } from "./types.js";
 
@@ -37,15 +38,20 @@ export function validateMurmurServiceRegistration(registration: MurmurServiceReg
  * Create the defensive descriptor passed across the service callback boundary.
  */
 export function createMurmurServiceSessionDescriptor(
-    session: Pick<MurmurSession, "id" | "descriptor" | "members" | "committer">,
+    session: Pick<MurmurSession, "id" | "descriptor" | "members" | "owner" | "admins" | "policies">,
 ): MurmurServiceSessionDescriptor {
     if (
         !(session.id instanceof Uint8Array) ||
         session.id.length !== 32 ||
         !(session.descriptor instanceof Uint8Array) ||
         session.descriptor.length > 1024 * 1024 ||
-        !(session.committer instanceof Uint8Array) ||
-        session.committer.length !== 32 ||
+        !(session.owner instanceof Uint8Array) ||
+        session.owner.length !== 32 ||
+        !Array.isArray(session.admins) ||
+        !session.admins.some((admin) => equalBytes(admin, session.owner)) ||
+        session.admins.some((admin) => !(admin instanceof Uint8Array) || admin.length !== 32) ||
+        typeof session.policies?.adminsAssignAdmins !== "boolean" ||
+        typeof session.policies.anyoneCanAddMembers !== "boolean" ||
         !Array.isArray(session.members) ||
         session.members.length < 1 ||
         session.members.length > 256 ||
@@ -57,6 +63,8 @@ export function createMurmurServiceSessionDescriptor(
         id: session.id.slice(),
         descriptor: session.descriptor.slice(),
         members: Object.freeze(session.members.map((member) => member.slice())),
-        committer: session.committer.slice(),
+        owner: session.owner.slice(),
+        admins: Object.freeze(session.admins.map((admin) => admin.slice())),
+        policies: Object.freeze({ ...session.policies }),
     });
 }

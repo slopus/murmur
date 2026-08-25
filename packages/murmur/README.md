@@ -21,14 +21,15 @@ application separately owns its history and effects.
 - a stateful client library with one durable identity per store;
 - end-to-end encrypted with MLS (TreeKEM) for two or more members;
 - built-in mutual-profile contacts plus optional typed services;
+- multi-device: one account links independently keyed devices through a
+  signed roster, and session membership converges automatically;
 - offline-first, with durable outboxes and restart-safe delivery.
 
 **Murmur is not:**
 
 - anonymous: the relay learns sender, recipient, fanout, and timing metadata;
 - server-side history: acknowledged deliveries are gone from the relay;
-- a recovery system: losing the local store loses sessions and contacts;
-- multi-device: one identity has one active receiving device.
+- a recovery system: losing the local store loses sessions and contacts.
 
 ```text
                       out-of-band (QR, deep link, ...)
@@ -58,6 +59,7 @@ application separately owns its history and effects.
 - [Contacts](#contacts)
 - [Build a group messenger](#build-a-group-messenger)
 - [Sessions](#sessions)
+- [Multiple devices](#multiple-devices)
 - [Typed synchronization services](#typed-synchronization-services)
 - [The synchronization loop](#the-synchronization-loop)
 - [Durability, offline use, and idempotency](#durability-offline-use-and-idempotency)
@@ -660,9 +662,10 @@ await alice.addMember(group.id, daveIdentity);
 await alice.removeMember(group.id, carolIdentity);
 ```
 
-The epoch committer applies the change directly. Calls from another member
-create authenticated proposals; the committer lists them with `proposals()` and
-accepts them with `acceptProposals()`.
+Each call persists an asynchronous membership intent and returns before relay
+I/O. During synchronization, any eligible current member can produce the next
+role-authorized Commit. Shared relay event order resolves concurrent Commits,
+and a losing intent retries against the winning epoch.
 
 Relay order is defined per identity inbox, not globally across every member.
 For a basic messenger, local inbox order is enough. If concurrent messages must
@@ -674,8 +677,8 @@ service rather than Murmur.
 
 Everything conversational in Murmur — two-person or group — is one MLS
 session. A session has an opaque `descriptor` (application-defined bytes that
-name what the session is for), a member list of identity keys, and exactly one
-authenticated _committer_ per epoch who serializes membership changes.
+name what the session is for), a member list of account identity keys, one
+immutable owner account, an admin set, and owner-controlled policies.
 
 ### Creating a session
 
@@ -688,14 +691,18 @@ relay queue:
 const session = await alice.createSession({
     descriptor: new TextEncoder().encode("notes/v1"),
     contacts: [bobIdentity, carolIdentity],
+    adminsAssignAdmins: false,
+    anyoneCanAddMembers: false,
     service: "notes", // optional: durably owned by this registered service
 });
-// session.id, session.status, session.members, session.committer
+// session.id, session.status, session.members, session.owner,
+// session.admins, session.policies
 ```
 
-The creator is the initial committer. Publication happens through the durable
-outbox: `createSession` returns once the session and its outbound work are
-persisted, and the sync loop performs the actual relay round trips.
+The creator account is the immutable owner and is always an admin. Both
+policies default to `false`. Publication happens through the durable outbox:
+`createSession` returns once the session and its outbound work are persisted,
+and the sync loop performs the actual relay round trips.
 
 ### Receiving a session
 
@@ -740,44 +747,110 @@ Do not wait for `session.status === "active"` before sending. `send()` also
 works immediately after `createSession()` and while a membership Commit from
 `addMember()` or `removeMember()` is still staged. Murmur encrypts those
 packets with the staged post-Commit epoch, advances that ratchet durably, and
-records the dependency. Once connected, it publishes any required Welcomes,
-then the Commit, then the dependent packets. The whole sequence survives a
-restart and never waits for another member to connect.
+records the dependency. Once connected, it publishes older current-epoch work,
+any required Welcomes, the Commit, and then dependent packets. If another
+Commit wins first, Murmur re-encrypts dependent sends against the winning epoch
+and retries the intent. The whole sequence survives a restart.
 
-### Membership and the committer
+### Membership, roles, and concurrent Commits
 
 ```ts
 await alice.addMember(session.id, daveIdentity);
 await alice.removeMember(session.id, carolIdentity); // 32-byte identity key
+await alice.grantAdmin(session.id, bobIdentity);
+await alice.revokeAdmin(session.id, bobIdentity);
+await alice.setPolicies(session.id, {
+    adminsAssignAdmins: true,
+    anyoneCanAddMembers: false,
+});
+await bob.leave(session.id);
 ```
 
-Each epoch has exactly one committer, recorded in MLS-protected state. When
-the caller is the committer, `addMember`/`removeMember` create the Commit
-directly. Any other member's call becomes an MLS _proposal_ delivered to the
-whole group; the committer reviews and applies proposals:
+These APIs durably record an intent and return before network convergence. The
+owner cannot be removed or demoted. Admins remove other accounts; any non-owner
+may leave. Admins add accounts unless `anyoneCanAddMembers` is enabled. Only the
+owner revokes admins and changes policies; with `adminsAssignAdmins`, an admin
+may also grant admin to a current member.
 
-```ts
-// On the committer:
-const proposals = await alice.proposals(session.id);
-await alice.acceptProposals(
-    session.id,
-    proposals.map((proposal) => proposal.id),
-);
-
-// Hand the role to Bob for future epochs:
-await alice.transferCommitter(session.id, bobIdentity);
-```
-
-Publish success only stages a Commit — even the committer adopts it from its
-own queue echo, so relay order never arbitrates concurrent Commits. If the
-committer's device is lost, application traffic in the current epoch keeps
-working, but membership changes block until the remaining members bootstrap a
-replacement session. Transfer the committer role deliberately in groups whose
-membership must outlive any single device.
+Role state is authenticated inside every Commit and Welcome. Any current
+member may publish a Commit it is authorized to make, and every recipient
+validates it against the prior epoch's roles. For concurrent Commits extending
+one epoch, the first valid shared relay event ID wins everywhere. A publisher
+also adopts only from its queue echo; a loser cancels its staged epoch,
+re-encrypts dependent sends, and retries its durable intent. Concurrent adds of
+one account become a no-op after the first succeeds. A stale add created before
+observing that account's removal becomes a durable issue; explicitly adding
+again after observing removal is permitted.
 
 `abandonSession(id)` destroys a session stuck on a blocked local membership
 operation, and `issues()` lists durable session and publication diagnostics.
 `session(id)` and `sessions({ after, limit })` read local session state.
+
+## Multiple devices
+
+One account can run several devices. The account identity is a signing key
+only: it signs a versioned, replay-protected device roster, and every device
+keeps its own secret key, MLS leaves, ratchets, inbox, and durable store.
+Devices never share encryption state, and the relay never sees the roster or
+which devices belong to which account — roster updates travel only inside
+existing encrypted sessions.
+
+Linking follows the Signal shape, and only one small payload ever travels out
+of band. The new device produces short-lived request bytes (about 750 bytes —
+comfortably one QR code or deep link); an existing device verifies user
+intent, signs the next roster revision, and publishes the encrypted response
+envelope straight to the new device's relay inbox. The envelope is sealed to
+the request's ephemeral key, so the relay carries only opaque bytes with a
+five-minute lifetime:
+
+```ts
+// On the new device: create a five-minute link request and keep syncing.
+const request = await newDevice.linkDevice(); // render as a QR code
+
+// On an existing device: verify intent and authorize. The encrypted
+// envelope is delivered through the relay automatically.
+await existingDevice.authorizeDevice(request);
+
+// The new device completes the link on its next synchronization —
+// no second scan and no manual transport.
+```
+
+`authorizeDevice` also returns the envelope bytes, and `completeDeviceLink`
+accepts them directly, for applications that link devices without any relay
+connectivity. The envelope grows with the roster, so it is not guaranteed to
+fit in a QR code — use a network channel for manual transport.
+
+From that point everything is automatic. Murmur drives MLS Adds and Welcomes
+for the new device in every known contact and service session, and MLS
+Removes after a revocation, without any application involvement. Application
+code keeps seeing accounts: `session.members` and `update.sender` are stable
+account keys, not device keys, so a messenger built on Murmur needs no
+device-awareness at all.
+
+```ts
+// Any active device may inspect and control the roster.
+const devices = await murmur.devices(); // roster entries with status
+await murmur.revokeDevice(otherDeviceKey); // stops delivery and drives MLS Removes
+
+// Lifecycle callbacks in the same sync loop:
+await murmur.sync({
+    onDeviceAdded: (events) => console.log("own device added", events),
+    onDeviceRevoked: (events) => console.log("own device revoked", events),
+    onContactRosterChanged: (events) => console.log("contact devices changed", events),
+});
+```
+
+Peers learn about additions and revocations only from the authenticated,
+account-signed roster carried over their existing sessions, never from an
+unauthenticated server claim. Losing a device store still loses that device's
+state: a replacement links as a fresh device and receives new Welcomes;
+application history transfer stays application-owned.
+
+The repository also contains internal, deliberately unexported groundwork for
+private group state — Ristretto255 credential mathematics, encrypted member
+identifiers, and an opaque group-state service that cannot read its members
+(`packages/murmur/sources/math`, `privateGroups`, `privateGroupState`). It
+requires external cryptographic audit before any production exposure.
 
 ## Typed synchronization services
 
@@ -821,8 +894,8 @@ assigned an owner up front with `createSession({ ..., service: "notes" })`.
 Services are independent; Murmur models no dependencies between services or
 sessions, and future chat is simply another service.
 
-Service-owned sessions use the ordinary session API — `send`, `addMember`,
-`removeMember`, committer transfer — so a service can run two-person and group
+Service-owned sessions use the ordinary session API — `send`, membership
+intents, and role policy controls — so a service can run two-person and group
 sessions alike:
 
 ```ts
@@ -993,9 +1066,14 @@ cursor, republishes pending outboxes, and re-offers any uncommitted batch.
 - **No recovery from the relay.** Acknowledged deliveries are deleted; the
   relay is never history. A lost store means lost sessions — plan real
   backups of the application store.
-- **One device per identity.** Running two live clients against one identity's
-  queue splits the cursor and corrupts delivery; don't share stores or roots
+- **One store per device.** Each linked device owns its own store and inbox.
+  Running two live clients against one device's queue splits the cursor and
+  corrupts delivery; link a second device instead of sharing stores or roots
   between concurrent processes.
+- **Device authorization is roster-signed.** Adding or revoking a device is an
+  account-signed, replay-protected roster mutation distributed over existing
+  encrypted sessions; the relay cannot forge, reorder, or hide one from peers
+  that share a session with the account.
 - **Operational hygiene.** Keys are `Uint8Array`s that Murmur zeroes when
   finished (`close()` zeroes the identity); never log them. Public identities
   are free to create, so a production relay deployment needs its own

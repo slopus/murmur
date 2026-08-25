@@ -118,7 +118,7 @@ export type {
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
-    MurmurSessionProposal,
+    MurmurSessionPolicies,
     MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,

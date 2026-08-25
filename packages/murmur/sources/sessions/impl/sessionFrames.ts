@@ -1,7 +1,5 @@
 import { gcm } from "@noble/ciphers/aes";
 import { randomBytes, type SealedBox } from "../../crypto/index.js";
-import type { MlsKeyPackage } from "../../mls/index.js";
-import { decodeMlsKeyPackage, encodeMlsKeyPackage } from "../../mls/index.js";
 import {
     canonicalJsonBytes,
     concatBytes,
@@ -21,6 +19,105 @@ const MAXIMUM_PROVISIONING_BYTES = 256 * 1024;
 const MAXIMUM_FRAME_BYTES = 70 * 1024 * 1024;
 const COMMIT_DOMAIN = utf8Encode("murmur/session-commit/v1");
 
+/** MLS-protected role state carried by every Commit of a role-managed session. */
+export interface SessionRoles {
+    /** Owner account key; always an admin, never demoted or removed. */
+    readonly owner: Uint8Array;
+    /** Admin account keys, excluding the owner, in canonical base64url order. */
+    readonly admins: readonly Uint8Array[];
+    /** Whether an admin may grant admin to another member. */
+    readonly adminsAssignAdmins: boolean;
+    /** Whether any member may add a new member account. */
+    readonly anyoneCanAddMembers: boolean;
+}
+
+const MAXIMUM_ROLE_ADMINS = 256;
+
+/** Copy role state into a normalized, deduplicated, canonically ordered value. */
+export function normalizeSessionRoles(roles: SessionRoles): SessionRoles {
+    if (roles.owner.length !== 32) throw new Error("Invalid session owner");
+    const owner = encodeBase64Url(roles.owner);
+    const admins = new Map<string, Uint8Array>();
+    for (const admin of roles.admins) {
+        if (admin.length !== 32) throw new Error("Invalid session admin");
+        const encoded = encodeBase64Url(admin);
+        if (encoded !== owner) admins.set(encoded, admin.slice());
+    }
+    if (admins.size > MAXIMUM_ROLE_ADMINS) throw new Error("Session admin set is too large");
+    return {
+        owner: roles.owner.slice(),
+        admins: [...admins.entries()]
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([, value]) => value),
+        adminsAssignAdmins: roles.adminsAssignAdmins,
+        anyoneCanAddMembers: roles.anyoneCanAddMembers,
+    };
+}
+
+function rolesToJson(roles: SessionRoles): Record<string, unknown> {
+    const normalized = normalizeSessionRoles(roles);
+    return {
+        owner: encodeBase64Url(normalized.owner),
+        admins: normalized.admins.map((admin) => encodeBase64Url(admin)),
+        adminsAssignAdmins: normalized.adminsAssignAdmins,
+        anyoneCanAddMembers: normalized.anyoneCanAddMembers,
+    };
+}
+
+function rolesFromJson(value: unknown, name: string): SessionRoles {
+    const input = object(value, name);
+    exact(input, ["owner", "admins", "adminsAssignAdmins", "anyoneCanAddMembers"], name);
+    if (
+        !Array.isArray(input.admins) ||
+        input.admins.length > MAXIMUM_ROLE_ADMINS ||
+        typeof input.adminsAssignAdmins !== "boolean" ||
+        typeof input.anyoneCanAddMembers !== "boolean"
+    ) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const owner = bytes(input.owner, 32, name);
+    const admins = input.admins.map((admin) => bytes(admin, 32, name));
+    if (owner.length !== 32 || admins.some((admin) => admin.length !== 32)) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const encoded = admins.map((admin) => encodeBase64Url(admin));
+    const canonical = [...new Set(encoded)].sort((left, right) => left.localeCompare(right));
+    if (
+        encoded.length !== canonical.length ||
+        encoded.some((value2, index) => value2 !== canonical[index]) ||
+        encoded.includes(encodeBase64Url(owner))
+    ) {
+        throw new Error(`Invalid ${name}`);
+    }
+    return {
+        owner,
+        admins,
+        adminsAssignAdmins: input.adminsAssignAdmins,
+        anyoneCanAddMembers: input.anyoneCanAddMembers,
+    };
+}
+
+/** Encode normalized role state for durable session records. */
+export function encodeSessionRoles(roles: SessionRoles): Uint8Array {
+    return canonicalJsonBytes(rolesToJson(roles) as never);
+}
+
+/** Decode normalized role state from one durable session record. */
+export function decodeSessionRoles(value: Uint8Array): SessionRoles {
+    return rolesFromJson(parseJson(value, "session roles"), "session roles");
+}
+
+/** Structural equality over normalized role state. */
+export function sessionRolesEqual(left: SessionRoles, right: SessionRoles): boolean {
+    return (
+        equalBytes(left.owner, right.owner) &&
+        left.admins.length === right.admins.length &&
+        left.admins.every((admin, index) => equalBytes(admin, right.admins[index]!)) &&
+        left.adminsAssignAdmins === right.adminsAssignAdmins &&
+        left.anyoneCanAddMembers === right.anyoneCanAddMembers
+    );
+}
+
 export interface BootstrapFrame {
     readonly version: 1;
     readonly inviter: Uint8Array;
@@ -31,42 +128,25 @@ export interface BootstrapFrame {
     readonly confirmationTag: Uint8Array;
     readonly commit: Uint8Array;
     readonly keyPackageReference: Uint8Array;
-    readonly committer: Uint8Array;
+    readonly roles: SessionRoles;
 }
 
 export type PrivateSessionFrame =
     | { readonly version: 1; readonly type: "application"; readonly bytes: Uint8Array }
+    | { readonly version: 1; readonly type: "leave" }
     | {
           readonly version: 1;
           readonly type: "account_roster";
           readonly roster: Uint8Array;
           readonly keyPackage?: Uint8Array;
-      }
-    | {
-          readonly version: 1;
-          readonly type: "proposal_add";
-          readonly keyPackage: MlsKeyPackage;
-      }
-    | {
-          readonly version: 1;
-          readonly type: "proposal_remove";
-          readonly identity: Uint8Array;
       };
-
-export interface StoredSessionProposal {
-    readonly proposer: Uint8Array;
-    readonly frame: Extract<
-        PrivateSessionFrame,
-        { readonly type: "proposal_add" | "proposal_remove" }
-    >;
-}
 
 export interface CommitFrame {
     readonly version: 1;
     readonly groupId: Uint8Array;
     readonly epoch: bigint;
     readonly commit: Uint8Array;
-    readonly nextCommitter: Uint8Array;
+    readonly roles: SessionRoles;
 }
 
 export type SessionCiphertext =
@@ -161,17 +241,15 @@ function commitAad(groupId: Uint8Array, epoch: bigint): Uint8Array {
 }
 
 export function sealCommitCiphertext(key: Uint8Array, frame: CommitFrame): Uint8Array {
-    if (key.length !== 32 || frame.nextCommitter.length !== 32) {
-        throw new Error("Invalid Commit frame key or committer");
-    }
+    if (key.length !== 32) throw new Error("Invalid Commit frame key");
     const nonce = randomBytes(12);
     const plaintext = canonicalJsonBytes({
         version: 1,
         groupId: encodeBase64Url(frame.groupId),
         epoch: frame.epoch.toString(),
         commit: encodeBase64Url(frame.commit),
-        nextCommitter: encodeBase64Url(frame.nextCommitter),
-    });
+        roles: rolesToJson(frame.roles),
+    } as never);
     try {
         const ciphertext = gcm(key, nonce, commitAad(frame.groupId, frame.epoch)).encrypt(
             plaintext,
@@ -249,7 +327,7 @@ export function openCommitCiphertext(
     );
     try {
         const input = parseJson(plaintext, "Commit frame");
-        exact(input, ["version", "groupId", "epoch", "commit", "nextCommitter"], "Commit frame");
+        exact(input, ["version", "groupId", "epoch", "commit", "roles"], "Commit frame");
         if (
             input.version !== 1 ||
             typeof input.epoch !== "string" ||
@@ -262,7 +340,7 @@ export function openCommitCiphertext(
             groupId: bytes(input.groupId, 255, "Commit group ID"),
             epoch: BigInt(input.epoch),
             commit: bytes(input.commit, 64 * 1024 * 1024, "Commit"),
-            nextCommitter: bytes(input.nextCommitter, 32, "next committer"),
+            roles: rolesFromJson(input.roles, "Commit roles"),
         };
         if (!equalBytes(frame.groupId, wire.groupId) || frame.epoch !== wire.epoch) {
             throw new Error("Commit frame header mismatch");
@@ -284,8 +362,8 @@ export function encodeBootstrapFrame(frame: BootstrapFrame): Uint8Array {
         confirmationTag: encodeBase64Url(frame.confirmationTag),
         commit: encodeBase64Url(frame.commit),
         keyPackageReference: encodeBase64Url(frame.keyPackageReference),
-        committer: encodeBase64Url(frame.committer),
-    });
+        roles: rolesToJson(frame.roles),
+    } as never);
 }
 
 export function decodeBootstrapFrame(value: Uint8Array): BootstrapFrame {
@@ -302,7 +380,7 @@ export function decodeBootstrapFrame(value: Uint8Array): BootstrapFrame {
             "confirmationTag",
             "commit",
             "keyPackageReference",
-            "committer",
+            "roles",
         ],
         "bootstrap frame",
     );
@@ -317,26 +395,27 @@ export function decodeBootstrapFrame(value: Uint8Array): BootstrapFrame {
         confirmationTag: bytes(input.confirmationTag, 32, "Commit confirmation tag"),
         commit: bytes(input.commit, 64 * 1024 * 1024, "bootstrap Commit"),
         keyPackageReference: bytes(input.keyPackageReference, 32, "KeyPackage reference"),
-        committer: bytes(input.committer, 32, "bootstrap committer"),
+        roles: rolesFromJson(input.roles, "bootstrap roles"),
     };
 }
 
-export function encodeCommitterControl(nextCommitter: Uint8Array): Uint8Array {
-    if (nextCommitter.length !== 32) throw new Error("Invalid next committer");
+/** Encode role state as the Commit's authenticated-data control. */
+export function encodeRolesControl(roles: SessionRoles): Uint8Array {
     return canonicalJsonBytes({
-        version: 1,
-        type: "committer",
-        nextCommitter: encodeBase64Url(nextCommitter),
-    });
+        version: 2,
+        type: "roles",
+        roles: rolesToJson(roles),
+    } as never);
 }
 
-export function decodeCommitterControl(value: Uint8Array): Uint8Array {
-    const input = parseJson(value, "committer control");
-    exact(input, ["version", "type", "nextCommitter"], "committer control");
-    if (input.version !== 1 || input.type !== "committer") {
-        throw new Error("Invalid committer control");
+/** Decode role state from one Commit's authenticated-data control. */
+export function decodeSessionControl(value: Uint8Array): SessionRoles {
+    const input = parseJson(value, "session control");
+    if (input.version === 2 && input.type === "roles") {
+        exact(input, ["version", "type", "roles"], "roles control");
+        return rolesFromJson(input.roles, "roles control");
     }
-    return bytes(input.nextCommitter, 32, "next committer");
+    throw new Error("Invalid session control");
 }
 
 export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
@@ -347,13 +426,6 @@ export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
             bytes: encodeBase64Url(frame.bytes),
         });
     }
-    if (frame.type === "proposal_add") {
-        return canonicalJsonBytes({
-            version: 1,
-            type: frame.type,
-            keyPackage: encodeBase64Url(encodeMlsKeyPackage(frame.keyPackage)),
-        });
-    }
     if (frame.type === "account_roster") {
         return canonicalJsonBytes({
             version: 1,
@@ -362,11 +434,10 @@ export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
             keyPackage: frame.keyPackage === undefined ? null : encodeBase64Url(frame.keyPackage),
         });
     }
-    return canonicalJsonBytes({
-        version: 1,
-        type: frame.type,
-        identity: encodeBase64Url(frame.identity),
-    });
+    if (frame.type === "leave") {
+        return canonicalJsonBytes({ version: 1, type: frame.type });
+    }
+    throw new Error("Unsupported private session frame");
 }
 
 export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
@@ -380,22 +451,6 @@ export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
             version: 1,
             type: "application",
             bytes: bytes(input.bytes, 1024 * 1024, "application bytes"),
-        };
-    }
-    if (input.type === "proposal_add") {
-        exact(input, ["version", "type", "keyPackage"], "Add proposal");
-        return {
-            version: 1,
-            type: "proposal_add",
-            keyPackage: decodeMlsKeyPackage(bytes(input.keyPackage, 1024 * 1024, "KeyPackage")),
-        };
-    }
-    if (input.type === "proposal_remove") {
-        exact(input, ["version", "type", "identity"], "Remove proposal");
-        return {
-            version: 1,
-            type: "proposal_remove",
-            identity: bytes(input.identity, 32, "removed identity"),
         };
     }
     if (input.type === "account_roster") {
@@ -414,27 +469,9 @@ export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
                   }),
         };
     }
-    throw new Error("Unsupported private session frame");
-}
-
-export function encodeStoredProposal(value: StoredSessionProposal): Uint8Array {
-    return canonicalJsonBytes({
-        version: 1,
-        proposer: encodeBase64Url(value.proposer),
-        frame: encodeBase64Url(encodePrivateFrame(value.frame)),
-    });
-}
-
-export function decodeStoredProposal(value: Uint8Array): StoredSessionProposal {
-    const input = parseJson(value, "stored proposal");
-    exact(input, ["version", "proposer", "frame"], "stored proposal");
-    if (input.version !== 1) throw new Error("Invalid stored proposal");
-    const frame = decodePrivateFrame(bytes(input.frame, 1024 * 1024, "stored proposal frame"));
-    if (frame.type === "application" || frame.type === "account_roster") {
-        throw new Error("Invalid stored proposal");
+    if (input.type === "leave") {
+        exact(input, ["version", "type"], "leave control");
+        return { version: 1, type: "leave" };
     }
-    return {
-        proposer: bytes(input.proposer, 32, "proposal sender"),
-        frame,
-    };
+    throw new Error("Unsupported private session frame");
 }

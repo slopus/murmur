@@ -1,11 +1,14 @@
 import type { MurmurUpdate } from "../sessions/types.js";
+import type { MurmurSessionPolicies } from "../sessions/types.js";
 
 /** Immutable-by-convention view offered to services for one newly observed session. */
 export interface MurmurServiceSessionDescriptor {
     readonly id: Uint8Array;
     readonly descriptor: Uint8Array;
     readonly members: readonly Uint8Array[];
-    readonly committer: Uint8Array;
+    readonly owner: Uint8Array;
+    readonly admins: readonly Uint8Array[];
+    readonly policies: MurmurSessionPolicies;
 }
 
 /**

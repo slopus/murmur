@@ -111,7 +111,7 @@ import type {
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
-    MurmurSessionProposal,
+    MurmurSessionPolicies,
     MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
@@ -125,7 +125,7 @@ export type {
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
-    MurmurSessionProposal,
+    MurmurSessionPolicies,
     MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
@@ -970,6 +970,12 @@ export class MurmurClient {
                     return await this.#engine.create(
                         {
                             descriptor: options.descriptor,
+                            ...(options.adminsAssignAdmins === undefined
+                                ? {}
+                                : { adminsAssignAdmins: options.adminsAssignAdmins }),
+                            ...(options.anyoneCanAddMembers === undefined
+                                ? {}
+                                : { anyoneCanAddMembers: options.anyoneCanAddMembers }),
                             members: selections.map((selection) => ({
                                 identity: selection.identity,
                                 keyPackage: decodeMlsKeyPackage(selection.keyPackage),
@@ -997,6 +1003,12 @@ export class MurmurClient {
             return this.#engine.create(
                 {
                     descriptor: options.descriptor,
+                    ...(options.adminsAssignAdmins === undefined
+                        ? {}
+                        : { adminsAssignAdmins: options.adminsAssignAdmins }),
+                    ...(options.anyoneCanAddMembers === undefined
+                        ? {}
+                        : { anyoneCanAddMembers: options.anyoneCanAddMembers }),
                     members: options.members,
                 },
                 owner,
@@ -1068,22 +1080,33 @@ export class MurmurClient {
         this.#signalSync();
     }
 
+    /** Durably request removal of one non-owner account and return before convergence. */
     async removeMember(id: Uint8Array, identity: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.remove(id, identity));
         this.#signalSync();
     }
 
-    async transferCommitter(id: Uint8Array, identity: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.transferCommitter(id, identity));
+    /** Durably request an admin grant and return before its Commit is published. */
+    async grantAdmin(id: Uint8Array, account: Uint8Array): Promise<void> {
+        await this.#exclusive(() => this.#engine.grantAdmin(id, account));
         this.#signalSync();
     }
 
-    async proposals(id: Uint8Array): Promise<readonly MurmurSessionProposal[]> {
-        return this.#tracked(() => this.#engine.proposals(id));
+    /** Durably request an owner-authorized admin revocation. */
+    async revokeAdmin(id: Uint8Array, account: Uint8Array): Promise<void> {
+        await this.#exclusive(() => this.#engine.revokeAdmin(id, account));
+        this.#signalSync();
     }
 
-    async acceptProposals(id: Uint8Array, proposalIds: readonly string[]): Promise<void> {
-        await this.#exclusive(() => this.#engine.acceptProposals(id, proposalIds));
+    /** Durably request owner-controlled policy changes. */
+    async setPolicies(id: Uint8Array, policies: MurmurSessionPolicies): Promise<void> {
+        await this.#exclusive(() => this.#engine.setPolicies(id, policies));
+        this.#signalSync();
+    }
+
+    /** Durably request removal of every local-account device from one session. */
+    async leave(id: Uint8Array): Promise<void> {
+        await this.#exclusive(() => this.#engine.leave(id));
         this.#signalSync();
     }
 
@@ -1575,7 +1598,8 @@ export class MurmurClient {
         for (const route of prepared.routes) {
             zeroBytes(route.session.id);
             zeroBytes(route.session.descriptor);
-            zeroBytes(route.session.committer);
+            zeroBytes(route.session.owner);
+            for (const admin of route.session.admins) zeroBytes(admin);
             for (const member of route.session.members) zeroBytes(member);
         }
         for (const update of prepared.updates) {

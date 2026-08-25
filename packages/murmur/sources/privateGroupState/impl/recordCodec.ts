@@ -124,6 +124,7 @@ export function privateGroupMlsStateDigest(content: PrivateGroupRecordContent): 
     if (new Set(members).size !== members.length) {
         throw new Error("MLS logical account roster contains a duplicate");
     }
+    const admins = content.session.admins.map(encodeBase64Url).sort();
     return sha256(
         canonicalJsonBytes({
             domain: "murmur.private-group-state.mls-binding.v1",
@@ -131,7 +132,12 @@ export function privateGroupMlsStateDigest(content: PrivateGroupRecordContent): 
             status: content.session.status,
             descriptor: encodeBase64Url(content.session.descriptor),
             members,
-            committer: encodeBase64Url(content.session.committer),
+            owner: encodeBase64Url(content.session.owner),
+            admins,
+            policies: {
+                adminsAssignAdmins: content.session.policies.adminsAssignAdmins,
+                anyoneCanAddMembers: content.session.policies.anyoneCanAddMembers,
+            },
         }),
     );
 }

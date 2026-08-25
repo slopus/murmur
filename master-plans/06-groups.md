@@ -25,19 +25,31 @@ every current epoch device member, including the publisher. The legacy relay
 publishes one ciphertext atomically to every recipient queue with one UUIDv7
 event ID. A negotiated relay durably accepts one fanout manifest and completes
 idempotent per-device insertion in event order, retrying failures without a
-cross-endpoint transaction. Event IDs are monotonic within each inbox; the
-session never assumes ordering across different inboxes or simultaneous fanout
-completion.
+cross-endpoint transaction. Event IDs are monotonic within each inbox, and the
+session never assumes simultaneous fanout completion. Because one multicast
+carries one event ID everywhere, the relative event-ID order of two multicasts
+is identical in every inbox that holds both; that is the only cross-inbox
+ordering property the session relies on, and it is what lets relay order
+arbitrate concurrent Commits.
 
-Each epoch has exactly one authenticated committer recorded in MLS-protected
-session state. Only that member may publish a Commit for the epoch. Other
-members publish MLS Proposals, and the committer serializes accepted proposals
-into Commits. A Commit may transfer the committer role for the next epoch.
-Publish success only stages a Commit; every member, including the committer,
-adopts it from its own relay echo. Relay order never arbitrates concurrent
-Commits. Losing the current committer can block membership changes until local
-state is restored or the remaining members bootstrap a replacement session;
-application traffic in the current epoch remains usable.
+Any current member may publish a Commit. Concurrent Commits against one epoch
+are resolved by relay arbitration: each atomic multicast carries one UUIDv7
+event ID shared by every recipient inbox, every inbox delivers in event-ID
+order, and therefore the first valid Commit for an epoch wins identically at
+every member. Publish success only stages a Commit; every member, including its
+sender, adopts a Commit from its own relay echo. A member whose staged Commit
+loses discards the staged epoch, re-encrypts any dependent staged-epoch
+application sends against the winning epoch, and retries the underlying durable
+membership intent, including a fresh Welcome for an affected joiner. A joiner
+whose pending session came from a losing Commit accepts a replacement bootstrap
+for the same session while it is still pending. Members retain a bounded
+prior-epoch window so application messages racing a Commit remain decryptable.
+Commit authorization is role-based and validated by every member; roles and the
+asynchronous membership-intent flow are dictated by
+[`10-group-roles.md`](10-group-roles.md). This change ships without backward
+compatibility: every session is role-managed, the single-committer flow and its
+serialized-proposal machinery are removed rather than retained, and old session
+records and Commit wire frames are not decoded or migrated.
 
 The public API never uses relay connectivity, peer presence, session creation,
 pending local activation, or a staged membership Commit as permission to send.
@@ -128,10 +140,13 @@ new Welcomes as fresh device state.
 - Every current epoch device member, including the publisher, receives each
   ongoing MLS delivery with the same UUIDv7 event ID. Legacy publication is
   atomic; negotiated publication durably retries ordered idempotent target
-  insertion. Ordering is guaranteed only within an individual inbox.
-- Exactly one authenticated epoch committer serializes MLS Proposals into
-  Commits. Publish success only stages a Commit, and relay order never resolves
-  Commit conflicts.
+  insertion. Ordering is guaranteed within an individual inbox, plus the
+  consistent relative order of two shared event IDs across inboxes.
+- Any member may publish a Commit, membership-changing Commits are validated
+  against the session's roles by every member, and shared per-multicast UUIDv7
+  event IDs make relay delivery order resolve concurrent Commits for one epoch
+  identically everywhere. A losing staged Commit is cancelled and retried from
+  its durable membership intent without losing staged application sends.
 - No session lifecycle or synchronization state blocks an application send.
   Sends during creation, pending local activation, or a staged membership
   change encrypt and persist immediately; staged-epoch sends publish after

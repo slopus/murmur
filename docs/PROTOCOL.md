@@ -52,9 +52,14 @@ manifest. Before publishing any Welcome, Murmur validates the Commit, local
 staged state, every child record, and every secondary index.
 
 Successful Welcome publications leave durable markers. The Commit publishes
-only after all markers are present and all current-epoch application/proposal
+only after all markers are present and all older current-epoch application
 outboxes have settled. The sender adopts the Commit only from its own identity
 queue echo; a publish response never advances the epoch.
+
+A pending session may replace its bootstrap only with a newer relay event whose
+Commit extends at least the pending session's base epoch and names the same
+owner. This permits a fresh Welcome after a losing Add race while rejecting a
+later-delivered sibling Welcome from another Commit against the old epoch.
 
 A valid received Welcome creates a bounded `pending` session. MLS protocol
 traffic continues while pending. A built-in contact descriptor keeps its
@@ -135,10 +140,22 @@ Two-member and many-member sessions use the same RFC 9420 profile:
 - X25519, HKDF-SHA-256, AES-128-GCM, and Ed25519;
 - BasicCredential bound to the Murmur identity key;
 - TreeKEM Adds, Removes, Welcome, Commit, and PrivateMessage;
-- one explicit epoch committer serialized through MLS authenticated data.
+- one MLS-authenticated role state containing an immutable owner, admins, and
+  membership policies.
 
-Non-committers send authenticated Add or Remove proposals. The committer lists
-them with proposer identity and explicitly accepts a bounded selection.
+Membership and role API calls persist bounded local intents. Any current member
+may publish a Commit that the prior epoch's role state authorizes. The owner is
+always an admin and cannot be removed or demoted. Admins remove other accounts;
+non-owner accounts may leave; adding requires an admin unless the
+`anyoneCanAddMembers` policy is enabled. Only the owner revokes admins or
+changes policies, while `adminsAssignAdmins` permits admins to grant admin.
+
+An atomic Commit multicast receives one UUIDv7 event ID shared by every current
+member inbox. Each recipient accepts the first valid Commit for its current
+epoch and treats later siblings as stale. A member whose staged Commit loses
+re-encrypts dependent sends against the winning epoch and retries its durable
+intent. Add intents snapshot a per-account removal generation, preventing a
+stale intent from silently re-admitting a recently removed account.
 
 Application sends clone and persist the post-ratchet epoch plus exact outbox
 before publication. Commit preparation persists active and staged epochs

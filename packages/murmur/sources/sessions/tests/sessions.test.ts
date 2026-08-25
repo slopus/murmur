@@ -17,6 +17,7 @@ import {
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
 import { MurmurClient, type MurmurSessionLimits, type MurmurUpdate } from "../index.js";
+import { decodeSessionRecord, encodeSessionRecord } from "../impl/sessionRecords.js";
 
 const NOW = 1_700_000_000_000;
 
@@ -546,7 +547,7 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("adds and removes members through the authenticated epoch committer", async () => {
+    test("adds members asynchronously and enforces admin removal", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
         const bob = await client(relay);
@@ -562,6 +563,7 @@ describe("stateful MLS sessions", () => {
 
             await alice.addMember(session.id, await carol.discovery());
             await alice.synchronize();
+            await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize();
             await carol.synchronize();
             expect((await alice.session(session.id))?.members).toHaveLength(3);
@@ -579,28 +581,51 @@ describe("stateful MLS sessions", () => {
             });
             expect(carolEvents).toEqual(["from bob"]);
 
+            await expect(bob.removeMember(session.id, carol.identity)).rejects.toThrow(
+                "Only an admin",
+            );
+            await alice.grantAdmin(session.id, bob.identity);
+            await alice.synchronize();
+            await bob.synchronize();
+            expect((await bob.session(session.id))?.admins).toContainEqual(bob.identity);
+
+            await expect(bob.grantAdmin(session.id, carol.identity)).rejects.toThrow(
+                "may not grant admin",
+            );
+            await alice.setPolicies(session.id, {
+                adminsAssignAdmins: true,
+                anyoneCanAddMembers: false,
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+
+            await bob.grantAdmin(session.id, carol.identity);
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect((await alice.session(session.id))?.admins).toContainEqual(carol.identity);
+            await expect(bob.revokeAdmin(session.id, carol.identity)).rejects.toThrow(
+                "Only the session owner",
+            );
+            await alice.revokeAdmin(session.id, carol.identity);
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect((await bob.session(session.id))?.admins).not.toContainEqual(carol.identity);
+
             await bob.removeMember(session.id, carol.identity);
             await bob.synchronize();
-            await alice.synchronize();
-            const proposals = await alice.proposals(session.id);
-            expect(proposals).toHaveLength(1);
-            expect(proposals[0]?.proposer).toEqual(bob.identity);
-            await alice.acceptProposals(
-                session.id,
-                proposals.map((proposal) => proposal.id),
-            );
             await alice.synchronize();
             await bob.synchronize();
             await carol.synchronize();
             expect((await alice.session(session.id))?.members).toHaveLength(2);
             expect((await bob.session(session.id))?.members).toHaveLength(2);
             expect(await carol.session(session.id)).toBeUndefined();
-
-            await alice.transferCommitter(session.id, bob.identity);
-            await alice.synchronize();
-            await bob.synchronize();
-            expect((await alice.session(session.id))?.committer).toEqual(bob.identity);
-            expect((await bob.session(session.id))?.committer).toEqual(bob.identity);
+            expect((await alice.session(session.id))?.owner).toEqual(alice.identity);
         } finally {
             alice.close();
             bob.close();
@@ -609,7 +634,384 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("queues a post-add message offline and relays it only after Welcome and Commit", async () => {
+    test("rejects an unauthorized membership Commit on every honest member", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bobStore = new MemoryMurmurStore();
+        const bob = await client(relay, bobStore);
+        const carol = await client(relay);
+        const dave = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("unauthorized add"),
+                members: [await bob.discovery(), await carol.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+            await activate(carol, session.id);
+
+            // Model a compromised client that lies to its own local authorization check.
+            const stateKey = `murmur/session-states/${encodeBase64Url(session.id)}`;
+            const state = (await bobStore.get(stateKey))!;
+            const record = decodeSessionRecord(state);
+            try {
+                await bobStore.set(
+                    stateKey,
+                    encodeSessionRecord({
+                        ...record,
+                        roles: { ...record.roles, anyoneCanAddMembers: true },
+                    }),
+                );
+            } finally {
+                zeroBytes(record.epoch);
+                if (record.previousEpoch !== undefined) zeroBytes(record.previousEpoch);
+                zeroBytes(state);
+            }
+
+            await bob.addMember(session.id, await dave.discovery());
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+
+            expect(await alice.session(session.id)).toMatchObject({
+                members: expect.arrayContaining([alice.identity, bob.identity, carol.identity]),
+                policies: {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: false,
+                },
+            });
+            expect((await alice.session(session.id))?.members).toHaveLength(3);
+            expect((await carol.session(session.id))?.members).toHaveLength(3);
+            for (const member of [alice, carol]) {
+                expect(await member.issues()).toEqual(
+                    expect.arrayContaining([
+                        expect.objectContaining({ code: "unauthorized_commit" }),
+                    ]),
+                );
+            }
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            dave.close();
+            await relay.close();
+        }
+    });
+
+    test("allows a non-owner member to leave asynchronously", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bob = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("leave"),
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+
+            await bob.leave(session.id);
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+
+            expect((await alice.session(session.id))?.members).toEqual([alice.identity]);
+            expect(await bob.session(session.id)).toBeUndefined();
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
+    test("arbitrates concurrent Commits and rebases a losing staged send", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        let blockBobCommit = false;
+        const bobTransport: DeliveryTransport = {
+            publish: async (delivery, signal) => {
+                if (blockBobCommit && delivery.ciphertext[0] === 3) {
+                    throw new DeliveryTransportError(429, "commit_blocked");
+                }
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+        };
+        const alice = await client(relay);
+        const bob = await MurmurClient.open({
+            transport: bobTransport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        const carol = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("concurrent commits"),
+                members: [await bob.discovery(), await carol.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+            await activate(carol, session.id);
+
+            await alice.grantAdmin(session.id, bob.identity);
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+
+            blockBobCommit = true;
+            await bob.removeMember(session.id, carol.identity);
+            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                transientPublicationFailures: 1,
+            });
+            await bob.send(session.id, utf8Encode("survives losing commit"));
+
+            await alice.setPolicies(session.id, {
+                adminsAssignAdmins: false,
+                anyoneCanAddMembers: true,
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+
+            blockBobCommit = false;
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+
+            const received: string[] = [];
+            await consume(alice, async (update) => {
+                received.push(utf8Decode(update.bytes));
+            });
+            expect(received).toEqual(["survives losing commit"]);
+            expect(await alice.session(session.id)).toMatchObject({
+                members: expect.arrayContaining([alice.identity, bob.identity]),
+                policies: {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                },
+            });
+            expect((await alice.session(session.id))?.members).toHaveLength(2);
+            expect((await bob.session(session.id))?.members).toHaveLength(2);
+            expect(await carol.session(session.id)).toBeUndefined();
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            await relay.close();
+        }
+    });
+
+    test("fails a stale add generation and permits a deliberate re-add", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bob = await client(relay);
+        const carol = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("removal generation"),
+                members: [await bob.discovery(), await carol.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+            await activate(carol, session.id);
+
+            await alice.grantAdmin(session.id, bob.identity);
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+
+            await bob.removeMember(session.id, carol.identity);
+            await bob.synchronize({ waitMilliseconds: 0 });
+
+            // Alice has not observed Bob's removal yet, so this snapshots the old generation.
+            await alice.addMember(session.id, await carol.discovery());
+            await alice.synchronize({ waitMilliseconds: 0 });
+            expect((await alice.session(session.id))?.members).toHaveLength(2);
+            expect(await alice.issues()).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        code: "add_intent_removal_generation_advanced",
+                        sessionId: session.id,
+                    }),
+                ]),
+            );
+
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect(await carol.session(session.id)).toBeUndefined();
+
+            await alice.addMember(session.id, await carol.discovery());
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            await activate(carol, session.id);
+
+            expect((await alice.session(session.id))?.members).toHaveLength(3);
+            expect((await bob.session(session.id))?.members).toHaveLength(3);
+            expect((await carol.session(session.id))?.members).toHaveLength(3);
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            await relay.close();
+        }
+    });
+
+    test("replaces a pending Welcome after its Add Commit loses", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        let blockBobCommit = false;
+        const bobTransport: DeliveryTransport = {
+            publish: async (delivery, signal) => {
+                if (blockBobCommit && delivery.ciphertext[0] === 3) {
+                    throw new DeliveryTransportError(429, "commit_blocked");
+                }
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+        };
+        const alice = await client(relay);
+        const bob = await MurmurClient.open({
+            transport: bobTransport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        const carol = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("replacement welcome"),
+                anyoneCanAddMembers: true,
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+
+            blockBobCommit = true;
+            await bob.addMember(session.id, await carol.discovery());
+            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                transientPublicationFailures: 1,
+            });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect(await carol.session(session.id)).toMatchObject({
+                status: "pending",
+                policies: {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                },
+            });
+
+            await alice.setPolicies(session.id, {
+                adminsAssignAdmins: true,
+                anyoneCanAddMembers: true,
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+
+            blockBobCommit = false;
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect(await carol.session(session.id)).toMatchObject({
+                status: "pending",
+                policies: {
+                    adminsAssignAdmins: true,
+                    anyoneCanAddMembers: true,
+                },
+            });
+
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await activate(carol, session.id);
+            expect((await alice.session(session.id))?.members).toHaveLength(3);
+            expect((await bob.session(session.id))?.members).toHaveLength(3);
+            expect((await carol.session(session.id))?.members).toHaveLength(3);
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            await relay.close();
+        }
+    });
+
+    test("converges concurrent adds of one account to one membership", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        let blockBobAdd = false;
+        const bobTransport: DeliveryTransport = {
+            publish: async (delivery, signal) => {
+                if (blockBobAdd && (delivery.ciphertext[0] === 1 || delivery.ciphertext[0] === 3)) {
+                    throw new DeliveryTransportError(429, "add_blocked");
+                }
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+        };
+        const alice = await client(relay);
+        const bob = await MurmurClient.open({
+            transport: bobTransport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        const carol = await client(relay);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("same account add"),
+                anyoneCanAddMembers: true,
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await activate(bob, session.id);
+
+            blockBobAdd = true;
+            await bob.addMember(session.id, await carol.discovery());
+            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                transientPublicationFailures: 1,
+            });
+
+            await alice.addMember(session.id, await carol.discovery());
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect((await carol.session(session.id))?.members).toHaveLength(3);
+
+            blockBobAdd = false;
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await activate(carol, session.id);
+
+            expect((await alice.session(session.id))?.members).toHaveLength(3);
+            expect((await bob.session(session.id))?.members).toHaveLength(3);
+            expect((await carol.session(session.id))?.members).toHaveLength(3);
+        } finally {
+            alice.close();
+            bob.close();
+            carol.close();
+            await relay.close();
+        }
+    });
+
+    test("sends on the current epoch before an asynchronous add converges", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const published: SignedDelivery[] = [];
         const base = new HttpDeliveryTransport("https://relay.test", {
@@ -646,22 +1048,19 @@ describe("stateful MLS sessions", () => {
 
             expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
-                pendingOutboxes: 0,
+                pendingOutboxes: 1,
             });
-            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2]);
-            expect(published[2]?.id).toBe(messageId);
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([2, 1, 3]);
+            expect(published[0]?.id).toBe(messageId);
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
             ).toEqual([
+                [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
                 [encodeBase64Url(carol.identity)],
                 [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
-                [
-                    encodeBase64Url(alice.identity),
-                    encodeBase64Url(bob.identity),
-                    encodeBase64Url(carol.identity),
-                ].sort(),
             ]);
 
+            await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
             const bobReceived: string[] = [];
@@ -673,7 +1072,7 @@ describe("stateful MLS sessions", () => {
                 carolReceived.push(utf8Decode(update.bytes));
             });
             expect(bobReceived).toEqual(["welcome carol"]);
-            expect(carolReceived).toEqual(["welcome carol"]);
+            expect(carolReceived).toEqual([]);
         } finally {
             alice.close();
             bob.close();
@@ -1031,6 +1430,7 @@ describe("stateful MLS sessions", () => {
 
             await alice.addMember(session.id, await carol.discovery());
             await alice.synchronize();
+            await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize();
             await carol.synchronize();
             expect((await alice.session(session.id))?.members).toHaveLength(3);
@@ -1128,121 +1528,6 @@ describe("stateful MLS sessions", () => {
             expect(await alice.session(session.id)).toBeUndefined();
             await bob.synchronize();
             expect(await bob.session(session.id)).toBeUndefined();
-        } finally {
-            alice.close();
-            bob.close();
-            await relay.close();
-        }
-    });
-
-    test("reconciles a no-add Commit whose publication index is missing", async () => {
-        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
-        const aliceStore = new MemoryMurmurStore();
-        const alice = await client(relay, aliceStore);
-        const bob = await client(relay);
-        try {
-            const session = await alice.createSession({
-                descriptor: utf8Encode("missing Commit order"),
-                members: [await bob.discovery()],
-            });
-            await alice.synchronize();
-            await bob.synchronize();
-            await activate(bob, session.id);
-
-            await alice.transferCommitter(session.id, bob.identity);
-            const outboxes = await aliceStore.scan("murmur/session-outbox/", {
-                limit: 10,
-            });
-            let commitOrderKey: string | undefined;
-            for (const [key, bytes] of outboxes) {
-                try {
-                    const value = JSON.parse(utf8Decode(bytes)) as {
-                        readonly kind?: unknown;
-                        readonly order?: unknown;
-                    };
-                    if (value.kind === "commit" && typeof value.order === "string") {
-                        commitOrderKey = `murmur/session-outbox-order/${value.order}/${key.slice(
-                            "murmur/session-outbox/".length,
-                        )}`;
-                    }
-                } finally {
-                    zeroBytes(bytes);
-                }
-            }
-            expect(commitOrderKey).toEqual(expect.any(String));
-            await aliceStore.delete(commitOrderKey!);
-
-            expect(await alice.synchronize()).toMatchObject({
-                published: 0,
-                pendingOutboxes: 0,
-                terminalPublicationFailures: 1,
-                issues: [{ code: "corrupt_membership_operation", sessionId: session.id }],
-            });
-            expect(await alice.session(session.id)).toMatchObject({
-                status: "active",
-                committer: alice.identity,
-            });
-
-            await alice.transferCommitter(session.id, bob.identity);
-            await alice.synchronize();
-            await bob.synchronize();
-            expect((await alice.session(session.id))?.committer).toEqual(bob.identity);
-            expect((await bob.session(session.id))?.committer).toEqual(bob.identity);
-        } finally {
-            alice.close();
-            bob.close();
-            await relay.close();
-        }
-    });
-
-    test("never publishes a Commit whose staged session reference is stale", async () => {
-        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
-        const aliceStore = new MemoryMurmurStore();
-        const alice = await client(relay, aliceStore);
-        const bob = await client(relay);
-        try {
-            const session = await alice.createSession({
-                descriptor: utf8Encode("stale staged Commit"),
-                members: [await bob.discovery()],
-            });
-            await alice.synchronize();
-            await bob.synchronize();
-            await activate(bob, session.id);
-
-            await alice.transferCommitter(session.id, bob.identity);
-            const key = `murmur/session-states/${encodeBase64Url(session.id)}`;
-            const stateBytes = await aliceStore.get(key);
-            expect(stateBytes).toBeDefined();
-            try {
-                const state = JSON.parse(utf8Decode(stateBytes!)) as Record<string, unknown>;
-                state.stagedCommitId = "A".repeat(32);
-                const corruptedState = utf8Encode(JSON.stringify(state));
-                try {
-                    await aliceStore.set(key, corruptedState);
-                } finally {
-                    zeroBytes(corruptedState);
-                }
-            } finally {
-                zeroBytes(stateBytes!);
-            }
-
-            expect(await alice.synchronize()).toMatchObject({
-                published: 0,
-                pendingOutboxes: 0,
-                terminalPublicationFailures: 2,
-            });
-            await bob.synchronize();
-            expect((await bob.session(session.id))?.committer).toEqual(alice.identity);
-            expect(await alice.session(session.id)).toMatchObject({
-                status: "active",
-                committer: alice.identity,
-            });
-
-            await alice.transferCommitter(session.id, bob.identity);
-            await alice.synchronize();
-            await bob.synchronize();
-            expect((await alice.session(session.id))?.committer).toEqual(bob.identity);
-            expect((await bob.session(session.id))?.committer).toEqual(bob.identity);
         } finally {
             alice.close();
             bob.close();
@@ -1454,7 +1739,7 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("relays a staged application after its membership Commit", async () => {
+    test("keeps current-epoch application work ahead of an asynchronous removal", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const base = new HttpDeliveryTransport("https://relay.test", {
             fetch: relayFetch(relay),
@@ -1494,10 +1779,11 @@ describe("stateful MLS sessions", () => {
             expect(sendId).toEqual(expect.any(String));
             failPrivateOnce = true;
             expect(await alice.synchronize()).toMatchObject({
-                published: 2,
+                published: 1,
                 transientPublicationFailures: 1,
-                pendingOutboxes: 1,
+                pendingOutboxes: 2,
             });
+            await alice.synchronize();
             await alice.synchronize();
             await bob.synchronize();
             const received: string[] = [];

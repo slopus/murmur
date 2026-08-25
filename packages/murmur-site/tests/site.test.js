@@ -354,7 +354,7 @@ describe("content: how Murmur works", () => {
         "KeyPackage",
         "SHA-256 digest",
         "five minutes",
-        "epoch committer",
+        "role-authorized Commit",
         "TreeKEM",
         "UUIDv7",
         "MurmurStore",

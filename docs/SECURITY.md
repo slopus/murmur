@@ -57,10 +57,13 @@ The relay is untrusted for confidentiality and correctness. It can delay, drop,
 reorder across inboxes, replay retained ciphertext, equivocate, or become
 unavailable. It cannot forge a valid sender delivery or decrypt MLS content.
 
-UUIDv7 order is a relay consistency service, not a cryptographic proof. The MLS
-committer rule removes dependence on a shared cross-inbox order. Clients still
-validate exact recipients, epoch, sender, committer control, KeyPackage
-lifetime, and every cryptographic transition.
+UUIDv7 order is a relay consistency service, not a cryptographic proof. Murmur
+uses the shared event ID from each atomic multicast to arbitrate concurrent
+Commits, but accepts only a cryptographically valid, role-authorized Commit for
+the current epoch. Clients validate exact recipients, epoch, sender, complete
+owner/admin/policy control, KeyPackage lifetime, and every cryptographic
+transition. A malicious relay can deny progress, but cannot make honest members
+accept different valid winners without violating the shared-order contract.
 
 SSE transports the same untrusted signed deliveries as bounded queue reads. A
 stream is authenticated once when opened and must use TLS. It can replay,
@@ -79,7 +82,8 @@ reconnects from durable progress. SSE receipt never authorizes deletion.
 - Persist invitation revocation authority and pending local key destruction
   across restart; never serialize the private authority into an invitation.
 - Adopt Commits only from authenticated queue echoes.
-- Keep active and staged epochs separate until the echo wins.
+- Keep active and staged epochs separate until the echo wins; cancel and rebase
+  dependent sends when an earlier valid Commit arrives.
 - Treat malformed authenticated input as terminal queue progress.
 - Never expose the `murmur/` storage namespace or transaction to application
   callbacks.
@@ -91,12 +95,12 @@ prefix fails explicitly rather than skipping missing MLS state.
 
 ## Limits
 
-Pending sessions, buffered events, replay entries, proposals, members, outboxes,
-ciphertext, fanout, queue bytes, sender bytes, and global relay storage are all
-bounded. Per-sender reference quotas charge multicast fanout, but identities are
-free to create: relay quotas bound resource usage, not fair availability under
-a Sybil attack. Probabilistic replay overflow can reject legitimate new traffic
-but never exposes a probable replay to the application.
+Pending sessions, buffered events, replay entries, membership intents, members,
+outboxes, ciphertext, fanout, queue bytes, sender bytes, and global relay
+storage are all bounded. Per-sender reference quotas charge multicast fanout,
+but identities are free to create: relay quotas bound resource usage, not fair
+availability under a Sybil attack. Probabilistic replay overflow can reject
+legitimate new traffic but never exposes a probable replay to the application.
 
 Relay UUIDv7 time is an untrusted ordering input. The inbox processor accepts
 its magnitude only inside a bounded local plausibility window before using it
