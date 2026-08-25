@@ -13,3 +13,6 @@ same vectors -> SQLite
 ```
 
 Page selection tests pin bounded hydration and UUID cursor behavior.
+Historical SQLite v3 and v4 fixtures pin transactional, byte-preserving schema
+migration and continuity backfill. Long-running SQLite and durable-fanout chaos
+coverage runs separately from the unit suite.
