@@ -40,6 +40,7 @@ import {
 const NOW = 1_700_000_000_000;
 const SESSION_STATE_PREFIX = "murmur/session-states/";
 const SESSION_INTENT_PREFIX = "murmur/session-intents/";
+const DELIVERY_STATE_KEYS = ["murmur/delivery/cursor", "murmur/delivery/continuity"] as const;
 const PREVIOUS_EPOCH_GRACE_MILLISECONDS = 5 * 60_000;
 
 interface Actor {
@@ -305,6 +306,18 @@ async function cloneMemoryStore(source: MurmurStore): Promise<MemoryMurmurStore>
             for (const value of page.values()) zeroBytes(value);
         }
         if (page.size < 256) return target;
+    }
+}
+
+async function copyDeliveryProgress(source: MurmurStore, target: MurmurStore): Promise<void> {
+    for (const key of DELIVERY_STATE_KEYS) {
+        const value = await source.get(key);
+        try {
+            if (value === undefined) await target.delete(key);
+            else await target.set(key, value);
+        } finally {
+            if (value !== undefined) zeroBytes(value);
+        }
     }
 }
 
@@ -865,6 +878,7 @@ describe("role, policy, and private-roster session races", () => {
                 const within = await consume(fixture.dave);
                 expect(within.length).toBeLessThanOrEqual(1);
 
+                await copyDeliveryProgress(oldWithin.store, oldOutside.store);
                 fixture.now.value += PREVIOUS_EPOCH_GRACE_MILLISECONDS + 1;
                 await oldOutside.client.send(
                     fixture.sessionId,
@@ -877,6 +891,7 @@ describe("role, policy, and private-roster session races", () => {
                     "old epoch outside grace",
                 );
 
+                await copyDeliveryProgress(oldOutside.store, oldControl.store);
                 await oldControl.client.grantAdmin(
                     fixture.sessionId,
                     fixture.carol.client.accountKey,

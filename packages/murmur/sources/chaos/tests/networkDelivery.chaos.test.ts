@@ -7,6 +7,7 @@ import {
 import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair, type IdentityKeyPair } from "../../crypto/index.js";
 import {
+    DeliveryCursorTrimmedError,
     DeliveryTransportError,
     HttpDeliveryTransport,
     InboxProcessor,
@@ -41,7 +42,7 @@ import {
 const NOW = 1_700_000_000_000;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const TWENTY_NINE_DAYS = 29 * DAY_MILLISECONDS;
-const NINETY_DAYS = 90 * DAY_MILLISECONDS;
+const SIX_MONTHS = 180 * DAY_MILLISECONDS;
 
 function relayFetch(relay: RelayService): DeliveryFetch {
     const handler = createRelayFetchHandler(relay, {
@@ -159,7 +160,20 @@ async function inbox(
     now: number,
     after: string | null = null,
 ): Promise<InboxPage> {
-    return transport.read(createSignedInboxRead(recipient, { after, limit: 256, createdAt: now }));
+    try {
+        return await transport.read(
+            createSignedInboxRead(recipient, { after, limit: 256, createdAt: now }),
+        );
+    } catch (error: unknown) {
+        if (!(error instanceof DeliveryCursorTrimmedError) || after !== null) throw error;
+        return transport.read(
+            createSignedInboxRead(recipient, {
+                after: error.acknowledgedThrough,
+                limit: 256,
+                createdAt: now,
+            }),
+        );
+    }
 }
 
 function expectExactDelivery(left: SignedDelivery, right: SignedDelivery): void {
@@ -863,7 +877,10 @@ describe("network and delivery contract chaos", () => {
                 });
                 expect((await inbox(fixture.http, bob, NOW)).deliveries).toHaveLength(1);
             }
-            await expect(fixture.http.acknowledge(valid)).resolves.toEqual({ removed: 1 });
+            await expect(fixture.http.acknowledge(valid)).resolves.toMatchObject({
+                removed: 1,
+                sequence: 1,
+            });
             expect((await inbox(fixture.http, bob, NOW)).deliveries).toHaveLength(0);
         } finally {
             await fixture.relay.close();
@@ -1020,7 +1037,7 @@ describe("network and delivery contract chaos", () => {
         }
     });
 
-    test("NET-19 five-minute invitation and 90-day hard delivery bounds are exact", async () => {
+    test("NET-19 five-minute invitation and 180-day hard delivery bounds are exact", async () => {
         const invitationFixture = networkFixture({
             maximumInvitationTtlMilliseconds: DISCOVERY_INVITATION_TTL_MILLISECONDS,
         });
@@ -1054,23 +1071,23 @@ describe("network and delivery contract chaos", () => {
             await invitationFixture.relay.close();
         }
 
-        const hardFixture = networkFixture({ maximumDeliveryTtlMilliseconds: NINETY_DAYS });
+        const hardFixture = networkFixture({ maximumDeliveryTtlMilliseconds: SIX_MONTHS });
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();
         try {
             await expect(
                 hardFixture.http.publish(
-                    labeledDelivery(alice, [bob], "hard edge", NOW, NOW + NINETY_DAYS),
+                    labeledDelivery(alice, [bob], "hard edge", NOW, NOW + SIX_MONTHS),
                 ),
             ).resolves.toMatchObject({ duplicate: false });
             await expect(
                 hardFixture.http.publish(
-                    labeledDelivery(alice, [bob], "over hard edge", NOW, NOW + NINETY_DAYS + 1),
+                    labeledDelivery(alice, [bob], "over hard edge", NOW, NOW + SIX_MONTHS + 1),
                 ),
             ).rejects.toMatchObject({ status: 401, code: "unauthorized" });
             expect(() =>
-                networkFixture({ maximumDeliveryTtlMilliseconds: NINETY_DAYS + 1 }),
-            ).toThrow("cannot exceed 90 days");
+                networkFixture({ maximumDeliveryTtlMilliseconds: SIX_MONTHS + 1 }),
+            ).toThrow("cannot exceed 180 days");
         } finally {
             await hardFixture.relay.close();
         }

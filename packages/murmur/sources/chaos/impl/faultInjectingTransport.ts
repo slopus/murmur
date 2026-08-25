@@ -3,6 +3,7 @@ import type {
     DeliveryStreamHooks,
     DeliveryTransport,
     InboxDelivery,
+    InboxStreamEvent,
     InboxPage,
     SignedDelivery,
     SignedInboxAck,
@@ -349,7 +350,7 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         input: SignedInboxRead,
         signal?: AbortSignal,
         hooks: DeliveryStreamHooks = {},
-    ): AsyncGenerator<InboxDelivery> {
+    ): AsyncGenerator<InboxStreamEvent> {
         const delegateStream = this.#context.delegate.stream;
         if (delegateStream === undefined) throw new Error("Delegate does not support streaming");
         const openOrdinal = nextOrdinal(this.#context, "stream.open");
@@ -385,6 +386,13 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         await applyResponseControl(this.#context, afterOpen, signal);
 
         for await (const inputDelivery of iterable) {
+            if ("type" in inputDelivery) {
+                yield {
+                    ...inputDelivery,
+                    generation: inputDelivery.generation.slice(),
+                };
+                continue;
+            }
             const ordinal = nextOrdinal(this.#context, "stream.delivery");
             let delivery = cloneInboxDelivery(inputDelivery);
             const before = point(

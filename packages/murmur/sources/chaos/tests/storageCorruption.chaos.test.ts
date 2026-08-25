@@ -33,6 +33,7 @@ const SESSION_STATE_PREFIX = "murmur/session-states/";
 const OUTBOX_PREFIX = "murmur/session-outbox/";
 const OUTBOX_ORDER_PREFIX = "murmur/session-outbox-order/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
+const DELIVERY_STATE_KEYS = ["murmur/delivery/cursor", "murmur/delivery/continuity"] as const;
 const DRAIN_PREFIX = "murmur/chaos/drained/";
 const ACK_KEY = "murmur/chaos/ack";
 const NORMAL_SCAN_LIMIT = 256;
@@ -534,6 +535,18 @@ async function cloneMemoryStore(source: MurmurStore): Promise<MemoryMurmurStore>
     }
 }
 
+async function copyDeliveryProgress(source: MurmurStore, target: MurmurStore): Promise<void> {
+    for (const key of DELIVERY_STATE_KEYS) {
+        const value = await source.get(key);
+        try {
+            if (value === undefined) await target.delete(key);
+            else await target.set(key, value);
+        } finally {
+            if (value !== undefined) zeroBytes(value);
+        }
+    }
+}
+
 async function runContention(): Promise<{
     readonly statuses: readonly string[];
     readonly keys: readonly [string, number][];
@@ -720,6 +733,8 @@ describe("storage corruption and capacity chaos", () => {
                 const followUp: string[] = [];
                 expect(await consume(bob, followUp)).toBe(1);
                 expect(followUp).toEqual([`follow-up-${nth}`]);
+                await copyDeliveryProgress(aliceDelegate, aliceBaseline);
+                await copyDeliveryProgress(bobDelegate, bobBaseline);
                 alice.close();
                 bob.close();
             }
