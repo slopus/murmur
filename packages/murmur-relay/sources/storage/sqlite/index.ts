@@ -973,7 +973,9 @@ export class SqliteRelayStore implements RelayStore {
                 try {
                     this.#database.exec(`
                     ALTER TABLE murmur_queue_global ADD COLUMN generation_seed BLOB
-                        NOT NULL DEFAULT (zeroblob(32)) CHECK (length(generation_seed) = 32);
+                        NOT NULL
+                        DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+                        CHECK (length(generation_seed) = 32);
                     ALTER TABLE murmur_queues ADD COLUMN head_sequence INTEGER
                         NOT NULL DEFAULT 0 CHECK (head_sequence >= 0);
                     ALTER TABLE murmur_queues ADD COLUMN next_sequence INTEGER
@@ -983,7 +985,9 @@ export class SqliteRelayStore implements RelayStore {
                             acknowledged_sequence >= 0 AND acknowledged_sequence <= head_sequence
                         );
                     ALTER TABLE murmur_queues ADD COLUMN loss_generation BLOB
-                        NOT NULL DEFAULT (zeroblob(32)) CHECK (length(loss_generation) = 32);
+                        NOT NULL
+                        DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
+                        CHECK (length(loss_generation) = 32);
                     ALTER TABLE murmur_queue_references ADD COLUMN sequence INTEGER
                         NOT NULL DEFAULT 0 CHECK (sequence >= 0);
                     UPDATE murmur_queue_references AS reference
