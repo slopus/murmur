@@ -13,10 +13,18 @@ import { openBox, sealBox, type IdentityKeyPair } from "../../crypto/index.js";
 import type { DiscoveryBundle } from "../../identity/discovery/index.js";
 import { verifyDiscoveryBundle } from "../../identity/discovery/index.js";
 import {
+    accountConvergenceJobs,
+    decodeDeviceCredential,
+    deleteAccountConvergenceJob,
+    observeDeviceRoster,
+    type AccountConvergenceJob,
+} from "../../accounts/index.js";
+import {
     MlsEpochState,
     MlsLocalMemberRemovedError,
     authenticateMurmurMlsCredential,
     createMlsGroup,
+    decodeMlsKeyPackage,
     decodeMlsPrivateMessage,
     decodeMlsRatchetTree,
     decodeMlsTreeCommit,
@@ -297,6 +305,32 @@ function activeMembers(epoch: MlsEpochState): readonly Uint8Array[] {
     return epoch.memberSignatureKeys.flatMap((value) => (value === undefined ? [] : [value]));
 }
 
+function memberAccount(epoch: MlsEpochState, leaf: number): Uint8Array {
+    const signatureKey = epoch.memberSignatureKeys[leaf];
+    const credential = epoch.memberCredentialIdentities[leaf];
+    if (signatureKey === undefined || credential === undefined) {
+        throw new Error("Session member is absent");
+    }
+    if (credential.length === 32 && equalBytes(credential, signatureKey)) {
+        return signatureKey;
+    }
+    const decoded = decodeDeviceCredential(credential);
+    if (!equalBytes(decoded.deviceKey, signatureKey)) {
+        throw new Error("Session device credential does not match its leaf");
+    }
+    return decoded.accountKey;
+}
+
+function activeAccounts(epoch: MlsEpochState): readonly Uint8Array[] {
+    const accounts = new Map<string, Uint8Array>();
+    for (let leaf = 0; leaf < epoch.memberSignatureKeys.length; leaf += 1) {
+        if (epoch.memberSignatureKeys[leaf] === undefined) continue;
+        const account = memberAccount(epoch, leaf);
+        accounts.set(encodeBase64Url(account), account);
+    }
+    return [...accounts.values()];
+}
+
 function memberLeaf(epoch: MlsEpochState, identity: Uint8Array): number {
     const matches = epoch.memberSignatureKeys.flatMap((value, index) =>
         value !== undefined && equalBytes(value, identity) ? [index] : [],
@@ -358,7 +392,7 @@ function publicSession(record: SessionRecord, epoch: MlsEpochState): MurmurSessi
         id: epoch.groupId,
         status: record.status,
         descriptor: record.descriptor.slice(),
-        members: activeMembers(epoch),
+        members: activeAccounts(epoch),
         committer: record.committer.slice(),
         bufferedEvents: record.bufferedEvents,
     };
@@ -398,6 +432,8 @@ export class SessionEngine {
     readonly #inbox: InboxProcessor;
     readonly #limits: ResolvedLimits;
     readonly #now: () => number;
+    #credentialIdentity: Uint8Array;
+    #accountKey: Uint8Array;
 
     constructor(
         identity: IdentityKeyPair,
@@ -405,11 +441,17 @@ export class SessionEngine {
         transport: DeliveryTransport,
         limits: MurmurSessionLimits = {},
         now: () => number = Date.now,
+        credentialIdentity: Uint8Array = identity.publicKey,
     ) {
         this.#identity = identity;
         this.#store = store;
         this.#transport = transport;
         this.#now = now;
+        this.#credentialIdentity = credentialIdentity.slice();
+        this.#accountKey =
+            credentialIdentity.length === 32 && equalBytes(credentialIdentity, identity.publicKey)
+                ? identity.publicKey.slice()
+                : decodeDeviceCredential(credentialIdentity).accountKey;
         this.#limits = {
             maximumPendingSessions: limits.maximumPendingSessions ?? DEFAULT_MAXIMUM_PENDING,
             maximumBufferedEventsPerSession:
@@ -449,6 +491,23 @@ export class SessionEngine {
             { now },
             MURMUR_INTERNAL_INBOX_HANDLER,
         );
+    }
+
+    /** Adopt an account-authorized device credential after provisioning completes. */
+    adoptDeviceCredential(credential: Uint8Array): void {
+        const decoded = decodeDeviceCredential(credential);
+        if (!equalBytes(decoded.deviceKey, this.#identity.publicKey)) {
+            throw new Error("Device credential does not match the local device");
+        }
+        zeroBytes(this.#credentialIdentity);
+        zeroBytes(this.#accountKey);
+        this.#credentialIdentity = credential.slice();
+        this.#accountKey = decoded.accountKey.slice();
+    }
+
+    /** Stable account key represented by this device's MLS credential. */
+    get accountKey(): Uint8Array {
+        return this.#accountKey.slice();
     }
 
     async storeKeyPackages(
@@ -661,7 +720,7 @@ export class SessionEngine {
                 throw new Error("Invalid session member discovery bundle");
             }
             return {
-                identity: member.identityKey,
+                identity: member.version === 1 ? member.identityKey : member.deviceKey,
                 keyPackage: member.keyPackages[0]!,
                 discovery: member,
             };
@@ -677,8 +736,7 @@ export class SessionEngine {
             if (
                 member.identity.length !== 32 ||
                 !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
-                !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity) ||
-                !equalBytes(member.keyPackage.leafNode.credential.identity, member.identity)
+                !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity)
             ) {
                 throw new Error("Invalid session member KeyPackage");
             }
@@ -697,7 +755,9 @@ export class SessionEngine {
         const discoveryClaims = discoveryMembers.map((member) =>
             usedDiscoveryKey(member.keyPackages[0]!),
         );
-        const epoch = createMlsGroup(this.#identity);
+        const epoch = createMlsGroup(this.#identity, {
+            credentialIdentity: this.#credentialIdentity,
+        });
         const id = epoch.groupId;
         let checkpoint: Uint8Array | undefined;
         try {
@@ -813,7 +873,10 @@ export class SessionEngine {
     }
 
     /** Activate one internally owned pending session after an explicit decision. */
-    async activateOwned(id: Uint8Array, expectedOwner: "contact" | "service"): Promise<void> {
+    async activateOwned(
+        id: Uint8Array,
+        expectedOwner: "contact" | "service" | "account",
+    ): Promise<void> {
         await this.#store.transaction(async (transaction) => {
             const owner = await this.#sessionOwner(transaction, id);
             if (owner === undefined || owner.owner !== expectedOwner) {
@@ -1123,6 +1186,24 @@ export class SessionEngine {
         return this.#queuePrivate(id, { version: 1, type: "application", bytes }, "application");
     }
 
+    /** Queue an encrypted built-in roster control without surfacing it to a service. */
+    async sendAccountRoster(
+        id: Uint8Array,
+        roster: Uint8Array,
+        keyPackage?: Uint8Array,
+    ): Promise<string> {
+        return this.#queuePrivate(
+            id,
+            {
+                version: 1,
+                type: "account_roster",
+                roster,
+                ...(keyPackage === undefined ? {} : { keyPackage }),
+            },
+            "proposal",
+        );
+    }
+
     /** Atomically queue one contact packet with its contact-state mutation. */
     async sendOwnedContact(
         id: Uint8Array,
@@ -1219,7 +1300,7 @@ export class SessionEngine {
                 throw new Error("Invalid Add discovery bundle");
             }
             member = {
-                identity: input.identityKey,
+                identity: input.version === 1 ? input.identityKey : input.deviceKey,
                 keyPackage: input.keyPackages[0]!,
                 discovery: input,
             };
@@ -1227,8 +1308,7 @@ export class SessionEngine {
         if (
             member.identity.length !== 32 ||
             !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
-            !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity) ||
-            !equalBytes(member.keyPackage.leafNode.credential.identity, member.identity)
+            !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity)
         ) {
             throw new Error("Invalid Add KeyPackage");
         }
@@ -1400,8 +1480,10 @@ export class SessionEngine {
         await this.#store.transaction((transaction) =>
             this.#pruneKeyPackages(transaction, this.#now()),
         );
+        await this.convergeAccounts();
         const before = await this.#flushOutboxes(options.signal);
         const inbox = await this.#inbox.synchronize(options);
+        await this.convergeAccounts();
         const after = await this.#flushOutboxes(options.signal);
         return this.#synchronizationResult(inbox, [before, after]);
     }
@@ -1414,13 +1496,122 @@ export class SessionEngine {
         await this.#store.transaction((transaction) =>
             this.#pruneKeyPackages(transaction, this.#now()),
         );
-        return (await this.#flushOutboxes(signal)).transientFailureIds.size > 0;
+        const convergeRetry = await this.convergeAccounts();
+        return (await this.#flushOutboxes(signal)).transientFailureIds.size > 0 || convergeRetry;
+    }
+
+    /**
+     * Drive every queued authenticated roster change into each matching session.
+     *
+     * A job adds or removes one account device. Sessions where the account is a
+     * logical member receive the required MLS Add or Remove: the local committer
+     * stages a Commit directly, other members queue an ordinary proposal, and
+     * pending or already-committing sessions retry on the next flush. Returns
+     * whether any job must retry later.
+     */
+    async convergeAccounts(): Promise<boolean> {
+        let retry = false;
+        for (const job of await accountConvergenceJobs(this.#store)) {
+            let complete = true;
+            try {
+                let after: string | undefined;
+                for (;;) {
+                    const page = await this.#store.scan(SESSION_STATE_PREFIX, {
+                        ...(after === undefined ? {} : { after }),
+                        limit: SESSION_LIST_LIMIT,
+                    });
+                    if (page.size === 0) break;
+                    for (const [key, bytes] of page) {
+                        after = key;
+                        let record: SessionRecord;
+                        try {
+                            record = decodeSessionRecord(bytes);
+                        } catch {
+                            zeroBytes(bytes);
+                            continue;
+                        }
+                        try {
+                            if (!(await this.#convergeSession(job, record))) complete = false;
+                        } catch {
+                            complete = false;
+                        } finally {
+                            this.#zeroSessionRecord(record);
+                            zeroBytes(bytes);
+                        }
+                    }
+                    if (page.size < SESSION_LIST_LIMIT) break;
+                }
+                if (complete) await deleteAccountConvergenceJob(this.#store, job.key);
+                else retry = true;
+            } finally {
+                zeroBytes(job.account);
+                zeroBytes(job.device);
+                if (job.keyPackage !== undefined) zeroBytes(job.keyPackage);
+            }
+        }
+        return retry;
+    }
+
+    /** Apply one roster convergence job to one session; false requests a retry. */
+    async #convergeSession(job: AccountConvergenceJob, record: SessionRecord): Promise<boolean> {
+        if (record.status === "removed") return true;
+        const epoch = restoreEpoch(this.#identity, record);
+        try {
+            let accountPresent = false;
+            let devicePresent = false;
+            for (let leaf = 0; leaf < epoch.memberSignatureKeys.length; leaf += 1) {
+                const signatureKey = epoch.memberSignatureKeys[leaf];
+                if (signatureKey === undefined) continue;
+                if (equalBytes(memberAccount(epoch, leaf), job.account)) accountPresent = true;
+                if (equalBytes(signatureKey, job.device)) devicePresent = true;
+            }
+            if (!accountPresent) return true;
+            if (job.change === "added" ? devicePresent : !devicePresent) return true;
+            if (record.status !== "active") return false;
+            const id = epoch.groupId;
+            const committing =
+                equalBytes(record.committer, this.#identity.publicKey) &&
+                !equalBytes(job.device, this.#identity.publicKey);
+            if (committing && record.stagedCommitId !== undefined) return false;
+            if (job.change === "added") {
+                const keyPackage = decodeMlsKeyPackage(job.keyPackage!);
+                if (!verifyMlsKeyPackage(keyPackage, Math.floor(this.#now() / 1_000))) {
+                    return true;
+                }
+                if (committing) {
+                    await this.#prepareCommit(
+                        id,
+                        [{ identity: job.device.slice(), keyPackage }],
+                        [],
+                        [],
+                    );
+                } else {
+                    await this.#queuePrivate(
+                        id,
+                        { version: 1, type: "proposal_add", keyPackage },
+                        "proposal",
+                    );
+                }
+            } else if (committing) {
+                await this.#prepareCommit(id, [], [job.device.slice()], []);
+            } else if (!equalBytes(job.device, this.#identity.publicKey)) {
+                await this.#queuePrivate(
+                    id,
+                    { version: 1, type: "proposal_remove", identity: job.device.slice() },
+                    "proposal",
+                );
+            }
+            return true;
+        } finally {
+            epoch.destroy();
+        }
     }
 
     async completeStreamEvent(
         inbox: InboxSyncResult,
         signal?: AbortSignal,
     ): Promise<MurmurSynchronizeResult> {
+        await this.convergeAccounts();
         return this.#synchronizationResult(inbox, [await this.#flushOutboxes(signal)]);
     }
 
@@ -2130,7 +2321,7 @@ export class SessionEngine {
                         outbox.sessionId,
                         record,
                         queued.eventId,
-                        this.#identity.publicKey,
+                        this.#accountKey,
                         frame.bytes,
                     );
                 } finally {
@@ -2236,8 +2427,11 @@ export class SessionEngine {
                     stateKey(epoch.groupId),
                     encodeSessionRecord(updated),
                 );
-                const sender = epoch.memberSignatureKeys[opened.message.sender];
-                if (sender === undefined || !equalBytes(sender, queued.delivery.sender)) {
+                const senderDevice = epoch.memberSignatureKeys[opened.message.sender];
+                if (
+                    senderDevice === undefined ||
+                    !equalBytes(senderDevice, queued.delivery.sender)
+                ) {
                     await this.#quarantine(transaction, queued.eventId, "sender_binding");
                     return;
                 }
@@ -2259,12 +2453,44 @@ export class SessionEngine {
                             epoch.groupId,
                             record,
                             queued.eventId,
-                            sender,
+                            memberAccount(epoch, opened.message.sender),
                             frame.bytes,
                         );
                     } finally {
                         zeroBytes(frame.bytes);
                     }
+                } else if (frame.type === "account_roster") {
+                    let admission:
+                        | { readonly device: Uint8Array; readonly keyPackage: Uint8Array }
+                        | undefined;
+                    if (frame.keyPackage !== undefined) {
+                        const keyPackage = decodeMlsKeyPackage(frame.keyPackage);
+                        const credential = decodeDeviceCredential(
+                            keyPackage.leafNode.credential.identity,
+                        );
+                        if (
+                            !verifyMlsKeyPackage(
+                                keyPackage,
+                                Math.floor(queued.delivery.createdAt / 1_000),
+                            ) ||
+                            !equalBytes(keyPackage.leafNode.signatureKey, credential.deviceKey)
+                        ) {
+                            throw new TerminalInboxDeliveryError("invalid_account_admission");
+                        }
+                        admission = {
+                            device: credential.deviceKey,
+                            keyPackage: frame.keyPackage,
+                        };
+                    }
+                    await observeDeviceRoster(
+                        transaction,
+                        this.#accountKey,
+                        queued.eventId,
+                        memberAccount(epoch, opened.message.sender),
+                        senderDevice,
+                        frame.roster,
+                        admission,
+                    );
                 } else if (
                     epoch === current &&
                     equalBytes(record.committer, this.#identity.publicKey)
@@ -2283,7 +2509,7 @@ export class SessionEngine {
                     await setAndZero(
                         transaction,
                         `${proposalPrefix(epoch.groupId)}${queued.eventId}`,
-                        encodeStoredProposal({ proposer: sender, frame }),
+                        encodeStoredProposal({ proposer: senderDevice, frame }),
                     );
                 }
             } finally {
@@ -2550,6 +2776,7 @@ export class SessionEngine {
                 )
             );
         }
+        if (frame.type !== "proposal_remove") return false;
         try {
             memberLeaf(epoch, frame.identity);
             return !equalBytes(frame.identity, record.committer);

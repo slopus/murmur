@@ -68,6 +68,7 @@ export {
     DISCOVERY_INVITATION_TTL_MILLISECONDS,
     DiscoveryTransportError,
     HttpDiscoveryTransport,
+    createAccountDiscoveryBundle,
     createDiscoveryBundle,
     parseDiscoveryBundle,
     serializeDiscoveryBundle,
@@ -124,6 +125,14 @@ export type {
     MurmurUpdate,
 } from "./sessions/index.js";
 export type {
+    MurmurContactRosterChanged,
+    MurmurDeviceAdded,
+    MurmurDeviceRevoked,
+    MurmurDeviceRoster,
+    MurmurDeviceRosterEntry,
+} from "./accounts/index.js";
+export type {
+    AccountDiscoveryBundle,
     DiscoveryBundle,
     DiscoveryBundleOptions,
     DiscoveryBundleValidationOptions,
@@ -133,6 +142,7 @@ export type {
     HttpDiscoveryTransportOptions,
     InvitationRevocationOutcome,
     InvitationUploadAuthorization,
+    LegacyDiscoveryBundle,
     SignedInvitationRevocation,
 } from "./identity/discovery/index.js";
 export { MAXIMUM_STORE_SCAN_ITEMS, MemoryMurmurStore } from "./storage/index.js";

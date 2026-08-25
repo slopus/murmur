@@ -36,6 +36,12 @@ export type PrivateSessionFrame =
     | { readonly version: 1; readonly type: "application"; readonly bytes: Uint8Array }
     | {
           readonly version: 1;
+          readonly type: "account_roster";
+          readonly roster: Uint8Array;
+          readonly keyPackage?: Uint8Array;
+      }
+    | {
+          readonly version: 1;
           readonly type: "proposal_add";
           readonly keyPackage: MlsKeyPackage;
       }
@@ -47,7 +53,10 @@ export type PrivateSessionFrame =
 
 export interface StoredSessionProposal {
     readonly proposer: Uint8Array;
-    readonly frame: Exclude<PrivateSessionFrame, { readonly type: "application" }>;
+    readonly frame: Extract<
+        PrivateSessionFrame,
+        { readonly type: "proposal_add" | "proposal_remove" }
+    >;
 }
 
 export interface CommitFrame {
@@ -328,6 +337,14 @@ export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
             keyPackage: encodeBase64Url(encodeMlsKeyPackage(frame.keyPackage)),
         });
     }
+    if (frame.type === "account_roster") {
+        return canonicalJsonBytes({
+            version: 1,
+            type: frame.type,
+            roster: encodeBase64Url(frame.roster),
+            keyPackage: frame.keyPackage === undefined ? null : encodeBase64Url(frame.keyPackage),
+        });
+    }
     return canonicalJsonBytes({
         version: 1,
         type: frame.type,
@@ -364,6 +381,22 @@ export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
             identity: bytes(input.identity, 32, "removed identity"),
         };
     }
+    if (input.type === "account_roster") {
+        exact(input, ["version", "type", "roster", "keyPackage"], "account roster control");
+        if (input.keyPackage !== null && typeof input.keyPackage !== "string") {
+            throw new Error("Invalid account roster control");
+        }
+        return {
+            version: 1,
+            type: "account_roster",
+            roster: bytes(input.roster, 64 * 1024, "account roster"),
+            ...(input.keyPackage === null
+                ? {}
+                : {
+                      keyPackage: bytes(input.keyPackage, 1024 * 1024, "account device KeyPackage"),
+                  }),
+        };
+    }
     throw new Error("Unsupported private session frame");
 }
 
@@ -380,7 +413,9 @@ export function decodeStoredProposal(value: Uint8Array): StoredSessionProposal {
     exact(input, ["version", "proposer", "frame"], "stored proposal");
     if (input.version !== 1) throw new Error("Invalid stored proposal");
     const frame = decodePrivateFrame(bytes(input.frame, 1024 * 1024, "stored proposal frame"));
-    if (frame.type === "application") throw new Error("Invalid stored proposal");
+    if (frame.type === "application" || frame.type === "account_roster") {
+        throw new Error("Invalid stored proposal");
+    }
     return {
         proposer: bytes(input.proposer, 32, "proposal sender"),
         frame,

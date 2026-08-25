@@ -18,6 +18,7 @@ import {
 import {
     DISCOVERY_INVITATION_TTL_MILLISECONDS,
     HttpDiscoveryTransport,
+    createAccountDiscoveryBundle,
     createInvitationUploadAuthorization,
     createSignedInvitationRevocation,
     createDiscoveryBundle,
@@ -35,9 +36,17 @@ import {
     encodeMlsKeyPackage,
     mlsKeyPackageReference,
     serializeMlsKeyPackageBundle,
+    verifyMlsKeyPackage,
 } from "../mls/index.js";
 import type { MurmurStore } from "../storage/index.js";
-import { equalBytes, zeroBytes } from "../utils/index.js";
+import {
+    canonicalJsonBytes,
+    decodeBase64Url,
+    encodeBase64Url,
+    equalBytes,
+    utf8Decode,
+    zeroBytes,
+} from "../utils/index.js";
 import {
     ContactEngine,
     type ContactAdmissionSelection,
@@ -60,6 +69,36 @@ import {
     type MurmurService,
     type MurmurServiceRegistration,
 } from "../services/index.js";
+import {
+    ACCOUNT_ROSTER_KEY,
+    accountSyncSessionDescriptor,
+    authorizeDeviceProvisioning,
+    completeDeviceProvisioning,
+    createDeviceLinkMaterial,
+    createInitialDeviceRoster,
+    decodeAccountSyncPacket,
+    deletePreparedAccountEvents,
+    encodeAccountSyncPacket,
+    encodeDeviceCredential,
+    isAccountSyncSessionDescriptor,
+    isActiveDevice,
+    observeDeviceRoster,
+    parseDeviceLinkMaterial,
+    parseDeviceLinkRequest,
+    parseDeviceRoster,
+    parseProvisioningEnvelope,
+    prepareAccountEvents,
+    serializeDeviceLinkMaterial,
+    serializeDeviceLinkRequest,
+    serializeDeviceRoster,
+    serializeProvisioningEnvelope,
+    revokeDeviceFromRoster,
+    type MurmurDeviceRoster,
+    type MurmurDeviceRosterEntry,
+    type PreparedAccountEvents,
+} from "../accounts/index.js";
+import { randomBytes } from "../crypto/index.js";
+import type { StoreTransaction } from "../storage/index.js";
 import {
     SessionEngine,
     type PreparedUpdates,
@@ -95,9 +134,16 @@ export type {
 
 const IDENTITY_KEY = "murmur/identity/root";
 const INVITATION_REVOCATION_KEY = "murmur/invitations/revocation-root";
+const ACCOUNT_ROOT_KEY = "murmur/accounts/v1/root";
+const DEVICE_CREDENTIAL_KEY = "murmur/accounts/v1/device-credential";
+const LINK_MATERIAL_KEY = "murmur/accounts/v1/link-material";
+const ACCOUNT_SESSION_KEY = "murmur/accounts/v1/sync-session";
+const ACCOUNT_ADMISSION_SENT_KEY = "murmur/accounts/v1/admission-sent";
+const ACCOUNT_BROADCAST_KEY = "murmur/accounts/v1/roster-broadcast";
 const DEFAULT_KEY_PACKAGES = 1;
 const CONTACT_ADMISSION_GENERATION = 1;
 const LAST_RESORT_KEY_PACKAGE_LIFETIME_SECONDS = 10 * 365 * 24 * 60 * 60;
+const KEY_PACKAGE_LIFETIME_SECONDS = 30 * 24 * 60 * 60;
 const SYNC_RECONNECT_DELAY_MILLISECONDS = 1_000;
 
 interface CreatedContactAdmission {
@@ -128,10 +174,13 @@ export class MurmurClient {
     readonly #invitationRevocation: IdentityKeyPair;
     readonly #invitations: InvitationState;
     readonly #engine: SessionEngine;
-    readonly #contacts: ContactEngine;
+    #contacts: ContactEngine;
     readonly #services = new Map<string, MurmurService>();
     readonly #discoveryTransport: DiscoveryTransport | undefined;
+    readonly #store: MurmurStore;
     readonly #now: () => number;
+    #account: IdentityKeyPair | undefined;
+    #deviceCredential: Uint8Array | undefined;
     #closed = false;
     #operationTail: Promise<void> = Promise.resolve();
     #pendingOperations = 0;
@@ -150,14 +199,26 @@ export class MurmurClient {
         limits: MurmurSessionLimits,
         now: () => number,
         services: readonly MurmurServiceRegistration[],
+        account: IdentityKeyPair | undefined,
+        deviceCredential: Uint8Array | undefined,
     ) {
         this.#identity = identity;
         this.#invitationRevocation = invitationRevocation;
+        this.#store = store;
         this.#now = now;
         this.#discoveryTransport = discoveryTransport;
-        this.#engine = new SessionEngine(identity, store, transport, limits, now);
+        this.#account = account;
+        this.#deviceCredential = deviceCredential;
+        this.#engine = new SessionEngine(
+            identity,
+            store,
+            transport,
+            limits,
+            now,
+            deviceCredential ?? identity.publicKey,
+        );
         this.#invitations = new InvitationState(store, now);
-        this.#contacts = new ContactEngine(store, identity.publicKey, now);
+        this.#contacts = new ContactEngine(store, account?.publicKey ?? identity.publicKey, now);
         for (const registration of services) {
             this.#services.set(registration.id, registration.service);
         }
@@ -186,6 +247,8 @@ export class MurmurClient {
         }
         let identity: IdentityKeyPair | undefined;
         let invitationRevocation: IdentityKeyPair | undefined;
+        let account: IdentityKeyPair | undefined;
+        let deviceCredential: Uint8Array | undefined;
         try {
             await options.store.transaction(async (transaction) => {
                 const stored = await transaction.get(IDENTITY_KEY);
@@ -240,6 +303,16 @@ export class MurmurClient {
                         zeroBytes(storedRevocation);
                     }
                 }
+
+                const storedAccount = await transaction.get(ACCOUNT_ROOT_KEY);
+                if (storedAccount !== undefined) {
+                    try {
+                        account = decodeIdentityRoot(storedAccount);
+                    } finally {
+                        zeroBytes(storedAccount);
+                    }
+                }
+                deviceCredential = await transaction.get(DEVICE_CREDENTIAL_KEY);
             });
             if (identity === undefined) throw new Error("Murmur identity did not open");
             if (invitationRevocation === undefined) {
@@ -274,6 +347,8 @@ export class MurmurClient {
                 options.limits ?? {},
                 options.now ?? Date.now,
                 services,
+                account,
+                deviceCredential,
             );
             const pendingReferences = await client.#invitations.pendingReferences();
             try {
@@ -287,6 +362,8 @@ export class MurmurClient {
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
             if (invitationRevocation !== undefined) destroyIdentity(invitationRevocation);
+            if (account !== undefined) destroyIdentity(account);
+            if (deviceCredential !== undefined) zeroBytes(deviceCredential);
             throw error;
         }
     }
@@ -295,6 +372,256 @@ export class MurmurClient {
     get identity(): Uint8Array {
         this.#assertOpen();
         return this.#identity.publicKey.slice();
+    }
+
+    /** Stable account signing key; equals the device identity until devices link. */
+    get accountKey(): Uint8Array {
+        this.#assertOpen();
+        return (this.#account ?? this.#identity).publicKey.slice();
+    }
+
+    /** Read this account's authenticated device roster entries. */
+    async devices(): Promise<readonly MurmurDeviceRosterEntry[]> {
+        return this.#tracked(async () => {
+            const roster = await this.#ownRoster();
+            return roster === undefined
+                ? []
+                : roster.devices.map((entry) =>
+                      Object.freeze({
+                          ...entry,
+                          deviceKey: entry.deviceKey.slice(),
+                          authorization: entry.authorization.slice(),
+                      }),
+                  );
+        });
+    }
+
+    async #ownRoster(): Promise<MurmurDeviceRoster | undefined> {
+        const bytes = await this.#store.get(ACCOUNT_ROSTER_KEY);
+        if (bytes === undefined) return undefined;
+        try {
+            return parseDeviceRoster(bytes);
+        } finally {
+            zeroBytes(bytes);
+        }
+    }
+
+    /**
+     * Begin linking this fresh device to an existing account.
+     *
+     * Returns short-lived request bytes for the application to transport to an
+     * active device, for example rendered as a QR code. The matching ephemeral
+     * secret is retained durably until {@link completeDeviceLink}.
+     */
+    async linkDevice(): Promise<Uint8Array> {
+        return this.#exclusive(async () => {
+            if (this.#account !== undefined || (await this.#ownRoster()) !== undefined) {
+                throw new Error("Device already belongs to an account");
+            }
+            const bundle = createMlsKeyPackage(this.#identity, Math.floor(this.#now() / 1_000));
+            try {
+                const reference = mlsKeyPackageReference(bundle.keyPackage);
+                const bytes = serializeMlsKeyPackageBundle(bundle);
+                try {
+                    await this.#engine.storeKeyPackages([
+                        {
+                            reference,
+                            bytes,
+                            expiresAt: Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n),
+                        },
+                    ]);
+                } finally {
+                    zeroBytes(reference);
+                    zeroBytes(bytes);
+                }
+                const material = createDeviceLinkMaterial(
+                    this.#identity,
+                    encodeMlsKeyPackage(bundle.keyPackage),
+                    this.#now(),
+                );
+                const stored = serializeDeviceLinkMaterial(material);
+                try {
+                    await this.#store.transaction((transaction) =>
+                        transaction.set(LINK_MATERIAL_KEY, stored),
+                    );
+                } finally {
+                    zeroBytes(material.ephemeralSecretKey);
+                    zeroBytes(stored);
+                }
+                return serializeDeviceLinkRequest(material.request);
+            } finally {
+                destroyMlsKeyPackageBundle(bundle);
+            }
+        });
+    }
+
+    /**
+     * Authorize one verified device-link request from an active device.
+     *
+     * Signs the next roster revision, adds the new device to the built-in
+     * account synchronization session, and returns encrypted envelope bytes the
+     * application transports back to the new device. Session membership across
+     * contacts and services then converges automatically.
+     */
+    async authorizeDevice(requestBytes: Uint8Array): Promise<Uint8Array> {
+        const envelope = await this.#exclusive(async () => {
+            const request = parseDeviceLinkRequest(requestBytes, this.#now());
+            const account = this.#account ?? this.#identity;
+            let roster = await this.#ownRoster();
+            if (roster === undefined) {
+                roster = createInitialDeviceRoster(
+                    account,
+                    this.#identity,
+                    this.#now(),
+                    randomBytes(16),
+                );
+            }
+            const authorized = authorizeDeviceProvisioning({
+                request,
+                account,
+                authorDevice: this.#identity,
+                roster,
+                now: this.#now(),
+            });
+            const keyPackage = decodeMlsKeyPackage(request.keyPackage);
+            await this.#store.transaction(async (transaction) => {
+                await observeDeviceRoster(
+                    transaction,
+                    account.publicKey,
+                    `local-${encodeBase64Url(randomBytes(12))}`,
+                    account.publicKey,
+                    this.#identity.publicKey,
+                    serializeDeviceRoster(authorized.roster),
+                );
+            });
+            const sessionId = await this.#store.get(ACCOUNT_SESSION_KEY);
+            if (sessionId === undefined) {
+                await this.#engine.create(
+                    {
+                        descriptor: accountSyncSessionDescriptor(),
+                        members: [{ identity: request.deviceKey, keyPackage }],
+                    },
+                    { version: 1, owner: "account" },
+                    async (transaction, id) => {
+                        await transaction.set(ACCOUNT_SESSION_KEY, id.slice());
+                    },
+                );
+            } else {
+                try {
+                    await this.#engine.add(sessionId, {
+                        identity: request.deviceKey,
+                        keyPackage,
+                    });
+                } finally {
+                    zeroBytes(sessionId);
+                }
+            }
+            return serializeProvisioningEnvelope(authorized.envelope);
+        });
+        this.#signalSync();
+        return envelope;
+    }
+
+    /**
+     * Complete linking on the new device from transported envelope bytes.
+     *
+     * Adopts the account root, roster, and account-authorized device credential.
+     * The device then automatically joins the account synchronization session
+     * and receives Welcomes for every converged contact and service session.
+     */
+    async completeDeviceLink(envelopeBytes: Uint8Array): Promise<void> {
+        await this.#exclusive(async () => {
+            const stored = await this.#store.get(LINK_MATERIAL_KEY);
+            if (stored === undefined) throw new Error("No pending device link");
+            let material: ReturnType<typeof parseDeviceLinkMaterial>;
+            try {
+                material = parseDeviceLinkMaterial(stored, this.#now());
+            } finally {
+                zeroBytes(stored);
+            }
+            try {
+                const envelope = parseProvisioningEnvelope(envelopeBytes);
+                const provisioned = completeDeviceProvisioning(material, envelope, this.#now());
+                const credential = encodeDeviceCredential(
+                    provisioned.roster,
+                    this.#identity.publicKey,
+                );
+                const accountRoot = encodeIdentityRoot(provisioned.account);
+                const rosterBytes = serializeDeviceRoster(provisioned.roster);
+                try {
+                    await this.#store.transaction(async (transaction) => {
+                        await transaction.set(ACCOUNT_ROOT_KEY, accountRoot);
+                        await transaction.set(DEVICE_CREDENTIAL_KEY, credential);
+                        await transaction.set(ACCOUNT_ROSTER_KEY, rosterBytes);
+                        await transaction.delete(LINK_MATERIAL_KEY);
+                    });
+                } finally {
+                    zeroBytes(accountRoot);
+                    zeroBytes(rosterBytes);
+                }
+                this.#account = provisioned.account;
+                this.#deviceCredential = credential.slice();
+                this.#engine.adoptDeviceCredential(credential);
+                this.#contacts = new ContactEngine(
+                    this.#store,
+                    provisioned.account.publicKey,
+                    this.#now,
+                );
+            } finally {
+                zeroBytes(material.ephemeralSecretKey);
+            }
+        });
+        this.#signalSync();
+    }
+
+    /**
+     * Revoke another account device from any active device.
+     *
+     * Signs the next roster revision, then automatically drives MLS Removes in
+     * every known session and publishes the authenticated roster to contacts.
+     */
+    async revokeDevice(deviceKey: Uint8Array): Promise<void> {
+        await this.#exclusive(async () => {
+            const account = this.#account ?? this.#identity;
+            const roster = await this.#ownRoster();
+            if (roster === undefined) throw new Error("Account has no device roster");
+            const revoked = revokeDeviceFromRoster(
+                roster,
+                account,
+                this.#identity,
+                deviceKey,
+                this.#now(),
+                randomBytes(16),
+            );
+            const rosterBytes = serializeDeviceRoster(revoked);
+            await this.#store.transaction(async (transaction) => {
+                await observeDeviceRoster(
+                    transaction,
+                    account.publicKey,
+                    `local-${encodeBase64Url(randomBytes(12))}`,
+                    account.publicKey,
+                    this.#identity.publicKey,
+                    rosterBytes,
+                );
+                await this.#queueRosterBroadcast(transaction, rosterBytes);
+            });
+        });
+        this.#signalSync();
+    }
+
+    async #queueRosterBroadcast(
+        transaction: StoreTransaction,
+        rosterBytes: Uint8Array,
+        keyPackage?: Uint8Array,
+    ): Promise<void> {
+        await transaction.set(
+            ACCOUNT_BROADCAST_KEY,
+            canonicalJsonBytes({
+                version: 1,
+                roster: encodeBase64Url(rosterBytes),
+                keyPackage: keyPackage === undefined ? null : encodeBase64Url(keyPackage),
+            }),
+        );
     }
 
     /** Register one optional typed service under its durable stable ID. */
@@ -764,12 +1091,16 @@ export class MurmurClient {
             | "onContactAdded"
             | "onContactUpdated"
             | "onContactRemoved"
+            | "onDeviceAdded"
+            | "onDeviceRevoked"
+            | "onContactRosterChanged"
         > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
             throw new Error("Cannot page synchronization while SSE sync is active");
         }
         await this.#exclusive(() => this.#queueContactMaintenance());
+        await this.#exclusive(() => this.#queueAccountWork());
         const result = await this.#exclusive(() => this.#engine.synchronize(options));
         await this.#deliverUpdates(lifecycle);
         return result;
@@ -870,6 +1201,8 @@ export class MurmurClient {
         this.#closed = true;
         destroyIdentity(this.#identity);
         destroyIdentity(this.#invitationRevocation);
+        if (this.#account !== undefined) destroyIdentity(this.#account);
+        if (this.#deviceCredential !== undefined) zeroBytes(this.#deviceCredential);
     }
 
     async #revokeInvitations(digest: Uint8Array | null, signal?: AbortSignal): Promise<void> {
@@ -915,13 +1248,21 @@ export class MurmurClient {
         }[] = [];
         try {
             for (let index = 0; index < CONTACT_ADMISSION_TARGET_KEY_PACKAGES; index += 1) {
-                bundles.push(createMlsKeyPackage(this.#identity, nowSeconds));
+                bundles.push(
+                    createMlsKeyPackage(
+                        this.#identity,
+                        nowSeconds,
+                        KEY_PACKAGE_LIFETIME_SECONDS,
+                        this.#deviceCredential ?? this.#identity.publicKey,
+                    ),
+                );
             }
             bundles.push(
                 createMlsKeyPackage(
                     this.#identity,
                     nowSeconds,
                     LAST_RESORT_KEY_PACKAGE_LIFETIME_SECONDS,
+                    this.#deviceCredential ?? this.#identity.publicKey,
                 ),
             );
             for (let index = 0; index < bundles.length; index += 1) {
@@ -969,7 +1310,12 @@ export class MurmurClient {
         }[] = [];
         try {
             for (let index = 0; index < DEFAULT_KEY_PACKAGES; index += 1) {
-                const bundle = createMlsKeyPackage(this.#identity, Math.floor(now / 1_000));
+                const bundle = createMlsKeyPackage(
+                    this.#identity,
+                    Math.floor(now / 1_000),
+                    KEY_PACKAGE_LIFETIME_SECONDS,
+                    this.#deviceCredential ?? this.#identity.publicKey,
+                );
                 bundles.push(bundle);
                 stored.push({
                     reference: mlsKeyPackageReference(bundle.keyPackage),
@@ -978,6 +1324,19 @@ export class MurmurClient {
                 });
             }
             await this.#engine.storeKeyPackages(stored);
+            if (this.#account !== undefined) {
+                const roster = await this.#ownRoster();
+                if (roster === undefined) {
+                    throw new Error("Account device is missing its roster");
+                }
+                return createAccountDiscoveryBundle(
+                    this.#account,
+                    this.#identity,
+                    roster,
+                    bundles.map((bundle) => bundle.keyPackage),
+                    { createdAt: now, expiresAt },
+                );
+            }
             return createDiscoveryBundle(
                 this.#identity,
                 bundles.map((bundle) => bundle.keyPackage),
@@ -1004,6 +1363,9 @@ export class MurmurClient {
             | "onContactAdded"
             | "onContactUpdated"
             | "onContactRemoved"
+            | "onDeviceAdded"
+            | "onDeviceRevoked"
+            | "onContactRosterChanged"
         >,
     ): Promise<number> {
         if (this.#updatesActive) return 0;
@@ -1013,18 +1375,35 @@ export class MurmurClient {
         try {
             for (;;) {
                 await this.#exclusive(() => this.#queueContactMaintenance());
+                await this.#exclusive(() => this.#queueAccountWork());
                 const prepared = await this.#exclusive(() => this.#engine.prepareUpdates());
                 const decisions: SessionRouteDecision[] = [];
                 const consumedKeys = new Set<string>();
                 const globalUpdates: MurmurUpdate[] = [];
                 const removedSessions: Uint8Array[] = [];
+                const claimedAccountSessions: Uint8Array[] = [];
                 let contactEvents: PreparedContactEvents | undefined;
+                let accountEvents: PreparedAccountEvents | undefined;
                 let deferredRoutes = false;
                 let deferredUpdates = false;
                 try {
                     for (const route of prepared.routes) {
                         let owner: SessionRouteDecision["owner"] | undefined;
-                        if (
+                        if (isAccountSyncSessionDescriptor(route.session.descriptor)) {
+                            const roster = await this.#ownRoster();
+                            const accountKey = (this.#account ?? this.#identity).publicKey;
+                            const claimed =
+                                roster !== undefined &&
+                                route.session.members.every(
+                                    (member) =>
+                                        equalBytes(member, accountKey) ||
+                                        isActiveDevice(roster, member),
+                                );
+                            owner = { version: 1, owner: claimed ? "account" : "ignored" };
+                            if (claimed) {
+                                claimedAccountSessions.push(route.session.id.slice());
+                            }
+                        } else if (
                             isContactSessionDescriptor(route.session.descriptor) &&
                             route.session.members.length === 2
                         ) {
@@ -1065,6 +1444,11 @@ export class MurmurClient {
                             consumedKeys.add(update.key);
                             continue;
                         }
+                        if (update.owner?.owner === "account") {
+                            await this.#processAccountPacket(update);
+                            consumedKeys.add(update.key);
+                            continue;
+                        }
                         if (update.owner?.owner === "ignored") {
                             consumedKeys.add(update.key);
                             continue;
@@ -1094,10 +1478,12 @@ export class MurmurClient {
                         consumedKeys.add(update.key);
                     }
                     contactEvents = await this.#contacts.prepareEvents();
+                    accountEvents = await prepareAccountEvents(this.#store);
                     if (
                         decisions.length === 0 &&
                         consumedKeys.size === 0 &&
-                        contactEvents.keys.length === 0
+                        contactEvents.keys.length === 0 &&
+                        accountEvents.keys.length === 0
                     ) {
                         break;
                     }
@@ -1116,29 +1502,56 @@ export class MurmurClient {
                     if (contactEvents.removed.length > 0) {
                         await lifecycle.onContactRemoved?.(contactEvents.removed);
                     }
+                    if (accountEvents.added.length > 0) {
+                        await lifecycle.onDeviceAdded?.(accountEvents.added);
+                    }
+                    if (accountEvents.revoked.length > 0) {
+                        await lifecycle.onDeviceRevoked?.(accountEvents.revoked);
+                    }
+                    if (accountEvents.contacts.length > 0) {
+                        await lifecycle.onContactRosterChanged?.(accountEvents.contacts);
+                    }
                     for (const sessionId of removedSessions) {
                         await this.#exclusive(() =>
                             this.#engine.destroyOwned(sessionId, "contact"),
                         );
                     }
                     const committedContactEvents = contactEvents;
+                    const committedAccountEvents = accountEvents;
                     await this.#exclusive(() =>
                         this.#engine.commitUpdates(
                             prepared,
                             decisions,
                             consumedKeys,
-                            async (transaction) =>
-                                this.#contacts.deletePreparedEvents(
+                            async (transaction) => {
+                                await this.#contacts.deletePreparedEvents(
                                     transaction,
                                     committedContactEvents,
-                                ),
+                                );
+                                await deletePreparedAccountEvents(
+                                    transaction,
+                                    committedAccountEvents,
+                                );
+                            },
                         ),
                     );
+                    for (const sessionId of claimedAccountSessions) {
+                        await this.#exclusive(async () => {
+                            const session = await this.#engine.get(sessionId);
+                            if (session?.status === "pending") {
+                                await this.#engine.activateOwned(sessionId, "account");
+                            }
+                            await this.#store.transaction((transaction) =>
+                                transaction.set(ACCOUNT_SESSION_KEY, sessionId.slice()),
+                            );
+                        });
+                    }
                     delivered += consumedKeys.size;
                     if (deferredRoutes || deferredUpdates) break;
                 } finally {
                     for (const decision of decisions) zeroBytes(decision.sessionId);
                     for (const sessionId of removedSessions) zeroBytes(sessionId);
+                    for (const sessionId of claimedAccountSessions) zeroBytes(sessionId);
                     this.#zeroPreparedUpdates(prepared);
                 }
             }
@@ -1161,6 +1574,147 @@ export class MurmurClient {
             zeroBytes(update.sender);
             zeroBytes(update.bytes);
         }
+    }
+
+    /** Validate and apply one authenticated packet from the account-sync session. */
+    async #processAccountPacket(update: MurmurUpdate): Promise<void> {
+        const account = this.#account ?? this.#identity;
+        try {
+            const packet = decodeAccountSyncPacket(update.bytes);
+            const roster = parseDeviceRoster(packet.roster);
+            if (!equalBytes(roster.accountKey, account.publicKey)) {
+                throw new Error("Account packet names a foreign account");
+            }
+            let admission:
+                | { readonly device: Uint8Array; readonly keyPackage: Uint8Array }
+                | undefined;
+            if (packet.type === "admission") {
+                const keyPackage = decodeMlsKeyPackage(packet.keyPackage);
+                if (!verifyMlsKeyPackage(keyPackage, Math.floor(this.#now() / 1_000))) {
+                    throw new Error("Account admission KeyPackage is invalid");
+                }
+                admission = {
+                    device: keyPackage.leafNode.signatureKey,
+                    keyPackage: packet.keyPackage,
+                };
+            }
+            await this.#store.transaction(async (transaction) => {
+                await observeDeviceRoster(
+                    transaction,
+                    account.publicKey,
+                    update.id,
+                    roster.accountKey,
+                    roster.authorDeviceKey,
+                    packet.roster,
+                    admission,
+                );
+                await this.#queueRosterBroadcast(transaction, packet.roster, admission?.keyPackage);
+            });
+        } catch {
+            return;
+        }
+    }
+
+    /** Queue automatic account work: pending admission and roster broadcast. */
+    async #queueAccountWork(): Promise<void> {
+        let queued = false;
+        if (this.#account !== undefined && this.#deviceCredential !== undefined) {
+            const sent = await this.#store.get(ACCOUNT_ADMISSION_SENT_KEY);
+            const sessionId = await this.#store.get(ACCOUNT_SESSION_KEY);
+            if (sent === undefined && sessionId !== undefined) {
+                const session = await this.#engine.get(sessionId);
+                const roster = await this.#ownRoster();
+                if (session?.status === "active" && roster !== undefined) {
+                    const bundle = createMlsKeyPackage(
+                        this.#identity,
+                        Math.floor(this.#now() / 1_000),
+                        KEY_PACKAGE_LIFETIME_SECONDS,
+                        this.#deviceCredential,
+                    );
+                    try {
+                        const reference = mlsKeyPackageReference(bundle.keyPackage);
+                        const bytes = serializeMlsKeyPackageBundle(bundle);
+                        try {
+                            // Reusable: convergence joins one Welcome per known session.
+                            await this.#engine.storeKeyPackages([
+                                {
+                                    reference,
+                                    bytes,
+                                    expiresAt: Number(
+                                        (bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n,
+                                    ),
+                                    reusable: true,
+                                },
+                            ]);
+                        } finally {
+                            zeroBytes(reference);
+                            zeroBytes(bytes);
+                        }
+                        const packet = encodeAccountSyncPacket({
+                            version: 1,
+                            type: "admission",
+                            roster: serializeDeviceRoster(roster),
+                            keyPackage: encodeMlsKeyPackage(bundle.keyPackage),
+                        });
+                        await this.#engine.send(sessionId, packet);
+                        await this.#store.transaction((transaction) =>
+                            transaction.set(ACCOUNT_ADMISSION_SENT_KEY, new Uint8Array([1])),
+                        );
+                        queued = true;
+                    } finally {
+                        destroyMlsKeyPackageBundle(bundle);
+                    }
+                }
+            }
+            if (sessionId !== undefined) zeroBytes(sessionId);
+        }
+        if (await this.#drainRosterBroadcast()) queued = true;
+        if (queued) this.#signalSync();
+    }
+
+    /** Publish the pending authenticated roster to every active non-account session. */
+    async #drainRosterBroadcast(): Promise<boolean> {
+        const pending = await this.#store.get(ACCOUNT_BROADCAST_KEY);
+        if (pending === undefined) return false;
+        let roster: Uint8Array;
+        let keyPackage: Uint8Array | undefined;
+        try {
+            const input = JSON.parse(utf8Decode(pending)) as Record<string, unknown>;
+            if (input.version !== 1 || typeof input.roster !== "string") {
+                throw new Error("Invalid roster broadcast");
+            }
+            roster = decodeBase64Url(input.roster);
+            keyPackage =
+                input.keyPackage === null || typeof input.keyPackage !== "string"
+                    ? undefined
+                    : decodeBase64Url(input.keyPackage);
+        } catch {
+            await this.#store.delete(ACCOUNT_BROADCAST_KEY);
+            return false;
+        } finally {
+            zeroBytes(pending);
+        }
+        const accountSessionId = await this.#store.get(ACCOUNT_SESSION_KEY);
+        let complete = true;
+        let cursor: string | null = null;
+        do {
+            const page = await this.#engine.list(cursor === null ? {} : { after: cursor });
+            for (const session of page.sessions) {
+                if (session.status !== "active") continue;
+                if (accountSessionId !== undefined && equalBytes(session.id, accountSessionId)) {
+                    continue;
+                }
+                try {
+                    await this.#engine.sendAccountRoster(session.id, roster, keyPackage);
+                } catch {
+                    complete = false;
+                }
+            }
+            cursor = page.cursor;
+        } while (cursor !== null);
+        if (accountSessionId !== undefined) zeroBytes(accountSessionId);
+        if (complete) await this.#store.delete(ACCOUNT_BROADCAST_KEY);
+        return true;
     }
 
     async #queueContactHellos(): Promise<boolean> {
@@ -1275,6 +1829,7 @@ export class MurmurClient {
     async #flushSync(milliseconds: number, signal: AbortSignal): Promise<void> {
         const retry = await this.#exclusive(async () => {
             await this.#queueContactMaintenance();
+            await this.#queueAccountWork();
             return this.#engine.flush(signal);
         });
         if (retry) {

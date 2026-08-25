@@ -6,6 +6,11 @@ import type {
     MurmurContactRequested,
     MurmurContactUpdated,
 } from "../contacts/types.js";
+import type {
+    MurmurContactRosterChanged,
+    MurmurDeviceAdded,
+    MurmurDeviceRevoked,
+} from "../accounts/types.js";
 
 /** Stable public view of one local MLS session. */
 export interface MurmurSession {
@@ -53,6 +58,14 @@ export interface MurmurSyncOptions {
     readonly onContactUpdated?: (contacts: readonly MurmurContactUpdated[]) => void | Promise<void>;
     /** Runs when technical contact sessions are removed. */
     readonly onContactRemoved?: (contacts: readonly MurmurContactRemoved[]) => void | Promise<void>;
+    /** Runs when a device of this account is durably authorized. */
+    readonly onDeviceAdded?: (devices: readonly MurmurDeviceAdded[]) => void | Promise<void>;
+    /** Runs when a device of this account is durably revoked. */
+    readonly onDeviceRevoked?: (devices: readonly MurmurDeviceRevoked[]) => void | Promise<void>;
+    /** Runs when an authenticated contact roster adds or revokes a device. */
+    readonly onContactRosterChanged?: (
+        changes: readonly MurmurContactRosterChanged[],
+    ) => void | Promise<void>;
 }
 
 /** One MLS-protected member proposal awaiting committer acceptance. */

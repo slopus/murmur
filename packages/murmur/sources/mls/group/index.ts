@@ -1,4 +1,5 @@
 import {
+    decodeDeviceCredential,
     equalBytes,
     randomBytes,
     zeroBytes,
@@ -31,6 +32,8 @@ import { openMlsWelcome } from "../welcome/index.js";
 export interface CreateMlsGroupOptions {
     readonly groupId?: Uint8Array;
     readonly epochSecret?: Uint8Array;
+    /** Account-authorized BasicCredential identity for this device leaf. */
+    readonly credentialIdentity?: Uint8Array;
 }
 
 /** Inputs for the reusable authenticated Welcome/tree adoption path. */
@@ -107,10 +110,30 @@ export function joinMlsGroupFromWelcome(options: JoinMlsGroupFromWelcomeOptions)
 
 /** Authenticate Murmur's BasicCredential identity-to-signing-key binding. */
 export function authenticateMurmurMlsCredential(leafNode: MlsLeafNode): boolean {
-    return (
+    if (
         leafNode.credential.identity.length === 32 &&
         equalBytes(leafNode.credential.identity, leafNode.signatureKey)
-    );
+    ) {
+        return true;
+    }
+    try {
+        return equalBytes(
+            decodeDeviceCredential(leafNode.credential.identity).deviceKey,
+            leafNode.signatureKey,
+        );
+    } catch {
+        return false;
+    }
+}
+
+/** Resolve the stable account key represented by one authenticated leaf. */
+export function murmurMlsAccountKey(leafNode: MlsLeafNode): Uint8Array {
+    if (!authenticateMurmurMlsCredential(leafNode)) {
+        throw new Error("Invalid Murmur MLS credential");
+    }
+    return leafNode.credential.identity.length === 32
+        ? leafNode.signatureKey.slice()
+        : decodeDeviceCredential(leafNode.credential.identity).accountKey;
 }
 
 /**
@@ -133,7 +156,12 @@ export function createMlsGroup(
         if (groupId.length === 0 || groupId.length > 255 || epochSecret.length !== 32) {
             throw new Error("Invalid MLS initial group inputs");
         }
-        bundle = createMlsKeyPackage(identity);
+        bundle = createMlsKeyPackage(
+            identity,
+            Math.floor(Date.now() / 1_000),
+            undefined,
+            options.credentialIdentity,
+        );
         const tree = new MlsRatchetTree([initialMlsRatchetTreeLeaf(bundle)]);
         const context: MlsGroupContext = {
             groupId,

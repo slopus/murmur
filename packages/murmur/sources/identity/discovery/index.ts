@@ -1,5 +1,6 @@
 export {
     DISCOVERY_INVITATION_TTL_MILLISECONDS,
+    createAccountDiscoveryBundle,
     createDiscoveryBundle,
     parseDiscoveryBundle,
     serializeDiscoveryBundle,
@@ -11,6 +12,7 @@ export {
     createSignedInvitationRevocation,
 } from "./impl/invitationAuthorization.js";
 export type {
+    AccountDiscoveryBundle,
     DiscoveryFetch,
     DiscoveryBundle,
     DiscoveryBundleOptions,
@@ -20,5 +22,6 @@ export type {
     HttpDiscoveryTransportOptions,
     InvitationRevocationOutcome,
     InvitationUploadAuthorization,
+    LegacyDiscoveryBundle,
     SignedInvitationRevocation,
 } from "./types.js";

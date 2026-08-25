@@ -1,6 +1,14 @@
 import type { IdentityKeyPair } from "../../../crypto/index.js";
 import { signBytes, validateIdentityPublicKey, verifyBytes } from "../../../crypto/index.js";
 import {
+    decodeDeviceCredential,
+    isActiveDevice,
+    parseDeviceRoster,
+    serializeDeviceRoster,
+    verifyDeviceRoster,
+    type MurmurDeviceRoster,
+} from "../../../accounts/index.js";
+import {
     decodeMlsKeyPackage,
     encodeMlsKeyPackage,
     mlsKeyPackageReference,
@@ -29,7 +37,7 @@ const MAXIMUM_BUNDLE_BYTES = 4 * 1024 * 1024;
 export const DISCOVERY_INVITATION_TTL_MILLISECONDS = 5 * 60 * 1_000;
 const DEFAULT_MAXIMUM_FUTURE_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 
-interface DiscoveryBundleJson {
+interface LegacyDiscoveryBundleJson {
     readonly version: 1;
     readonly identityKey: string;
     readonly createdAt: number;
@@ -37,6 +45,21 @@ interface DiscoveryBundleJson {
     readonly keyPackages: readonly string[];
     readonly signature: string;
 }
+
+interface AccountDiscoveryBundleJson {
+    readonly version: 2;
+    readonly identityKey: string;
+    readonly deviceKey: string;
+    readonly roster: string;
+    readonly createdAt: number;
+    readonly expiresAt: number;
+    readonly keyPackages: readonly string[];
+    readonly signature: string;
+}
+
+type UnsignedDiscoveryBundleJson =
+    | Omit<LegacyDiscoveryBundleJson, "signature">
+    | Omit<AccountDiscoveryBundleJson, "signature">;
 
 function object(value: unknown): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -46,7 +69,19 @@ function object(value: unknown): Record<string, unknown> {
 }
 
 function exact(value: Record<string, unknown>): void {
-    const fields = ["version", "identityKey", "createdAt", "expiresAt", "keyPackages", "signature"];
+    const fields =
+        value.version === 2
+            ? [
+                  "version",
+                  "identityKey",
+                  "deviceKey",
+                  "roster",
+                  "createdAt",
+                  "expiresAt",
+                  "keyPackages",
+                  "signature",
+              ]
+            : ["version", "identityKey", "createdAt", "expiresAt", "keyPackages", "signature"];
     if (
         fields.some((field) => !Object.hasOwn(value, field)) ||
         Object.keys(value).some((field) => !fields.includes(field))
@@ -55,9 +90,8 @@ function exact(value: Record<string, unknown>): void {
     }
 }
 
-function unsignedJson(bundle: DiscoveryBundle): Omit<DiscoveryBundleJson, "signature"> {
-    return {
-        version: 1,
+function unsignedJson(bundle: DiscoveryBundle): UnsignedDiscoveryBundleJson {
+    const common = {
         identityKey: encodeBase64Url(bundle.identityKey),
         createdAt: bundle.createdAt,
         expiresAt: bundle.expiresAt,
@@ -65,9 +99,17 @@ function unsignedJson(bundle: DiscoveryBundle): Omit<DiscoveryBundleJson, "signa
             encodeBase64Url(encodeMlsKeyPackage(keyPackage)),
         ),
     };
+    return bundle.version === 1
+        ? { ...common, version: 1 }
+        : {
+              ...common,
+              version: 2,
+              deviceKey: encodeBase64Url(bundle.deviceKey),
+              roster: encodeBase64Url(serializeDeviceRoster(bundle.roster)),
+          };
 }
 
-function signingJsonBytes(value: Omit<DiscoveryBundleJson, "signature">): Uint8Array {
+function signingJsonBytes(value: UnsignedDiscoveryBundleJson): Uint8Array {
     const prefix = utf8Encode(`${DOMAIN}\0`);
     const body = canonicalJsonBytes(value);
     const bytes = new Uint8Array(prefix.length + body.length);
@@ -86,7 +128,7 @@ function validateHeader(
     maximumFutureSkewMilliseconds: number,
 ): void {
     if (
-        bundle.version !== 1 ||
+        (bundle.version !== 1 && bundle.version !== 2) ||
         bundle.identityKey.length !== 32 ||
         !Number.isSafeInteger(bundle.createdAt) ||
         bundle.createdAt < 0 ||
@@ -97,6 +139,16 @@ function validateHeader(
         throw new Error("Invalid discovery bundle");
     }
     validateIdentityPublicKey({ publicKey: bundle.identityKey });
+    if (bundle.version === 2) {
+        validateIdentityPublicKey({ publicKey: bundle.deviceKey });
+        if (
+            !verifyDeviceRoster(bundle.roster) ||
+            !equalBytes(bundle.roster.accountKey, bundle.identityKey) ||
+            !isActiveDevice(bundle.roster, bundle.deviceKey)
+        ) {
+            throw new Error("Invalid discovery device roster");
+        }
+    }
     if (
         now !== null &&
         (!Number.isSafeInteger(now) ||
@@ -117,6 +169,7 @@ function validateKeyPackages(bundle: DiscoveryBundle, nowSeconds: number | null)
     }
     const references = new Set<string>();
     let totalBytes = 0;
+    const expectedDevice = bundle.version === 1 ? bundle.identityKey : bundle.deviceKey;
     for (const keyPackage of bundle.keyPackages) {
         const encoded = encodeMlsKeyPackage(keyPackage);
         totalBytes += encoded.length;
@@ -124,11 +177,23 @@ function validateKeyPackages(bundle: DiscoveryBundle, nowSeconds: number | null)
             encoded.length > MAXIMUM_KEY_PACKAGE_BYTES ||
             totalBytes > MAXIMUM_BUNDLE_BYTES ||
             !verifyMlsKeyPackage(keyPackage, nowSeconds) ||
-            !equalBytes(keyPackage.leafNode.signatureKey, bundle.identityKey) ||
-            !equalBytes(keyPackage.leafNode.credential.identity, bundle.identityKey) ||
+            !equalBytes(keyPackage.leafNode.signatureKey, expectedDevice) ||
             BigInt(bundle.expiresAt) > (keyPackage.leafNode.notAfter + 1n) * 1_000n
         ) {
             throw new Error("Invalid discovery KeyPackage");
+        }
+        if (bundle.version === 1) {
+            if (!equalBytes(keyPackage.leafNode.credential.identity, bundle.identityKey)) {
+                throw new Error("Invalid discovery KeyPackage credential");
+            }
+        } else {
+            const credential = decodeDeviceCredential(keyPackage.leafNode.credential.identity);
+            if (
+                !equalBytes(credential.accountKey, bundle.identityKey) ||
+                !equalBytes(credential.deviceKey, bundle.deviceKey)
+            ) {
+                throw new Error("Invalid discovery KeyPackage credential");
+            }
         }
         const reference = encodeBase64Url(mlsKeyPackageReference(keyPackage));
         if (references.has(reference)) {
@@ -191,6 +256,36 @@ export function createDiscoveryBundle(
     return bundle;
 }
 
+/** Create an account-signed bundle for one independently keyed active device. */
+export function createAccountDiscoveryBundle(
+    account: IdentityKeyPair,
+    device: IdentityKeyPair,
+    roster: MurmurDeviceRoster,
+    keyPackages: readonly MlsKeyPackage[],
+    options: DiscoveryBundleOptions = {},
+): DiscoveryBundle {
+    const createdAt = options.createdAt ?? Date.now();
+    const unsigned: DiscoveryBundle = {
+        version: 2,
+        identityKey: account.publicKey.slice(),
+        deviceKey: device.publicKey.slice(),
+        roster: parseDeviceRoster(serializeDeviceRoster(roster)),
+        createdAt,
+        expiresAt: options.expiresAt ?? createdAt + DISCOVERY_INVITATION_TTL_MILLISECONDS,
+        keyPackages: keyPackages.map((value) => decodeMlsKeyPackage(encodeMlsKeyPackage(value))),
+        signature: new Uint8Array(64),
+    };
+    validate(unsigned, createdAt, 0);
+    const bundle: DiscoveryBundle = {
+        ...unsigned,
+        signature: signBytes(account, signingBytes(unsigned)),
+    };
+    if (encodedBundle(bundle).length > MAXIMUM_BUNDLE_BYTES) {
+        throw new Error("Discovery bundle exceeds maximum encoded size");
+    }
+    return bundle;
+}
+
 /** Verify identity binding, outer signature, KeyPackages, lifetime, and uniqueness. */
 export function verifyDiscoveryBundle(
     bundle: DiscoveryBundle,
@@ -239,7 +334,7 @@ export function parseDiscoveryBundle(
     const input = object(parsed);
     exact(input);
     if (
-        input.version !== 1 ||
+        (input.version !== 1 && input.version !== 2) ||
         typeof input.identityKey !== "string" ||
         typeof input.createdAt !== "number" ||
         typeof input.expiresAt !== "number" ||
@@ -248,6 +343,12 @@ export function parseDiscoveryBundle(
         typeof input.signature !== "string"
     ) {
         throw new Error("Invalid discovery bundle");
+    }
+    if (
+        input.version === 2 &&
+        (typeof input.deviceKey !== "string" || typeof input.roster !== "string")
+    ) {
+        throw new Error("Invalid discovery account bundle");
     }
     if (
         input.keyPackages.length < 1 ||
@@ -267,40 +368,84 @@ export function parseDiscoveryBundle(
         throw new Error("Non-canonical discovery bundle encoding");
     }
     const time = validationTime(options);
-    const header: DiscoveryBundle = {
-        version: 1,
-        identityKey,
-        createdAt: input.createdAt,
-        expiresAt: input.expiresAt,
-        keyPackages: [],
-        signature,
-    };
+    const accountFields =
+        input.version === 2
+            ? {
+                  deviceKey: decodeBase64Url(input.deviceKey as string),
+                  roster: parseDeviceRoster(decodeBase64Url(input.roster as string)),
+              }
+            : undefined;
+    const header: DiscoveryBundle =
+        input.version === 1
+            ? {
+                  version: 1,
+                  identityKey,
+                  createdAt: input.createdAt,
+                  expiresAt: input.expiresAt,
+                  keyPackages: [],
+                  signature,
+              }
+            : {
+                  version: 2,
+                  identityKey,
+                  deviceKey: accountFields!.deviceKey,
+                  roster: accountFields!.roster,
+                  createdAt: input.createdAt,
+                  expiresAt: input.expiresAt,
+                  keyPackages: [],
+                  signature,
+              };
     validateHeader(header, time.now, time.maximumFutureSkewMilliseconds);
     if (
         !verifyBytes(
             { publicKey: identityKey },
-            signingJsonBytes({
-                version: 1,
-                identityKey: input.identityKey,
-                createdAt: input.createdAt,
-                expiresAt: input.expiresAt,
-                keyPackages: input.keyPackages as string[],
-            }),
+            signingJsonBytes(
+                input.version === 1
+                    ? {
+                          version: 1,
+                          identityKey: input.identityKey,
+                          createdAt: input.createdAt,
+                          expiresAt: input.expiresAt,
+                          keyPackages: input.keyPackages as string[],
+                      }
+                    : {
+                          version: 2,
+                          identityKey: input.identityKey,
+                          deviceKey: input.deviceKey as string,
+                          roster: input.roster as string,
+                          createdAt: input.createdAt,
+                          expiresAt: input.expiresAt,
+                          keyPackages: input.keyPackages as string[],
+                      },
+            ),
             signature,
         )
     ) {
         throw new Error("Invalid discovery bundle authentication");
     }
-    const bundle: DiscoveryBundle = {
-        version: 1,
-        identityKey,
-        createdAt: input.createdAt,
-        expiresAt: input.expiresAt,
-        keyPackages: input.keyPackages.map((value) =>
-            decodeMlsKeyPackage(decodeBase64Url(value as string)),
-        ),
-        signature,
-    };
+    const keyPackages = input.keyPackages.map((value) =>
+        decodeMlsKeyPackage(decodeBase64Url(value as string)),
+    );
+    const bundle: DiscoveryBundle =
+        input.version === 1
+            ? {
+                  version: 1,
+                  identityKey,
+                  createdAt: input.createdAt,
+                  expiresAt: input.expiresAt,
+                  keyPackages,
+                  signature,
+              }
+            : {
+                  version: 2,
+                  identityKey,
+                  deviceKey: accountFields!.deviceKey,
+                  roster: accountFields!.roster,
+                  createdAt: input.createdAt,
+                  expiresAt: input.expiresAt,
+                  keyPackages,
+                  signature,
+              };
     validateKeyPackages(bundle, Math.floor(Math.max(time.now, bundle.createdAt) / 1_000));
     const canonical = encodedBundle(bundle);
     if (!equalBytes(canonical, bytes)) {

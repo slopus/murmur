@@ -11,6 +11,7 @@ import type { MlsSecretTreeState } from "../secretTree/index.js";
 /** Public member data needed to authenticate one MLS epoch. */
 export interface MlsEpochMember {
     readonly signatureKey: Uint8Array;
+    readonly credentialIdentity: Uint8Array;
     readonly encryptionKey?: Uint8Array;
 }
 

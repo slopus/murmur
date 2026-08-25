@@ -127,6 +127,182 @@ function assertCurrentRequest(request: MurmurDeviceLinkRequest, now: number): vo
     }
 }
 
+function bytesField(value: unknown, exactLength: number | null, name: string): Uint8Array {
+    if (typeof value !== "string") throw new Error(`Invalid ${name}`);
+    const result = decodeBase64Url(value);
+    if (
+        (exactLength !== null && result.length !== exactLength) ||
+        encodeBase64Url(result) !== value
+    ) {
+        throw new Error(`Invalid ${name}`);
+    }
+    return result;
+}
+
+function parseObject(
+    value: Uint8Array,
+    fields: readonly string[],
+    name: string,
+): Record<string, unknown> {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(utf8Decode(value)) as unknown;
+    } catch {
+        throw new Error(`Invalid ${name}`);
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const input = parsed as Record<string, unknown>;
+    if (
+        fields.some((field) => !Object.hasOwn(input, field)) ||
+        Object.keys(input).some((field) => !fields.includes(field))
+    ) {
+        throw new Error(`Invalid ${name}`);
+    }
+    return input;
+}
+
+/** Serialize one device-link request for out-of-band transfer. */
+export function serializeDeviceLinkRequest(request: MurmurDeviceLinkRequest): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        requestId: encodeBase64Url(request.requestId),
+        createdAt: request.createdAt,
+        expiresAt: request.expiresAt,
+        ephemeralKey: encodeBase64Url(request.ephemeralKey),
+        deviceKey: encodeBase64Url(request.deviceKey),
+        keyPackage: encodeBase64Url(request.keyPackage),
+        proof: encodeBase64Url(request.proof),
+    });
+}
+
+/** Parse and time-validate one out-of-band device-link request. */
+export function parseDeviceLinkRequest(
+    value: Uint8Array,
+    now: number = Date.now(),
+): MurmurDeviceLinkRequest {
+    if (value.length < 1 || value.length > 2 * MAXIMUM_KEY_PACKAGE_BYTES) {
+        throw new Error("Invalid device-link request");
+    }
+    const input = parseObject(
+        value,
+        [
+            "version",
+            "requestId",
+            "createdAt",
+            "expiresAt",
+            "ephemeralKey",
+            "deviceKey",
+            "keyPackage",
+            "proof",
+        ],
+        "device-link request",
+    );
+    if (
+        input.version !== 1 ||
+        typeof input.createdAt !== "number" ||
+        typeof input.expiresAt !== "number"
+    ) {
+        throw new Error("Invalid device-link request");
+    }
+    const request: MurmurDeviceLinkRequest = Object.freeze({
+        version: 1,
+        requestId: bytesField(input.requestId, 32, "link request ID"),
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        ephemeralKey: bytesField(input.ephemeralKey, 32, "link ephemeral key"),
+        deviceKey: bytesField(input.deviceKey, 32, "link device key"),
+        keyPackage: bytesField(input.keyPackage, null, "link KeyPackage"),
+        proof: bytesField(input.proof, 64, "link proof"),
+    });
+    assertCurrentRequest(request, now);
+    return request;
+}
+
+/** Serialize one provisioning envelope for out-of-band transfer. */
+export function serializeProvisioningEnvelope(
+    envelope: MurmurDeviceProvisioningEnvelope,
+): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        requestId: encodeBase64Url(envelope.requestId),
+        createdAt: envelope.createdAt,
+        expiresAt: envelope.expiresAt,
+        authorDeviceKey: encodeBase64Url(envelope.authorDeviceKey),
+        ephemeralKey: encodeBase64Url(envelope.ephemeralKey),
+        nonce: encodeBase64Url(envelope.nonce),
+        ciphertext: encodeBase64Url(envelope.ciphertext),
+        signature: encodeBase64Url(envelope.signature),
+    });
+}
+
+/** Parse one out-of-band provisioning envelope without decrypting it. */
+export function parseProvisioningEnvelope(value: Uint8Array): MurmurDeviceProvisioningEnvelope {
+    if (value.length < 1 || value.length > 2 * MAXIMUM_ENVELOPE_BYTES) {
+        throw new Error("Invalid provisioning envelope");
+    }
+    const input = parseObject(
+        value,
+        [
+            "version",
+            "requestId",
+            "createdAt",
+            "expiresAt",
+            "authorDeviceKey",
+            "ephemeralKey",
+            "nonce",
+            "ciphertext",
+            "signature",
+        ],
+        "provisioning envelope",
+    );
+    if (
+        input.version !== 1 ||
+        typeof input.createdAt !== "number" ||
+        typeof input.expiresAt !== "number"
+    ) {
+        throw new Error("Invalid provisioning envelope");
+    }
+    return Object.freeze({
+        version: 1,
+        requestId: bytesField(input.requestId, 32, "envelope request ID"),
+        createdAt: input.createdAt,
+        expiresAt: input.expiresAt,
+        authorDeviceKey: bytesField(input.authorDeviceKey, 32, "envelope author key"),
+        ephemeralKey: bytesField(input.ephemeralKey, 32, "envelope ephemeral key"),
+        nonce: bytesField(input.nonce, 12, "envelope nonce"),
+        ciphertext: bytesField(input.ciphertext, null, "envelope ciphertext"),
+        signature: bytesField(input.signature, 64, "envelope signature"),
+    });
+}
+
+/** Serialize retained link material, including its ephemeral secret, for storage. */
+export function serializeDeviceLinkMaterial(material: MurmurDeviceLinkMaterial): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        request: encodeBase64Url(serializeDeviceLinkRequest(material.request)),
+        ephemeralSecretKey: encodeBase64Url(material.ephemeralSecretKey),
+    });
+}
+
+/** Restore retained link material from durable storage without expiry checks. */
+export function parseDeviceLinkMaterial(
+    value: Uint8Array,
+    now: number = Date.now(),
+): MurmurDeviceLinkMaterial {
+    const input = parseObject(
+        value,
+        ["version", "request", "ephemeralSecretKey"],
+        "device-link material",
+    );
+    if (input.version !== 1) throw new Error("Invalid device-link material");
+    return Object.freeze({
+        request: parseDeviceLinkRequest(bytesField(input.request, null, "link request"), now),
+        ephemeralSecretKey: bytesField(input.ephemeralSecretKey, 32, "link ephemeral secret"),
+    });
+}
+
 /** Create short-lived URI material and retain the matching ephemeral secret. */
 export function createDeviceLinkMaterial(
     device: IdentityKeyPair,

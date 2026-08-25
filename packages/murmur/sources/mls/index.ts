@@ -2,6 +2,7 @@ export {
     authenticateMurmurMlsCredential,
     createMlsGroup,
     joinMlsGroupFromWelcome,
+    murmurMlsAccountKey,
 } from "./group/index.js";
 export { MlsEpochState } from "./epoch/index.js";
 export type { MlsEpochCommitProposal } from "./epoch/index.js";

@@ -1,5 +1,6 @@
 import {
     concatBytes,
+    decodeDeviceCredential,
     equalBytes,
     randomBytes,
     type IdentityKeyPair,
@@ -39,6 +40,7 @@ export function createMlsKeyPackage(
     identity: IdentityKeyPair,
     nowSeconds: number = Math.floor(Date.now() / 1_000),
     lifetimeSeconds: number = DEFAULT_LIFETIME_SECONDS,
+    credentialIdentity: Uint8Array = identity.publicKey,
 ): MlsKeyPackageBundle {
     if (
         !Number.isSafeInteger(nowSeconds) ||
@@ -58,10 +60,13 @@ export function createMlsKeyPackage(
         if (notAfter > 0xffff_ffff_ffff_ffffn) {
             throw new Error("KeyPackage lifetime exceeds uint64");
         }
+        if (credentialIdentity.length < 1 || credentialIdentity.length > 1024) {
+            throw new Error("Invalid MLS credential identity");
+        }
         const unsignedLeaf = {
             encryptionKey: leafKeyPair.publicKey,
             signatureKey: identity.publicKey.slice(),
-            credential: { identity: identity.publicKey.slice() },
+            credential: { identity: credentialIdentity.slice() },
             notBefore,
             notAfter,
         };
@@ -107,14 +112,33 @@ export function verifyMlsKeyPackage(
     try {
         const canonicalInitKey = canonicalizeHpkePublicKey(keyPackage.initKey);
         const canonicalLeafKey = canonicalizeHpkePublicKey(keyPackage.leafNode.encryptionKey);
+        const credentialMatches = (() => {
+            if (
+                keyPackage.leafNode.credential.identity.length === 32 &&
+                equalBytes(
+                    keyPackage.leafNode.credential.identity,
+                    keyPackage.leafNode.signatureKey,
+                )
+            ) {
+                return true;
+            }
+            try {
+                return equalBytes(
+                    decodeDeviceCredential(keyPackage.leafNode.credential.identity).deviceKey,
+                    keyPackage.leafNode.signatureKey,
+                );
+            } catch {
+                return false;
+            }
+        })();
         return (
             keyPackage.version === 1 &&
             keyPackage.cipherSuite === 0x0001 &&
             keyPackage.initKey.length === 32 &&
             keyPackage.leafNode.encryptionKey.length === 32 &&
             keyPackage.leafNode.signatureKey.length === 32 &&
-            keyPackage.leafNode.credential.identity.length === 32 &&
-            equalBytes(keyPackage.leafNode.credential.identity, keyPackage.leafNode.signatureKey) &&
+            keyPackage.leafNode.credential.identity.length <= 1024 &&
+            credentialMatches &&
             !equalBytes(canonicalInitKey, canonicalLeafKey) &&
             (nowSeconds === null ||
                 (Number.isSafeInteger(nowSeconds) &&

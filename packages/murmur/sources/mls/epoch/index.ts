@@ -145,6 +145,7 @@ function membersFromTree(tree: MlsRatchetTree): readonly (MlsEpochMember | undef
         const decoded = decodeMlsLeafNodeBytes(node.encoded);
         return {
             signatureKey: decoded.signatureKey.slice(),
+            credentialIdentity: decoded.credential.identity.slice(),
             encryptionKey: decoded.encryptionKey.slice(),
         };
     });
@@ -322,10 +323,14 @@ export class MlsEpochState {
         if (
             localMember === undefined ||
             localMember.signatureKey.length !== 32 ||
+            localMember.credentialIdentity.length < 1 ||
+            localMember.credentialIdentity.length > 1024 ||
             configuredMembers.some(
                 (member) =>
                     member !== undefined &&
                     (member.signatureKey.length !== 32 ||
+                        member.credentialIdentity.length < 1 ||
+                        member.credentialIdentity.length > 1024 ||
                         (member.encryptionKey !== undefined && member.encryptionKey.length !== 32)),
             )
         ) {
@@ -364,9 +369,13 @@ export class MlsEpochState {
                 member === undefined
                     ? undefined
                     : member.encryptionKey === undefined
-                      ? { signatureKey: member.signatureKey.slice() }
+                      ? {
+                            signatureKey: member.signatureKey.slice(),
+                            credentialIdentity: member.credentialIdentity.slice(),
+                        }
                       : {
                             signatureKey: member.signatureKey.slice(),
+                            credentialIdentity: member.credentialIdentity.slice(),
                             encryptionKey: member.encryptionKey.slice(),
                         },
             );
@@ -480,6 +489,12 @@ export class MlsEpochState {
     get memberSignatureKeys(): readonly (Uint8Array | undefined)[] {
         this.#ensureActive();
         return this.#members.map((member) => member?.signatureKey.slice());
+    }
+
+    /** Defensive BasicCredential identity view indexed by MLS leaf number. */
+    get memberCredentialIdentities(): readonly (Uint8Array | undefined)[] {
+        this.#ensureActive();
+        return this.#members.map((member) => member?.credentialIdentity.slice());
     }
 
     /** MLS leaf index of the local member inside this epoch. */

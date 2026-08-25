@@ -1,7 +1,8 @@
 import type { MlsKeyPackage } from "../../mls/keyPackage/index.js";
+import type { MurmurDeviceRoster } from "../../accounts/index.js";
 
 /** Signed, self-contained material an application may share out of band. */
-export interface DiscoveryBundle {
+export interface LegacyDiscoveryBundle {
     readonly version: 1;
     readonly identityKey: Uint8Array;
     readonly createdAt: number;
@@ -9,6 +10,23 @@ export interface DiscoveryBundle {
     readonly keyPackages: readonly MlsKeyPackage[];
     readonly signature: Uint8Array;
 }
+
+/** Account-signed discovery material for one independently keyed active device. */
+export interface AccountDiscoveryBundle {
+    readonly version: 2;
+    /** Stable account-signing identity. */
+    readonly identityKey: Uint8Array;
+    /** Independently keyed device owning the included KeyPackages and inbox. */
+    readonly deviceKey: Uint8Array;
+    readonly roster: MurmurDeviceRoster;
+    readonly createdAt: number;
+    readonly expiresAt: number;
+    readonly keyPackages: readonly MlsKeyPackage[];
+    readonly signature: Uint8Array;
+}
+
+/** Backward-compatible legacy or account-device discovery material. */
+export type DiscoveryBundle = LegacyDiscoveryBundle | AccountDiscoveryBundle;
 
 /** Construction policy for one discovery bundle. */
 export interface DiscoveryBundleOptions {

@@ -73,6 +73,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "WebSocketDeliveryTransport",
     "contactSessionDescriptor",
     "containsRecipient",
+    "createAccountDiscoveryBundle",
     "createDiscoveryBundle",
     "createMurmurServiceSessionDescriptor",
     "createSignedDelivery",

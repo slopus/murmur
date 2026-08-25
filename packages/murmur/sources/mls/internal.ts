@@ -20,3 +20,4 @@ export {
     zeroBytes,
     type JsonValue,
 } from "../utils/index.js";
+export { decodeDeviceCredential } from "../accounts/index.js";
