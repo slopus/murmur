@@ -13,6 +13,7 @@ export {
     HttpDeliveryTransport,
     HttpRelaySessionProvider,
     InboxProcessor,
+    InboxContinuityLossError,
     InboxStateRollbackError,
     OversizedInboxDeliveryError,
     TerminalInboxDeliveryError,
@@ -22,6 +23,7 @@ export {
     createSignedInboxRead,
     createSignedRelaySessionRequest,
     parseInboxPage,
+    parseInboxContinuity,
     parseRelaySessionTicket,
     parseSignedDelivery,
     parseSignedRelaySessionRequest,
@@ -48,8 +50,11 @@ export type {
     HttpDeliveryTransportOptions,
     HttpRelaySessionProviderOptions,
     InboxDelivery,
+    InboxAcknowledgement,
     InboxDeliveryHandler,
     InboxPage,
+    InboxContinuity,
+    InboxStreamEvent,
     InboxProcessorDependencies,
     InboxProcessorOptions,
     InboxRejection,
@@ -109,7 +114,7 @@ export type {
     MurmurServiceRegistration,
     MurmurServiceSessionDescriptor,
 } from "./services/index.js";
-export { MurmurClient } from "./sessions/index.js";
+export { MurmurClient, MurmurResetRequiredError } from "./sessions/index.js";
 export type {
     CreateMurmurSessionOptions,
     MurmurClientOptions,
@@ -119,6 +124,8 @@ export type {
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionPolicies,
+    MurmurResetEvent,
+    MurmurResetSession,
     MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
@@ -130,6 +137,7 @@ export type {
     MurmurDeviceRevoked,
     MurmurDeviceRoster,
     MurmurDeviceRosterEntry,
+    MurmurDormantDevice,
 } from "./accounts/index.js";
 export type {
     AccountDiscoveryBundle,
