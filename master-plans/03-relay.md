@@ -87,10 +87,10 @@ For every ongoing MLS delivery, the exact recipient set contains every current
 device member, including the publishing device, and is bound in a way
 recipients can verify. Multiple devices owned by one account are independent
 MLS members with roster-certified credentials and independent state. The relay
-never resolves concurrent MLS Commits. MLS sessions serialize Commits through their
-authenticated epoch committer before publication; non-committers publish MLS
-Proposals instead. Exact authentication, token format, signatures, and wire
-encoding remain implementation details.
+applies no Commit semantics; members resolve concurrent MLS Commits themselves
+from the shared event ID that each atomic multicast carries in every inbox, as
+dictated by the sessions plan. Exact authentication, token format, signatures,
+and wire encoding remain implementation details.
 
 Publication never waits for a recipient to be online. Murmur may create an
 entire dependency-ordered outbox while offline, including Welcome deliveries, a
@@ -99,6 +99,30 @@ When the relay becomes reachable, Murmur publishes each recipient's
 prerequisites before the deliveries that depend on them. The relay durably
 queues those accepted deliveries within its configured bounds; recipient
 consumption is not part of sender publication.
+
+## Continuity
+
+Each inbox carries two continuity values alongside its event IDs: a strictly
+sequential per-inbox delivery number stamped on every queued delivery, and a
+per-inbox loss generation. Whenever the relay removes a delivery reference that
+was never acknowledged — expiry, quota eviction, database recovery, or any
+other cause — it advances that inbox's loss generation instead of pretending
+nothing happened. Acknowledged trimming never changes the generation. A relay
+with fresh or restored state issues a new unpredictable generation, so lost
+relay storage cannot impersonate continuity. Reads and streams expose the
+current generation and each delivery's sequence number.
+
+A device that observes a sequence gap or a generation change knows with
+certainty that it missed something; a device that drains to the current tip
+without either has proof it processed every delivery in order. The relay still
+attaches no meaning to any of it — the numbers describe the queue, never the
+contents.
+
+The unacknowledged retention window is six months. That single constant is the
+system's re-pairing window: a device dark for less than six months drains its
+inbox completely and loses nothing, and a device dark for longer is
+definitionally dead and re-enters only through the device reset flow dictated
+by the continuity plan.
 
 ## Receiving and trimming
 
@@ -128,10 +152,12 @@ record.
 
 ## Bounds
 
-Queues have a quota and a maximum delivery TTL. The invitation cache has
-separate item and byte quotas and a hard five-minute TTL. A full queue or cache
-creates explicit backpressure, and expiration defines the maximum supported
-offline or invitation window. Fanout manifests and their retry work are bounded
+Queues have a quota and a six-month maximum delivery TTL. The invitation cache
+has separate item and byte quotas and a hard five-minute TTL. A full queue or
+cache creates explicit backpressure, and expiration defines the maximum
+supported offline or invitation window. Every unacknowledged removal, whether
+by TTL or quota, advances the inbox's loss generation so the loss is explicit
+rather than silent. Fanout manifests and their retry work are bounded
 by the same delivery expiry plus separate item and byte quotas. These bounds
 prevent abandoned state from consuming storage forever. They do not turn the
 relay into durable history, an identity directory, or a recovery system.
@@ -155,8 +181,8 @@ relay into durable history, an identity directory, or a recovery system.
   remains; after the relay forgets it, durable recipient replay protection
   handles a late retry.
 - Every ongoing MLS delivery includes the publisher and every other current
-  epoch member. The relay does not arbitrate Commits; the MLS epoch committer
-  serializes them before publication.
+  epoch member. The relay applies no Commit semantics; members resolve
+  concurrent Commits from the shared per-multicast event IDs.
 - A sender may durably prepare Welcome, Commit, and post-Commit application
   deliveries entirely offline. Later publication preserves their dependency
   order and never waits for any recipient to connect or consume them.
@@ -176,8 +202,12 @@ relay into durable history, an identity directory, or a recovery system.
   digest of its exact bytes, is never enumerable by identity, expires within
   five minutes, and cannot have its lifetime extended by re-upload.
 - Quota and TTL bound abandoned queues and incomplete fanout, expose
-  backpressure and the maximum offline window, and separately bound cached
-  invitations.
+  backpressure and the six-month maximum offline window, and separately bound
+  cached invitations.
+- Every delivery carries a strictly sequential per-inbox number, every inbox
+  exposes a loss generation that advances exactly when an unacknowledged
+  delivery is removed for any reason, and fresh relay state issues a new
+  unpredictable generation.
 - Every schema upgrade after version 3 migrates in place and preserves pending
   relay data; operators are not required to start from a clean database.
 - The relay has no retained event history, snapshots, public identity or
