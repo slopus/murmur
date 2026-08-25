@@ -25,8 +25,12 @@ On detected loss the device resets completely. It stops processing, surfaces
 one final reset event to the application containing the full snapshot of every
 affected session — identifiers, descriptors, membership, and roles — and then
 destroys all session state: epochs, ratchets, buffered events, outboxes, and
-intents. It keeps only its identity key, device credential, and account
-roster. There is no partial reset and no per-session survival.
+intents. It keeps its device identity key, device credential, account signing
+material where this device holds it, the account roster, and durable contact
+relationships and their profile metadata — the social graph is account state,
+not session state, and a reset must not cost it. Everything transport- and
+session-shaped is destroyed. There is no partial reset and no per-session
+survival.
 
 Re-admission reuses the existing roster convergence machinery. The reset
 device announces a signed reset generation through its account roster, the
@@ -71,10 +75,14 @@ silent unacknowledged removal the relay performs today.
 - A device that drains to the tip with an unbroken sequence chain and
   unchanged generation has processed every delivery exactly once and in
   order; the chaos suites cannot construct a silent-loss counterexample.
-- A sequence gap or generation change triggers exactly one reset: one
-  application callback with the complete affected-session snapshot, then
-  destruction of all session state with identity, device credential, and
-  roster retained.
+- A sequence gap or generation change triggers exactly one committed reset:
+  the reset is durably recorded first, the application callback delivers the
+  complete affected-session snapshot at least once until it resolves, and the
+  purge commits exactly once, destroying all session and transport state while
+  device identity, account signing material held by this device, device
+  credential, roster, and durable contact relationships are retained.
+- A reset adopts the relay's observed head as its new continuity baseline, so
+  a reset device cannot loop on the same loss.
 - A reset device's signed reset announcement converges automatically: every
   member holding the account Removes the dead leaf and issues a fresh Welcome
   in every shared session, without manual action, while the account remains a
