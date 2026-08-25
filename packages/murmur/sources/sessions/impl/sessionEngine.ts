@@ -79,6 +79,7 @@ import {
     encodeBootstrapFrame,
     encodeCommitterControl,
     encodePrivateCiphertext,
+    encodeProvisioningCiphertext,
     encodePrivateFrame,
     encodeStoredProposal,
     openCommitCiphertext,
@@ -130,6 +131,8 @@ const OUTBOX_SCAN_ITEMS = 64;
 const PREVIOUS_EPOCH_GRACE_MILLISECONDS = 5 * 60 * 1_000;
 const PREVIOUS_EPOCH_MESSAGES = 64;
 const DELIVERY_TTL_MILLISECONDS = 29 * 24 * 60 * 60 * 1_000;
+const PROVISIONING_TTL_MILLISECONDS = 5 * 60 * 1_000;
+const PENDING_ENVELOPE_KEY = "murmur/accounts/v1/pending-envelope";
 const COMMIT_EXPORT_LABEL = "murmur session commit";
 const COMMIT_EXPORT_CONTEXT = utf8Encode("murmur/session-commit/v1");
 
@@ -491,6 +494,41 @@ export class SessionEngine {
             { now },
             MURMUR_INTERNAL_INBOX_HANDLER,
         );
+    }
+
+    /**
+     * Publish one encrypted provisioning envelope to the new device's inbox.
+     *
+     * The envelope is already sealed to the requesting device's ephemeral key,
+     * so the relay carries only opaque bytes with a five-minute lifetime. This
+     * publishes immediately: device linking is interactive, and a failure is
+     * surfaced to the caller for retry rather than queued durably.
+     */
+    async publishProvisioningEnvelope(
+        recipientDevice: Uint8Array,
+        envelope: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        if (recipientDevice.length !== 32) throw new Error("Invalid provisioning recipient");
+        const now = this.#now();
+        const delivery = createSignedDelivery(
+            this.#identity,
+            [recipientDevice],
+            encodeProvisioningCiphertext(envelope),
+            { createdAt: now, expiresAt: now + PROVISIONING_TTL_MILLISECONDS },
+        );
+        await this.#transport.publish(delivery, signal);
+    }
+
+    /** Read the durably received provisioning envelope, if one is pending. */
+    async pendingProvisioningEnvelope(): Promise<Uint8Array | undefined> {
+        return this.#store.get(PENDING_ENVELOPE_KEY);
+    }
+
+    /** Delete the pending provisioning envelope after completion or rejection. */
+    async deletePendingProvisioningEnvelope(transaction?: StoreTransaction): Promise<void> {
+        if (transaction === undefined) await this.#store.delete(PENDING_ENVELOPE_KEY);
+        else await transaction.delete(PENDING_ENVELOPE_KEY);
     }
 
     /** Adopt an account-authorized device credential after provisioning completes. */
@@ -2039,6 +2077,13 @@ export class SessionEngine {
         }
         if (wire.kind === "bootstrap") {
             await this.#receiveBootstrap(transaction, queued, wire.box);
+            return;
+        }
+        if (wire.kind === "provisioning") {
+            if (this.#now() > queued.delivery.createdAt + PROVISIONING_TTL_MILLISECONDS) {
+                throw new TerminalInboxDeliveryError("expired_provisioning_envelope");
+            }
+            await setAndZero(transaction, PENDING_ENVELOPE_KEY, wire.envelope.slice());
             return;
         }
         let id: Uint8Array;

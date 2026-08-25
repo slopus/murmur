@@ -70,7 +70,11 @@ issuedAt, mutationId): MurmurDeviceRoster` — signed child revision marking
 ### Provisioning (`impl/deviceProvisioning.ts`)
 
 The Signal-style linking handshake. All artifacts are short-lived (5 minutes),
-transcript-bound, and replay-protected.
+transcript-bound, and replay-protected. Only the request (~750 bytes) needs an
+out-of-band channel such as a QR code; the response envelope is normally
+published to the new device's relay inbox as an opaque five-minute delivery
+and picked up automatically on its next synchronization. The byte codecs
+below remain for fully offline manual transport.
 
 - `createDeviceLinkMaterial(device, keyPackage, now?, ttlMilliseconds?):
 MurmurDeviceLinkMaterial` — new device builds the signed link request (its

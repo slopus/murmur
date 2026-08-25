@@ -41,30 +41,22 @@ requires external cryptographic audit before production use.
 
 - `class PrivateGroupStateClient` — one member's view of one private group,
   constructed from the group master secret, the local account identifier, and
-  a `PrivateGroupStateTransport` to the service.
-    - `obtainCredential(...): Promise<PrivateGroupAccountCredential>` — run
-      blind issuance against the service: the service authenticates the account
-      upstream, signs the hidden identifier plus expiry, and the client unblinds
-      and validates the result.
-    - `createPresentation(...): Uint8Array` — answer one service challenge with
-      a randomized zero-knowledge presentation proving the credential covers
-      the same hidden identifier as the member's encrypted entry.
-    - `authorize(...): Promise<PrivateGroupAccessToken>` — full challenge →
-      presentation → short-lived scoped token round trip.
-    - `buildInitialRecord(content: PrivateGroupRecordContent):
+  a `PrivateGroupStateTransport` to the service. - `obtainCredential(...): Promise<PrivateGroupAccountCredential>` — run
+  blind issuance against the service: the service authenticates the account
+  upstream, signs the hidden identifier plus expiry, and the client unblinds
+  and validates the result. - `createPresentation(...): Uint8Array` — answer one service challenge with
+  a randomized zero-knowledge presentation proving the credential covers
+  the same hidden identifier as the member's encrypted entry. - `authorize(...): Promise<PrivateGroupAccessToken>` — full challenge →
+  presentation → short-lived scoped token round trip. - `buildInitialRecord(content: PrivateGroupRecordContent):
 PrivateGroupStateRecord` — revision 1 from the current authenticated MLS
-      snapshot: deterministic member entries, encrypted attributes, MLS digest,
-      member-keyed revision authenticator.
-    - `buildSuccessorRecord(...): PrivateGroupStateRecord` — next revision
-      chained to the accepted parent hash.
-    - `acceptRecord(...): PrivateGroupAcceptedState` — the trust gate: verify
-      authenticator, decrypt attributes, check revision continuity against the
-      trusted tip (no forks, rollbacks, or gaps), and require the encrypted
-      roster to equal the logical accounts of the local MLS session snapshot.
-    - `createGroup(...)` / `readGroup(...)` / `replaceGroup(...):
+  snapshot: deterministic member entries, encrypted attributes, MLS digest,
+  member-keyed revision authenticator. - `buildSuccessorRecord(...): PrivateGroupStateRecord` — next revision
+  chained to the accepted parent hash. - `acceptRecord(...): PrivateGroupAcceptedState` — the trust gate: verify
+  authenticator, decrypt attributes, check revision continuity against the
+  trusted tip (no forks, rollbacks, or gaps), and require the encrypted
+  roster to equal the logical accounts of the local MLS session snapshot. - `createGroup(...)` / `readGroup(...)` / `replaceGroup(...):
 Promise<PrivateGroupAcceptedState>` — token-authorized service round
-      trips that end in `acceptRecord`.
-    - `close(): void` — zero retained group and credential secrets.
+  trips that end in `acceptRecord`. - `close(): void` — zero retained group and credential secrets.
 
 ### Record codec (`impl/recordCodec.ts`)
 

@@ -154,10 +154,12 @@ describe("multidevice messenger", () => {
                 await pumpAll([alice1, bob], 4);
                 expect(bob.messages.map(({ text }) => text)).toContain("hello bob");
 
-                // The second device links through transported request and envelope bytes.
+                // Only the QR-sized request travels out of band; the encrypted
+                // envelope arrives automatically through the new device's inbox.
                 const request = await alice2.client.linkDevice();
-                const envelope = await alice1.client.authorizeDevice(request);
-                await alice2.client.completeDeviceLink(envelope);
+                expect(request.length).toBeLessThan(1_200);
+                await alice1.client.authorizeDevice(request);
+                await pumpAll([alice2], 2);
                 expect(alice2.client.accountKey).toEqual(alice1.client.accountKey);
                 await pumpAll([alice1, alice2, bob], 8);
 

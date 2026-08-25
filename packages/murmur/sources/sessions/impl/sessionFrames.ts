@@ -16,6 +16,8 @@ import {
 const BOOTSTRAP_KIND = 1;
 const PRIVATE_KIND = 2;
 const COMMIT_KIND = 3;
+const PROVISIONING_KIND = 4;
+const MAXIMUM_PROVISIONING_BYTES = 256 * 1024;
 const MAXIMUM_FRAME_BYTES = 70 * 1024 * 1024;
 const COMMIT_DOMAIN = utf8Encode("murmur/session-commit/v1");
 
@@ -70,6 +72,7 @@ export interface CommitFrame {
 export type SessionCiphertext =
     | { readonly kind: "bootstrap"; readonly box: SealedBox }
     | { readonly kind: "private"; readonly message: Uint8Array }
+    | { readonly kind: "provisioning"; readonly envelope: Uint8Array }
     | {
           readonly kind: "commit";
           readonly groupId: Uint8Array;
@@ -132,6 +135,14 @@ export function encodeBootstrapCiphertext(box: SealedBox): Uint8Array {
     );
 }
 
+/** Frame one already-encrypted provisioning envelope for inbox delivery. */
+export function encodeProvisioningCiphertext(envelope: Uint8Array): Uint8Array {
+    if (envelope.length < 1 || envelope.length > MAXIMUM_PROVISIONING_BYTES) {
+        throw new Error("Invalid provisioning envelope delivery");
+    }
+    return prefixed(PROVISIONING_KIND, envelope);
+}
+
 export function encodePrivateCiphertext(message: Uint8Array): Uint8Array {
     if (message.length < 1 || message.length > MAXIMUM_FRAME_BYTES) {
         throw new Error("Invalid MLS private delivery");
@@ -187,6 +198,12 @@ export function parseSessionCiphertext(value: Uint8Array): SessionCiphertext {
     const kind = value[0];
     const body = value.slice(1);
     if (kind === PRIVATE_KIND) return { kind: "private", message: body };
+    if (kind === PROVISIONING_KIND) {
+        if (body.length > MAXIMUM_PROVISIONING_BYTES) {
+            throw new Error("Invalid provisioning envelope delivery");
+        }
+        return { kind: "provisioning", envelope: body };
+    }
     const input = parseJson(body, "session ciphertext");
     if (kind === BOOTSTRAP_KIND) {
         exact(

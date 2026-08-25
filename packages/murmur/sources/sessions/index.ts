@@ -516,7 +516,9 @@ export class MurmurClient {
                     zeroBytes(sessionId);
                 }
             }
-            return serializeProvisioningEnvelope(authorized.envelope);
+            const envelopeBytes = serializeProvisioningEnvelope(authorized.envelope);
+            await this.#engine.publishProvisioningEnvelope(request.deviceKey, envelopeBytes);
+            return envelopeBytes;
         });
         this.#signalSync();
         return envelope;
@@ -530,48 +532,55 @@ export class MurmurClient {
      * and receives Welcomes for every converged contact and service session.
      */
     async completeDeviceLink(envelopeBytes: Uint8Array): Promise<void> {
-        await this.#exclusive(async () => {
-            const stored = await this.#store.get(LINK_MATERIAL_KEY);
-            if (stored === undefined) throw new Error("No pending device link");
-            let material: ReturnType<typeof parseDeviceLinkMaterial>;
-            try {
-                material = parseDeviceLinkMaterial(stored, this.#now());
-            } finally {
-                zeroBytes(stored);
-            }
-            try {
-                const envelope = parseProvisioningEnvelope(envelopeBytes);
-                const provisioned = completeDeviceProvisioning(material, envelope, this.#now());
-                const credential = encodeDeviceCredential(
-                    provisioned.roster,
-                    this.#identity.publicKey,
-                );
-                const accountRoot = encodeIdentityRoot(provisioned.account);
-                const rosterBytes = serializeDeviceRoster(provisioned.roster);
-                try {
-                    await this.#store.transaction(async (transaction) => {
-                        await transaction.set(ACCOUNT_ROOT_KEY, accountRoot);
-                        await transaction.set(DEVICE_CREDENTIAL_KEY, credential);
-                        await transaction.set(ACCOUNT_ROSTER_KEY, rosterBytes);
-                        await transaction.delete(LINK_MATERIAL_KEY);
-                    });
-                } finally {
-                    zeroBytes(accountRoot);
-                    zeroBytes(rosterBytes);
-                }
-                this.#account = provisioned.account;
-                this.#deviceCredential = credential.slice();
-                this.#engine.adoptDeviceCredential(credential);
-                this.#contacts = new ContactEngine(
-                    this.#store,
-                    provisioned.account.publicKey,
-                    this.#now,
-                );
-            } finally {
-                zeroBytes(material.ephemeralSecretKey);
-            }
-        });
+        await this.#exclusive(() => this.#completeDeviceLinkBytes(envelopeBytes));
         this.#signalSync();
+    }
+
+    async #completeDeviceLinkBytes(envelopeBytes: Uint8Array): Promise<void> {
+        const stored = await this.#store.get(LINK_MATERIAL_KEY);
+        if (stored === undefined) throw new Error("No pending device link");
+        let material: ReturnType<typeof parseDeviceLinkMaterial>;
+        try {
+            material = parseDeviceLinkMaterial(stored, this.#now());
+        } finally {
+            zeroBytes(stored);
+        }
+        try {
+            const envelope = parseProvisioningEnvelope(envelopeBytes);
+            const provisioned = completeDeviceProvisioning(material, envelope, this.#now());
+            const credential = encodeDeviceCredential(provisioned.roster, this.#identity.publicKey);
+            const accountRoot = encodeIdentityRoot(provisioned.account);
+            const rosterBytes = serializeDeviceRoster(provisioned.roster);
+            try {
+                await this.#store.transaction(async (transaction) => {
+                    await transaction.set(ACCOUNT_ROOT_KEY, accountRoot);
+                    await transaction.set(DEVICE_CREDENTIAL_KEY, credential);
+                    await observeDeviceRoster(
+                        transaction,
+                        provisioned.account.publicKey,
+                        `link-${encodeBase64Url(envelope.requestId)}`,
+                        provisioned.account.publicKey,
+                        envelope.authorDeviceKey,
+                        rosterBytes,
+                    );
+                    await transaction.delete(LINK_MATERIAL_KEY);
+                    await this.#engine.deletePendingProvisioningEnvelope(transaction);
+                });
+            } finally {
+                zeroBytes(accountRoot);
+                zeroBytes(rosterBytes);
+            }
+            this.#account = provisioned.account;
+            this.#deviceCredential = credential.slice();
+            this.#engine.adoptDeviceCredential(credential);
+            this.#contacts = new ContactEngine(
+                this.#store,
+                provisioned.account.publicKey,
+                this.#now,
+            );
+        } finally {
+            zeroBytes(material.ephemeralSecretKey);
+        }
     }
 
     /**
@@ -1615,9 +1624,27 @@ export class MurmurClient {
         }
     }
 
-    /** Queue automatic account work: pending admission and roster broadcast. */
+    /** Queue automatic account work: link completion, admission, roster broadcast. */
     async #queueAccountWork(): Promise<void> {
         let queued = false;
+        const pendingEnvelope = await this.#engine.pendingProvisioningEnvelope();
+        if (pendingEnvelope !== undefined) {
+            try {
+                const linkMaterial = await this.#store.get(LINK_MATERIAL_KEY);
+                if (linkMaterial !== undefined) zeroBytes(linkMaterial);
+                if (this.#account === undefined && linkMaterial !== undefined) {
+                    await this.#completeDeviceLinkBytes(pendingEnvelope);
+                    queued = true;
+                } else {
+                    await this.#engine.deletePendingProvisioningEnvelope();
+                }
+            } catch {
+                // An invalid or expired envelope must not wedge the sync loop.
+                await this.#engine.deletePendingProvisioningEnvelope();
+            } finally {
+                zeroBytes(pendingEnvelope);
+            }
+        }
         if (this.#account !== undefined && this.#deviceCredential !== undefined) {
             const sent = await this.#store.get(ACCOUNT_ADMISSION_SENT_KEY);
             const sessionId = await this.#store.get(ACCOUNT_SESSION_KEY);

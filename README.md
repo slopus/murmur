@@ -790,21 +790,30 @@ Devices never share encryption state, and the relay never sees the roster or
 which devices belong to which account — roster updates travel only inside
 existing encrypted sessions.
 
-Linking follows the Signal shape. The new device produces short-lived request
-bytes (render them as a QR code or deep link), an existing device verifies
-user intent and authorizes, and the resulting encrypted envelope travels back:
+Linking follows the Signal shape, and only one small payload ever travels out
+of band. The new device produces short-lived request bytes (about 750 bytes —
+comfortably one QR code or deep link); an existing device verifies user
+intent, signs the next roster revision, and publishes the encrypted response
+envelope straight to the new device's relay inbox. The envelope is sealed to
+the request's ephemeral key, so the relay carries only opaque bytes with a
+five-minute lifetime:
 
 ```ts
-// On the new device: create a five-minute link request.
-const request = await newDevice.linkDevice();
+// On the new device: create a five-minute link request and keep syncing.
+const request = await newDevice.linkDevice(); // render as a QR code
 
-// On an existing device: verify intent, sign the next roster revision,
-// and produce an envelope encrypted to the new device.
-const envelope = await existingDevice.authorizeDevice(request);
+// On an existing device: verify intent and authorize. The encrypted
+// envelope is delivered through the relay automatically.
+await existingDevice.authorizeDevice(request);
 
-// Back on the new device: adopt the account and its roster.
-await newDevice.completeDeviceLink(envelope);
+// The new device completes the link on its next synchronization —
+// no second scan and no manual transport.
 ```
+
+`authorizeDevice` also returns the envelope bytes, and `completeDeviceLink`
+accepts them directly, for applications that link devices without any relay
+connectivity. The envelope grows with the roster, so it is not guaranteed to
+fit in a QR code — use a network channel for manual transport.
 
 From that point everything is automatic. Murmur drives MLS Adds and Welcomes
 for the new device in every known contact and service session, and MLS
