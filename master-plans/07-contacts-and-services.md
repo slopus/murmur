@@ -4,9 +4,10 @@
 
 Contacts are a built-in, foundational part of Murmur. They are not an optional
 plugin and do not restore the pre-v0.3 friend-channel, topic, or retained-event
-design. A confirmed contact is represented by a durable two-device technical
-MLS session and the mutual typed profile handshake performed through it. This
-session is contact and control state, not chat.
+design. A confirmed contact is represented by a durable technical MLS session
+between two stable account identities and the mutual typed profile handshake
+performed through their initial devices. This session is contact and control
+state, not chat, and its leaves track both verified active-device rosters.
 
 Capabilities beyond contacts are optional, strictly typed synchronization
 services registered on a Murmur client. A service is a class or object with
@@ -18,11 +19,11 @@ behavior built into a contact.
 
 ## Establishing a contact
 
-One device identity uploads its signed five-minute discovery bundle to the
+One account device uploads its signed five-minute discovery bundle to the
 relay and shares the returned 32-byte SHA-256 digest out of band. The other
-device identity resolves and verifies it, accepts the invitation material,
-creates a two-device technical MLS session, and sends a typed hello containing
-its profile.
+account device resolves and verifies its account identity and roster proof,
+accepts the invitation material, creates an initially two-device technical MLS
+session, and sends a typed hello containing its profile.
 
 Murmur receives, decrypts, and validates that hello while the contact session is
 pending. It exposes the profile for a contact decision without first activating
@@ -32,11 +33,12 @@ its own typed profile hello. Only after both hellos are durably processed does
 Murmur persist the confirmed contact and retain the technical session as
 cryptographic proof of contact.
 
-A confirmed contact session remains two-device. It may carry strictly typed
-contact and control packets, but chat and other application domains use their
-own services and sessions. Other devices owned by either application user are
-independent identities and join appropriate service sessions through ordinary
-MLS membership changes rather than by sharing roots or ratchets.
+A confirmed contact remains attached to both stable account identities. Later
+valid device-roster changes do not repeat contact acceptance: Murmur
+automatically adds or removes those independent device leaves in the technical
+contact session and emits typed device lifecycle events. Chat and other
+application domains still use their own services and sessions, whose device
+membership also converges automatically without sharing roots or ratchets.
 
 ## Persistence, routing, and offline use
 
@@ -108,8 +110,8 @@ browser-safe with its Noble-only runtime dependency boundary.
   its contact session is pending.
 - Rejection destroys the pending contact session; acceptance sends the local
   typed hello; only mutual hello completion persists a confirmed contact.
-- Confirmed contact state and its two-device technical session survive restart
-  and are usable offline before synchronization.
+- Confirmed account-contact state and its roster-aligned technical session
+  survive restart and are usable offline before synchronization.
 - Optional strictly typed services are registered on `MurmurClient`, expose
   exactly `onNewSession` and `onUpdate` to Murmur, own persistence outside
   `MurmurStore`, and participate automatically in the one identity-wide

@@ -2,7 +2,7 @@
 
 ## Vision
 
-Murmur is a stateful library for discovering a public device identity,
+Murmur is a stateful library for discovering a public account identity,
 bootstrapping an MLS session, establishing a built-in contact relationship,
 and exchanging data through typed synchronization services. A two-person
 interaction and a many-person interaction use the same MLS group primitive.
@@ -30,17 +30,20 @@ signed SSE receiver. Applications may continue configuring that relay directly.
 
 An additive negotiated protocol supports independent devices. A main server
 authenticates an application user, verifies that the user controls one Murmur
-device identity, and issues a short-lived token naming the assigned endpoint
+account device, and issues a short-lived token naming the assigned endpoint
 and transport protocol. The endpoint may be the main server or a stateful edge
 object reached through its public ingress. The first negotiated transport uses
 an authenticated WebSocket.
 
-One application user may authorize multiple device identities. Every device
-has its own identity root, MLS leaf and ratchets, durable Murmur store, and
-authenticated inbox; devices never share one identity root or sender state.
-The server may retain the bounded user-to-device routing needed to issue tokens
-and deliver traffic, but it does not become a discovery directory or receive
-device secrets.
+One application user has one stable Murmur account identity and may authorize
+multiple independently keyed devices through its signed device roster. Every
+device has its own device key, MLS leaf and ratchets, durable Murmur store, and
+authenticated inbox; devices never share sender or epoch state. Active devices
+synchronize Murmur-owned account state and automatically drive their MLS
+membership across known account sessions. The server may retain the bounded
+account-to-device routing needed to issue tokens and deliver traffic, but it
+cannot forge the roster, does not become a public discovery directory, and
+receives no device secrets.
 
 The relay stores encrypted deliveries that remain unacknowledged and unexpired.
 It may also hold a signed discovery bundle for at most five minutes under the
@@ -102,32 +105,41 @@ quarantined with replay and queue progress and no application effect before
 acknowledgement. A crash before acknowledgement causes expected redelivery.
 
 Relay replay is not a recovery mechanism. Losing the local store or device
-loses protocol state and application history; recovery requires a backup or
-being added again.
+loses its protocol state and application history; account-identity continuity
+does not reconstruct them. Recovery requires a backup or authorization as a
+fresh device followed by new MLS Welcomes.
 
 ## The layers, in order
 
-1. **Admission and routing.** Continue supporting a directly configured legacy
+1. **Account and devices.** Create a stable account identity, authorize
+   independently keyed devices through a signed roster, synchronize those
+   devices, and converge their membership across known MLS sessions.
+2. **Admission and routing.** Continue supporting a directly configured legacy
    relay, or ask the application authentication server for a short-lived token
-   that binds one authorized device identity to an endpoint and transport.
-2. **Discovery.** Define and validate a self-contained signed bundle containing
-   a public device identity and current KeyPackage material without creating a
-   friend relationship. An application may share it directly, or upload it to
+   that binds one authorized account device to an endpoint and transport.
+3. **Discovery.** Define and validate a self-contained signed bundle containing
+   a public account identity, authorized device, and current KeyPackage
+   material without creating a friend relationship. An application may share
+   it directly, or upload it to
    the relay's five-minute content-addressed cache and share only its SHA-256
    digest. The recipient fetches by that digest and rejects an expired or
    invalid bundle.
-3. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
+4. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
    material to the recipient's authenticated queue. The recipient persists it
    as pending and trims the queue before generic application acceptance or
    built-in contact handling.
-4. **MLS sessions.** Send opaque descriptors, application events, and
+5. **MLS sessions.** Send opaque descriptors, application events, and
    membership changes through the same MLS primitive for two or more members.
-5. **Contacts.** Use a two-device technical MLS session and a mutual typed
-   profile hello to establish durable cryptographic proof of contact.
-6. **Synchronization services.** Register optional independent typed services
+6. **Contacts.** Use an initially two-device technical MLS session and a mutual
+   typed profile hello to establish durable proof between account identities,
+   then track their verified active-device rosters.
+7. **Synchronization services.** Register optional independent typed services
    on the client. Each service may claim a new session from its descriptor and
    then owns later updates routed through that durable association.
-7. **Applications.** Register typed synchronization services for domains such
+8. **Private group state.** Store canonical encrypted group records behind
+   anonymous, zero-knowledge membership authorization without exposing a
+   readable social graph or replacing MLS membership.
+9. **Applications.** Register typed synchronization services for domains such
    as chat, documents, or files.
 
 ## How we know it is done
@@ -136,11 +148,11 @@ being added again.
   short-lived device token and application-supplied transactional persistence
   in a browser or Node.js process without exposing storage transactions through
   its session API.
-- A negotiated token binds one independently keyed device identity to its
+- A negotiated token binds one independently keyed account device to its
   endpoint and declares the transport protocol. The first new protocol carries
   authenticated inbox traffic over WebSocket while the HTTP/SSE protocol stays
   compatible.
-- Two device identities can discover the material needed to bootstrap an MLS
+- Two account devices can discover the material needed to bootstrap an MLS
   session, and the recipient can durably receive it without waiting for the
   application to activate or ignore it.
 - A relay-cached discovery bundle is non-enumerable, addressed only by the
@@ -159,6 +171,12 @@ being added again.
   to that service.
 - The same MLS session engine works for two and many members, including adding
   and removing members in service-owned sessions.
+- A stable account identity has the signed roster, built-in device
+  synchronization, automatic MLS convergence, revocation, recovery boundary,
+  and complete tombstone defined by the multidevice plan.
+- The private-group state service provides canonical encrypted group state and
+  anonymous role enforcement without learning the account social graph, while
+  its remaining network and delivery metadata is stated explicitly.
 - Every session operation works from durable local state while offline. No
   session or synchronization state blocks `send`; sends against a staged
   membership epoch are encrypted and persisted immediately, survive restart,

@@ -10,11 +10,12 @@ built-in contact protocol or to a registered typed synchronization service.
 
 The public API creates a session from an opaque descriptor, sends opaque events,
 and adds or removes device members. All ongoing membership control and
-application data travel inside MLS. One application user may authorize several
-devices, but every device is a distinct MLS member with its own credential,
-ratchets, durable store, and authenticated inbox. Adding or removing one user's
-devices uses ordinary MLS membership changes for those device identities. A
-newly added device receives the MLS Welcome and initial material through its
+application data travel inside MLS. One stable account may authorize several
+devices, but every device is a distinct MLS member with its own roster-certified
+credential, ratchets, durable store, and authenticated inbox. Murmur
+automatically translates an account roster addition or removal into ordinary
+MLS membership changes in every known session containing that account. A newly
+added device receives a separate MLS Welcome and fresh state through its
 authenticated inbox.
 
 ## Ordering and delivery
@@ -60,8 +61,9 @@ whether the service claims the session, and `onUpdate`, which receives later
 updates after a successful claim. Murmur persists the session-to-service owner
 mapping. Services are independent, and Murmur models no dependencies between
 services or sessions. Service-owned group sessions may send packets and add or
-remove members. The technical session proving one contact relationship remains
-two-device.
+remove members. The technical session proving one contact relationship starts
+with two devices and then tracks the verified active-device rosters of both
+accounts.
 
 If no registered service claims a new session, Murmur ignores its unknown
 updates after durably recording replay and queue progress. Those updates are
@@ -106,8 +108,9 @@ quarantined with replay and queue progress and no application effect before
 acknowledgement. The application owns application history; Murmur retains
 current protocol state rather than an event-sourced copy of the session.
 
-A client cannot reconstruct a session from the relay after trimming. Losing
-local state requires restoring a backup or being added again.
+A client cannot reconstruct a session from the account identity or relay after
+trimming. Losing local state requires restoring a backup or authorization and
+new Welcomes as fresh device state.
 
 ## How we know it is done
 
@@ -153,3 +156,6 @@ local state requires restoring a backup or being added again.
   and staged epoch state, dependency-ordered outboxes, replay, and queue
   progress through application-supplied persistence.
 - The relay is never treated as session history or recovery storage.
+- Account roster additions and revocations automatically converge through
+  durable MLS Adds, Welcomes, and Removes across every locally known session
+  without sharing sender state or blocking application sends.

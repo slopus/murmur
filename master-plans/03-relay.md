@@ -7,12 +7,12 @@ identity, bounded HTTP reads, and one recipient-authenticated SSE receiver. Its
 public API and wire format remain supported.
 
 The negotiated relay has one authenticated inbox per independently keyed
-device identity. A main server authenticates an application user and verifies
-control of the device identity before issuing a short-lived token that names
-the selected endpoint and protocol. The endpoint may be that server or a
-stateful edge object behind public ingress. One user may authorize multiple
-device identities, but each device has its own root, MLS state, durable store,
-queue progress, and receiver.
+account device. A main server authenticates an application user and verifies
+the device's membership in the signed account roster before issuing a
+short-lived token that names the selected endpoint and protocol. The endpoint
+may be that server or a stateful edge object behind public ingress. One account
+may authorize multiple devices, but each device has its own key, MLS state,
+durable store, queue progress, and receiver.
 
 The relay stores encrypted deliveries only while at least one target reference
 remains unacknowledged and unexpired. It also provides a strictly bounded,
@@ -28,6 +28,12 @@ for admission and delivery. The relay does not interpret encrypted delivery
 contents or trust cached discovery contents. It does learn authenticated user
 admission, device, sender, recipient, exact fanout, timing, and queue progress;
 this metadata exposure is accepted.
+
+Valid device revocation stops new token issuance, publication, and inbox access
+for that device and removes its pending account-owned routing and queue state.
+A valid account tombstone does the same for every account device. This
+transport revocation does not replace the MLS Remove Commits required by each
+session.
 
 Version 0.3.3 and relay schema version 3 are the compatibility baseline. Every
 later relay schema upgrade migrates in place without deleting pending data or
@@ -79,9 +85,9 @@ that redelivery harmless.
 
 For every ongoing MLS delivery, the exact recipient set contains every current
 device member, including the publishing device, and is bound in a way
-recipients can verify. Multiple devices owned by one application user are
-independent MLS members with independent credentials and state. The relay never
-resolves concurrent MLS Commits. MLS sessions serialize Commits through their
+recipients can verify. Multiple devices owned by one account are independent
+MLS members with roster-certified credentials and independent state. The relay
+never resolves concurrent MLS Commits. MLS sessions serialize Commits through their
 authenticated epoch committer before publication; non-committers publish MLS
 Proposals instead. Exact authentication, token format, signatures, and wire
 encoding remain implementation details.
@@ -134,7 +140,7 @@ relay into durable history, an identity directory, or a recovery system.
 
 - The legacy HTTP/SSE protocol remains supported with one authenticated ordered
   inbound queue per public identity and its existing wire contract.
-- The negotiated protocol gives each independently keyed device identity one
+- The negotiated protocol gives each independently keyed account device one
   authenticated ordered inbox and one short-lived token naming its endpoint and
   protocol.
 - A legacy stable delivery ID and exact recipient set still produce one
@@ -176,3 +182,6 @@ relay into durable history, an identity directory, or a recovery system.
   relay data; operators are not required to start from a clean database.
 - The relay has no retained event history, snapshots, public identity or
   application lists, generic topics, or anonymous addressing.
+- Signed device revocation and account tombstones remove corresponding future
+  routing authority and account-owned relay state without pretending to replace
+  MLS Remove Commits.
