@@ -21,14 +21,15 @@ application separately owns its history and effects.
 - a stateful client library with one durable identity per store;
 - end-to-end encrypted with MLS (TreeKEM) for two or more members;
 - built-in mutual-profile contacts plus optional typed services;
+- multi-device: one account links independently keyed devices through a
+  signed roster, and session membership converges automatically;
 - offline-first, with durable outboxes and restart-safe delivery.
 
 **Murmur is not:**
 
 - anonymous: the relay learns sender, recipient, fanout, and timing metadata;
 - server-side history: acknowledged deliveries are gone from the relay;
-- a recovery system: losing the local store loses sessions and contacts;
-- multi-device: one identity has one active receiving device.
+- a recovery system: losing the local store loses sessions and contacts.
 
 ```text
                       out-of-band (QR, deep link, ...)
@@ -58,6 +59,7 @@ application separately owns its history and effects.
 - [Contacts](#contacts)
 - [Build a group messenger](#build-a-group-messenger)
 - [Sessions](#sessions)
+- [Multiple devices](#multiple-devices)
 - [Typed synchronization services](#typed-synchronization-services)
 - [The synchronization loop](#the-synchronization-loop)
 - [Durability, offline use, and idempotency](#durability-offline-use-and-idempotency)
@@ -779,6 +781,63 @@ membership must outlive any single device.
 operation, and `issues()` lists durable session and publication diagnostics.
 `session(id)` and `sessions({ after, limit })` read local session state.
 
+## Multiple devices
+
+One account can run several devices. The account identity is a signing key
+only: it signs a versioned, replay-protected device roster, and every device
+keeps its own secret key, MLS leaves, ratchets, inbox, and durable store.
+Devices never share encryption state, and the relay never sees the roster or
+which devices belong to which account — roster updates travel only inside
+existing encrypted sessions.
+
+Linking follows the Signal shape. The new device produces short-lived request
+bytes (render them as a QR code or deep link), an existing device verifies
+user intent and authorizes, and the resulting encrypted envelope travels back:
+
+```ts
+// On the new device: create a five-minute link request.
+const request = await newDevice.linkDevice();
+
+// On an existing device: verify intent, sign the next roster revision,
+// and produce an envelope encrypted to the new device.
+const envelope = await existingDevice.authorizeDevice(request);
+
+// Back on the new device: adopt the account and its roster.
+await newDevice.completeDeviceLink(envelope);
+```
+
+From that point everything is automatic. Murmur drives MLS Adds and Welcomes
+for the new device in every known contact and service session, and MLS
+Removes after a revocation, without any application involvement. Application
+code keeps seeing accounts: `session.members` and `update.sender` are stable
+account keys, not device keys, so a messenger built on Murmur needs no
+device-awareness at all.
+
+```ts
+// Any active device may inspect and control the roster.
+const devices = await murmur.devices(); // roster entries with status
+await murmur.revokeDevice(otherDeviceKey); // stops delivery and drives MLS Removes
+
+// Lifecycle callbacks in the same sync loop:
+await murmur.sync({
+    onDeviceAdded: (events) => console.log("own device added", events),
+    onDeviceRevoked: (events) => console.log("own device revoked", events),
+    onContactRosterChanged: (events) => console.log("contact devices changed", events),
+});
+```
+
+Peers learn about additions and revocations only from the authenticated,
+account-signed roster carried over their existing sessions, never from an
+unauthenticated server claim. Losing a device store still loses that device's
+state: a replacement links as a fresh device and receives new Welcomes;
+application history transfer stays application-owned.
+
+The repository also contains internal, deliberately unexported groundwork for
+private group state — Ristretto255 credential mathematics, encrypted member
+identifiers, and an opaque group-state service that cannot read its members
+(`packages/murmur/sources/math`, `privateGroups`, `privateGroupState`). It
+requires external cryptographic audit before any production exposure.
+
 ## Typed synchronization services
 
 Services are how applications build domains — chat, documents, files — on top
@@ -993,9 +1052,14 @@ cursor, republishes pending outboxes, and re-offers any uncommitted batch.
 - **No recovery from the relay.** Acknowledged deliveries are deleted; the
   relay is never history. A lost store means lost sessions — plan real
   backups of the application store.
-- **One device per identity.** Running two live clients against one identity's
-  queue splits the cursor and corrupts delivery; don't share stores or roots
+- **One store per device.** Each linked device owns its own store and inbox.
+  Running two live clients against one device's queue splits the cursor and
+  corrupts delivery; link a second device instead of sharing stores or roots
   between concurrent processes.
+- **Device authorization is roster-signed.** Adding or revoking a device is an
+  account-signed, replay-protected roster mutation distributed over existing
+  encrypted sessions; the relay cannot forge, reorder, or hide one from peers
+  that share a session with the account.
 - **Operational hygiene.** Keys are `Uint8Array`s that Murmur zeroes when
   finished (`close()` zeroes the identity); never log them. Public identities
   are free to create, so a production relay deployment needs its own

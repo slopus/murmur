@@ -71,6 +71,13 @@ Every directory has a `README.md` that explains what the directory contains and
 how it works. It includes ASCII diagrams and any other context needed to
 understand the structure and behavior.
 
+A module's top-level `README.md` additionally documents its export surface: an
+Exports section listing everything `index.ts` exports, grouped by feature, with
+each function's signature and a human-friendly explanation of what it does and
+why it exists, plus a list of the exported types. The reference is written for
+a human reviewing the module without opening the code, and it is updated in the
+same change that alters the exports.
+
 ## Change discipline
 
 Before every commit, the model runs the formatter and includes every resulting

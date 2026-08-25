@@ -224,7 +224,7 @@ export class MurmurClient {
         }
     }
 
-    /** Open or create one durable single-device Murmur identity. */
+    /** Open or create one durable per-device Murmur identity and its account state. */
     static async open(options: MurmurClientOptions): Promise<MurmurClient> {
         const deliveryChoices = [
             options.relay !== undefined,
