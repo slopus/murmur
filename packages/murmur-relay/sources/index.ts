@@ -97,3 +97,24 @@ export type {
     RelayWebSocketPeer,
     RelayWebSocketSessionOptions,
 } from "./websocket/index.js";
+export {
+    PrivateGroupStateService,
+    SqlitePrivateGroupStateStore,
+    encodePrivateGroupStateRecord,
+    encodeUnsignedPrivateGroupStateRecord,
+    privateGroupStateRecordHash,
+} from "./privateGroupState/index.js";
+export type {
+    PrivateGroupAccessToken,
+    PrivateGroupChallengeOperation,
+    PrivateGroupCredentialAuthority,
+    PrivateGroupMemberEntry,
+    PrivateGroupPresentationChallenge,
+    PrivateGroupRole,
+    PrivateGroupStateLimits,
+    PrivateGroupStateRecord,
+    PrivateGroupStateServiceOptions,
+    PrivateGroupStateStore,
+    SqlitePrivateGroupStateStoreOptions,
+    StoredPrivateGroupStateRecord,
+} from "./privateGroupState/index.js";
