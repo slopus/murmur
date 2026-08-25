@@ -81,9 +81,12 @@ response requires `limit: 1` for one-event storage backpressure and is
 `text/event-stream`. Each delivery record is:
 
 ```text
+event: continuity
+data: {"generation":"<32-byte base64url>","head":...,"headSequence":N,...}
+
 id: <lowercase UUIDv7>
 event: delivery
-data: {"eventId":"<same UUIDv7>","delivery":<SignedDeliveryJson>}
+data: {"eventId":"<same UUIDv7>","sequence":N,"delivery":<SignedDeliveryJson>}
 
 ```
 
@@ -184,10 +187,36 @@ update or terminal rejection.
 Relay UUIDv7 event IDs provide a monotonic per-inbox cursor and processing-time
 floor. Implausible event times reject the page without durable mutation.
 
+Each recipient reference also receives a strictly increasing sequence. The
+relay retains a 32-byte loss generation for every opened inbox. Expiry or any
+other unacknowledged removal advances it by the exact removed-reference count;
+acknowledgement does not. A declared relay backup restore issues unpredictable
+new generations. The client commits its last generation and sequence with each
+delivery outcome, so an unchanged generation plus contiguous sequence chain is
+proof of gapless processing. Retention and replay epochs use exactly 180 days;
+fresh admission KeyPackages live 210 days.
+
 ## Queue acknowledgement
 
 Reads and acknowledgements are signed by the recipient identity. After durable
 processing, the client acknowledges through its latest cursor. Acknowledgement
-is monotonic and idempotent while queue state exists. Once an inbox has no
-pending references, the relay may reclaim its row; an absent inbox is an empty
-state, not retained history.
+is monotonic and idempotent and returns the acknowledged sequence plus current
+generation. Empty inboxes retain continuity metadata indefinitely.
+
+## Device continuity reset
+
+A sequence gap, generation change, or missing local continuity record freezes
+processing. Murmur first stores one reset event with every session's ID,
+descriptor, membership, owner, admins, and policies. The application `onReset`
+callback receives that stable event at least once until it resolves. One local
+transaction then destroys all MLS/session/transport state, retains identity,
+account credential and signing material, rosters, contacts, and profiles, and
+adopts the observed relay head and sequence as the new baseline.
+
+The reset device advances its account-signed roster reset generation and sends
+the roster with a fresh KeyPackage in recipient-sealed reset announcements.
+Peers queue a Remove and dependent Add for every shared session. The resulting
+Welcome preserves the group ID and descriptor, and the local public session is
+flagged as a re-admission. Applications own any history backfill. Active sibling
+devices silent for 180 days are reported as dormant and may be explicitly
+revoked; Murmur never revokes them automatically.
