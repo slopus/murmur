@@ -15,6 +15,7 @@ export function encodeStoredDelivery(delivery: SignedDelivery): {
 /** Bounded queue-row metadata selected before delivery JSON hydration. */
 export interface StoredPageCandidate {
     readonly eventId: string;
+    readonly sequence: number;
     readonly encodedBytes: number;
 }
 
@@ -22,23 +23,28 @@ export interface StoredPageCandidate {
 export interface StoredPageSelection {
     readonly candidates: readonly StoredPageCandidate[];
     readonly head: string | null;
+    readonly headSequence: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+    readonly generation: Uint8Array;
     readonly exhausted: boolean;
 }
 
 function encodedEmptyPageBytes(
     head: string | null,
+    headSequence: number,
     acknowledgedThrough: string | null,
+    acknowledgedSequence: number,
     exhausted: boolean,
 ): number {
     return textEncoder.encode(
-        `{"deliveries":[],"head":${head === null ? "null" : `"${head}"`},"acknowledgedThrough":${acknowledgedThrough === null ? "null" : `"${acknowledgedThrough}"`},"exhausted":${exhausted.toString()}}`,
+        `{"deliveries":[],"head":${head === null ? "null" : `"${head}"`},"headSequence":${headSequence},"acknowledgedThrough":${acknowledgedThrough === null ? "null" : `"${acknowledgedThrough}"`},"acknowledgedSequence":${acknowledgedSequence},"generation":"${"A".repeat(43)}","exhausted":${exhausted.toString()}}`,
     ).length;
 }
 
 function encodedCandidateBytes(candidate: StoredPageCandidate, index: number): number {
     const metadataBytes = textEncoder.encode(
-        `{"eventId":"${candidate.eventId}","delivery":`,
+        `{"eventId":"${candidate.eventId}","sequence":${candidate.sequence},"delivery":`,
     ).length;
     return (index === 0 ? 0 : 1) + metadataBytes + candidate.encodedBytes + 1;
 }
@@ -53,7 +59,10 @@ function encodedCandidateBytes(candidate: StoredPageCandidate, index: number): n
 export function selectQueuePageMetadata(
     candidates: readonly StoredPageCandidate[],
     head: string | null,
+    headSequence: number,
     acknowledgedThrough: string | null,
+    acknowledgedSequence: number,
+    generation: Uint8Array,
     after: string | null,
     limit: number,
     constraints: PageReadConstraints,
@@ -61,14 +70,29 @@ export function selectQueuePageMetadata(
     if (candidates.length === 0) {
         return {
             candidates: [],
-            head: after,
+            head,
+            headSequence,
             acknowledgedThrough,
+            acknowledgedSequence,
+            generation,
             exhausted: true,
         };
     }
     const available = candidates.slice(0, limit);
-    let exhaustedBytes = encodedEmptyPageBytes(head, acknowledgedThrough, true);
-    let continuedBytes = encodedEmptyPageBytes(head, acknowledgedThrough, false);
+    let exhaustedBytes = encodedEmptyPageBytes(
+        head,
+        headSequence,
+        acknowledgedThrough,
+        acknowledgedSequence,
+        true,
+    );
+    let continuedBytes = encodedEmptyPageBytes(
+        head,
+        headSequence,
+        acknowledgedThrough,
+        acknowledgedSequence,
+        false,
+    );
     let selectedCount = 1;
     for (const [index, candidate] of available.entries()) {
         const encodedBytes = encodedCandidateBytes(candidate, index);
@@ -85,14 +109,20 @@ export function selectQueuePageMetadata(
         return {
             candidates: available,
             head,
+            headSequence,
             acknowledgedThrough,
+            acknowledgedSequence,
+            generation,
             exhausted: true,
         };
     }
     return {
         candidates: available.slice(0, selectedCount),
         head,
+        headSequence,
         acknowledgedThrough,
+        acknowledgedSequence,
+        generation,
         exhausted: false,
     };
 }

@@ -29,6 +29,7 @@ import type {
     InvitationRevocationOutcome,
     InvitationUploadOutcome,
     QueueEventSubscription,
+    QueueContinuityEvent,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,
@@ -41,6 +42,7 @@ export type {
     InvitationRevocationOutcome,
     InvitationUploadOutcome,
     QueueEventSubscription,
+    QueueContinuityEvent,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,
@@ -48,7 +50,9 @@ export type {
 
 const MEBIBYTE = 1024 * 1024;
 const HARD_MAXIMUM_LONG_POLL_MILLISECONDS = 30_000;
-const HARD_MAXIMUM_DELIVERY_TTL_MILLISECONDS = 90 * 24 * 60 * 60 * 1_000;
+/** Six-month relay delivery continuity window, defined as exactly 180 days. */
+export const DELIVERY_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
+const HARD_MAXIMUM_DELIVERY_TTL_MILLISECONDS = DELIVERY_RETENTION_MILLISECONDS;
 const HARD_MAXIMUM_INVITATION_TTL_MILLISECONDS = 5 * 60 * 1_000;
 const HARD_MAXIMUM_INVITATION_BYTES = 64 * 1024;
 const HARD_MAXIMUM_RECIPIENTS = 1_024;
@@ -144,7 +148,7 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
             "Maximum global references",
         ),
         maximumDeliveryTtlMilliseconds: positiveInteger(
-            options.maximumDeliveryTtlMilliseconds ?? 30 * 24 * 60 * 60 * 1_000,
+            options.maximumDeliveryTtlMilliseconds ?? DELIVERY_RETENTION_MILLISECONDS,
             "Maximum delivery TTL",
         ),
         maximumAuthenticationSkewMilliseconds: positiveInteger(
@@ -188,7 +192,7 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
         throw new Error("Invitation cache limits are inconsistent");
     }
     if (resolved.maximumDeliveryTtlMilliseconds > HARD_MAXIMUM_DELIVERY_TTL_MILLISECONDS) {
-        throw new Error("Maximum delivery TTL cannot exceed 90 days");
+        throw new Error("Maximum delivery TTL cannot exceed 180 days");
     }
     if (resolved.maximumRecipients > HARD_MAXIMUM_RECIPIENTS) {
         throw new Error("Maximum recipients cannot exceed 1,024");
@@ -577,6 +581,12 @@ export class RelayService {
         return this.#store.pruneExpired(this.#now());
     }
 
+    /** Invalidate known inbox continuity after an operator declares a backup restore. */
+    async declareRestored(): Promise<number> {
+        this.#assertOpen();
+        return this.#store.declareRestored();
+    }
+
     /** Confirm the wake subscription and backing store are reachable. */
     async health(): Promise<void> {
         this.#assertOpen();
@@ -640,8 +650,9 @@ export class RelayService {
         queueId: string,
         signal: AbortSignal,
         close: () => void,
-    ): AsyncGenerator<QueuedDelivery | null> {
+    ): AsyncGenerator<QueuedDelivery | QueueContinuityEvent | null> {
         let after = request.after;
+        let observedGeneration: Uint8Array | undefined;
         const constraints = { maximumEncodedBytes: Number.MAX_SAFE_INTEGER };
         try {
             while (!signal.aborted) {
@@ -652,6 +663,20 @@ export class RelayService {
                     this.#now(),
                     constraints,
                 );
+                if (
+                    observedGeneration === undefined ||
+                    !equalBytes(observedGeneration, page.generation)
+                ) {
+                    observedGeneration = page.generation.slice();
+                    yield {
+                        type: "continuity",
+                        generation: page.generation.slice(),
+                        head: page.head,
+                        headSequence: page.headSequence,
+                        acknowledgedThrough: page.acknowledgedThrough,
+                        acknowledgedSequence: page.acknowledgedSequence,
+                    };
+                }
                 if (page.deliveries.length > 0) {
                     for (const queued of page.deliveries) {
                         if (after !== null && queued.eventId <= after) {

@@ -73,10 +73,11 @@ place while preserving pending deliveries and invitations. Do not introduce an
 upgrade that requires operators to delete relay data or provision a clean
 database.
 
-The current standalone relay uses schema v4. Startup migrates v3 in place by
-adding nullable invitation revocation authorities and an expiring tombstone
-table; pending v3 invitations remain readable and may be owner-upgraded on an
-exact authenticated re-upload.
+The current standalone relay uses schema v5. Startup migrates v3 in place by
+adding invitation revocation authorities, an expiring tombstone table, queue
+sequences, and loss generations; pending deliveries and invitations remain in
+place. After restoring a relay backup, set `MURMUR_RELAY_DECLARE_RESTORED=1`
+for one startup so every client can detect the loss.
 
 Pre-v0.3 topic-relay schemas remain unsupported.
 

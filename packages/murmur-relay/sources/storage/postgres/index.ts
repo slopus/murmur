@@ -12,6 +12,11 @@ import {
     selectQueuePageMetadata,
     type StoredPageCandidate,
 } from "../page.js";
+import {
+    advanceLossGeneration,
+    createGenerationSeed,
+    initialLossGeneration,
+} from "../continuity.js";
 import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
     AcknowledgeOutcome,
@@ -387,11 +392,13 @@ export class PostgresRelayStore implements RelayStore {
             );
             const globalResult = await transaction.query<{
                 last_event_id: unknown;
+                generation_seed: unknown;
                 pending_items: unknown;
                 pending_bytes: unknown;
                 pending_references: unknown;
             }>(
-                `SELECT last_event_id, pending_items, pending_bytes, pending_references
+                `SELECT last_event_id, generation_seed, pending_items, pending_bytes,
+                        pending_references
                  FROM murmur_queue_global WHERE singleton = 1`,
             );
             const global = globalResult.rows[0];
@@ -485,13 +492,26 @@ export class PostgresRelayStore implements RelayStore {
                 .map((_, index) => `($${index + 1}::bytea)`)
                 .join(", ");
             const targetParameters = [...delivery.recipients];
+            const generationSeed = copyBytes(global.generation_seed, "generation seed");
+            const queueParameters: (Uint8Array | string)[] = [];
+            const queueValues = delivery.recipients
+                .map((recipient, index) => {
+                    queueParameters.push(
+                        recipient,
+                        initialLossGeneration(generationSeed, recipient),
+                    );
+                    return `($${index * 2 + 1}::bytea, $${index * 2 + 2}::bytea)`;
+                })
+                .join(", ");
             await transaction.query(
                 `INSERT INTO murmur_queues
-                    (recipient, head, acknowledged_through, pending_items, pending_bytes)
-                 SELECT target.recipient, $${targetParameters.length + 1}::uuid, NULL, 0, 0
-                 FROM (VALUES ${targetValues}) AS target(recipient)
+                    (recipient, head, head_sequence, next_sequence, acknowledged_through,
+                     acknowledged_sequence, loss_generation, pending_items, pending_bytes)
+                 SELECT target.recipient, $${queueParameters.length + 1}::uuid, 1, 2,
+                        NULL, 0, target.loss_generation, 0, 0
+                 FROM (VALUES ${queueValues}) AS target(recipient, loss_generation)
                  ON CONFLICT DO NOTHING`,
-                [...targetParameters, eventId],
+                [...queueParameters, eventId],
             );
             const recipientUsage = await transaction.query<{
                 item_count: unknown;
@@ -547,6 +567,12 @@ export class PostgresRelayStore implements RelayStore {
             await transaction.query(
                 `UPDATE murmur_queues AS queue
                  SET head = $${targetParameters.length + 1}::uuid,
+                     head_sequence = CASE
+                         WHEN queue.head = $${targetParameters.length + 1}::uuid
+                         THEN queue.head_sequence ELSE queue.next_sequence END,
+                     next_sequence = CASE
+                         WHEN queue.head = $${targetParameters.length + 1}::uuid
+                         THEN queue.next_sequence ELSE queue.next_sequence + 1 END,
                      pending_items = queue.pending_items + 1,
                      pending_bytes = queue.pending_bytes + $${targetParameters.length + 2}
                  FROM (VALUES ${targetValues}) AS target(recipient)
@@ -555,14 +581,15 @@ export class PostgresRelayStore implements RelayStore {
             );
             await transaction.query(
                 `INSERT INTO murmur_queue_references
-                    (recipient, event_id, sender, delivery_id, encoded_bytes,
+                    (recipient, event_id, sequence, sender, delivery_id, encoded_bytes,
                      admission_principal)
                  SELECT target.recipient, $${targetParameters.length + 1}::uuid,
-                        $${targetParameters.length + 2}::bytea,
+                        queue.head_sequence, $${targetParameters.length + 2}::bytea,
                         $${targetParameters.length + 3}::text,
                         $${targetParameters.length + 4},
                         $${targetParameters.length + 5}::bytea
-                 FROM (VALUES ${targetValues}) AS target(recipient)`,
+                 FROM (VALUES ${targetValues}) AS target(recipient)
+                 JOIN murmur_queues AS queue ON queue.recipient = target.recipient`,
                 [
                     ...targetParameters,
                     eventId,
@@ -585,29 +612,48 @@ export class PostgresRelayStore implements RelayStore {
         constraints: PageReadConstraints,
     ): Promise<QueuePage> {
         this.#assertOpen();
+        await this.pruneExpired(now);
         return this.#database.transaction(async (transaction) => {
             const queueResult = await transaction.query<{
                 head: unknown;
+                head_sequence: unknown;
                 acknowledged_through: unknown;
+                acknowledged_sequence: unknown;
+                loss_generation: unknown;
             }>(
-                `SELECT head, acknowledged_through
+                `SELECT head, head_sequence, acknowledged_through, acknowledged_sequence,
+                        loss_generation
                  FROM murmur_queues WHERE recipient = $1`,
                 [recipient],
             );
             const queue = queueResult.rows[0];
             if (queue === undefined) {
+                const global = await transaction.query<{ generation_seed: unknown }>(
+                    `SELECT generation_seed FROM murmur_queue_global WHERE singleton = 1`,
+                );
+                const seed = global.rows[0];
+                if (seed === undefined) throw new Error("Missing generation seed");
                 return {
                     deliveries: [],
                     head: after,
+                    headSequence: 0,
                     acknowledgedThrough: after,
+                    acknowledgedSequence: 0,
+                    generation: initialLossGeneration(
+                        copyBytes(seed.generation_seed, "generation seed"),
+                        recipient,
+                    ),
                     exhausted: true,
                 };
             }
             const head = textColumn(queue.head, "queue head");
+            const headSequence = safeNumberColumn(queue.head_sequence);
             const acknowledgedThrough = nullableTextColumn(
                 queue.acknowledged_through,
                 "acknowledged event ID",
             );
+            const acknowledgedSequence = safeNumberColumn(queue.acknowledged_sequence);
+            const generation = copyBytes(queue.loss_generation, "loss generation");
             if (acknowledgedThrough !== null && (after === null || after < acknowledgedThrough)) {
                 throw new RelayError(409, "Queue cursor was already trimmed", {
                     error: "cursor_trimmed",
@@ -621,9 +667,10 @@ export class PostgresRelayStore implements RelayStore {
             }
             const metadata = await transaction.query<{
                 event_id: unknown;
+                sequence: unknown;
                 encoded_bytes: unknown;
             }>(
-                `SELECT reference.event_id, delivery.encoded_bytes
+                `SELECT reference.event_id, reference.sequence, delivery.encoded_bytes
                  FROM murmur_queue_references AS reference
                  JOIN murmur_queue_deliveries AS delivery
                    ON delivery.sender = reference.sender
@@ -631,7 +678,7 @@ export class PostgresRelayStore implements RelayStore {
                  WHERE reference.recipient = $1
                    AND ($2::uuid IS NULL OR reference.event_id > $2)
                    AND delivery.expires_at > $3
-                 ORDER BY reference.event_id
+                 ORDER BY reference.sequence
                  LIMIT $4`,
                 [recipient, after, now.toString(), limit + 1],
             );
@@ -639,11 +686,15 @@ export class PostgresRelayStore implements RelayStore {
                 metadata.rows.map(
                     (row): StoredPageCandidate => ({
                         eventId: textColumn(row.event_id, "event ID"),
+                        sequence: safeNumberColumn(row.sequence),
                         encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
                 head,
+                headSequence,
                 acknowledgedThrough,
+                acknowledgedSequence,
+                generation,
                 after,
                 limit,
                 constraints,
@@ -653,9 +704,11 @@ export class PostgresRelayStore implements RelayStore {
                     ? { rows: [] }
                     : await transaction.query<{
                           event_id: unknown;
+                          sequence: unknown;
                           delivery_json: unknown;
                       }>(
-                          `SELECT reference.event_id, delivery.delivery_json
+                          `SELECT reference.event_id, reference.sequence,
+                                  delivery.delivery_json
                            FROM murmur_queue_references AS reference
                            JOIN murmur_queue_deliveries AS delivery
                              ON delivery.sender = reference.sender
@@ -664,7 +717,7 @@ export class PostgresRelayStore implements RelayStore {
                              AND reference.event_id IN (${selection.candidates
                                  .map((_, index) => `$${index + 2}`)
                                  .join(", ")})
-                           ORDER BY reference.event_id`,
+                           ORDER BY reference.sequence`,
                           [recipient, ...selection.candidates.map(({ eventId }) => eventId)],
                       );
             if (hydrated.rows.length !== selection.candidates.length) {
@@ -677,13 +730,17 @@ export class PostgresRelayStore implements RelayStore {
                 }
                 return {
                     eventId,
+                    sequence: safeNumberColumn(row.sequence),
                     delivery: parseSignedDelivery(jsonValue(row.delivery_json)),
                 };
             });
             return {
                 deliveries,
                 head: selection.head,
+                headSequence: selection.headSequence,
                 acknowledgedThrough: selection.acknowledgedThrough,
+                acknowledgedSequence: selection.acknowledgedSequence,
+                generation: selection.generation,
                 exhausted: selection.exhausted,
             };
         }, "repeatable read");
@@ -702,17 +759,34 @@ export class PostgresRelayStore implements RelayStore {
             );
             const queueResult = await transaction.query<{
                 head: unknown;
+                head_sequence: unknown;
                 acknowledged_through: unknown;
+                acknowledged_sequence: unknown;
+                loss_generation: unknown;
             }>(
-                `SELECT head, acknowledged_through FROM murmur_queues
+                `SELECT head, head_sequence, acknowledged_through, acknowledged_sequence,
+                        loss_generation FROM murmur_queues
                  WHERE recipient = $1 FOR UPDATE`,
                 [recipient],
             );
             const queue = queueResult.rows[0];
             if (queue === undefined) {
-                return { removed: 0 };
+                const global = await transaction.query<{ generation_seed: unknown }>(
+                    `SELECT generation_seed FROM murmur_queue_global WHERE singleton = 1`,
+                );
+                const seed = global.rows[0];
+                if (seed === undefined) throw new Error("Missing generation seed");
+                return {
+                    removed: 0,
+                    generation: initialLossGeneration(
+                        copyBytes(seed.generation_seed, "generation seed"),
+                        recipient,
+                    ),
+                    sequence: 0,
+                };
             }
             const head = textColumn(queue.head, "queue head");
+            const headSequence = safeNumberColumn(queue.head_sequence);
             const acknowledgedThrough = nullableTextColumn(
                 queue.acknowledged_through,
                 "acknowledged event ID",
@@ -733,16 +807,25 @@ export class PostgresRelayStore implements RelayStore {
                 sender: unknown;
                 delivery_id: unknown;
                 encoded_bytes: unknown;
+                sequence: unknown;
             }>(
                 `DELETE FROM murmur_queue_references
                  WHERE recipient = $1 AND event_id <= $2
-                 RETURNING sender, delivery_id, encoded_bytes`,
+                 RETURNING sender, delivery_id, encoded_bytes, sequence`,
                 [recipient, through],
             );
             const removedBytes = removed.rows.reduce(
                 (total, row) => total + bigintColumn(row.encoded_bytes),
                 0n,
             );
+            const previousAcknowledgedSequence = safeNumberColumn(queue.acknowledged_sequence);
+            const acknowledgedSequence =
+                through === head
+                    ? headSequence
+                    : removed.rows.reduce(
+                          (maximum, row) => Math.max(maximum, safeNumberColumn(row.sequence)),
+                          previousAcknowledgedSequence,
+                      );
             if (removed.rows.length > 0) {
                 const parameters: (Uint8Array | string)[] = [];
                 const values = removed.rows
@@ -790,22 +873,22 @@ export class PostgresRelayStore implements RelayStore {
             await transaction.query(
                 `UPDATE murmur_queues
                  SET acknowledged_through = $1,
-                     pending_items = pending_items - $2,
-                     pending_bytes = pending_bytes - $3
-                 WHERE recipient = $4`,
-                [through, removed.rows.length, removedBytes.toString(), recipient],
-            );
-            await transaction.query(
-                `DELETE FROM murmur_queues AS queue
-                 WHERE queue.recipient = $1
-                   AND NOT EXISTS (
-                       SELECT 1 FROM murmur_queue_references AS reference
-                       WHERE reference.recipient = queue.recipient
-                   )`,
-                [recipient],
+                     acknowledged_sequence = $2,
+                     pending_items = pending_items - $3,
+                     pending_bytes = pending_bytes - $4
+                 WHERE recipient = $5`,
+                [
+                    through,
+                    acknowledgedSequence,
+                    removed.rows.length,
+                    removedBytes.toString(),
+                    recipient,
+                ],
             );
             return {
                 removed: removed.rows.length,
+                generation: copyBytes(queue.loss_generation, "loss generation"),
+                sequence: acknowledgedSequence,
             };
         });
     }
@@ -817,6 +900,29 @@ export class PostgresRelayStore implements RelayStore {
                 "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
             );
             return this.#pruneExpired(transaction, now);
+        });
+    }
+
+    async declareRestored(): Promise<number> {
+        this.#assertOpen();
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                `SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE`,
+            );
+            const queues = await transaction.query<{ recipient: unknown }>(
+                `SELECT recipient FROM murmur_queues ORDER BY recipient FOR UPDATE`,
+            );
+            for (const queue of queues.rows) {
+                await transaction.query(
+                    `UPDATE murmur_queues SET loss_generation = $1 WHERE recipient = $2`,
+                    [createGenerationSeed(), copyBytes(queue.recipient, "queue recipient")],
+                );
+            }
+            await transaction.query(
+                `UPDATE murmur_queue_global SET generation_seed = $1 WHERE singleton = 1`,
+                [createGenerationSeed()],
+            );
+            return queues.rows.length;
         });
     }
 
@@ -901,6 +1007,7 @@ export class PostgresRelayStore implements RelayStore {
             recipient: unknown;
             item_count: unknown;
             byte_count: unknown;
+            loss_generation: unknown;
         }>(
             `WITH expired AS (
                  SELECT sender, delivery_id
@@ -911,12 +1018,14 @@ export class PostgresRelayStore implements RelayStore {
              )
              SELECT reference.recipient,
                     COUNT(reference.event_id) AS item_count,
-                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count
+                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count,
+                    queue.loss_generation
              FROM murmur_queue_references AS reference
+             JOIN murmur_queues AS queue ON queue.recipient = reference.recipient
              JOIN expired
               ON expired.sender = reference.sender
               AND expired.delivery_id = reference.delivery_id
-             GROUP BY reference.recipient`,
+             GROUP BY reference.recipient, queue.loss_generation`,
             [now.toString()],
         );
         const removed = await transaction.query<{ event_id: unknown }>(
@@ -943,30 +1052,23 @@ export class PostgresRelayStore implements RelayStore {
                         copyBytes(row.recipient, "queue recipient"),
                         bigintColumn(row.item_count).toString(),
                         bigintColumn(row.byte_count).toString(),
+                        advanceLossGeneration(
+                            copyBytes(row.loss_generation, "loss generation"),
+                            safeNumberColumn(row.item_count),
+                        ),
                     );
-                    return `($${index * 3 + 1}::bytea, $${index * 3 + 2}::bigint, $${index * 3 + 3}::bigint)`;
+                    return `($${index * 4 + 1}::bytea, $${index * 4 + 2}::bigint, $${index * 4 + 3}::bigint, $${index * 4 + 4}::bytea)`;
                 })
                 .join(", ");
             await transaction.query(
                 `UPDATE murmur_queues AS queue
                  SET pending_items = queue.pending_items - change.item_count,
-                     pending_bytes = queue.pending_bytes - change.byte_count
+                     pending_bytes = queue.pending_bytes - change.byte_count,
+                     loss_generation = change.loss_generation
                  FROM (VALUES ${changeValues})
-                      AS change(recipient, item_count, byte_count)
+                      AS change(recipient, item_count, byte_count, loss_generation)
                  WHERE queue.recipient = change.recipient`,
                 changeParameters,
-            );
-            const parameters = chunk.map((row) => copyBytes(row.recipient, "queue recipient"));
-            const values = parameters.map((_, index) => `($${index + 1}::bytea)`).join(", ");
-            await transaction.query(
-                `DELETE FROM murmur_queues AS queue
-                 USING (VALUES ${values}) AS candidate(recipient)
-                 WHERE queue.recipient = candidate.recipient
-                   AND NOT EXISTS (
-                       SELECT 1 FROM murmur_queue_references AS reference
-                       WHERE reference.recipient = queue.recipient
-                   )`,
-                parameters,
             );
         }
         await transaction.query(

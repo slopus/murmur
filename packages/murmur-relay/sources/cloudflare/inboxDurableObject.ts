@@ -18,6 +18,7 @@ import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
 import { isUuidV7 } from "../utils/uuidV7.js";
 import { relaySessionTokenFromWebSocketProtocols } from "../websocket/index.js";
+import { advanceLossGeneration, createGenerationSeed } from "../storage/continuity.js";
 import {
     MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS,
     MAXIMUM_MESSAGE_BYTES,
@@ -25,6 +26,7 @@ import {
     MAXIMUM_QUEUE_ITEMS,
     STREAM_HEARTBEAT_MILLISECONDS,
     decodeStoredDelivery,
+    continuityFrame,
     deliveryFrame,
     encodedDeliveryBytes,
     exact,
@@ -71,10 +73,14 @@ interface InboxExpiryRecord {
 interface QueuePageBody {
     readonly deliveries: readonly {
         readonly eventId: string;
+        readonly sequence: number;
         readonly delivery: SignedDeliveryJson;
     }[];
     readonly head: string | null;
+    readonly headSequence: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+    readonly generation: string;
     readonly exhausted: boolean;
 }
 
@@ -89,7 +95,11 @@ function expiryKey(expiresAt: number, eventId: string): string {
 function emptyMetadata(): InboxMetadata {
     return {
         head: null,
+        headSequence: 0,
+        nextSequence: 1,
         acknowledgedThrough: null,
+        acknowledgedSequence: 0,
+        generation: encodeBase64Url(createGenerationSeed()),
         pendingItems: 0,
         pendingBytes: 0,
     };
@@ -272,8 +282,12 @@ export class MurmurInboxDurableObject {
                         responseFrame(frame.id, 413, {
                             error: "delivery_too_large",
                             eventId: page.deliveries[0]?.eventId ?? null,
+                            sequence: page.deliveries[0]?.sequence ?? null,
                             head: page.head,
+                            headSequence: page.headSequence,
                             acknowledgedThrough: page.acknowledgedThrough,
+                            acknowledgedSequence: page.acknowledgedSequence,
+                            generation: page.generation,
                         }),
                     );
                 } else {
@@ -300,8 +314,24 @@ export class MurmurInboxDurableObject {
                 after: read.after,
             });
             send(socket, responseFrame(frame.id, 200, { connected: true }));
+            send(
+                socket,
+                continuityFrame(frame.id, {
+                    head: page.head,
+                    headSequence: page.headSequence,
+                    nextSequence: page.headSequence + 1,
+                    acknowledgedThrough: page.acknowledgedThrough,
+                    acknowledgedSequence: page.acknowledgedSequence,
+                    generation: page.generation,
+                    pendingItems: page.deliveries.length,
+                    pendingBytes: 0,
+                }),
+            );
             for (const queued of page.deliveries) {
-                send(socket, deliveryFrame(frame.id, queued.eventId, queued.delivery));
+                send(
+                    socket,
+                    deliveryFrame(frame.id, queued.eventId, queued.sequence, queued.delivery),
+                );
                 socket.serializeAttachment({
                     ...attachment(socket),
                     after: queued.eventId,
@@ -386,7 +416,7 @@ export class MurmurInboxDurableObject {
                 }
                 return true;
             }
-            const metadata = (await transaction.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+            const metadata = await this.#metadataInTransaction(transaction);
             if (metadata.head !== null && eventId <= metadata.head) {
                 throw new RelayError(409, "Inbox event order regressed", {
                     error: "event_order",
@@ -421,6 +451,7 @@ export class MurmurInboxDurableObject {
             }
             const record: StoredDeliveryRecord = {
                 eventId,
+                sequence: metadata.nextSequence,
                 delivery: signedDeliveryToJson(delivery),
                 encodedBytes,
                 senderCounter,
@@ -432,6 +463,8 @@ export class MurmurInboxDurableObject {
             await transaction.put<InboxMetadata>(META_KEY, {
                 ...metadata,
                 head: eventId,
+                headSequence: metadata.nextSequence,
+                nextSequence: metadata.nextSequence + 1,
                 pendingItems: metadata.pendingItems + 1,
                 pendingBytes: metadata.pendingBytes + encodedBytes,
             });
@@ -445,15 +478,16 @@ export class MurmurInboxDurableObject {
             });
             return false;
         });
-        this.#broadcast(eventId, signedDeliveryToJson(delivery));
+        const metadata = await this.#state.storage.get<InboxMetadata>(META_KEY);
+        if (metadata === undefined) throw new Error("Missing inbox metadata after insertion");
+        this.#broadcast(eventId, metadata.headSequence, signedDeliveryToJson(delivery));
         await this.#scheduleAt(delivery.expiresAt);
         return duplicate;
     }
 
     async #read(read: SignedQueueRead): Promise<QueuePageBody> {
         await this.#pruneExpired(Date.now());
-        const metadata =
-            (await this.#state.storage.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+        const metadata = await this.#metadata();
         if (
             metadata.acknowledgedThrough !== null &&
             (read.after === null || read.after < metadata.acknowledgedThrough)
@@ -480,18 +514,28 @@ export class MurmurInboxDurableObject {
         return {
             deliveries: selected.map((value) => ({
                 eventId: value.eventId,
+                sequence: value.sequence,
                 delivery: value.delivery,
             })),
             head: metadata.head,
+            headSequence: metadata.headSequence,
             acknowledgedThrough: metadata.acknowledgedThrough,
+            acknowledgedSequence: metadata.acknowledgedSequence,
+            generation: metadata.generation,
             exhausted: values.length <= selected.length,
         };
     }
 
-    async #acknowledge(acknowledgement: SignedQueueAck): Promise<{ readonly removed: number }> {
+    async #acknowledge(acknowledgement: SignedQueueAck): Promise<{
+        readonly removed: number;
+        readonly sequence: number;
+        readonly generation: string;
+    }> {
         return this.#state.storage.transaction(async (transaction) => {
-            const metadata = (await transaction.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
-            if (metadata.head === null) return { removed: 0 };
+            const metadata = await this.#metadataInTransaction(transaction);
+            if (metadata.head === null) {
+                return { removed: 0, sequence: 0, generation: metadata.generation };
+            }
             if (acknowledgement.through > metadata.head) {
                 throw new RelayError(409, "Acknowledgement exceeds inbox head", {
                     error: "ack_future",
@@ -519,10 +563,27 @@ export class MurmurInboxDurableObject {
             await transaction.put<InboxMetadata>(META_KEY, {
                 ...metadata,
                 acknowledgedThrough: acknowledgement.through,
+                acknowledgedSequence:
+                    acknowledgement.through === metadata.head
+                        ? metadata.headSequence
+                        : Math.max(
+                              metadata.acknowledgedSequence,
+                              ...[...entries.values()].map((entry) => entry.sequence),
+                          ),
                 pendingItems: Math.max(0, metadata.pendingItems - entries.size),
                 pendingBytes: Math.max(0, metadata.pendingBytes - removedBytes),
             });
-            return { removed: entries.size };
+            return {
+                removed: entries.size,
+                sequence:
+                    acknowledgement.through === metadata.head
+                        ? metadata.headSequence
+                        : Math.max(
+                              metadata.acknowledgedSequence,
+                              ...[...entries.values()].map((entry) => entry.sequence),
+                          ),
+                generation: metadata.generation,
+            };
         });
     }
 
@@ -541,13 +602,16 @@ export class MurmurInboxDurableObject {
             }
             await this.#deleteRecords(transaction, records);
             await transaction.delete([...expirations.keys()]);
-            const metadata = (await transaction.get<InboxMetadata>(META_KEY)) ?? emptyMetadata();
+            const metadata = await this.#metadataInTransaction(transaction);
             const removedBytes = records.reduce(
                 (total, [, value]) => total + value.encodedBytes,
                 0,
             );
             await transaction.put<InboxMetadata>(META_KEY, {
                 ...metadata,
+                generation: encodeBase64Url(
+                    advanceLossGeneration(decodeBase64Url(metadata.generation, 32), records.length),
+                ),
                 pendingItems: Math.max(0, metadata.pendingItems - records.length),
                 pendingBytes: Math.max(0, metadata.pendingBytes - removedBytes),
             });
@@ -617,7 +681,7 @@ export class MurmurInboxDurableObject {
         }
     }
 
-    #broadcast(eventId: string, delivery: SignedDeliveryJson): void {
+    #broadcast(eventId: string, sequence: number, delivery: SignedDeliveryJson): void {
         for (const socket of this.#state.getWebSockets()) {
             try {
                 const value = attachment(socket);
@@ -625,7 +689,7 @@ export class MurmurInboxDurableObject {
                     value.streamId !== undefined &&
                     (value.after === null || value.after === undefined || eventId > value.after)
                 ) {
-                    send(socket, deliveryFrame(value.streamId, eventId, delivery));
+                    send(socket, deliveryFrame(value.streamId, eventId, sequence, delivery));
                     socket.serializeAttachment({ ...value, after: eventId });
                 }
             } catch {
@@ -636,6 +700,73 @@ export class MurmurInboxDurableObject {
 
     async #scheduleHeartbeat(): Promise<void> {
         await this.#scheduleAt(Date.now() + STREAM_HEARTBEAT_MILLISECONDS);
+    }
+
+    async #metadata(): Promise<InboxMetadata> {
+        return this.#state.storage.transaction((transaction) =>
+            this.#metadataInTransaction(transaction),
+        );
+    }
+
+    async #metadataInTransaction(
+        transaction: DurableObjectTransactionLike,
+    ): Promise<InboxMetadata> {
+        const existing = await transaction.get<Partial<InboxMetadata>>(META_KEY);
+        if (existing === undefined) {
+            const created = emptyMetadata();
+            await transaction.put(META_KEY, created);
+            return created;
+        }
+        if (
+            (existing.head === null || typeof existing.head === "string") &&
+            Number.isSafeInteger(existing.headSequence) &&
+            (existing.headSequence ?? -1) >= 0 &&
+            Number.isSafeInteger(existing.nextSequence) &&
+            (existing.nextSequence ?? 0) > (existing.headSequence ?? -1) &&
+            (existing.acknowledgedThrough === null ||
+                typeof existing.acknowledgedThrough === "string") &&
+            Number.isSafeInteger(existing.acknowledgedSequence) &&
+            (existing.acknowledgedSequence ?? -1) >= 0 &&
+            typeof existing.generation === "string"
+        ) {
+            try {
+                decodeBase64Url(existing.generation, 32);
+                return existing as InboxMetadata;
+            } catch {
+                // Fall through to a loss-signaling lazy migration.
+            }
+        }
+
+        const records = await transaction.list<StoredDeliveryRecord>({
+            prefix: EVENT_PREFIX,
+            limit: MAXIMUM_QUEUE_ITEMS + 1,
+        });
+        if (records.size > MAXIMUM_QUEUE_ITEMS) {
+            throw new Error("Inbox migration exceeds queue capacity");
+        }
+        let sequence = 0;
+        let pendingBytes = 0;
+        for (const [key, record] of records) {
+            sequence += 1;
+            pendingBytes += record.encodedBytes;
+            await transaction.put<StoredDeliveryRecord>(key, { ...record, sequence });
+        }
+        const last = [...records.values()].at(-1);
+        const migrated: InboxMetadata = {
+            head: typeof existing.head === "string" ? existing.head : (last?.eventId ?? null),
+            headSequence: sequence,
+            nextSequence: sequence + 1,
+            acknowledgedThrough:
+                typeof existing.acknowledgedThrough === "string"
+                    ? existing.acknowledgedThrough
+                    : null,
+            acknowledgedSequence: 0,
+            generation: encodeBase64Url(createGenerationSeed()),
+            pendingItems: records.size,
+            pendingBytes,
+        };
+        await transaction.put(META_KEY, migrated);
+        return migrated;
     }
 
     async #scheduleAt(scheduled: number): Promise<void> {

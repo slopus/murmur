@@ -164,10 +164,14 @@ contains:
 interface InboxPageJson {
     deliveries: readonly {
         eventId: string;
+        sequence: number;
         delivery: SignedDeliveryJson;
     }[];
     head: string | null;
+    headSequence: number;
     acknowledgedThrough: string | null;
+    acknowledgedSequence: number;
+    generation: string; // canonical base64url, exactly 32 bytes
     exhausted: boolean;
 }
 ```
@@ -183,9 +187,12 @@ Opens one recipient-authenticated SSE response using the same
 response is `text/event-stream`; it emits exact queued deliveries:
 
 ```text
+event: continuity
+data: {"generation":"...","head":"019...","headSequence":4,"acknowledgedThrough":null,"acknowledgedSequence":0}
+
 id: 019...
 event: delivery
-data: {"eventId":"019...","delivery":{...SignedDeliveryJson}}
+data: {"eventId":"019...","sequence":4,"delivery":{...SignedDeliveryJson}}
 
 ```
 
@@ -212,7 +219,10 @@ interface SignedQueueAckJson {
 
 Acknowledgement must not regress or exceed the inbox head. It removes queue
 references through `through`, deletes orphan deliveries, updates exact pending
-counters, and reclaims empty inbox metadata.
+counters, and returns `{removed, sequence, generation}`. Empty inbox metadata
+is retained. Expiry of any unacknowledged reference advances its inbox's
+generation; acknowledgement never does. The hard retention window is exactly
+180 days.
 
 ## Errors and admission
 

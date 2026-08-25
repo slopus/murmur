@@ -38,6 +38,8 @@ export interface RevokeInvitationsOutcome {
 /** Result of one monotonic queue-prefix acknowledgement. */
 export interface AcknowledgeOutcome {
     readonly removed: number;
+    readonly generation: Uint8Array;
+    readonly sequence: number;
 }
 
 /** Per-identity queue bounds enforced atomically across a multicast. */
@@ -61,6 +63,7 @@ export interface PageReadConstraints {
 /** One retained queue reference and its shared delivery. */
 export interface QueuedDelivery {
     readonly eventId: string;
+    readonly sequence: number;
     readonly delivery: SignedDelivery;
 }
 
@@ -68,7 +71,10 @@ export interface QueuedDelivery {
 export interface QueuePage {
     readonly deliveries: readonly QueuedDelivery[];
     readonly head: string | null;
+    readonly headSequence: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+    readonly generation: Uint8Array;
     readonly exhausted: boolean;
 }
 
@@ -104,6 +110,8 @@ export interface RelayStore {
         constraints: PageReadConstraints,
     ): Promise<QueuePage>;
     acknowledge(recipient: Uint8Array, through: string, now: number): Promise<AcknowledgeOutcome>;
+    /** Invalidate every known inbox after an operator-declared state restoration. */
+    declareRestored(): Promise<number>;
     pruneExpired(now: number): Promise<number>;
     health(): Promise<void>;
     close(): Promise<void>;

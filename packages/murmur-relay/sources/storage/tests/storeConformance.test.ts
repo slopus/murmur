@@ -452,8 +452,9 @@ describe("identity queue store conformance", () => {
                     expect(page.head).toBe(published.eventId);
                 }
 
-                expect(await store.acknowledge(bob, published.eventId, NOW)).toEqual({
+                expect(await store.acknowledge(bob, published.eventId, NOW)).toMatchObject({
                     removed: 1,
+                    sequence: 1,
                 });
                 expect(
                     (await store.readQueue(bob, published.eventId, 10, NOW, PAGE)).deliveries,
@@ -463,7 +464,10 @@ describe("identity queue store conformance", () => {
                 );
                 await store.acknowledge(alice, published.eventId, NOW);
                 await store.acknowledge(carol, published.eventId, NOW);
-                expect(await store.acknowledge(alice, eventId(0), NOW)).toEqual({ removed: 0 });
+                await expect(store.acknowledge(alice, eventId(0), NOW)).rejects.toMatchObject({
+                    status: 409,
+                    body: { error: "ack_regression" },
+                });
 
                 const republished = await store.publish(delivery, NOW, LIMITS, ADMISSION_PRINCIPAL);
                 expect(republished.duplicate).toBe(false);
@@ -544,17 +548,45 @@ describe("identity queue store conformance", () => {
                 const expired = await store.readQueue(bob, null, 10, NOW + 2, PAGE);
                 expect(expired).toMatchObject({
                     deliveries: [],
-                    head: null,
+                    head: published.eventId,
                     acknowledgedThrough: null,
+                    headSequence: 1,
                     exhausted: true,
                 });
                 await store.acknowledge(bob, published.eventId, NOW + 2);
-                expect(await store.readQueue(bob, null, 10, NOW + 2, PAGE)).toEqual({
+                const baseline = await store.readQueue(bob, published.eventId, 10, NOW + 2, PAGE);
+                expect(baseline).toMatchObject({
                     deliveries: [],
-                    head: null,
-                    acknowledgedThrough: null,
+                    head: published.eventId,
+                    acknowledgedThrough: published.eventId,
+                    acknowledgedSequence: 1,
                     exhausted: true,
                 });
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
+    test("declared restore changes generations without deleting pending data", async () => {
+        const aliceSecret = secret(40);
+        const bob = identity(secret(41));
+        for (const store of await stores()) {
+            try {
+                const published = await store.publish(
+                    signedDelivery(aliceSecret, recipients(bob), { id: 42 }),
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                const before = await store.readQueue(bob, null, 10, NOW, PAGE);
+                await expect(store.declareRestored()).resolves.toBeGreaterThanOrEqual(1);
+                const after = await store.readQueue(bob, null, 10, NOW, PAGE);
+                expect(after.deliveries.map((delivery) => delivery.eventId)).toEqual([
+                    published.eventId,
+                ]);
+                expect(after.headSequence).toBe(before.headSequence);
+                expect(after.generation).not.toEqual(before.generation);
             } finally {
                 await store.close();
             }
@@ -758,7 +790,7 @@ describe("identity queue store conformance", () => {
                     )
                     .get(),
             ).toEqual({
-                queues: 0,
+                queues: 1,
                 refs: 0,
                 deliveries: 0,
                 pending_items: 0,
@@ -788,7 +820,7 @@ describe("identity queue store conformance", () => {
                     )
                     .get(),
             ).toEqual({
-                queues: 0,
+                queues: 1,
                 refs: 0,
                 deliveries: 0,
                 pending_items: 0,

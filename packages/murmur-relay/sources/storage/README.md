@@ -11,7 +11,7 @@ owner revoke -> digest tombstone -> reject fetch/re-upload until expiry
 delivery -> monotonic UUIDv7 -> recipient inbox references
 ack prefix ----------------> delete one recipient's references
 no references / expiration -> delete delivery
-empty inbox ---------------> delete queue metadata
+empty inbox ---------------> retain continuity metadata
 ```
 
 Invitation rows are separate from delivery counters. They have indexed expiry
@@ -28,9 +28,11 @@ authority-wide selection is indexed and capped; no unbounded table scan is
 used.
 
 The global singleton maintains exact pending delivery, encoded-byte, and
-reference counters. Every nonempty inbox row also maintains exact pending item
-and byte counters, while references carry their encoded size so acknowledge and
-expiration can decrement without rescanning inbox depth. Publication checks
+reference counters plus an unpredictable generation seed. Every known inbox row
+maintains a strictly increasing sequence, acknowledged sequence, 32-byte loss
+generation, and exact pending item and byte counters. References carry their
+sequence and encoded size so acknowledgement and expiration can update state
+without rescanning inbox depth. Publication checks
 those counters plus indexed sender and admitted-principal usage while holding
 the writer lock. `RelayStore.publish` requires the already-derived 32-byte
 admission-principal digest and never substitutes the free protocol sender
@@ -39,18 +41,19 @@ storage ceiling.
 Multicast target creation, quota reads, reference insertion, head updates, and
 wake publication are set-based SQL rather than one statement per recipient.
 
-Schema version 3 is the compatibility baseline. Version 4 migrates SQLite and
+Schema version 3 is the compatibility baseline. Version 5 migrates SQLite and
 Postgres stores in place while retaining pending deliveries, references, and
-invitations, then adds invitation revocation metadata and tombstones. An
+invitations, adding invitation revocation metadata, sequence numbers, and loss
+generations. An
 upgrade must not require a clean database. Pre-v0.3 topic-relay schemas remain
 unsupported.
 
-Only pending, unexpired data is authoritative. Empty queue metadata is deleted,
-so the relay does not retain recipient tombstones or historical cursors.
-Unknown empty inboxes echo the caller's `after` cursor and reveal no global
-traffic counter. Numeric sequences and loss-gap watermarks do not exist.
-Expiration is destructive; later MLS processing supplies the durable terminal
-outcome if a required event was missed.
+Only pending, unexpired delivery data is authoritative. Continuity metadata is
+retained indefinitely after first publication. Acknowledged trimming advances
+the acknowledged sequence without changing generation. Any unacknowledged
+removal advances the 256-bit generation by the exact removed-reference count.
+An operator-declared store restore replaces every known generation and the seed
+for future inboxes, making state loss detectable instead of silent.
 
 Reads filter expiration without mutating storage and hydrate only the page
 selected from bounded UUID and encoded-length metadata. Acknowledgement removes

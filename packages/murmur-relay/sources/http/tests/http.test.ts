@@ -140,7 +140,7 @@ describe("identity queue HTTP API", () => {
                     signedQueueAckToJson(signedAck(bobSecret, publishBody.eventId)),
                 ),
             );
-            expect(await acknowledged.json()).toEqual({ removed: 1 });
+            expect(await acknowledged.json()).toMatchObject({ removed: 1, sequence: 1 });
         } finally {
             await relay.close();
         }
@@ -179,6 +179,8 @@ describe("identity queue HTTP API", () => {
                 now: NOW,
             });
             const published = await relay.publish(delivery, "sse-tests");
+            const continuity = new TextDecoder().decode((await reader.read()).value);
+            expect(continuity).toContain("event: continuity\ndata: ");
             const encoded = new TextDecoder().decode((await reader.read()).value);
             expect(encoded).toContain(`id: ${published.eventId}\nevent: delivery\ndata: `);
             const data = encoded
@@ -187,6 +189,7 @@ describe("identity queue HTTP API", () => {
                 ?.slice("data: ".length);
             expect(JSON.parse(data!)).toEqual({
                 eventId: published.eventId,
+                sequence: 1,
                 delivery: signedDeliveryToJson(delivery),
             });
             controller.abort();
@@ -271,11 +274,15 @@ describe("identity queue HTTP API", () => {
                 post("/v1/queue/read", signedQueueReadToJson(signedRead(bobSecret, { now: NOW }))),
             );
             expect(response.status).toBe(413);
-            expect(await response.json()).toEqual({
+            expect(await response.json()).toMatchObject({
                 error: "delivery_too_large",
                 eventId: published.eventId,
+                sequence: 1,
                 head: published.eventId,
+                headSequence: 1,
                 acknowledgedThrough: null,
+                acknowledgedSequence: 0,
+                generation: expect.any(String),
             });
         } finally {
             await reader.close();

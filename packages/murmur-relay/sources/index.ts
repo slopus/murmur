@@ -22,11 +22,17 @@ export type {
     SignedQueueRead,
     SignedQueueReadJson,
 } from "./protocol/index.js";
-export { InProcessWakeSource, PostgresWakeSource, RelayService } from "./relay/index.js";
+export {
+    DELIVERY_RETENTION_MILLISECONDS,
+    InProcessWakeSource,
+    PostgresWakeSource,
+    RelayService,
+} from "./relay/index.js";
 export type {
     InvitationDownload,
     InvitationUploadOutcome,
     QueueEventSubscription,
+    QueueContinuityEvent,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,

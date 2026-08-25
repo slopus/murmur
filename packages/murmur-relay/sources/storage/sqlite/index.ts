@@ -10,6 +10,7 @@ import {
     parseSignedDelivery,
     type SignedDelivery,
 } from "../../protocol/index.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
 import { nextUuidV7 } from "../../utils/uuidV7.js";
 import {
@@ -17,6 +18,11 @@ import {
     selectQueuePageMetadata,
     type StoredPageCandidate,
 } from "../page.js";
+import {
+    advanceLossGeneration,
+    createGenerationSeed,
+    initialLossGeneration,
+} from "../continuity.js";
 import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
     AcknowledgeOutcome,
@@ -375,7 +381,8 @@ export class SqliteRelayStore implements RelayStore {
 
             const encoded = encodeStoredDelivery(delivery);
             const global = this.#requiredGet(
-                `SELECT last_event_id, pending_items, pending_bytes, pending_references
+                `SELECT last_event_id, generation_seed, pending_items, pending_bytes,
+                        pending_references
                  FROM murmur_queue_global WHERE singleton = 1`,
             );
             if (
@@ -480,34 +487,60 @@ export class SqliteRelayStore implements RelayStore {
                 BigInt(encoded.encodedBytes),
                 BigInt(delivery.expiresAt),
             );
-            const queueValues = delivery.recipients.map(() => "(?, ?, NULL, 1, ?)").join(", ");
+            const generationSeed = copyBytes(global.generation_seed, "generation seed");
+            const queueValues = delivery.recipients
+                .map(() => "(?, ?, 1, 2, NULL, 0, ?, 1, ?)")
+                .join(", ");
             const queueParameters = delivery.recipients.flatMap((recipient) => [
                 recipient,
                 eventId,
+                initialLossGeneration(generationSeed, recipient),
                 BigInt(encoded.encodedBytes),
             ]);
             this.#run(
                 `INSERT INTO murmur_queues
-                    (recipient, head, acknowledged_through, pending_items, pending_bytes)
+                    (recipient, head, head_sequence, next_sequence,
+                     acknowledged_through, acknowledged_sequence, loss_generation,
+                     pending_items, pending_bytes)
                  VALUES ${queueValues}
                  ON CONFLICT (recipient) DO UPDATE SET
                     head = excluded.head,
+                    head_sequence = murmur_queues.next_sequence,
+                    next_sequence = murmur_queues.next_sequence + 1,
                     pending_items = murmur_queues.pending_items + 1,
                     pending_bytes = murmur_queues.pending_bytes + excluded.pending_bytes`,
                 ...queueParameters,
             );
-            const referenceValues = delivery.recipients.map(() => "(?, ?, ?, ?, ?, ?)").join(", ");
-            const referenceParameters = delivery.recipients.flatMap((recipient) => [
-                recipient,
-                eventId,
-                delivery.sender,
-                delivery.id,
-                BigInt(encoded.encodedBytes),
-                admissionPrincipal,
-            ]);
+            const assigned = this.#all(
+                `SELECT recipient, head_sequence FROM murmur_queues
+                 WHERE recipient IN (${delivery.recipients.map(() => "?").join(", ")})`,
+                ...delivery.recipients,
+            );
+            const sequenceByRecipient = new Map(
+                assigned.map((row) => [
+                    encodeBase64Url(copyBytes(row.recipient, "queue recipient")),
+                    safeNumberColumn(row.head_sequence),
+                ]),
+            );
+            const referenceValues = delivery.recipients
+                .map(() => "(?, ?, ?, ?, ?, ?, ?)")
+                .join(", ");
+            const referenceParameters = delivery.recipients.flatMap((recipient) => {
+                const sequence = sequenceByRecipient.get(encodeBase64Url(recipient));
+                if (sequence === undefined) throw new Error("Missing assigned inbox sequence");
+                return [
+                    recipient,
+                    eventId,
+                    BigInt(sequence),
+                    delivery.sender,
+                    delivery.id,
+                    BigInt(encoded.encodedBytes),
+                    admissionPrincipal,
+                ];
+            });
             this.#run(
                 `INSERT INTO murmur_queue_references
-                    (recipient, event_id, sender, delivery_id, encoded_bytes,
+                    (recipient, event_id, sequence, sender, delivery_id, encoded_bytes,
                      admission_principal)
                  VALUES ${referenceValues}`,
                 ...referenceParameters,
@@ -528,27 +561,41 @@ export class SqliteRelayStore implements RelayStore {
         constraints: PageReadConstraints,
     ): Promise<QueuePage> {
         this.#assertOpen();
+        await this.pruneExpired(now);
         this.#database.exec("BEGIN");
         try {
             const queue = this.#get(
-                `SELECT head, acknowledged_through
+                `SELECT head, head_sequence, acknowledged_through, acknowledged_sequence,
+                        loss_generation
                  FROM murmur_queues WHERE recipient = ?`,
                 recipient,
             );
             if (queue === undefined) {
+                const global = this.#requiredGet(
+                    `SELECT generation_seed FROM murmur_queue_global WHERE singleton = 1`,
+                );
                 this.#database.exec("COMMIT");
                 return {
                     deliveries: [],
                     head: after,
+                    headSequence: 0,
                     acknowledgedThrough: after,
+                    acknowledgedSequence: 0,
+                    generation: initialLossGeneration(
+                        copyBytes(global.generation_seed, "generation seed"),
+                        recipient,
+                    ),
                     exhausted: true,
                 };
             }
             const head = textColumn(queue.head, "queue head");
+            const headSequence = safeNumberColumn(queue.head_sequence);
             const acknowledgedThrough = nullableTextColumn(
                 queue.acknowledged_through,
                 "acknowledged event ID",
             );
+            const acknowledgedSequence = safeNumberColumn(queue.acknowledged_sequence);
+            const generation = copyBytes(queue.loss_generation, "loss generation");
             if (acknowledgedThrough !== null && (after === null || after < acknowledgedThrough)) {
                 throw new RelayError(409, "Queue cursor was already trimmed", {
                     error: "cursor_trimmed",
@@ -562,7 +609,7 @@ export class SqliteRelayStore implements RelayStore {
             }
 
             const metadata = this.#all(
-                `SELECT reference.event_id, delivery.encoded_bytes
+                `SELECT reference.event_id, reference.sequence, delivery.encoded_bytes
                  FROM murmur_queue_references AS reference
                  JOIN murmur_queue_deliveries AS delivery
                    ON delivery.sender = reference.sender
@@ -570,7 +617,7 @@ export class SqliteRelayStore implements RelayStore {
                  WHERE reference.recipient = ?
                    AND (? IS NULL OR reference.event_id > ?)
                    AND delivery.expires_at > ?
-                 ORDER BY reference.event_id
+                 ORDER BY reference.sequence
                  LIMIT ?`,
                 recipient,
                 after,
@@ -582,11 +629,15 @@ export class SqliteRelayStore implements RelayStore {
                 metadata.map(
                     (row): StoredPageCandidate => ({
                         eventId: textColumn(row.event_id, "event ID"),
+                        sequence: safeNumberColumn(row.sequence),
                         encodedBytes: safeNumberColumn(row.encoded_bytes),
                     }),
                 ),
                 head,
+                headSequence,
                 acknowledgedThrough,
+                acknowledgedSequence,
+                generation,
                 after,
                 limit,
                 constraints,
@@ -595,7 +646,8 @@ export class SqliteRelayStore implements RelayStore {
                 selection.candidates.length === 0
                     ? []
                     : this.#all(
-                          `SELECT reference.event_id, delivery.delivery_json
+                          `SELECT reference.event_id, reference.sequence,
+                                  delivery.delivery_json
                            FROM murmur_queue_references AS reference
                            JOIN murmur_queue_deliveries AS delivery
                              ON delivery.sender = reference.sender
@@ -604,7 +656,7 @@ export class SqliteRelayStore implements RelayStore {
                              AND reference.event_id IN (${selection.candidates
                                  .map(() => "?")
                                  .join(", ")})
-                           ORDER BY reference.event_id`,
+                           ORDER BY reference.sequence`,
                           recipient,
                           ...selection.candidates.map(({ eventId }) => eventId),
                       );
@@ -618,6 +670,7 @@ export class SqliteRelayStore implements RelayStore {
                 }
                 return {
                     eventId,
+                    sequence: safeNumberColumn(row.sequence),
                     delivery: parseSignedDelivery(
                         JSON.parse(textColumn(row.delivery_json, "delivery JSON")) as unknown,
                     ),
@@ -627,7 +680,10 @@ export class SqliteRelayStore implements RelayStore {
             return {
                 deliveries,
                 head: selection.head,
+                headSequence: selection.headSequence,
                 acknowledgedThrough: selection.acknowledgedThrough,
+                acknowledgedSequence: selection.acknowledgedSequence,
+                generation: selection.generation,
                 exhausted: selection.exhausted,
             };
         } catch (error: unknown) {
@@ -646,15 +702,27 @@ export class SqliteRelayStore implements RelayStore {
         this.#database.exec("BEGIN IMMEDIATE");
         try {
             const queue = this.#get(
-                `SELECT head, acknowledged_through
+                `SELECT head, head_sequence, acknowledged_through, acknowledged_sequence,
+                        loss_generation
                  FROM murmur_queues WHERE recipient = ?`,
                 recipient,
             );
             if (queue === undefined) {
+                const global = this.#requiredGet(
+                    `SELECT generation_seed FROM murmur_queue_global WHERE singleton = 1`,
+                );
                 this.#database.exec("COMMIT");
-                return { removed: 0 };
+                return {
+                    removed: 0,
+                    generation: initialLossGeneration(
+                        copyBytes(global.generation_seed, "generation seed"),
+                        recipient,
+                    ),
+                    sequence: 0,
+                };
             }
             const head = textColumn(queue.head, "queue head");
+            const headSequence = safeNumberColumn(queue.head_sequence);
             const acknowledgedThrough = nullableTextColumn(
                 queue.acknowledged_through,
                 "acknowledged event ID",
@@ -672,7 +740,7 @@ export class SqliteRelayStore implements RelayStore {
                 });
             }
             const affected = this.#all(
-                `SELECT sender, delivery_id, encoded_bytes
+                `SELECT sender, delivery_id, encoded_bytes, sequence
                  FROM murmur_queue_references
                  WHERE recipient = ? AND event_id <= ?`,
                 recipient,
@@ -690,13 +758,23 @@ export class SqliteRelayStore implements RelayStore {
                 (total, row) => total + bigintColumn(row.encoded_bytes),
                 0n,
             );
+            const previousAcknowledgedSequence = safeNumberColumn(queue.acknowledged_sequence);
+            const acknowledgedSequence =
+                through === head
+                    ? headSequence
+                    : affected.reduce(
+                          (maximum, row) => Math.max(maximum, safeNumberColumn(row.sequence)),
+                          previousAcknowledgedSequence,
+                      );
             this.#run(
                 `UPDATE murmur_queues
                  SET acknowledged_through = ?,
+                     acknowledged_sequence = ?,
                      pending_items = pending_items - ?,
                      pending_bytes = pending_bytes - ?
                  WHERE recipient = ?`,
                 through,
+                BigInt(acknowledgedSequence),
                 BigInt(removed),
                 removedBytes,
                 recipient,
@@ -737,9 +815,12 @@ export class SqliteRelayStore implements RelayStore {
                 orphanedBytes,
                 BigInt(removed),
             );
-            this.#deleteEmptyQueue(recipient);
             this.#database.exec("COMMIT");
-            return { removed };
+            return {
+                removed,
+                generation: copyBytes(queue.loss_generation, "loss generation"),
+                sequence: acknowledgedSequence,
+            };
         } catch (error: unknown) {
             this.#rollback();
             throw error;
@@ -777,6 +858,30 @@ export class SqliteRelayStore implements RelayStore {
             );
             this.#database.exec("COMMIT");
             return removedDeliveries + removedInvitations + removedRevocations;
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
+    }
+
+    async declareRestored(): Promise<number> {
+        this.#assertOpen();
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            const queues = this.#all(`SELECT recipient FROM murmur_queues ORDER BY recipient`);
+            for (const queue of queues) {
+                this.#run(
+                    `UPDATE murmur_queues SET loss_generation = ? WHERE recipient = ?`,
+                    createGenerationSeed(),
+                    copyBytes(queue.recipient, "queue recipient"),
+                );
+            }
+            this.#run(
+                `UPDATE murmur_queue_global SET generation_seed = ? WHERE singleton = 1`,
+                createGenerationSeed(),
+            );
+            this.#database.exec("COMMIT");
+            return queues.length;
         } catch (error: unknown) {
             this.#rollback();
             throw error;
@@ -856,9 +961,73 @@ export class SqliteRelayStore implements RelayStore {
                     this.#rollback();
                     throw error;
                 }
+                const queueGlobal = this.#get(
+                    `SELECT name FROM sqlite_master
+                     WHERE type = 'table' AND name = 'murmur_queue_global'`,
+                );
+                if (queueGlobal !== undefined) this.#initializeSchema();
                 return;
             }
-            if (version !== 4n) {
+            if (version === 4n) {
+                this.#database.exec("BEGIN IMMEDIATE");
+                try {
+                    this.#database.exec(`
+                    ALTER TABLE murmur_queue_global ADD COLUMN generation_seed BLOB
+                        NOT NULL DEFAULT (zeroblob(32)) CHECK (length(generation_seed) = 32);
+                    ALTER TABLE murmur_queues ADD COLUMN head_sequence INTEGER
+                        NOT NULL DEFAULT 0 CHECK (head_sequence >= 0);
+                    ALTER TABLE murmur_queues ADD COLUMN next_sequence INTEGER
+                        NOT NULL DEFAULT 1 CHECK (next_sequence > head_sequence);
+                    ALTER TABLE murmur_queues ADD COLUMN acknowledged_sequence INTEGER
+                        NOT NULL DEFAULT 0 CHECK (
+                            acknowledged_sequence >= 0 AND acknowledged_sequence <= head_sequence
+                        );
+                    ALTER TABLE murmur_queues ADD COLUMN loss_generation BLOB
+                        NOT NULL DEFAULT (zeroblob(32)) CHECK (length(loss_generation) = 32);
+                    ALTER TABLE murmur_queue_references ADD COLUMN sequence INTEGER
+                        NOT NULL DEFAULT 0 CHECK (sequence >= 0);
+                    UPDATE murmur_queue_references AS reference
+                    SET sequence = (
+                        SELECT COUNT(*) FROM murmur_queue_references AS prior
+                        WHERE prior.recipient = reference.recipient
+                          AND prior.event_id <= reference.event_id
+                    );
+                    CREATE UNIQUE INDEX murmur_queue_reference_sequence
+                        ON murmur_queue_references(recipient, sequence);
+                    UPDATE murmur_queues
+                    SET head_sequence = COALESCE((
+                            SELECT MAX(sequence) FROM murmur_queue_references AS reference
+                            WHERE reference.recipient = murmur_queues.recipient
+                        ), 0),
+                        next_sequence = COALESCE((
+                            SELECT MAX(sequence) + 1
+                            FROM murmur_queue_references AS reference
+                            WHERE reference.recipient = murmur_queues.recipient
+                        ), 1);
+                    UPDATE murmur_queue_schema SET version = 5 WHERE singleton = 1;
+                    `);
+                    const seed = createGenerationSeed();
+                    this.#run(
+                        `UPDATE murmur_queue_global SET generation_seed = ? WHERE singleton = 1`,
+                        seed,
+                    );
+                    const queues = this.#all(`SELECT recipient FROM murmur_queues`);
+                    for (const queue of queues) {
+                        const recipient = copyBytes(queue.recipient, "queue recipient");
+                        this.#run(
+                            `UPDATE murmur_queues SET loss_generation = ? WHERE recipient = ?`,
+                            initialLossGeneration(seed, recipient),
+                            recipient,
+                        );
+                    }
+                    this.#database.exec("COMMIT");
+                } catch (error: unknown) {
+                    this.#rollback();
+                    throw error;
+                }
+                return;
+            }
+            if (version !== 5n) {
                 throw new Error("Unsupported SQLite queue schema version");
             }
             return;
@@ -870,28 +1039,36 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 4);
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 5);
             CREATE TABLE murmur_queue_global (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 last_event_id TEXT CHECK (
                     last_event_id IS NULL OR length(last_event_id) = 36
                 ),
+                generation_seed BLOB NOT NULL CHECK (length(generation_seed) = 32),
                 pending_items INTEGER NOT NULL CHECK (pending_items >= 0),
                 pending_bytes INTEGER NOT NULL CHECK (pending_bytes >= 0),
                 pending_references INTEGER NOT NULL CHECK (pending_references >= 0)
             ) STRICT;
             INSERT INTO murmur_queue_global
-                (singleton, last_event_id, pending_items, pending_bytes, pending_references)
-            VALUES (1, NULL, 0, 0, 0);
+                (singleton, last_event_id, generation_seed, pending_items, pending_bytes,
+                 pending_references)
+            VALUES (1, NULL, zeroblob(32), 0, 0, 0);
             CREATE TABLE murmur_queues (
                 recipient BLOB PRIMARY KEY CHECK (length(recipient) = 32),
                 head TEXT NOT NULL CHECK (length(head) = 36),
+                head_sequence INTEGER NOT NULL CHECK (head_sequence >= 1),
+                next_sequence INTEGER NOT NULL CHECK (next_sequence = head_sequence + 1),
                 acknowledged_through TEXT CHECK (
                     acknowledged_through IS NULL OR (
                         length(acknowledged_through) = 36
                         AND acknowledged_through <= head
                     )
                 ),
+                acknowledged_sequence INTEGER NOT NULL CHECK (
+                    acknowledged_sequence >= 0 AND acknowledged_sequence <= head_sequence
+                ),
+                loss_generation BLOB NOT NULL CHECK (length(loss_generation) = 32),
                 pending_items INTEGER NOT NULL CHECK (pending_items >= 0),
                 pending_bytes INTEGER NOT NULL CHECK (pending_bytes >= 0)
             ) STRICT;
@@ -911,11 +1088,13 @@ export class SqliteRelayStore implements RelayStore {
                 recipient BLOB NOT NULL REFERENCES murmur_queues(recipient)
                     ON DELETE CASCADE,
                 event_id TEXT NOT NULL CHECK (length(event_id) = 36),
+                sequence INTEGER NOT NULL CHECK (sequence >= 1),
                 sender BLOB NOT NULL,
                 delivery_id TEXT NOT NULL,
                 encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes > 0),
                 admission_principal BLOB NOT NULL CHECK (length(admission_principal) = 32),
                 PRIMARY KEY (recipient, event_id),
+                UNIQUE (recipient, sequence),
                 FOREIGN KEY (sender, delivery_id)
                     REFERENCES murmur_queue_deliveries(sender, delivery_id)
                     ON DELETE CASCADE
@@ -959,6 +1138,10 @@ export class SqliteRelayStore implements RelayStore {
             CREATE INDEX murmur_invitation_revocation_admission
                 ON murmur_invitation_revocations(admission_principal);
             `);
+            this.#run(
+                `UPDATE murmur_queue_global SET generation_seed = ? WHERE singleton = 1`,
+                createGenerationSeed(),
+            );
             this.#database.exec("COMMIT");
         } catch (error: unknown) {
             this.#rollback();
@@ -1023,8 +1206,10 @@ export class SqliteRelayStore implements RelayStore {
         const affected = this.#all(
             `SELECT reference.recipient,
                     COUNT(reference.event_id) AS item_count,
-                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count
+                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count,
+                    queue.loss_generation
              FROM murmur_queue_references AS reference
+             JOIN murmur_queues AS queue ON queue.recipient = reference.recipient
              JOIN murmur_queue_deliveries AS delivery
                ON delivery.sender = reference.sender
               AND delivery.delivery_id = reference.delivery_id
@@ -1034,7 +1219,7 @@ export class SqliteRelayStore implements RelayStore {
                  ORDER BY expires_at, event_id
                  LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
              )
-             GROUP BY reference.recipient`,
+             GROUP BY reference.recipient, queue.loss_generation`,
             BigInt(now),
         );
         const removed = safeNumberColumn(
@@ -1051,14 +1236,18 @@ export class SqliteRelayStore implements RelayStore {
         );
         for (let offset = 0; offset < affected.length; offset += SQL_VALUE_CHUNK) {
             const chunk = affected.slice(offset, offset + SQL_VALUE_CHUNK);
-            const changeValues = chunk.map(() => "(?, ?, ?)").join(", ");
+            const changeValues = chunk.map(() => "(?, ?, ?, ?)").join(", ");
             const changeParameters = chunk.flatMap((row) => [
                 copyBytes(row.recipient, "queue recipient"),
                 bigintColumn(row.item_count),
                 bigintColumn(row.byte_count),
+                advanceLossGeneration(
+                    copyBytes(row.loss_generation, "loss generation"),
+                    safeNumberColumn(row.item_count),
+                ),
             ]);
             this.#run(
-                `WITH changes(recipient, item_count, byte_count) AS (
+                `WITH changes(recipient, item_count, byte_count, loss_generation) AS (
                      VALUES ${changeValues}
                  )
                  UPDATE murmur_queues
@@ -1069,20 +1258,13 @@ export class SqliteRelayStore implements RelayStore {
                      pending_bytes = pending_bytes - (
                          SELECT byte_count FROM changes
                          WHERE changes.recipient = murmur_queues.recipient
+                     ),
+                     loss_generation = (
+                         SELECT loss_generation FROM changes
+                         WHERE changes.recipient = murmur_queues.recipient
                      )
                  WHERE recipient IN (SELECT recipient FROM changes)`,
                 ...changeParameters,
-            );
-            const recipients = chunk.map((row) => copyBytes(row.recipient, "queue recipient"));
-            const placeholders = recipients.map(() => "?").join(", ");
-            this.#run(
-                `DELETE FROM murmur_queues
-                 WHERE recipient IN (${placeholders})
-                   AND NOT EXISTS (
-                       SELECT 1 FROM murmur_queue_references AS reference
-                       WHERE reference.recipient = murmur_queues.recipient
-                   )`,
-                ...recipients,
             );
         }
         this.#run(
@@ -1096,18 +1278,6 @@ export class SqliteRelayStore implements RelayStore {
             bigintColumn(references.reference_count),
         );
         return removed;
-    }
-
-    #deleteEmptyQueue(recipient: Uint8Array): void {
-        this.#run(
-            `DELETE FROM murmur_queues
-             WHERE recipient = ?
-               AND NOT EXISTS (
-                   SELECT 1 FROM murmur_queue_references AS reference
-                   WHERE reference.recipient = murmur_queues.recipient
-               )`,
-            recipient,
-        );
     }
 
     #get(

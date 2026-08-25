@@ -124,8 +124,20 @@ function queueEventResponse(
                     controller.enqueue(textEncoder.encode(": keepalive\n\n"));
                     return;
                 }
+                if ("type" in next.value) {
+                    const data = JSON.stringify({
+                        generation: encodeBase64Url(next.value.generation),
+                        head: next.value.head,
+                        headSequence: next.value.headSequence,
+                        acknowledgedThrough: next.value.acknowledgedThrough,
+                        acknowledgedSequence: next.value.acknowledgedSequence,
+                    });
+                    controller.enqueue(textEncoder.encode(`event: continuity\ndata: ${data}\n\n`));
+                    return;
+                }
                 const data = JSON.stringify({
                     eventId: next.value.eventId,
+                    sequence: next.value.sequence,
                     delivery: signedDeliveryToJson(next.value.delivery),
                 });
                 controller.enqueue(
@@ -437,10 +449,14 @@ export function createRelayFetchHandler(
                     {
                         deliveries: page.deliveries.map((queued) => ({
                             eventId: queued.eventId,
+                            sequence: queued.sequence,
                             delivery: signedDeliveryToJson(queued.delivery),
                         })),
                         head: page.head,
+                        headSequence: page.headSequence,
                         acknowledgedThrough: page.acknowledgedThrough,
+                        acknowledgedSequence: page.acknowledgedSequence,
+                        generation: encodeBase64Url(page.generation),
                         exhausted: page.exhausted,
                     },
                     relay.options.maximumJsonBodyBytes,
@@ -448,8 +464,12 @@ export function createRelayFetchHandler(
                     {
                         error: "delivery_too_large",
                         eventId: page.deliveries[0]?.eventId ?? null,
+                        sequence: page.deliveries[0]?.sequence ?? null,
                         head: page.head,
+                        headSequence: page.headSequence,
                         acknowledgedThrough: page.acknowledgedThrough,
+                        acknowledgedSequence: page.acknowledgedSequence,
+                        generation: encodeBase64Url(page.generation),
                     },
                 );
             }
@@ -466,7 +486,11 @@ export function createRelayFetchHandler(
                 );
                 const outcome = await relay.acknowledge(acknowledgement);
                 return boundedJson(
-                    { removed: outcome.removed },
+                    {
+                        removed: outcome.removed,
+                        sequence: outcome.sequence,
+                        generation: encodeBase64Url(outcome.generation),
+                    },
                     relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );

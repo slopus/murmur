@@ -82,16 +82,19 @@ describe("identity queue relay", () => {
             const forged = { ...signedRead(bobSecret, { now }), recipient: alice };
             await expect(relay.readQueue(forged)).rejects.toMatchObject({ status: 401 });
 
-            expect(await relay.acknowledge(signedAck(bobSecret, published.eventId, now))).toEqual({
+            expect(
+                await relay.acknowledge(signedAck(bobSecret, published.eventId, now)),
+            ).toMatchObject({
                 removed: 1,
+                sequence: 1,
             });
             expect(
                 (await relay.readQueue(signedRead(bobSecret, { after: published.eventId, now })))
                     .deliveries,
             ).toEqual([]);
-            expect(
-                (await relay.readQueue(signedRead(bobSecret, { after: null, now }))).deliveries,
-            ).toEqual([]);
+            await expect(
+                relay.readQueue(signedRead(bobSecret, { after: null, now })),
+            ).rejects.toMatchObject({ status: 409, body: { error: "cursor_trimmed" } });
 
             now += 1;
         } finally {
@@ -234,10 +237,19 @@ describe("identity queue relay", () => {
             });
             const firstPublished = await relay.publish(firstDelivery, "relay-tests");
             const secondPublished = await relay.publish(secondDelivery, "relay-tests");
-            expect(await waiting).toEqual({
+            expect(await waiting).toMatchObject({
+                done: false,
+                value: {
+                    type: "continuity",
+                    headSequence: 0,
+                    acknowledgedSequence: 0,
+                },
+            });
+            expect(await iterator.next()).toEqual({
                 done: false,
                 value: {
                     eventId: firstPublished.eventId,
+                    sequence: 1,
                     delivery: firstDelivery,
                 },
             });
@@ -245,6 +257,7 @@ describe("identity queue relay", () => {
                 done: false,
                 value: {
                     eventId: secondPublished.eventId,
+                    sequence: 2,
                     delivery: secondDelivery,
                 },
             });
@@ -275,11 +288,14 @@ describe("identity queue relay", () => {
             const page = await relay.readQueue(signedRead(bobSecret, { now }));
             expect(page).toMatchObject({
                 deliveries: [],
-                head: null,
+                head: published.eventId,
+                headSequence: 1,
                 exhausted: true,
             });
             expect(await relay.acknowledge(signedAck(bobSecret, published.eventId, now))).toEqual({
                 removed: 0,
+                sequence: 1,
+                generation: expect.any(Uint8Array),
             });
         } finally {
             await relay.close();
@@ -299,7 +315,10 @@ describe("identity queue relay", () => {
         const emptyPage: QueuePage = {
             deliveries: [],
             head: null,
+            headSequence: 0,
             acknowledgedThrough: null,
+            acknowledgedSequence: 0,
+            generation: new Uint8Array(32),
             exhausted: true,
         };
         const store: RelayStore = {
@@ -334,6 +353,9 @@ describe("identity queue relay", () => {
                 return emptyPage;
             },
             async acknowledge(): Promise<AcknowledgeOutcome> {
+                throw new Error("Unused");
+            },
+            async declareRestored(): Promise<number> {
                 throw new Error("Unused");
             },
             async pruneExpired(): Promise<number> {

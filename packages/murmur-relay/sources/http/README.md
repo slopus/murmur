@@ -32,14 +32,16 @@ deployments require TLS at a trusted reverse proxy or load balancer because
 signed reads and acknowledgements can be replayed within their timestamp
 window.
 
-A queue page uses nullable UUIDv7 `head` and `acknowledgedThrough` cursors. If a
+A queue page uses nullable UUIDv7 `head` and `acknowledgedThrough` cursors plus
+`headSequence`, `acknowledgedSequence`, and a 32-byte loss generation. If a
 previously accepted delivery is larger than the current response budget, the
 relay returns `413 delivery_too_large` with its `eventId` and inbox progress so
 the client can durably quarantine that terminal item and advance without
 head-of-line blocking.
 
-`POST /v1/queue/events` requires a signed zero-wait queue read and returns one
-pull-driven `delivery` SSE record per exact queue event. Comment heartbeats do
+`POST /v1/queue/events` requires a signed zero-wait queue read, emits a
+`continuity` control record, and returns one pull-driven `delivery` SSE record
+with its sequence per exact queue event. Comment heartbeats do
 not advance progress. Disconnect and response cancellation close the relay
 subscription.
 

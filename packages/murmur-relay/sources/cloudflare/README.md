@@ -5,6 +5,11 @@ WebSocket to that device's inbox Durable Object. Publications are persisted by
 one deployment-wide sequencing/fanout Durable Object before acceptance, then
 retried into per-device inbox Durable Objects with idempotent inserts.
 
+Each inbox object durably retains its next sequence, acknowledged sequence, and
+loss generation. Existing objects lazy-migrate in place without dropping
+pending records; migration issues a fresh unpredictable generation. Streams
+send continuity before queued deliveries.
+
 The application main server remains responsible for user authentication and
 for calling `createRelaySessionFetchHandler` with its account-to-device
 authorization policy. It returns the Worker's `wss:` endpoint in the ticket.

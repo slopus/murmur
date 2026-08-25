@@ -28,13 +28,16 @@ endpoint and a stable admission principal from that callback.
   before acceptance, then retries idempotent per-device insertion until every
   target completes or the signed delivery expires.
 - Event IDs are time ordered and strictly monotonic within each inbox.
+- Every inbox reference also has a strictly increasing sequence, and every
+  inbox exposes a 32-byte loss generation.
 - One queue reference per exact recipient.
 - Sender-scoped delivery IDs deduplicate while any reference remains.
 - Signed reads prove ownership of the recipient identity.
 - Recipient-authenticated SSE emits each exact queued delivery in inbox UUIDv7
   order with pull-driven backpressure.
 - Signed monotonic acknowledgements trim one processed queue prefix.
-- A delivery disappears after every reference is acknowledged or it expires.
+- Unacknowledged deliveries are retained for at most exactly 180 days. Expiry
+  advances each affected inbox generation; acknowledgement never does.
 - Per-recipient, per-sender, and relay-wide item/byte/reference quotas make
   publication all-or-nothing and bound pending storage. Sender reference quota
   charges multicast fanout rather than only ciphertext records.
@@ -74,6 +77,11 @@ MURMUR_RELAY_ORIGINS='https://app.example' \
 pnpm --filter @slopus/murmur-relay start
 ```
 
+After restoring relay storage from backup, start once with
+`MURMUR_RELAY_DECLARE_RESTORED=1`. This explicitly randomizes known inbox
+generations and the unopened-inbox seed so clients reset rather than silently
+accept missing deliveries. Ordinary startup never rotates continuity state.
+
 Set `MURMUR_RELAY_STORE=postgres` and provide a Postgres URL in
 `MURMUR_RELAY_DB` for the Postgres backend. Node 22.5 or later is required.
 The direct command is suitable for local development; production traffic must
@@ -103,9 +111,10 @@ invitation cache. Applications using it must configure a compatible external
 revocation.
 
 Relay schema v3, shipped with Murmur v0.3.3, is the compatibility baseline.
-The current schema v4 migrates an existing SQLite database or Postgres schema
+The current schema v5 migrates an existing SQLite database or Postgres schema
 in place and preserves pending deliveries and invitations while adding public
-revocation metadata and expiring tombstones. Upgrading from the baseline never
+revocation metadata, expiring tombstones, queue sequences, and loss generations.
+Upgrading from the baseline never
 requires a clean database. Pre-v0.3 `murmur_relay_*` topic schemas remain
 unsupported.
 

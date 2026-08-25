@@ -76,9 +76,19 @@ export interface InvitationRevocationOutcome {
     readonly revoked: number;
 }
 
+/** One stream control frame proving the current inbox continuity baseline. */
+export interface QueueContinuityEvent {
+    readonly type: "continuity";
+    readonly generation: Uint8Array;
+    readonly head: string | null;
+    readonly headSequence: number;
+    readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+}
+
 /** One pull-driven recipient SSE subscription; `null` represents a heartbeat. */
 export interface QueueEventSubscription {
-    readonly events: AsyncIterable<QueuedDelivery | null>;
+    readonly events: AsyncIterable<QueuedDelivery | QueueContinuityEvent | null>;
     close(): void;
 }
 

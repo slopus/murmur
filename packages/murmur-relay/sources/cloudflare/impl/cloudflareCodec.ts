@@ -9,7 +9,7 @@ import type { CloudflareServerWebSocket } from "../types.js";
 
 export const MAXIMUM_MESSAGE_BYTES = 16 * 1024 * 1024;
 export const MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS = 5 * 60 * 1_000;
-export const MAXIMUM_DELIVERY_TTL_MILLISECONDS = 30 * 24 * 60 * 60 * 1_000;
+export const MAXIMUM_DELIVERY_TTL_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 export const MAXIMUM_CIPHERTEXT_BYTES = 1024 * 1024;
 export const MAXIMUM_RECIPIENTS = 256;
 export const MAXIMUM_QUEUE_ITEMS = 10_000;
@@ -25,6 +25,7 @@ export interface CloudflareRequestFrame {
 
 export interface StoredDeliveryRecord {
     readonly eventId: string;
+    readonly sequence: number;
     readonly delivery: SignedDeliveryJson;
     readonly encodedBytes: number;
     readonly senderCounter: string;
@@ -34,7 +35,11 @@ export interface StoredDeliveryRecord {
 
 export interface InboxMetadata {
     readonly head: string | null;
+    readonly headSequence: number;
+    readonly nextSequence: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+    readonly generation: string;
     readonly pendingItems: number;
     readonly pendingBytes: number;
 }
@@ -79,12 +84,32 @@ export function responseFrame(id: string, status: number, body: unknown): string
     return JSON.stringify({ version: 1, id, type: "response", status, body });
 }
 
-export function deliveryFrame(id: string, eventId: string, delivery: SignedDeliveryJson): string {
+export function deliveryFrame(
+    id: string,
+    eventId: string,
+    sequence: number,
+    delivery: SignedDeliveryJson,
+): string {
     return JSON.stringify({
         version: 1,
         id,
         type: "delivery",
-        body: { eventId, delivery },
+        body: { eventId, sequence, delivery },
+    });
+}
+
+export function continuityFrame(id: string, metadata: InboxMetadata): string {
+    return JSON.stringify({
+        version: 1,
+        id,
+        type: "continuity",
+        body: {
+            generation: metadata.generation,
+            head: metadata.head,
+            headSequence: metadata.headSequence,
+            acknowledgedThrough: metadata.acknowledgedThrough,
+            acknowledgedSequence: metadata.acknowledgedSequence,
+        },
     });
 }
 

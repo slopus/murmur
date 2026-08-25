@@ -126,6 +126,14 @@ export async function main(): Promise<void> {
         logger.info(`relay:store-open-start backend=${backend}`);
         ({ store, wakeSource } = await createStore(backend));
         logger.info(`relay:store-open-complete backend=${backend}`);
+        const declareRestored = process.env.MURMUR_RELAY_DECLARE_RESTORED;
+        if (declareRestored !== undefined && declareRestored !== "1") {
+            throw new Error("MURMUR_RELAY_DECLARE_RESTORED must be exactly 1 when set");
+        }
+        if (declareRestored === "1") {
+            const invalidated = await store.declareRestored();
+            logger.info(`relay:state-restored invalidated_inboxes=${invalidated}`);
+        }
 
         stage = "service-create";
         logger.info(`relay:service-create-start backend=${backend}`);

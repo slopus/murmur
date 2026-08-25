@@ -8,6 +8,7 @@ import {
 import type { RelayService } from "../relay/index.js";
 import { verifyRelaySessionToken } from "../session/index.js";
 import { equalBytes } from "../utils/bytes.js";
+import { encodeBase64Url } from "../utils/base64Url.js";
 import type {
     RelayWebSocketAuthenticationOptions,
     RelayWebSocketPeer,
@@ -156,10 +157,14 @@ export class RelayWebSocketSession {
                 const body = {
                     deliveries: page.deliveries.map((queued) => ({
                         eventId: queued.eventId,
+                        sequence: queued.sequence,
                         delivery: signedDeliveryToJson(queued.delivery),
                     })),
                     head: page.head,
+                    headSequence: page.headSequence,
                     acknowledgedThrough: page.acknowledgedThrough,
+                    acknowledgedSequence: page.acknowledgedSequence,
+                    generation: encodeBase64Url(page.generation),
                     exhausted: page.exhausted,
                 };
                 const encoded = response(request.id, 200, body);
@@ -168,8 +173,12 @@ export class RelayWebSocketSession {
                         response(request.id, 413, {
                             error: "delivery_too_large",
                             eventId: page.deliveries[0]?.eventId ?? null,
+                            sequence: page.deliveries[0]?.sequence ?? null,
                             head: page.head,
+                            headSequence: page.headSequence,
                             acknowledgedThrough: page.acknowledgedThrough,
+                            acknowledgedSequence: page.acknowledgedSequence,
+                            generation: encodeBase64Url(page.generation),
                         }),
                     );
                 } else {
@@ -219,15 +228,29 @@ export class RelayWebSocketSession {
                     JSON.stringify(
                         queued === null
                             ? { version: 1, id, type: "heartbeat", body: null }
-                            : {
-                                  version: 1,
-                                  id,
-                                  type: "delivery",
-                                  body: {
-                                      eventId: queued.eventId,
-                                      delivery: signedDeliveryToJson(queued.delivery),
-                                  },
-                              },
+                            : "type" in queued
+                              ? {
+                                    version: 1,
+                                    id,
+                                    type: "continuity",
+                                    body: {
+                                        generation: encodeBase64Url(queued.generation),
+                                        head: queued.head,
+                                        headSequence: queued.headSequence,
+                                        acknowledgedThrough: queued.acknowledgedThrough,
+                                        acknowledgedSequence: queued.acknowledgedSequence,
+                                    },
+                                }
+                              : {
+                                    version: 1,
+                                    id,
+                                    type: "delivery",
+                                    body: {
+                                        eventId: queued.eventId,
+                                        sequence: queued.sequence,
+                                        delivery: signedDeliveryToJson(queued.delivery),
+                                    },
+                                },
                     ),
                 );
             }

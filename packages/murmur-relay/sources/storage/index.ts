@@ -28,6 +28,12 @@ export type {
     StoreInvitationOutcome,
 } from "./types.js";
 export { RELAY_EXPIRATION_BATCH_ITEMS } from "./types.js";
+export {
+    LOSS_GENERATION_BYTES,
+    advanceLossGeneration,
+    createGenerationSeed,
+    initialLossGeneration,
+} from "./continuity.js";
 
 /** Storage backend names accepted by the standalone relay. */
 export type RelayStoreBackend = "sqlite" | "postgres";
