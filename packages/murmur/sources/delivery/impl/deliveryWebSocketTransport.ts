@@ -1,14 +1,15 @@
 import type { IdentityKeyPair } from "../../crypto/index.js";
 import { randomBytes } from "../../crypto/index.js";
-import { encodeBase64Url, equalBytes, utf8Encode } from "../../utils/index.js";
+import { decodeBase64Url, encodeBase64Url, equalBytes, utf8Encode } from "../../utils/index.js";
 import type {
     DeliveryPublishOutcome,
     DeliveryStreamHooks,
     DeliveryTransport,
     DeliveryWebSocket,
     DeliveryWebSocketFactory,
-    InboxDelivery,
+    InboxAcknowledgement,
     InboxPage,
+    InboxStreamEvent,
     RelaySessionProvider,
     RelaySessionTicket,
     SignedDelivery,
@@ -18,6 +19,7 @@ import type {
 } from "../types.js";
 import {
     parseInboxDelivery,
+    parseInboxContinuity,
     parseInboxPage,
     signedDeliveryToJson,
     signedInboxAckToJson,
@@ -97,11 +99,32 @@ function throwFailure(status: number, value: unknown): never {
         failure.error === "delivery_too_large" &&
         failure.acknowledgedThrough !== undefined
     ) {
-        exact(failure, ["error", "eventId", "head", "acknowledgedThrough"]);
+        exact(failure, [
+            "error",
+            "eventId",
+            "sequence",
+            "head",
+            "headSequence",
+            "acknowledgedThrough",
+            "acknowledgedSequence",
+            "generation",
+        ]);
+        if (
+            typeof failure.sequence !== "number" ||
+            typeof failure.headSequence !== "number" ||
+            typeof failure.acknowledgedSequence !== "number" ||
+            typeof failure.generation !== "string"
+        ) {
+            throw new Error("Invalid relay WebSocket message");
+        }
         throw new OversizedInboxDeliveryError(
             uuid(failure.eventId),
+            failure.sequence,
             uuid(failure.head),
+            failure.headSequence,
             failure.acknowledgedThrough === null ? null : uuid(failure.acknowledgedThrough),
+            failure.acknowledgedSequence,
+            decodeBase64Url(failure.generation),
         );
     }
     if (
@@ -214,22 +237,34 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     async acknowledge(
         request: SignedInboxAck,
         signal?: AbortSignal,
-    ): Promise<{ readonly removed: number }> {
+    ): Promise<InboxAcknowledgement> {
         this.#assertRecipient(request.recipient);
         const response = await this.#request("acknowledge", signedInboxAckToJson(request), signal);
         if (response.status < 200 || response.status >= 300) {
             throwFailure(response.status, response.body);
         }
         const body = object(response.body);
-        exact(body, ["removed"]);
+        exact(body, ["removed", "sequence", "generation"]);
         if (
             typeof body.removed !== "number" ||
             !Number.isSafeInteger(body.removed) ||
-            body.removed < 0
+            body.removed < 0 ||
+            typeof body.sequence !== "number" ||
+            !Number.isSafeInteger(body.sequence) ||
+            body.sequence < 0 ||
+            typeof body.generation !== "string"
         ) {
             throw new Error("Invalid relay WebSocket response");
         }
-        return { removed: body.removed };
+        return {
+            removed: body.removed,
+            sequence: body.sequence,
+            generation: (() => {
+                const generation = decodeBase64Url(body.generation);
+                if (generation.length !== 32) throw new Error("Invalid relay WebSocket response");
+                return generation;
+            })(),
+        };
     }
 
     /** Stream exact queued deliveries over a negotiated WebSocket. */
@@ -237,7 +272,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         request: SignedInboxRead,
         signal?: AbortSignal,
         hooks: DeliveryStreamHooks = {},
-    ): AsyncGenerator<InboxDelivery> {
+    ): AsyncGenerator<InboxStreamEvent> {
         this.#assertRecipient(request.recipient);
         if (request.waitMilliseconds !== 0) {
             throw new Error("Delivery event streams require a zero wait duration");
@@ -247,7 +282,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         if (isAborted(signal)) return;
         const requestId = encodeBase64Url(randomBytes(18));
         const socket = this.#openSocket(ticket);
-        const queued: InboxDelivery[] = [];
+        const queued: InboxStreamEvent[] = [];
         let wake: (() => void) | undefined;
         let connected = false;
         let ended = false;
@@ -328,10 +363,14 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
                     resetHeartbeat();
                     return;
                 }
-                if (input.type !== "delivery" || !connected) {
+                if ((input.type !== "delivery" && input.type !== "continuity") || !connected) {
                     throw new Error("Invalid relay stream message");
                 }
-                queued.push(parseInboxDelivery(input.body));
+                queued.push(
+                    input.type === "continuity"
+                        ? parseInboxContinuity(input.body)
+                        : parseInboxDelivery(input.body),
+                );
                 resetHeartbeat();
                 notify();
             } catch (error: unknown) {

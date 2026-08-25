@@ -25,6 +25,7 @@ import {
 
 const NOW = 1_720_000_000_000;
 const EVENT_ID = "0190b2e0-8000-7000-8000-000000000001";
+const GENERATION = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 interface RequestFrame {
     readonly version: 1;
@@ -135,7 +136,10 @@ describe("negotiated WebSocket delivery", () => {
                             body: {
                                 deliveries: [],
                                 head: EVENT_ID,
+                                headSequence: 1,
                                 acknowledgedThrough: null,
+                                acknowledgedSequence: 0,
+                                generation: GENERATION,
                                 exhausted: true,
                             },
                         });
@@ -145,7 +149,7 @@ describe("negotiated WebSocket delivery", () => {
                             id: frame.id,
                             type: "response",
                             status: 200,
-                            body: { removed: 1 },
+                            body: { removed: 1, sequence: 1, generation: GENERATION },
                         });
                     } else {
                         socket.receive({
@@ -159,9 +163,24 @@ describe("negotiated WebSocket delivery", () => {
                             socket.receive({
                                 version: 1,
                                 id: frame.id,
+                                type: "continuity",
+                                body: {
+                                    generation: GENERATION,
+                                    head: EVENT_ID,
+                                    headSequence: 1,
+                                    acknowledgedThrough: EVENT_ID,
+                                    acknowledgedSequence: 1,
+                                },
+                            }),
+                        );
+                        queueMicrotask(() =>
+                            socket.receive({
+                                version: 1,
+                                id: frame.id,
                                 type: "delivery",
                                 body: {
                                     eventId: EVENT_ID,
+                                    sequence: 1,
                                     delivery: signedDeliveryToJson(delivery),
                                 },
                             }),
@@ -180,16 +199,23 @@ describe("negotiated WebSocket delivery", () => {
         ).resolves.toMatchObject({ head: EVENT_ID, deliveries: [] });
         await expect(
             transport.acknowledge(createSignedInboxAck(identity, EVENT_ID, NOW)),
-        ).resolves.toEqual({ removed: 1 });
+        ).resolves.toMatchObject({ removed: 1, sequence: 1 });
 
         const controller = new AbortController();
         const events = transport.stream(
             createSignedInboxRead(identity, { createdAt: NOW, limit: 1 }),
             controller.signal,
         );
-        const streamed = await events[Symbol.asyncIterator]().next();
+        const iterator = events[Symbol.asyncIterator]();
+        const continuity = await iterator.next();
+        const streamed = await iterator.next();
         controller.abort();
-        expect(streamed.value?.eventId).toBe(EVENT_ID);
+        expect(continuity.value).toMatchObject({
+            type: "continuity",
+            head: EVENT_ID,
+            headSequence: 1,
+        });
+        expect(streamed.value).toMatchObject({ eventId: EVENT_ID, sequence: 1 });
 
         expect(issued).toHaveLength(1);
         expect(verifySignedRelaySessionRequest(issued[0]!)).toBe(true);

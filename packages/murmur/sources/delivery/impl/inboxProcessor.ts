@@ -31,6 +31,7 @@ import {
 import { StagedStoreTransaction } from "./storeTransactionStage.js";
 
 const CURSOR_KEY = "murmur/delivery/cursor";
+const CONTINUITY_KEY = "murmur/delivery/continuity";
 const REJECTION_PREFIX = "murmur/delivery/rejections/";
 const REPLAY_ENTRY_PREFIX = "murmur/delivery/replay/entries/";
 const REPLAY_EXPIRY_PREFIX = "murmur/delivery/replay/expiry/";
@@ -44,12 +45,12 @@ const DEFAULT_MAXIMUM_RELAY_CLOCK_SKEW_MILLISECONDS = 5 * 60 * 1_000;
 const HARD_MAXIMUM_REPLAY_ENTRIES = 100_000;
 const REPLAY_PRUNE_BATCH_SIZE = 100;
 const REPLAY_PRUNE_BUDGET_MILLISECONDS = 1_000;
-const REPLAY_OVERFLOW_EPOCH_MILLISECONDS = 90 * 24 * 60 * 60 * 1_000;
+const REPLAY_OVERFLOW_EPOCH_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 const REPLAY_OVERFLOW_SHARD_BYTES = 4 * 1_024;
 const REPLAY_OVERFLOW_HASHES = 4;
 const REPLAY_TERMINAL_RETAINED_EPOCHS = 3;
 const REPLAY_TERMINAL_SHARDS_PER_EPOCH = 256;
-const MAXIMUM_DELIVERY_TTL_MILLISECONDS = 90 * 24 * 60 * 60 * 1_000;
+const MAXIMUM_DELIVERY_TTL_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 interface RejectionJson {
@@ -62,6 +63,17 @@ interface ReplayJson {
     readonly version: 1;
     readonly fingerprint: string;
     readonly expiresAt: number;
+}
+
+interface ContinuityJson {
+    readonly version: 1;
+    readonly generation: string;
+    readonly sequence: number;
+}
+
+interface ContinuityState {
+    readonly generation: Uint8Array;
+    readonly sequence: number;
 }
 
 /** @internal Capability used only by Murmur's built-in session handler. */
@@ -95,6 +107,34 @@ export class InboxStateRollbackError extends Error {
     }
 }
 
+/** Certain evidence that the relay inbox can no longer be processed gaplessly. */
+export class InboxContinuityLossError extends Error {
+    readonly reason: "generation_changed" | "sequence_gap" | "state_missing";
+    readonly expectedSequence: number;
+    readonly observedSequence: number;
+    readonly generation: Uint8Array;
+    readonly head: string | null;
+    readonly headSequence: number;
+
+    constructor(options: {
+        readonly reason: "generation_changed" | "sequence_gap" | "state_missing";
+        readonly expectedSequence: number;
+        readonly observedSequence: number;
+        readonly generation: Uint8Array;
+        readonly head: string | null;
+        readonly headSequence: number;
+    }) {
+        super("Inbox continuity was irrecoverably lost");
+        this.name = "InboxContinuityLossError";
+        this.reason = options.reason;
+        this.expectedSequence = options.expectedSequence;
+        this.observedSequence = options.observedSequence;
+        this.generation = options.generation.slice();
+        this.head = options.head;
+        this.headSequence = options.headSequence;
+    }
+}
+
 function cursorBytes(cursor: string): Uint8Array {
     if (!UUID_V7.test(cursor)) throw new Error("Invalid inbox cursor");
     return utf8Encode(cursor);
@@ -105,6 +145,48 @@ function parseCursor(bytes: Uint8Array | undefined): string | null {
     const value = utf8Decode(bytes);
     if (!UUID_V7.test(value)) throw new Error("Invalid stored inbox cursor");
     return value;
+}
+
+function continuityBytes(state: ContinuityState): Uint8Array {
+    return utf8Encode(
+        JSON.stringify({
+            version: 1,
+            generation: encodeBase64Url(state.generation),
+            sequence: state.sequence,
+        } satisfies ContinuityJson),
+    );
+}
+
+function parseContinuity(bytes: Uint8Array | undefined): ContinuityState | undefined {
+    if (bytes === undefined) return undefined;
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(utf8Decode(bytes)) as unknown;
+    } catch {
+        throw new Error("Invalid stored inbox continuity");
+    }
+    if (
+        parsed === null ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        (parsed as Record<string, unknown>).version !== 1 ||
+        typeof (parsed as Record<string, unknown>).generation !== "string" ||
+        typeof (parsed as Record<string, unknown>).sequence !== "number" ||
+        !Number.isSafeInteger((parsed as Record<string, unknown>).sequence) ||
+        ((parsed as Record<string, unknown>).sequence as number) < 0 ||
+        Object.keys(parsed).some((field) => !["version", "generation", "sequence"].includes(field))
+    ) {
+        throw new Error("Invalid stored inbox continuity");
+    }
+    const value = parsed as unknown as ContinuityJson;
+    return {
+        generation: (() => {
+            const generation = decodeBase64Url(value.generation);
+            if (generation.length !== 32) throw new Error("Invalid stored inbox continuity");
+            return generation;
+        })(),
+        sequence: value.sequence,
+    };
 }
 
 function relayEventTime(eventId: string): number {
@@ -200,6 +282,40 @@ export class InboxProcessor {
         return parseCursor(await this.#dependencies.store.get(CURSOR_KEY));
     }
 
+    /** Return the durable last processed sequence and loss generation. */
+    async continuity(): Promise<Readonly<ContinuityState> | undefined> {
+        const state = parseContinuity(await this.#dependencies.store.get(CONTINUITY_KEY));
+        return state === undefined
+            ? undefined
+            : { generation: state.generation.slice(), sequence: state.sequence };
+    }
+
+    /** @internal Adopt a relay-provided post-reset tip in the caller's purge transaction. */
+    async adoptBaselineInTransaction(
+        transaction: StoreTransaction,
+        generation: Uint8Array,
+        head: string | null,
+        headSequence: number,
+    ): Promise<void> {
+        if (generation.length !== 32 || !Number.isSafeInteger(headSequence) || headSequence < 0) {
+            throw new Error("Invalid inbox reset baseline");
+        }
+        if (head === null) {
+            await transaction.delete(CURSOR_KEY);
+        } else {
+            await transaction.set(CURSOR_KEY, cursorBytes(head));
+        }
+        await transaction.set(
+            CONTINUITY_KEY,
+            continuityBytes({ generation: generation.slice(), sequence: headSequence }),
+        );
+    }
+
+    /** @internal Acknowledge a baseline already committed by a continuity reset. */
+    async acknowledgeBaseline(head: string | null, signal?: AbortSignal): Promise<void> {
+        if (head !== null) await this.#acknowledge(head, signal);
+    }
+
     /** Return retained terminal rejections in relay order. */
     async rejections(): Promise<readonly InboxRejection[]> {
         const entries = await this.#dependencies.store.scan(REJECTION_PREFIX, {
@@ -240,7 +356,13 @@ export class InboxProcessor {
                     if (error instanceof DeliveryCursorTrimmedError) {
                         throw new InboxStateRollbackError(cursor, error.acknowledgedThrough);
                     }
-                    throw error;
+                    if (
+                        !(error instanceof InboxContinuityLossError) ||
+                        error.reason !== "generation_changed"
+                    ) {
+                        throw error;
+                    }
+                    // The stream's continuity frame carries the authoritative current head.
                 }
             }
             const request = createSignedInboxRead(this.#dependencies.identity, {
@@ -255,6 +377,47 @@ export class InboxProcessor {
                 options.signal,
                 options.onConnected === undefined ? {} : { onConnected: options.onConnected },
             )) {
+                if ("type" in queued) {
+                    await this.#exclusive(async () => {
+                        cursor = await this.cursor();
+                        const continuity = await this.continuity();
+                        if (continuity === undefined) {
+                            if (cursor !== null || queued.acknowledgedSequence > 0) {
+                                throw this.#continuityLoss(
+                                    "state_missing",
+                                    0,
+                                    queued.acknowledgedSequence,
+                                    queued,
+                                );
+                            }
+                            await this.#dependencies.store.set(
+                                CONTINUITY_KEY,
+                                continuityBytes({
+                                    generation: queued.generation,
+                                    sequence: 0,
+                                }),
+                            );
+                            return;
+                        }
+                        if (!equalBytes(continuity.generation, queued.generation)) {
+                            throw this.#continuityLoss(
+                                "generation_changed",
+                                continuity.sequence + 1,
+                                queued.headSequence,
+                                queued,
+                            );
+                        }
+                        if (queued.acknowledgedSequence > continuity.sequence) {
+                            throw this.#continuityLoss(
+                                "sequence_gap",
+                                continuity.sequence + 1,
+                                queued.acknowledgedSequence,
+                                queued,
+                            );
+                        }
+                    });
+                    continue;
+                }
                 const result = await this.#exclusive(async () => {
                     cursor = await this.cursor();
                     if (cursor !== null && queued.eventId <= cursor) {
@@ -262,7 +425,34 @@ export class InboxProcessor {
                     }
                     const processingNow = relayEventTime(queued.eventId);
                     this.#validateRelayEventTime(queued.eventId, this.#requestTime());
-                    const outcome = await this.#process(queued, cursor, processingNow);
+                    const continuity = await this.continuity();
+                    const observedSequence = queued.sequence ?? (continuity?.sequence ?? -1) + 1;
+                    if (continuity === undefined) {
+                        throw new InboxContinuityLossError({
+                            reason: "state_missing",
+                            expectedSequence: 0,
+                            observedSequence,
+                            generation: new Uint8Array(32),
+                            head: queued.eventId,
+                            headSequence: observedSequence,
+                        });
+                    }
+                    if (observedSequence !== continuity.sequence + 1) {
+                        throw new InboxContinuityLossError({
+                            reason: "sequence_gap",
+                            expectedSequence: continuity.sequence + 1,
+                            observedSequence,
+                            generation: continuity.generation,
+                            head: queued.eventId,
+                            headSequence: observedSequence,
+                        });
+                    }
+                    const outcome = await this.#process(
+                        { ...queued, sequence: observedSequence },
+                        cursor,
+                        processingNow,
+                        continuity.generation,
+                    );
                     cursor = queued.eventId;
                     await this.#pruneReplay(processingNow);
                     await this.#acknowledge(cursor, options.signal);
@@ -290,7 +480,13 @@ export class InboxProcessor {
                 if (error instanceof DeliveryCursorTrimmedError) {
                     throw new InboxStateRollbackError(cursor, error.acknowledgedThrough);
                 }
-                throw error;
+                if (
+                    !(error instanceof InboxContinuityLossError) ||
+                    error.reason !== "generation_changed"
+                ) {
+                    throw error;
+                }
+                // Continue to the page whose metadata names the authoritative reset tip.
             }
         }
 
@@ -326,7 +522,44 @@ export class InboxProcessor {
                 throw new Error("Relay returned a non-advancing oversized delivery");
             }
             this.#validateRelayEventTime(error.eventId, this.#requestTime());
-            await this.#persistTerminal(error.eventId, "delivery_too_large");
+            let continuity = await this.continuity();
+            if (continuity === undefined) {
+                if (cursor !== null || error.acknowledgedSequence > 0) {
+                    throw this.#continuityLoss(
+                        "state_missing",
+                        0,
+                        error.acknowledgedSequence,
+                        error,
+                    );
+                }
+                continuity = { generation: error.generation.slice(), sequence: 0 };
+                await this.#dependencies.store.set(CONTINUITY_KEY, continuityBytes(continuity));
+            }
+            if (!equalBytes(continuity.generation, error.generation)) {
+                throw this.#continuityLoss(
+                    "generation_changed",
+                    continuity.sequence + 1,
+                    error.sequence,
+                    error,
+                );
+            }
+            if (
+                error.acknowledgedSequence > continuity.sequence ||
+                error.sequence !== continuity.sequence + 1
+            ) {
+                throw this.#continuityLoss(
+                    "sequence_gap",
+                    continuity.sequence + 1,
+                    Math.max(error.acknowledgedSequence, error.sequence),
+                    error,
+                );
+            }
+            await this.#persistTerminal(
+                error.eventId,
+                "delivery_too_large",
+                error.generation,
+                error.sequence,
+            );
             cursor = error.eventId;
             await this.#pruneReplay(relayEventTime(cursor));
             await this.#acknowledge(cursor, options.signal);
@@ -342,25 +575,90 @@ export class InboxProcessor {
         ) {
             throw new Error("Relay returned inconsistent inbox metadata");
         }
+        const generation = page.generation?.slice() ?? new Uint8Array(32);
+        let continuity = await this.continuity();
+        if (continuity === undefined) {
+            if (cursor !== null) {
+                throw this.#continuityLoss("state_missing", 0, 0, {
+                    generation,
+                    head: page.head,
+                    headSequence: page.headSequence ?? 0,
+                });
+            }
+            continuity = { generation, sequence: 0 };
+            await this.#dependencies.store.transaction(async (transaction) => {
+                const existing = parseContinuity(await transaction.get(CONTINUITY_KEY));
+                if (existing === undefined) {
+                    await transaction.set(CONTINUITY_KEY, continuityBytes(continuity!));
+                }
+            });
+        } else if (!equalBytes(continuity.generation, generation)) {
+            throw this.#continuityLoss(
+                "generation_changed",
+                continuity.sequence + 1,
+                page.deliveries[0]?.sequence ?? page.headSequence ?? continuity.sequence,
+                {
+                    generation,
+                    head: page.head,
+                    headSequence: page.headSequence ?? continuity.sequence,
+                },
+            );
+        }
+        const acknowledgedSequence = page.acknowledgedSequence ?? continuity.sequence;
+        const deliveries = page.deliveries.map((delivery, index) => ({
+            ...delivery,
+            sequence: delivery.sequence ?? continuity!.sequence + index + 1,
+        }));
+        const headSequence =
+            page.headSequence ?? deliveries.at(-1)?.sequence ?? continuity.sequence;
+        const continuityPage = { generation, head: page.head, headSequence };
+        if (acknowledgedSequence > continuity.sequence) {
+            throw this.#continuityLoss(
+                "sequence_gap",
+                continuity.sequence + 1,
+                acknowledgedSequence,
+                continuityPage,
+            );
+        }
         const pageRequestTime = this.#requestTime();
-        for (const delivery of page.deliveries) {
+        let expectedSequence = continuity.sequence + 1;
+        for (const delivery of deliveries) {
             if (
                 (previous !== null && delivery.eventId <= previous) ||
                 page.head === null ||
-                delivery.eventId > page.head
+                delivery.eventId > page.head ||
+                delivery.sequence !== expectedSequence
             ) {
+                if (delivery.sequence !== expectedSequence) {
+                    throw this.#continuityLoss(
+                        "sequence_gap",
+                        expectedSequence,
+                        delivery.sequence,
+                        continuityPage,
+                    );
+                }
                 throw new Error("Relay returned an out-of-order inbox page");
             }
             this.#validateRelayEventTime(delivery.eventId, pageRequestTime);
             previous = delivery.eventId;
+            expectedSequence += 1;
+        }
+        if (deliveries.length === 0 && page.exhausted && headSequence > continuity.sequence) {
+            throw this.#continuityLoss(
+                "sequence_gap",
+                continuity.sequence + 1,
+                headSequence,
+                continuityPage,
+            );
         }
 
         previous = cursor;
-        for (const delivery of page.deliveries) {
+        for (const delivery of deliveries) {
             const outcome = await this.#process(
                 delivery,
                 previous,
                 relayEventTime(delivery.eventId),
+                generation,
             );
             processed += outcome === "processed" ? 1 : 0;
             rejected += outcome === "rejected" ? 1 : 0;
@@ -378,11 +676,21 @@ export class InboxProcessor {
         queued: InboxDelivery,
         expectedCursor: string | null,
         processingNow: number,
+        generation: Uint8Array,
     ): Promise<"processed" | "rejected"> {
         return this.#dependencies.store.transaction(async (transaction) => {
             const actualCursor = parseCursor(await transaction.get(CURSOR_KEY));
             if (actualCursor !== expectedCursor) {
                 throw new Error("Inbox cursor changed during synchronization");
+            }
+            const actualContinuity = parseContinuity(await transaction.get(CONTINUITY_KEY));
+            if (
+                actualContinuity === undefined ||
+                !equalBytes(actualContinuity.generation, generation) ||
+                queued.sequence === undefined ||
+                queued.sequence !== actualContinuity.sequence + 1
+            ) {
+                throw new Error("Inbox continuity changed during synchronization");
             }
             let rejection: string | undefined;
             const digest = this.#replayDigest(queued);
@@ -433,18 +741,56 @@ export class InboxProcessor {
                 await this.#storeRejection(transaction, queued.eventId, rejection);
             }
             await transaction.set(CURSOR_KEY, cursorBytes(queued.eventId));
+            await transaction.set(
+                CONTINUITY_KEY,
+                continuityBytes({ generation, sequence: queued.sequence }),
+            );
             return rejection === undefined ? "processed" : "rejected";
         });
     }
 
-    async #persistTerminal(eventId: string, code: string): Promise<void> {
+    #continuityLoss(
+        reason: InboxContinuityLossError["reason"],
+        expectedSequence: number,
+        observedSequence: number,
+        page: {
+            readonly generation: Uint8Array;
+            readonly head: string | null;
+            readonly headSequence: number;
+        },
+    ): InboxContinuityLossError {
+        return new InboxContinuityLossError({
+            reason,
+            expectedSequence,
+            observedSequence,
+            generation: page.generation,
+            head: page.head,
+            headSequence: page.headSequence,
+        });
+    }
+
+    async #persistTerminal(
+        eventId: string,
+        code: string,
+        generation: Uint8Array,
+        sequence: number,
+    ): Promise<void> {
         await this.#dependencies.store.transaction(async (transaction) => {
             const cursor = parseCursor(await transaction.get(CURSOR_KEY));
+            const continuity = parseContinuity(await transaction.get(CONTINUITY_KEY));
             if (cursor !== null && eventId <= cursor) {
                 throw new Error("Relay returned a non-advancing terminal delivery");
             }
+            if (
+                continuity === undefined ||
+                !equalBytes(continuity.generation, generation) ||
+                sequence !== continuity.sequence + 1
+            ) {
+                throw new Error("Inbox continuity changed during terminal delivery processing");
+            }
             await this.#storeRejection(transaction, eventId, code);
             await transaction.set(CURSOR_KEY, cursorBytes(eventId));
+            await transaction.set(CONTINUITY_KEY, continuityBytes({ generation, sequence }));
         });
     }
 
@@ -849,10 +1195,44 @@ export class InboxProcessor {
     }
 
     async #acknowledge(cursor: string, signal?: AbortSignal): Promise<void> {
-        await this.#dependencies.transport.acknowledge(
+        const outcome = await this.#dependencies.transport.acknowledge(
             createSignedInboxAck(this.#dependencies.identity, cursor, this.#requestTime()),
             signal,
         );
+        const continuity = await this.continuity();
+        const outcomeGeneration =
+            outcome.generation ?? continuity?.generation ?? new Uint8Array(32);
+        const outcomeSequence = outcome.sequence ?? continuity?.sequence ?? 0;
+        if (continuity === undefined) {
+            throw new InboxContinuityLossError({
+                reason: "state_missing",
+                expectedSequence: 0,
+                observedSequence: outcomeSequence,
+                generation: outcomeGeneration,
+                head: cursor,
+                headSequence: outcomeSequence,
+            });
+        }
+        if (!equalBytes(continuity.generation, outcomeGeneration)) {
+            throw new InboxContinuityLossError({
+                reason: "generation_changed",
+                expectedSequence: continuity.sequence,
+                observedSequence: outcomeSequence,
+                generation: outcomeGeneration,
+                head: cursor,
+                headSequence: outcomeSequence,
+            });
+        }
+        if (outcomeSequence !== continuity.sequence) {
+            throw new InboxContinuityLossError({
+                reason: "sequence_gap",
+                expectedSequence: continuity.sequence,
+                observedSequence: outcomeSequence,
+                generation: outcomeGeneration,
+                head: cursor,
+                headSequence: outcomeSequence,
+            });
+        }
     }
 
     #requestTime(): number {

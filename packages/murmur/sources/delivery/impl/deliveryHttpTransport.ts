@@ -1,14 +1,15 @@
-import { utf8Decode } from "../../utils/index.js";
+import { decodeBase64Url, utf8Decode } from "../../utils/index.js";
 import type {
     DeliveryFetch,
     DeliveryPublishOutcome,
     DeliveryTransport,
-    InboxDelivery,
+    InboxStreamEvent,
     InboxPage,
     SignedDelivery,
     SignedInboxAck,
     SignedInboxRead,
     DeliveryStreamHooks,
+    InboxAcknowledgement,
 } from "../types.js";
 import {
     parseInboxPage,
@@ -39,15 +40,60 @@ export class DeliveryTransportError extends Error {
 /** Terminal metadata for an inbox head too large for the relay response budget. */
 export class OversizedInboxDeliveryError extends DeliveryTransportError {
     readonly eventId: string;
+    readonly sequence: number;
     readonly head: string;
+    readonly headSequence: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+    readonly generation: Uint8Array;
 
-    constructor(eventId: string, head: string, acknowledgedThrough: string | null) {
+    constructor(eventId: string, head: string, acknowledgedThrough: string | null);
+    constructor(
+        eventId: string,
+        sequence: number,
+        head: string,
+        headSequence: number,
+        acknowledgedThrough: string | null,
+        acknowledgedSequence: number,
+        generation: Uint8Array,
+    );
+    constructor(
+        eventId: string,
+        sequenceOrHead: number | string,
+        headOrAcknowledged: string | null,
+        headSequence?: number,
+        acknowledgedThrough?: string | null,
+        acknowledgedSequence?: number,
+        generation?: Uint8Array,
+    ) {
         super(413, "delivery_too_large");
+        const legacy = typeof sequenceOrHead === "string";
+        const sequence = legacy ? 1 : sequenceOrHead;
+        const head = legacy ? sequenceOrHead : (headOrAcknowledged as string);
+        const resolvedHeadSequence = legacy ? 1 : headSequence!;
+        const resolvedAcknowledgedThrough = legacy ? headOrAcknowledged : acknowledgedThrough!;
+        const resolvedAcknowledgedSequence = legacy ? 0 : acknowledgedSequence!;
+        const resolvedGeneration = legacy ? new Uint8Array(32) : generation!;
+        if (
+            !Number.isSafeInteger(sequence) ||
+            sequence < 1 ||
+            !Number.isSafeInteger(resolvedHeadSequence) ||
+            resolvedHeadSequence < sequence ||
+            !Number.isSafeInteger(resolvedAcknowledgedSequence) ||
+            resolvedAcknowledgedSequence < 0 ||
+            resolvedAcknowledgedSequence >= sequence ||
+            resolvedGeneration.length !== 32
+        ) {
+            throw new Error("Invalid oversized inbox delivery metadata");
+        }
         this.name = "OversizedInboxDeliveryError";
         this.eventId = eventId;
+        this.sequence = sequence;
         this.head = head;
-        this.acknowledgedThrough = acknowledgedThrough;
+        this.headSequence = resolvedHeadSequence;
+        this.acknowledgedThrough = resolvedAcknowledgedThrough;
+        this.acknowledgedSequence = resolvedAcknowledgedSequence;
+        this.generation = resolvedGeneration.slice();
     }
 }
 
@@ -205,19 +251,31 @@ export class HttpDeliveryTransport implements DeliveryTransport {
     async acknowledge(
         request: SignedInboxAck,
         signal?: AbortSignal,
-    ): Promise<{ readonly removed: number }> {
+    ): Promise<InboxAcknowledgement> {
         const value = object(
             await this.#post("/v1/queue/ack", signedInboxAckToJson(request), signal),
         );
-        exact(value, ["removed"]);
+        exact(value, ["removed", "sequence", "generation"]);
         if (
             typeof value.removed !== "number" ||
             !Number.isSafeInteger(value.removed) ||
-            value.removed < 0
+            value.removed < 0 ||
+            typeof value.sequence !== "number" ||
+            !Number.isSafeInteger(value.sequence) ||
+            value.sequence < 0 ||
+            typeof value.generation !== "string"
         ) {
             throw new Error("Invalid relay response");
         }
-        return { removed: value.removed };
+        return {
+            removed: value.removed,
+            sequence: value.sequence,
+            generation: (() => {
+                const generation = decodeBase64Url(value.generation);
+                if (generation.length !== 32) throw new Error("Invalid relay response");
+                return generation;
+            })(),
+        };
     }
 
     /** Stream exact queued deliveries over one recipient-authenticated SSE response. */
@@ -225,7 +283,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         request: SignedInboxRead,
         signal?: AbortSignal,
         hooks: DeliveryStreamHooks = {},
-    ): AsyncGenerator<InboxDelivery> {
+    ): AsyncGenerator<InboxStreamEvent> {
         if (request.waitMilliseconds !== 0) {
             throw new Error("Delivery event streams require a zero wait duration");
         }
@@ -330,13 +388,34 @@ export class HttpDeliveryTransport implements DeliveryTransport {
             failure.error === "delivery_too_large" &&
             failure.acknowledgedThrough !== undefined
         ) {
-            exact(failure, ["error", "eventId", "head", "acknowledgedThrough"]);
+            exact(failure, [
+                "error",
+                "eventId",
+                "sequence",
+                "head",
+                "headSequence",
+                "acknowledgedThrough",
+                "acknowledgedSequence",
+                "generation",
+            ]);
             const acknowledgedThrough =
                 failure.acknowledgedThrough === null ? null : uuid(failure.acknowledgedThrough);
+            if (
+                typeof failure.sequence !== "number" ||
+                typeof failure.headSequence !== "number" ||
+                typeof failure.acknowledgedSequence !== "number" ||
+                typeof failure.generation !== "string"
+            ) {
+                throw new Error("Invalid relay response");
+            }
             throw new OversizedInboxDeliveryError(
                 uuid(failure.eventId),
+                failure.sequence,
                 uuid(failure.head),
+                failure.headSequence,
                 acknowledgedThrough,
+                failure.acknowledgedSequence,
+                decodeBase64Url(failure.generation),
             );
         }
         if (

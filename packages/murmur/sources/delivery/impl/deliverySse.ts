@@ -1,5 +1,5 @@
-import type { InboxDelivery } from "../types.js";
-import { parseInboxDelivery } from "./deliveryCodec.js";
+import type { InboxStreamEvent } from "../types.js";
+import { parseInboxContinuity, parseInboxDelivery } from "./deliveryCodec.js";
 
 interface TimedReadOptions {
     readonly controller: AbortController;
@@ -41,7 +41,7 @@ export async function* decodeDeliveryEventStream(
     controller: AbortController,
     maximumEventBytes: number,
     heartbeatTimeoutMilliseconds: number,
-): AsyncGenerator<InboxDelivery> {
+): AsyncGenerator<InboxStreamEvent> {
     const reader = response.body?.getReader();
     if (reader === undefined) throw new Error("Delivery event stream has no body");
     const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -50,14 +50,18 @@ export async function* decodeDeliveryEventStream(
     let eventId = "";
     let data: string[] = [];
     let eventCharacters = 0;
-    const dispatch = (): InboxDelivery | undefined => {
+    const dispatch = (): InboxStreamEvent | undefined => {
         if (data.length === 0) {
             eventName = "";
             eventId = "";
             eventCharacters = 0;
             return undefined;
         }
-        if (eventName !== "delivery" || eventId.length === 0) {
+        if (
+            (eventName !== "delivery" && eventName !== "continuity") ||
+            (eventName === "delivery" && eventId.length === 0) ||
+            (eventName === "continuity" && eventId.length !== 0)
+        ) {
             throw new Error("Invalid delivery event stream record");
         }
         let parsed: unknown;
@@ -66,8 +70,9 @@ export async function* decodeDeliveryEventStream(
         } catch {
             throw new Error("Invalid delivery event stream JSON");
         }
-        const queued = parseInboxDelivery(parsed);
-        if (queued.eventId !== eventId) {
+        const queued =
+            eventName === "continuity" ? parseInboxContinuity(parsed) : parseInboxDelivery(parsed);
+        if (!("type" in queued) && queued.eventId !== eventId) {
             throw new Error("Delivery event ID does not match its SSE identifier");
         }
         eventName = "";

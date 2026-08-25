@@ -2,7 +2,7 @@ import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus
 import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
-import { utf8Decode, utf8Encode } from "../../utils/index.js";
+import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
 import { signedDeliveryToJson } from "../impl/deliveryCodec.js";
 import {
     HttpDeliveryTransport,
@@ -67,7 +67,12 @@ describe("delivery client", () => {
                 exhausted: true,
             });
             expect(utf8Decode((await store.get("application/message"))!)).toBe("hello");
-            const page = await transport.read(createSignedInboxRead(bob, { createdAt: NOW }));
+            const page = await transport.read(
+                createSignedInboxRead(bob, {
+                    after: await processor.cursor(),
+                    createdAt: NOW,
+                }),
+            );
             expect(page.deliveries).toHaveLength(0);
         } finally {
             await relay.close();
@@ -424,8 +429,15 @@ describe("delivery client", () => {
             start(controller) {
                 controller.enqueue(
                     utf8Encode(
-                        `event: delivery\nid: ${eventId}\ndata: ${JSON.stringify({
+                        `event: continuity\ndata: ${JSON.stringify({
+                            generation: encodeBase64Url(new Uint8Array(32)),
+                            head: eventId,
+                            headSequence: 1,
+                            acknowledgedThrough: null,
+                            acknowledgedSequence: 0,
+                        })}\n\nevent: delivery\nid: ${eventId}\ndata: ${JSON.stringify({
                             eventId,
+                            sequence: 1,
                             delivery: signedDeliveryToJson(delivery),
                         })}\n\n`,
                     ),
@@ -444,6 +456,10 @@ describe("delivery client", () => {
             createSignedInboxRead(identity, { createdAt: NOW, waitMilliseconds: 0 }),
         );
 
+        await expect(stream.next()).resolves.toMatchObject({
+            done: false,
+            value: { type: "continuity" },
+        });
         await expect(stream.next()).resolves.toMatchObject({
             done: false,
             value: { eventId },
@@ -592,7 +608,7 @@ describe("delivery client", () => {
         const identity = generateIdentityKeyPair();
         const delivery = createSignedDelivery(identity, [identity.publicKey], utf8Encode("edge"), {
             createdAt: NOW,
-            expiresAt: NOW + 90 * 24 * 60 * 60 * 1_000,
+            expiresAt: NOW + 180 * 24 * 60 * 60 * 1_000,
         });
         const eventId = relayEventId(15);
         let applications = 0;
@@ -630,7 +646,7 @@ describe("delivery client", () => {
         const sender = generateIdentityKeyPair();
         const tooLong = createSignedDelivery(sender, [identity.publicKey], utf8Encode("long"), {
             createdAt: NOW,
-            expiresAt: NOW + 90 * 24 * 60 * 60 * 1_000 + 1,
+            expiresAt: NOW + 180 * 24 * 60 * 60 * 1_000 + 1,
         });
         const invalid = createSignedDelivery(sender, [identity.publicKey], utf8Encode("bad"), {
             createdAt: NOW,
@@ -682,7 +698,7 @@ describe("delivery client", () => {
     test("rotates terminal replay shards instead of accumulating them forever", async () => {
         const recipient = generateIdentityKeyPair();
         const sender = generateIdentityKeyPair();
-        const epoch = 90 * 24 * 60 * 60 * 1_000;
+        const epoch = 180 * 24 * 60 * 60 * 1_000;
         let now = NOW;
         const invalid = createSignedDelivery(sender, [recipient.publicKey], utf8Encode("invalid"), {
             createdAt: NOW,

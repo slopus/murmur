@@ -42,6 +42,8 @@ export interface DeliveryPublishOutcome {
 /** One retained delivery reference in an inbox. */
 export interface InboxDelivery {
     readonly eventId: string;
+    /** Relay v2 continuity sequence; omitted only by legacy custom transports. */
+    readonly sequence?: number;
     readonly delivery: SignedDelivery;
 }
 
@@ -49,8 +51,31 @@ export interface InboxDelivery {
 export interface InboxPage {
     readonly deliveries: readonly InboxDelivery[];
     readonly head: string | null;
+    readonly headSequence?: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence?: number;
+    readonly generation?: Uint8Array;
     readonly exhausted: boolean;
+}
+
+/** Stream control frame proving the current relay inbox generation and head. */
+export interface InboxContinuity {
+    readonly type: "continuity";
+    readonly generation: Uint8Array;
+    readonly head: string | null;
+    readonly headSequence: number;
+    readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+}
+
+/** One exact stream delivery or its preceding continuity control frame. */
+export type InboxStreamEvent = InboxDelivery | InboxContinuity;
+
+/** Continuity metadata returned after a monotonic acknowledgement. */
+export interface InboxAcknowledgement {
+    readonly removed: number;
+    readonly sequence?: number;
+    readonly generation?: Uint8Array;
 }
 
 /** Browser-safe fetch signature used by the HTTP delivery transport. */
@@ -134,16 +159,13 @@ export interface DeliveryStreamHooks {
 export interface DeliveryTransport {
     publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
     read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
-    acknowledge(
-        request: SignedInboxAck,
-        signal?: AbortSignal,
-    ): Promise<{ readonly removed: number }>;
+    acknowledge(request: SignedInboxAck, signal?: AbortSignal): Promise<InboxAcknowledgement>;
     /** Stream exact queued events in recipient inbox order when supported. */
     stream?(
         request: SignedInboxRead,
         signal?: AbortSignal,
         hooks?: DeliveryStreamHooks,
-    ): AsyncIterable<InboxDelivery>;
+    ): AsyncIterable<InboxStreamEvent>;
 }
 
 /** Inputs for one exact sender-signed delivery. */

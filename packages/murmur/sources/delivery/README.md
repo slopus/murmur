@@ -10,8 +10,9 @@ signed SSE stream -/                         | buffer/rejection |
                                               +------------------+
 ```
 
-The SSE path carries the exact queued delivery and UUIDv7 event ID, applies
-stream backpressure, and processes one record at a time. It is not a wake-only
+The SSE path starts with a continuity control record, then carries each exact
+queued delivery with its UUIDv7 event ID and per-inbox sequence. It applies
+stream backpressure and processes one record at a time. It is not a wake-only
 channel. Reconnect uses a freshly signed request after the durable local cursor,
 so anything committed but not acknowledged may be replayed safely.
 
@@ -36,9 +37,9 @@ code or blocks the queue.
 
 Replay expiry and overflow epochs advance from the relay-assigned UUIDv7 event
 time. Inbox ordering makes that clock nondecreasing; its magnitude must also
-fall within the local 90-day retention horizon plus configured clock skew.
+fall within the local 180-day retention horizon plus configured clock skew.
 An implausible timestamp rejects the page without changing durable state.
-Murmur enforces the relay profile's 90-day hard remaining-TTL bound, but a
+Murmur enforces the relay profile's 180-day hard remaining-TTL bound, but a
 validly signed TTL-policy failure is not added to the terminal filter.
 Structurally valid invalid IDs enter a bounded rotating terminal filter, so
 repeated invalid deliveries avoid repeated cryptographic work without making
@@ -50,3 +51,10 @@ persists `delivery_too_large`, advances its cursor, and acknowledges without
 seeing the ciphertext. A stale local backup behind the relay's acknowledged
 prefix instead throws `InboxStateRollbackError`; it cannot be repaired by
 skipping missing MLS state.
+
+The processor durably stores `{generation, sequence}` beside its cursor. Every
+page, control frame, delivery, and acknowledgement must continue that exact
+chain. A changed generation, missing sequence, or missing local continuity
+record throws `InboxContinuityLossError` without advancing protocol state. The
+session facade turns that proof of loss into its durable whole-device reset;
+there is no best-effort processing after a gap.

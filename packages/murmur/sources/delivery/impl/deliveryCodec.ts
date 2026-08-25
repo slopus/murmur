@@ -16,6 +16,7 @@ import type {
     CreateDeliveryOptions,
     CreateInboxReadOptions,
     InboxDelivery,
+    InboxContinuity,
     SignedDelivery,
     SignedInboxAck,
     SignedInboxRead,
@@ -339,13 +340,28 @@ export function parseInboxPage(
     value: unknown,
     maximumDeliveries: number = MAXIMUM_INBOX_READ_ITEMS,
 ): {
-    readonly deliveries: readonly { readonly eventId: string; readonly delivery: SignedDelivery }[];
+    readonly deliveries: readonly InboxDelivery[];
     readonly head: string | null;
+    readonly headSequence: number;
     readonly acknowledgedThrough: string | null;
+    readonly acknowledgedSequence: number;
+    readonly generation: Uint8Array;
     readonly exhausted: boolean;
 } {
     const input = object(value, "inbox page");
-    exact(input, ["deliveries", "head", "acknowledgedThrough", "exhausted"], "inbox page");
+    exact(
+        input,
+        [
+            "deliveries",
+            "head",
+            "headSequence",
+            "acknowledgedThrough",
+            "acknowledgedSequence",
+            "generation",
+            "exhausted",
+        ],
+        "inbox page",
+    );
     if (
         !Number.isSafeInteger(maximumDeliveries) ||
         maximumDeliveries < 1 ||
@@ -354,6 +370,7 @@ export function parseInboxPage(
         input.deliveries.length > maximumDeliveries ||
         (input.head !== null && typeof input.head !== "string") ||
         (input.acknowledgedThrough !== null && typeof input.acknowledgedThrough !== "string") ||
+        typeof input.generation !== "string" ||
         typeof input.exhausted !== "boolean"
     ) {
         throw new Error("Invalid inbox page");
@@ -361,10 +378,20 @@ export function parseInboxPage(
     return {
         deliveries: input.deliveries.map(parseInboxDelivery),
         head: input.head === null ? null : validateUuid(input.head, "inbox head"),
+        headSequence: safeInteger(input.headSequence, "inbox head sequence"),
         acknowledgedThrough:
             input.acknowledgedThrough === null
                 ? null
                 : validateUuid(input.acknowledgedThrough, "acknowledged event ID"),
+        acknowledgedSequence: safeInteger(
+            input.acknowledgedSequence,
+            "acknowledged inbox sequence",
+        ),
+        generation: (() => {
+            const generation = decodeBase64Url(input.generation);
+            if (generation.length !== 32) throw new Error("Invalid inbox generation");
+            return generation;
+        })(),
         exhausted: input.exhausted,
     };
 }
@@ -372,10 +399,41 @@ export function parseInboxPage(
 /** Strictly decode one queued delivery from a relay page or SSE event. */
 export function parseInboxDelivery(value: unknown): InboxDelivery {
     const queued = object(value, "queued delivery");
-    exact(queued, ["eventId", "delivery"], "queued delivery");
+    exact(queued, ["eventId", "sequence", "delivery"], "queued delivery");
     return {
         eventId: validateUuid(queued.eventId, "relay event ID"),
+        sequence: safeInteger(queued.sequence, "inbox sequence"),
         delivery: parseSignedDeliveryValue(queued.delivery, false),
+    };
+}
+
+/** Strictly decode one relay stream continuity control frame. */
+export function parseInboxContinuity(value: unknown): InboxContinuity {
+    const input = object(value, "inbox continuity");
+    exact(
+        input,
+        ["generation", "head", "headSequence", "acknowledgedThrough", "acknowledgedSequence"],
+        "inbox continuity",
+    );
+    if (
+        typeof input.generation !== "string" ||
+        (input.head !== null && typeof input.head !== "string") ||
+        (input.acknowledgedThrough !== null && typeof input.acknowledgedThrough !== "string")
+    ) {
+        throw new Error("Invalid inbox continuity");
+    }
+    const generation = decodeBase64Url(input.generation);
+    if (generation.length !== 32) throw new Error("Invalid inbox continuity");
+    return {
+        type: "continuity",
+        generation,
+        head: input.head === null ? null : validateUuid(input.head, "inbox head"),
+        headSequence: safeInteger(input.headSequence, "inbox head sequence"),
+        acknowledgedThrough:
+            input.acknowledgedThrough === null
+                ? null
+                : validateUuid(input.acknowledgedThrough, "acknowledged event ID"),
+        acknowledgedSequence: safeInteger(input.acknowledgedSequence, "acknowledged sequence"),
     };
 }
 

@@ -18,6 +18,7 @@ export type { SignedRelaySessionRequestJson } from "./impl/deliveryNegotiation.j
 export { WebSocketDeliveryTransport } from "./impl/deliveryWebSocketTransport.js";
 export {
     InboxProcessor,
+    InboxContinuityLossError,
     InboxStateRollbackError,
     MURMUR_INTERNAL_INBOX_HANDLER,
     TerminalInboxDeliveryError,
@@ -29,6 +30,7 @@ export {
     createSignedInboxAck,
     createSignedInboxRead,
     parseInboxDelivery,
+    parseInboxContinuity,
     parseInboxPage,
     parseSignedDelivery,
     signedDeliveryToJson,
@@ -50,8 +52,11 @@ export type {
     DeliveryWebSocketMessageEvent,
     HttpRelaySessionProviderOptions,
     InboxDelivery,
+    InboxAcknowledgement,
     InboxDeliveryHandler,
     InboxPage,
+    InboxContinuity,
+    InboxStreamEvent,
     InboxProcessorDependencies,
     InboxProcessorOptions,
     InboxRejection,
