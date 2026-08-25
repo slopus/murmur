@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2";
 import {
     DeliveryTransportError,
     HttpDeliveryTransport,
+    InboxContinuityLossError,
     WebSocketDeliveryTransport,
     type DeliveryFetch,
     type RelaySessionProvider,
@@ -45,6 +46,7 @@ import {
     encodeBase64Url,
     equalBytes,
     utf8Decode,
+    utf8Encode,
     zeroBytes,
 } from "../utils/index.js";
 import {
@@ -70,6 +72,7 @@ import {
     type MurmurServiceRegistration,
 } from "../services/index.js";
 import {
+    ACCOUNT_PEER_ROSTER_PREFIX,
     ACCOUNT_ROSTER_KEY,
     accountSyncSessionDescriptor,
     authorizeDeviceProvisioning,
@@ -93,10 +96,20 @@ import {
     serializeDeviceRoster,
     serializeProvisioningEnvelope,
     revokeDeviceFromRoster,
+    resetDeviceInRoster,
     type MurmurDeviceRoster,
     type MurmurDeviceRosterEntry,
+    type MurmurDormantDevice,
     type PreparedAccountEvents,
 } from "../accounts/index.js";
+import {
+    CONTACT_IDENTITY_PREFIX,
+    CONTACT_LOCAL_PROFILE_KEY,
+    CONTACT_SOCIAL_PREFIX,
+    contactSocialKey,
+    decodeContactRecord,
+    encodeContactSocialRecord,
+} from "../contacts/impl/contactRecords.js";
 import { randomBytes } from "../crypto/index.js";
 import type { StoreTransaction } from "../storage/index.js";
 import {
@@ -112,11 +125,14 @@ import type {
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionPolicies,
+    MurmurResetEvent,
+    MurmurResetSession,
     MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
     MurmurUpdate,
 } from "./types.js";
+import { MurmurResetRequiredError } from "./types.js";
 
 export type {
     CreateMurmurSessionOptions,
@@ -126,11 +142,14 @@ export type {
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionPolicies,
+    MurmurResetEvent,
+    MurmurResetSession,
     MurmurSyncOptions,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
     MurmurUpdate,
 } from "./types.js";
+export { MurmurResetRequiredError } from "./types.js";
 
 const IDENTITY_KEY = "murmur/identity/root";
 const INVITATION_REVOCATION_KEY = "murmur/invitations/revocation-root";
@@ -140,15 +159,161 @@ const LINK_MATERIAL_KEY = "murmur/accounts/v1/link-material";
 const ACCOUNT_SESSION_KEY = "murmur/accounts/v1/sync-session";
 const ACCOUNT_ADMISSION_SENT_KEY = "murmur/accounts/v1/admission-sent";
 const ACCOUNT_BROADCAST_KEY = "murmur/accounts/v1/roster-broadcast";
+const RESET_PENDING_KEY = "murmur/reset/v1/pending";
+const RESET_READMISSION_PREFIX = "murmur/reset/v1/re-admissions/";
+const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
+const MURMUR_KEY_PREFIX = "murmur/";
+const RESET_PURGE_SCAN_LIMIT = 10_000;
+const DEVICE_DORMANCY_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 const DEFAULT_KEY_PACKAGES = 1;
 const CONTACT_ADMISSION_GENERATION = 1;
 const LAST_RESORT_KEY_PACKAGE_LIFETIME_SECONDS = 10 * 365 * 24 * 60 * 60;
-const KEY_PACKAGE_LIFETIME_SECONDS = 30 * 24 * 60 * 60;
+// KeyPackages outlive the six-month delivery window by thirty days.
+const KEY_PACKAGE_LIFETIME_SECONDS = 210 * 24 * 60 * 60;
 const SYNC_RECONNECT_DELAY_MILLISECONDS = 1_000;
 
 interface CreatedContactAdmission {
     readonly admission: MurmurContactAdmission;
     readonly references: readonly Uint8Array[];
+}
+
+function encodeResetEvent(reset: MurmurResetEvent): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        id: reset.id,
+        reason: reset.reason,
+        generation: encodeBase64Url(reset.generation),
+        head: reset.head,
+        headSequence: reset.headSequence,
+        sessions: reset.sessions.map((session) => ({
+            id: encodeBase64Url(session.id),
+            status: session.status,
+            descriptor: encodeBase64Url(session.descriptor),
+            members: session.members.map(encodeBase64Url),
+            owner: encodeBase64Url(session.owner),
+            admins: session.admins.map(encodeBase64Url),
+            policies: session.policies,
+        })),
+    } as never);
+}
+
+function resetBytes(value: unknown, length: number | undefined, name: string): Uint8Array {
+    if (typeof value !== "string") throw new Error(`Invalid stored reset ${name}`);
+    const bytes = decodeBase64Url(value);
+    if (
+        (length === undefined
+            ? bytes.length < 1 || bytes.length > 1_048_576
+            : bytes.length !== length) ||
+        encodeBase64Url(bytes) !== value
+    ) {
+        throw new Error(`Invalid stored reset ${name}`);
+    }
+    return bytes;
+}
+
+function decodeResetEvent(bytes: Uint8Array): MurmurResetEvent {
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(utf8Decode(bytes)) as unknown;
+    } catch {
+        throw new Error("Invalid stored reset event");
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Invalid stored reset event");
+    }
+    const input = parsed as Record<string, unknown>;
+    if (
+        input.version !== 1 ||
+        typeof input.id !== "string" ||
+        !/^[A-Za-z0-9_-]{22}$/.test(input.id) ||
+        input.reason !== "inbox_continuity_lost" ||
+        (input.head !== null &&
+            (typeof input.head !== "string" ||
+                !/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(
+                    input.head,
+                ))) ||
+        typeof input.headSequence !== "number" ||
+        !Number.isSafeInteger(input.headSequence) ||
+        input.headSequence < 0 ||
+        !Array.isArray(input.sessions) ||
+        Object.keys(input).some(
+            (field) =>
+                ![
+                    "version",
+                    "id",
+                    "reason",
+                    "generation",
+                    "head",
+                    "headSequence",
+                    "sessions",
+                ].includes(field),
+        )
+    ) {
+        throw new Error("Invalid stored reset event");
+    }
+    const generation = resetBytes(input.generation, 32, "generation");
+    const sessions = input.sessions.map((candidate): MurmurResetSession => {
+        if (candidate === null || typeof candidate !== "object" || Array.isArray(candidate)) {
+            throw new Error("Invalid stored reset session");
+        }
+        const session = candidate as Record<string, unknown>;
+        const policies = session.policies;
+        if (
+            !["creating", "pending", "active", "removed"].includes(session.status as string) ||
+            !Array.isArray(session.members) ||
+            !Array.isArray(session.admins) ||
+            policies === null ||
+            typeof policies !== "object" ||
+            Array.isArray(policies) ||
+            typeof (policies as Record<string, unknown>).adminsAssignAdmins !== "boolean" ||
+            typeof (policies as Record<string, unknown>).anyoneCanAddMembers !== "boolean" ||
+            Object.keys(policies).some(
+                (field) => !["adminsAssignAdmins", "anyoneCanAddMembers"].includes(field),
+            ) ||
+            Object.keys(session).some(
+                (field) =>
+                    ![
+                        "id",
+                        "status",
+                        "descriptor",
+                        "members",
+                        "owner",
+                        "admins",
+                        "policies",
+                    ].includes(field),
+            )
+        ) {
+            throw new Error("Invalid stored reset session");
+        }
+        return Object.freeze({
+            id: resetBytes(session.id, undefined, "session ID"),
+            status: session.status as MurmurSession["status"],
+            descriptor: resetBytes(session.descriptor, undefined, "descriptor"),
+            members: Object.freeze(
+                session.members.map((member) => resetBytes(member, 32, "member")),
+            ),
+            owner: resetBytes(session.owner, 32, "owner"),
+            admins: Object.freeze(session.admins.map((admin) => resetBytes(admin, 32, "admin"))),
+            policies: Object.freeze({
+                adminsAssignAdmins:
+                    (policies as Record<string, unknown>).adminsAssignAdmins === true,
+                anyoneCanAddMembers:
+                    (policies as Record<string, unknown>).anyoneCanAddMembers === true,
+            }),
+        });
+    });
+    const reset = Object.freeze({
+        id: input.id,
+        reason: "inbox_continuity_lost" as const,
+        generation,
+        head: input.head as string | null,
+        headSequence: input.headSequence,
+        sessions: Object.freeze(sessions),
+    });
+    if (!equalBytes(encodeResetEvent(reset), bytes)) {
+        throw new Error("Non-canonical stored reset event");
+    }
+    return reset;
 }
 
 /** Construction inputs for the stateful Murmur MLS client. */
@@ -393,6 +558,50 @@ export class MurmurClient {
                           authorization: entry.authorization.slice(),
                       }),
                   );
+        });
+    }
+
+    /** List active sibling devices with no authenticated activity for six months. */
+    async dormantDevices(): Promise<readonly MurmurDormantDevice[]> {
+        return this.#tracked(async () => {
+            const roster = await this.#ownRoster();
+            if (roster === undefined) return [];
+            const now = this.#now();
+            const dormant: MurmurDormantDevice[] = [];
+            for (const entry of roster.devices) {
+                if (
+                    entry.status !== "active" ||
+                    equalBytes(entry.deviceKey, this.#identity.publicKey)
+                ) {
+                    continue;
+                }
+                const bytes = await this.#store.get(
+                    `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(entry.deviceKey)}`,
+                );
+                let lastActivityAt = roster.issuedAt;
+                try {
+                    if (bytes !== undefined) {
+                        const encoded = utf8Decode(bytes);
+                        if (!/^\d{16}$/.test(encoded)) {
+                            throw new Error("Invalid stored device activity");
+                        }
+                        lastActivityAt = Number(encoded);
+                    }
+                } finally {
+                    if (bytes !== undefined) zeroBytes(bytes);
+                }
+                const dormantSince = lastActivityAt + DEVICE_DORMANCY_MILLISECONDS;
+                if (now >= dormantSince) {
+                    dormant.push(
+                        Object.freeze({
+                            device: entry.deviceKey.slice(),
+                            lastActivityAt,
+                            dormantSince,
+                        }),
+                    );
+                }
+            }
+            return Object.freeze(dormant);
         });
     }
 
@@ -876,6 +1085,10 @@ export class MurmurClient {
         await this.#exclusive(async () => {
             const contact = await this.#contacts.contact(identity);
             if (contact === undefined) throw new Error("Unknown contact");
+            if (contact.sessionId.length === 0) {
+                await this.#store.delete(contactSocialKey(identity));
+                return;
+            }
             const packet = encodeContactPacket({ version: 2, type: "remove" });
             try {
                 await this.#engine.sendOwnedContact(
@@ -1114,6 +1327,253 @@ export class MurmurClient {
         return this.#tracked(() => this.#engine.issues());
     }
 
+    async #pendingReset(): Promise<MurmurResetEvent | undefined> {
+        const bytes = await this.#store.get(RESET_PENDING_KEY);
+        if (bytes === undefined) return undefined;
+        try {
+            return decodeResetEvent(bytes);
+        } finally {
+            zeroBytes(bytes);
+        }
+    }
+
+    async #recordReset(loss: InboxContinuityLossError): Promise<MurmurResetEvent> {
+        const existing = await this.#pendingReset();
+        if (existing !== undefined) return existing;
+        const sessions: MurmurResetSession[] = [];
+        let cursor: string | null = null;
+        do {
+            const page = await this.#engine.list(cursor === null ? {} : { after: cursor });
+            for (const session of page.sessions) {
+                sessions.push(
+                    Object.freeze({
+                        id: session.id.slice(),
+                        status: session.status,
+                        descriptor: session.descriptor.slice(),
+                        members: Object.freeze(session.members.map((member) => member.slice())),
+                        owner: session.owner.slice(),
+                        admins: Object.freeze(session.admins.map((admin) => admin.slice())),
+                        policies: Object.freeze({ ...session.policies }),
+                    }),
+                );
+            }
+            cursor = page.cursor;
+        } while (cursor !== null);
+        const reset: MurmurResetEvent = Object.freeze({
+            id: encodeBase64Url(randomBytes(16)),
+            reason: "inbox_continuity_lost",
+            generation: loss.generation.slice(),
+            head: loss.head,
+            headSequence: loss.headSequence,
+            sessions: Object.freeze(sessions),
+        });
+        const encoded = encodeResetEvent(reset);
+        try {
+            await this.#store.transaction(async (transaction) => {
+                const pending = await transaction.get(RESET_PENDING_KEY);
+                try {
+                    if (pending === undefined) await transaction.set(RESET_PENDING_KEY, encoded);
+                } finally {
+                    if (pending !== undefined) zeroBytes(pending);
+                }
+            });
+        } finally {
+            zeroBytes(encoded);
+        }
+        return (await this.#pendingReset())!;
+    }
+
+    #preserveAcrossReset(key: string): boolean {
+        return (
+            key === IDENTITY_KEY ||
+            key === INVITATION_REVOCATION_KEY ||
+            key === ACCOUNT_ROOT_KEY ||
+            key === DEVICE_CREDENTIAL_KEY ||
+            key === ACCOUNT_ROSTER_KEY ||
+            key.startsWith(ACCOUNT_PEER_ROSTER_PREFIX) ||
+            key.startsWith(ACCOUNT_DEVICE_ACTIVITY_PREFIX) ||
+            key.startsWith(CONTACT_SOCIAL_PREFIX) ||
+            key === CONTACT_LOCAL_PROFILE_KEY ||
+            key === RESET_PENDING_KEY
+        );
+    }
+
+    async #resetAnnouncementRecipients(reset: MurmurResetEvent): Promise<readonly Uint8Array[]> {
+        const recipients = new Map<string, Uint8Array>();
+        const rosterAccounts = new Set<string>();
+        const addRoster = (roster: MurmurDeviceRoster): void => {
+            rosterAccounts.add(encodeBase64Url(roster.accountKey));
+            for (const entry of roster.devices) {
+                if (
+                    entry.status === "active" &&
+                    !equalBytes(entry.deviceKey, this.#identity.publicKey)
+                ) {
+                    recipients.set(encodeBase64Url(entry.deviceKey), entry.deviceKey.slice());
+                }
+            }
+        };
+        const own = await this.#ownRoster();
+        if (own !== undefined) addRoster(own);
+        let after: string | undefined;
+        for (;;) {
+            const page = await this.#store.scan(ACCOUNT_PEER_ROSTER_PREFIX, {
+                ...(after === undefined ? {} : { after }),
+                limit: RESET_PURGE_SCAN_LIMIT,
+            });
+            if (page.size === 0) break;
+            for (const [key, bytes] of page) {
+                after = key;
+                try {
+                    addRoster(parseDeviceRoster(bytes));
+                } finally {
+                    zeroBytes(bytes);
+                }
+            }
+            if (page.size < RESET_PURGE_SCAN_LIMIT) break;
+        }
+        const ownAccount = (this.#account ?? this.#identity).publicKey;
+        for (const session of reset.sessions) {
+            for (const member of session.members) {
+                const encoded = encodeBase64Url(member);
+                if (
+                    !equalBytes(member, ownAccount) &&
+                    !rosterAccounts.has(encoded) &&
+                    !equalBytes(member, this.#identity.publicKey)
+                ) {
+                    // Before multidevice linking, an account key is its exact inbox identity.
+                    recipients.set(encoded, member.slice());
+                }
+            }
+        }
+        return Object.freeze([...recipients.values()]);
+    }
+
+    async #purgeReset(reset: MurmurResetEvent): Promise<void> {
+        const account = this.#account ?? this.#identity;
+        const currentRoster =
+            (await this.#ownRoster()) ??
+            createInitialDeviceRoster(account, this.#identity, this.#now(), randomBytes(16));
+        const roster = resetDeviceInRoster(
+            currentRoster,
+            account,
+            this.#identity,
+            this.#identity.publicKey,
+            this.#now(),
+            randomBytes(16),
+        );
+        const rosterBytes = serializeDeviceRoster(roster);
+        const recipients = await this.#resetAnnouncementRecipients(reset);
+        const bundle = createMlsKeyPackage(
+            this.#identity,
+            Math.floor(this.#now() / 1_000),
+            KEY_PACKAGE_LIFETIME_SECONDS,
+            this.#deviceCredential ?? this.#identity.publicKey,
+        );
+        const reference = mlsKeyPackageReference(bundle.keyPackage);
+        const bundleBytes = serializeMlsKeyPackageBundle(bundle);
+        const keyPackage = encodeMlsKeyPackage(bundle.keyPackage);
+        let announcement: Uint8Array | undefined;
+        try {
+            announcement = encodeAccountSyncPacket({
+                version: 1,
+                type: "admission",
+                roster: rosterBytes,
+                keyPackage,
+            });
+            const announcementBytes = announcement;
+            await this.#store.transaction(async (transaction) => {
+                let after: string | undefined;
+                for (;;) {
+                    const page = await transaction.scan(MURMUR_KEY_PREFIX, {
+                        ...(after === undefined ? {} : { after }),
+                        limit: RESET_PURGE_SCAN_LIMIT,
+                    });
+                    if (page.size === 0) break;
+                    for (const [key, value] of page) {
+                        after = key;
+                        try {
+                            if (key.startsWith(CONTACT_IDENTITY_PREFIX)) {
+                                const contact = decodeContactRecord(value);
+                                try {
+                                    await transaction.set(
+                                        contactSocialKey(contact.identity),
+                                        encodeContactSocialRecord({
+                                            version: 1,
+                                            identity: contact.identity,
+                                            localProfile: contact.localProfile,
+                                            profile: contact.profile,
+                                            confirmedAt: contact.confirmedAt,
+                                        }),
+                                    );
+                                } finally {
+                                    zeroBytes(contact.identity);
+                                    zeroBytes(contact.sessionId);
+                                }
+                                await transaction.delete(key);
+                                continue;
+                            }
+                            if (!this.#preserveAcrossReset(key)) await transaction.delete(key);
+                        } finally {
+                            zeroBytes(value);
+                        }
+                    }
+                    if (page.size < RESET_PURGE_SCAN_LIMIT) break;
+                }
+                await transaction.set(ACCOUNT_ROSTER_KEY, rosterBytes);
+                await this.#queueRosterBroadcast(transaction, rosterBytes, keyPackage);
+                await this.#engine.storeKeyPackagesInTransaction(transaction, [
+                    {
+                        reference,
+                        bytes: bundleBytes,
+                        expiresAt: Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n),
+                        reusable: true,
+                    },
+                ]);
+                await this.#engine.queueAccountResetAnnouncementsInTransaction(
+                    transaction,
+                    recipients,
+                    announcementBytes,
+                );
+                for (const session of reset.sessions) {
+                    await transaction.set(
+                        `${RESET_READMISSION_PREFIX}${encodeBase64Url(session.id)}`,
+                        session.descriptor,
+                    );
+                }
+                await this.#engine.adoptInboxBaselineInTransaction(
+                    transaction,
+                    reset.generation,
+                    reset.head,
+                    reset.headSequence,
+                );
+                await transaction.delete(RESET_PENDING_KEY);
+            });
+            try {
+                await this.#engine.acknowledgeInboxBaseline(reset.head);
+            } catch {
+                // The committed cursor causes the next synchronization to retry this signed ACK.
+            }
+        } finally {
+            zeroBytes(rosterBytes);
+            zeroBytes(reference);
+            zeroBytes(bundleBytes);
+            zeroBytes(keyPackage);
+            if (announcement !== undefined) zeroBytes(announcement);
+            for (const recipient of recipients) zeroBytes(recipient);
+            destroyMlsKeyPackageBundle(bundle);
+        }
+    }
+
+    async #completeReset(
+        reset: MurmurResetEvent,
+        onReset: MurmurSyncOptions["onReset"],
+    ): Promise<never> {
+        if (onReset === undefined) throw new MurmurResetRequiredError(reset, false);
+        await onReset(reset);
+        await this.#exclusive(() => this.#purgeReset(reset));
+        throw new MurmurResetRequiredError(reset, true);
+    }
+
     async synchronize(
         options: MurmurSynchronizeOptions = {},
         lifecycle: Pick<
@@ -1126,14 +1586,27 @@ export class MurmurClient {
             | "onDeviceAdded"
             | "onDeviceRevoked"
             | "onContactRosterChanged"
+            | "onReset"
+            | "onDeviceDormant"
         > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
             throw new Error("Cannot page synchronization while SSE sync is active");
         }
+        const pendingReset = await this.#pendingReset();
+        if (pendingReset !== undefined) {
+            return this.#completeReset(pendingReset, lifecycle.onReset);
+        }
         await this.#exclusive(() => this.#queueContactMaintenance());
         await this.#exclusive(() => this.#queueAccountWork());
-        const result = await this.#exclusive(() => this.#engine.synchronize(options));
+        let result: MurmurSynchronizeResult;
+        try {
+            result = await this.#exclusive(() => this.#engine.synchronize(options));
+        } catch (error: unknown) {
+            if (!(error instanceof InboxContinuityLossError)) throw error;
+            const reset = await this.#exclusive(() => this.#recordReset(error));
+            return this.#completeReset(reset, lifecycle.onReset);
+        }
         await this.#deliverUpdates(lifecycle);
         return result;
     }
@@ -1154,6 +1627,10 @@ export class MurmurClient {
         const wakeOnAbort = (): void => this.#signalSync();
         signal.addEventListener("abort", wakeOnAbort, { once: true });
         try {
+            const pendingReset = await this.#pendingReset();
+            if (pendingReset !== undefined) {
+                await this.#completeReset(pendingReset, options.onReset);
+            }
             await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
             await this.#deliverUpdates(options);
             while (!signal.aborted) {
@@ -1194,6 +1671,10 @@ export class MurmurClient {
                 } catch (error: unknown) {
                     disconnectedBy = error;
                     if (signal.aborted) break;
+                    if (error instanceof InboxContinuityLossError) {
+                        const reset = await this.#exclusive(() => this.#recordReset(error));
+                        await this.#completeReset(reset, options.onReset);
+                    }
                     if (
                         !(error instanceof DeliveryTransportError) ||
                         (error.status !== 0 && error.status !== 429 && error.status < 500)
@@ -1398,6 +1879,7 @@ export class MurmurClient {
             | "onDeviceAdded"
             | "onDeviceRevoked"
             | "onContactRosterChanged"
+            | "onDeviceDormant"
         >,
     ): Promise<number> {
         if (this.#updatesActive) return 0;
@@ -1405,6 +1887,10 @@ export class MurmurClient {
         this.#pendingOperations += 1;
         let delivered = 0;
         try {
+            if (lifecycle.onDeviceDormant !== undefined) {
+                const dormant = await this.dormantDevices();
+                if (dormant.length > 0) await lifecycle.onDeviceDormant(dormant);
+            }
             for (;;) {
                 await this.#exclusive(() => this.#queueContactMaintenance());
                 await this.#exclusive(() => this.#queueAccountWork());
@@ -1650,6 +2136,10 @@ export class MurmurClient {
 
     /** Queue automatic account work: link completion, admission, roster broadcast. */
     async #queueAccountWork(): Promise<void> {
+        await this.#store.set(
+            `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(this.#identity.publicKey)}`,
+            utf8Encode(String(this.#now()).padStart(16, "0")),
+        );
         let queued = false;
         const pendingEnvelope = await this.#engine.pendingProvisioningEnvelope();
         if (pendingEnvelope !== undefined) {
@@ -1747,6 +2237,7 @@ export class MurmurClient {
         }
         const accountSessionId = await this.#store.get(ACCOUNT_SESSION_KEY);
         let complete = true;
+        let targets = 0;
         let cursor: string | null = null;
         do {
             const page = await this.#engine.list(cursor === null ? {} : { after: cursor });
@@ -1755,6 +2246,7 @@ export class MurmurClient {
                 if (accountSessionId !== undefined && equalBytes(session.id, accountSessionId)) {
                     continue;
                 }
+                targets += 1;
                 try {
                     await this.#engine.sendAccountRoster(session.id, roster, keyPackage);
                 } catch {
@@ -1764,8 +2256,9 @@ export class MurmurClient {
             cursor = page.cursor;
         } while (cursor !== null);
         if (accountSessionId !== undefined) zeroBytes(accountSessionId);
+        if (targets === 0) complete = false;
         if (complete) await this.#store.delete(ACCOUNT_BROADCAST_KEY);
-        return true;
+        return targets > 0;
     }
 
     async #queueContactHellos(): Promise<boolean> {

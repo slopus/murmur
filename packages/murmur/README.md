@@ -791,9 +791,10 @@ operation, and `issues()` lists durable session and publication diagnostics.
 One account can run several devices. The account identity is a signing key
 only: it signs a versioned, replay-protected device roster, and every device
 keeps its own secret key, MLS leaves, ratchets, inbox, and durable store.
-Devices never share encryption state, and the relay never sees the roster or
-which devices belong to which account — roster updates travel only inside
-existing encrypted sessions.
+Devices never share encryption state. Ordinary roster updates travel inside
+existing encrypted sessions. A continuity reset uses recipient-sealed direct
+announcements because the reset device has already destroyed its old MLS leaf;
+the relay still sees only opaque ciphertext.
 
 Linking follows the Signal shape, and only one small payload ever travels out
 of band. The new device produces short-lived request bytes (about 750 bytes —
@@ -830,21 +831,28 @@ device-awareness at all.
 ```ts
 // Any active device may inspect and control the roster.
 const devices = await murmur.devices(); // roster entries with status
+const dormant = await murmur.dormantDevices(); // silent for 180 days
 await murmur.revokeDevice(otherDeviceKey); // stops delivery and drives MLS Removes
 
 // Lifecycle callbacks in the same sync loop:
 await murmur.sync({
     onDeviceAdded: (events) => console.log("own device added", events),
     onDeviceRevoked: (events) => console.log("own device revoked", events),
+    onDeviceDormant: (events) => console.log("siblings eligible for revocation", events),
     onContactRosterChanged: (events) => console.log("contact devices changed", events),
+    onReset: (event) => persistFinalSessionSnapshot(event),
 });
 ```
 
-Peers learn about additions and revocations only from the authenticated,
-account-signed roster carried over their existing sessions, never from an
-unauthenticated server claim. Losing a device store still loses that device's
-state: a replacement links as a fresh device and receives new Welcomes;
-application history transfer stays application-owned.
+Peers accept additions, revocations, and resets only from authenticated,
+account-signed rosters, never from an unauthenticated server claim. Every inbox
+delivery also carries a strictly increasing sequence under a retained loss
+generation. A gap or changed generation persists one complete reset snapshot,
+retries `onReset` until it resolves, destroys all technical state exactly once,
+and adopts the relay head. The reset roster drives automatic Remove/Add
+convergence with a fresh Welcome; reappearing sessions keep their descriptors
+and expose `reAdmission: true`. Application history transfer stays
+application-owned.
 
 The repository also contains internal, deliberately unexported groundwork for
 private group state — Ristretto255 credential mathematics, encrypted member
@@ -964,6 +972,9 @@ What the loop guarantees:
   after its processing outcome — new MLS state, replay and queue progress, and
   any buffered application update — is atomically persisted. A crash before
   that simply causes harmless redelivery.
+- **Continuity is proved.** The generation and contiguous per-inbox sequence
+  commit beside each outcome. Any certain loss stops delivery and enters the
+  durable whole-device reset before any more MLS processing.
 - **Callbacks gate the local batch.** Murmur runs every relevant service
   handler and callback for a batch, and commits and drains that batch only
   after they all resolve. A thrown handler or a crash re-delivers the same
@@ -1001,9 +1012,10 @@ Murmur is offline-first. Opening a client restores identity, contacts,
 sessions, and service routing from the store before any relay contact, so
 Murmur reads and mutations work immediately. Sends and membership changes made
 offline persist as durable outboxes and publish when connectivity returns.
-Unacknowledged inbound deliveries wait in the relay queue within its quota and
-TTL — the queue bound defines the maximum supported offline window, not an
-archive.
+Unacknowledged inbound deliveries wait in the relay queue within its quota for
+at most exactly 180 days. The queue bound defines the maximum supported offline
+window, not an archive. Devices silent beyond that window are dormant and can
+no longer prove continuity.
 
 Delivery to the application is _at-least-once with stable IDs_. Murmur
 deduplicates protocol-level redelivery internally, but an application callback
@@ -1126,6 +1138,7 @@ Deeper reference material lives in the repository docs:
 ## Protocol versions
 
 Murmur v0.4 uses contact protocol and contact storage version 2. It is a clean
-break from the v0.3 contact format. Relay schema v4 adds owner-authorized
-invitation metadata and expiring revocation tombstones. SQLite and Postgres
+break from the v0.3 contact format. Relay schema v5 adds owner-authorized
+invitation metadata, expiring revocation tombstones, queue sequences, and loss
+generations. SQLite and Postgres
 migrate schema v3 in place without deleting pending deliveries or invitations.

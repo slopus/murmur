@@ -51,6 +51,9 @@ mutationId): MurmurDeviceRoster` — signed child revision adding one active
 - `revokeDeviceFromRoster(previous, account, authorDevice, deviceKey,
 issuedAt, mutationId): MurmurDeviceRoster` — signed child revision marking
   one device revoked; a device cannot revoke itself.
+- `resetDeviceInRoster(previous, account, authorDevice, deviceKey, issuedAt,
+mutationId): MurmurDeviceRoster` — signed child revision advancing one active
+  device's monotonic reset generation without removing the account.
 - `verifyDeviceRoster(roster): boolean` — canonical shape plus both
   signatures.
 - `isActiveDevice(roster, deviceKey): boolean` — membership check.
@@ -105,7 +108,9 @@ events for callbacks and MLS membership jobs for automatic convergence.
 senderDevice, rosterBytes, admission?)` — validate one roster transition
   (sender must be an active device of that account; revisions must chain or
   win fork ordering), persist it, record added/revoked events, and queue
-  convergence jobs. Used for both own-account and contact rosters.
+  convergence jobs. A reset with fresh admission material queues one atomic
+  leaf replacement Commit containing Remove and Add. Used for both own-account
+  and contact rosters.
 - `accountConvergenceJobs(store): readonly AccountConvergenceJob[]` — read
   the bounded queue of pending MLS Add/Remove work.
 - `deleteAccountConvergenceJob(store, key)` — remove one completed job.
@@ -135,7 +140,16 @@ roster updates and admission KeyPackages; never surfaced to applications.
 `MurmurDeviceLinkRequest`, `MurmurDeviceLinkMaterial`,
 `MurmurDeviceProvisioningAuthorization`, `MurmurDeviceProvisioningEnvelope`,
 `MurmurProvisionedAccount`, `MurmurDeviceAdded`, `MurmurDeviceRevoked`,
+`MurmurDormantDevice`,
 `MurmurContactRosterChanged`.
+
+Continuity reset announcements carry the signed roster plus a fresh reusable
+KeyPackage in recipient-sealed, MLS-independent inbox deliveries. This lets
+peers authenticate the reset after the old leaf state is destroyed and drive
+the ordinary roster convergence machinery. `onContactRosterChanged` reports
+`change: "reset"`. `dormantDevices()` reports active siblings with no
+authenticated activity for 180 days; applications may revoke them explicitly,
+but Murmur never revokes automatically.
 
 This module deliberately knows nothing about the private-group mathematics;
 the only place the two meet is `sources/privateGroupState`.

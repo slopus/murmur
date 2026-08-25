@@ -26,6 +26,7 @@ export interface SessionRecord {
     readonly removalGenerations: readonly SessionRemovalGeneration[];
     readonly bootstrapEventId?: string;
     readonly bootstrapKeyPackageReference?: Uint8Array;
+    readonly reAdmission?: boolean;
 }
 
 export interface SessionRemovalGeneration {
@@ -46,6 +47,7 @@ export interface SessionOutboxRecord {
     readonly retainPreviousEpoch?: boolean;
     readonly bootstrapDeliveryIds?: readonly string[];
     readonly roles?: SessionRoles;
+    readonly accountConvergenceKey?: string;
 }
 
 /** One durable asynchronous membership or role mutation. */
@@ -141,6 +143,7 @@ export function encodeSessionRecord(record: SessionRecord): Uint8Array {
         previousGeneration: record.previousGeneration?.toString() ?? null,
         previousEpochExpiresAt: record.previousEpochExpiresAt ?? null,
         previousMessagesRemaining: record.previousMessagesRemaining ?? null,
+        ...(record.reAdmission === true ? { reAdmission: true } : {}),
     };
     const removalGenerations = [...record.removalGenerations]
         .map((value) => ({ account: encodeBase64Url(value.account), generation: value.generation }))
@@ -169,28 +172,26 @@ export function encodeSessionRecord(record: SessionRecord): Uint8Array {
 
 export function decodeSessionRecord(value: Uint8Array): SessionRecord {
     const input = json(value, 70 * 1024 * 1024, "session record");
-    exact(
-        input,
-        [
-            "version",
-            "status",
-            "descriptor",
-            "epoch",
-            "generation",
-            "bufferedEvents",
-            "bufferedBytes",
-            "stagedCommitId",
-            "previousEpoch",
-            "previousGeneration",
-            "previousEpochExpiresAt",
-            "previousMessagesRemaining",
-            "roles",
-            "removalGenerations",
-            "bootstrapEventId",
-            "bootstrapKeyPackageReference",
-        ],
-        "session record",
-    );
+    const fields = [
+        "version",
+        "status",
+        "descriptor",
+        "epoch",
+        "generation",
+        "bufferedEvents",
+        "bufferedBytes",
+        "stagedCommitId",
+        "previousEpoch",
+        "previousGeneration",
+        "previousEpochExpiresAt",
+        "previousMessagesRemaining",
+        "roles",
+        "removalGenerations",
+        "bootstrapEventId",
+        "bootstrapKeyPackageReference",
+        ...(Object.hasOwn(input, "reAdmission") ? ["reAdmission"] : []),
+    ];
+    exact(input, fields, "session record");
     if (
         input.version !== 2 ||
         (input.status !== "creating" &&
@@ -213,7 +214,8 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         (input.bootstrapEventId !== null &&
             (typeof input.bootstrapEventId !== "string" || input.bootstrapEventId.length > 128)) ||
         (input.bootstrapKeyPackageReference !== null &&
-            typeof input.bootstrapKeyPackageReference !== "string")
+            typeof input.bootstrapKeyPackageReference !== "string") ||
+        (input.reAdmission !== undefined && input.reAdmission !== true)
     ) {
         throw new Error("Invalid session record");
     }
@@ -267,6 +269,7 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
               }),
         roles: decodeSessionRoles(bytes(input.roles, 64 * 1024, "session roles")),
         removalGenerations,
+        ...(input.reAdmission === true ? { reAdmission: true } : {}),
         ...(input.bootstrapEventId === null
             ? {}
             : { bootstrapEventId: input.bootstrapEventId as string }),
@@ -298,6 +301,9 @@ export function encodeOutboxRecord(record: SessionOutboxRecord): Uint8Array {
         bootstrapDeliveryIds: record.bootstrapDeliveryIds ?? null,
         roles:
             record.roles === undefined ? null : encodeBase64Url(encodeSessionRoles(record.roles)),
+        ...(record.accountConvergenceKey === undefined
+            ? {}
+            : { accountConvergenceKey: record.accountConvergenceKey }),
     });
 }
 
@@ -318,6 +324,7 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
             "retainPreviousEpoch",
             "bootstrapDeliveryIds",
             "roles",
+            ...(Object.hasOwn(input, "accountConvergenceKey") ? ["accountConvergenceKey"] : []),
         ],
         "session outbox",
     );
@@ -341,7 +348,10 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
                     (value) => typeof value !== "string" || !DELIVERY_ID.test(value),
                 ) ||
                 new Set(input.bootstrapDeliveryIds).size !== input.bootstrapDeliveryIds.length)) ||
-        (input.roles !== null && typeof input.roles !== "string")
+        (input.roles !== null && typeof input.roles !== "string") ||
+        (input.accountConvergenceKey !== undefined &&
+            (typeof input.accountConvergenceKey !== "string" ||
+                !input.accountConvergenceKey.startsWith("murmur/accounts/v1/convergence/")))
     ) {
         throw new Error("Invalid session outbox");
     }
@@ -398,6 +408,9 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
         ...(input.roles === null
             ? {}
             : { roles: decodeSessionRoles(bytes(input.roles, 64 * 1024, "outbox roles")) }),
+        ...(input.accountConvergenceKey === undefined
+            ? {}
+            : { accountConvergenceKey: input.accountConvergenceKey as string }),
     };
 }
 

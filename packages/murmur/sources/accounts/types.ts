@@ -6,6 +6,8 @@ export interface MurmurDeviceRosterEntry {
     readonly addedAtRevision: number;
     readonly authorization: Uint8Array;
     readonly status: "active" | "revoked";
+    /** Monotonic continuity-reset generation for this physical device. */
+    readonly resetGeneration: number;
     readonly revokedAtRevision?: number;
 }
 
@@ -80,12 +82,19 @@ export interface MurmurDeviceAdded {
 /** Durable local lifecycle notification for one revoked account device. */
 export interface MurmurDeviceRevoked extends MurmurDeviceAdded {}
 
+/** One active sibling device whose last authenticated activity crossed six months. */
+export interface MurmurDormantDevice {
+    readonly device: Uint8Array;
+    readonly lastActivityAt: number;
+    readonly dormantSince: number;
+}
+
 /** Authenticated device-membership change observed for a contact account. */
 export interface MurmurContactRosterChanged {
     readonly id: string;
     readonly account: Uint8Array;
     readonly device: Uint8Array;
-    readonly change: "added" | "revoked";
+    readonly change: "added" | "revoked" | "reset";
     readonly rosterRevision?: number;
 }
 

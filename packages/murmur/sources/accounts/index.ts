@@ -7,6 +7,7 @@ export {
     isActiveDevice,
     parseDeviceRoster,
     revokeDeviceFromRoster,
+    resetDeviceInRoster,
     selectDeviceRosterChild,
     serializeDeviceRoster,
     verifyDeviceRoster,
@@ -54,5 +55,6 @@ export type {
     MurmurDeviceRoster,
     MurmurDeviceRosterEntry,
     MurmurDeviceRevoked,
+    MurmurDormantDevice,
     MurmurProvisionedAccount,
 } from "./types.js";

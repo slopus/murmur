@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
+import { MemoryMurmurStore } from "../../storage/index.js";
 import { equalBytes, zeroBytes } from "../../utils/index.js";
 import {
     addDeviceToRoster,
@@ -11,8 +12,12 @@ import {
     deviceRosterHash,
     encodeDeviceCredential,
     isActiveDevice,
+    accountConvergenceJobs,
+    observeDeviceRoster,
     parseDeviceRoster,
     revokeDeviceFromRoster,
+    resetDeviceInRoster,
+    prepareAccountEvents,
     selectDeviceRosterChild,
     serializeDeviceRoster,
     verifyDeviceRoster,
@@ -94,6 +99,55 @@ describe("account device rosters", () => {
             destroyIdentity(account);
             destroyIdentity(first);
             destroyIdentity(second);
+        }
+    });
+
+    test("signs a monotonic reset and queues remove-then-add convergence for peers", async () => {
+        const account = generateIdentityKeyPair();
+        const device = generateIdentityKeyPair();
+        const observer = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        try {
+            const initial = createInitialDeviceRoster(account, device, NOW, new Uint8Array(16));
+            const reset = resetDeviceInRoster(
+                initial,
+                account,
+                device,
+                device.publicKey,
+                NOW + 1,
+                new Uint8Array(16).fill(1),
+            );
+            expect(reset.devices[0]!.resetGeneration).toBe(1);
+            expect(parseDeviceRoster(serializeDeviceRoster(reset))).toEqual(reset);
+            await store.transaction(async (transaction) => {
+                await observeDeviceRoster(
+                    transaction,
+                    observer.publicKey,
+                    "initial",
+                    account.publicKey,
+                    device.publicKey,
+                    serializeDeviceRoster(initial),
+                );
+                await observeDeviceRoster(
+                    transaction,
+                    observer.publicKey,
+                    "reset",
+                    account.publicKey,
+                    device.publicKey,
+                    serializeDeviceRoster(reset),
+                    { device: device.publicKey, keyPackage: new Uint8Array([1]) },
+                );
+            });
+            const jobs = await accountConvergenceJobs(store);
+            expect(jobs.map((job) => job.change)).toEqual(["reset_add"]);
+            expect((await prepareAccountEvents(store)).contacts).toMatchObject([
+                { change: "added" },
+                { change: "reset" },
+            ]);
+        } finally {
+            destroyIdentity(account);
+            destroyIdentity(device);
+            destroyIdentity(observer);
         }
     });
 });

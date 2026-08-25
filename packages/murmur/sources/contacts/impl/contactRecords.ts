@@ -15,6 +15,7 @@ export const CONTACT_SESSION_PREFIX = "murmur/contacts/v2/by-session/";
 export const CONTACT_HANDSHAKE_PREFIX = "murmur/contacts/v2/handshakes/";
 export const CONTACT_EVENT_PREFIX = "murmur/contacts/v2/events/";
 export const CONTACT_LOCAL_PROFILE_KEY = "murmur/contacts/v2/local-profile";
+export const CONTACT_SOCIAL_PREFIX = "murmur/contacts/v2/social/";
 
 const DELIVERY_ID = /^[A-Za-z0-9_-]{32}$/;
 const EVENT_ID = /^[A-Za-z0-9_-]{1,128}$/;
@@ -58,6 +59,15 @@ export interface ContactLocalProfileRecord {
     readonly version: 1;
     readonly revision: number;
     readonly profile: MurmurContactProfile;
+}
+
+/** Contact account state retained when all technical sessions are reset. */
+export interface ContactSocialRecord {
+    readonly version: 1;
+    readonly identity: Uint8Array;
+    readonly localProfile: MurmurContactProfile;
+    readonly profile: MurmurContactProfile;
+    readonly confirmedAt: number;
 }
 
 export type ContactEventRecord =
@@ -230,6 +240,11 @@ export function contactIdentityKey(identity: Uint8Array): string {
     return `${CONTACT_IDENTITY_PREFIX}${identityKeyBytes(identity, "contact identity")}`;
 }
 
+/** Return the reset-safe social-graph key for one peer identity. */
+export function contactSocialKey(identity: Uint8Array): string {
+    return `${CONTACT_SOCIAL_PREFIX}${identityKeyBytes(identity, "contact identity")}`;
+}
+
 /** Return the durable contact lookup key for a technical session. */
 export function contactSessionKey(sessionId: Uint8Array): string {
     return `${CONTACT_SESSION_PREFIX}${keyBytes(sessionId, 32, 32, "contact session")}`;
@@ -357,6 +372,42 @@ export function decodeContactRecord(value: Uint8Array): ContactRecord {
         refillNeeded: input.refillNeeded,
         ...(refillRequestDeliveryId === undefined ? {} : { refillRequestDeliveryId }),
         ...(supplyRequestEventId === undefined ? {} : { supplyRequestEventId }),
+    };
+}
+
+/** Encode contact identity and profiles without session or admission material. */
+export function encodeContactSocialRecord(record: ContactSocialRecord): Uint8Array {
+    if (
+        record.version !== 1 ||
+        !Number.isSafeInteger(record.confirmedAt) ||
+        record.confirmedAt < 0
+    ) {
+        throw new Error("Invalid contact social record");
+    }
+    return canonicalJsonBytes({
+        version: 1,
+        identity: identityKeyBytes(record.identity, "contact identity"),
+        localProfile: profileJson(record.localProfile),
+        profile: profileJson(record.profile),
+        confirmedAt: record.confirmedAt,
+    });
+}
+
+/** Decode reset-safe contact identity and profile metadata. */
+export function decodeContactSocialRecord(value: Uint8Array): ContactSocialRecord {
+    const input = parse(value, "contact social record");
+    exact(
+        input,
+        ["version", "identity", "localProfile", "profile", "confirmedAt"],
+        "contact social record",
+    );
+    if (input.version !== 1) throw new Error("Invalid contact social record");
+    return {
+        version: 1,
+        identity: identityBytes(input.identity, "contact identity"),
+        localProfile: validateContactProfile(input.localProfile),
+        profile: validateContactProfile(input.profile),
+        confirmedAt: timestamp(input.confirmedAt, "contact confirmation time"),
     };
 }
 

@@ -86,13 +86,16 @@ function authorizationBytes(
 }
 
 function rosterEntryJson(entry: MurmurDeviceRosterEntry): JsonValue {
-    return {
+    const value: Record<string, JsonValue> = {
         addedAtRevision: entry.addedAtRevision,
         authorization: encodeBase64Url(entry.authorization),
         deviceKey: encodeBase64Url(entry.deviceKey),
         revokedAtRevision: entry.revokedAtRevision ?? null,
         status: entry.status,
     };
+    // Omit zero so pre-reset v1 roster signatures remain byte-for-byte valid.
+    if (entry.resetGeneration > 0) value.resetGeneration = entry.resetGeneration;
+    return value;
 }
 
 function rosterTbsJson(roster: MurmurDeviceRoster): JsonValue {
@@ -146,6 +149,8 @@ function assertRosterShape(roster: MurmurDeviceRoster): void {
             entry.addedAtRevision < 1 ||
             entry.addedAtRevision > roster.revision ||
             entry.authorization.length !== 64 ||
+            !Number.isSafeInteger(entry.resetGeneration) ||
+            entry.resetGeneration < 0 ||
             (entry.status === "active" && entry.revokedAtRevision !== undefined) ||
             (entry.status === "revoked" &&
                 (entry.revokedAtRevision === undefined ||
@@ -208,6 +213,7 @@ function authorizedEntry(
             authorizationBytes(account.publicKey, deviceKey, addedAtRevision),
         ),
         status: "active" as const,
+        resetGeneration: 0,
     });
 }
 
@@ -217,6 +223,7 @@ function cloneEntry(entry: MurmurDeviceRosterEntry): MurmurDeviceRosterEntry {
         addedAtRevision: entry.addedAtRevision,
         authorization: entry.authorization.slice(),
         status: entry.status,
+        resetGeneration: entry.resetGeneration,
         ...(entry.revokedAtRevision === undefined
             ? {}
             : { revokedAtRevision: entry.revokedAtRevision }),
@@ -342,6 +349,54 @@ export function revokeDeviceFromRoster(
     );
 }
 
+/** Sign one direct roster child advancing this active device's reset generation. */
+export function resetDeviceInRoster(
+    previous: MurmurDeviceRoster,
+    account: IdentityKeyPair,
+    authorDevice: IdentityKeyPair,
+    deviceKey: Uint8Array,
+    issuedAt: number,
+    mutationId: Uint8Array,
+): MurmurDeviceRoster {
+    if (!verifyDeviceRoster(previous)) throw new Error("Invalid previous device roster");
+    validateIdentityKeyPair(account);
+    validateIdentityKeyPair(authorDevice);
+    if (!equalBytes(account.publicKey, previous.accountKey)) {
+        throw new Error("Roster account key does not match");
+    }
+    if (!isActiveDevice(previous, authorDevice.publicKey)) {
+        throw new Error("Roster author is not active");
+    }
+    const target = previous.devices.find((entry) => equalBytes(entry.deviceKey, deviceKey));
+    if (target?.status !== "active") throw new Error("Reset device is not active");
+    if (!Number.isSafeInteger(issuedAt) || issuedAt < 0 || mutationId.length !== 16) {
+        throw new Error("Invalid reset roster metadata");
+    }
+    const revision = previous.revision + 1;
+    const devices = previous.devices.map((entry) =>
+        equalBytes(entry.deviceKey, deviceKey)
+            ? Object.freeze({
+                  ...cloneEntry(entry),
+                  resetGeneration: entry.resetGeneration + 1,
+              })
+            : cloneEntry(entry),
+    );
+    return signRoster(
+        {
+            version: 1,
+            accountKey: previous.accountKey.slice(),
+            revision,
+            parentHash: deviceRosterHash(previous),
+            issuedAt,
+            mutationId: mutationId.slice(),
+            authorDeviceKey: authorDevice.publicKey.slice(),
+            devices,
+        },
+        account,
+        authorDevice,
+    );
+}
+
 /** Verify canonical roster shape plus account and author signatures. */
 export function verifyDeviceRoster(roster: MurmurDeviceRoster): boolean {
     try {
@@ -415,7 +470,14 @@ export function parseDeviceRoster(value: Uint8Array): MurmurDeviceRoster {
         const entry = object(candidate, "device roster entry");
         exact(
             entry,
-            ["addedAtRevision", "authorization", "deviceKey", "revokedAtRevision", "status"],
+            [
+                "addedAtRevision",
+                "authorization",
+                "deviceKey",
+                "resetGeneration",
+                "revokedAtRevision",
+                "status",
+            ].filter((field) => field !== "resetGeneration" || Object.hasOwn(entry, field)),
             "device roster entry",
         );
         if (entry.status !== "active" && entry.status !== "revoked") {
@@ -429,6 +491,10 @@ export function parseDeviceRoster(value: Uint8Array): MurmurDeviceRoster {
             deviceKey: bytes(entry.deviceKey, 32, "device key"),
             addedAtRevision: safeInteger(entry.addedAtRevision, 1, "device addition revision"),
             authorization: bytes(entry.authorization, 64, "device authorization"),
+            resetGeneration:
+                entry.resetGeneration === undefined
+                    ? 0
+                    : safeInteger(entry.resetGeneration, 0, "device reset generation"),
             status: entry.status,
             ...(revokedAtRevision === undefined ? {} : { revokedAtRevision }),
         });

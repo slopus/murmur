@@ -15,6 +15,7 @@ const BOOTSTRAP_KIND = 1;
 const PRIVATE_KIND = 2;
 const COMMIT_KIND = 3;
 const PROVISIONING_KIND = 4;
+const ACCOUNT_RESET_KIND = 5;
 const MAXIMUM_PROVISIONING_BYTES = 256 * 1024;
 const MAXIMUM_FRAME_BYTES = 70 * 1024 * 1024;
 const COMMIT_DOMAIN = utf8Encode("murmur/session-commit/v1");
@@ -153,6 +154,7 @@ export type SessionCiphertext =
     | { readonly kind: "bootstrap"; readonly box: SealedBox }
     | { readonly kind: "private"; readonly message: Uint8Array }
     | { readonly kind: "provisioning"; readonly envelope: Uint8Array }
+    | { readonly kind: "account_reset"; readonly box: SealedBox }
     | {
           readonly kind: "commit";
           readonly groupId: Uint8Array;
@@ -206,6 +208,19 @@ function prefixed(kind: number, bytesValue: Uint8Array): Uint8Array {
 export function encodeBootstrapCiphertext(box: SealedBox): Uint8Array {
     return prefixed(
         BOOTSTRAP_KIND,
+        canonicalJsonBytes({
+            version: 1,
+            ephemeralPublicKey: encodeBase64Url(box.ephemeralPublicKey),
+            nonce: encodeBase64Url(box.nonce),
+            ciphertext: encodeBase64Url(box.ciphertext),
+        }),
+    );
+}
+
+/** Frame one recipient-sealed account reset announcement independent of MLS state. */
+export function encodeAccountResetCiphertext(box: SealedBox): Uint8Array {
+    return prefixed(
+        ACCOUNT_RESET_KIND,
         canonicalJsonBytes({
             version: 1,
             ephemeralPublicKey: encodeBase64Url(box.ephemeralPublicKey),
@@ -283,7 +298,7 @@ export function parseSessionCiphertext(value: Uint8Array): SessionCiphertext {
         return { kind: "provisioning", envelope: body };
     }
     const input = parseJson(body, "session ciphertext");
-    if (kind === BOOTSTRAP_KIND) {
+    if (kind === BOOTSTRAP_KIND || kind === ACCOUNT_RESET_KIND) {
         exact(
             input,
             ["version", "ephemeralPublicKey", "nonce", "ciphertext"],
@@ -291,7 +306,7 @@ export function parseSessionCiphertext(value: Uint8Array): SessionCiphertext {
         );
         if (input.version !== 1) throw new Error("Invalid bootstrap ciphertext");
         return {
-            kind: "bootstrap",
+            kind: kind === BOOTSTRAP_KIND ? "bootstrap" : "account_reset",
             box: {
                 ephemeralPublicKey: bytes(input.ephemeralPublicKey, 32, "box key"),
                 nonce: bytes(input.nonce, 12, "box nonce"),

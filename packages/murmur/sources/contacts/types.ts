@@ -13,10 +13,13 @@ export type MurmurContactProfile = Readonly<Record<string, MurmurContactProfileV
 /** One confirmed contact and its durable two-person technical session. */
 export interface MurmurContact {
     readonly identity: Uint8Array;
+    /** Empty while only reset-safe account-level social metadata remains. */
     readonly sessionId: Uint8Array;
     readonly localProfile: MurmurContactProfile;
     readonly profile: MurmurContactProfile;
     readonly status: "active" | "removing";
+    /** True until ordinary contact re-bootstrap creates a new technical session. */
+    readonly technicalReset?: true;
 }
 
 /** One validated incoming contact hello awaiting an explicit decision. */

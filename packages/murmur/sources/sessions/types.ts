@@ -10,6 +10,7 @@ import type {
     MurmurContactRosterChanged,
     MurmurDeviceAdded,
     MurmurDeviceRevoked,
+    MurmurDormantDevice,
 } from "../accounts/types.js";
 
 /** Stable public view of one local MLS session. */
@@ -25,6 +26,47 @@ export interface MurmurSession {
     /** Membership and role-assignment policies. */
     readonly policies: MurmurSessionPolicies;
     readonly bufferedEvents: number;
+    /** True when this local session was recreated by continuity-reset convergence. */
+    readonly reAdmission?: boolean;
+}
+
+/** Complete application-facing view of one session destroyed by an inbox reset. */
+export interface MurmurResetSession {
+    readonly id: Uint8Array;
+    readonly status: MurmurSession["status"];
+    readonly descriptor: Uint8Array;
+    readonly members: readonly Uint8Array[];
+    readonly owner: Uint8Array;
+    readonly admins: readonly Uint8Array[];
+    readonly policies: MurmurSessionPolicies;
+}
+
+/** Durable final event emitted before continuity-broken technical state is destroyed. */
+export interface MurmurResetEvent {
+    /** Stable identifier reused if the lifecycle callback must be retried. */
+    readonly id: string;
+    readonly reason: "inbox_continuity_lost";
+    readonly generation: Uint8Array;
+    readonly head: string | null;
+    readonly headSequence: number;
+    readonly sessions: readonly MurmurResetSession[];
+}
+
+/** Thrown after a reset is recorded, or after its one-time purge commits. */
+export class MurmurResetRequiredError extends Error {
+    readonly reset: MurmurResetEvent;
+    readonly committed: boolean;
+
+    constructor(reset: MurmurResetEvent, committed: boolean) {
+        super(
+            committed
+                ? "Inbox continuity reset committed; session state was destroyed"
+                : "Inbox continuity reset requires an onReset callback",
+        );
+        this.name = "MurmurResetRequiredError";
+        this.reset = reset;
+        this.committed = committed;
+    }
 }
 
 /** Owner-controlled policies for one role-managed session. */
@@ -53,6 +95,13 @@ export interface MurmurSyncOptions {
     /** Runs when that connection closes, before reconnect or final shutdown. */
     readonly onDisconnected?: (error?: unknown) => void | Promise<void>;
     /**
+     * Receives the complete durable session snapshot after inbox continuity loss.
+     *
+     * Throwing leaves the reset pending and retries this same event. Resolving
+     * authorizes Murmur's one-time technical-state purge.
+     */
+    readonly onReset?: (reset: MurmurResetEvent) => void | Promise<void>;
+    /**
      * Runs for one ordered application-update batch.
      *
      * Murmur commits the whole batch after this hook resolves. Throwing or
@@ -73,6 +122,8 @@ export interface MurmurSyncOptions {
     readonly onDeviceAdded?: (devices: readonly MurmurDeviceAdded[]) => void | Promise<void>;
     /** Runs when a device of this account is durably revoked. */
     readonly onDeviceRevoked?: (devices: readonly MurmurDeviceRevoked[]) => void | Promise<void>;
+    /** Reports sibling devices silent for six months; revocation remains application-directed. */
+    readonly onDeviceDormant?: (devices: readonly MurmurDormantDevice[]) => void | Promise<void>;
     /** Runs when an authenticated contact roster adds or revokes a device. */
     readonly onContactRosterChanged?: (
         changes: readonly MurmurContactRosterChanged[],

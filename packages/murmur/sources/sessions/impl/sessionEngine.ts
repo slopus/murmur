@@ -4,10 +4,13 @@ import {
     MURMUR_INTERNAL_INBOX_HANDLER,
     TerminalInboxDeliveryError,
     createSignedDelivery,
+    parseSignedDelivery,
+    signedDeliveryToJson,
     type DeliveryTransport,
     type InboxDelivery,
     type InboxStreamOptions,
     type InboxSyncResult,
+    type SignedDelivery,
 } from "../../delivery/index.js";
 import { openBox, randomBytes, sealBox, type IdentityKeyPair } from "../../crypto/index.js";
 import type { DiscoveryBundle } from "../../identity/discovery/index.js";
@@ -16,8 +19,8 @@ import {
     accountConvergenceJobs,
     ACCOUNT_PEER_ROSTER_PREFIX,
     ACCOUNT_ROSTER_KEY,
+    decodeAccountSyncPacket,
     decodeDeviceCredential,
-    deleteAccountConvergenceJob,
     isActiveDevice,
     observeDeviceRoster,
     parseDeviceRoster,
@@ -78,6 +81,7 @@ import {
     decodeBootstrapFrame,
     decodeSessionControl,
     decodePrivateFrame,
+    encodeAccountResetCiphertext,
     encodeBootstrapCiphertext,
     encodeBootstrapFrame,
     encodeRolesControl,
@@ -123,6 +127,10 @@ const BOOTSTRAP_INDEX_PREFIX = "murmur/bootstrap-outboxes/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
 const POST_COMMIT_OUTBOX_INDEX_PREFIX = "murmur/post-commit-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
+const RESET_READMISSION_PREFIX = "murmur/reset/v1/re-admissions/";
+const ACCOUNT_RESET_OUTBOX_PREFIX = "murmur/reset/v1/outboxes/";
+const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
+const ACCOUNT_CONVERGENCE_COMPLETION_PREFIX = "murmur/accounts/v1/convergence-complete/";
 const DEFAULT_MAXIMUM_PENDING = 64;
 const DEFAULT_MAXIMUM_BUFFERED_EVENTS = 1_000;
 const DEFAULT_MAXIMUM_BUFFERED_BYTES = 16 * 1024 * 1024;
@@ -138,7 +146,8 @@ const MAXIMUM_UPDATE_BATCH_EVENTS = 256;
 const OUTBOX_SCAN_ITEMS = 64;
 const PREVIOUS_EPOCH_GRACE_MILLISECONDS = 5 * 60 * 1_000;
 const PREVIOUS_EPOCH_MESSAGES = 64;
-const DELIVERY_TTL_MILLISECONDS = 29 * 24 * 60 * 60 * 1_000;
+const DELIVERY_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
+const DELIVERY_TTL_MILLISECONDS = DELIVERY_RETENTION_MILLISECONDS - 5 * 60 * 1_000;
 const PROVISIONING_TTL_MILLISECONDS = 5 * 60 * 1_000;
 const PENDING_ENVELOPE_KEY = "murmur/accounts/v1/pending-envelope";
 const COMMIT_EXPORT_LABEL = "murmur session commit";
@@ -210,6 +219,34 @@ function intentKey(intentId: string): string {
 
 function outboxKey(deliveryId: string): string {
     return `${OUTBOX_PREFIX}${deliveryId}`;
+}
+
+function accountResetOutboxKey(deliveryId: string): string {
+    return `${ACCOUNT_RESET_OUTBOX_PREFIX}${deliveryId}`;
+}
+
+function accountDeviceActivityKey(device: Uint8Array): string {
+    return `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(device)}`;
+}
+
+function accountConvergenceCompletionPrefix(key: string): string {
+    return `${ACCOUNT_CONVERGENCE_COMPLETION_PREFIX}${encodeBase64Url(utf8Encode(key))}/`;
+}
+
+function accountConvergenceCompletionKey(key: string, id: Uint8Array): string {
+    return `${accountConvergenceCompletionPrefix(key)}${sessionId(id)}`;
+}
+
+function encodeAccountResetOutbox(delivery: SignedDelivery): Uint8Array {
+    return canonicalJsonBytes(signedDeliveryToJson(delivery) as never);
+}
+
+function decodeAccountResetOutbox(bytes: Uint8Array): SignedDelivery {
+    const delivery = parseSignedDelivery(JSON.parse(utf8Decode(bytes)) as unknown);
+    if (!equalBytes(encodeAccountResetOutbox(delivery), bytes)) {
+        throw new Error("Non-canonical account reset outbox");
+    }
+    return delivery;
 }
 
 function outboxOrderKey(order: string, deliveryId: string): string {
@@ -471,6 +508,7 @@ function publicSession(record: SessionRecord, epoch: MlsEpochState): MurmurSessi
             anyoneCanAddMembers: roles.anyoneCanAddMembers,
         },
         bufferedEvents: record.bufferedEvents,
+        ...(record.reAdmission === true ? { reAdmission: true } : {}),
     };
 }
 
@@ -629,61 +667,135 @@ export class SessionEngine {
             readonly reusable?: boolean;
         }[],
     ): Promise<void> {
-        await this.#store.transaction(async (transaction) => {
-            const now = this.#now();
-            await this.#pruneKeyPackages(transaction, now);
-            const existing = new Map(
-                await transaction.scan(KEY_PACKAGE_PREFIX, {
-                    limit: MAXIMUM_KEY_PACKAGES + 1,
-                }),
-            );
-            if (existing.size > MAXIMUM_KEY_PACKAGES) {
-                for (const bytes of existing.values()) zeroBytes(bytes);
-                throw new Error("Local KeyPackage capacity exceeded");
-            }
+        await this.#store.transaction((transaction) =>
+            this.storeKeyPackagesInTransaction(transaction, values),
+        );
+    }
+
+    /** @internal Store reset KeyPackages atomically with a caller-owned state transition. */
+    async storeKeyPackagesInTransaction(
+        transaction: StoreTransaction,
+        values: readonly {
+            readonly reference: Uint8Array;
+            readonly bytes: Uint8Array;
+            readonly expiresAt: number;
+            readonly reusable?: boolean;
+        }[],
+    ): Promise<void> {
+        const now = this.#now();
+        await this.#pruneKeyPackages(transaction, now);
+        const existing = new Map(
+            await transaction.scan(KEY_PACKAGE_PREFIX, {
+                limit: MAXIMUM_KEY_PACKAGES + 1,
+            }),
+        );
+        if (existing.size > MAXIMUM_KEY_PACKAGES) {
             for (const bytes of existing.values()) zeroBytes(bytes);
-            const newKeys = new Set<string>();
-            for (const value of values) {
+            throw new Error("Local KeyPackage capacity exceeded");
+        }
+        for (const bytes of existing.values()) zeroBytes(bytes);
+        const newKeys = new Set<string>();
+        for (const value of values) {
+            if (
+                value.reference.length !== 32 ||
+                !Number.isSafeInteger(value.expiresAt) ||
+                value.expiresAt <= now
+            ) {
+                throw new Error("Invalid local KeyPackage expiry");
+            }
+            const bundle = deserializeMlsKeyPackageBundle(value.bytes);
+            try {
                 if (
-                    value.reference.length !== 32 ||
-                    !Number.isSafeInteger(value.expiresAt) ||
-                    value.expiresAt <= now
+                    !verifyMlsKeyPackage(bundle.keyPackage, Math.floor(now / 1_000)) ||
+                    !equalBytes(mlsKeyPackageReference(bundle.keyPackage), value.reference) ||
+                    BigInt(value.expiresAt) > (bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n
                 ) {
-                    throw new Error("Invalid local KeyPackage expiry");
+                    throw new Error("Invalid local KeyPackage state");
                 }
-                const bundle = deserializeMlsKeyPackageBundle(value.bytes);
-                try {
-                    if (
-                        !verifyMlsKeyPackage(bundle.keyPackage, Math.floor(now / 1_000)) ||
-                        !equalBytes(mlsKeyPackageReference(bundle.keyPackage), value.reference) ||
-                        BigInt(value.expiresAt) >
-                            (bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n
-                    ) {
-                        throw new Error("Invalid local KeyPackage state");
-                    }
-                } finally {
-                    destroyMlsKeyPackageBundle(bundle);
-                }
-                const key = keyPackageKey(value.reference);
-                if (!existing.has(key)) newKeys.add(key);
+            } finally {
+                destroyMlsKeyPackageBundle(bundle);
             }
-            if (existing.size + newKeys.size > MAXIMUM_KEY_PACKAGES) {
-                throw new Error("Local KeyPackage capacity exceeded");
+            const key = keyPackageKey(value.reference);
+            if (!existing.has(key)) newKeys.add(key);
+        }
+        if (existing.size + newKeys.size > MAXIMUM_KEY_PACKAGES) {
+            throw new Error("Local KeyPackage capacity exceeded");
+        }
+        for (const value of values) {
+            await transaction.set(keyPackageKey(value.reference), value.bytes);
+            await setAndZero(
+                transaction,
+                keyPackageExpiryKey(value.reference),
+                utf8Encode(String(value.expiresAt).padStart(16, "0")),
+            );
+            if (value.reusable === true) {
+                await transaction.set(keyPackageReusableKey(value.reference), new Uint8Array());
+            } else {
+                await transaction.delete(keyPackageReusableKey(value.reference));
             }
-            for (const value of values) {
-                await transaction.set(keyPackageKey(value.reference), value.bytes);
-                await setAndZero(
-                    transaction,
-                    keyPackageExpiryKey(value.reference),
-                    utf8Encode(String(value.expiresAt).padStart(16, "0")),
-                );
-                if (value.reusable === true) {
-                    await transaction.set(keyPackageReusableKey(value.reference), new Uint8Array());
-                } else {
-                    await transaction.delete(keyPackageReusableKey(value.reference));
-                }
+        }
+    }
+
+    /** @internal Commit a post-loss inbox baseline inside the reset purge transaction. */
+    async adoptInboxBaselineInTransaction(
+        transaction: StoreTransaction,
+        generation: Uint8Array,
+        head: string | null,
+        headSequence: number,
+    ): Promise<void> {
+        await this.#inbox.adoptBaselineInTransaction(transaction, generation, head, headSequence);
+    }
+
+    /** @internal Retry the remote half of a committed post-loss baseline adoption. */
+    async acknowledgeInboxBaseline(head: string | null, signal?: AbortSignal): Promise<void> {
+        await this.#inbox.acknowledgeBaseline(head, signal);
+    }
+
+    /** @internal Queue MLS-independent, recipient-sealed reset roster announcements. */
+    async queueAccountResetAnnouncementsInTransaction(
+        transaction: StoreTransaction,
+        recipients: readonly Uint8Array[],
+        packet: Uint8Array,
+    ): Promise<void> {
+        const unique = new Map<string, Uint8Array>();
+        for (const recipient of recipients) {
+            if (recipient.length !== 32) throw new Error("Invalid reset announcement recipient");
+            if (!equalBytes(recipient, this.#identity.publicKey)) {
+                unique.set(encodeBase64Url(recipient), recipient);
             }
+        }
+        const existing = await transaction.scan(ACCOUNT_RESET_OUTBOX_PREFIX, {
+            limit: this.#limits.maximumOutboxes + 1,
         });
+        try {
+            if (existing.size + unique.size > this.#limits.maximumOutboxes) {
+                throw new Error("Account reset announcement capacity exceeded");
+            }
+        } finally {
+            for (const value of existing.values()) zeroBytes(value);
+        }
+        const now = this.#now();
+        for (const recipient of unique.values()) {
+            const box = sealBox(
+                { publicKey: recipient },
+                packet,
+                concatBytes(this.#identity.publicKey, recipient),
+            );
+            const ciphertext = encodeAccountResetCiphertext(box);
+            try {
+                const delivery = createSignedDelivery(this.#identity, [recipient], ciphertext, {
+                    createdAt: now,
+                    expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                });
+                await transaction.set(
+                    accountResetOutboxKey(delivery.id),
+                    encodeAccountResetOutbox(delivery),
+                );
+            } finally {
+                zeroBytes(ciphertext);
+                zeroBytes(box.ciphertext);
+            }
+        }
     }
 
     async deleteKeyPackages(references: readonly Uint8Array[]): Promise<void> {
@@ -1805,7 +1917,7 @@ export class SessionEngine {
     /**
      * Drive every queued authenticated roster change into each matching session.
      *
-     * A job adds or removes one account device. Any authorized current member
+     * A job adds, removes, or atomically replaces one account device. Any authorized current member
      * stages the direct Commit, and the durable job remains until an adopted
      * epoch proves that the requested roster state has converged.
      */
@@ -1841,8 +1953,15 @@ export class SessionEngine {
                     }
                     if (page.size < SESSION_LIST_LIMIT) break;
                 }
-                if (complete) await deleteAccountConvergenceJob(this.#store, job.key);
-                else retry = true;
+                if (complete) {
+                    await this.#store.transaction(async (transaction) => {
+                        await transaction.delete(job.key);
+                        await this.#deletePrefix(
+                            transaction,
+                            accountConvergenceCompletionPrefix(job.key),
+                        );
+                    });
+                } else retry = true;
             } finally {
                 zeroBytes(job.account);
                 zeroBytes(job.device);
@@ -1855,6 +1974,15 @@ export class SessionEngine {
     /** Apply one roster convergence job to one session; false requests a retry. */
     async #convergeSession(job: AccountConvergenceJob, record: SessionRecord): Promise<boolean> {
         if (record.status === "removed") return true;
+        if (job.dependsOn !== undefined) {
+            const dependency = await this.#store.get(job.dependsOn);
+            if (dependency !== undefined) {
+                zeroBytes(dependency);
+                return false;
+            }
+        }
+        const adding = job.change === "added" || job.change === "reset_add";
+        const removing = job.change === "revoked" || job.change === "reset_remove";
         const deviceCurrentlyAllowed = await this.#deviceAllowedByObservedRoster(
             this.#store,
             job.account,
@@ -1862,12 +1990,21 @@ export class SessionEngine {
         );
         if (
             (job.change === "added" && !deviceCurrentlyAllowed) ||
-            (job.change === "revoked" && deviceCurrentlyAllowed)
+            (job.change === "revoked" && deviceCurrentlyAllowed) ||
+            (job.change === "reset_add" && !deviceCurrentlyAllowed) ||
+            (!adding && !removing)
         ) {
             return true;
         }
         const epoch = restoreEpoch(this.#identity, record);
         try {
+            const completion = await this.#store.get(
+                accountConvergenceCompletionKey(job.key, epoch.groupId),
+            );
+            if (completion !== undefined) {
+                zeroBytes(completion);
+                return true;
+            }
             let accountPresent = false;
             let devicePresent = false;
             for (let leaf = 0; leaf < epoch.memberSignatureKeys.length; leaf += 1) {
@@ -1877,7 +2014,13 @@ export class SessionEngine {
                 if (equalBytes(signatureKey, job.device)) devicePresent = true;
             }
             if (!accountPresent) return true;
-            if (job.change === "added" ? devicePresent : !devicePresent) return true;
+            if (
+                (job.change === "added" && devicePresent) ||
+                (job.change === "revoked" && !devicePresent) ||
+                (job.change === "reset_remove" && !devicePresent)
+            ) {
+                return true;
+            }
             if (record.status !== "active") return false;
             const id = epoch.groupId;
             if (record.stagedCommitId !== undefined) return false;
@@ -1887,7 +2030,7 @@ export class SessionEngine {
             ) {
                 return false;
             }
-            if (job.change === "added") {
+            if (adding) {
                 const keyPackage = decodeMlsKeyPackage(job.keyPackage!);
                 if (!verifyMlsKeyPackage(keyPackage, Math.floor(this.#now() / 1_000))) {
                     return true;
@@ -1895,8 +2038,11 @@ export class SessionEngine {
                 await this.#prepareCommit(
                     id,
                     [{ identity: job.device.slice(), keyPackage }],
-                    [],
+                    job.change === "reset_add" && devicePresent ? [job.device.slice()] : [],
                     record.roles,
+                    undefined,
+                    undefined,
+                    job.change === "reset_add" ? job.key : undefined,
                 );
             } else {
                 if (equalBytes(job.device, this.#identity.publicKey)) return false;
@@ -1921,11 +2067,17 @@ export class SessionEngine {
         inbox: InboxSyncResult,
         publications: readonly FlushOutboxResult[],
     ): Promise<MurmurSynchronizeResult> {
-        const pendingOutboxes = (
-            await this.#store.scan(OUTBOX_PREFIX, {
-                limit: this.#limits.maximumOutboxes,
-            })
-        ).size;
+        const pendingOutboxes =
+            (
+                await this.#store.scan(OUTBOX_PREFIX, {
+                    limit: this.#limits.maximumOutboxes,
+                })
+            ).size +
+            (
+                await this.#store.scan(ACCOUNT_RESET_OUTBOX_PREFIX, {
+                    limit: this.#limits.maximumOutboxes,
+                })
+            ).size;
         const publishedIds = new Set(publications.flatMap(({ publishedIds }) => [...publishedIds]));
         const transientFailureIds = new Set(
             publications.flatMap(({ transientFailureIds }) => [...transientFailureIds]),
@@ -2267,6 +2419,7 @@ export class SessionEngine {
         roles: SessionRoles,
         operationId?: string,
         existingTransaction?: StoreTransaction,
+        accountConvergenceKey?: string,
     ): Promise<void> {
         const prepare = async (transaction: StoreTransaction): Promise<void> => {
             const bytes = await transaction.get(stateKey(id));
@@ -2290,7 +2443,9 @@ export class SessionEngine {
                 if (
                     new Set(additionIds).size !== additionIds.length ||
                     new Set(removalIds).size !== removalIds.length ||
-                    additionIds.some((identity) => memberIds.has(identity)) ||
+                    additionIds.some(
+                        (identity) => memberIds.has(identity) && !removalIds.includes(identity),
+                    ) ||
                     removalIds.some((identity) => !memberIds.has(identity))
                 ) {
                     throw new Error("Invalid or conflicting session membership change");
@@ -2450,6 +2605,7 @@ export class SessionEngine {
                         retainPreviousEpoch: removals.length === 0,
                         bootstrapDeliveryIds,
                         roles: nextRoles,
+                        ...(accountConvergenceKey === undefined ? {} : { accountConvergenceKey }),
                     }),
                 );
                 await transaction.set(outboxOrderKey(commitOrder, delivery.id), new Uint8Array());
@@ -2473,6 +2629,10 @@ export class SessionEngine {
         if (queued.delivery.ciphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
             throw new TerminalInboxDeliveryError("session_ciphertext_too_large");
         }
+        await transaction.set(
+            accountDeviceActivityKey(queued.delivery.sender),
+            utf8Encode(String(queued.delivery.createdAt).padStart(16, "0")),
+        );
         let wire: ReturnType<typeof parseSessionCiphertext>;
         try {
             wire = parseSessionCiphertext(queued.delivery.ciphertext);
@@ -2489,6 +2649,54 @@ export class SessionEngine {
             }
             await setAndZero(transaction, PENDING_ENVELOPE_KEY, wire.envelope.slice());
             return;
+        }
+        if (wire.kind === "account_reset") {
+            if (
+                queued.delivery.recipients.length !== 1 ||
+                !equalBytes(queued.delivery.recipients[0]!, this.#identity.publicKey)
+            ) {
+                throw new TerminalInboxDeliveryError("account_reset_recipient_set");
+            }
+            let plaintext: Uint8Array;
+            try {
+                plaintext = openBox(
+                    this.#identity,
+                    wire.box,
+                    concatBytes(queued.delivery.sender, this.#identity.publicKey),
+                );
+            } catch {
+                throw new TerminalInboxDeliveryError("invalid_account_reset_box");
+            }
+            try {
+                const packet = decodeAccountSyncPacket(plaintext);
+                if (packet.type !== "admission") {
+                    throw new Error("Account reset packet lacks admission material");
+                }
+                const roster = parseDeviceRoster(packet.roster);
+                const keyPackage = decodeMlsKeyPackage(packet.keyPackage);
+                if (
+                    !equalBytes(roster.authorDeviceKey, queued.delivery.sender) ||
+                    !equalBytes(keyPackage.leafNode.signatureKey, queued.delivery.sender) ||
+                    !verifyMlsKeyPackage(keyPackage, Math.floor(queued.delivery.createdAt / 1_000))
+                ) {
+                    throw new Error("Account reset sender is not its reset device");
+                }
+                await observeDeviceRoster(
+                    transaction,
+                    this.#accountKey,
+                    queued.eventId,
+                    roster.accountKey,
+                    roster.authorDeviceKey,
+                    packet.roster,
+                    { device: queued.delivery.sender, keyPackage: packet.keyPackage },
+                );
+                return;
+            } catch (error: unknown) {
+                if (error instanceof TerminalInboxDeliveryError) throw error;
+                throw new TerminalInboxDeliveryError("invalid_account_reset");
+            } finally {
+                zeroBytes(plaintext);
+            }
         }
         let id: Uint8Array;
         try {
@@ -2549,6 +2757,7 @@ export class SessionEngine {
             throw new TerminalInboxDeliveryError("invalid_bootstrap_box");
         }
         let replacementRemovalGenerations: SessionRecord["removalGenerations"] = [];
+        let replacementReAdmission = false;
         try {
             let frame: ReturnType<typeof decodeBootstrapFrame>;
             let commit: ReturnType<typeof decodeMlsTreeCommit>;
@@ -2585,6 +2794,7 @@ export class SessionEngine {
                         account: entry.account.slice(),
                         generation: entry.generation,
                     }));
+                    replacementReAdmission = existing.reAdmission === true;
                     replacing = true;
                 } finally {
                     existingEpoch?.destroy();
@@ -2684,6 +2894,13 @@ export class SessionEngine {
                 }
                 protocolComplete = true;
                 checkpoint = epoch.serialize();
+                const reAdmissionKey = `${RESET_READMISSION_PREFIX}${sessionId(frame.groupId)}`;
+                const reAdmissionDescriptor = await transaction.get(reAdmissionKey);
+                const reAdmission =
+                    reAdmissionDescriptor !== undefined &&
+                    equalBytes(reAdmissionDescriptor, frame.descriptor);
+                if (reAdmissionDescriptor !== undefined) zeroBytes(reAdmissionDescriptor);
+                if (reAdmission) await transaction.delete(reAdmissionKey);
                 if (replacing) {
                     await this.#deletePrefix(transaction, bufferPrefix(frame.groupId));
                 }
@@ -2702,6 +2919,7 @@ export class SessionEngine {
                         removalGenerations: replacementRemovalGenerations,
                         bootstrapEventId: queued.eventId,
                         bootstrapKeyPackageReference: frame.keyPackageReference,
+                        ...(reAdmission || replacementReAdmission ? { reAdmission: true } : {}),
                     }),
                 );
                 await transaction.set(pendingKey(frame.groupId), new Uint8Array());
@@ -2800,6 +3018,15 @@ export class SessionEngine {
                         }),
                     );
                     await transaction.delete(intentKey(outbox.operationId));
+                    if (outbox.accountConvergenceKey !== undefined) {
+                        await transaction.set(
+                            accountConvergenceCompletionKey(
+                                outbox.accountConvergenceKey,
+                                outbox.sessionId,
+                            ),
+                            new Uint8Array(),
+                        );
+                    }
                     await this.#activatePostCommitOutboxes(
                         transaction,
                         queued.delivery.id,
@@ -3455,10 +3682,12 @@ export class SessionEngine {
     }
 
     async #flushOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
-        const publishedIds = new Set<string>();
+        const reset = await this.#flushAccountResetOutboxes(signal);
+        const publishedIds = new Set<string>(reset.publishedIds);
         const publishedCommitIds = new Set<string>();
-        const transientFailureIds = new Set<string>();
+        const transientFailureIds = new Set<string>(reset.transientFailureIds);
         const terminalFailureIds = await this.#preflightMembershipOutboxes();
+        for (const id of reset.terminalFailureIds) terminalFailureIds.add(id);
         const phases = ["current", "bootstrap", "commit", "post-commit"] as const;
         for (const phase of phases) {
             const blockedSessions = new Set<string>();
@@ -3605,6 +3834,61 @@ export class SessionEngine {
                 }
                 if (page.size < OUTBOX_SCAN_ITEMS) break;
             }
+        }
+        return { publishedIds, transientFailureIds, terminalFailureIds };
+    }
+
+    async #flushAccountResetOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
+        const publishedIds = new Set<string>();
+        const transientFailureIds = new Set<string>();
+        const terminalFailureIds = new Set<string>();
+        let after: string | undefined;
+        for (;;) {
+            const page = await this.#store.scan(ACCOUNT_RESET_OUTBOX_PREFIX, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) break;
+            for (const [key, bytes] of page) {
+                after = key;
+                const fallbackId = key.slice(ACCOUNT_RESET_OUTBOX_PREFIX.length);
+                let delivery: SignedDelivery | undefined;
+                try {
+                    try {
+                        delivery = decodeAccountResetOutbox(bytes);
+                    } catch {
+                        await this.#store.delete(key);
+                        terminalFailureIds.add(fallbackId);
+                        continue;
+                    }
+                    if (delivery.expiresAt <= this.#now()) {
+                        await this.#store.delete(key);
+                        terminalFailureIds.add(delivery.id);
+                        continue;
+                    }
+                    try {
+                        await this.#transport.publish(delivery, signal);
+                        await this.#store.delete(key);
+                        publishedIds.add(delivery.id);
+                    } catch (error: unknown) {
+                        if (
+                            error instanceof DeliveryTransportError &&
+                            error.status >= 400 &&
+                            error.status < 500 &&
+                            error.status !== 401 &&
+                            error.status !== 429
+                        ) {
+                            await this.#store.delete(key);
+                            terminalFailureIds.add(delivery.id);
+                        } else {
+                            transientFailureIds.add(delivery.id);
+                        }
+                    }
+                } finally {
+                    zeroBytes(bytes);
+                }
+            }
+            if (page.size < OUTBOX_SCAN_ITEMS) break;
         }
         return { publishedIds, transientFailureIds, terminalFailureIds };
     }

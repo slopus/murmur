@@ -28,14 +28,17 @@ import {
     CONTACT_HANDSHAKE_PREFIX,
     CONTACT_IDENTITY_PREFIX,
     CONTACT_LOCAL_PROFILE_KEY,
+    CONTACT_SOCIAL_PREFIX,
     contactEventKey,
     contactHandshakeKey,
     contactIdentityKey,
     contactSessionKey,
+    contactSocialKey,
     decodeContactEventRecord,
     decodeContactHandshakeRecord,
     decodeContactLocalProfileRecord,
     decodeContactRecord,
+    decodeContactSocialRecord,
     encodeContactEventRecord,
     encodeContactHandshakeRecord,
     encodeContactLocalProfileRecord,
@@ -160,6 +163,7 @@ function equalProfiles(left: MurmurContactProfile, right: MurmurContactProfile):
 async function writeContact(transaction: StoreTransaction, record: ContactRecord): Promise<void> {
     await setAndZero(transaction, contactIdentityKey(record.identity), encodeContactRecord(record));
     await setAndZero(transaction, contactSessionKey(record.sessionId), encodeContactRecord(record));
+    await transaction.delete(contactSocialKey(record.identity));
 }
 
 /** Internal durable contact state coordinator. */
@@ -952,7 +956,24 @@ export class ContactEngine {
 
     async contact(identity: Uint8Array): Promise<MurmurContact | undefined> {
         const bytes = await this.#store.get(contactIdentityKey(identity));
-        if (bytes === undefined) return undefined;
+        if (bytes === undefined) {
+            const socialBytes = await this.#store.get(contactSocialKey(identity));
+            if (socialBytes === undefined) return undefined;
+            const social = decodeContactSocialRecord(socialBytes);
+            try {
+                return Object.freeze({
+                    identity: social.identity.slice(),
+                    sessionId: new Uint8Array(),
+                    localProfile: social.localProfile,
+                    profile: social.profile,
+                    status: "active" as const,
+                    technicalReset: true as const,
+                });
+            } finally {
+                zeroBytes(social.identity);
+                zeroBytes(socialBytes);
+            }
+        }
         const record = decodeContactRecord(bytes);
         try {
             return publicContact(record);
@@ -975,6 +996,27 @@ export class ContactEngine {
             } finally {
                 zeroBytes(record.identity);
                 zeroBytes(record.sessionId);
+                zeroBytes(bytes);
+            }
+        }
+        const socialPage = await this.#store.scan(CONTACT_SOCIAL_PREFIX, {
+            limit: CONTACT_SCAN_LIMIT,
+        });
+        for (const bytes of socialPage.values()) {
+            const record = decodeContactSocialRecord(bytes);
+            try {
+                contacts.push(
+                    Object.freeze({
+                        identity: record.identity.slice(),
+                        sessionId: new Uint8Array(),
+                        localProfile: record.localProfile,
+                        profile: record.profile,
+                        status: "active" as const,
+                        technicalReset: true as const,
+                    }),
+                );
+            } finally {
+                zeroBytes(record.identity);
                 zeroBytes(bytes);
             }
         }

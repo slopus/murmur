@@ -32,16 +32,17 @@ export interface AccountConvergenceJob {
     readonly key: string;
     readonly account: Uint8Array;
     readonly device: Uint8Array;
-    readonly change: "added" | "revoked";
+    readonly change: "added" | "revoked" | "reset_remove" | "reset_add";
     readonly rosterRevision: number;
     readonly keyPackage?: Uint8Array;
+    readonly dependsOn?: string;
 }
 
 type AccountEventRecord =
     | {
           readonly version: 1;
           readonly scope: "own";
-          readonly type: "added" | "revoked";
+          readonly type: "added" | "revoked" | "reset";
           readonly id: string;
           readonly account: Uint8Array;
           readonly device: Uint8Array;
@@ -50,7 +51,7 @@ type AccountEventRecord =
     | {
           readonly version: 1;
           readonly scope: "contact";
-          readonly type: "added" | "revoked";
+          readonly type: "added" | "revoked" | "reset";
           readonly id: string;
           readonly account: Uint8Array;
           readonly device: Uint8Array;
@@ -92,7 +93,7 @@ function decodeEvent(value: Uint8Array): AccountEventRecord {
     if (
         input.version !== 1 ||
         (input.scope !== "own" && input.scope !== "contact") ||
-        (input.type !== "added" && input.type !== "revoked") ||
+        (input.type !== "added" && input.type !== "revoked" && input.type !== "reset") ||
         typeof input.id !== "string" ||
         typeof input.account !== "string" ||
         typeof input.device !== "string" ||
@@ -163,7 +164,9 @@ export async function prepareAccountEvents(store: MurmurStore): Promise<Prepared
                     device: event.device.slice(),
                     rosterRevision: event.rosterRevision,
                 });
-                (event.type === "added" ? added : revoked).push(publicEvent);
+                if (event.type !== "reset") {
+                    (event.type === "added" ? added : revoked).push(publicEvent);
+                }
             }
         } finally {
             zeroBytes(event.account);
@@ -193,7 +196,7 @@ function rosterKey(account: Uint8Array, ownAccount: Uint8Array): string {
 function convergenceKey(
     account: Uint8Array,
     device: Uint8Array,
-    change: "added" | "revoked",
+    change: AccountConvergenceJob["change"],
 ): string {
     return `${ACCOUNT_CONVERGENCE_PREFIX}${encodeBase64Url(account)}/${encodeBase64Url(device)}/${change}`;
 }
@@ -201,9 +204,10 @@ function convergenceKey(
 function encodeConvergence(
     account: Uint8Array,
     device: Uint8Array,
-    change: "added" | "revoked",
+    change: AccountConvergenceJob["change"],
     rosterRevision: number,
     keyPackage?: Uint8Array,
+    dependsOn?: string,
 ): Uint8Array {
     return canonicalJsonBytes({
         version: 1,
@@ -212,6 +216,7 @@ function encodeConvergence(
         change,
         rosterRevision,
         keyPackage: keyPackage === undefined ? null : encodeBase64Url(keyPackage),
+        dependsOn: dependsOn ?? null,
     });
 }
 
@@ -219,9 +224,10 @@ async function queueConvergence(
     transaction: StoreTransaction,
     account: Uint8Array,
     device: Uint8Array,
-    change: "added" | "revoked",
+    change: AccountConvergenceJob["change"],
     rosterRevision: number,
     keyPackage?: Uint8Array,
+    dependsOn?: string,
 ): Promise<void> {
     const page = await transaction.scan(ACCOUNT_CONVERGENCE_PREFIX, {
         limit: MAXIMUM_CONVERGENCE_JOBS,
@@ -231,7 +237,7 @@ async function queueConvergence(
     }
     await transaction.set(
         convergenceKey(account, device, change),
-        encodeConvergence(account, device, change, rosterRevision, keyPackage),
+        encodeConvergence(account, device, change, rosterRevision, keyPackage, dependsOn),
     );
 }
 
@@ -309,6 +315,7 @@ export async function observeDeviceRoster(
         const before = activeDevices(current);
         const after = activeDevices(candidate);
         const changes: { device: Uint8Array; change: "added" | "revoked" }[] = [];
+        const resets: Uint8Array[] = [];
         if (accepted) {
             for (const [encoded, device] of after) {
                 if (!before.has(encoded)) changes.push({ device, change: "added" });
@@ -316,8 +323,46 @@ export async function observeDeviceRoster(
             for (const [encoded, device] of before) {
                 if (!after.has(encoded)) changes.push({ device, change: "revoked" });
             }
+            for (const entry of candidate.devices) {
+                const prior = current?.devices.find((value) =>
+                    equalBytes(value.deviceKey, entry.deviceKey),
+                );
+                if (
+                    entry.status === "active" &&
+                    (prior === undefined || prior.status === "active") &&
+                    entry.resetGeneration > (prior?.resetGeneration ?? 0)
+                ) {
+                    resets.push(entry.deviceKey);
+                }
+            }
+        }
+        for (const device of resets) {
+            const keyPackage =
+                admission !== undefined && equalBytes(admission.device, device)
+                    ? admission.keyPackage
+                    : undefined;
+            if (keyPackage !== undefined) {
+                await queueConvergence(
+                    transaction,
+                    candidate.accountKey,
+                    device,
+                    "reset_add",
+                    candidate.revision,
+                    keyPackage,
+                );
+            }
+            await recordAccountEvent(transaction, {
+                version: 1,
+                scope: equalBytes(candidate.accountKey, ownAccount) ? "own" : "contact",
+                type: "reset",
+                id: eventId,
+                account: candidate.accountKey,
+                device,
+                rosterRevision: candidate.revision,
+            });
         }
         for (const change of changes) {
+            if (resets.some((device) => equalBytes(device, change.device))) continue;
             const keyPackage =
                 change.change === "added" &&
                 admission !== undefined &&
@@ -344,7 +389,10 @@ export async function observeDeviceRoster(
                 rosterRevision: candidate.revision,
             });
         }
-        if (admission !== undefined) {
+        if (
+            admission !== undefined &&
+            !resets.some((device) => equalBytes(device, admission.device))
+        ) {
             await queueConvergence(
                 transaction,
                 candidate.accountKey,
@@ -365,16 +413,30 @@ function decodeConvergence(key: string, value: Uint8Array): AccountConvergenceJo
         throw new Error("Invalid account convergence job");
     }
     const input = parsed as Record<string, unknown>;
-    const fields = ["version", "account", "device", "change", "rosterRevision", "keyPackage"];
+    const fields = [
+        "version",
+        "account",
+        "device",
+        "change",
+        "rosterRevision",
+        "keyPackage",
+        "dependsOn",
+    ];
     if (
         input.version !== 1 ||
         typeof input.account !== "string" ||
         typeof input.device !== "string" ||
-        (input.change !== "added" && input.change !== "revoked") ||
+        (input.change !== "added" &&
+            input.change !== "revoked" &&
+            input.change !== "reset_remove" &&
+            input.change !== "reset_add") ||
         typeof input.rosterRevision !== "number" ||
         !Number.isSafeInteger(input.rosterRevision) ||
         input.rosterRevision < 1 ||
         (input.keyPackage !== null && typeof input.keyPackage !== "string") ||
+        (input.dependsOn !== undefined &&
+            input.dependsOn !== null &&
+            typeof input.dependsOn !== "string") ||
         Object.keys(input).some((field) => !fields.includes(field))
     ) {
         throw new Error("Invalid account convergence job");
@@ -386,8 +448,9 @@ function decodeConvergence(key: string, value: Uint8Array): AccountConvergenceJo
     if (
         account.length !== 32 ||
         device.length !== 32 ||
-        (input.change === "added" && keyPackage === undefined) ||
-        (input.change === "revoked" && keyPackage !== undefined)
+        ((input.change === "added" || input.change === "reset_add") && keyPackage === undefined) ||
+        ((input.change === "revoked" || input.change === "reset_remove") &&
+            keyPackage !== undefined)
     ) {
         throw new Error("Invalid account convergence job");
     }
@@ -398,6 +461,9 @@ function decodeConvergence(key: string, value: Uint8Array): AccountConvergenceJo
         change: input.change,
         rosterRevision: input.rosterRevision,
         ...(keyPackage === undefined ? {} : { keyPackage }),
+        ...(input.dependsOn === undefined || input.dependsOn === null
+            ? {}
+            : { dependsOn: input.dependsOn as string }),
     };
 }
 

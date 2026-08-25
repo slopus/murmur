@@ -26,6 +26,16 @@ service-owned updates with their stable service ID; Murmur atomically removes a
 whole batch only after every relevant callback resolves. `synchronize()`
 remains the bounded foreground alternative.
 
+Every inbox delivery has a per-inbox sequence and loss generation. A gap or
+generation change first persists one stable `MurmurResetEvent` containing the
+complete session snapshot. `onReset` is retried with that same event until it
+resolves. Murmur then commits one purge of all session, MLS, outbox, intent,
+buffer, replay, and transport state while retaining device identity, account
+signing material, credential, rosters, contacts, and profiles. The transaction
+adopts the relay's observed head as the new baseline and queues the signed
+roster reset announcement. Recreated sessions keep their descriptors and expose
+`reAdmission: true`; application history backfill remains application-owned.
+
 Every session epoch authenticates one immutable owner account, an admin set,
 and the `adminsAssignAdmins` and `anyoneCanAddMembers` policies. Public
 membership and role mutations first persist bounded asynchronous intents. Any
