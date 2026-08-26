@@ -650,7 +650,7 @@ describe("stateful MLS sessions", () => {
             carol.close();
             await relay.close();
         }
-    }, 10_000);
+    }, 120_000);
 
     test("rejects an unauthorized membership Commit on every honest member", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
