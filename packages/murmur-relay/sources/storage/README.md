@@ -21,9 +21,8 @@ ticketed exact claim -> spend budget -> consume one-time or read fallback
 ```
 
 One-use reference history, upload nonces, and ticket-use counters are durable.
-Schema version 3 adds these tables and migrates version 2 in place without
-removing pending deliveries.
+The one clean schema carries version stamp 3.
 
-Initialization accepts the current exact schema or the complete version 2
-predecessor for its one in-place migration. Unexpected or incomplete tables and
-metadata fail closed.
+Initialization accepts only the current exact schema. A mismatched version or
+unexpected or incomplete tables and metadata fail closed; there is no migration
+path.

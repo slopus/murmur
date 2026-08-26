@@ -1203,20 +1203,7 @@ export class SqliteRelayStore implements RelayStore {
             const schema = this.#requiredGet(
                 "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
             );
-            let version = bigintColumn(schema.version);
-            if (version === 2n) {
-                this.#database.exec("BEGIN IMMEDIATE");
-                try {
-                    this.#createDirectorySchema();
-                    this.#run("UPDATE murmur_queue_schema SET version = 3 WHERE singleton = 1");
-                    this.#database.exec("COMMIT");
-                    version = 3n;
-                } catch (error: unknown) {
-                    this.#rollback();
-                    throw error;
-                }
-            }
-            if (version !== 3n) {
+            if (bigintColumn(schema.version) !== 3n) {
                 throw new Error("Unsupported SQLite queue schema version");
             }
             const tables = this.#requiredGet(

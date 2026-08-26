@@ -578,32 +578,22 @@ describe("identity queue store conformance", () => {
         database.close();
     });
 
-    test("migrates the step-3 roster schema to directory schema v3 in place", async () => {
+    test("rejects a mismatched schema version without migration", async () => {
         const sqlite = new DatabaseSync(":memory:");
-        new SqliteRelayStore(":memory:", { database: sqlite });
-        sqlite.exec(`
-            DROP TABLE murmur_directory_prekeys;
-            DROP TABLE murmur_directory_devices;
-            DROP TABLE murmur_directory_prekey_references;
-            DROP TABLE murmur_directory_upload_nonces;
-            DROP TABLE murmur_directory_ticket_uses;
-            UPDATE murmur_queue_schema SET version = 2 WHERE singleton = 1;
-        `);
-        const migratedSqlite = new SqliteRelayStore(":memory:", { database: sqlite });
-        await expect(migratedSqlite.health()).resolves.toBeUndefined();
-        await migratedSqlite.close();
+        const sqliteStore = new SqliteRelayStore(":memory:", { database: sqlite });
+        sqlite.exec("UPDATE murmur_queue_schema SET version = 2 WHERE singleton = 1");
+        expect(() => new SqliteRelayStore(":memory:", { database: sqlite })).toThrow(
+            "Unsupported SQLite queue schema version",
+        );
+        await sqliteStore.close();
 
         const pglite = new PGliteDatabase(new PGlite());
-        await PostgresRelayStore.create(pglite);
-        await pglite.query("DROP TABLE murmur_directory_prekeys");
-        await pglite.query("DROP TABLE murmur_directory_devices");
-        await pglite.query("DROP TABLE murmur_directory_prekey_references");
-        await pglite.query("DROP TABLE murmur_directory_upload_nonces");
-        await pglite.query("DROP TABLE murmur_directory_ticket_uses");
+        const postgresStore = await PostgresRelayStore.create(pglite);
         await pglite.query("UPDATE murmur_queue_schema SET version = 2 WHERE singleton = 1");
-        const migratedPostgres = await PostgresRelayStore.create(pglite);
-        await expect(migratedPostgres.health()).resolves.toBeUndefined();
-        await migratedPostgres.close();
+        await expect(PostgresRelayStore.create(pglite)).rejects.toThrow(
+            "Unsupported Postgres queue schema version",
+        );
+        await postgresStore.close();
     });
 
     test("atomically multicasts one event ID and trims each recipient independently", async () => {

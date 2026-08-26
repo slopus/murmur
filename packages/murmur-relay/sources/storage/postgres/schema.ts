@@ -67,7 +67,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 const schemaVersion = bigintColumn(versionRow.version);
-                if (schemaVersion !== 2n && schemaVersion !== 3n) {
+                if (schemaVersion !== 3n) {
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 if (
@@ -77,38 +77,14 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     row.references === null ||
                     row.rosters === null ||
                     row.roster_devices === null ||
-                    row.roster_nonces === null
-                ) {
-                    throw new Error("Incomplete Postgres queue schema");
-                }
-                if (schemaVersion === 2n) {
-                    if (
-                        row.directory_devices !== null ||
-                        row.directory_prekeys !== null ||
-                        row.directory_references !== null ||
-                        row.directory_nonces !== null ||
-                        row.directory_tickets !== null
-                    ) {
-                        throw new Error("Incomplete Postgres directory schema");
-                    }
-                    await connection.transaction(async (transaction) => {
-                        for (const statement of directoryStatements()) {
-                            await transaction.query(statement);
-                        }
-                        await transaction.query(
-                            "UPDATE murmur_queue_schema SET version = 3 WHERE singleton = 1",
-                        );
-                    });
-                    return;
-                }
-                if (
+                    row.roster_nonces === null ||
                     row.directory_devices === null ||
                     row.directory_prekeys === null ||
                     row.directory_references === null ||
                     row.directory_nonces === null ||
                     row.directory_tickets === null
                 ) {
-                    throw new Error("Incomplete Postgres directory schema");
+                    throw new Error("Incomplete Postgres queue schema");
                 }
                 return;
             }
