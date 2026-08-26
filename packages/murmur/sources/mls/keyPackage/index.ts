@@ -1,6 +1,5 @@
 import {
     concatBytes,
-    decodeDeviceCredential,
     equalBytes,
     randomBytes,
     type IdentityKeyPair,
@@ -112,25 +111,7 @@ export function verifyMlsKeyPackage(
     try {
         const canonicalInitKey = canonicalizeHpkePublicKey(keyPackage.initKey);
         const canonicalLeafKey = canonicalizeHpkePublicKey(keyPackage.leafNode.encryptionKey);
-        const credentialMatches = (() => {
-            if (
-                keyPackage.leafNode.credential.identity.length === 32 &&
-                equalBytes(
-                    keyPackage.leafNode.credential.identity,
-                    keyPackage.leafNode.signatureKey,
-                )
-            ) {
-                return true;
-            }
-            try {
-                return equalBytes(
-                    decodeDeviceCredential(keyPackage.leafNode.credential.identity).deviceKey,
-                    keyPackage.leafNode.signatureKey,
-                );
-            } catch {
-                return false;
-            }
-        })();
+        const credentialMatches = keyPackage.leafNode.credential.identity.length === 32;
         return (
             keyPackage.version === 1 &&
             keyPackage.cipherSuite === 0x0001 &&

@@ -6,8 +6,11 @@ import {
 } from "node:sqlite";
 import {
     RelayError,
+    deviceRosterToJson,
     deliveryFingerprint,
     parseSignedDelivery,
+    type DeviceRoster,
+    type DeviceRosterMutation,
     type SignedDelivery,
 } from "../../protocol/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
@@ -59,6 +62,14 @@ function nullableTextColumn(value: unknown, name: string): string | null {
     return value === null ? null : textColumn(value, name);
 }
 
+function compareBytes(left: Uint8Array, right: Uint8Array): number {
+    for (let index = 0; index < left.length; index += 1) {
+        const difference = left[index]! - right[index]!;
+        if (difference !== 0) return difference;
+    }
+    return 0;
+}
+
 /** Fresh-schema SQLite identity-queue store. */
 export class SqliteRelayStore implements RelayStore {
     readonly #database: DatabaseSync;
@@ -77,14 +88,61 @@ export class SqliteRelayStore implements RelayStore {
         now: number,
         limits: QueueLimits,
         admissionPrincipal: Uint8Array,
+        transactionOpen: boolean = false,
     ): Promise<PublishOutcome> {
         this.#assertOpen();
         if (!(admissionPrincipal instanceof Uint8Array) || admissionPrincipal.length !== 32) {
             throw new Error("Invalid admission principal");
         }
-        await this.pruneExpired(now);
-        this.#database.exec("BEGIN IMMEDIATE");
+        if (!transactionOpen) {
+            await this.pruneExpired(now);
+            this.#database.exec("BEGIN IMMEDIATE");
+        }
         try {
+            const staleRosters: DeviceRoster[] = [];
+            const currentRosters: DeviceRoster[] = [];
+            for (const target of delivery.targetAccounts) {
+                const roster = this.#readDeviceRoster(target.accountKey);
+                if (roster === undefined) {
+                    throw new RelayError(409, "Target account has no registered devices", {
+                        error: "roster_missing",
+                        accountKey: encodeBase64Url(target.accountKey),
+                    });
+                }
+                currentRosters.push(roster);
+                if (
+                    roster.revision !== target.rosterRevision ||
+                    roster.devices.some(
+                        (entry) =>
+                            !delivery.recipients.some((recipient) =>
+                                equalBytes(recipient, entry.deviceKey),
+                            ),
+                    )
+                ) {
+                    staleRosters.push(roster);
+                }
+            }
+            if (staleRosters.length === 0 && currentRosters.length > 0) {
+                const currentDevices = new Set(
+                    currentRosters.flatMap((roster) =>
+                        roster.devices.map((entry) => encodeBase64Url(entry.deviceKey)),
+                    ),
+                );
+                if (
+                    currentDevices.size !== delivery.recipients.length ||
+                    delivery.recipients.some(
+                        (recipient) => !currentDevices.has(encodeBase64Url(recipient)),
+                    )
+                ) {
+                    staleRosters.push(...currentRosters);
+                }
+            }
+            if (staleRosters.length > 0) {
+                throw new RelayError(409, "Delivery does not match current account devices", {
+                    error: "stale_roster",
+                    rosters: staleRosters.map(deviceRosterToJson),
+                });
+            }
             const fingerprint = deliveryFingerprint(delivery);
             const existing = this.#get(
                 `SELECT event_id, fingerprint
@@ -100,7 +158,7 @@ export class SqliteRelayStore implements RelayStore {
                         error: "id_collision",
                     });
                 }
-                this.#database.exec("COMMIT");
+                if (!transactionOpen) this.#database.exec("COMMIT");
                 return {
                     eventId: textColumn(existing.event_id, "event ID"),
                     duplicate: true,
@@ -273,10 +331,10 @@ export class SqliteRelayStore implements RelayStore {
                  VALUES ${referenceValues}`,
                 ...referenceParameters,
             );
-            this.#database.exec("COMMIT");
+            if (!transactionOpen) this.#database.exec("COMMIT");
             return { eventId, duplicate: false };
         } catch (error: unknown) {
-            this.#rollback();
+            if (!transactionOpen) this.#rollback();
             throw error;
         }
     }
@@ -414,6 +472,150 @@ export class SqliteRelayStore implements RelayStore {
                 generation: selection.generation,
                 exhausted: selection.exhausted,
             };
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
+    }
+
+    async readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined> {
+        this.#assertOpen();
+        return this.#readDeviceRoster(accountKey);
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        mutation: DeviceRosterMutation,
+        now: number,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<DeviceRoster> {
+        this.#assertOpen();
+        await this.pruneExpired(now);
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            const replay = this.#get(
+                `SELECT 1 AS present FROM murmur_device_roster_nonces
+                 WHERE account_key = ? AND nonce = ?`,
+                delivery.sender,
+                delivery.id,
+            );
+            if (replay !== undefined) {
+                throw new RelayError(409, "Device roster mutation was already used", {
+                    error: "replay",
+                });
+            }
+            const current = this.#readDeviceRoster(delivery.sender);
+            const devices = new Map(
+                (current?.devices ?? []).map((entry) => [encodeBase64Url(entry.deviceKey), entry]),
+            );
+            const admissions = new Map(
+                (current?.admissions ?? []).map((entry) => [
+                    encodeBase64Url(entry.deviceKey),
+                    entry,
+                ]),
+            );
+            const encodedDevice = encodeBase64Url(mutation.deviceKey);
+            const existing = devices.get(encodedDevice);
+            if (mutation.type === "register") {
+                const expectedGeneration =
+                    existing === undefined ? 0 : existing.resetGeneration + 1;
+                if (mutation.resetGeneration !== expectedGeneration) {
+                    throw new RelayError(409, "Device reset generation is stale", {
+                        error: "reset_generation",
+                        expectedGeneration,
+                    });
+                }
+                devices.set(encodedDevice, {
+                    deviceKey: mutation.deviceKey,
+                    resetGeneration: mutation.resetGeneration,
+                });
+                admissions.set(encodedDevice, {
+                    deviceKey: mutation.deviceKey,
+                    keyPackage: mutation.keyPackage,
+                });
+            } else {
+                if (
+                    existing === undefined ||
+                    mutation.resetGeneration !== existing.resetGeneration
+                ) {
+                    throw new RelayError(409, "Device removal names stale roster state", {
+                        error: "reset_generation",
+                        expectedGeneration: existing?.resetGeneration ?? null,
+                    });
+                }
+                devices.delete(encodedDevice);
+                admissions.delete(encodedDevice);
+            }
+            const sortedDevices = [...devices.values()].sort((left, right) =>
+                compareBytes(left.deviceKey, right.deviceKey),
+            );
+            if (
+                delivery.targetAccounts.length !== 0 ||
+                delivery.recipients.length !== sortedDevices.length ||
+                sortedDevices.some(
+                    (entry, index) => !equalBytes(entry.deviceKey, delivery.recipients[index]!),
+                )
+            ) {
+                throw new RelayError(409, "Roster mutation recipients are stale", {
+                    error: "stale_roster",
+                    ...(current === undefined ? {} : { rosters: [deviceRosterToJson(current)] }),
+                });
+            }
+            const revision = (current?.revision ?? 0) + 1;
+            this.#run(
+                `INSERT INTO murmur_device_rosters (account_key, revision)
+                 VALUES (?, ?)
+                 ON CONFLICT (account_key) DO UPDATE SET revision = excluded.revision`,
+                delivery.sender,
+                BigInt(revision),
+            );
+            this.#run(
+                "DELETE FROM murmur_device_roster_devices WHERE account_key = ?",
+                delivery.sender,
+            );
+            for (const entry of sortedDevices) {
+                const storedAdmission = admissions.get(encodeBase64Url(entry.deviceKey));
+                if (storedAdmission === undefined) throw new Error("Missing roster admission");
+                this.#run(
+                    `INSERT INTO murmur_device_roster_devices
+                        (account_key, device_key, reset_generation, key_package)
+                     VALUES (?, ?, ?, ?)`,
+                    delivery.sender,
+                    entry.deviceKey,
+                    BigInt(entry.resetGeneration),
+                    storedAdmission.keyPackage,
+                );
+            }
+            this.#run(
+                `INSERT INTO murmur_device_roster_nonces (account_key, nonce, created_at)
+                 VALUES (?, ?, ?)`,
+                delivery.sender,
+                delivery.id,
+                BigInt(now),
+            );
+            const roster: DeviceRoster = {
+                version: 1,
+                accountKey: delivery.sender.slice(),
+                revision,
+                devices: sortedDevices.map((entry) => ({
+                    deviceKey: entry.deviceKey.slice(),
+                    resetGeneration: entry.resetGeneration,
+                })),
+                admissions: sortedDevices.map((entry) => {
+                    const value = admissions.get(encodeBase64Url(entry.deviceKey));
+                    if (value === undefined) throw new Error("Missing roster admission");
+                    return {
+                        deviceKey: entry.deviceKey.slice(),
+                        keyPackage: value.keyPackage.slice(),
+                    };
+                }),
+            };
+            if (delivery.recipients.length > 0) {
+                await this.publish(delivery, now, limits, admissionPrincipal, true);
+            }
+            this.#database.exec("COMMIT");
+            return roster;
         } catch (error: unknown) {
             this.#rollback();
             throw error;
@@ -604,6 +806,33 @@ export class SqliteRelayStore implements RelayStore {
         }
     }
 
+    #readDeviceRoster(accountKey: Uint8Array): DeviceRoster | undefined {
+        const row = this.#get(
+            "SELECT revision FROM murmur_device_rosters WHERE account_key = ?",
+            accountKey,
+        );
+        if (row === undefined) return undefined;
+        const entries = this.#all(
+            `SELECT device_key, reset_generation, key_package
+             FROM murmur_device_roster_devices
+             WHERE account_key = ? ORDER BY device_key`,
+            accountKey,
+        );
+        return {
+            version: 1,
+            accountKey: accountKey.slice(),
+            revision: safeNumberColumn(row.revision),
+            devices: entries.map((entry) => ({
+                deviceKey: copyBytes(entry.device_key, "roster device key"),
+                resetGeneration: safeNumberColumn(entry.reset_generation),
+            })),
+            admissions: entries.map((entry) => ({
+                deviceKey: copyBytes(entry.device_key, "roster device key"),
+                keyPackage: copyBytes(entry.key_package, "roster KeyPackage"),
+            })),
+        };
+    }
+
     #initializeSchema(): void {
         const marker = this.#get(
             `SELECT name FROM sqlite_master
@@ -624,7 +853,7 @@ export class SqliteRelayStore implements RelayStore {
                 "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
             );
             const version = bigintColumn(schema.version);
-            if (version !== 1n) {
+            if (version !== 2n) {
                 throw new Error("Unsupported SQLite queue schema version");
             }
             const tables = this.#requiredGet(
@@ -635,9 +864,12 @@ export class SqliteRelayStore implements RelayStore {
                     'murmur_queues',
                     'murmur_queue_deliveries',
                     'murmur_queue_references'
+                    ,'murmur_device_rosters'
+                    ,'murmur_device_roster_devices'
+                    ,'murmur_device_roster_nonces'
                  )`,
             );
-            if (safeNumberColumn(tables.table_count) !== 5) {
+            if (safeNumberColumn(tables.table_count) !== 8) {
                 throw new Error("Incomplete SQLite queue schema");
             }
             return;
@@ -649,7 +881,7 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 1);
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 2);
             CREATE TABLE murmur_queue_global (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 last_event_id TEXT CHECK (
@@ -713,6 +945,25 @@ export class SqliteRelayStore implements RelayStore {
                 ON murmur_queue_references(sender, delivery_id);
             CREATE INDEX murmur_queue_reference_admission
                 ON murmur_queue_references(admission_principal);
+            CREATE TABLE murmur_device_rosters (
+                account_key BLOB PRIMARY KEY CHECK (length(account_key) = 32),
+                revision INTEGER NOT NULL CHECK (revision >= 1)
+            ) STRICT;
+            CREATE TABLE murmur_device_roster_devices (
+                account_key BLOB NOT NULL REFERENCES murmur_device_rosters(account_key)
+                    ON DELETE CASCADE,
+                device_key BLOB NOT NULL CHECK (length(device_key) = 32),
+                reset_generation INTEGER NOT NULL CHECK (reset_generation >= 0),
+                key_package BLOB NOT NULL CHECK (length(key_package) > 0),
+                PRIMARY KEY (account_key, device_key)
+            ) STRICT;
+            CREATE TABLE murmur_device_roster_nonces (
+                account_key BLOB NOT NULL REFERENCES murmur_device_rosters(account_key)
+                    ON DELETE CASCADE,
+                nonce TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (account_key, nonce)
+            ) STRICT;
             `);
             this.#run(
                 `UPDATE murmur_queue_global SET generation_seed = ? WHERE singleton = 1`,

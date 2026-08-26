@@ -322,6 +322,12 @@ describe("identity queue relay", () => {
             exhausted: true,
         };
         const store: RelayStore = {
+            async readDeviceRoster() {
+                return undefined;
+            },
+            async mutateDeviceRoster() {
+                throw new Error("not used");
+            },
             async publish(
                 _delivery: SignedDelivery,
                 _now: number,

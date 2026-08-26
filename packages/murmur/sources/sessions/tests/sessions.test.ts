@@ -88,6 +88,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         let alice = await MurmurClient.open({
             transport: recording,
@@ -120,7 +122,7 @@ describe("stateful MLS sessions", () => {
                 ).size,
             ).toBe(3);
 
-            const aliceIdentity = alice.identity;
+            const aliceIdentity = alice.deviceKey;
             alice.close();
             alice = await MurmurClient.open({
                 transport: recording,
@@ -146,12 +148,12 @@ describe("stateful MLS sessions", () => {
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
             ).toEqual([
-                [encodeBase64Url(aliceIdentity)],
-                [encodeBase64Url(bob.identity)],
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
+                [encodeBase64Url(bob.deviceKey)],
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
             ]);
 
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -653,6 +655,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await client(relay);
         const bob = await MurmurClient.open({
@@ -880,6 +884,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await client(relay);
         const bobStore = new MemoryMurmurStore();
@@ -959,6 +965,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await client(relay);
         const bob = await MurmurClient.open({
@@ -1020,6 +1028,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await MurmurClient.open({
             transport,
@@ -1051,9 +1061,13 @@ describe("stateful MLS sessions", () => {
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
             ).toEqual([
-                [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
-                [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
-                [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
+                [encodeBase64Url(alice.deviceKey), encodeBase64Url(bob.deviceKey)].sort(),
+                [encodeBase64Url(alice.deviceKey), encodeBase64Url(bob.deviceKey)].sort(),
+                [
+                    encodeBase64Url(alice.deviceKey),
+                    encodeBase64Url(bob.deviceKey),
+                    encodeBase64Url(carol.deviceKey),
+                ].sort(),
             ]);
 
             expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
@@ -1061,7 +1075,7 @@ describe("stateful MLS sessions", () => {
                 pendingOutboxes: 1,
             });
             expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([2, 2, 3, 3, 1, 2]);
-            expect(published.at(-2)?.recipients).toEqual([carol.identity]);
+            expect(published.at(-2)?.recipients).toEqual([carol.deviceKey]);
             await bob.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
             const bobReceived: string[] = [];
@@ -1096,6 +1110,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         let alice = await MurmurClient.open({
             transport: unreliable,
@@ -1150,7 +1166,7 @@ describe("stateful MLS sessions", () => {
         });
         try {
             await transport.publish(
-                createSignedDelivery(attacker, [alice.identity], new Uint8Array([99, 1]), {
+                createSignedDelivery(attacker, [alice.deviceKey], new Uint8Array([99, 1]), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
                 }),
@@ -1336,6 +1352,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const aliceStore = new MemoryMurmurStore();
         const alice = await MurmurClient.open({
@@ -1355,7 +1373,7 @@ describe("stateful MLS sessions", () => {
             await alice.send(session.id, utf8Encode("will be rejected"));
             rejectPublications = true;
             await base.publish(
-                createSignedDelivery(attacker, [alice.identity], new Uint8Array([99, 1]), {
+                createSignedDelivery(attacker, [alice.deviceKey], new Uint8Array([99, 1]), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
                 }),
@@ -1677,6 +1695,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await MurmurClient.open({
             transport: welcomeFailing,
@@ -1756,6 +1776,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await MurmurClient.open({
             transport: ordered,
@@ -1816,6 +1838,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await MurmurClient.open({
             transport: recoverable,
@@ -1961,6 +1985,8 @@ describe("stateful MLS sessions", () => {
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const alice = await MurmurClient.open({
             transport: blocked,
@@ -1999,12 +2025,17 @@ describe("stateful MLS sessions", () => {
         const carolIdentity = generateIdentityKeyPair();
         let capturedBootstrap: SignedDelivery | undefined;
         const capturing: DeliveryTransport = {
-            publish: (delivery, signal) => {
-                if (delivery.ciphertext[0] === 1) capturedBootstrap = delivery;
+            publish: async (delivery, signal) => {
+                if (delivery.ciphertext[0] === 1 && capturedBootstrap === undefined) {
+                    capturedBootstrap = delivery;
+                    return { eventId: delivery.id, duplicate: false };
+                }
                 return base.publish(delivery, signal);
             },
             read: (request, signal) => base.read(request, signal),
             acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
         };
         const carol = await MurmurClient.open({
             identity: carolIdentity,
@@ -2029,17 +2060,7 @@ describe("stateful MLS sessions", () => {
 
             await bob.ignoreSession(first.id);
             expect(capturedBootstrap).toBeDefined();
-            await base.publish(
-                createSignedDelivery(
-                    carolIdentity,
-                    capturedBootstrap!.recipients,
-                    capturedBootstrap!.ciphertext,
-                    {
-                        createdAt: NOW,
-                        expiresAt: NOW + 60_000,
-                    },
-                ),
-            );
+            await base.publish(capturedBootstrap!);
             await bob.synchronize();
             expect(await bob.session(second.id)).toMatchObject({ status: "pending" });
         } finally {

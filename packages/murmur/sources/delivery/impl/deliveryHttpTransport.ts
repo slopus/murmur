@@ -1,6 +1,7 @@
-import { decodeBase64Url, utf8Decode } from "../../utils/index.js";
+import { decodeBase64Url, encodeBase64Url, utf8Decode } from "../../utils/index.js";
 import type {
     DeliveryFetch,
+    DeliveryDeviceRoster,
     DeliveryPublishOutcome,
     DeliveryTransport,
     InboxStreamEvent,
@@ -111,6 +112,17 @@ export class DeliveryAcknowledgementFutureError extends DeliveryTransportError {
     }
 }
 
+/** Relay response proving that an account-targeted publication used a stale roster. */
+export class DeliveryStaleRosterError extends DeliveryTransportError {
+    readonly rosters: readonly DeliveryDeviceRoster[];
+
+    constructor(rosters: readonly DeliveryDeviceRoster[]) {
+        super(409, "stale_roster");
+        this.name = "DeliveryStaleRosterError";
+        this.rosters = rosters;
+    }
+}
+
 /** Configuration for the browser-safe relay HTTP transport. */
 export interface HttpDeliveryTransportOptions {
     readonly fetch?: DeliveryFetch;
@@ -140,6 +152,55 @@ function uuid(value: unknown): string {
         throw new Error("Invalid relay event ID");
     }
     return value;
+}
+
+function safeInteger(value: unknown): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error("Invalid relay response");
+    }
+    return value;
+}
+
+function roster(value: unknown): DeliveryDeviceRoster {
+    const input = object(value);
+    exact(input, ["version", "accountKey", "revision", "devices", "admissions"]);
+    if (
+        input.version !== 1 ||
+        typeof input.accountKey !== "string" ||
+        !Array.isArray(input.devices) ||
+        !Array.isArray(input.admissions) ||
+        input.devices.length !== input.admissions.length
+    ) {
+        throw new Error("Invalid relay response");
+    }
+    const accountKey = decodeBase64Url(input.accountKey);
+    if (accountKey.length !== 32) throw new Error("Invalid relay response");
+    return {
+        version: 1,
+        accountKey,
+        revision: safeInteger(input.revision),
+        devices: input.devices.map((candidate) => {
+            const entry = object(candidate);
+            exact(entry, ["deviceKey", "resetGeneration"]);
+            if (typeof entry.deviceKey !== "string") throw new Error("Invalid relay response");
+            const deviceKey = decodeBase64Url(entry.deviceKey);
+            if (deviceKey.length !== 32) throw new Error("Invalid relay response");
+            return { deviceKey, resetGeneration: safeInteger(entry.resetGeneration) };
+        }),
+        admissions: input.admissions.map((candidate) => {
+            const entry = object(candidate);
+            exact(entry, ["deviceKey", "keyPackage"]);
+            if (typeof entry.deviceKey !== "string" || typeof entry.keyPackage !== "string") {
+                throw new Error("Invalid relay response");
+            }
+            const deviceKey = decodeBase64Url(entry.deviceKey);
+            const keyPackage = decodeBase64Url(entry.keyPackage);
+            if (deviceKey.length !== 32 || keyPackage.length < 1) {
+                throw new Error("Invalid relay response");
+            }
+            return { deviceKey, keyPackage };
+        }),
+    };
 }
 
 async function boundedResponseJson(response: Response, maximumBytes: number): Promise<unknown> {
@@ -225,6 +286,33 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         exact(value, ["eventId", "duplicate"]);
         if (typeof value.duplicate !== "boolean") throw new Error("Invalid relay response");
         return { eventId: uuid(value.eventId), duplicate: value.duplicate };
+    }
+
+    async readDeviceRoster(
+        accountKey: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster | undefined> {
+        if (accountKey.length !== 32) throw new Error("Invalid account identity key");
+        const value = object(
+            await this.#post(
+                "/v1/device-rosters/read",
+                { version: 1, accountKey: encodeBase64Url(accountKey) },
+                signal,
+            ),
+        );
+        exact(value, ["roster"]);
+        return value.roster === null ? undefined : roster(value.roster);
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster> {
+        const value = object(
+            await this.#post("/v1/device-rosters/mutate", signedDeliveryToJson(delivery), signal),
+        );
+        exact(value, ["roster"]);
+        return roster(value.roster);
     }
 
     /** Read one bounded page from an identity inbox. */
@@ -420,6 +508,14 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         if (response.status === 409 && failure.error === "ack_future") {
             exact(failure, ["error", "head"]);
             throw new DeliveryAcknowledgementFutureError(uuid(failure.head));
+        }
+        if (
+            response.status === 409 &&
+            failure.error === "stale_roster" &&
+            Array.isArray(failure.rosters)
+        ) {
+            exact(failure, ["error", "rosters"]);
+            throw new DeliveryStaleRosterError(failure.rosters.map(roster));
         }
         throw new DeliveryTransportError(
             response.status,

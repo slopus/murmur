@@ -74,12 +74,20 @@ Queue progress, replay markers, buffered events, lifecycle records, and routing
 decisions commit together. A thrown hook therefore retries the same durable
 effect without reapplying protocol state.
 
-## Account synchronization
+## Account devices
 
-Device provisioning proves possession of a fresh device identity and transfers
-account-root custody in an encrypted envelope. Signed roster revisions add,
-reset, or revoke device leaves. Account synchronization drives the matching MLS
-changes across known sessions.
+Restoring an account identity on a new store generates an independent device
+inbox key and account-signs a self-registration mutation containing its reset
+generation and current MLS KeyPackage. The relay replay-protects the mutation,
+atomically updates its one current roster, and queues that same ordinary
+delivery to every post-mutation device inbox. Account-signed removal may name
+the current device or any sibling.
+
+Account-targeted deliveries sign each account key and source roster revision.
+The relay rejects stale revisions or omitted current devices and returns the
+current roster. The client durably observes it, retargets the exact outbox, and
+drives ordinary MLS Add or Remove convergence. Pure inbox publication has no
+roster target and is unchanged.
 
 ## Continuity loss
 

@@ -6,25 +6,7 @@ import {
     type RelayOptions,
 } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
-import {
-    addDeviceToRoster,
-    authorizeDeviceProvisioning,
-    completeDeviceProvisioning,
-    createDeviceLinkMaterial,
-    createInitialDeviceRoster,
-    decodeAccountSyncPacket,
-    encodeAccountSyncPacket,
-    isActiveDevice,
-    parseDeviceLinkRequest,
-    parseDeviceRoster,
-    parseProvisioningEnvelope,
-    resetDeviceInRoster,
-    revokeDeviceFromRoster,
-    selectDeviceRosterChild,
-    serializeDeviceLinkRequest,
-    serializeDeviceRoster,
-    serializeProvisioningEnvelope,
-} from "../../accounts/index.js";
+import { decodeDeviceRosterMutation, encodeDeviceRosterMutation } from "../../accounts/index.js";
 import {
     destroyIdentity,
     generateIdentityKeyPair,
@@ -61,7 +43,6 @@ import { MlsSecretTree, destroyMlsGenerationKey } from "../../mls/secretTree/ind
 import { MurmurClient, type MurmurUpdate } from "../../sessions/index.js";
 import {
     decodeSessionRoles,
-    encodeAccountResetCiphertext,
     encodeSessionRoles,
     openCommitCiphertext,
     parseSessionCiphertext,
@@ -209,10 +190,10 @@ describe("adversarial inputs and resource limits", () => {
             "commit",
             "welcome",
             "directory-prekey",
-            "provisioning",
+            "roster-mutation",
             "role-control",
             "account-roster",
-            "account-sync",
+            "roster-notification",
         ] as const;
         const processor = new InboxProcessor(
             { identity: recipient, transport: fixture.transport, store },
@@ -366,11 +347,7 @@ describe("adversarial inputs and resource limits", () => {
             await bob.synchronize({ waitMilliseconds: 0 });
             await bob.activateSession(session.id);
 
-            const poison = delivery(
-                attacker,
-                [bobIdentity.publicKey],
-                new Uint8Array([3, 0xff, 0x00]),
-            );
+            const poison = delivery(attacker, [bob.deviceKey], new Uint8Array([3, 0xff, 0x00]));
             await fixture.transport.publish(poison);
             await alice.setPolicies(session.id, {
                 adminsAssignAdmins: true,
@@ -534,12 +511,13 @@ describe("adversarial inputs and resource limits", () => {
                 status: 401,
             });
             expect(containsRecipient(exact, third.publicKey)).toBe(false);
-            expect(() =>
-                createSignedDelivery(sender, [], new Uint8Array(1), {
-                    createdAt: NOW,
-                    expiresAt: NOW + 1,
-                }),
-            ).toThrow();
+            const empty = createSignedDelivery(sender, [], new Uint8Array(1), {
+                createdAt: NOW,
+                expiresAt: NOW + 1,
+            });
+            await expect(fixture.relay.publish(empty, "empty")).rejects.toMatchObject({
+                status: 400,
+            });
             expect(() =>
                 createSignedDelivery(
                     sender,
@@ -841,201 +819,6 @@ describe("adversarial inputs and resource limits", () => {
             await fixture.relay.close();
         }
     }, 120_000);
-
-    test("ADV-11 provisioning and roster substitutions, replay, rollback, and revocation fail closed", () => {
-        const account = generateIdentityKeyPair();
-        const author = generateIdentityKeyPair();
-        const device = generateIdentityKeyPair();
-        const forkDevice = generateIdentityKeyPair();
-        const material = createDeviceLinkMaterial(device, utf8Encode("key-package"), NOW);
-        try {
-            const roster = createInitialDeviceRoster(account, author, NOW, new Uint8Array(16));
-            const authorization = authorizeDeviceProvisioning({
-                request: material.request,
-                account,
-                authorDevice: author,
-                roster,
-                now: NOW + 1,
-            });
-            const requestBytes = serializeDeviceLinkRequest(material.request);
-            const envelopeBytes = serializeProvisioningEnvelope(authorization.envelope);
-            expect(parseDeviceLinkRequest(requestBytes, NOW)).toEqual(material.request);
-            expect(parseProvisioningEnvelope(envelopeBytes)).toEqual(authorization.envelope);
-
-            for (let replay = 0; replay < 1_000; replay += 1) {
-                expect(parseProvisioningEnvelope(envelopeBytes).requestId).toEqual(
-                    material.request.requestId,
-                );
-            }
-            const completed = completeDeviceProvisioning(material, authorization.envelope, NOW + 2);
-            expect(completed.account.publicKey).toEqual(account.publicKey);
-            destroyIdentity(completed.account);
-            expect(() =>
-                completeDeviceProvisioning(
-                    {
-                        ...material,
-                        request: {
-                            ...material.request,
-                            requestId: flip(material.request.requestId),
-                        },
-                    },
-                    authorization.envelope,
-                    NOW + 2,
-                ),
-            ).toThrow();
-            expect(() =>
-                completeDeviceProvisioning(
-                    material,
-                    { ...authorization.envelope, authorDeviceKey: forkDevice.publicKey },
-                    NOW + 2,
-                ),
-            ).toThrow();
-            expect(() =>
-                completeDeviceProvisioning(
-                    material,
-                    authorization.envelope,
-                    material.request.expiresAt,
-                ),
-            ).toThrow();
-            for (const malformed of [
-                flip(requestBytes),
-                requestBytes.slice(0, -1),
-                new Uint8Array(),
-            ]) {
-                expect(() => parseDeviceLinkRequest(malformed, NOW)).toThrow();
-            }
-
-            const left = addDeviceToRoster(
-                roster,
-                account,
-                author,
-                device.publicKey,
-                NOW + 1,
-                new Uint8Array(16).fill(1),
-            );
-            const right = addDeviceToRoster(
-                roster,
-                account,
-                author,
-                forkDevice.publicKey,
-                NOW + 1,
-                new Uint8Array(16).fill(2),
-            );
-            expect(selectDeviceRosterChild(left, [right])).toBeUndefined();
-            const revoked = revokeDeviceFromRoster(
-                left,
-                account,
-                author,
-                device.publicKey,
-                NOW + 2,
-                new Uint8Array(16).fill(3),
-            );
-            expect(isActiveDevice(revoked, device.publicKey)).toBe(false);
-            expect(() => parseDeviceRoster(flip(serializeDeviceRoster(revoked)))).toThrow();
-        } finally {
-            zeroBytes(material.ephemeralSecretKey);
-            destroyIdentity(account);
-            destroyIdentity(author);
-            destroyIdentity(device);
-            destroyIdentity(forkDevice);
-        }
-    });
-
-    test("ADV-11 reset-announcement poison is terminal and cannot starve later session traffic", async () => {
-        const fixture = relayFixture();
-        const aliceIdentity = generateIdentityKeyPair();
-        const bobIdentity = generateIdentityKeyPair();
-        const attacker = generateIdentityKeyPair();
-        const attackerAccount = generateIdentityKeyPair();
-        const alice = await MurmurClient.open({
-            identity: aliceIdentity,
-            transport: fixture.transport,
-            store: new MemoryMurmurStore(),
-            now: () => NOW,
-        });
-        const bob = await MurmurClient.open({
-            identity: bobIdentity,
-            transport: fixture.transport,
-            store: new MemoryMurmurStore(),
-            now: () => NOW,
-        });
-        try {
-            const initialRoster = createInitialDeviceRoster(
-                attackerAccount,
-                attacker,
-                NOW,
-                new Uint8Array(16).fill(1),
-            );
-            const resetRoster = resetDeviceInRoster(
-                initialRoster,
-                attackerAccount,
-                attacker,
-                attacker.publicKey,
-                NOW + 1,
-                new Uint8Array(16).fill(2),
-            );
-            expect(resetRoster.devices[0]).toMatchObject({ resetGeneration: 1 });
-            const packet = encodeAccountSyncPacket({
-                version: 1,
-                type: "admission",
-                roster: serializeDeviceRoster(resetRoster),
-                keyPackage: utf8Encode("adversarial reset KeyPackage"),
-            });
-            expect(decodeAccountSyncPacket(packet)).toMatchObject({ type: "admission" });
-            const packetJson = objectJson(packet);
-            for (const malformed of [
-                packet.slice(0, -1),
-                utf8Encode(JSON.stringify({ ...packetJson, unknown: true })),
-                utf8Encode(utf8Decode(packet).replace("{", '{"version":1,')),
-            ]) {
-                expect(() => decodeAccountSyncPacket(malformed)).toThrow();
-            }
-
-            const session = await alice.createSession({
-                descriptor: utf8Encode("reset-announcement-adversarial"),
-                members: [await bob.createKeyPackage()],
-            });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.activateSession(session.id);
-
-            await fixture.transport.publish(
-                delivery(attacker, [bobIdentity.publicKey], new Uint8Array([5, 0x7b])),
-            );
-            await fixture.transport.publish(
-                delivery(
-                    attacker,
-                    [bobIdentity.publicKey],
-                    encodeAccountResetCiphertext({
-                        ephemeralPublicKey: new Uint8Array(32),
-                        nonce: new Uint8Array(12),
-                        ciphertext: new Uint8Array(16),
-                    }),
-                ),
-            );
-            await alice.send(session.id, utf8Encode("valid-after-reset-poison"));
-            await alice.synchronize({ waitMilliseconds: 0 });
-
-            const updates: MurmurUpdate[] = [];
-            const synchronized = await bob.synchronize(
-                { waitMilliseconds: 0 },
-                {
-                    onUpdates: async (batch) => {
-                        updates.push(...batch);
-                    },
-                },
-            );
-            expect(synchronized.inbox).toMatchObject({ processed: 1, rejected: 2 });
-            expect(updates.map((update) => utf8Decode(update.bytes))).toEqual([
-                "valid-after-reset-poison",
-            ]);
-            expect(await bob.session(session.id)).toMatchObject({ status: "active" });
-        } finally {
-            alice.close();
-            bob.close();
-            await closeFixture(fixture, [aliceIdentity, bobIdentity, attacker, attackerAccount]);
-        }
-    });
 
     test("ADV-13 strict HTTP and response framing recovers after malformed inputs", async () => {
         const maximumJsonBodyBytes = 4_200;
@@ -1379,8 +1162,13 @@ describe("adversarial inputs and resource limits", () => {
         const peer = generateIdentityKeyPair();
         const signed = delivery(identity, [peer.publicKey], utf8Encode("mutation-control"));
         const signedBytes = utf8Encode(JSON.stringify(signedDeliveryToJson(signed)));
-        const link = createDeviceLinkMaterial(peer, utf8Encode("mutation-key-package"), NOW);
-        const request = serializeDeviceLinkRequest(link.request);
+        const rosterMutation = encodeDeviceRosterMutation({
+            version: 1,
+            type: "register",
+            deviceKey: peer.publicKey,
+            resetGeneration: 0,
+            keyPackage: utf8Encode("mutation-key-package"),
+        });
         const roles = encodeSessionRoles({
             owner: identity.publicKey,
             admins: [peer.publicKey],
@@ -1396,10 +1184,10 @@ describe("adversarial inputs and resource limits", () => {
                 },
             },
             {
-                name: "provisioning-request",
-                bytes: request,
+                name: "roster-mutation",
+                bytes: rosterMutation,
                 parse: (value: Uint8Array): void => {
-                    parseDeviceLinkRequest(value, NOW);
+                    decodeDeviceRosterMutation(value);
                 },
             },
             {
@@ -1452,7 +1240,6 @@ describe("adversarial inputs and resource limits", () => {
                 expect(() => artifact.parse(artifact.bytes)).not.toThrow();
             }
         } finally {
-            zeroBytes(link.ephemeralSecretKey);
             destroyIdentity(identity);
             destroyIdentity(peer);
         }

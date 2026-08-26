@@ -1,8 +1,8 @@
 # Sessions
 
-`MurmurClient` is the stateful public facade. It owns identity restoration,
-bare KeyPackage creation, session lifecycle, device linking, service routing,
-durable synchronization, and cleanup.
+`MurmurClient` is the stateful public facade. It owns account restoration,
+device self-registration, bare KeyPackage creation, session lifecycle, service
+routing, durable synchronization, and cleanup.
 
 ```text
 bare KeyPackage -> sealed Welcome -> pending session -> activate or ignore

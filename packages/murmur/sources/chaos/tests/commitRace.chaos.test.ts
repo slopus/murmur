@@ -3,6 +3,7 @@ import { describe, expect, test } from "vitest";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
 import type {
     DeliveryFetch,
+    DeliveryDeviceRoster,
     DeliveryPublishOutcome,
     DeliveryTransport,
     InboxAcknowledgement,
@@ -218,6 +219,23 @@ class GatedTransport implements DeliveryTransport {
     ): Promise<InboxAcknowledgement> {
         this.acknowledgements.push(request.through);
         return this.#delegate.acknowledge(request, signal);
+    }
+
+    async readDeviceRoster(
+        accountKey: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster | undefined> {
+        return this.#delegate.readDeviceRoster?.(accountKey, signal);
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster> {
+        if (this.#delegate.mutateDeviceRoster === undefined) {
+            throw new Error("Delivery transport does not support device rosters");
+        }
+        return this.#delegate.mutateDeviceRoster(delivery, signal);
     }
 }
 
@@ -1538,7 +1556,7 @@ describe("Commit race and intent convergence chaos", () => {
     );
 
     scenarioFails(
-        "RACE-19 relay-first winner survives loser continuity reset and re-admission",
+        "RACE-19 relay-first winner survives loser continuity reset and roster convergence",
         "PRODUCT FINDING RACE-19/I06/I15/I24",
         { timeout: 120_000 },
         async () => {
@@ -1571,7 +1589,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await transport.publish(
                     createSignedDelivery(
                         expiringSender,
-                        [fixture.bob.client.identity],
+                        [fixture.bob.client.deviceKey],
                         utf8Encode("race-continuity-loss"),
                         {
                             createdAt: fixture.clock.now(),
@@ -1615,6 +1633,10 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(await fixture.bob.client.session(fixture.session.id)).toBeUndefined();
                 await assertNoOrphans([fixture.bob]);
 
+                await fixture.alice.client.send(
+                    fixture.session.id,
+                    utf8Encode("refresh restored race roster"),
+                );
                 for (let cycle = 0; cycle < 12; cycle += 1) {
                     for (const actor of [fixture.alice, fixture.carol, fixture.bob]) {
                         try {
@@ -1631,50 +1653,30 @@ describe("Commit race and intent convergence chaos", () => {
                 await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
                     {
                         status: "pending",
-                        reAdmission: true,
                     },
                 );
                 await fixture.bob.client.activateSession(fixture.session.id);
                 await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
                     {
                         status: "active",
-                        reAdmission: true,
                     },
                 );
-                let convergenceFailure: unknown;
-                try {
-                    await settle(fixture, fixture.session.id, ["alice", "carol", "bob"], 80);
-                } catch (error: unknown) {
-                    convergenceFailure = error;
-                }
-                if (
-                    convergenceFailure !== undefined &&
-                    (!(convergenceFailure instanceof Error) ||
-                        convergenceFailure.message !== "Invalid device credential")
-                ) {
-                    throw new Error("Unexpected post-readmission race failure", {
-                        cause: convergenceFailure,
-                    });
-                }
-                expect(
-                    convergenceFailure,
-                    "PRODUCT FINDING RACE-19/I06/I15/I24: the freshly re-admitted race loser rejects the first post-activation Commit credential",
-                ).toBeUndefined();
+                await settle(fixture, fixture.session.id, ["alice", "carol", "bob"], 80);
                 const terminal = await fixture.alice.client.session(fixture.session.id);
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
                 expect(memberCount(terminal, fixture.bob)).toBe(1);
-                expect(memberCount(terminal, fixture.carol)).toBe(1);
+                expect(
+                    memberCount(terminal, fixture.carol),
+                    "PRODUCT FINDING RACE-19/I06/I15/I24: the relay-first winner must retain Carol after restored-device convergence",
+                ).toBe(1);
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol]) {
                     expect(publicSession(await actor.client.session(fixture.session.id))).toEqual(
                         publicSession(terminal),
                     );
                 }
-                expect((await fixture.bob.client.session(fixture.session.id))?.reAdmission).toBe(
-                    true,
-                );
                 await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
             } finally {
                 destroyIdentity(expiringSender);

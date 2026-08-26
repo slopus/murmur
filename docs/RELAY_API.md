@@ -20,6 +20,24 @@ interface PublishResponse {
 }
 ```
 
+An account-targeted delivery includes exact account keys and source roster
+revisions. A `409 stale_roster` response includes the relay's current roster so
+the sender can durably retarget and retry. Deliveries with no account targets
+retain pure exact-inbox semantics.
+
+## `POST /v1/device-rosters/read`
+
+Accepts `{ accountKey }` for one exact public account identity. Returns the
+current roster, including its revision, active device keys, reset generations,
+and current MLS admission KeyPackages, or `404` when no roster exists.
+
+## `POST /v1/device-rosters/mutate`
+
+Accepts an account-identity-signed ordinary delivery whose ciphertext is one
+strict register or remove mutation. The relay replay-protects the mutation and
+atomically commits both the current roster and the notification queued to every
+post-mutation device inbox. Success returns the resulting roster.
+
 ## `POST /v1/queue/read`
 
 Accepts a signed queue-read request and returns:
@@ -59,7 +77,7 @@ Regressing or future acknowledgements fail closed.
 
 - `400` malformed or noncanonical input;
 - `401` invalid identity, signature, time, or recipient authorization;
-- `409` cursor or acknowledgement continuity conflict;
+- `409` cursor, acknowledgement, replay, reset-generation, or stale-roster conflict;
 - `413` request, ciphertext, recipient set, or response head exceeds a bound;
 - `429` sender, recipient, ingress-principal, or address-rate quota exceeded;
 - `503` global storage pressure or unavailable backing state.

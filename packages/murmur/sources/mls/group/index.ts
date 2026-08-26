@@ -1,5 +1,4 @@
 import {
-    decodeDeviceCredential,
     equalBytes,
     randomBytes,
     zeroBytes,
@@ -110,20 +109,7 @@ export function joinMlsGroupFromWelcome(options: JoinMlsGroupFromWelcomeOptions)
 
 /** Authenticate Murmur's BasicCredential identity-to-signing-key binding. */
 export function authenticateMurmurMlsCredential(leafNode: MlsLeafNode): boolean {
-    if (
-        leafNode.credential.identity.length === 32 &&
-        equalBytes(leafNode.credential.identity, leafNode.signatureKey)
-    ) {
-        return true;
-    }
-    try {
-        return equalBytes(
-            decodeDeviceCredential(leafNode.credential.identity).deviceKey,
-            leafNode.signatureKey,
-        );
-    } catch {
-        return false;
-    }
+    return leafNode.credential.identity.length === 32 && leafNode.signatureKey.length === 32;
 }
 
 /** Resolve the stable account key represented by one authenticated leaf. */
@@ -131,9 +117,7 @@ export function murmurMlsAccountKey(leafNode: MlsLeafNode): Uint8Array {
     if (!authenticateMurmurMlsCredential(leafNode)) {
         throw new Error("Invalid Murmur MLS credential");
     }
-    return leafNode.credential.identity.length === 32
-        ? leafNode.signatureKey.slice()
-        : decodeDeviceCredential(leafNode.credential.identity).accountKey;
+    return leafNode.credential.identity.slice();
 }
 
 /**

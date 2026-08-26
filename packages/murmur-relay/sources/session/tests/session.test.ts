@@ -198,6 +198,10 @@ describe("negotiated relay sessions", () => {
                         id: delivery.id,
                         sender: encodeBase64Url(delivery.sender),
                         recipients: delivery.recipients.map(encodeBase64Url),
+                        targetAccounts: delivery.targetAccounts.map((target) => ({
+                            accountKey: encodeBase64Url(target.accountKey),
+                            rosterRevision: target.rosterRevision,
+                        })),
                         createdAt: delivery.createdAt,
                         expiresAt: delivery.expiresAt,
                         ciphertext: encodeBase64Url(delivery.ciphertext),

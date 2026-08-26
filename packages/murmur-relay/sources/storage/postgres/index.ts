@@ -1,8 +1,11 @@
 import {
     RelayError,
+    deviceRosterToJson,
     deliveryFingerprint,
     parseSignedDelivery,
     type SignedDelivery,
+    type DeviceRoster,
+    type DeviceRosterMutation,
 } from "../../protocol/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
@@ -86,186 +89,242 @@ export class PostgresRelayStore implements RelayStore {
             throw new Error("Invalid admission principal");
         }
         await this.pruneExpired(now);
-        return this.#database.transaction(async (transaction) => {
-            await transaction.query(
-                "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
-            );
-            const globalResult = await transaction.query<{
-                last_event_id: unknown;
-                generation_seed: unknown;
-                pending_items: unknown;
-                pending_bytes: unknown;
-                pending_references: unknown;
-            }>(
-                `SELECT last_event_id, generation_seed, pending_items, pending_bytes,
+        return this.#database.transaction((transaction) =>
+            this.#publishWithQuery(transaction, delivery, now, limits, admissionPrincipal),
+        );
+    }
+
+    async #publishWithQuery(
+        transaction: PostgresQuery,
+        delivery: SignedDelivery,
+        now: number,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<PublishOutcome> {
+        await transaction.query(
+            "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
+        );
+        const globalResult = await transaction.query<{
+            last_event_id: unknown;
+            generation_seed: unknown;
+            pending_items: unknown;
+            pending_bytes: unknown;
+            pending_references: unknown;
+        }>(
+            `SELECT last_event_id, generation_seed, pending_items, pending_bytes,
                         pending_references
                  FROM murmur_queue_global WHERE singleton = 1`,
-            );
-            const global = globalResult.rows[0];
-            if (global === undefined) throw new Error("Missing global queue state");
+        );
+        const global = globalResult.rows[0];
+        if (global === undefined) throw new Error("Missing global queue state");
 
-            const fingerprint = deliveryFingerprint(delivery);
-            const existing = await transaction.query<{
-                event_id: unknown;
-                fingerprint: unknown;
-            }>(
-                `SELECT event_id, fingerprint FROM murmur_queue_deliveries
-                 WHERE sender = $1 AND delivery_id = $2`,
-                [delivery.sender, delivery.id],
+        const staleRosters: DeviceRoster[] = [];
+        const currentRosters: DeviceRoster[] = [];
+        for (const target of delivery.targetAccounts) {
+            const roster = await this.#readDeviceRosterWithQuery(
+                transaction,
+                target.accountKey,
+                true,
             );
-            const duplicate = existing.rows[0];
-            if (duplicate !== undefined) {
-                const storedFingerprint = copyBytes(duplicate.fingerprint, "delivery fingerprint");
-                if (!equalBytes(storedFingerprint, fingerprint)) {
-                    throw new RelayError(409, "Delivery identifier collision", {
-                        error: "id_collision",
-                    });
-                }
-                await this.#notifyRecipients(transaction, delivery.recipients);
-                return {
-                    eventId: textColumn(duplicate.event_id, "event ID"),
-                    duplicate: true,
-                };
-            }
-
-            const encoded = encodeStoredDelivery(delivery);
-            if (
-                bigintColumn(global.pending_items) + 1n > BigInt(limits.maximumGlobalItems) ||
-                bigintColumn(global.pending_bytes) + BigInt(encoded.encodedBytes) >
-                    BigInt(limits.maximumGlobalBytes) ||
-                bigintColumn(global.pending_references) + BigInt(delivery.recipients.length) >
-                    BigInt(limits.maximumGlobalReferences)
-            ) {
-                throw new RelayError(503, "Relay pending-storage quota exceeded", {
-                    error: "relay_full",
+            if (roster === undefined) {
+                throw new RelayError(409, "Target account has no registered devices", {
+                    error: "roster_missing",
+                    accountKey: encodeBase64Url(target.accountKey),
                 });
             }
-            const admissionUsage = await transaction.query<{ reference_count: unknown }>(
-                `SELECT COUNT(*) AS reference_count
+            currentRosters.push(roster);
+            if (
+                roster.revision !== target.rosterRevision ||
+                roster.devices.some(
+                    (entry) =>
+                        !delivery.recipients.some((recipient) =>
+                            equalBytes(recipient, entry.deviceKey),
+                        ),
+                )
+            ) {
+                staleRosters.push(roster);
+            }
+        }
+        if (staleRosters.length === 0 && currentRosters.length > 0) {
+            const currentDevices = new Set(
+                currentRosters.flatMap((roster) =>
+                    roster.devices.map((entry) => encodeBase64Url(entry.deviceKey)),
+                ),
+            );
+            if (
+                currentDevices.size !== delivery.recipients.length ||
+                delivery.recipients.some(
+                    (recipient) => !currentDevices.has(encodeBase64Url(recipient)),
+                )
+            ) {
+                staleRosters.push(...currentRosters);
+            }
+        }
+        if (staleRosters.length > 0) {
+            throw new RelayError(409, "Delivery does not match current account devices", {
+                error: "stale_roster",
+                rosters: staleRosters.map(deviceRosterToJson),
+            });
+        }
+
+        const fingerprint = deliveryFingerprint(delivery);
+        const existing = await transaction.query<{
+            event_id: unknown;
+            fingerprint: unknown;
+        }>(
+            `SELECT event_id, fingerprint FROM murmur_queue_deliveries
+                 WHERE sender = $1 AND delivery_id = $2`,
+            [delivery.sender, delivery.id],
+        );
+        const duplicate = existing.rows[0];
+        if (duplicate !== undefined) {
+            const storedFingerprint = copyBytes(duplicate.fingerprint, "delivery fingerprint");
+            if (!equalBytes(storedFingerprint, fingerprint)) {
+                throw new RelayError(409, "Delivery identifier collision", {
+                    error: "id_collision",
+                });
+            }
+            await this.#notifyRecipients(transaction, delivery.recipients);
+            return {
+                eventId: textColumn(duplicate.event_id, "event ID"),
+                duplicate: true,
+            };
+        }
+
+        const encoded = encodeStoredDelivery(delivery);
+        if (
+            bigintColumn(global.pending_items) + 1n > BigInt(limits.maximumGlobalItems) ||
+            bigintColumn(global.pending_bytes) + BigInt(encoded.encodedBytes) >
+                BigInt(limits.maximumGlobalBytes) ||
+            bigintColumn(global.pending_references) + BigInt(delivery.recipients.length) >
+                BigInt(limits.maximumGlobalReferences)
+        ) {
+            throw new RelayError(503, "Relay pending-storage quota exceeded", {
+                error: "relay_full",
+            });
+        }
+        const admissionUsage = await transaction.query<{ reference_count: unknown }>(
+            `SELECT COUNT(*) AS reference_count
                  FROM murmur_queue_references
                  WHERE admission_principal = $1`,
-                [admissionPrincipal],
-            );
-            const admissionUsageRow = admissionUsage.rows[0];
-            if (admissionUsageRow === undefined) {
-                throw new Error("Missing admission-principal usage result");
-            }
-            if (
-                bigintColumn(admissionUsageRow.reference_count) +
-                    BigInt(delivery.recipients.length) >
-                BigInt(limits.maximumAdmissionReferences)
-            ) {
-                throw new RelayError(429, "Admission-principal fanout quota exceeded", {
-                    error: "admission_full",
-                });
-            }
-            const senderUsage = await transaction.query<{
-                item_count: unknown;
-                byte_count: unknown;
-                reference_count: unknown;
-            }>(
-                `SELECT COUNT(*) AS item_count,
+            [admissionPrincipal],
+        );
+        const admissionUsageRow = admissionUsage.rows[0];
+        if (admissionUsageRow === undefined) {
+            throw new Error("Missing admission-principal usage result");
+        }
+        if (
+            bigintColumn(admissionUsageRow.reference_count) + BigInt(delivery.recipients.length) >
+            BigInt(limits.maximumAdmissionReferences)
+        ) {
+            throw new RelayError(429, "Admission-principal fanout quota exceeded", {
+                error: "admission_full",
+            });
+        }
+        const senderUsage = await transaction.query<{
+            item_count: unknown;
+            byte_count: unknown;
+            reference_count: unknown;
+        }>(
+            `SELECT COUNT(*) AS item_count,
                         COALESCE(SUM(encoded_bytes), 0) AS byte_count,
                         (SELECT COUNT(*)
                          FROM murmur_queue_references
                          WHERE sender = $1) AS reference_count
                  FROM murmur_queue_deliveries
                  WHERE sender = $1`,
-                [delivery.sender],
-            );
-            const senderUsageRow = senderUsage.rows[0];
-            if (senderUsageRow === undefined) throw new Error("Missing sender usage result");
-            if (
-                bigintColumn(senderUsageRow.item_count) + 1n > BigInt(limits.maximumSenderItems) ||
-                bigintColumn(senderUsageRow.byte_count) + BigInt(encoded.encodedBytes) >
-                    BigInt(limits.maximumSenderBytes) ||
-                bigintColumn(senderUsageRow.reference_count) + BigInt(delivery.recipients.length) >
-                    BigInt(limits.maximumSenderReferences)
-            ) {
-                throw new RelayError(429, "Sender pending-storage quota exceeded", {
-                    error: "sender_full",
-                });
-            }
-            const lastEventId = nullableTextColumn(global.last_event_id, "last event ID");
-            const eventId = nextUuidV7(now, lastEventId);
-            const targetValues = delivery.recipients
-                .map((_, index) => `($${index + 1}::bytea)`)
-                .join(", ");
-            const targetParameters = [...delivery.recipients];
-            const generationSeed = copyBytes(global.generation_seed, "generation seed");
-            const queueParameters: (Uint8Array | string)[] = [];
-            const queueValues = delivery.recipients
-                .map((recipient, index) => {
-                    queueParameters.push(
-                        recipient,
-                        initialLossGeneration(generationSeed, recipient),
-                    );
-                    return `($${index * 2 + 1}::bytea, $${index * 2 + 2}::bytea)`;
-                })
-                .join(", ");
-            await transaction.query(
-                `INSERT INTO murmur_queues
+            [delivery.sender],
+        );
+        const senderUsageRow = senderUsage.rows[0];
+        if (senderUsageRow === undefined) throw new Error("Missing sender usage result");
+        if (
+            bigintColumn(senderUsageRow.item_count) + 1n > BigInt(limits.maximumSenderItems) ||
+            bigintColumn(senderUsageRow.byte_count) + BigInt(encoded.encodedBytes) >
+                BigInt(limits.maximumSenderBytes) ||
+            bigintColumn(senderUsageRow.reference_count) + BigInt(delivery.recipients.length) >
+                BigInt(limits.maximumSenderReferences)
+        ) {
+            throw new RelayError(429, "Sender pending-storage quota exceeded", {
+                error: "sender_full",
+            });
+        }
+        const lastEventId = nullableTextColumn(global.last_event_id, "last event ID");
+        const eventId = nextUuidV7(now, lastEventId);
+        const targetValues = delivery.recipients
+            .map((_, index) => `($${index + 1}::bytea)`)
+            .join(", ");
+        const targetParameters = [...delivery.recipients];
+        const generationSeed = copyBytes(global.generation_seed, "generation seed");
+        const queueParameters: (Uint8Array | string)[] = [];
+        const queueValues = delivery.recipients
+            .map((recipient, index) => {
+                queueParameters.push(recipient, initialLossGeneration(generationSeed, recipient));
+                return `($${index * 2 + 1}::bytea, $${index * 2 + 2}::bytea)`;
+            })
+            .join(", ");
+        await transaction.query(
+            `INSERT INTO murmur_queues
                     (recipient, head, head_sequence, next_sequence, acknowledged_through,
                      acknowledged_sequence, loss_generation, pending_items, pending_bytes)
                  SELECT target.recipient, $${queueParameters.length + 1}::uuid, 1, 2,
                         NULL, 0, target.loss_generation, 0, 0
                  FROM (VALUES ${queueValues}) AS target(recipient, loss_generation)
                  ON CONFLICT DO NOTHING`,
-                [...queueParameters, eventId],
-            );
-            const recipientUsage = await transaction.query<{
-                item_count: unknown;
-                byte_count: unknown;
-            }>(
-                `SELECT queue.pending_items AS item_count,
+            [...queueParameters, eventId],
+        );
+        const recipientUsage = await transaction.query<{
+            item_count: unknown;
+            byte_count: unknown;
+        }>(
+            `SELECT queue.pending_items AS item_count,
                         queue.pending_bytes AS byte_count
                  FROM murmur_queues AS queue
                  JOIN (VALUES ${targetValues}) AS target(recipient)
                    ON queue.recipient = target.recipient
                  ORDER BY queue.recipient
                  FOR UPDATE OF queue`,
-                targetParameters,
-            );
-            if (recipientUsage.rows.length !== delivery.recipients.length) {
-                throw new Error("Postgres recipient usage did not cover every target");
+            targetParameters,
+        );
+        if (recipientUsage.rows.length !== delivery.recipients.length) {
+            throw new Error("Postgres recipient usage did not cover every target");
+        }
+        for (const row of recipientUsage.rows) {
+            if (
+                bigintColumn(row.item_count) >= BigInt(limits.maximumItems) ||
+                bigintColumn(row.byte_count) + BigInt(encoded.encodedBytes) >
+                    BigInt(limits.maximumBytes)
+            ) {
+                throw new RelayError(429, "Recipient queue quota exceeded", {
+                    error: "queue_full",
+                });
             }
-            for (const row of recipientUsage.rows) {
-                if (
-                    bigintColumn(row.item_count) >= BigInt(limits.maximumItems) ||
-                    bigintColumn(row.byte_count) + BigInt(encoded.encodedBytes) >
-                        BigInt(limits.maximumBytes)
-                ) {
-                    throw new RelayError(429, "Recipient queue quota exceeded", {
-                        error: "queue_full",
-                    });
-                }
-            }
-            await transaction.query(
-                `UPDATE murmur_queue_global
+        }
+        await transaction.query(
+            `UPDATE murmur_queue_global
                  SET last_event_id = $1,
                      pending_items = pending_items + 1,
                      pending_bytes = pending_bytes + $2,
                      pending_references = pending_references + $3
                  WHERE singleton = 1`,
-                [eventId, encoded.encodedBytes, delivery.recipients.length],
-            );
-            await transaction.query(
-                `INSERT INTO murmur_queue_deliveries
+            [eventId, encoded.encodedBytes, delivery.recipients.length],
+        );
+        await transaction.query(
+            `INSERT INTO murmur_queue_deliveries
                     (sender, delivery_id, event_id, fingerprint, delivery_json,
                      encoded_bytes, expires_at)
                  VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
-                [
-                    delivery.sender,
-                    delivery.id,
-                    eventId,
-                    fingerprint,
-                    encoded.json,
-                    encoded.encodedBytes,
-                    delivery.expiresAt.toString(),
-                ],
-            );
-            await transaction.query(
-                `UPDATE murmur_queues AS queue
+            [
+                delivery.sender,
+                delivery.id,
+                eventId,
+                fingerprint,
+                encoded.json,
+                encoded.encodedBytes,
+                delivery.expiresAt.toString(),
+            ],
+        );
+        await transaction.query(
+            `UPDATE murmur_queues AS queue
                  SET head = $${targetParameters.length + 1}::uuid,
                      head_sequence = CASE
                          WHEN queue.head = $${targetParameters.length + 1}::uuid
@@ -277,10 +336,10 @@ export class PostgresRelayStore implements RelayStore {
                      pending_bytes = queue.pending_bytes + $${targetParameters.length + 2}
                  FROM (VALUES ${targetValues}) AS target(recipient)
                  WHERE queue.recipient = target.recipient`,
-                [...targetParameters, eventId, encoded.encodedBytes],
-            );
-            await transaction.query(
-                `INSERT INTO murmur_queue_references
+            [...targetParameters, eventId, encoded.encodedBytes],
+        );
+        await transaction.query(
+            `INSERT INTO murmur_queue_references
                     (recipient, event_id, sequence, sender, delivery_id, encoded_bytes,
                      admission_principal)
                  SELECT target.recipient, $${targetParameters.length + 1}::uuid,
@@ -290,18 +349,17 @@ export class PostgresRelayStore implements RelayStore {
                         $${targetParameters.length + 5}::bytea
                  FROM (VALUES ${targetValues}) AS target(recipient)
                  JOIN murmur_queues AS queue ON queue.recipient = target.recipient`,
-                [
-                    ...targetParameters,
-                    eventId,
-                    delivery.sender,
-                    delivery.id,
-                    encoded.encodedBytes,
-                    admissionPrincipal,
-                ],
-            );
-            await this.#notifyRecipients(transaction, delivery.recipients);
-            return { eventId, duplicate: false };
-        });
+            [
+                ...targetParameters,
+                eventId,
+                delivery.sender,
+                delivery.id,
+                encoded.encodedBytes,
+                admissionPrincipal,
+            ],
+        );
+        await this.#notifyRecipients(transaction, delivery.recipients);
+        return { eventId, duplicate: false };
     }
 
     async readQueue(
@@ -444,6 +502,162 @@ export class PostgresRelayStore implements RelayStore {
                 exhausted: selection.exhausted,
             };
         }, "repeatable read");
+    }
+
+    async readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined> {
+        this.#assertOpen();
+        return this.#database.connection((connection) =>
+            this.#readDeviceRosterWithQuery(connection, accountKey, false),
+        );
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        mutation: DeviceRosterMutation,
+        now: number,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<DeviceRoster> {
+        this.#assertOpen();
+        await this.pruneExpired(now);
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
+            );
+            const current = await this.#readDeviceRosterWithQuery(
+                transaction,
+                delivery.sender,
+                true,
+            );
+            const replay = await transaction.query(
+                `SELECT 1 AS present FROM murmur_device_roster_nonces
+                 WHERE account_key = $1 AND nonce = $2`,
+                [delivery.sender, delivery.id],
+            );
+            if (replay.rows.length > 0) {
+                throw new RelayError(409, "Device roster mutation was already used", {
+                    error: "replay",
+                });
+            }
+            const devices = new Map(
+                (current?.devices ?? []).map((entry) => [encodeBase64Url(entry.deviceKey), entry]),
+            );
+            const admissions = new Map(
+                (current?.admissions ?? []).map((entry) => [
+                    encodeBase64Url(entry.deviceKey),
+                    entry,
+                ]),
+            );
+            const encodedDevice = encodeBase64Url(mutation.deviceKey);
+            const existing = devices.get(encodedDevice);
+            if (mutation.type === "register") {
+                const expectedGeneration =
+                    existing === undefined ? 0 : existing.resetGeneration + 1;
+                if (mutation.resetGeneration !== expectedGeneration) {
+                    throw new RelayError(409, "Device reset generation is stale", {
+                        error: "reset_generation",
+                        expectedGeneration,
+                    });
+                }
+                devices.set(encodedDevice, {
+                    deviceKey: mutation.deviceKey,
+                    resetGeneration: mutation.resetGeneration,
+                });
+                admissions.set(encodedDevice, {
+                    deviceKey: mutation.deviceKey,
+                    keyPackage: mutation.keyPackage,
+                });
+            } else {
+                if (
+                    existing === undefined ||
+                    mutation.resetGeneration !== existing.resetGeneration
+                ) {
+                    throw new RelayError(409, "Device removal names stale roster state", {
+                        error: "reset_generation",
+                        expectedGeneration: existing?.resetGeneration ?? null,
+                    });
+                }
+                devices.delete(encodedDevice);
+                admissions.delete(encodedDevice);
+            }
+            const sortedDevices = [...devices.values()].sort((left, right) => {
+                for (let index = 0; index < left.deviceKey.length; index += 1) {
+                    const difference = left.deviceKey[index]! - right.deviceKey[index]!;
+                    if (difference !== 0) return difference;
+                }
+                return 0;
+            });
+            if (
+                delivery.targetAccounts.length !== 0 ||
+                delivery.recipients.length !== sortedDevices.length ||
+                sortedDevices.some(
+                    (entry, index) => !equalBytes(entry.deviceKey, delivery.recipients[index]!),
+                )
+            ) {
+                throw new RelayError(409, "Roster mutation recipients are stale", {
+                    error: "stale_roster",
+                    ...(current === undefined ? {} : { rosters: [deviceRosterToJson(current)] }),
+                });
+            }
+            const revision = (current?.revision ?? 0) + 1;
+            await transaction.query(
+                `INSERT INTO murmur_device_rosters (account_key, revision)
+                 VALUES ($1, $2)
+                 ON CONFLICT (account_key) DO UPDATE SET revision = excluded.revision`,
+                [delivery.sender, revision],
+            );
+            await transaction.query(
+                "DELETE FROM murmur_device_roster_devices WHERE account_key = $1",
+                [delivery.sender],
+            );
+            for (const entry of sortedDevices) {
+                const storedAdmission = admissions.get(encodeBase64Url(entry.deviceKey));
+                if (storedAdmission === undefined) throw new Error("Missing roster admission");
+                await transaction.query(
+                    `INSERT INTO murmur_device_roster_devices
+                        (account_key, device_key, reset_generation, key_package)
+                     VALUES ($1, $2, $3, $4)`,
+                    [
+                        delivery.sender,
+                        entry.deviceKey,
+                        entry.resetGeneration,
+                        storedAdmission.keyPackage,
+                    ],
+                );
+            }
+            await transaction.query(
+                `INSERT INTO murmur_device_roster_nonces (account_key, nonce, created_at)
+                 VALUES ($1, $2, $3)`,
+                [delivery.sender, delivery.id, now],
+            );
+            const roster: DeviceRoster = {
+                version: 1,
+                accountKey: delivery.sender.slice(),
+                revision,
+                devices: sortedDevices.map((entry) => ({
+                    deviceKey: entry.deviceKey.slice(),
+                    resetGeneration: entry.resetGeneration,
+                })),
+                admissions: sortedDevices.map((entry) => {
+                    const value = admissions.get(encodeBase64Url(entry.deviceKey));
+                    if (value === undefined) throw new Error("Missing roster admission");
+                    return {
+                        deviceKey: entry.deviceKey.slice(),
+                        keyPackage: value.keyPackage.slice(),
+                    };
+                }),
+            };
+            if (delivery.recipients.length > 0) {
+                await this.#publishWithQuery(
+                    transaction,
+                    delivery,
+                    now,
+                    limits,
+                    admissionPrincipal,
+                );
+            }
+            return roster;
+        });
     }
 
     async acknowledge(
@@ -636,6 +850,42 @@ export class PostgresRelayStore implements RelayStore {
             this.#closed = true;
             await this.#database.close();
         }
+    }
+
+    async #readDeviceRosterWithQuery(
+        query: PostgresQuery,
+        accountKey: Uint8Array,
+        lock: boolean,
+    ): Promise<DeviceRoster | undefined> {
+        const roster = await query.query<{ revision: unknown }>(
+            `SELECT revision FROM murmur_device_rosters WHERE account_key = $1${lock ? " FOR UPDATE" : ""}`,
+            [accountKey],
+        );
+        const row = roster.rows[0];
+        if (row === undefined) return undefined;
+        const entries = await query.query<{
+            device_key: unknown;
+            reset_generation: unknown;
+            key_package: unknown;
+        }>(
+            `SELECT device_key, reset_generation, key_package
+             FROM murmur_device_roster_devices
+             WHERE account_key = $1 ORDER BY device_key`,
+            [accountKey],
+        );
+        return {
+            version: 1,
+            accountKey: accountKey.slice(),
+            revision: safeNumberColumn(row.revision),
+            devices: entries.rows.map((entry) => ({
+                deviceKey: copyBytes(entry.device_key, "roster device key"),
+                resetGeneration: safeNumberColumn(entry.reset_generation),
+            })),
+            admissions: entries.rows.map((entry) => ({
+                deviceKey: copyBytes(entry.device_key, "roster device key"),
+                keyPackage: copyBytes(entry.key_package, "roster KeyPackage"),
+            })),
+        };
     }
 
     async #notifyRecipients(

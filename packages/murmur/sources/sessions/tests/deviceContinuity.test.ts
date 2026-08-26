@@ -59,7 +59,7 @@ describe("device inbox continuity", () => {
                 fetch: relayFetch(relay),
             });
             await transport.publish(
-                createSignedDelivery(expiringSender, [bob.identity], utf8Encode("will expire"), {
+                createSignedDelivery(expiringSender, [bob.deviceKey], utf8Encode("will expire"), {
                     createdAt: now,
                     expiresAt: now + 1,
                 }),
@@ -109,9 +109,10 @@ describe("device inbox continuity", () => {
             expect(await bobStore.get("murmur/reset/v1/pending")).toBeUndefined();
 
             await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
-                inbox: { processed: 0 },
+                inbox: { processed: 1 },
             });
 
+            await alice.send(created.id, utf8Encode("refresh restored roster"));
             for (let cycle = 0; cycle < 8; cycle += 1) {
                 await alice.synchronize({ waitMilliseconds: 0 });
                 await bob.synchronize({ waitMilliseconds: 0 });
@@ -119,7 +120,6 @@ describe("device inbox continuity", () => {
             await expect(bob.session(created.id)).resolves.toMatchObject({
                 descriptor: created.descriptor,
                 status: "pending",
-                reAdmission: true,
             });
         } finally {
             alice.close();

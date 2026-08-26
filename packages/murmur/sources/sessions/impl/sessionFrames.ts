@@ -14,9 +14,6 @@ import {
 const BOOTSTRAP_KIND = 1;
 const PRIVATE_KIND = 2;
 const COMMIT_KIND = 3;
-const PROVISIONING_KIND = 4;
-const ACCOUNT_RESET_KIND = 5;
-const MAXIMUM_PROVISIONING_BYTES = 256 * 1024;
 const MAXIMUM_FRAME_BYTES = 70 * 1024 * 1024;
 const MAXIMUM_UINT64 = 0xffff_ffff_ffff_ffffn;
 const COMMIT_DOMAIN = utf8Encode("murmur/session-commit/v1");
@@ -141,13 +138,7 @@ export interface BootstrapFrame {
 export type PrivateSessionFrame =
     | { readonly version: 1; readonly type: "application"; readonly bytes: Uint8Array }
     | { readonly version: 1; readonly type: "leave" }
-    | { readonly version: 1; readonly type: "welcome_complete" }
-    | {
-          readonly version: 1;
-          readonly type: "account_roster";
-          readonly roster: Uint8Array;
-          readonly keyPackage?: Uint8Array;
-      };
+    | { readonly version: 1; readonly type: "welcome_complete" };
 
 export interface CommitFrame {
     readonly version: 1;
@@ -160,8 +151,6 @@ export interface CommitFrame {
 export type SessionCiphertext =
     | { readonly kind: "bootstrap"; readonly box: SealedBox }
     | { readonly kind: "private"; readonly message: Uint8Array }
-    | { readonly kind: "provisioning"; readonly envelope: Uint8Array }
-    | { readonly kind: "account_reset"; readonly box: SealedBox }
     | {
           readonly kind: "commit";
           readonly groupId: Uint8Array;
@@ -233,27 +222,6 @@ export function encodeBootstrapCiphertext(box: SealedBox): Uint8Array {
     );
 }
 
-/** Frame one recipient-sealed account reset announcement independent of MLS state. */
-export function encodeAccountResetCiphertext(box: SealedBox): Uint8Array {
-    return prefixed(
-        ACCOUNT_RESET_KIND,
-        canonicalJsonBytes({
-            version: 1,
-            ephemeralPublicKey: encodeBase64Url(box.ephemeralPublicKey),
-            nonce: encodeBase64Url(box.nonce),
-            ciphertext: encodeBase64Url(box.ciphertext),
-        }),
-    );
-}
-
-/** Frame one already-encrypted provisioning envelope for inbox delivery. */
-export function encodeProvisioningCiphertext(envelope: Uint8Array): Uint8Array {
-    if (envelope.length < 1 || envelope.length > MAXIMUM_PROVISIONING_BYTES) {
-        throw new Error("Invalid provisioning envelope delivery");
-    }
-    return prefixed(PROVISIONING_KIND, envelope);
-}
-
 export function encodePrivateCiphertext(message: Uint8Array): Uint8Array {
     if (message.length < 1 || message.length > MAXIMUM_FRAME_BYTES) {
         throw new Error("Invalid MLS private delivery");
@@ -310,14 +278,8 @@ export function parseSessionCiphertext(value: Uint8Array): SessionCiphertext {
     const kind = value[0];
     const body = value.slice(1);
     if (kind === PRIVATE_KIND) return { kind: "private", message: body };
-    if (kind === PROVISIONING_KIND) {
-        if (body.length > MAXIMUM_PROVISIONING_BYTES) {
-            throw new Error("Invalid provisioning envelope delivery");
-        }
-        return { kind: "provisioning", envelope: body };
-    }
     const input = parseJson(body, "session ciphertext");
-    if (kind === BOOTSTRAP_KIND || kind === ACCOUNT_RESET_KIND) {
+    if (kind === BOOTSTRAP_KIND) {
         exact(
             input,
             ["version", "ephemeralPublicKey", "nonce", "ciphertext"],
@@ -325,7 +287,7 @@ export function parseSessionCiphertext(value: Uint8Array): SessionCiphertext {
         );
         if (input.version !== 1) throw new Error("Invalid bootstrap ciphertext");
         return {
-            kind: kind === BOOTSTRAP_KIND ? "bootstrap" : "account_reset",
+            kind: "bootstrap",
             box: {
                 ephemeralPublicKey: bytes(input.ephemeralPublicKey, 32, "box key"),
                 nonce: bytes(input.nonce, 12, "box nonce"),
@@ -451,14 +413,6 @@ export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
             bytes: encodeBase64Url(frame.bytes),
         });
     }
-    if (frame.type === "account_roster") {
-        return canonicalJsonBytes({
-            version: 1,
-            type: frame.type,
-            roster: encodeBase64Url(frame.roster),
-            keyPackage: frame.keyPackage === undefined ? null : encodeBase64Url(frame.keyPackage),
-        });
-    }
     if (frame.type === "leave") {
         return canonicalJsonBytes({ version: 1, type: frame.type });
     }
@@ -479,22 +433,6 @@ export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
             version: 1,
             type: "application",
             bytes: bytes(input.bytes, 1024 * 1024, "application bytes"),
-        };
-    }
-    if (input.type === "account_roster") {
-        exact(input, ["version", "type", "roster", "keyPackage"], "account roster control");
-        if (input.keyPackage !== null && typeof input.keyPackage !== "string") {
-            throw new Error("Invalid account roster control");
-        }
-        return {
-            version: 1,
-            type: "account_roster",
-            roster: bytes(input.roster, 64 * 1024, "account roster"),
-            ...(input.keyPackage === null
-                ? {}
-                : {
-                      keyPackage: bytes(input.keyPackage, 1024 * 1024, "account device KeyPackage"),
-                  }),
         };
     }
     if (input.type === "leave") {

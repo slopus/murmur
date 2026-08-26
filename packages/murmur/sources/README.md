@@ -1,7 +1,7 @@
 # Library sources
 
 ```text
-accounts/   authenticated account-device rosters and provisioning
+accounts/   relay-owned account-device roster state and convergence
 chaos/      deterministic fault-injection support
 crypto/     identity roots, signatures, key agreement, and hashing
 delivery/   signed queue transport, processing, SSE, and WebSocket clients

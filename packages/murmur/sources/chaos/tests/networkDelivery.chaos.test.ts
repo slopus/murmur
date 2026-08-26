@@ -70,6 +70,10 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
         id: delivery.id,
         sender: delivery.sender.slice(),
         recipients: delivery.recipients.map((recipient) => recipient.slice()),
+        targetAccounts: delivery.targetAccounts.map((target) => ({
+            accountKey: target.accountKey.slice(),
+            rosterRevision: target.rosterRevision,
+        })),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),

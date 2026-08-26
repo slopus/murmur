@@ -75,7 +75,6 @@ const RECORD_FIXTURES: readonly RecordFixture[] = Object.freeze([
     record("key-package-expiry", "murmur/key-package-expiries/expiry/reference"),
     record("account-roster", "murmur/accounts/v1/own-roster"),
     record("account-job", "murmur/accounts/v1/convergence/session/device"),
-    record("provisioning", "murmur/accounts/v1/pending-envelope"),
 ]);
 
 const BOUNDED_PREFIXES = Object.freeze([

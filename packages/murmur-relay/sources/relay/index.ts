@@ -1,6 +1,7 @@
 import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
+    parseDeviceRosterMutation,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
     verifyQueueAckSignature,
@@ -8,6 +9,7 @@ import {
     type SignedDelivery,
     type SignedQueueAck,
     type SignedQueueRead,
+    type DeviceRoster,
 } from "../protocol/index.js";
 import type {
     AcknowledgeOutcome,
@@ -207,6 +209,9 @@ export class RelayService {
                 error: "limit",
             });
         }
+        if (delivery.recipients.length < 1) {
+            throw new RelayError(400, "Delivery has no recipients", { error: "malformed" });
+        }
         if (delivery.ciphertext.length > this.#options.maximumCiphertextBytes) {
             throw new RelayError(413, "Delivery ciphertext exceeds relay limit", {
                 error: "limit",
@@ -254,6 +259,79 @@ export class RelayService {
             await this.#wakeSource.notify(queueId).catch(() => undefined);
         }
         return outcome;
+    }
+
+    /** Read one current roster by exact public account identity key. */
+    async readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined> {
+        this.#assertOpen();
+        return this.#store.readDeviceRoster(accountKey);
+    }
+
+    /** Validate, apply, and enqueue one identity-signed roster mutation. */
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        admissionPrincipal: string,
+    ): Promise<DeviceRoster> {
+        this.#assertOpen();
+        validateSignedDeliveryShape(delivery);
+        if (
+            typeof admissionPrincipal !== "string" ||
+            admissionPrincipal.length < 1 ||
+            admissionPrincipal.length > 255
+        ) {
+            throw new RelayError(400, "Invalid admission principal", {
+                error: "malformed",
+            });
+        }
+        if (!verifyDeliverySignature(delivery)) {
+            throw new RelayError(401, "Invalid device roster mutation signature", {
+                error: "unauthorized",
+            });
+        }
+        if (delivery.recipients.length > this.#options.maximumRecipients) {
+            throw new RelayError(413, "Device roster exceeds relay limit", { error: "limit" });
+        }
+        if (delivery.ciphertext.length > this.#options.maximumCiphertextBytes) {
+            throw new RelayError(413, "Device roster mutation exceeds relay limit", {
+                error: "limit",
+            });
+        }
+        const now = this.#now();
+        if (
+            delivery.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt < now - this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > this.#options.maximumDeliveryTtlMilliseconds
+        ) {
+            throw new RelayError(401, "Device roster mutation violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        const mutation = parseDeviceRosterMutation(delivery.ciphertext);
+        const roster = await this.#store.mutateDeviceRoster(
+            delivery,
+            mutation,
+            now,
+            {
+                maximumItems: this.#options.maximumQueueItems,
+                maximumBytes: this.#options.maximumQueueBytes,
+                maximumSenderItems: this.#options.maximumSenderItems,
+                maximumSenderBytes: this.#options.maximumSenderBytes,
+                maximumSenderReferences: this.#options.maximumSenderReferences,
+                maximumAdmissionReferences: this.#options.maximumAdmissionReferences,
+                maximumGlobalItems: this.#options.maximumGlobalItems,
+                maximumGlobalBytes: this.#options.maximumGlobalBytes,
+                maximumGlobalReferences: this.#options.maximumGlobalReferences,
+            },
+            this.#digestAdmissionPrincipal(admissionPrincipal),
+        );
+        for (const recipient of delivery.recipients) {
+            const queueId = encodeBase64Url(recipient);
+            this.#wake(queueId);
+            await this.#wakeSource.notify(queueId).catch(() => undefined);
+        }
+        return roster;
     }
 
     /** Authenticate and read one identity's queue, optionally long-polling. */

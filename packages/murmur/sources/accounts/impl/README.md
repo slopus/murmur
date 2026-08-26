@@ -1,15 +1,12 @@
 # Account implementation
 
-`deviceRosterCodec.ts` owns canonical roster and MLS device-credential
-encoding, signature checks, direct-child updates, and deterministic sibling
-selection. `deviceProvisioning.ts` owns the ephemeral X25519 provisioning
-transcript and authenticated encryption.
+`deviceRosterCodec.ts` owns strict current-roster and roster-mutation encoding.
+The mutation is carried by an account-identity-signed ordinary delivery; the
+relay authenticates it and atomically stores the resulting roster and inbox
+notification.
 
 `accountRecords.ts` prepares only account-device lifecycle events and durable
 roster convergence jobs.
 
-```text
-request proof -> intent check -> signed roster child -> encrypted response
-      ^                                                    |
-      `---------------- transcript hash -------------------'
-```
+There is no provisioning transcript, roster chain, device credential, or
+approval ceremony.

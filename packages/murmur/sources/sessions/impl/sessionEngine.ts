@@ -1,27 +1,27 @@
 import {
     DeliveryTransportError,
+    DeliveryStaleRosterError,
     InboxProcessor,
     MURMUR_INTERNAL_INBOX_HANDLER,
     TerminalInboxDeliveryError,
     createSignedDelivery,
-    parseSignedDelivery,
-    signedDeliveryToJson,
     type DeliveryTransport,
+    type DeliveryAccountTarget,
+    type DeliveryDeviceRoster,
     type InboxDelivery,
     type InboxStreamOptions,
     type InboxSyncResult,
-    type SignedDelivery,
 } from "../../delivery/index.js";
 import { openBox, randomBytes, sealBox, type IdentityKeyPair } from "../../crypto/index.js";
 import {
     accountConvergenceJobs,
     ACCOUNT_PEER_ROSTER_PREFIX,
     ACCOUNT_ROSTER_KEY,
-    decodeAccountSyncPacket,
-    decodeDeviceCredential,
+    decodeDeviceRosterMutation,
     isActiveDevice,
     observeDeviceRoster,
     parseDeviceRoster,
+    serializeDeviceRoster,
     type AccountConvergenceJob,
 } from "../../accounts/index.js";
 import {
@@ -79,12 +79,10 @@ import {
     decodeBootstrapFrame,
     decodeSessionControl,
     decodePrivateFrame,
-    encodeAccountResetCiphertext,
     encodeBootstrapCiphertext,
     encodeBootstrapFrame,
     encodeSessionControl,
     encodePrivateCiphertext,
-    encodeProvisioningCiphertext,
     encodePrivateFrame,
     normalizeSessionRoles,
     openCommitCiphertext,
@@ -127,7 +125,6 @@ const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
 const POST_COMMIT_OUTBOX_INDEX_PREFIX = "murmur/post-commit-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
 const RESET_READMISSION_PREFIX = "murmur/reset/v1/re-admissions/";
-const ACCOUNT_RESET_OUTBOX_PREFIX = "murmur/reset/v1/outboxes/";
 const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
 const ACCOUNT_CONVERGENCE_COMPLETION_PREFIX = "murmur/accounts/v1/convergence-complete/";
 const DEFAULT_MAXIMUM_PENDING = 64;
@@ -147,8 +144,6 @@ const PREVIOUS_EPOCH_GRACE_MILLISECONDS = 5 * 60 * 1_000;
 const PREVIOUS_EPOCH_MESSAGES = 64;
 const DELIVERY_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 const DELIVERY_TTL_MILLISECONDS = DELIVERY_RETENTION_MILLISECONDS - 5 * 60 * 1_000;
-const PROVISIONING_TTL_MILLISECONDS = 5 * 60 * 1_000;
-const PENDING_ENVELOPE_KEY = "murmur/accounts/v1/pending-envelope";
 const COMMIT_EXPORT_LABEL = "murmur session commit";
 const COMMIT_EXPORT_CONTEXT = utf8Encode("murmur/session-commit/v1");
 
@@ -218,10 +213,6 @@ function outboxKey(deliveryId: string): string {
     return `${OUTBOX_PREFIX}${deliveryId}`;
 }
 
-function accountResetOutboxKey(deliveryId: string): string {
-    return `${ACCOUNT_RESET_OUTBOX_PREFIX}${deliveryId}`;
-}
-
 function accountDeviceActivityKey(device: Uint8Array): string {
     return `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(device)}`;
 }
@@ -232,18 +223,6 @@ function accountConvergenceCompletionPrefix(key: string): string {
 
 function accountConvergenceCompletionKey(key: string, id: Uint8Array): string {
     return `${accountConvergenceCompletionPrefix(key)}${sessionId(id)}`;
-}
-
-function encodeAccountResetOutbox(delivery: SignedDelivery): Uint8Array {
-    return canonicalJsonBytes(signedDeliveryToJson(delivery) as never);
-}
-
-function decodeAccountResetOutbox(bytes: Uint8Array): SignedDelivery {
-    const delivery = parseSignedDelivery(JSON.parse(utf8Decode(bytes)) as unknown);
-    if (!equalBytes(encodeAccountResetOutbox(delivery), bytes)) {
-        throw new Error("Non-canonical account reset outbox");
-    }
-    return delivery;
 }
 
 function outboxOrderKey(order: string, deliveryId: string): string {
@@ -369,14 +348,8 @@ function memberAccount(epoch: MlsEpochState, leaf: number): Uint8Array {
     if (signatureKey === undefined || credential === undefined) {
         throw new Error("Session member is absent");
     }
-    if (credential.length === 32 && equalBytes(credential, signatureKey)) {
-        return signatureKey;
-    }
-    const decoded = decodeDeviceCredential(credential);
-    if (!equalBytes(decoded.deviceKey, signatureKey)) {
-        throw new Error("Session device credential does not match its leaf");
-    }
-    return decoded.accountKey;
+    if (credential.length !== 32) throw new Error("Invalid session account credential");
+    return credential;
 }
 
 function activeAccounts(epoch: MlsEpochState): readonly Uint8Array[] {
@@ -391,14 +364,8 @@ function activeAccounts(epoch: MlsEpochState): readonly Uint8Array[] {
 
 function keyPackageAccount(keyPackage: MlsKeyPackage): Uint8Array {
     const credential = keyPackage.leafNode.credential.identity;
-    if (credential.length === 32 && equalBytes(credential, keyPackage.leafNode.signatureKey)) {
-        return keyPackage.leafNode.signatureKey.slice();
-    }
-    const decoded = decodeDeviceCredential(credential);
-    if (!equalBytes(decoded.deviceKey, keyPackage.leafNode.signatureKey)) {
-        throw new Error("Session device credential does not match its KeyPackage");
-    }
-    return decoded.accountKey;
+    if (credential.length !== 32) throw new Error("Invalid session account credential");
+    return credential.slice();
 }
 
 function isSessionAdmin(roles: SessionRoles, account: Uint8Array): boolean {
@@ -461,9 +428,8 @@ function exactRecipients(
     delivery: InboxDelivery["delivery"],
     members: readonly Uint8Array[],
 ): boolean {
-    if (delivery.recipients.length !== members.length) return false;
-    const expected = new Set(members.map(encodeBase64Url));
-    return delivery.recipients.every((recipient) => expected.delete(encodeBase64Url(recipient)));
+    const actual = new Set(delivery.recipients.map(encodeBase64Url));
+    return members.every((member) => actual.has(encodeBase64Url(member)));
 }
 
 async function setAndZero(
@@ -573,10 +539,8 @@ export class SessionEngine {
         this.#transport = transport;
         this.#now = now;
         this.#credentialIdentity = credentialIdentity.slice();
-        this.#accountKey =
-            credentialIdentity.length === 32 && equalBytes(credentialIdentity, identity.publicKey)
-                ? identity.publicKey.slice()
-                : decodeDeviceCredential(credentialIdentity).accountKey;
+        if (credentialIdentity.length !== 32) throw new Error("Invalid account credential");
+        this.#accountKey = credentialIdentity.slice();
         this.#limits = {
             maximumPendingSessions: limits.maximumPendingSessions ?? DEFAULT_MAXIMUM_PENDING,
             maximumBufferedEventsPerSession:
@@ -618,56 +582,64 @@ export class SessionEngine {
         );
     }
 
-    /**
-     * Publish one encrypted provisioning envelope to the new device's inbox.
-     *
-     * The envelope is already sealed to the requesting device's ephemeral key,
-     * so the relay carries only opaque bytes with a five-minute lifetime. This
-     * publishes immediately: device linking is interactive, and a failure is
-     * surfaced to the caller for retry rather than queued durably.
-     */
-    async publishProvisioningEnvelope(
-        recipientDevice: Uint8Array,
-        envelope: Uint8Array,
-        signal?: AbortSignal,
-    ): Promise<void> {
-        if (recipientDevice.length !== 32) throw new Error("Invalid provisioning recipient");
-        const now = this.#now();
-        const delivery = createSignedDelivery(
-            this.#identity,
-            [recipientDevice],
-            encodeProvisioningCiphertext(envelope),
-            { createdAt: now, expiresAt: now + PROVISIONING_TTL_MILLISECONDS },
-        );
-        await this.#transport.publish(delivery, signal);
-    }
-
-    /** Read the durably received provisioning envelope, if one is pending. */
-    async pendingProvisioningEnvelope(): Promise<Uint8Array | undefined> {
-        return this.#store.get(PENDING_ENVELOPE_KEY);
-    }
-
-    /** Delete the pending provisioning envelope after completion or rejection. */
-    async deletePendingProvisioningEnvelope(transaction?: StoreTransaction): Promise<void> {
-        if (transaction === undefined) await this.#store.delete(PENDING_ENVELOPE_KEY);
-        else await transaction.delete(PENDING_ENVELOPE_KEY);
-    }
-
-    /** Adopt an account-authorized device credential after provisioning completes. */
-    adoptDeviceCredential(credential: Uint8Array): void {
-        const decoded = decodeDeviceCredential(credential);
-        if (!equalBytes(decoded.deviceKey, this.#identity.publicKey)) {
-            throw new Error("Device credential does not match the local device");
-        }
-        zeroBytes(this.#credentialIdentity);
-        zeroBytes(this.#accountKey);
-        this.#credentialIdentity = credential.slice();
-        this.#accountKey = decoded.accountKey.slice();
-    }
-
     /** Stable account key represented by this device's MLS credential. */
     get accountKey(): Uint8Array {
         return this.#accountKey.slice();
+    }
+
+    async #targetAccounts(
+        store: StoreTransaction,
+        epoch: MlsEpochState,
+        additionalAccounts: readonly Uint8Array[] = [],
+    ): Promise<readonly DeliveryAccountTarget[]> {
+        if (
+            this.#transport.readDeviceRoster === undefined ||
+            this.#transport.mutateDeviceRoster === undefined
+        ) {
+            return [];
+        }
+        const targets: DeliveryAccountTarget[] = [];
+        const accounts = new Map(
+            [...activeAccounts(epoch), ...additionalAccounts].map((accountKey) => [
+                encodeBase64Url(accountKey),
+                accountKey,
+            ]),
+        );
+        for (const accountKey of accounts.values()) {
+            const key = equalBytes(accountKey, this.#accountKey)
+                ? ACCOUNT_ROSTER_KEY
+                : `${ACCOUNT_PEER_ROSTER_PREFIX}${encodeBase64Url(accountKey)}`;
+            const bytes = await store.get(key);
+            let rosterRevision = 0;
+            try {
+                if (bytes !== undefined) {
+                    const roster = parseDeviceRoster(bytes);
+                    if (equalBytes(roster.accountKey, accountKey)) {
+                        rosterRevision = roster.revision;
+                    }
+                } else {
+                    const roster = await this.#transport.readDeviceRoster(accountKey);
+                    if (roster !== undefined) {
+                        rosterRevision = roster.revision;
+                        const rosterBytes = serializeDeviceRoster(roster);
+                        try {
+                            await observeDeviceRoster(
+                                store,
+                                this.#accountKey,
+                                `lookup-${roster.revision}`,
+                                rosterBytes,
+                            );
+                        } finally {
+                            zeroBytes(rosterBytes);
+                        }
+                    }
+                }
+            } finally {
+                if (bytes !== undefined) zeroBytes(bytes);
+            }
+            targets.push({ accountKey: accountKey.slice(), rosterRevision });
+        }
+        return targets;
     }
 
     async storeKeyPackages(
@@ -760,53 +732,6 @@ export class SessionEngine {
     /** @internal Retry the remote half of a committed post-loss baseline adoption. */
     async acknowledgeInboxBaseline(head: string | null, signal?: AbortSignal): Promise<void> {
         await this.#inbox.acknowledgeBaseline(head, signal);
-    }
-
-    /** @internal Queue MLS-independent, recipient-sealed reset roster announcements. */
-    async queueAccountResetAnnouncementsInTransaction(
-        transaction: StoreTransaction,
-        recipients: readonly Uint8Array[],
-        packet: Uint8Array,
-    ): Promise<void> {
-        const unique = new Map<string, Uint8Array>();
-        for (const recipient of recipients) {
-            if (recipient.length !== 32) throw new Error("Invalid reset announcement recipient");
-            if (!equalBytes(recipient, this.#identity.publicKey)) {
-                unique.set(encodeBase64Url(recipient), recipient);
-            }
-        }
-        const existing = await transaction.scan(ACCOUNT_RESET_OUTBOX_PREFIX, {
-            limit: this.#limits.maximumOutboxes + 1,
-        });
-        try {
-            if (existing.size + unique.size > this.#limits.maximumOutboxes) {
-                throw new Error("Account reset announcement capacity exceeded");
-            }
-        } finally {
-            for (const value of existing.values()) zeroBytes(value);
-        }
-        const now = this.#now();
-        for (const recipient of unique.values()) {
-            const box = sealBox(
-                { publicKey: recipient },
-                packet,
-                concatBytes(this.#identity.publicKey, recipient),
-            );
-            const ciphertext = encodeAccountResetCiphertext(box);
-            try {
-                const delivery = createSignedDelivery(this.#identity, [recipient], ciphertext, {
-                    createdAt: now,
-                    expiresAt: now + DELIVERY_TTL_MILLISECONDS,
-                });
-                await transaction.set(
-                    accountResetOutboxKey(delivery.id),
-                    encodeAccountResetOutbox(delivery),
-                );
-            } finally {
-                zeroBytes(ciphertext);
-                zeroBytes(box.ciphertext);
-            }
-        }
     }
 
     async deleteKeyPackages(references: readonly Uint8Array[]): Promise<void> {
@@ -1404,24 +1329,6 @@ export class SessionEngine {
         return this.#queuePrivate(id, { version: 1, type: "application", bytes }, "application");
     }
 
-    /** Queue an encrypted built-in roster control without surfacing it to a service. */
-    async sendAccountRoster(
-        id: Uint8Array,
-        roster: Uint8Array,
-        keyPackage?: Uint8Array,
-    ): Promise<string> {
-        return this.#queuePrivate(
-            id,
-            {
-                version: 1,
-                type: "account_roster",
-                roster,
-                ...(keyPackage === undefined ? {} : { keyPackage }),
-            },
-            "application",
-        );
-    }
-
     async add(
         id: Uint8Array,
         member: SessionMemberMaterial,
@@ -1993,17 +1900,11 @@ export class SessionEngine {
         inbox: InboxSyncResult,
         publications: readonly FlushOutboxResult[],
     ): Promise<MurmurSynchronizeResult> {
-        const pendingOutboxes =
-            (
-                await this.#store.scan(OUTBOX_PREFIX, {
-                    limit: this.#limits.maximumOutboxes,
-                })
-            ).size +
-            (
-                await this.#store.scan(ACCOUNT_RESET_OUTBOX_PREFIX, {
-                    limit: this.#limits.maximumOutboxes,
-                })
-            ).size;
+        const pendingOutboxes = (
+            await this.#store.scan(OUTBOX_PREFIX, {
+                limit: this.#limits.maximumOutboxes,
+            })
+        ).size;
         const publishedIds = new Set(publications.flatMap(({ publishedIds }) => [...publishedIds]));
         const transientFailureIds = new Set(
             publications.flatMap(({ transientFailureIds }) => [...transientFailureIds]),
@@ -2141,6 +2042,7 @@ export class SessionEngine {
                 const delivery = createSignedDelivery(this.#identity, members, ciphertext, {
                     createdAt: now,
                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                    targetAccounts: await this.#targetAccounts(transaction, epoch),
                 });
                 checkpoint = epoch.serialize();
                 if (parent === undefined) {
@@ -2439,10 +2341,26 @@ export class SessionEngine {
                 if (commitCiphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
                     throw new Error("Session Commit exceeds the configured ciphertext limit");
                 }
-                const delivery = createSignedDelivery(this.#identity, members, commitCiphertext, {
-                    createdAt: now,
-                    expiresAt: now + DELIVERY_TTL_MILLISECONDS,
-                });
+                const delivery = createSignedDelivery(
+                    this.#identity,
+                    [
+                        ...new Map(
+                            [...members, ...additions.map((addition) => addition.identity)].map(
+                                (recipient) => [encodeBase64Url(recipient), recipient],
+                            ),
+                        ).values(),
+                    ],
+                    commitCiphertext,
+                    {
+                        createdAt: now,
+                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        targetAccounts: await this.#targetAccounts(
+                            transaction,
+                            epoch,
+                            additions.map((addition) => keyPackageAccount(addition.keyPackage)),
+                        ),
+                    },
+                );
                 const commitOrder = await this.#nextOutboxOrder(transaction);
                 await setAndZero(
                     transaction,
@@ -2573,6 +2491,15 @@ export class SessionEngine {
             accountDeviceActivityKey(queued.delivery.sender),
             utf8Encode(String(queued.delivery.createdAt).padStart(16, "0")),
         );
+        try {
+            decodeDeviceRosterMutation(queued.delivery.ciphertext);
+            if (!equalBytes(queued.delivery.sender, this.#accountKey)) {
+                throw new TerminalInboxDeliveryError("foreign_roster_mutation");
+            }
+            return;
+        } catch (error: unknown) {
+            if (error instanceof TerminalInboxDeliveryError) throw error;
+        }
         let wire: ReturnType<typeof parseSessionCiphertext>;
         try {
             wire = parseSessionCiphertext(queued.delivery.ciphertext);
@@ -2582,61 +2509,6 @@ export class SessionEngine {
         if (wire.kind === "bootstrap") {
             await this.#receiveBootstrap(transaction, queued, wire.box);
             return;
-        }
-        if (wire.kind === "provisioning") {
-            if (this.#now() > queued.delivery.createdAt + PROVISIONING_TTL_MILLISECONDS) {
-                throw new TerminalInboxDeliveryError("expired_provisioning_envelope");
-            }
-            await setAndZero(transaction, PENDING_ENVELOPE_KEY, wire.envelope.slice());
-            return;
-        }
-        if (wire.kind === "account_reset") {
-            if (
-                queued.delivery.recipients.length !== 1 ||
-                !equalBytes(queued.delivery.recipients[0]!, this.#identity.publicKey)
-            ) {
-                throw new TerminalInboxDeliveryError("account_reset_recipient_set");
-            }
-            let plaintext: Uint8Array;
-            try {
-                plaintext = openBox(
-                    this.#identity,
-                    wire.box,
-                    concatBytes(queued.delivery.sender, this.#identity.publicKey),
-                );
-            } catch {
-                throw new TerminalInboxDeliveryError("invalid_account_reset_box");
-            }
-            try {
-                const packet = decodeAccountSyncPacket(plaintext);
-                if (packet.type !== "admission") {
-                    throw new Error("Account reset packet lacks admission material");
-                }
-                const roster = parseDeviceRoster(packet.roster);
-                const keyPackage = decodeMlsKeyPackage(packet.keyPackage);
-                if (
-                    !equalBytes(roster.authorDeviceKey, queued.delivery.sender) ||
-                    !equalBytes(keyPackage.leafNode.signatureKey, queued.delivery.sender) ||
-                    !verifyMlsKeyPackage(keyPackage, Math.floor(queued.delivery.createdAt / 1_000))
-                ) {
-                    throw new Error("Account reset sender is not its reset device");
-                }
-                await observeDeviceRoster(
-                    transaction,
-                    this.#accountKey,
-                    queued.eventId,
-                    roster.accountKey,
-                    roster.authorDeviceKey,
-                    packet.roster,
-                    { device: queued.delivery.sender, keyPackage: packet.keyPackage },
-                );
-                return;
-            } catch (error: unknown) {
-                if (error instanceof TerminalInboxDeliveryError) throw error;
-                throw new TerminalInboxDeliveryError("invalid_account_reset");
-            } finally {
-                zeroBytes(plaintext);
-            }
         }
         let id: Uint8Array;
         try {
@@ -3105,38 +2977,6 @@ export class SessionEngine {
                     } finally {
                         zeroBytes(frame.bytes);
                     }
-                } else if (frame.type === "account_roster") {
-                    let admission:
-                        | { readonly device: Uint8Array; readonly keyPackage: Uint8Array }
-                        | undefined;
-                    if (frame.keyPackage !== undefined) {
-                        const keyPackage = decodeMlsKeyPackage(frame.keyPackage);
-                        const credential = decodeDeviceCredential(
-                            keyPackage.leafNode.credential.identity,
-                        );
-                        if (
-                            !verifyMlsKeyPackage(
-                                keyPackage,
-                                Math.floor(queued.delivery.createdAt / 1_000),
-                            ) ||
-                            !equalBytes(keyPackage.leafNode.signatureKey, credential.deviceKey)
-                        ) {
-                            throw new TerminalInboxDeliveryError("invalid_account_admission");
-                        }
-                        admission = {
-                            device: credential.deviceKey,
-                            keyPackage: frame.keyPackage,
-                        };
-                    }
-                    await observeDeviceRoster(
-                        transaction,
-                        this.#accountKey,
-                        queued.eventId,
-                        memberAccount(epoch, opened.message.sender),
-                        senderDevice,
-                        frame.roster,
-                        admission,
-                    );
                 } else if (frame.type === "leave") {
                     const account = memberAccount(epoch, opened.message.sender);
                     if (
@@ -3385,10 +3225,6 @@ export class SessionEngine {
                         }
                     } finally {
                         if (frame.type === "application") zeroBytes(frame.bytes);
-                        if (frame.type === "account_roster") {
-                            zeroBytes(frame.roster);
-                            if (frame.keyPackage !== undefined) zeroBytes(frame.keyPackage);
-                        }
                     }
                     const message = next.seal(dependent.applicationData);
                     const ciphertext = encodePrivateCiphertext(message);
@@ -3397,7 +3233,11 @@ export class SessionEngine {
                         this.#identity,
                         activeMembers(next),
                         ciphertext,
-                        { createdAt: now, expiresAt: now + DELIVERY_TTL_MILLISECONDS },
+                        {
+                            createdAt: now,
+                            expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                            targetAccounts: await this.#targetAccounts(transaction, next),
+                        },
                     );
                     await transaction.delete(outboxKey(previousId));
                     await transaction.delete(
@@ -3621,11 +3461,9 @@ export class SessionEngine {
     }
 
     async #flushOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
-        const reset = await this.#flushAccountResetOutboxes(signal);
-        const publishedIds = new Set<string>(reset.publishedIds);
-        const transientFailureIds = new Set<string>(reset.transientFailureIds);
+        const publishedIds = new Set<string>();
+        const transientFailureIds = new Set<string>();
         const terminalFailureIds = await this.#preflightMembershipOutboxes();
-        for (const id of reset.terminalFailureIds) terminalFailureIds.add(id);
         const phases = ["current", "commit", "bootstrap", "completion"] as const;
         for (const phase of phases) {
             const blockedSessions = new Set<string>();
@@ -3740,6 +3578,31 @@ export class SessionEngine {
                                 });
                             }
                         } catch (error: unknown) {
+                            if (error instanceof DeliveryStaleRosterError) {
+                                await this.#store.transaction(async (transaction) => {
+                                    for (const roster of error.rosters) {
+                                        const rosterBytes = serializeDeviceRoster(roster);
+                                        try {
+                                            await observeDeviceRoster(
+                                                transaction,
+                                                this.#accountKey,
+                                                `stale-${decodedRecord.delivery.id}-${encodeBase64Url(roster.accountKey)}`,
+                                                rosterBytes,
+                                            );
+                                        } finally {
+                                            zeroBytes(rosterBytes);
+                                        }
+                                    }
+                                });
+                                await this.#refreshStaleRosterOutbox(
+                                    key,
+                                    decodedRecord,
+                                    error.rosters,
+                                );
+                                transientFailureIds.add(decodedRecord.delivery.id);
+                                blockedSessions.add(encodedSessionId);
+                                continue;
+                            }
                             if (
                                 decodedRecord.kind === "commit" ||
                                 decodedRecord.kind === "bootstrap"
@@ -3800,66 +3663,7 @@ export class SessionEngine {
             return false;
         } finally {
             if (frame?.type === "application") zeroBytes(frame.bytes);
-            if (frame?.type === "account_roster") {
-                zeroBytes(frame.roster);
-                if (frame.keyPackage !== undefined) zeroBytes(frame.keyPackage);
-            }
         }
-    }
-
-    async #flushAccountResetOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
-        const publishedIds = new Set<string>();
-        const transientFailureIds = new Set<string>();
-        const terminalFailureIds = new Set<string>();
-        let after: string | undefined;
-        for (;;) {
-            const page = await this.#store.scan(ACCOUNT_RESET_OUTBOX_PREFIX, {
-                ...(after === undefined ? {} : { after }),
-                limit: OUTBOX_SCAN_ITEMS,
-            });
-            if (page.size === 0) break;
-            for (const [key, bytes] of page) {
-                after = key;
-                const fallbackId = key.slice(ACCOUNT_RESET_OUTBOX_PREFIX.length);
-                let delivery: SignedDelivery | undefined;
-                try {
-                    try {
-                        delivery = decodeAccountResetOutbox(bytes);
-                    } catch {
-                        await this.#store.delete(key);
-                        terminalFailureIds.add(fallbackId);
-                        continue;
-                    }
-                    if (delivery.expiresAt <= this.#now()) {
-                        await this.#store.delete(key);
-                        terminalFailureIds.add(delivery.id);
-                        continue;
-                    }
-                    try {
-                        await this.#transport.publish(delivery, signal);
-                        await this.#store.delete(key);
-                        publishedIds.add(delivery.id);
-                    } catch (error: unknown) {
-                        if (
-                            error instanceof DeliveryTransportError &&
-                            error.status >= 400 &&
-                            error.status < 500 &&
-                            error.status !== 401 &&
-                            error.status !== 429
-                        ) {
-                            await this.#store.delete(key);
-                            terminalFailureIds.add(delivery.id);
-                        } else {
-                            transientFailureIds.add(delivery.id);
-                        }
-                    }
-                } finally {
-                    zeroBytes(bytes);
-                }
-            }
-            if (page.size < OUTBOX_SCAN_ITEMS) break;
-        }
-        return { publishedIds, transientFailureIds, terminalFailureIds };
     }
 
     async #preflightMembershipOutboxes(): Promise<Set<string>> {
@@ -4334,6 +4138,137 @@ export class SessionEngine {
         return true;
     }
 
+    async #refreshStaleRosterOutbox(
+        key: string,
+        record: SessionOutboxRecord,
+        rosters: readonly DeliveryDeviceRoster[],
+    ): Promise<void> {
+        const targets = new Map(
+            record.delivery.targetAccounts.map((target) => [
+                encodeBase64Url(target.accountKey),
+                target,
+            ]),
+        );
+        for (const roster of rosters) {
+            const encodedAccount = encodeBase64Url(roster.accountKey);
+            if (!targets.has(encodedAccount)) continue;
+            targets.set(encodedAccount, {
+                accountKey: roster.accountKey,
+                rosterRevision: roster.revision,
+            });
+        }
+        const recipients = new Map<string, Uint8Array>();
+        let completeRosters = true;
+        for (const target of targets.values()) {
+            const rosterKey = equalBytes(target.accountKey, this.#accountKey)
+                ? ACCOUNT_ROSTER_KEY
+                : `${ACCOUNT_PEER_ROSTER_PREFIX}${encodeBase64Url(target.accountKey)}`;
+            const bytes = await this.#store.get(rosterKey);
+            try {
+                if (bytes === undefined) {
+                    completeRosters = false;
+                    continue;
+                }
+                const roster = parseDeviceRoster(bytes);
+                if (
+                    !equalBytes(roster.accountKey, target.accountKey) ||
+                    roster.revision !== target.rosterRevision
+                ) {
+                    completeRosters = false;
+                    continue;
+                }
+                for (const device of roster.devices) {
+                    recipients.set(encodeBase64Url(device.deviceKey), device.deviceKey);
+                }
+            } finally {
+                if (bytes !== undefined) zeroBytes(bytes);
+            }
+        }
+        if (!completeRosters) {
+            for (const recipient of record.delivery.recipients) {
+                recipients.set(encodeBase64Url(recipient), recipient);
+            }
+        }
+        const now = this.#now();
+        const delivery = createSignedDelivery(
+            this.#identity,
+            [...recipients.values()],
+            record.delivery.ciphertext,
+            {
+                createdAt: now,
+                expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                targetAccounts: [...targets.values()],
+            },
+        );
+        await this.#store.transaction(async (transaction) => {
+            await transaction.delete(key);
+            await transaction.delete(outboxOrderKey(record.order, record.delivery.id));
+            await setAndZero(
+                transaction,
+                outboxKey(delivery.id),
+                encodeOutboxRecord({ ...record, delivery }),
+            );
+            await transaction.set(outboxOrderKey(record.order, delivery.id), new Uint8Array());
+            if (record.kind === "application") {
+                await transaction.delete(epochOutboxIndexKey(record.sessionId, record.delivery.id));
+                if (record.parentCommitId === undefined) {
+                    await transaction.set(
+                        epochOutboxIndexKey(record.sessionId, delivery.id),
+                        new Uint8Array(),
+                    );
+                } else {
+                    await transaction.delete(
+                        postCommitOutboxIndexKey(record.parentCommitId, record.delivery.id),
+                    );
+                    await transaction.set(
+                        postCommitOutboxIndexKey(record.parentCommitId, delivery.id),
+                        new Uint8Array(),
+                    );
+                }
+            } else if (record.kind === "bootstrap") {
+                const markerKey = bootstrapIndexKey(record.parentCommitId!, record.delivery.id);
+                const marker = await transaction.get(markerKey);
+                if (marker === undefined) throw new Error("Unknown bootstrap outbox");
+                try {
+                    await transaction.delete(markerKey);
+                    await transaction.set(
+                        bootstrapIndexKey(record.parentCommitId!, delivery.id),
+                        marker,
+                    );
+                } finally {
+                    zeroBytes(marker);
+                }
+            } else {
+                const stateBytes = await transaction.get(stateKey(record.sessionId));
+                if (stateBytes === undefined) throw new Error("Unknown staged session");
+                const session = decodeSessionRecord(stateBytes);
+                try {
+                    if (session.stagedCommitId !== record.delivery.id) {
+                        throw new Error("Staged Commit changed while refreshing");
+                    }
+                    await setAndZero(
+                        transaction,
+                        stateKey(record.sessionId),
+                        encodeSessionRecord({ ...session, stagedCommitId: delivery.id }),
+                    );
+                    await this.#moveBootstrapIndexParent(
+                        transaction,
+                        record.delivery.id,
+                        delivery.id,
+                    );
+                    await this.#movePostCommitIndexParent(
+                        transaction,
+                        record.delivery.id,
+                        delivery.id,
+                    );
+                } finally {
+                    this.#zeroSessionRecord(session);
+                    zeroBytes(stateBytes);
+                }
+            }
+        });
+    }
+
     async #refreshMembershipOutbox(key: string, record: SessionOutboxRecord): Promise<void> {
         if (record.kind !== "commit" && record.kind !== "bootstrap") {
             throw new Error("Only membership outboxes can be refreshed");
@@ -4346,6 +4281,7 @@ export class SessionEngine {
             {
                 createdAt: now,
                 expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                targetAccounts: record.delivery.targetAccounts,
             },
         );
         await this.#store.transaction(async (transaction) => {

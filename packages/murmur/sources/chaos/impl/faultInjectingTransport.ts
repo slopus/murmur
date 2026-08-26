@@ -1,5 +1,6 @@
 import type {
     DeliveryPublishOutcome,
+    DeliveryDeviceRoster,
     DeliveryStreamHooks,
     DeliveryTransport,
     InboxDelivery,
@@ -33,6 +34,10 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
         id: delivery.id,
         sender: delivery.sender.slice(),
         recipients: delivery.recipients.map((recipient) => recipient.slice()),
+        targetAccounts: delivery.targetAccounts.map((target) => ({
+            accountKey: target.accountKey.slice(),
+            rosterRevision: target.rosterRevision,
+        })),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),
@@ -353,6 +358,23 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             await this.#context.delegate.acknowledge(request, signal);
         }
         return { removed: outcome.removed };
+    }
+
+    async readDeviceRoster(
+        accountKey: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster | undefined> {
+        return this.#context.delegate.readDeviceRoster?.(accountKey, signal);
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster> {
+        if (this.#context.delegate.mutateDeviceRoster === undefined) {
+            throw new Error("Delegate does not support device rosters");
+        }
+        return this.#context.delegate.mutateDeviceRoster(delivery, signal);
     }
 
     async *#stream(

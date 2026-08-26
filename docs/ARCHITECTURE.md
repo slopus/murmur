@@ -42,7 +42,8 @@ ignore destroys the pending secrets and data.
 
 The relay authenticates queue reads and acknowledgements, validates signed
 delivery envelopes, atomically fans one event out to exact recipient inboxes,
-and retains only unacknowledged unexpired ciphertext. It has no MLS, descriptor,
+and retains only unacknowledged unexpired ciphertext. It also owns one current
+device roster per exact account identity, without learning MLS, descriptor,
 membership, role, application, or conversation semantics.
 
 UUIDv7 event IDs order deliveries only within one inbox. Signed acknowledgement
@@ -59,9 +60,10 @@ Applications may register typed services under stable IDs. A service can claim
 new pending sessions and receives its own updates before the global application
 batch is prepared.
 
-Device linking creates an authenticated account roster. Account synchronization
-uses an internal MLS session, while ordinary sessions continue to expose
-account identities instead of individual device leaves.
+Restoring an account on a new store generates an independent device key and
+self-registers it through an account-signed relay mutation. Ordinary roster
+notifications drive MLS convergence, while public session views continue to
+expose account identities instead of individual device leaves.
 
 ## Failure boundaries
 

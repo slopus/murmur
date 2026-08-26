@@ -6,6 +6,7 @@ import {
     HttpDeliveryTransport,
     createSignedDelivery,
     type DeliveryFetch,
+    type DeliveryDeviceRoster,
     type DeliveryPublishOutcome,
     type DeliveryTransport,
     type InboxPage,
@@ -109,6 +110,23 @@ class CommitGateTransport implements DeliveryTransport {
     ): Promise<{ readonly removed: number }> {
         return this.#delegate.acknowledge(request, signal);
     }
+
+    async readDeviceRoster(
+        accountKey: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster | undefined> {
+        return this.#delegate.readDeviceRoster?.(accountKey, signal);
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster> {
+        if (this.#delegate.mutateDeviceRoster === undefined) {
+            throw new Error("Delivery transport does not support device rosters");
+        }
+        return this.#delegate.mutateDeviceRoster(delivery, signal);
+    }
 }
 
 function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
@@ -117,6 +135,10 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
         id: delivery.id,
         sender: delivery.sender.slice(),
         recipients: delivery.recipients.map((recipient) => recipient.slice()),
+        targetAccounts: delivery.targetAccounts.map((target) => ({
+            accountKey: target.accountKey.slice(),
+            rosterRevision: target.rosterRevision,
+        })),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),
@@ -924,74 +946,6 @@ describe("role, policy, and private-roster session races", () => {
         }
     }, 120_000);
 
-    test("ROLE-07 an admin account spans two devices and loses authority account-wide", async () => {
-        const fixture = await createRoleFixture({
-            adminsAssignAdmins: true,
-            anyoneCanAddMembers: false,
-        });
-        const bobSecond = await openActor("bob", fixture.base, () => fixture.now.value);
-        try {
-            const request = await bobSecond.client.linkDevice();
-            await fixture.bob.client.authorizeDevice(request);
-            await synchronize([bobSecond], 2);
-            expect(bobSecond.client.accountKey).toEqual(fixture.bob.client.accountKey);
-            await synchronize(
-                [fixture.alice, fixture.bob, bobSecond, fixture.carol, fixture.dave],
-                8,
-            );
-            const secondSession = await bobSecond.client.session(fixture.sessionId);
-            if (secondSession?.status === "pending") {
-                await bobSecond.client.activateSession(fixture.sessionId);
-                await synchronize(
-                    [fixture.alice, fixture.bob, bobSecond, fixture.carol, fixture.dave],
-                    3,
-                );
-            }
-
-            for (const actor of [fixture.alice, fixture.bob, bobSecond]) {
-                const session = await requireSession(actor, fixture.sessionId);
-                expect(
-                    session.admins.filter((admin) =>
-                        equalBytes(admin, fixture.bob.client.accountKey),
-                    ),
-                ).toHaveLength(1);
-            }
-            await bobSecond.client.grantAdmin(fixture.sessionId, fixture.carol.client.accountKey);
-            await synchronize(
-                [bobSecond, fixture.alice, fixture.bob, fixture.carol, fixture.dave],
-                4,
-            );
-            expect(
-                (await requireSession(fixture.alice, fixture.sessionId)).admins.some((admin) =>
-                    equalBytes(admin, fixture.carol.client.accountKey),
-                ),
-            ).toBe(true);
-
-            await fixture.bob.client.revokeDevice(bobSecond.client.identity);
-            await synchronize([fixture.bob, fixture.alice, fixture.carol, fixture.dave], 8);
-            const afterDeviceRevoke = await requireSession(fixture.alice, fixture.sessionId);
-            expect(afterDeviceRevoke.members).toContainEqual(fixture.bob.client.accountKey);
-            expect(afterDeviceRevoke.admins).toContainEqual(fixture.bob.client.accountKey);
-
-            await fixture.alice.client.revokeAdmin(
-                fixture.sessionId,
-                fixture.bob.client.accountKey,
-            );
-            await synchronize([fixture.alice, fixture.bob, fixture.carol, fixture.dave], 4);
-            expect(
-                (await requireSession(fixture.alice, fixture.sessionId)).admins.some((admin) =>
-                    equalBytes(admin, fixture.bob.client.accountKey),
-                ),
-            ).toBe(false);
-            await expect(
-                fixture.bob.client.grantAdmin(fixture.sessionId, fixture.dave.client.accountKey),
-            ).rejects.toThrow();
-        } finally {
-            bobSecond.client.close();
-            await fixture.close();
-        }
-    }, 120_000);
-
     test("ROLE-09 owner-transfer-adjacent forged races preserve the immutable owner", async () => {
         for (const winner of ["forged-first", "owner-revoke-first"] as const) {
             const fixture = await createRoleFixture({
@@ -1130,7 +1084,7 @@ describe("role, policy, and private-roster session races", () => {
             await fixture.base.publish(
                 createSignedDelivery(
                     expiringSender,
-                    [fixture.bob.client.identity],
+                    [fixture.bob.client.deviceKey],
                     utf8Encode("role-reset-gap"),
                     { createdAt: fixture.now.value, expiresAt: fixture.now.value + 1 },
                 ),
@@ -1185,12 +1139,15 @@ describe("role, policy, and private-roster session races", () => {
             expect(await fixture.bob.client.session(fixture.sessionId)).toBeUndefined();
             expect(await intentKeys(fixture.bob.store)).toEqual([]);
 
+            await fixture.alice.client.send(
+                fixture.sessionId,
+                utf8Encode("refresh reset role roster"),
+            );
             for (let cycle = 0; cycle < 12; cycle += 1) {
                 await synchronize([fixture.alice, fixture.carol, fixture.dave, fixture.bob], 1);
             }
             await expect(fixture.bob.client.session(fixture.sessionId)).resolves.toMatchObject({
                 status: "pending",
-                reAdmission: true,
             });
             await fixture.bob.client.activateSession(fixture.sessionId);
             expect(roleSnapshot(await requireSession(fixture.bob, fixture.sessionId))).toEqual(

@@ -8,6 +8,8 @@ import {
     secret,
     signedDelivery,
 } from "../../protocol/tests/helpers.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
+import { canonicalJson } from "../../utils/canonicalJson.js";
 import {
     parseRelayStoreBackend,
     PGliteDatabase,
@@ -39,6 +41,189 @@ async function stores(): Promise<readonly RelayStore[]> {
 }
 
 describe("identity queue store conformance", () => {
+    test("stores one replay-protected current roster and rejects stale account targeting", async () => {
+        const accountSecret = secret(91);
+        const account = identity(accountSecret);
+        const first = identity(secret(92));
+        const second = identity(secret(93));
+        const mutationBytes = (
+            type: "register" | "remove",
+            deviceKey: Uint8Array,
+            resetGeneration: number,
+        ): Uint8Array =>
+            canonicalJson({
+                version: 1,
+                type,
+                deviceKey: encodeBase64Url(deviceKey),
+                resetGeneration,
+                ...(type === "register"
+                    ? { keyPackage: encodeBase64Url(new Uint8Array([resetGeneration + 1])) }
+                    : {}),
+            });
+        for (const store of await stores()) {
+            try {
+                const firstMutation = signedDelivery(accountSecret, recipients(first), {
+                    id: 91,
+                    ciphertext: mutationBytes("register", first, 0),
+                });
+                await expect(
+                    store.mutateDeviceRoster(
+                        firstMutation,
+                        {
+                            version: 1,
+                            type: "register",
+                            deviceKey: first,
+                            resetGeneration: 0,
+                            keyPackage: new Uint8Array([1]),
+                        },
+                        NOW,
+                        { ...LIMITS, maximumGlobalItems: 0 },
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).rejects.toMatchObject({ status: 503, body: { error: "relay_full" } });
+                await expect(store.readDeviceRoster(account)).resolves.toBeUndefined();
+                const firstRoster = await store.mutateDeviceRoster(
+                    firstMutation,
+                    {
+                        version: 1,
+                        type: "register",
+                        deviceKey: first,
+                        resetGeneration: 0,
+                        keyPackage: new Uint8Array([1]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(firstRoster).toMatchObject({ revision: 1 });
+                await expect(
+                    store.mutateDeviceRoster(
+                        firstMutation,
+                        {
+                            version: 1,
+                            type: "register",
+                            deviceKey: first,
+                            resetGeneration: 0,
+                            keyPackage: new Uint8Array([1]),
+                        },
+                        NOW,
+                        LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).rejects.toMatchObject({ status: 409, body: { error: "replay" } });
+
+                const currentRecipients = recipients(first, second);
+                const secondMutation = signedDelivery(accountSecret, currentRecipients, {
+                    id: 92,
+                    ciphertext: mutationBytes("register", second, 0),
+                });
+                const secondRoster = await store.mutateDeviceRoster(
+                    secondMutation,
+                    {
+                        version: 1,
+                        type: "register",
+                        deviceKey: second,
+                        resetGeneration: 0,
+                        keyPackage: new Uint8Array([1]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(secondRoster.devices).toHaveLength(2);
+
+                await expect(
+                    store.publish(
+                        signedDelivery(secret(94), recipients(first), {
+                            id: 93,
+                            targetAccounts: [{ accountKey: account, rosterRevision: 1 }],
+                        }),
+                        NOW,
+                        LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).rejects.toMatchObject({ status: 409, body: { error: "stale_roster" } });
+
+                const converged = signedDelivery(secret(94), currentRecipients, {
+                    id: 94,
+                    targetAccounts: [{ accountKey: account, rosterRevision: 2 }],
+                });
+                await expect(
+                    store.publish(converged, NOW, LIMITS, ADMISSION_PRINCIPAL),
+                ).resolves.toMatchObject({ duplicate: false });
+
+                const reset = signedDelivery(accountSecret, currentRecipients, {
+                    id: 95,
+                    ciphertext: mutationBytes("register", second, 1),
+                });
+                expect(
+                    (
+                        await store.mutateDeviceRoster(
+                            reset,
+                            {
+                                version: 1,
+                                type: "register",
+                                deviceKey: second,
+                                resetGeneration: 1,
+                                keyPackage: new Uint8Array([2]),
+                            },
+                            NOW,
+                            LIMITS,
+                            ADMISSION_PRINCIPAL,
+                        )
+                    ).devices.find(
+                        (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(second),
+                    )?.resetGeneration,
+                ).toBe(1);
+
+                const removal = signedDelivery(accountSecret, recipients(first), {
+                    id: 96,
+                    ciphertext: mutationBytes("remove", second, 1),
+                });
+                expect(
+                    (
+                        await store.mutateDeviceRoster(
+                            removal,
+                            {
+                                version: 1,
+                                type: "remove",
+                                deviceKey: second,
+                                resetGeneration: 1,
+                            },
+                            NOW,
+                            LIMITS,
+                            ADMISSION_PRINCIPAL,
+                        )
+                    ).devices,
+                ).toHaveLength(1);
+                await expect(
+                    store.publish(
+                        signedDelivery(secret(94), currentRecipients, {
+                            id: 97,
+                            targetAccounts: [{ accountKey: account, rosterRevision: 4 }],
+                        }),
+                        NOW,
+                        LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).rejects.toMatchObject({ status: 409, body: { error: "stale_roster" } });
+                await expect(
+                    store.publish(
+                        signedDelivery(secret(94), recipients(first), {
+                            id: 98,
+                            targetAccounts: [{ accountKey: account, rosterRevision: 4 }],
+                        }),
+                        NOW,
+                        LIMITS,
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).resolves.toMatchObject({ duplicate: false });
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
     test("strictly parses the configured backend and rejects an incomplete SQLite schema", () => {
         expect(parseRelayStoreBackend(undefined)).toBe("sqlite");
         expect(parseRelayStoreBackend("postgres")).toBe("postgres");

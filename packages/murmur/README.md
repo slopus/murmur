@@ -10,8 +10,8 @@ private deployment infrastructure.
 
 ## Model
 
-- One Ed25519 public key identifies a Murmur device. Signing and X25519 key
-  agreement are derived from one 32-byte root.
+- One stable Ed25519 account identity is restored across devices. Each local
+  store independently owns a device key used for its relay inbox and MLS leaf.
 - Two-person and many-person conversations use the same RFC 9420-style MLS
   session machinery.
 - Every membership or role change is an authenticated Commit.
@@ -160,18 +160,22 @@ adopts its own Commit only after the authenticated queue echo arrives.
 
 ## Multiple devices
 
-Device linking transfers account custody through application-transported link
-material and an encrypted queue envelope:
+Restoring the same account identity on another store creates a fresh device key
+and self-registers it with the relay-owned current roster:
 
 ```ts
-const request = await newDevice.linkDevice();
-await existingDevice.authorizeDevice(request);
-await newDevice.synchronize({ waitMilliseconds: 0 });
+const secondDevice = await MurmurClient.open({
+    identity: restoredAccount,
+    relay,
+    store: secondStore,
+});
+await secondDevice.synchronize({ waitMilliseconds: 0 });
 ```
 
-Account roster changes converge through MLS. Any active device may revoke
-another device. Dormancy reporting is advisory; revocation remains an explicit
-application decision.
+Registration and removal are account-identity-signed relay mutations. Their
+ordinary inbox notifications drive MLS convergence. Any restored device may
+remove itself or another device with `removeDevice(deviceKey)`. Dormancy
+reporting is advisory; removal remains an explicit application decision.
 
 ## Storage and recovery
 

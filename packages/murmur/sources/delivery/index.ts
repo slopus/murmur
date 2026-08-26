@@ -2,6 +2,7 @@ export {
     DeliveryAcknowledgementFutureError,
     DeliveryCursorTrimmedError,
     DeliveryTransportError,
+    DeliveryStaleRosterError,
     HttpDeliveryTransport,
     OversizedInboxDeliveryError,
 } from "./impl/deliveryHttpTransport.js";
@@ -42,7 +43,9 @@ export {
 export type {
     CreateDeliveryOptions,
     CreateInboxReadOptions,
+    DeliveryAccountTarget,
     DeliveryFetch,
+    DeliveryDeviceRoster,
     DeliveryPublishOutcome,
     DeliveryStreamHooks,
     DeliveryTransport,

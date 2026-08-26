@@ -1,12 +1,20 @@
 import type { IdentityKeyPair } from "../crypto/index.js";
 import type { MurmurStore, StoreTransaction } from "../storage/index.js";
 
+/** One signed claim about the relay roster used to expand an account target. */
+export interface DeliveryAccountTarget {
+    readonly accountKey: Uint8Array;
+    readonly rosterRevision: number;
+}
+
 /** One sender-signed encrypted multicast accepted by the relay. */
 export interface SignedDelivery {
     readonly version: 1;
     readonly id: string;
     readonly sender: Uint8Array;
     readonly recipients: readonly Uint8Array[];
+    /** Exact logical account-roster revisions used to select recipient inboxes. */
+    readonly targetAccounts: readonly DeliveryAccountTarget[];
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: Uint8Array;
@@ -37,6 +45,21 @@ export interface SignedInboxAck {
 export interface DeliveryPublishOutcome {
     readonly eventId: string;
     readonly duplicate: boolean;
+}
+
+/** Current relay-owned roster returned by lookup or stale-publication rejection. */
+export interface DeliveryDeviceRoster {
+    readonly version: 1;
+    readonly accountKey: Uint8Array;
+    readonly revision: number;
+    readonly devices: readonly {
+        readonly deviceKey: Uint8Array;
+        readonly resetGeneration: number;
+    }[];
+    readonly admissions: readonly {
+        readonly deviceKey: Uint8Array;
+        readonly keyPackage: Uint8Array;
+    }[];
 }
 
 /** One retained delivery reference in an inbox. */
@@ -163,6 +186,16 @@ export interface DeliveryTransport {
     publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
     read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
     acknowledge(request: SignedInboxAck, signal?: AbortSignal): Promise<InboxAcknowledgement>;
+    /** Read the relay's one current roster for an exact account identity key. */
+    readDeviceRoster?(
+        accountKey: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster | undefined>;
+    /** Apply and enqueue one account-signed roster-mutation delivery. */
+    mutateDeviceRoster?(
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster>;
     /** Stream exact queued events in recipient inbox order when supported. */
     stream?(
         request: SignedInboxRead,
@@ -176,6 +209,8 @@ export interface CreateDeliveryOptions {
     readonly id?: string;
     readonly createdAt?: number;
     readonly expiresAt: number;
+    /** Exact account-roster revisions checked against relay-owned current state. */
+    readonly targetAccounts?: readonly DeliveryAccountTarget[];
 }
 
 /** Inputs for one signed inbox read. */

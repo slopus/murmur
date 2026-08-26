@@ -277,7 +277,7 @@ type SoakAction =
     | { readonly kind: "private-roster"; readonly session: number }
     | {
           readonly kind: "mutation";
-          readonly family: "delivery" | "commit" | "welcome" | "provisioning";
+          readonly family: "delivery" | "commit" | "welcome" | "roster";
       }
     | { readonly kind: "noop" };
 
@@ -439,7 +439,7 @@ function generateActions(seed: number, config: ProfileConfig): readonly SoakActi
         { kind: "mutation", family: "delivery" },
         { kind: "mutation", family: "commit" },
         { kind: "mutation", family: "welcome" },
-        { kind: "mutation", family: "provisioning" },
+        { kind: "mutation", family: "roster" },
     );
     while (actions.length < config.actions) {
         switch (random.integer(0, 8)) {
@@ -465,7 +465,7 @@ function generateActions(seed: number, config: ProfileConfig): readonly SoakActi
                 });
                 break;
             case 4:
-                actions.push({ kind: "mutation", family: "provisioning" });
+                actions.push({ kind: "mutation", family: "roster" });
                 break;
             case 5:
                 actions.push({ kind: "mutation", family: "delivery" });
@@ -1843,7 +1843,7 @@ describe("seeded soak and refinement", () => {
         expect(first.attempts).toBeLessThanOrEqual(2_000);
     });
 
-    test("SOAK continuity reset retries the callback, purges once, and re-admits", async () => {
+    test("SOAK continuity reset retries the callback, purges once, and reconverges", async () => {
         let now = NOW;
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
         const aliceStore = new MemoryMurmurStore();
@@ -1881,7 +1881,7 @@ describe("seeded soak and refinement", () => {
             await transport.publish(
                 createSignedDelivery(
                     expiringSender,
-                    [bob.identity],
+                    [bob.deviceKey],
                     utf8Encode("continuity-loss"),
                     { createdAt: now, expiresAt: now + 1 },
                 ),
@@ -1935,9 +1935,10 @@ describe("seeded soak and refinement", () => {
             expect(await bobStore.get("application/soak-preserved")).toBeDefined();
             expect(await bobStore.get("murmur/reset/v1/pending")).toBeUndefined();
             await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
-                inbox: { processed: 0 },
+                inbox: { processed: 1 },
             });
 
+            await alice.send(created.id, utf8Encode("refresh restored soak roster"));
             for (let cycle = 0; cycle < 8; cycle += 1) {
                 await alice.synchronize({ waitMilliseconds: 0 });
                 await bob.synchronize({ waitMilliseconds: 0 });
@@ -1945,7 +1946,6 @@ describe("seeded soak and refinement", () => {
             await expect(bob.session(created.id)).resolves.toMatchObject({
                 descriptor: created.descriptor,
                 status: "pending",
-                reAdmission: true,
             });
         } finally {
             alice.close();

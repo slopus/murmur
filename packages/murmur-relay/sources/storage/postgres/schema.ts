@@ -15,13 +15,19 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 queues: unknown;
                 deliveries: unknown;
                 references: unknown;
+                rosters: unknown;
+                roster_devices: unknown;
+                roster_nonces: unknown;
             }>(
                 `SELECT
                     to_regclass('murmur_queue_schema') AS marker,
                     to_regclass('murmur_queue_global') AS queue_state,
                     to_regclass('murmur_queues') AS queues,
                     to_regclass('murmur_queue_deliveries') AS deliveries,
-                    to_regclass('murmur_queue_references') AS references`,
+                    to_regclass('murmur_queue_references') AS references,
+                    to_regclass('murmur_device_rosters') AS rosters,
+                    to_regclass('murmur_device_roster_devices') AS roster_devices,
+                    to_regclass('murmur_device_roster_nonces') AS roster_nonces`,
             );
             const row = presence.rows[0];
             if (row === undefined) throw new Error("Missing Postgres schema inspection");
@@ -30,7 +36,10 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 (row.queue_state !== null ||
                     row.queues !== null ||
                     row.deliveries !== null ||
-                    row.references !== null)
+                    row.references !== null ||
+                    row.rosters !== null ||
+                    row.roster_devices !== null ||
+                    row.roster_nonces !== null)
             ) {
                 throw new Error("Incomplete Postgres queue schema");
             }
@@ -43,14 +52,17 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 const schemaVersion = bigintColumn(versionRow.version);
-                if (schemaVersion !== 1n) {
+                if (schemaVersion !== 2n) {
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 if (
                     row.queue_state === null ||
                     row.queues === null ||
                     row.deliveries === null ||
-                    row.references === null
+                    row.references === null ||
+                    row.rosters === null ||
+                    row.roster_devices === null ||
+                    row.roster_nonces === null
                 ) {
                     throw new Error("Incomplete Postgres queue schema");
                 }
@@ -61,7 +73,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 1)`,
+                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 2)`,
                 `CREATE TABLE murmur_queue_global (
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     last_event_id uuid,
@@ -121,6 +133,25 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     ON murmur_queue_references(sender, delivery_id)`,
                 `CREATE INDEX murmur_queue_reference_admission
                     ON murmur_queue_references(admission_principal)`,
+                `CREATE TABLE murmur_device_rosters (
+                    account_key bytea PRIMARY KEY CHECK (octet_length(account_key) = 32),
+                    revision bigint NOT NULL CHECK (revision >= 1)
+                )`,
+                `CREATE TABLE murmur_device_roster_devices (
+                    account_key bytea NOT NULL REFERENCES murmur_device_rosters(account_key)
+                        ON DELETE CASCADE,
+                    device_key bytea NOT NULL CHECK (octet_length(device_key) = 32),
+                    reset_generation bigint NOT NULL CHECK (reset_generation >= 0),
+                    key_package bytea NOT NULL CHECK (octet_length(key_package) > 0),
+                    PRIMARY KEY (account_key, device_key)
+                )`,
+                `CREATE TABLE murmur_device_roster_nonces (
+                    account_key bytea NOT NULL REFERENCES murmur_device_rosters(account_key)
+                        ON DELETE CASCADE,
+                    nonce text NOT NULL,
+                    created_at bigint NOT NULL,
+                    PRIMARY KEY (account_key, nonce)
+                )`,
             ];
             await connection.transaction(async (transaction) => {
                 for (const statement of statements) {

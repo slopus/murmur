@@ -1,4 +1,4 @@
-import type { SignedDelivery } from "../protocol/index.js";
+import type { DeviceRoster, DeviceRosterMutation, SignedDelivery } from "../protocol/index.js";
 
 /** Maximum expired delivery records removed by one writer transaction. */
 export const RELAY_EXPIRATION_BATCH_ITEMS = 100;
@@ -60,6 +60,16 @@ export interface RelayStore {
         limits: QueueLimits,
         admissionPrincipal: Uint8Array,
     ): Promise<PublishOutcome>;
+    /** Read one current roster by exact public account identity key. */
+    readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined>;
+    /** Atomically apply and notify one replay-protected identity-signed roster mutation. */
+    mutateDeviceRoster(
+        delivery: SignedDelivery,
+        mutation: DeviceRosterMutation,
+        now: number,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<DeviceRoster>;
     readQueue(
         recipient: Uint8Array,
         after: string | null,

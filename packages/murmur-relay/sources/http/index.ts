@@ -1,5 +1,7 @@
 import {
     RelayError,
+    deviceRosterToJson,
+    parseDeviceRosterLookup,
     parseSignedDelivery,
     parseSignedQueueAck,
     parseSignedQueueRead,
@@ -358,6 +360,35 @@ export function createRelayFetchHandler(
                         eventId: outcome.eventId,
                         duplicate: outcome.duplicate,
                     },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/device-rosters/read") {
+                const accountKey = parseDeviceRosterLookup(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const roster = await relay.readDeviceRoster(accountKey);
+                return boundedJson(
+                    roster === undefined
+                        ? { roster: null }
+                        : { roster: deviceRosterToJson(roster) },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/device-rosters/mutate") {
+                const delivery = parseSignedDelivery(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                if (admissionPrincipal === undefined) {
+                    throw new RelayError(503, "Admission principal is required", {
+                        error: "admission_context_required",
+                    });
+                }
+                const roster = await relay.mutateDeviceRoster(delivery, admissionPrincipal);
+                return boundedJson(
+                    { roster: deviceRosterToJson(roster) },
                     relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );

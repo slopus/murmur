@@ -41,6 +41,10 @@ export function signedDelivery(
         readonly now?: number;
         readonly expiresAt?: number;
         readonly ciphertext?: Uint8Array;
+        readonly targetAccounts?: readonly {
+            readonly accountKey: Uint8Array;
+            readonly rosterRevision: number;
+        }[];
     } = {},
 ): SignedDelivery {
     const now = options.now ?? 10_000;
@@ -49,6 +53,10 @@ export function signedDelivery(
         id: encodeBase64Url(new Uint8Array(24).fill(options.id ?? 1)),
         sender: identity(secretKey),
         recipients: targets.map((target) => target.slice()),
+        targetAccounts: (options.targetAccounts ?? []).map((target) => ({
+            accountKey: target.accountKey.slice(),
+            rosterRevision: target.rosterRevision,
+        })),
         createdAt: now,
         expiresAt: options.expiresAt ?? now + 60_000,
         ciphertext: options.ciphertext?.slice() ?? new Uint8Array([1, 2, 3]),

@@ -46,9 +46,10 @@ continuity is a security property rather than an operational convenience.
 
 ## Delivery
 
-Signed envelopes bind the operation ID, sender, exact recipient set, timestamps,
-and ciphertext. The relay validates all bounds and signatures before storage.
-Queue reads and acknowledgements are independently signed by the recipient.
+Signed envelopes bind the operation ID, sender, exact recipient set, account
+target revisions, timestamps, and ciphertext. The relay validates all bounds
+and signatures before storage. Queue reads and acknowledgements are
+independently signed by the recipient.
 
 Use constant-time comparison for authentication values. Never log request
 bodies, signatures, ciphertext, queue tokens, identity roots, or relay-session
@@ -68,10 +69,10 @@ surface only the initiator and opaque metadata needed for an informed decision.
 
 ## Multiple devices
 
-Verify device-link material over an authenticated user-visible channel. Roster
-revisions are signed by active account devices. Review dormant-device reports
-and revoke lost devices promptly. A revoked device must be removed from every
-known MLS session before it stops receiving new traffic.
+Protect account-restoration material: possession authorizes registering and
+removing devices without a sibling approval step. Review dormant-device reports
+and remove lost devices promptly. The relay rejects account-targeted traffic
+whose signed roster revision is stale while MLS membership converges.
 
 ## Operations
 

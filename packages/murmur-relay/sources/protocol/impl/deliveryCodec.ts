@@ -115,6 +115,7 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
             "id",
             "sender",
             "recipients",
+            "targetAccounts",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -126,8 +127,11 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
         throw new RelayError(400, "Invalid delivery", { error: "malformed" });
     }
     validateIdentity(delivery.sender, "delivery sender");
-    if (!Array.isArray(delivery.recipients) || delivery.recipients.length === 0) {
+    if (!Array.isArray(delivery.recipients)) {
         throw new RelayError(400, "Invalid delivery recipients", { error: "malformed" });
+    }
+    if (!Array.isArray(delivery.targetAccounts)) {
+        throw new RelayError(400, "Invalid delivery target accounts", { error: "malformed" });
     }
     let previous: Uint8Array | undefined;
     for (const recipient of delivery.recipients) {
@@ -138,6 +142,23 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
             });
         }
         previous = recipient;
+    }
+    previous = undefined;
+    for (const target of delivery.targetAccounts) {
+        const value = objectValue(target, "delivery target account");
+        exactKeys(value, ["accountKey", "rosterRevision"], "delivery target account");
+        validateIdentity(target.accountKey, "delivery target account");
+        if (!Number.isSafeInteger(target.rosterRevision) || target.rosterRevision < 0) {
+            throw new RelayError(400, "Invalid delivery target roster revision", {
+                error: "malformed",
+            });
+        }
+        if (previous !== undefined && compareBytes(previous, target.accountKey) >= 0) {
+            throw new RelayError(400, "Delivery target accounts must be sorted and unique", {
+                error: "malformed",
+            });
+        }
+        previous = target.accountKey;
     }
     if (
         !Number.isSafeInteger(delivery.createdAt) ||
@@ -158,6 +179,10 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
         id: delivery.id,
         sender: encodeBase64Url(delivery.sender),
         recipients: delivery.recipients.map(encodeBase64Url),
+        targetAccounts: delivery.targetAccounts.map((target) => ({
+            accountKey: encodeBase64Url(target.accountKey),
+            rosterRevision: target.rosterRevision,
+        })),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: encodeBase64Url(delivery.ciphertext),
@@ -175,6 +200,7 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
             "id",
             "sender",
             "recipients",
+            "targetAccounts",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -186,7 +212,8 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
         input.version !== 1 ||
         typeof input.id !== "string" ||
         !isDeliveryId(input.id) ||
-        !Array.isArray(input.recipients)
+        !Array.isArray(input.recipients) ||
+        !Array.isArray(input.targetAccounts)
     ) {
         throw new RelayError(400, "Invalid delivery", { error: "malformed" });
     }
@@ -197,6 +224,21 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
         recipients: input.recipients.map((recipient) =>
             bytesValue(recipient, "delivery recipient", IDENTITY_BYTES),
         ),
+        targetAccounts: input.targetAccounts.map((candidate) => {
+            const target = objectValue(candidate, "delivery target account");
+            exactKeys(target, ["accountKey", "rosterRevision"], "delivery target account");
+            return {
+                accountKey: bytesValue(
+                    target.accountKey,
+                    "delivery target account",
+                    IDENTITY_BYTES,
+                ),
+                rosterRevision: safeInteger(
+                    target.rosterRevision,
+                    "delivery target roster revision",
+                ),
+            };
+        }),
         createdAt: safeInteger(input.createdAt, "delivery timestamp"),
         expiresAt: safeInteger(input.expiresAt, "delivery expiration"),
         ciphertext: bytesValue(input.ciphertext, "delivery ciphertext"),

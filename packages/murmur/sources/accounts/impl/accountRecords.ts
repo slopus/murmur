@@ -7,12 +7,7 @@ import {
     utf8Decode,
     zeroBytes,
 } from "../../utils/index.js";
-import {
-    deviceRosterHash,
-    isActiveDevice,
-    parseDeviceRoster,
-    serializeDeviceRoster,
-} from "./deviceRosterCodec.js";
+import { parseDeviceRoster, serializeDeviceRoster } from "./deviceRosterCodec.js";
 import type { MurmurDeviceAdded, MurmurDeviceRevoked, MurmurDeviceRoster } from "../types.js";
 
 export const ACCOUNT_EVENT_PREFIX = "murmur/accounts/v1/events/";
@@ -212,9 +207,7 @@ async function queueConvergence(
 
 function activeDevices(roster: MurmurDeviceRoster | undefined): Map<string, Uint8Array> {
     return new Map(
-        (roster?.devices ?? [])
-            .filter((entry) => entry.status === "active")
-            .map((entry) => [encodeBase64Url(entry.deviceKey), entry.deviceKey]),
+        (roster?.devices ?? []).map((entry) => [encodeBase64Url(entry.deviceKey), entry.deviceKey]),
     );
 }
 
@@ -222,64 +215,25 @@ function acceptsRoster(
     current: MurmurDeviceRoster | undefined,
     candidate: MurmurDeviceRoster,
 ): boolean {
-    if (current === undefined) return true;
-    const currentHash = deviceRosterHash(current);
-    const candidateHash = deviceRosterHash(candidate);
-    if (equalBytes(currentHash, candidateHash)) return false;
-    if (
-        candidate.revision === current.revision + 1 &&
-        candidate.parentHash !== null &&
-        equalBytes(candidate.parentHash, currentHash)
-    ) {
-        return true;
-    }
-    if (
-        candidate.revision === current.revision &&
-        candidate.parentHash !== null &&
-        current.parentHash !== null &&
-        equalBytes(candidate.parentHash, current.parentHash)
-    ) {
-        for (let index = 0; index < candidateHash.length; index += 1) {
-            if (candidateHash[index] === currentHash[index]) continue;
-            return candidateHash[index]! > currentHash[index]!;
-        }
-    }
-    return false;
+    return current === undefined || candidate.revision > current.revision;
 }
 
-/** Apply one MLS-authenticated roster update and queue its automatic membership work. */
+/** Apply one relay-authenticated current roster and queue its automatic membership work. */
 export async function observeDeviceRoster(
     transaction: StoreTransaction,
     ownAccount: Uint8Array,
     eventId: string,
-    senderAccount: Uint8Array,
-    senderDevice: Uint8Array,
     rosterBytes: Uint8Array,
-    admission?: { readonly device: Uint8Array; readonly keyPackage: Uint8Array },
 ): Promise<void> {
     const candidate = parseDeviceRoster(rosterBytes);
-    if (
-        !equalBytes(candidate.accountKey, senderAccount) ||
-        !isActiveDevice(candidate, senderDevice)
-    ) {
-        throw new Error("Roster control sender is not active in its account");
-    }
-    if (
-        admission !== undefined &&
-        (!isActiveDevice(candidate, admission.device) || admission.keyPackage.length < 1)
-    ) {
-        throw new Error("Roster admission does not name an active device");
-    }
     const key = rosterKey(candidate.accountKey, ownAccount);
     const stored = await transaction.get(key);
     let current: MurmurDeviceRoster | undefined;
     try {
         if (stored !== undefined) current = parseDeviceRoster(stored);
         const accepted = acceptsRoster(current, candidate);
-        const same =
-            current !== undefined &&
-            equalBytes(deviceRosterHash(current), deviceRosterHash(candidate));
-        if (!accepted && !same) throw new Error("Stale or unauthenticated roster transition");
+        const same = current !== undefined && candidate.revision === current.revision;
+        if (!accepted && !same) return;
         if (accepted) await transaction.set(key, serializeDeviceRoster(candidate));
         const before = activeDevices(current);
         const after = activeDevices(candidate);
@@ -296,20 +250,15 @@ export async function observeDeviceRoster(
                 const prior = current?.devices.find((value) =>
                     equalBytes(value.deviceKey, entry.deviceKey),
                 );
-                if (
-                    entry.status === "active" &&
-                    (prior === undefined || prior.status === "active") &&
-                    entry.resetGeneration > (prior?.resetGeneration ?? 0)
-                ) {
+                if (entry.resetGeneration > (prior?.resetGeneration ?? 0)) {
                     resets.push(entry.deviceKey);
                 }
             }
         }
         for (const device of resets) {
-            const keyPackage =
-                admission !== undefined && equalBytes(admission.device, device)
-                    ? admission.keyPackage
-                    : undefined;
+            const keyPackage = candidate.admissions.find((value) =>
+                equalBytes(value.deviceKey, device),
+            )?.keyPackage;
             if (keyPackage !== undefined) {
                 await queueConvergence(
                     transaction,
@@ -335,10 +284,10 @@ export async function observeDeviceRoster(
         for (const change of changes) {
             if (resets.some((device) => equalBytes(device, change.device))) continue;
             const keyPackage =
-                change.change === "added" &&
-                admission !== undefined &&
-                equalBytes(admission.device, change.device)
-                    ? admission.keyPackage
+                change.change === "added"
+                    ? candidate.admissions.find((value) =>
+                          equalBytes(value.deviceKey, change.device),
+                      )?.keyPackage
                     : undefined;
             if (change.change === "revoked" || keyPackage !== undefined) {
                 await queueConvergence(
@@ -361,19 +310,6 @@ export async function observeDeviceRoster(
                     rosterRevision: candidate.revision,
                 });
             }
-        }
-        if (
-            admission !== undefined &&
-            !resets.some((device) => equalBytes(device, admission.device))
-        ) {
-            await queueConvergence(
-                transaction,
-                candidate.accountKey,
-                admission.device,
-                "added",
-                candidate.revision,
-                admission.keyPackage,
-            );
         }
     } finally {
         if (stored !== undefined) zeroBytes(stored);

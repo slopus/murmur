@@ -34,6 +34,10 @@ export interface SignedDeliveryJson {
     readonly id: string;
     readonly sender: string;
     readonly recipients: readonly string[];
+    readonly targetAccounts: readonly {
+        readonly accountKey: string;
+        readonly rosterRevision: number;
+    }[];
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: string;
@@ -121,6 +125,10 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
         id: delivery.id,
         sender: encodeBase64Url(delivery.sender),
         recipients: delivery.recipients.map(encodeBase64Url),
+        targetAccounts: delivery.targetAccounts.map((target) => ({
+            accountKey: encodeBase64Url(target.accountKey),
+            rosterRevision: target.rosterRevision,
+        })),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: encodeBase64Url(delivery.ciphertext),
@@ -142,7 +150,6 @@ export function validateSignedDelivery(delivery: SignedDelivery): void {
     validateIdentityPublicKey({ publicKey: delivery.sender });
     if (
         delivery.version !== 1 ||
-        delivery.recipients.length < 1 ||
         !Number.isSafeInteger(delivery.createdAt) ||
         delivery.createdAt < 0 ||
         !Number.isSafeInteger(delivery.expiresAt) ||
@@ -158,6 +165,17 @@ export function validateSignedDelivery(delivery: SignedDelivery): void {
             throw new Error("Delivery recipients must be sorted and unique");
         }
         previous = recipient;
+    }
+    previous = undefined;
+    for (const target of delivery.targetAccounts) {
+        validateIdentityPublicKey({ publicKey: target.accountKey });
+        if (!Number.isSafeInteger(target.rosterRevision) || target.rosterRevision < 0) {
+            throw new Error("Invalid delivery target roster revision");
+        }
+        if (previous !== undefined && compareBytes(previous, target.accountKey) >= 0) {
+            throw new Error("Delivery target accounts must be sorted and unique");
+        }
+        previous = target.accountKey;
     }
 }
 
@@ -188,6 +206,12 @@ export function createSignedDelivery(
         id: options.id ?? encodeBase64Url(randomBytes(24)),
         sender: identity.publicKey.slice(),
         recipients: recipients.map((value) => value.slice()).sort(compareBytes),
+        targetAccounts: (options.targetAccounts ?? [])
+            .map((target) => ({
+                accountKey: target.accountKey.slice(),
+                rosterRevision: target.rosterRevision,
+            }))
+            .sort((left, right) => compareBytes(left.accountKey, right.accountKey)),
         createdAt,
         expiresAt: options.expiresAt,
         ciphertext: ciphertext.slice(),
@@ -206,6 +230,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
             "id",
             "sender",
             "recipients",
+            "targetAccounts",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -219,6 +244,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         typeof input.sender !== "string" ||
         !Array.isArray(input.recipients) ||
         input.recipients.some((entry) => typeof entry !== "string") ||
+        !Array.isArray(input.targetAccounts) ||
         typeof input.ciphertext !== "string" ||
         typeof input.signature !== "string"
     ) {
@@ -229,6 +255,20 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         id: input.id,
         sender: decodeBase64Url(input.sender),
         recipients: input.recipients.map((entry) => decodeBase64Url(entry as string)),
+        targetAccounts: input.targetAccounts.map((entry) => {
+            const target = object(entry, "delivery target account");
+            exact(target, ["accountKey", "rosterRevision"], "delivery target account");
+            if (typeof target.accountKey !== "string") {
+                throw new Error("Invalid delivery target account");
+            }
+            return {
+                accountKey: decodeBase64Url(target.accountKey),
+                rosterRevision: safeInteger(
+                    target.rosterRevision,
+                    "delivery target roster revision",
+                ),
+            };
+        }),
         createdAt: safeInteger(input.createdAt, "delivery timestamp"),
         expiresAt: safeInteger(input.expiresAt, "delivery expiration"),
         ciphertext: decodeBase64Url(input.ciphertext),
@@ -241,7 +281,6 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         if (
             delivery.sender.length !== 32 ||
             delivery.version !== 1 ||
-            delivery.recipients.length < 1 ||
             !Number.isSafeInteger(delivery.createdAt) ||
             delivery.createdAt < 0 ||
             !Number.isSafeInteger(delivery.expiresAt) ||
@@ -257,6 +296,20 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
                 throw new Error("Delivery recipients must be sorted and unique");
             }
             previous = recipient;
+        }
+        previous = undefined;
+        for (const target of delivery.targetAccounts) {
+            if (
+                target.accountKey.length !== 32 ||
+                !Number.isSafeInteger(target.rosterRevision) ||
+                target.rosterRevision < 0
+            ) {
+                throw new Error("Invalid delivery target account");
+            }
+            if (previous !== undefined && compareBytes(previous, target.accountKey) >= 0) {
+                throw new Error("Delivery target accounts must be sorted and unique");
+            }
+            previous = target.accountKey;
         }
     }
     return delivery;

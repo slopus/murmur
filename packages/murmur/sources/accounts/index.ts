@@ -1,28 +1,13 @@
 export {
-    addDeviceToRoster,
-    createInitialDeviceRoster,
-    decodeDeviceCredential,
-    deviceRosterHash,
-    encodeDeviceCredential,
+    decodeDeviceRosterMutation,
+    deviceRosterToJson,
+    encodeDeviceRosterMutation,
     isActiveDevice,
     parseDeviceRoster,
-    revokeDeviceFromRoster,
-    resetDeviceInRoster,
-    selectDeviceRosterChild,
+    parseDeviceRosterValue,
     serializeDeviceRoster,
-    verifyDeviceRoster,
+    validateDeviceRoster,
 } from "./impl/deviceRosterCodec.js";
-export {
-    authorizeDeviceProvisioning,
-    completeDeviceProvisioning,
-    createDeviceLinkMaterial,
-    parseDeviceLinkMaterial,
-    parseDeviceLinkRequest,
-    parseProvisioningEnvelope,
-    serializeDeviceLinkMaterial,
-    serializeDeviceLinkRequest,
-    serializeProvisioningEnvelope,
-} from "./impl/deviceProvisioning.js";
 export {
     ACCOUNT_CONVERGENCE_PREFIX,
     ACCOUNT_EVENT_PREFIX,
@@ -37,23 +22,12 @@ export {
     type AccountConvergenceJob,
     type PreparedAccountEvents,
 } from "./impl/accountRecords.js";
-export {
-    accountSyncSessionDescriptor,
-    decodeAccountSyncPacket,
-    encodeAccountSyncPacket,
-    isAccountSyncSessionDescriptor,
-    type AccountSyncPacket,
-} from "./impl/accountSyncCodec.js";
 export type {
-    MurmurDeviceCredential,
-    MurmurDeviceLinkMaterial,
-    MurmurDeviceLinkRequest,
     MurmurDeviceAdded,
-    MurmurDeviceProvisioningAuthorization,
-    MurmurDeviceProvisioningEnvelope,
+    MurmurDeviceAdmission,
     MurmurDeviceRoster,
     MurmurDeviceRosterEntry,
+    MurmurDeviceRosterMutation,
     MurmurDeviceRevoked,
     MurmurDormantDevice,
-    MurmurProvisionedAccount,
 } from "./types.js";
