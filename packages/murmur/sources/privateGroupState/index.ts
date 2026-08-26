@@ -5,6 +5,14 @@ export {
 export type { PrivateGroupCredentialAuthorityAdapter } from "./impl/credentialAuthority.js";
 export { PrivateGroupStateClient } from "./impl/privateGroupStateClient.js";
 export {
+    HttpPrivateGroupStateTransport,
+    PrivateGroupStateTransportError,
+} from "./impl/httpPrivateGroupStateTransport.js";
+export type {
+    HttpPrivateGroupStateTransportOptions,
+    PrivateGroupStateFetch,
+} from "./impl/httpPrivateGroupStateTransport.js";
+export {
     canonicalMemberEntries,
     createPrivateGroupStateRecord,
     encodePrivateGroupStateRecord,
@@ -18,6 +26,7 @@ export type {
     PrivateGroupAccessToken,
     PrivateGroupAccountCredential,
     PrivateGroupAccountRole,
+    PrivateGroupCredentialIssuanceChallenge,
     PrivateGroupMemberEntry,
     PrivateGroupPresentationChallenge,
     PrivateGroupRecordContent,

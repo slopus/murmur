@@ -6,6 +6,8 @@
   authentication, and MLS logical-roster binding.
 - `privateGroupStateClient.ts` obtains credentials and tokens, constructs and
   verifies records, and tracks one rollback-protected local revision tip.
+- `httpPrivateGroupStateTransport.ts` performs the bounded HTTP flow and
+  validates canonical UUIDv7 response metadata.
 
 ```text
 session snapshot -> encrypted roster + sealed metadata -> HMAC -> revision hash

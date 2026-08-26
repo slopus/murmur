@@ -3,6 +3,13 @@ import { dirname, resolve } from "node:path";
 import { Pool } from "pg";
 import { createRelayFetchHandler, parseRelayAllowedOrigins } from "./http/index.js";
 import {
+    PostgresPrivateGroupStateStore,
+    PrivateGroupStateService,
+    SqlitePrivateGroupStateStore,
+    createPrivateGroupStateFetchHandler,
+    createPrivateGroupStateServiceFromSecret,
+} from "./privateGroupState/index.js";
+import {
     InProcessWakeSource,
     PostgresWakeSource,
     RelayService,
@@ -23,6 +30,7 @@ import {
     type RelayStore,
 } from "./storage/index.js";
 import { createHumanLogger, safeErrorSummary } from "./utils/logger.js";
+import { decodeBase64Url } from "./utils/base64Url.js";
 
 const PRUNE_INTERVAL_MILLISECONDS = 10_000;
 const PRUNE_DRAIN_BUDGET_MILLISECONDS = 1_000;
@@ -67,12 +75,55 @@ async function createStore(
     }
 }
 
+interface PrivateGroupRuntime {
+    readonly service: PrivateGroupStateService;
+    close(): Promise<void>;
+}
+
+async function createPrivateGroupRuntime(backend: RelayStoreBackend): Promise<PrivateGroupRuntime> {
+    const encodedSecret = process.env.MURMUR_PRIVATE_GROUP_SECRET;
+    if (encodedSecret === undefined) {
+        throw new Error("MURMUR_PRIVATE_GROUP_SECRET is required");
+    }
+    const secret = decodeBase64Url(encodedSecret, 32);
+    let database: PgPoolDatabase | undefined;
+    try {
+        const store =
+            backend === "sqlite"
+                ? new SqlitePrivateGroupStateStore(
+                      process.env.MURMUR_RELAY_DB ?? "./data/murmur-relay.sqlite",
+                  )
+                : await (async () => {
+                      const connectionString = process.env.MURMUR_RELAY_DB;
+                      if (connectionString === undefined) {
+                          throw new Error("MURMUR_RELAY_DB is required");
+                      }
+                      database = new PgPoolDatabase(new Pool({ connectionString }));
+                      return PostgresPrivateGroupStateStore.create(database);
+                  })();
+        const service = createPrivateGroupStateServiceFromSecret({ store, secret });
+        return {
+            service,
+            close: async (): Promise<void> => {
+                service.close();
+                await database?.close();
+            },
+        };
+    } catch (error) {
+        await database?.close().catch(() => undefined);
+        throw error;
+    } finally {
+        secret.fill(0);
+    }
+}
+
 /** Start the standalone identity-queue relay. */
 export async function main(): Promise<void> {
     let stage = "configuration";
     let store: RelayStore | undefined;
     let wakeSource: WakeSource | undefined;
     let service: RelayService | undefined;
+    let privateGroups: PrivateGroupRuntime | undefined;
     let server: ReturnType<typeof createNodeRelayServer> | undefined;
     try {
         const backend = parseRelayStoreBackend(process.env.MURMUR_RELAY_STORE);
@@ -125,6 +176,7 @@ export async function main(): Promise<void> {
         stage = "store-open";
         logger.info(`relay:store-open-start backend=${backend}`);
         ({ store, wakeSource } = await createStore(backend));
+        privateGroups = await createPrivateGroupRuntime(backend);
         logger.info(`relay:store-open-complete backend=${backend}`);
         const declareRestored = process.env.MURMUR_RELAY_DECLARE_RESTORED;
         if (declareRestored !== undefined && declareRestored !== "1") {
@@ -169,15 +221,21 @@ export async function main(): Promise<void> {
         logger.info(`relay:connectivity-check-complete backend=${backend}`);
 
         stage = "http-create";
-        const activeServer = createNodeRelayServer(
-            createRelayFetchHandler(activeService, {
-                allowedOrigins,
-                ...(maximumRequestsPerMinutePerAddress === undefined
-                    ? {}
-                    : { maximumRequestsPerMinutePerAddress }),
-                ...(maximumTrackedAddresses === undefined ? {} : { maximumTrackedAddresses }),
-                ...(remoteAddressHeader === undefined ? {} : { remoteAddressHeader }),
-            }),
+        const relayHandler = createRelayFetchHandler(activeService, {
+            allowedOrigins,
+            ...(maximumRequestsPerMinutePerAddress === undefined
+                ? {}
+                : { maximumRequestsPerMinutePerAddress }),
+            ...(maximumTrackedAddresses === undefined ? {} : { maximumTrackedAddresses }),
+            ...(remoteAddressHeader === undefined ? {} : { remoteAddressHeader }),
+        });
+        const privateGroupHandler = createPrivateGroupStateFetchHandler(privateGroups.service, {
+            allowedOrigins,
+        });
+        const activeServer = createNodeRelayServer(async (request, context) =>
+            new URL(request.url).pathname.startsWith("/v1/private-groups/")
+                ? privateGroupHandler(request, context)
+                : relayHandler(request, context),
         );
         server = activeServer;
         stage = "http-listen";
@@ -228,6 +286,14 @@ export async function main(): Promise<void> {
                     shutdownError = error;
                     logger.error(`relay:http-close-failed ${safeErrorSummary(error)}`);
                 }
+                logger.info("relay:private-groups-close-start");
+                try {
+                    await privateGroups?.close();
+                    logger.info("relay:private-groups-close-complete");
+                } catch (error) {
+                    shutdownError ??= error;
+                    logger.error(`relay:private-groups-close-failed ${safeErrorSummary(error)}`);
+                }
                 logger.info("relay:service-close-start");
                 try {
                     await activeService.close();
@@ -254,12 +320,22 @@ export async function main(): Promise<void> {
             });
         }
         if (service !== undefined) {
+            await privateGroups?.close().catch((cleanupError: unknown) => {
+                logger.error(
+                    `relay:start-cleanup-private-groups-failed ${safeErrorSummary(cleanupError)}`,
+                );
+            });
             await service.close().catch((cleanupError: unknown) => {
                 logger.error(
                     `relay:start-cleanup-service-failed ${safeErrorSummary(cleanupError)}`,
                 );
             });
         } else {
+            await privateGroups?.close().catch((cleanupError: unknown) => {
+                logger.error(
+                    `relay:start-cleanup-private-groups-failed ${safeErrorSummary(cleanupError)}`,
+                );
+            });
             await wakeSource?.close().catch((cleanupError: unknown) => {
                 logger.error(`relay:start-cleanup-wake-failed ${safeErrorSummary(cleanupError)}`);
             });

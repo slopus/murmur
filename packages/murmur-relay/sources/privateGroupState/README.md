@@ -1,88 +1,62 @@
 # Private-group state service
 
-This module stores one canonical encrypted record per opaque group identifier.
-It sees only group capabilities, deterministic encrypted member entries, fixed
-roles, revisions, sizes, and access timing.
+This experimental module stores one canonical encrypted record per opaque
+group identifier. It sees only group capabilities, deterministic encrypted
+member entries, fixed roles, revision metadata, sizes, and access timing.
 
 ```text
 authenticated account -> blind credential issuance authority
                                       |
 opaque entry -> randomized proof -> short-lived scoped token
                                       |
-                               SQLite canonical record
+                         canonical record store
+                         (SQLite / Postgres / Durable Object)
 ```
 
-The service receives cryptographic issuance and presentation verification as a
-narrow authority. It never receives a group master secret or plaintext account
-roster. Production HTTP integration must supply the authenticated account
-identifier from the authenticated session, never from an unauthenticated
-request field.
+The service never receives a group master secret, plaintext account roster,
+session identifier, or attributes. Tokens contain no account identifier and
+are scoped to one opaque group, encrypted entry, fixed role, and expiry. The
+current record persists while the group exists; stores retain no history.
 
-Tokens contain no account identifier and are scoped to one opaque group,
-encrypted entry, fixed role, and expiry. SQLite stores only the current record,
-so storage remains bounded by explicit group, member, record-byte, and pending
-challenge limits.
-
-This feature requires external cryptographic review before production use. It
-hides the persistent social graph from this service, not IP, timing, volume,
-cardinality, role, or record-size metadata.
+Every accepted write receives a monotonic server-assigned UUIDv7 canonical
+version and names its predecessor. An exact create or replacement retry returns
+the original accepted result. Stale or conflicting writes fail closed.
 
 ## Structure
 
-- `index.ts` — `PrivateGroupStateService` and the export surface below.
-- `types.ts` — store, authority, challenge, and limit interfaces.
-- `impl/privateGroupStateStoreSqlite.ts` — the bounded SQLite store.
-- `tests/` — service tests against `SqlitePrivateGroupStateStore(":memory:")`.
+- `index.ts` — service behavior, secret-based construction, and exports.
+- `types.ts` — store, authority, challenge, record, and limit interfaces.
+- `http.ts` — strict fetch-compatible credential, proof, and record routes.
+- `impl/privateGroupStateStoreSqlite.ts` — bounded SQLite store.
+- `impl/privateGroupStateStorePostgres.ts` — Postgres/PGlite store.
+- `tests/` — real PGlite store coverage; the browser package runs the complete
+  client/service flow against real in-memory SQLite and HTTP handlers.
 
-## Exports
+## Public relay-host construction
 
-### `class PrivateGroupStateService`
+- `PrivateGroupStateService` — validates credentials, proofs, tokens, records,
+  role authorization, and canonical predecessor replacement.
+- `SqlitePrivateGroupStateStore` — synchronous SQLite implementation.
+- `PostgresPrivateGroupStateStore.create(database)` — async Postgres/PGlite
+  implementation with one clean beta schema and no migration path.
+- `createPrivateGroupCredentialAuthorityFromSecret(secret)` — experimental
+  trusted-relay authority construction from one 32-byte issuer secret.
+- `createPrivateGroupStateServiceFromSecret(options)` — derives independent
+  credential-authority and bearer-token domains from one 32-byte deployment
+  secret, then constructs the complete service.
+- `createPrivateGroupStateFetchHandler(service)` — mounts strict
+  `/v1/private-groups/*` routes for configuration, account-signed credential
+  issuance, challenges, presentations, and record create/read/replace. Blind
+  issuance requires an Ed25519 signature from the named account identity over
+  a short-lived server challenge and the exact blind request/context hashes.
 
-The whole service behavior behind one class; storage and cryptography are
-injected so this module never imports browser-library internals.
+## Beta security gaps
 
-- `constructor(options: PrivateGroupStateServiceOptions)` — takes a
-  `PrivateGroupStateStore`, a `PrivateGroupCredentialAuthority` (byte-only
-  issuance/verification adapter), an HMAC token secret, optional limits and
-  lifetimes, and a clock.
-- `credentialIssuanceContext(authenticationContext: Uint8Array): Uint8Array`
-  — derive the domain-separated context a client must bind into its blind
-  issuance request, tying issuance to the upstream authenticated session.
-- `issueCredential(options): Promise<Uint8Array>` — blind-issue one
-  short-lived credential over the hidden identifier of an
-  already-authenticated account. The `authenticatedAccountIdentifier` must
-  come from upstream authentication, never from the request payload.
-- `createPresentationChallenge(options):
-Promise<PrivateGroupPresentationChallenge>` — mint one bounded, one-use,
-  30-second challenge naming the opaque group, entry, role, and operation.
-- `authenticatePresentation(options): Promise<{ bytes, expiresAt }>` —
-  atomically consume the challenge, verify the randomized presentation
-  against the stored entry and group public parameters, and return a
-  short-lived HMAC bearer token scoped to group + entry + role + expiry.
-  Replay of a consumed challenge fails.
-- `createRecord(options)` — validate and store revision 1 of a group under a
-  `create`-scoped token; duplicate groups and oversized records are rejected.
-- `readRecord(options)` — return the current canonical record and its hash
-  under any valid token for that group.
-- `replaceRecord(options)` — atomically replace the record only when the
-  caller's expected parent hash matches the stored revision (stale forks are
-  rejected) and the token's role permits mutation.
-- `close(): void` — release the store.
+- Access tokens are bearer capabilities without proof of possession.
+- `commitEventId` is null; server verification of the winning MLS Commit is
+  deferred. Clients still enforce the encrypted revision and canonical
+  predecessor chains locally.
+- The anonymous credential construction requires external cryptographic audit.
 
-### Store (`impl/privateGroupStateStoreSqlite.ts`)
-
-- `class SqlitePrivateGroupStateStore` — `node:sqlite` implementation of
-  `PrivateGroupStateStore`: current-record-only storage with an entry index
-  for duplicate detection, bounded pending challenges, and atomic
-  expected-parent replacement. Accepts `":memory:"` for tests.
-- `SqlitePrivateGroupStateStoreOptions` — its configuration type.
-
-### Types (`types.ts`)
-
-`PrivateGroupStateStore` (the storage contract),
-`PrivateGroupCredentialAuthority` (the injected crypto contract),
-`PrivateGroupStateServiceOptions`, `PrivateGroupStateLimits`,
-`PrivateGroupStateRecord`, `StoredPrivateGroupStateRecord`,
-`PrivateGroupMemberEntry`, `PrivateGroupRole`,
-`PrivateGroupPresentationChallenge`, `PrivateGroupChallengeOperation`,
-`PrivateGroupAccessToken`.
+The service hides the persistent social graph from storage operators. It does
+not hide IP address, timing, volume, cardinality, role, or record-size metadata.

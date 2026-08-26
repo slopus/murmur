@@ -5,6 +5,7 @@ import {
     decodePrivateGroupPublicParameters,
     decodeUidPresentation,
     deriveCredentialIssuer,
+    destroyCredentialIssuer,
     encodeCredentialIssuanceResponse,
     encodeCredentialIssuerPublicParameters,
     issueCredential,
@@ -34,6 +35,8 @@ export interface PrivateGroupCredentialAuthorityAdapter {
         readonly context: Uint8Array;
         readonly now: number;
     }): number | null;
+    /** Destroy retained credential-issuer secrets. */
+    close(): void;
 }
 
 /**
@@ -45,10 +48,15 @@ export interface PrivateGroupCredentialAuthorityAdapter {
 export function createPrivateGroupCredentialAuthority(
     issuer: CredentialIssuer,
 ): PrivateGroupCredentialAuthorityAdapter {
+    let closed = false;
+    const assertOpen = (): void => {
+        if (closed) throw new Error("Private-group credential authority is closed");
+    };
     return {
         publicParameters: encodeCredentialIssuerPublicParameters(issuer.publicParameters),
-        issueCredential: (options): Uint8Array =>
-            encodeCredentialIssuanceResponse(
+        issueCredential: (options): Uint8Array => {
+            assertOpen();
+            return encodeCredentialIssuanceResponse(
                 issueCredential({
                     issuer,
                     accountIdentifier: options.authenticatedAccountIdentifier,
@@ -57,8 +65,10 @@ export function createPrivateGroupCredentialAuthority(
                     now: options.now,
                     context: options.context,
                 }),
-            ),
+            );
+        },
         validateGroupPublicParameters: (publicParameters, expectedOpaqueGroupId): boolean => {
+            assertOpen();
             try {
                 return equalBytes(
                     decodePrivateGroupPublicParameters(publicParameters).opaqueGroupId,
@@ -69,6 +79,7 @@ export function createPrivateGroupCredentialAuthority(
             }
         },
         verifyPresentation: (options): number | null => {
+            assertOpen();
             try {
                 const presentation = decodeUidPresentation(options.presentation);
                 return verifyUidPresentation({
@@ -84,6 +95,12 @@ export function createPrivateGroupCredentialAuthority(
                     : null;
             } catch {
                 return null;
+            }
+        },
+        close: (): void => {
+            if (!closed) {
+                closed = true;
+                destroyCredentialIssuer(issuer);
             }
         },
     };

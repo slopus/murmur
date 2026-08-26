@@ -1,12 +1,19 @@
+import { ed25519 } from "@noble/curves/ed25519";
 import { hmac } from "@noble/hashes/hmac";
+import { hkdf } from "@noble/hashes/hkdf";
 import { sha256 } from "@noble/hashes/sha2";
 import { randomBytes } from "@noble/hashes/utils";
+import {
+    createPrivateGroupCredentialAuthorityFromSecret,
+    type PrivateGroupCredentialAuthorityAdapter,
+} from "@slopus/murmur";
 import { canonicalJson } from "../utils/canonicalJson.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
 import { isUuidV7 } from "../utils/uuidV7.js";
 import type {
     PrivateGroupChallengeOperation,
+    PrivateGroupCredentialIssuanceChallenge,
     PrivateGroupCredentialAuthority,
     PrivateGroupPresentationChallenge,
     PrivateGroupRole,
@@ -19,9 +26,13 @@ import type {
 export { SqlitePrivateGroupStateStore } from "./impl/privateGroupStateStoreSqlite.js";
 export type { SqlitePrivateGroupStateStoreOptions } from "./impl/privateGroupStateStoreSqlite.js";
 export { PostgresPrivateGroupStateStore } from "./impl/privateGroupStateStorePostgres.js";
+export { createPrivateGroupStateFetchHandler } from "./http.js";
+export { createPrivateGroupCredentialAuthorityFromSecret } from "@slopus/murmur";
+export type { PrivateGroupCredentialAuthorityAdapter } from "@slopus/murmur";
 export type {
     PrivateGroupAccessToken,
     PrivateGroupChallengeOperation,
+    PrivateGroupCredentialIssuanceChallenge,
     PrivateGroupCredentialAuthority,
     PrivateGroupMemberEntry,
     PrivateGroupPresentationChallenge,
@@ -43,6 +54,24 @@ const DEFAULT_LIMITS: PrivateGroupStateLimits = {
 const DEFAULT_CREDENTIAL_LIFETIME = 5 * 60_000;
 const DEFAULT_CHALLENGE_LIFETIME = 30_000;
 const DEFAULT_TOKEN_LIFETIME = 60_000;
+const CREDENTIAL_AUTHORIZATION_CHALLENGE_LIFETIME = 30_000;
+const SERVICE_SECRET_SALT = sha256(
+    new TextEncoder().encode("murmur/private-group-state/service-secret/v1"),
+);
+const CREDENTIAL_SECRET_INFO = new TextEncoder().encode("credential-authority");
+const TOKEN_SECRET_INFO = new TextEncoder().encode("access-token");
+const CREDENTIAL_CHALLENGE_SECRET_DOMAIN = new TextEncoder().encode(
+    "murmur/private-group-state/credential-challenge-secret/v1",
+);
+
+/** Construction inputs for the domain-separated deployment-secret helper. */
+export interface PrivateGroupStateSecretServiceOptions extends Omit<
+    PrivateGroupStateServiceOptions,
+    "credentialAuthority" | "tokenSecret"
+> {
+    /** Deployment-specific 32-byte secret, never shared with clients. */
+    readonly secret: Uint8Array;
+}
 
 interface TokenClaims {
     readonly version: 1;
@@ -181,6 +210,102 @@ function issuanceContext(authenticationContext: Uint8Array): Uint8Array {
     });
 }
 
+function credentialChallengePayload(options: {
+    readonly accountIdentifier: Uint8Array;
+    readonly issuedAt: number;
+    readonly expiresAt: number;
+    readonly nonce: Uint8Array;
+}): Uint8Array {
+    return canonicalJson({
+        domain: "murmur.private-group-state.credential-challenge.v1",
+        accountIdentifier: encodeBase64Url(options.accountIdentifier),
+        issuedAt: options.issuedAt,
+        expiresAt: options.expiresAt,
+        nonce: encodeBase64Url(options.nonce),
+    });
+}
+
+function credentialAuthorizationBytes(options: {
+    readonly accountIdentifier: Uint8Array;
+    readonly challenge: Uint8Array;
+    readonly request: Uint8Array;
+    readonly authenticationContext: Uint8Array;
+}): Uint8Array {
+    return canonicalJson({
+        domain: "murmur.private-group-state.credential-authorization.v1",
+        accountIdentifier: encodeBase64Url(options.accountIdentifier),
+        challenge: encodeBase64Url(options.challenge),
+        requestHash: encodeBase64Url(sha256(options.request)),
+        authenticationContextHash: encodeBase64Url(sha256(options.authenticationContext)),
+    });
+}
+
+function parseCredentialChallenge(
+    bytes: Uint8Array,
+    secret: Uint8Array,
+    expectedAccountIdentifier: Uint8Array,
+    now: number,
+): void {
+    if (bytes.length < 1 || bytes.length > 2048) {
+        throw new Error("Invalid credential issuance challenge");
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
+    } catch {
+        throw new Error("Invalid credential issuance challenge");
+    }
+    if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("Invalid credential issuance challenge");
+    }
+    const input = parsed as Record<string, unknown>;
+    if (
+        input.domain !== "murmur.private-group-state.credential-challenge.v1" ||
+        typeof input.accountIdentifier !== "string" ||
+        typeof input.issuedAt !== "number" ||
+        !Number.isSafeInteger(input.issuedAt) ||
+        typeof input.expiresAt !== "number" ||
+        !Number.isSafeInteger(input.expiresAt) ||
+        typeof input.nonce !== "string" ||
+        typeof input.tag !== "string" ||
+        Object.keys(input).some(
+            (field) =>
+                !["domain", "accountIdentifier", "issuedAt", "expiresAt", "nonce", "tag"].includes(
+                    field,
+                ),
+        )
+    ) {
+        throw new Error("Invalid credential issuance challenge");
+    }
+    const accountIdentifier = decodeBase64Url(input.accountIdentifier, 32);
+    const nonce = decodeBase64Url(input.nonce, 32);
+    const tag = decodeBase64Url(input.tag, 32);
+    const payload = credentialChallengePayload({
+        accountIdentifier,
+        issuedAt: input.issuedAt,
+        expiresAt: input.expiresAt,
+        nonce,
+    });
+    const canonical = canonicalJson({
+        domain: "murmur.private-group-state.credential-challenge.v1",
+        accountIdentifier: input.accountIdentifier,
+        issuedAt: input.issuedAt,
+        expiresAt: input.expiresAt,
+        nonce: input.nonce,
+        tag: input.tag,
+    });
+    if (
+        !equalBytes(bytes, canonical) ||
+        !equalBytes(accountIdentifier, expectedAccountIdentifier) ||
+        input.issuedAt > now ||
+        input.expiresAt !== input.issuedAt + CREDENTIAL_AUTHORIZATION_CHALLENGE_LIFETIME ||
+        input.expiresAt <= now ||
+        !equalBytes(tag, hmac(sha256, secret, payload))
+    ) {
+        throw new Error("Invalid or expired credential issuance challenge");
+    }
+}
+
 function tokenPayload(claims: TokenClaims): Uint8Array {
     return canonicalJson({
         version: claims.version,
@@ -255,6 +380,7 @@ export class PrivateGroupStateService {
     readonly #store: PrivateGroupStateServiceOptions["store"];
     readonly #authority: PrivateGroupCredentialAuthority;
     readonly #tokenSecret: Uint8Array;
+    readonly #credentialChallengeSecret: Uint8Array;
     readonly #now: () => number;
     readonly #credentialLifetime: number;
     readonly #challengeLifetime: number;
@@ -267,6 +393,11 @@ export class PrivateGroupStateService {
         this.#store = options.store;
         this.#authority = options.credentialAuthority;
         this.#tokenSecret = options.tokenSecret.slice();
+        this.#credentialChallengeSecret = hmac(
+            sha256,
+            options.tokenSecret,
+            CREDENTIAL_CHALLENGE_SECRET_DOMAIN,
+        );
         this.#now = options.now ?? Date.now;
         this.#credentialLifetime = safePositive(
             options.credentialLifetimeMilliseconds ?? DEFAULT_CREDENTIAL_LIFETIME,
@@ -296,6 +427,74 @@ export class PrivateGroupStateService {
             throw new Error("Invalid authenticated credential context");
         }
         return issuanceContext(authenticationContext);
+    }
+
+    /** Create a short-lived stateless challenge bound to one account identity key. */
+    createCredentialIssuanceChallenge(
+        accountIdentifier: Uint8Array,
+    ): PrivateGroupCredentialIssuanceChallenge {
+        this.#assertOpen();
+        validateBytes(accountIdentifier, 32, "credential account identity");
+        const issuedAt = this.#safeNow();
+        const expiresAt = issuedAt + CREDENTIAL_AUTHORIZATION_CHALLENGE_LIFETIME;
+        if (!Number.isSafeInteger(expiresAt)) {
+            throw new Error("Credential issuance challenge expiry overflow");
+        }
+        const nonce = randomBytes(32);
+        const payload = credentialChallengePayload({
+            accountIdentifier,
+            issuedAt,
+            expiresAt,
+            nonce,
+        });
+        const bytes = canonicalJson({
+            domain: "murmur.private-group-state.credential-challenge.v1",
+            accountIdentifier: encodeBase64Url(accountIdentifier),
+            issuedAt,
+            expiresAt,
+            nonce: encodeBase64Url(nonce),
+            tag: encodeBase64Url(hmac(sha256, this.#credentialChallengeSecret, payload)),
+        });
+        return { bytes, expiresAt };
+    }
+
+    /** Verify account-key authorization before running blind credential issuance. */
+    async issueAuthenticatedCredential(options: {
+        readonly authenticatedAccountIdentifier: Uint8Array;
+        readonly request: Uint8Array;
+        readonly authenticationContext: Uint8Array;
+        readonly challenge: Uint8Array;
+        readonly signature: Uint8Array;
+    }): Promise<Uint8Array> {
+        this.#assertOpen();
+        validateBytes(options.authenticatedAccountIdentifier, 32, "authenticated account ID");
+        validateBytes(options.signature, 64, "credential authorization signature");
+        parseCredentialChallenge(
+            options.challenge,
+            this.#credentialChallengeSecret,
+            options.authenticatedAccountIdentifier,
+            this.#safeNow(),
+        );
+        let verified = false;
+        try {
+            verified = ed25519.verify(
+                options.signature,
+                credentialAuthorizationBytes({
+                    accountIdentifier: options.authenticatedAccountIdentifier,
+                    challenge: options.challenge,
+                    request: options.request,
+                    authenticationContext: options.authenticationContext,
+                }),
+                options.authenticatedAccountIdentifier,
+                { zip215: false },
+            );
+        } catch {
+            verified = false;
+        }
+        if (!verified) {
+            throw new Error("Invalid credential issuance account signature");
+        }
+        return this.issueCredential(options);
     }
 
     /** Blind-issue a short-lived credential to an upstream-authenticated account. */
@@ -536,6 +735,8 @@ export class PrivateGroupStateService {
         if (!this.#closed) {
             this.#closed = true;
             this.#tokenSecret.fill(0);
+            this.#credentialChallengeSecret.fill(0);
+            this.#authority.close?.();
             this.#store.close();
         }
     }
@@ -598,5 +799,40 @@ export class PrivateGroupStateService {
 
     #assertOpen(): void {
         if (this.#closed) throw new Error("Private-group state service is closed");
+    }
+}
+
+/**
+ * EXPERIMENTAL: create a complete state service from one deployment secret.
+ *
+ * Credential-issuer and bearer-token secrets are independently derived in
+ * fixed domains. The caller retains ownership of `options.secret`.
+ */
+export function createPrivateGroupStateServiceFromSecret(
+    options: PrivateGroupStateSecretServiceOptions,
+): PrivateGroupStateService {
+    if (!(options.secret instanceof Uint8Array) || options.secret.length !== 32) {
+        throw new Error("Private-group deployment secret must be 32 bytes");
+    }
+    const credentialSecret = hkdf(
+        sha256,
+        options.secret,
+        SERVICE_SECRET_SALT,
+        CREDENTIAL_SECRET_INFO,
+        32,
+    );
+    const tokenSecret = hkdf(sha256, options.secret, SERVICE_SECRET_SALT, TOKEN_SECRET_INFO, 32);
+    try {
+        const credentialAuthority: PrivateGroupCredentialAuthorityAdapter =
+            createPrivateGroupCredentialAuthorityFromSecret(credentialSecret);
+        const { secret: _secret, ...serviceOptions } = options;
+        return new PrivateGroupStateService({
+            ...serviceOptions,
+            credentialAuthority,
+            tokenSecret,
+        });
+    } finally {
+        credentialSecret.fill(0);
+        tokenSecret.fill(0);
     }
 }

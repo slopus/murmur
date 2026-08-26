@@ -57,6 +57,12 @@ export interface PrivateGroupAccessToken {
     readonly expiresAt: number;
 }
 
+/** Short-lived server challenge used to authorize blind credential issuance. */
+export interface PrivateGroupCredentialIssuanceChallenge {
+    readonly bytes: Uint8Array;
+    readonly expiresAt: number;
+}
+
 /** Byte-only transport implemented by the private-group state service. */
 export interface PrivateGroupStateTransport {
     readonly credentialIssuerPublicParameters: Uint8Array;

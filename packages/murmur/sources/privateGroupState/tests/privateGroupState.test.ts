@@ -2,11 +2,15 @@ import { describe, expect, it } from "vitest";
 import {
     PrivateGroupStateService,
     SqlitePrivateGroupStateStore,
+    createPrivateGroupStateFetchHandler,
+    createPrivateGroupStateServiceFromSecret,
     encodePrivateGroupStateRecord as encodeServiceRecord,
 } from "@slopus/murmur-relay";
+import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
 import { encodeBase64Url, equalBytes, utf8Encode } from "../../utils/index.js";
 import {
     PrivateGroupStateClient,
+    HttpPrivateGroupStateTransport,
     createPrivateGroupCredentialAuthorityFromSecret,
     privateGroupStateRecordHash,
     type PrivateGroupRecordContent,
@@ -137,6 +141,90 @@ function stored(
 }
 
 describe("private-group canonical state service", () => {
+    it("runs create, read, and replace through the strict HTTP transport", async () => {
+        const identity = generateIdentityKeyPair();
+        const account = identity.publicKey;
+        const service = createPrivateGroupStateServiceFromSecret({
+            store: new SqlitePrivateGroupStateStore(":memory:"),
+            secret: bytes(211),
+            now: () => START,
+        });
+        const handler = createPrivateGroupStateFetchHandler(service);
+        const transport = await HttpPrivateGroupStateTransport.create("https://relay.example", {
+            identity,
+            fetch: async (input, init) => handler(new Request(input, init)),
+        });
+        const client = new PrivateGroupStateClient({
+            accountIdentifier: account,
+            groupMasterSecret: bytes(111),
+            transport,
+            now: () => START,
+        });
+        const baseContent: PrivateGroupRecordContent = {
+            attributes: utf8Encode("HTTP alpha"),
+            session: {
+                id: bytes(161),
+                status: "active",
+                descriptor: utf8Encode("private group HTTP session"),
+                members: [account],
+                owner: account,
+                admins: [account],
+                policies: { adminsAssignAdmins: false, anyoneCanAddMembers: false },
+            },
+            roles: [{ accountIdentifier: account, role: "owner" }],
+        };
+        try {
+            const credential = await client.obtainCredential(utf8Encode("beta client auth"));
+            const created = await client.createGroup(credential, baseContent);
+            const token = await client.authorize(credential, "owner", "access");
+            const read = await client.readGroup(token, baseContent);
+            expect(new TextDecoder().decode(read.attributes)).toBe("HTTP alpha");
+
+            const successorContent = {
+                ...baseContent,
+                attributes: utf8Encode("HTTP beta"),
+            };
+            const replaced = await client.replaceGroup(token, created.record, successorContent);
+            expect(new TextDecoder().decode(replaced.attributes)).toBe("HTTP beta");
+            expect(replaced.record.canonicalVersion > created.record.canonicalVersion).toBe(true);
+
+            const challenge = await handler(
+                new Request("https://relay.example/v1/private-groups/credentials/challenge", {
+                    method: "POST",
+                    body: JSON.stringify({ accountIdentifier: encodeBase64Url(account) }),
+                }),
+            );
+            const challengeBody = (await challenge.json()) as { readonly bytes: string };
+            const forged = await handler(
+                new Request("https://relay.example/v1/private-groups/credentials", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        accountIdentifier: encodeBase64Url(account),
+                        request: encodeBase64Url(bytes(221)),
+                        authenticationContext: encodeBase64Url(utf8Encode("forged")),
+                        challenge: challengeBody.bytes,
+                        signature: encodeBase64Url(new Uint8Array(64)),
+                    }),
+                }),
+            );
+            expect(forged.status).toBe(401);
+            expect(await forged.json()).toEqual({ error: "private_group_unauthorized" });
+
+            const duplicateJson = await handler(
+                new Request("https://relay.example/v1/private-groups/credentials", {
+                    method: "POST",
+                    body: '{"accountIdentifier":"a","accountIdentifier":"b"}',
+                }),
+            );
+            expect(duplicateJson.status).toBe(400);
+            expect(await duplicateJson.json()).toEqual({ error: "duplicate_json_key" });
+        } finally {
+            client.close();
+            service.close();
+            destroyIdentity(identity);
+        }
+    });
+
     it("creates opaque state, admits another member anonymously, rejects duplicates, and unlinks groups", async () => {
         const value = fixture();
         try {

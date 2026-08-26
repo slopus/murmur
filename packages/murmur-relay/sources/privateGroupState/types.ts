@@ -51,6 +51,12 @@ export interface PrivateGroupAccessToken {
     readonly expiresAt: number;
 }
 
+/** Short-lived stateless server challenge for authenticated credential issuance. */
+export interface PrivateGroupCredentialIssuanceChallenge {
+    readonly bytes: Uint8Array;
+    readonly expiresAt: number;
+}
+
 /** Blind credential and presentation operations supplied by the credential authority. */
 export interface PrivateGroupCredentialAuthority {
     readonly publicParameters: Uint8Array;
@@ -73,6 +79,8 @@ export interface PrivateGroupCredentialAuthority {
         readonly context: Uint8Array;
         readonly now: number;
     }): number | null | Promise<number | null>;
+    /** Optional secret cleanup hook for an owned authority. */
+    close?(): void;
 }
 
 /** Explicit storage and replay bounds for one service instance. */
