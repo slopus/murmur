@@ -14,6 +14,7 @@ websocket/   authenticated WebSocket protocol
 ```
 
 The relay stores opaque pending ciphertext, continuity metadata, current
-account rosters, and account-linked directory state. Standalone storage owns
-transactional terminal account deletion; the queue-only Cloudflare adapter
-returns an explicit unsupported-operation response.
+account rosters, account-linked directory state, and relay-visible session
+routing policy. Standalone stores keep all cascades in one database transaction;
+Cloudflare commits singleton control deletion first and completes per-device
+inbox deletion through a durable alarm-retried cascade.

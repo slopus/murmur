@@ -4,5 +4,7 @@ These files use small structural interfaces instead of a runtime dependency on
 Cloudflare type packages. The Worker entry imports only browser-safe relay
 modules.
 
-The strict request codec recognizes terminal account deletion so this
-queue-only adapter can return an explicit unsupported-operation response.
+The strict request codec covers queue work plus account deletion, roster
+read/mutation, and directory upload/claim frames. Session fanout and those
+control operations are forwarded to the singleton Durable Object, whose
+synchronous SQLite state determines authorization and exact recipients.

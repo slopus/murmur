@@ -4,6 +4,7 @@ import { decodeBase64Url, encodeBase64Url, equalBytes, utf8Encode } from "../../
 import type {
     DeliveryPublishOutcome,
     DeliveryDeviceRoster,
+    DeliveryDirectoryClaim,
     DeliveryStreamHooks,
     DeliveryTransport,
     DeliveryWebSocket,
@@ -47,6 +48,10 @@ type WebSocketOperation =
     | "publish"
     | "delete_session"
     | "delete_account"
+    | "read_device_roster"
+    | "mutate_device_roster"
+    | "upload_directory_prekeys"
+    | "claim_directory"
     | "read"
     | "acknowledge"
     | "stream";
@@ -126,6 +131,49 @@ function roster(value: unknown): DeliveryDeviceRoster {
                 throw new Error("Invalid relay WebSocket message");
             }
             return { deviceKey, keyPackage };
+        }),
+    };
+}
+
+function directoryClaim(value: unknown): DeliveryDirectoryClaim {
+    const input = object(value);
+    exact(input, ["version", "accountKey", "rosterRevision", "devices"]);
+    if (
+        input.version !== 1 ||
+        typeof input.accountKey !== "string" ||
+        !Array.isArray(input.devices)
+    ) {
+        throw new Error("Invalid relay WebSocket message");
+    }
+    const accountKey = decodeBase64Url(input.accountKey);
+    if (accountKey.length !== 32 || input.devices.length > 256) {
+        throw new Error("Invalid relay WebSocket message");
+    }
+    return {
+        version: 1,
+        accountKey,
+        rosterRevision: safeInteger(input.rosterRevision),
+        devices: input.devices.map((candidate) => {
+            const entry = object(candidate);
+            exact(entry, ["deviceKey", "resetGeneration", "keyPackage", "source"]);
+            if (
+                typeof entry.deviceKey !== "string" ||
+                typeof entry.keyPackage !== "string" ||
+                (entry.source !== "one_time" && entry.source !== "last_resort")
+            ) {
+                throw new Error("Invalid relay WebSocket message");
+            }
+            const deviceKey = decodeBase64Url(entry.deviceKey);
+            const keyPackage = decodeBase64Url(entry.keyPackage);
+            if (deviceKey.length !== 32 || keyPackage.length < 1) {
+                throw new Error("Invalid relay WebSocket message");
+            }
+            return {
+                deviceKey,
+                resetGeneration: safeInteger(entry.resetGeneration),
+                keyPackage,
+                source: entry.source,
+            };
         }),
     };
 }
@@ -323,6 +371,78 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         const body = object(response.body);
         exact(body, ["deleted"]);
         if (body.deleted !== true) throw new Error("Invalid relay WebSocket response");
+    }
+
+    async readDeviceRoster(
+        accountKey: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster | undefined> {
+        if (accountKey.length !== 32) throw new Error("Invalid account identity key");
+        const response = await this.#request(
+            "read_device_roster",
+            { version: 1, accountKey: encodeBase64Url(accountKey) },
+            signal,
+        );
+        if (response.status < 200 || response.status >= 300) {
+            throwFailure(response.status, response.body);
+        }
+        const body = object(response.body);
+        exact(body, ["roster"]);
+        return body.roster === null ? undefined : roster(body.roster);
+    }
+
+    async mutateDeviceRoster(
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDeviceRoster> {
+        const response = await this.#request(
+            "mutate_device_roster",
+            signedDeliveryToJson(delivery),
+            signal,
+        );
+        if (response.status < 200 || response.status >= 300) {
+            throwFailure(response.status, response.body);
+        }
+        const body = object(response.body);
+        exact(body, ["roster"]);
+        return roster(body.roster);
+    }
+
+    async uploadDirectoryPrekeys(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+        const response = await this.#request(
+            "upload_directory_prekeys",
+            signedDeliveryToJson(delivery),
+            signal,
+        );
+        if (response.status < 200 || response.status >= 300) {
+            throwFailure(response.status, response.body);
+        }
+        const body = object(response.body);
+        exact(body, ["uploaded"]);
+        if (body.uploaded !== true) throw new Error("Invalid relay WebSocket response");
+    }
+
+    async claimDirectory(
+        accountKey: Uint8Array,
+        ticket: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDirectoryClaim> {
+        if (accountKey.length !== 32 || ticket.length < 1) {
+            throw new Error("Invalid directory claim");
+        }
+        const response = await this.#request(
+            "claim_directory",
+            {
+                version: 1,
+                accountKey: encodeBase64Url(accountKey),
+                ticket: encodeBase64Url(ticket),
+            },
+            signal,
+        );
+        if (response.status < 200 || response.status >= 300) {
+            throwFailure(response.status, response.body);
+        }
+        return directoryClaim(response.body);
     }
 
     /** Read one bounded page from the negotiated device inbox. */

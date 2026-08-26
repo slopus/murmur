@@ -9,12 +9,14 @@ directory prekey pools.
 
 - SQLite through Node's built-in `node:sqlite` support.
 - PostgreSQL through `pg`, with database-backed wake notifications.
-- Cloudflare Durable Objects for inboxes and manifest-first fanout.
+- Cloudflare Durable Objects for inboxes, manifest-first fanout, and singleton
+  SQLite roster, directory, and relay-visible session control state.
 
-The Cloudflare adapter is queue-only. It returns `501 session_state_unavailable`
-for session-addressed publication and `501 account_deletion_unavailable` for
-terminal account deletion. Both operations require the standalone SQLite or
-PostgreSQL relay.
+Cloudflare session publications derive exact current-device recipients from the
+singleton control database. Terminal account deletion removes control state
+before replying, then durably retries its asynchronous per-device inbox purge.
+`deriveCloudflareDirectoryTicketSecret()` gives the application ticket issuer
+the domain-separated seed expected by Cloudflare directory claims.
 
 ## Run locally
 

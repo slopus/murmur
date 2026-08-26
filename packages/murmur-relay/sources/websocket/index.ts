@@ -1,5 +1,9 @@
 import {
     RelayError,
+    deviceRosterToJson,
+    directoryClaimToJson,
+    parseDeviceRosterLookup,
+    parseDirectoryClaimRequest,
     parseSignedDelivery,
     parseSignedQueueAck,
     parseSignedQueueRead,
@@ -32,6 +36,10 @@ interface RequestFrame {
         | "publish"
         | "delete_session"
         | "delete_account"
+        | "read_device_roster"
+        | "mutate_device_roster"
+        | "upload_directory_prekeys"
+        | "claim_directory"
         | "read"
         | "acknowledge"
         | "stream";
@@ -73,6 +81,10 @@ function frame(value: string, maximumBytes: number): RequestFrame {
         (input.operation !== "publish" &&
             input.operation !== "delete_session" &&
             input.operation !== "delete_account" &&
+            input.operation !== "read_device_roster" &&
+            input.operation !== "mutate_device_roster" &&
+            input.operation !== "upload_directory_prekeys" &&
+            input.operation !== "claim_directory" &&
             input.operation !== "read" &&
             input.operation !== "acknowledge" &&
             input.operation !== "stream")
@@ -164,6 +176,43 @@ export class RelayWebSocketSession {
                 const delivery = parseSignedDelivery(request.body);
                 await this.#relay.deleteAccount(delivery);
                 this.#send(response(request.id, 200, { deleted: true }));
+                return;
+            }
+            if (request.operation === "read_device_roster") {
+                const roster = await this.#relay.readDeviceRoster(
+                    parseDeviceRosterLookup(request.body),
+                );
+                this.#send(
+                    response(request.id, 200, {
+                        roster: roster === undefined ? null : deviceRosterToJson(roster),
+                    }),
+                );
+                return;
+            }
+            if (request.operation === "mutate_device_roster") {
+                const roster = await this.#relay.mutateDeviceRoster(
+                    parseSignedDelivery(request.body),
+                    this.#claims.admissionPrincipal,
+                );
+                this.#send(response(request.id, 200, { roster: deviceRosterToJson(roster) }));
+                return;
+            }
+            if (request.operation === "upload_directory_prekeys") {
+                await this.#relay.uploadDirectoryPrekeys(parseSignedDelivery(request.body));
+                this.#send(response(request.id, 200, { uploaded: true }));
+                return;
+            }
+            if (request.operation === "claim_directory") {
+                const claim = parseDirectoryClaimRequest(request.body);
+                this.#send(
+                    response(
+                        request.id,
+                        200,
+                        directoryClaimToJson(
+                            await this.#relay.claimDirectory(claim.accountKey, claim.ticket),
+                        ),
+                    ),
+                );
                 return;
             }
             if (request.operation === "read") {

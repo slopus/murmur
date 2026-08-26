@@ -10,12 +10,20 @@ account-signed deletion installs a durable tombstone, resumes partial inbox
 purges idempotently, rejects replay, and advances continuity in every affected
 inbox, including historical member inboxes not named by the final MLS notice.
 
-This queue-only adapter does not own current account rosters, the identity
-directory, or relay-visible session state. Session-addressed publication returns
-`501 session_state_unavailable`, and `delete_account` returns
-`501 account_deletion_unavailable`. These operations require the standalone
-SQLite or PostgreSQL relay, where all linked state shares one transaction
-boundary.
+The singleton fanout object also owns authoritative relay control state in its
+Durable Object SQLite database: device rosters, directory pools and ticket-use
+counters, and per-session membership, roles, policy, and epoch. A
+session-addressed publication advances that state synchronously and stores its
+exact roster-derived device set in the retry manifest. Roster mutations and
+one-time-prekey claims use the same manifest-first fanout path for their inbox
+notifications.
+
+Terminal account deletion first removes the roster, directory, and every
+affected session from control SQLite. The response means this state is already
+unreachable and an inbox cascade is durably scheduled; alarms retry each exact
+device inbox independently until all account inbox state is gone. The cascade
+is intentionally asynchronous and may still be running after the deletion
+response.
 
 Each inbox stores required sequence, acknowledgement, continuity-generation,
 pending-item, and pending-byte metadata in one exact shape. Invalid metadata
@@ -23,4 +31,9 @@ fails closed. Streams emit continuity before ordered queued deliveries.
 
 The application server remains responsible for user authentication and ticket
 issuance. Staging and production require a canonical base64url
-`MURMUR_RELAY_TOKEN_SECRET` and exact public `MURMUR_RELAY_ENDPOINT`.
+`MURMUR_RELAY_TOKEN_SECRET` and exact public `MURMUR_RELAY_ENDPOINT`. Cloudflare
+directory tickets use `LocalDirectoryTicketIssuer` with issuer
+`murmur-cloudflare-directory` and the domain-separated
+`deriveCloudflareDirectoryTicketSecret()` result as its signing seed; the
+authenticated application server must issue those short-lived, budgeted
+tickets.

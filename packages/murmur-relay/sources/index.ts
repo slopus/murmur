@@ -29,6 +29,7 @@ export type {
     IssueDirectoryTicketOptions,
     LocalDirectoryTicketIssuerOptions,
 } from "./directory/index.js";
+export { deriveCloudflareDirectoryTicketSecret } from "./cloudflare/impl/cloudflareCodec.js";
 export {
     DELIVERY_RETENTION_MILLISECONDS,
     InProcessWakeSource,

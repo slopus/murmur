@@ -87,8 +87,11 @@ whose signed roster revision is stale while MLS membership converges.
 Account deletion removes relay-owned and local technical state, but it is not
 retroactive erasure from other members. Authenticated MLS events already held
 by remote applications remain under those applications' storage policy. The
-Cloudflare queue-only adapter cannot perform session-addressed publication or
-terminal account deletion.
+Cloudflare adapter removes authoritative control state before acknowledging
+terminal deletion, but its per-device inbox purge is asynchronous and
+alarm-retried. A successful response therefore proves immediate unreachability
+through roster and directory lookup, not completion of every cross-object
+physical deletion.
 
 ## Identity directory
 

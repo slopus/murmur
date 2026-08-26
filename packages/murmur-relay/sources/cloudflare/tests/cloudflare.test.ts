@@ -1,9 +1,12 @@
+import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, test } from "vitest";
-import { signedDeliveryToJson } from "../../protocol/index.js";
+import { LocalDirectoryTicketIssuer } from "../../directory/index.js";
+import { signedDeliveryToJson, type SignedDelivery } from "../../protocol/index.js";
 import { identity, recipients, secret, signedDelivery } from "../../protocol/tests/helpers.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { MurmurFanoutDurableObject } from "../fanoutDurableObject.js";
 import { MurmurInboxDurableObject } from "../inboxDurableObject.js";
+import { deriveCloudflareDirectoryTicketSecret } from "../impl/cloudflareCodec.js";
 import type {
     CloudflareServerWebSocket,
     DurableObjectIdLike,
@@ -12,6 +15,9 @@ import type {
     DurableObjectStateLike,
     DurableObjectStorageLike,
     DurableObjectStubLike,
+    DurableObjectSqlCursorLike,
+    DurableObjectSqlLike,
+    DurableObjectSqlValue,
     DurableObjectTransactionLike,
     MurmurCloudflareEnvironment,
 } from "../types.js";
@@ -41,6 +47,36 @@ class CapturingSocket implements CloudflareServerWebSocket {
 
 class MemoryStorage implements DurableObjectStorageLike {
     readonly values = new Map<string, unknown>();
+    readonly #database = new DatabaseSync(":memory:");
+    readonly sql: DurableObjectSqlLike = {
+        exec: <Row extends Record<string, unknown>>(
+            query: string,
+            ...bindings: readonly DurableObjectSqlValue[]
+        ): DurableObjectSqlCursorLike<Row> => {
+            const normalized = query.trimStart().toUpperCase();
+            let rows: Row[] = [];
+            if (bindings.length === 0 && !normalized.startsWith("SELECT")) {
+                this.#database.exec(query);
+            } else {
+                const statement = this.#database.prepare(query);
+                const values = bindings.map((binding) =>
+                    binding instanceof ArrayBuffer ? new Uint8Array(binding) : binding,
+                ) as readonly SQLInputValue[];
+                if (normalized.startsWith("SELECT")) {
+                    rows = statement.all(...values) as Row[];
+                } else {
+                    statement.run(...values);
+                }
+            }
+            return {
+                toArray: () => rows,
+                one: () => {
+                    if (rows.length !== 1) throw new Error("Expected exactly one SQL row");
+                    return rows[0]!;
+                },
+            };
+        },
+    };
     alarm: number | null = null;
 
     async get<T>(key: string): Promise<T | undefined> {
@@ -75,6 +111,18 @@ class MemoryStorage implements DurableObjectStorageLike {
         closure: (transaction: DurableObjectTransactionLike) => Promise<T>,
     ): Promise<T> {
         return closure(this);
+    }
+
+    transactionSync<T>(closure: () => T): T {
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            const result = closure();
+            this.#database.exec("COMMIT");
+            return result;
+        } catch (error: unknown) {
+            this.#database.exec("ROLLBACK");
+            throw error;
+        }
     }
 
     async getAlarm(): Promise<number | null> {
@@ -149,32 +197,173 @@ const unusedNamespace: DurableObjectNamespaceLike = {
     get: () => ({ fetch: async () => Response.json({ error: "unused" }, { status: 500 }) }),
 };
 
+class FanoutNamespace implements DurableObjectNamespaceLike {
+    object: MurmurFanoutDurableObject | undefined;
+
+    idFromName(name: string): DurableObjectIdLike {
+        return new NamedId(name);
+    }
+
+    get(): DurableObjectStubLike {
+        return {
+            fetch: (request) => this.object!.fetch(request),
+        };
+    }
+}
+
+function bytes(value: unknown): Uint8Array {
+    return new TextEncoder().encode(JSON.stringify(value));
+}
+
+function internalRequest(path: string, body: unknown): Request {
+    return new Request(`https://murmur.internal${path}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(body),
+    });
+}
+
+async function registerDevice(
+    fanout: MurmurFanoutDurableObject,
+    accountSecret: Uint8Array,
+    deviceKey: Uint8Array,
+    now: number,
+    id: number,
+): Promise<Response> {
+    const delivery = signedDelivery(accountSecret, recipients(deviceKey), {
+        id,
+        now,
+        expiresAt: now + 60_000,
+        ciphertext: bytes({
+            version: 1,
+            type: "register",
+            deviceKey: encodeBase64Url(deviceKey),
+            resetGeneration: 0,
+            keyPackage: encodeBase64Url(new Uint8Array([id, 1, 2])),
+        }),
+    });
+    return fanout.fetch(
+        internalRequest("/v2/roster/mutate", {
+            delivery: signedDeliveryToJson(delivery),
+            admissionPrincipal: `account-${id}`,
+        }),
+    );
+}
+
+async function publish(
+    fanout: MurmurFanoutDurableObject,
+    delivery: SignedDelivery,
+    admissionPrincipal: string = "test-principal",
+): Promise<Response> {
+    return fanout.fetch(
+        internalRequest("/v2/publish", {
+            delivery: signedDeliveryToJson(delivery),
+            admissionPrincipal,
+        }),
+    );
+}
+
 describe("Cloudflare durable fanout", () => {
-    test("returns an explicit unsupported response for terminal account deletion", async () => {
+    test("routes terminal account deletion through the authenticated inbox", async () => {
+        const now = Date.now();
+        const accountSecret = secret(120);
+        const fanoutNamespace = new FanoutNamespace();
         const environment: MurmurCloudflareEnvironment = {
             MURMUR_INBOXES: unusedNamespace,
-            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_FANOUT: fanoutNamespace,
             MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
             MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
         };
+        fanoutNamespace.object = new MurmurFanoutDurableObject(new MemoryState(), environment);
         const inbox = new MurmurInboxDurableObject(new MemoryState(), environment);
         const socket = new CapturingSocket();
+        const deletion = signedDelivery(accountSecret, [], {
+            id: 120,
+            now,
+            expiresAt: now + 60_000,
+            ciphertext: bytes({ version: 1, type: "delete_account" }),
+        });
         await inbox.webSocketMessage(
             socket,
             JSON.stringify({
                 version: 1,
                 id: "AAAAAAAAAAAAAAAAAAAAAAAA",
                 operation: "delete_account",
-                body: null,
+                body: signedDeliveryToJson(deletion),
             }),
         );
         expect(JSON.parse(socket.messages[0]!) as unknown).toMatchObject({
-            status: 501,
-            body: { error: "account_deletion_unavailable" },
+            status: 200,
+            body: { deleted: true },
         });
     });
 
-    test("returns an explicit unsupported response for session-addressed publication", async () => {
+    test("derives a session-addressed fanout across current member inboxes", async () => {
+        const now = Date.now();
+        const ownerSecret = secret(121);
+        const owner = identity(ownerSecret);
+        const ownerDeviceSecret = secret(122);
+        const ownerDevice = identity(ownerDeviceSecret);
+        const memberSecret = secret(123);
+        const member = identity(memberSecret);
+        const memberDevice = identity(secret(124));
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        expect((await registerDevice(fanout, ownerSecret, ownerDevice, now, 121)).status).toBe(200);
+        expect((await registerDevice(fanout, memberSecret, memberDevice, now, 123)).status).toBe(
+            200,
+        );
+        const sessionId = new Uint8Array(32).fill(125);
+        const delivery = signedDelivery(ownerDeviceSecret, [], {
+            id: 125,
+            now,
+            expiresAt: now + 60_000,
+            senderAccount: owner,
+            ownerAccount: owner,
+            sessionId,
+            sessionControl: {
+                version: 1,
+                type: "create",
+                epoch: 0n,
+                members: recipients(owner, member),
+                roles: {
+                    owner,
+                    admins: [],
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: false,
+                    sendPolicy: "everyone",
+                },
+                coveredDevices: recipients(ownerDevice, memberDevice),
+            },
+        });
+        expect((await publish(fanout, delivery)).status).toBe(200);
+        await fanout.alarm();
+        for (const device of [ownerDevice, memberDevice]) {
+            const storage = inboxes.states.get(encodeBase64Url(device))!.storage;
+            const queued = await storage.list({ prefix: "inbox:event:" });
+            expect(
+                [...queued.values()].some(
+                    (value) =>
+                        (value as { readonly delivery: { readonly sessionControl: unknown } })
+                            .delivery.sessionControl !== null,
+                ),
+            ).toBe(true);
+        }
+    });
+
+    test("enforces membership summaries, member identity, and send policy", async () => {
+        const now = Date.now();
+        const accountSecrets = [secret(130), secret(131), secret(132)];
+        const accounts = accountSecrets.map(identity);
+        const deviceSecrets = [secret(133), secret(134), secret(135)];
+        const devices = deviceSecrets.map(identity);
         const environment: MurmurCloudflareEnvironment = {
             MURMUR_INBOXES: unusedNamespace,
             MURMUR_FANOUT: unusedNamespace,
@@ -182,38 +371,294 @@ describe("Cloudflare durable fanout", () => {
             MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
         };
         const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
-        const accountSecret = secret(121);
-        const account = identity(accountSecret);
-        const delivery = signedDelivery(accountSecret, [], {
-            ownerAccount: account,
-            sessionId: identity(secret(122)),
-            sessionControl: {
-                version: 1,
-                type: "create",
-                epoch: 0n,
-                members: [account],
-                roles: {
-                    owner: account,
-                    admins: [],
-                    adminsAssignAdmins: false,
-                    anyoneCanAddMembers: false,
-                    sendPolicy: "everyone",
+        for (let index = 0; index < accounts.length; index += 1) {
+            expect(
+                (
+                    await registerDevice(
+                        fanout,
+                        accountSecrets[index]!,
+                        devices[index]!,
+                        now,
+                        130 + index,
+                    )
+                ).status,
+            ).toBe(200);
+        }
+        const sessionId = new Uint8Array(32).fill(136);
+        const roles = {
+            owner: accounts[0]!,
+            admins: [] as readonly Uint8Array[],
+            adminsAssignAdmins: false,
+            anyoneCanAddMembers: false,
+            sendPolicy: "admins" as const,
+        };
+        expect(
+            (
+                await publish(
+                    fanout,
+                    signedDelivery(deviceSecrets[0]!, [], {
+                        id: 136,
+                        now,
+                        expiresAt: now + 60_000,
+                        senderAccount: accounts[0]!,
+                        ownerAccount: accounts[0]!,
+                        sessionId,
+                        sessionControl: {
+                            version: 1,
+                            type: "create",
+                            epoch: 0n,
+                            members: recipients(accounts[0]!, accounts[1]!),
+                            roles,
+                            coveredDevices: recipients(devices[0]!, devices[1]!),
+                        },
+                    }),
+                )
+            ).status,
+        ).toBe(200);
+
+        const memberSend = await publish(
+            fanout,
+            signedDelivery(deviceSecrets[1]!, [], {
+                id: 137,
+                now,
+                expiresAt: now + 60_000,
+                senderAccount: accounts[1]!,
+                ownerAccount: accounts[0]!,
+                sessionId,
+                sessionControl: {
+                    version: 1,
+                    type: "message",
+                    epoch: 1n,
+                    content: "application",
+                    coveredDevices: recipients(devices[0]!, devices[1]!),
                 },
-                coveredDevices: [account],
-            },
-        });
-        const response = await fanout.fetch(
-            new Request("https://murmur.internal/v2/publish", {
-                method: "POST",
-                headers: { "content-type": "application/json" },
-                body: JSON.stringify({
-                    delivery: signedDeliveryToJson(delivery),
-                    admissionPrincipal: "account-121",
-                }),
             }),
         );
-        expect(response.status).toBe(501);
-        expect(await response.json()).toEqual({ error: "session_state_unavailable" });
+        expect(memberSend.status).toBe(403);
+        expect(await memberSend.json()).toEqual({ error: "session_unauthorized" });
+
+        const nonMemberSend = await publish(
+            fanout,
+            signedDelivery(deviceSecrets[2]!, [], {
+                id: 138,
+                now,
+                expiresAt: now + 60_000,
+                senderAccount: accounts[2]!,
+                ownerAccount: accounts[0]!,
+                sessionId,
+                sessionControl: {
+                    version: 1,
+                    type: "message",
+                    epoch: 1n,
+                    content: "protocol",
+                    coveredDevices: recipients(devices[0]!, devices[1]!),
+                },
+            }),
+        );
+        expect(nonMemberSend.status).toBe(403);
+
+        const unexplainedCommit = await publish(
+            fanout,
+            signedDelivery(deviceSecrets[0]!, [], {
+                id: 139,
+                now,
+                expiresAt: now + 60_000,
+                senderAccount: accounts[0]!,
+                ownerAccount: accounts[0]!,
+                sessionId,
+                sessionControl: {
+                    version: 1,
+                    type: "commit",
+                    epoch: 1n,
+                    members: recipients(accounts[0]!, accounts[1]!, accounts[2]!),
+                    roles,
+                    changes: [],
+                    coveredDevices: recipients(devices[0]!, devices[1]!, devices[2]!),
+                },
+            }),
+        );
+        expect(unexplainedCommit.status).toBe(403);
+        expect(await unexplainedCommit.json()).toEqual({ error: "session_unauthorized" });
+    });
+
+    test("self-registers a device, reads its roster, and queues the notification", async () => {
+        const now = Date.now();
+        const accountSecret = secret(140);
+        const account = identity(accountSecret);
+        const device = identity(secret(141));
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        expect((await registerDevice(fanout, accountSecret, device, now, 140)).status).toBe(200);
+        const lookup = await fanout.fetch(
+            internalRequest("/v2/roster/read", {
+                version: 1,
+                accountKey: encodeBase64Url(account),
+            }),
+        );
+        expect(lookup.status).toBe(200);
+        expect(await lookup.json()).toMatchObject({
+            roster: {
+                revision: 1,
+                devices: [{ deviceKey: encodeBase64Url(device), resetGeneration: 0 }],
+            },
+        });
+        await fanout.alarm();
+        expect(
+            (
+                await inboxes.states
+                    .get(encodeBase64Url(device))!
+                    .storage.list({ prefix: "inbox:event:" })
+            ).size,
+        ).toBe(1);
+    });
+
+    test("rotates, claims, spends, and falls back to a last-resort directory prekey", async () => {
+        const now = Date.now();
+        const accountSecret = secret(142);
+        const account = identity(accountSecret);
+        const deviceSecret = secret(143);
+        const device = identity(deviceSecret);
+        const inboxes = new InboxNamespace();
+        const tokenSecret = new Uint8Array(32).fill(9);
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(tokenSecret),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        expect((await registerDevice(fanout, accountSecret, device, now, 142)).status).toBe(200);
+        const reference = new Uint8Array(32).fill(144);
+        const spent = signedDelivery(deviceSecret, recipients(device), {
+            id: 144,
+            now,
+            expiresAt: now + 60_000,
+            senderAccount: account,
+            ciphertext: bytes({
+                version: 1,
+                type: "directory_prekey_spent",
+                reference: encodeBase64Url(reference),
+            }),
+        });
+        const upload = signedDelivery(accountSecret, [], {
+            id: 145,
+            now,
+            expiresAt: now + 60_000,
+            ciphertext: bytes({
+                version: 1,
+                type: "directory_prekey_upload",
+                mode: "rotate",
+                deviceKey: encodeBase64Url(device),
+                resetGeneration: 0,
+                oneTimePrekeys: [
+                    {
+                        reference: encodeBase64Url(reference),
+                        keyPackage: encodeBase64Url(new Uint8Array([1, 4, 4])),
+                        expiresAt: now + 50_000,
+                        spentNotification: signedDeliveryToJson(spent),
+                    },
+                ],
+                lastResort: {
+                    reference: encodeBase64Url(new Uint8Array(32).fill(145)),
+                    keyPackage: encodeBase64Url(new Uint8Array([1, 4, 5])),
+                    expiresAt: now + 60_000,
+                },
+            }),
+        });
+        const uploaded = await fanout.fetch(
+            internalRequest("/v2/directory/upload", {
+                delivery: signedDeliveryToJson(upload),
+            }),
+        );
+        expect(uploaded.status).toBe(200);
+        const issuer = new LocalDirectoryTicketIssuer({
+            issuer: "murmur-cloudflare-directory",
+            secretKey: deriveCloudflareDirectoryTicketSecret(encodeBase64Url(tokenSecret)),
+        });
+        const claim = async (ticketId: number): Promise<Response> =>
+            fanout.fetch(
+                internalRequest("/v2/directory/claim", {
+                    version: 1,
+                    accountKey: encodeBase64Url(account),
+                    ticket: encodeBase64Url(
+                        issuer.issue({
+                            expiresAt: now + 60_000,
+                            claimBudget: 1,
+                            ticketId: new Uint8Array(32).fill(ticketId),
+                        }),
+                    ),
+                }),
+            );
+        const first = await claim(146);
+        expect(first.status).toBe(200);
+        expect(await first.json()).toMatchObject({ devices: [{ source: "one_time" }] });
+        await fanout.alarm();
+        const queued = await inboxes.states
+            .get(encodeBase64Url(device))!
+            .storage.list<{ readonly delivery: { readonly id: string } }>({
+                prefix: "inbox:event:",
+            });
+        expect([...queued.values()].some((entry) => entry.delivery.id === spent.id)).toBe(true);
+        const second = await claim(147);
+        expect(second.status).toBe(200);
+        expect(await second.json()).toMatchObject({ devices: [{ source: "last_resort" }] });
+    });
+
+    test("purges account control state first and retries each inbox cascade", async () => {
+        const now = Date.now();
+        const accountSecret = secret(148);
+        const account = identity(accountSecret);
+        const device = identity(secret(149));
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        expect((await registerDevice(fanout, accountSecret, device, now, 148)).status).toBe(200);
+        await fanout.alarm();
+        const deviceName = encodeBase64Url(device);
+        expect(
+            (await inboxes.states.get(deviceName)!.storage.list({ prefix: "inbox:event:" })).size,
+        ).toBe(1);
+        const deletion = signedDelivery(accountSecret, [], {
+            id: 149,
+            now,
+            expiresAt: now + 60_000,
+            ciphertext: bytes({ version: 1, type: "delete_account" }),
+        });
+        const deleted = await fanout.fetch(
+            internalRequest("/v2/delete-account", {
+                delivery: signedDeliveryToJson(deletion),
+            }),
+        );
+        expect(deleted.status).toBe(200);
+        const lookup = await fanout.fetch(
+            internalRequest("/v2/roster/read", {
+                version: 1,
+                accountKey: encodeBase64Url(account),
+            }),
+        );
+        expect(await lookup.json()).toEqual({ roster: null });
+
+        inboxes.failNameOnce = deviceName;
+        await fanout.alarm();
+        expect(
+            (await inboxes.states.get(deviceName)!.storage.list({ prefix: "inbox:event:" })).size,
+        ).toBe(1);
+        await fanout.alarm();
+        expect((await inboxes.states.get(deviceName)!.storage.list()).size).toBe(0);
     });
 
     test("rejects duplicate keys on internal Fetch JSON boundaries", async () => {

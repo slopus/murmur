@@ -1,3 +1,4 @@
+import { sha256 } from "@noble/hashes/sha2";
 import {
     parseSignedDelivery,
     signedDeliveryToJson,
@@ -23,6 +24,10 @@ export interface CloudflareRequestFrame {
         | "publish"
         | "delete_session"
         | "delete_account"
+        | "read_device_roster"
+        | "mutate_device_roster"
+        | "upload_directory_prekeys"
+        | "claim_directory"
         | "read"
         | "acknowledge"
         | "stream";
@@ -79,6 +84,10 @@ export function requestFrame(message: string): CloudflareRequestFrame {
         (input.operation !== "publish" &&
             input.operation !== "delete_session" &&
             input.operation !== "delete_account" &&
+            input.operation !== "read_device_roster" &&
+            input.operation !== "mutate_device_roster" &&
+            input.operation !== "upload_directory_prekeys" &&
+            input.operation !== "claim_directory" &&
             input.operation !== "read" &&
             input.operation !== "acknowledge" &&
             input.operation !== "stream")
@@ -138,6 +147,14 @@ export function parseTokenSecret(value: string): Uint8Array {
         throw new Error("MURMUR_RELAY_TOKEN_SECRET must be canonical base64url");
     }
     return secret;
+}
+
+/** Derive a domain-separated Ed25519 directory-ticket seed from the relay secret. */
+export function deriveCloudflareDirectoryTicketSecret(value: string): Uint8Array {
+    const hash = sha256.create();
+    hash.update(textEncoder.encode("murmur.cloudflare.directory-ticket.v1\0"));
+    hash.update(parseTokenSecret(value));
+    return hash.digest();
 }
 
 export function encodedDeliveryBytes(delivery: SignedDelivery): number {

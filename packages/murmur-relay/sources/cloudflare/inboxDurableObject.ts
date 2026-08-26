@@ -197,6 +197,21 @@ export class MurmurInboxDurableObject {
     /** Accept authenticated sockets or idempotent internal fanout insertions. */
     async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v2/purge") {
+            try {
+                const input = object(await requestJson(request));
+                exact(input, ["recipient"]);
+                if (typeof input.recipient !== "string") {
+                    throw new RelayError(400, "Invalid inbox purge", { error: "malformed" });
+                }
+                decodeBase64Url(input.recipient, 32);
+                await this.#purgeAll();
+                return json({ purged: true }, 200);
+            } catch (error: unknown) {
+                if (error instanceof RelayError) return json(error.body, error.status);
+                return json({ error: "internal" }, 500);
+            }
+        }
         if (request.method === "POST" && url.pathname === "/v2/delete") {
             try {
                 const input = object(await requestJson(request));
@@ -234,7 +249,10 @@ export class MurmurInboxDurableObject {
                 }
                 const recipient = decodeBase64Url(input.recipient, 32);
                 const delivery = parseSignedDelivery(input.delivery);
-                if (!delivery.recipients.some((value) => equalBytes(value, recipient))) {
+                if (
+                    delivery.sessionControl === null &&
+                    !delivery.recipients.some((value) => equalBytes(value, recipient))
+                ) {
                     throw new RelayError(400, "Delivery omits target inbox", {
                         error: "malformed",
                     });
@@ -334,12 +352,39 @@ export class MurmurInboxDurableObject {
                 return;
             }
             if (frame.operation === "delete_account") {
-                send(
-                    socket,
-                    responseFrame(frame.id, 501, {
-                        error: "account_deletion_unavailable",
+                const delivery = parseSignedDelivery(frame.body);
+                const fanoutId = this.#environment.MURMUR_FANOUT.idFromName(FANOUT_OBJECT_NAME);
+                const response = await this.#environment.MURMUR_FANOUT.get(fanoutId).fetch(
+                    new Request("https://murmur.internal/v2/delete-account", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ delivery: signedDeliveryToJson(delivery) }),
                     }),
                 );
+                send(socket, responseFrame(frame.id, response.status, await response.json()));
+                return;
+            }
+            if (frame.operation === "read_device_roster") {
+                await this.#forwardControl(socket, frame.id, "/v2/roster/read", frame.body);
+                return;
+            }
+            if (frame.operation === "mutate_device_roster") {
+                const delivery = parseSignedDelivery(frame.body);
+                await this.#forwardControl(socket, frame.id, "/v2/roster/mutate", {
+                    delivery: signedDeliveryToJson(delivery),
+                    admissionPrincipal: authorization.admissionPrincipal,
+                });
+                return;
+            }
+            if (frame.operation === "upload_directory_prekeys") {
+                const delivery = parseSignedDelivery(frame.body);
+                await this.#forwardControl(socket, frame.id, "/v2/directory/upload", {
+                    delivery: signedDeliveryToJson(delivery),
+                });
+                return;
+            }
+            if (frame.operation === "claim_directory") {
+                await this.#forwardControl(socket, frame.id, "/v2/directory/claim", frame.body);
                 return;
             }
             if (frame.operation === "read") {
@@ -427,6 +472,35 @@ export class MurmurInboxDurableObject {
     /** Close a hibernated socket after Cloudflare reports a transport error. */
     webSocketError(socket: CloudflareServerWebSocket): void {
         socket.close(1011, "socket error");
+    }
+
+    async #forwardControl(
+        socket: CloudflareServerWebSocket,
+        requestId: string,
+        path: string,
+        body: unknown,
+    ): Promise<void> {
+        const fanoutId = this.#environment.MURMUR_FANOUT.idFromName(FANOUT_OBJECT_NAME);
+        const response = await this.#environment.MURMUR_FANOUT.get(fanoutId).fetch(
+            new Request(`https://murmur.internal${path}`, {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify(body),
+            }),
+        );
+        send(socket, responseFrame(requestId, response.status, await response.json()));
+    }
+
+    async #purgeAll(): Promise<void> {
+        for (;;) {
+            const page = await this.#state.storage.list({ limit: 1_000 });
+            if (page.size === 0) break;
+            await this.#state.storage.delete([...page.keys()]);
+            if (page.size < 1_000) break;
+        }
+        for (const socket of this.#state.getWebSockets()) {
+            socket.close(1000, "account deleted");
+        }
     }
 
     /** Send stream heartbeats and enforce the ticket's maximum socket lifetime. */

@@ -1,4 +1,5 @@
 import { DurableFanoutCoordinator } from "../fanout/index.js";
+import { LocalDirectoryTicketIssuer } from "../directory/index.js";
 import type {
     DurableFanoutStore,
     FanoutRetryScheduler,
@@ -7,17 +8,28 @@ import type {
 } from "../fanout/index.js";
 import {
     RelayError,
+    deviceRosterToJson,
+    directoryClaimToJson,
     deliveryFingerprint,
+    parseAccountDeletionRequest,
+    parseDeviceRosterLookup,
+    parseDeviceRosterMutation,
+    parseDirectoryClaimRequest,
+    parseDirectoryPrekeyUpload,
+    parseDirectorySpentNotification,
     parseSessionDeletionRequest,
     parseSignedDelivery,
     signedDeliveryToJson,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
+    type DirectoryClaim,
     type SignedDelivery,
     type SignedDeliveryJson,
 } from "../protocol/index.js";
 import type { RelayStorePublishOutcome } from "../storage/index.js";
+import { RelayControlSqlStore, type RelayControlSql } from "../storage/controlSql.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
+import { equalBytes } from "../utils/bytes.js";
 import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 import { nextUuidV7 } from "../utils/uuidV7.js";
 import {
@@ -25,6 +37,7 @@ import {
     MAXIMUM_CIPHERTEXT_BYTES,
     MAXIMUM_DELIVERY_TTL_MILLISECONDS,
     MAXIMUM_RECIPIENTS,
+    deriveCloudflareDirectoryTicketSecret,
     object,
     textEncoder,
 } from "./impl/cloudflareCodec.js";
@@ -56,6 +69,7 @@ interface FanoutIndexRecord {
     readonly expiresAt: number;
     readonly encodedBytes: number;
     readonly references: number;
+    readonly recipients: readonly string[];
     readonly sessionIndexKey: string | null;
 }
 
@@ -162,16 +176,43 @@ async function requestJson(request: Request): Promise<unknown> {
     }
 }
 
+function controlSql(state: DurableObjectStateLike): RelayControlSql {
+    return {
+        exec: <Row extends Record<string, unknown>>(
+            query: string,
+            ...bindings: readonly (Uint8Array | string | number | null)[]
+        ) => {
+            const cursor = state.storage.sql.exec<Row>(
+                query,
+                ...bindings.map((binding) =>
+                    binding instanceof Uint8Array ? binding.slice().buffer : binding,
+                ),
+            );
+            return {
+                toArray: () => cursor.toArray(),
+                one: () => cursor.one(),
+            };
+        },
+    };
+}
+
 /** Deployment-wide event sequencer and durable retry coordinator. */
 export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetryScheduler {
     readonly #state: DurableObjectStateLike;
     readonly #environment: MurmurCloudflareEnvironment;
     readonly #coordinator: DurableFanoutCoordinator;
+    readonly #control: RelayControlSqlStore;
+    readonly #directoryTickets: LocalDirectoryTicketIssuer;
     readonly #deletionsInFlight = new Set<string>();
 
     constructor(state: DurableObjectStateLike, environment: MurmurCloudflareEnvironment) {
         this.#state = state;
         this.#environment = environment;
+        this.#control = new RelayControlSqlStore(controlSql(state));
+        this.#directoryTickets = new LocalDirectoryTicketIssuer({
+            issuer: "murmur-cloudflare-directory",
+            secretKey: deriveCloudflareDirectoryTicketSecret(environment.MURMUR_RELAY_TOKEN_SECRET),
+        });
         const target: FanoutTarget = {
             insert: async (recipient, eventId, delivery, admissionPrincipal) => {
                 const id = this.#environment.MURMUR_INBOXES.idFromName(encodeBase64Url(recipient));
@@ -212,24 +253,41 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 const removed = await this.#deleteSession(delivery);
                 return json({ removed }, 200);
             }
+            if (url.pathname === "/v2/delete-account") {
+                const delivery = parseSignedDelivery(input.delivery);
+                await this.#deleteAccount(delivery);
+                return json({ deleted: true }, 200);
+            }
+            if (url.pathname === "/v2/roster/read") {
+                const roster = this.#control.readDeviceRoster(parseDeviceRosterLookup(input));
+                return json(
+                    { roster: roster === undefined ? null : deviceRosterToJson(roster) },
+                    200,
+                );
+            }
+            if (url.pathname === "/v2/roster/mutate") {
+                const delivery = parseSignedDelivery(input.delivery);
+                const admissionPrincipal = this.#admissionPrincipal(input.admissionPrincipal);
+                const roster = await this.#mutateDeviceRoster(delivery, admissionPrincipal);
+                return json({ roster: deviceRosterToJson(roster) }, 200);
+            }
+            if (url.pathname === "/v2/directory/upload") {
+                const delivery = parseSignedDelivery(input.delivery);
+                this.#uploadDirectoryPrekeys(delivery);
+                return json({ uploaded: true }, 200);
+            }
+            if (url.pathname === "/v2/directory/claim") {
+                const request = parseDirectoryClaimRequest(input);
+                const claim = await this.#claimDirectory(request.accountKey, request.ticket);
+                return json(directoryClaimToJson(claim), 200);
+            }
             if (url.pathname !== "/v2/publish") {
                 return json({ error: "not_found" }, 404);
             }
-            if (
-                typeof input.admissionPrincipal !== "string" ||
-                input.admissionPrincipal.length < 1 ||
-                input.admissionPrincipal.length > 255
-            ) {
-                throw new RelayError(400, "Invalid admission principal", {
-                    error: "malformed",
-                });
-            }
+            const admissionPrincipal = this.#admissionPrincipal(input.admissionPrincipal);
             const delivery = parseSignedDelivery(input.delivery);
-            if (delivery.sessionControl !== null) {
-                return json({ error: "session_state_unavailable" }, 501);
-            }
             this.#validateDelivery(delivery);
-            const outcome = await this.#coordinator.publish(delivery, input.admissionPrincipal);
+            const outcome = await this.#coordinator.publish(delivery, admissionPrincipal);
             return json(outcome, 200);
         } catch (error: unknown) {
             if (error instanceof RelayError) return json(error.body, error.status);
@@ -241,6 +299,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
     async alarm(): Promise<void> {
         await this.#pruneDeletionState(Date.now());
         await this.#coordinator.retry();
+        await this.#resumeAccountPurges();
         await this.#scheduleNextExpiration();
     }
 
@@ -252,11 +311,38 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
     ): Promise<RelayStorePublishOutcome> {
         await this.pruneExpired(now);
         const fingerprint = encodeBase64Url(deliveryFingerprint(delivery));
+        const key = indexKey(delivery);
+        const prior = await this.#state.storage.get<FanoutIndexRecord>(key);
+        if (prior !== undefined) {
+            if (prior.fingerprint !== fingerprint) {
+                throw new RelayError(409, "Delivery identifier collision", {
+                    error: "id_collision",
+                });
+            }
+            return {
+                eventId: prior.eventId,
+                duplicate: true,
+                recipients: prior.recipients.map((recipient) => decodeBase64Url(recipient, 32)),
+            };
+        }
+        if (delivery.ownerAccount !== null && delivery.sessionId !== null) {
+            const tombstone = await this.#state.storage.get<SessionTombstoneRecord>(
+                sessionTombstoneKey(delivery.ownerAccount, delivery.sessionId),
+            );
+            if (tombstone !== undefined && tombstone.expiresAt > now) {
+                throw new RelayError(409, "Session was deleted", { error: "session_deleted" });
+            }
+        }
+        const recipients = this.#state.storage.transactionSync(() =>
+            delivery.sessionControl === null
+                ? this.#control.resolveDirectRecipients(delivery)
+                : this.#control.resolveSessionRecipients(delivery, MAXIMUM_RECIPIENTS),
+        );
+        const encodedRecipients = recipients.map(encodeBase64Url);
         const encodedBytes = textEncoder.encode(
             JSON.stringify(signedDeliveryToJson(delivery)),
         ).length;
         return this.#state.storage.transaction(async (transaction) => {
-            const key = indexKey(delivery);
             const existing = await transaction.get<FanoutIndexRecord>(key);
             if (existing !== undefined) {
                 if (existing.fingerprint !== fingerprint) {
@@ -267,7 +353,9 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 return {
                     eventId: existing.eventId,
                     duplicate: true,
-                    recipients: delivery.recipients,
+                    recipients: existing.recipients.map((recipient) =>
+                        decodeBase64Url(recipient, 32),
+                    ),
                 };
             }
             const metadata = (await transaction.get<FanoutMetadata>(META_KEY)) ?? emptyMetadata();
@@ -291,7 +379,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
             if (
                 metadata.retainedItems + 1 > MAXIMUM_GLOBAL_ITEMS ||
                 metadata.retainedBytes + encodedBytes > MAXIMUM_GLOBAL_BYTES ||
-                metadata.retainedReferences + delivery.recipients.length > MAXIMUM_GLOBAL_REFERENCES
+                metadata.retainedReferences + recipients.length > MAXIMUM_GLOBAL_REFERENCES
             ) {
                 throw new RelayError(503, "Fanout storage quota exceeded", {
                     error: "relay_full",
@@ -302,14 +390,15 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 fingerprint,
                 expiresAt: delivery.expiresAt,
                 encodedBytes,
-                references: delivery.recipients.length,
+                references: recipients.length,
+                recipients: encodedRecipients,
                 sessionIndexKey: linkedSessionIndexKey,
             };
             const manifest: StoredFanoutManifest = {
                 eventId,
                 delivery: signedDeliveryToJson(delivery),
                 admissionPrincipal,
-                pendingRecipients: delivery.recipients.map(encodeBase64Url),
+                pendingRecipients: encodedRecipients,
             };
             await transaction.put(key, record);
             await transaction.put<FanoutExpiryRecord>(expiryKey(delivery.expiresAt, eventId), {
@@ -318,7 +407,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
             });
             if (linkedSessionIndexKey !== null) {
                 await transaction.put<SessionIndexRecord>(linkedSessionIndexKey, {
-                    recipients: delivery.recipients.map(encodeBase64Url),
+                    recipients: encodedRecipients,
                 });
             }
             await transaction.put(pendingKey(eventId), manifest);
@@ -326,9 +415,9 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 lastEventId: eventId,
                 retainedItems: metadata.retainedItems + 1,
                 retainedBytes: metadata.retainedBytes + encodedBytes,
-                retainedReferences: metadata.retainedReferences + delivery.recipients.length,
+                retainedReferences: metadata.retainedReferences + recipients.length,
             });
-            return { eventId, duplicate: false, recipients: delivery.recipients };
+            return { eventId, duplicate: false, recipients };
         });
     }
 
@@ -419,7 +508,9 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
     /** Set the Durable Object alarm without delaying an earlier wake. */
     async schedule(at: number): Promise<void> {
         const existing = await this.#state.storage.getAlarm();
-        if (existing === null || at < existing) await this.#state.storage.setAlarm(at);
+        if (existing === null || at < existing || existing <= Date.now()) {
+            await this.#state.storage.setAlarm(at);
+        }
     }
 
     async #scheduleNextExpiration(): Promise<void> {
@@ -499,6 +590,9 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 );
                 return created;
             });
+            this.#state.storage.transactionSync(() => {
+                this.#control.deleteSession(delivery.sender, sessionId);
+            });
             if (record.status === "collecting") {
                 const recipients = new Set<string>();
                 let after: string | undefined;
@@ -561,6 +655,128 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
         }
     }
 
+    async #mutateDeviceRoster(
+        delivery: SignedDelivery,
+        admissionPrincipal: string,
+    ): Promise<ReturnType<RelayControlSqlStore["mutateDeviceRoster"]>> {
+        this.#validateDelivery(delivery, true);
+        this.#validateRecentControlTime(delivery, "Device roster mutation");
+        if (!equalBytes(delivery.senderAccount, delivery.sender)) {
+            throw new RelayError(401, "Invalid device roster mutation owner", {
+                error: "unauthorized",
+            });
+        }
+        const mutation = parseDeviceRosterMutation(delivery.ciphertext);
+        const roster = this.#state.storage.transactionSync(() =>
+            this.#control.mutateDeviceRoster(delivery, mutation, Date.now()),
+        );
+        if (delivery.recipients.length > 0) {
+            await this.#coordinator.publish(delivery, admissionPrincipal);
+        }
+        return roster;
+    }
+
+    #uploadDirectoryPrekeys(delivery: SignedDelivery): void {
+        this.#validateDelivery(delivery, true);
+        this.#validateRecentControlTime(delivery, "Directory upload");
+        if (!equalBytes(delivery.senderAccount, delivery.sender)) {
+            throw new RelayError(401, "Invalid directory upload owner", {
+                error: "unauthorized",
+            });
+        }
+        if (delivery.recipients.length !== 0 || delivery.targetAccounts.length !== 0) {
+            throw new RelayError(400, "Directory uploads may not target inboxes", {
+                error: "malformed",
+            });
+        }
+        const upload = parseDirectoryPrekeyUpload(delivery.ciphertext);
+        const now = Date.now();
+        for (const entry of upload.oneTimePrekeys) {
+            const notification = entry.spentNotification;
+            if (
+                !equalBytes(notification.sender, upload.deviceKey) ||
+                !equalBytes(notification.senderAccount, delivery.sender) ||
+                notification.recipients.length !== 1 ||
+                !equalBytes(notification.recipients[0]!, upload.deviceKey) ||
+                notification.targetAccounts.length !== 0 ||
+                notification.ciphertext.length > MAXIMUM_CIPHERTEXT_BYTES ||
+                notification.createdAt > now + MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+                notification.expiresAt <= now ||
+                notification.expiresAt - now > MAXIMUM_DELIVERY_TTL_MILLISECONDS ||
+                notification.expiresAt < entry.expiresAt ||
+                !equalBytes(
+                    parseDirectorySpentNotification(notification.ciphertext),
+                    entry.reference,
+                ) ||
+                !verifyDeliverySignature(notification)
+            ) {
+                throw new RelayError(401, "Invalid spent-prekey notification", {
+                    error: "unauthorized",
+                });
+            }
+        }
+        this.#state.storage.transactionSync(() => {
+            this.#control.uploadDirectoryPrekeys(delivery, upload, now);
+        });
+    }
+
+    async #claimDirectory(accountKey: Uint8Array, ticket: Uint8Array): Promise<DirectoryClaim> {
+        const now = Date.now();
+        let claims;
+        try {
+            claims = this.#directoryTickets.verify(ticket, now);
+        } catch {
+            throw new RelayError(401, "Invalid directory claim ticket", {
+                error: "invalid_ticket",
+            });
+        }
+        const result = this.#state.storage.transactionSync(() =>
+            this.#control.claimDirectory(accountKey, claims, now),
+        );
+        for (const notification of result.notifications) {
+            await this.#coordinator.publish(notification, `directory-ticket:${claims.issuer}`);
+        }
+        return result.claim;
+    }
+
+    async #deleteAccount(delivery: SignedDelivery): Promise<void> {
+        const now = Date.now();
+        this.#validateTerminalAccountDeletion(delivery, now);
+        this.#state.storage.transactionSync(() => {
+            this.#control.deleteAccount(delivery.sender, delivery.id, now);
+        });
+        await this.schedule(now);
+    }
+
+    async #resumeAccountPurges(): Promise<void> {
+        const purges = this.#state.storage.transactionSync(() =>
+            this.#control.pendingAccountPurges(),
+        );
+        let failed = false;
+        for (const purge of purges) {
+            for (const deviceKey of purge.deviceKeys) {
+                const recipient = encodeBase64Url(deviceKey);
+                try {
+                    const id = this.#environment.MURMUR_INBOXES.idFromName(recipient);
+                    const response = await this.#environment.MURMUR_INBOXES.get(id).fetch(
+                        new Request("https://murmur.internal/v2/purge", {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                            body: JSON.stringify({ recipient }),
+                        }),
+                    );
+                    if (!response.ok) throw new Error(`Inbox purge failed (${response.status})`);
+                    this.#state.storage.transactionSync(() => {
+                        this.#control.completeAccountPurgeDevice(purge.accountDigest, deviceKey);
+                    });
+                } catch {
+                    failed = true;
+                }
+            }
+        }
+        if (failed) await this.schedule(Date.now() + 1_000);
+    }
+
     async #deletePrefix(prefix: string): Promise<void> {
         for (;;) {
             const page = await this.#state.storage.list({ prefix, limit: 1_000 });
@@ -585,6 +801,51 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
         return entries.size;
     }
 
+    #admissionPrincipal(value: unknown): string {
+        if (typeof value !== "string" || value.length < 1 || value.length > 255) {
+            throw new RelayError(400, "Invalid admission principal", {
+                error: "malformed",
+            });
+        }
+        return value;
+    }
+
+    #validateRecentControlTime(delivery: SignedDelivery, name: string): void {
+        if (delivery.createdAt < Date.now() - MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS) {
+            throw new RelayError(401, `${name} violates relay time policy`, {
+                error: "unauthorized",
+            });
+        }
+    }
+
+    #validateTerminalAccountDeletion(delivery: SignedDelivery, now: number): void {
+        validateSignedDeliveryShape(delivery);
+        if (
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0 ||
+            delivery.ownerAccount !== null ||
+            delivery.sessionId !== null ||
+            !equalBytes(delivery.senderAccount, delivery.sender) ||
+            !verifyDeliverySignature(delivery)
+        ) {
+            throw new RelayError(401, "Invalid account deletion authorization", {
+                error: "unauthorized",
+            });
+        }
+        if (
+            delivery.createdAt > now + MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt < now - MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > MAXIMUM_DELIVERY_TTL_MILLISECONDS
+        ) {
+            throw new RelayError(401, "Account deletion violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        parseAccountDeletionRequest(delivery.ciphertext);
+    }
+
     #validateDeletion(delivery: SignedDelivery, now: number): Uint8Array {
         validateSignedDeliveryShape(delivery);
         if (
@@ -593,6 +854,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
             delivery.ownerAccount !== null ||
             delivery.sessionId !== null ||
             delivery.ciphertext.length > 1_024 ||
+            !equalBytes(delivery.senderAccount, delivery.sender) ||
             !verifyDeliverySignature(delivery)
         ) {
             throw new RelayError(401, "Invalid session deletion authorization", {
@@ -613,12 +875,19 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
         return parseSessionDeletionRequest(delivery.ciphertext);
     }
 
-    #validateDelivery(delivery: SignedDelivery): void {
+    #validateDelivery(delivery: SignedDelivery, allowRecipientless: boolean = false): void {
         validateSignedDeliveryShape(delivery);
         if (!verifyDeliverySignature(delivery)) {
             throw new RelayError(401, "Invalid delivery signature", {
                 error: "unauthorized",
             });
+        }
+        if (
+            !allowRecipientless &&
+            delivery.sessionControl === null &&
+            delivery.recipients.length < 1
+        ) {
+            throw new RelayError(400, "Delivery has no recipients", { error: "malformed" });
         }
         const now = Date.now();
         if (
@@ -629,6 +898,10 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
         }
         if (
             delivery.createdAt > now + MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt <
+                now -
+                    MAXIMUM_DELIVERY_TTL_MILLISECONDS -
+                    MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
             delivery.createdAt >= delivery.expiresAt ||
             delivery.expiresAt <= now ||
             delivery.expiresAt - now > MAXIMUM_DELIVERY_TTL_MILLISECONDS

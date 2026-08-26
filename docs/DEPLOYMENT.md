@@ -57,14 +57,18 @@ pnpm --filter @slopus/murmur-relay cloudflare:deploy:production
 
 The application's authenticated server issues short-lived relay session
 tickets. The Worker verifies each ticket before upgrading to WebSocket. Durable
-Objects retain bounded pending deliveries and alarms prune expiry.
+Objects retain bounded pending deliveries and alarms prune expiry. The same
+server issues directory tickets with `LocalDirectoryTicketIssuer`, issuer
+`murmur-cloudflare-directory`, and the domain-separated result of
+`deriveCloudflareDirectoryTicketSecret(MURMUR_RELAY_TOKEN_SECRET)`.
 
-The Cloudflare adapter is queue-only and does not hold authoritative account
-rosters or relay-visible session state. Session-addressed publication returns
-`501 session_state_unavailable`. It also cannot perform the cross-roster,
-directory, inbox, and outbound-state transaction required by terminal account
-deletion, so `delete_account` returns `501 account_deletion_unavailable`. Use the
-standalone SQLite or PostgreSQL relay when either API is required.
+The singleton fanout object stores authoritative rosters, directory pools, and
+relay-visible session state in Durable Object SQLite. Session publications use
+that state to derive an exact manifest fanout. Terminal account deletion removes
+control state before returning success and durably schedules each known device
+inbox for alarm-retried deletion. Operators must treat that inbox cascade as
+asynchronous and monitor alarm failures; success does not mean every inbox purge
+has already completed.
 
 ## Health and shutdown
 

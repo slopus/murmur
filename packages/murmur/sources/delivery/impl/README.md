@@ -4,7 +4,8 @@
 strict directory operations plus session and account deletion.
 `deliveryNegotiation.ts` signs temporary-session requests and validates routed
 WebSocket tickets. `deliveryWebSocketTransport.ts` implements the current
-WebSocket framing, including account-signed terminal operations.
+WebSocket framing, including account-signed terminal, roster, and directory
+operations.
 
 `deliveryCodec.ts` owns the exact relay-compatible signed wire format and binds
 each sender to the account that owns its outbound relay state.

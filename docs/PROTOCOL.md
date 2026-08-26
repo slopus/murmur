@@ -155,10 +155,14 @@ interpreting ciphertext.
 
 `deleteAccount()` durably submits one account-identity-signed, replay-protected
 terminal request. The relay handles an authenticated missing account as the
-same successful no-op as an existing account, then atomically removes the
-account roster, dependent directory state, every device inbox and continuity
-row, raw account nonces, and all pending outbound deliveries owned by the
-account. A hashed request tombstone remains for the delivery-retention window.
+same successful no-op as an existing account. SQLite and PostgreSQL atomically
+remove the account roster, dependent directory state, every device inbox and
+continuity row, raw account nonces, and all pending outbound deliveries owned by
+the account. Cloudflare first commits removal of authoritative roster,
+directory, and session control state, then durably retries deletion of each
+known device inbox through alarms; its success response can precede completion
+of that cross-object physical purge. A hashed request tombstone remains for the
+delivery-retention window.
 
 Only after relay confirmation does the client remove every local store key and
 destroy its device and account roots in memory. This operation does not erase

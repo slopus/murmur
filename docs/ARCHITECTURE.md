@@ -66,10 +66,11 @@ restored or rolled-back relay database.
 
 The standalone relay supports SQLite and PostgreSQL. The Cloudflare deployment
 uses one inbox Durable Object per public identity and a global fanout Durable
-Object for manifest-first atomic multicast. The queue-only Cloudflare adapter
-does not own roster, directory, or relay-visible session state, so
-session-addressed publication and terminal account deletion require the
-standalone relay.
+Object for manifest-first atomic multicast. That singleton's SQLite owns roster,
+directory, and relay-visible session control state. Terminal account deletion
+makes control state unreachable synchronously, then uses a durable alarm
+worklist to clear each device inbox without pretending the cross-object purge is
+atomic.
 
 ## Services and accounts
 

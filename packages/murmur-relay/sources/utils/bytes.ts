@@ -12,10 +12,9 @@ export function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
 
 /** Copy a database byte value into an ordinary Uint8Array. */
 export function copyBytes(value: unknown, name: string): Uint8Array {
-    if (!(value instanceof Uint8Array)) {
-        throw new Error(`Invalid ${name} bytes in relay store`);
-    }
-    return new Uint8Array(value);
+    if (value instanceof Uint8Array) return new Uint8Array(value);
+    if (value instanceof ArrayBuffer) return new Uint8Array(value.slice(0));
+    throw new Error(`Invalid ${name} bytes in relay store`);
 }
 
 /** Convert a database int8 value from pg, PGlite, or SQLite into one bigint. */

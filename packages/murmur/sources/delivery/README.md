@@ -25,6 +25,6 @@ custom transport must expose `deleteSession` and `deleteAccount` for those
 operations.
 
 The transport seam optionally exposes current-roster mutation plus directory
-upload and exact ticketed claim operations. The built-in HTTP transport
-implements all four. A custom transport must implement the directory methods
-to support automatic publication, `claimAccount()`, and `rotate()`.
+upload and exact ticketed claim operations. Both built-in transports implement
+all four. A custom transport must implement the directory methods to support
+automatic publication, `claimAccount()`, and `rotate()`.

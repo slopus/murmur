@@ -1,6 +1,7 @@
 # Cloudflare adapter tests
 
-The in-memory Durable Object harness checks strict internal JSON boundaries,
-manifest-first sequencing, partial fanout retry, alarms, and idempotent
-per-device inbox insertion. It also pins the explicit unsupported response for
-terminal account deletion in this queue-only adapter.
+The Durable Object harness uses `node:sqlite` behind the synchronous Cloudflare
+SQL cursor surface. It checks strict internal JSON boundaries, manifest-first
+sequencing, partial retry, roster notification, roster-derived session fanout
+and role failures, directory one-time spending and fallback, session deletion,
+and alarm-retried terminal account inbox cascades.

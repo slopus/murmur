@@ -42,6 +42,7 @@ import type {
     RelayStorePublishOutcome,
 } from "../types.js";
 import { resolveSessionPublication, type RelaySessionState } from "../sessionState.js";
+import { RELAY_CONTROL_SQL } from "../controlSql.js";
 
 const SQL_VALUE_CHUNK = 5_000;
 const MAXIMUM_DIRECTORY_PREKEYS_PER_DEVICE = 256;
@@ -508,10 +509,7 @@ export class SqliteRelayStore implements RelayStore {
     async readDeviceAccount(deviceKey: Uint8Array): Promise<Uint8Array | undefined> {
         this.#assertOpen();
         if (deviceKey.length !== 32) throw new Error("Invalid device identity key");
-        const row = this.#get(
-            `SELECT account_key FROM murmur_device_roster_devices WHERE device_key = ?`,
-            deviceKey,
-        );
+        const row = this.#get(RELAY_CONTROL_SQL.readDeviceAccount, deviceKey);
         return row === undefined ? undefined : copyBytes(row.account_key, "device account key");
     }
 
@@ -522,22 +520,12 @@ export class SqliteRelayStore implements RelayStore {
     }
 
     #readSessionState(sessionId: Uint8Array): RelaySessionState | undefined {
-        const row = this.#get(
-            `SELECT owner_account, epoch, admins_assign_admins, anyone_can_add_members, send_policy
-             FROM murmur_sessions WHERE session_id = ?`,
-            sessionId,
-        );
+        const row = this.#get(RELAY_CONTROL_SQL.readSession, sessionId);
         if (row === undefined) return undefined;
-        const members = this.#all(
-            `SELECT account_key, roster_revision FROM murmur_session_members
-             WHERE session_id = ? ORDER BY account_key`,
-            sessionId,
+        const members = this.#all(RELAY_CONTROL_SQL.readSessionMembers, sessionId);
+        const admins = this.#all(RELAY_CONTROL_SQL.readSessionAdmins, sessionId).map((entry) =>
+            copyBytes(entry.account_key, "session admin account"),
         );
-        const admins = this.#all(
-            `SELECT account_key FROM murmur_session_admins
-             WHERE session_id = ? ORDER BY account_key`,
-            sessionId,
-        ).map((entry) => copyBytes(entry.account_key, "session admin account"));
         const sendPolicy = textColumn(row.send_policy, "session send policy");
         if (sendPolicy !== "everyone" && sendPolicy !== "admins") {
             throw new Error("Invalid SQLite session send policy");
@@ -1537,17 +1525,9 @@ export class SqliteRelayStore implements RelayStore {
     }
 
     #readDeviceRoster(accountKey: Uint8Array): DeviceRoster | undefined {
-        const row = this.#get(
-            "SELECT revision FROM murmur_device_rosters WHERE account_key = ?",
-            accountKey,
-        );
+        const row = this.#get(RELAY_CONTROL_SQL.readRoster, accountKey);
         if (row === undefined) return undefined;
-        const entries = this.#all(
-            `SELECT device_key, reset_generation, key_package
-             FROM murmur_device_roster_devices
-             WHERE account_key = ? ORDER BY device_key`,
-            accountKey,
-        );
+        const entries = this.#all(RELAY_CONTROL_SQL.readRosterDevices, accountKey);
         return {
             version: 1,
             accountKey: accountKey.slice(),

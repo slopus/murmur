@@ -26,6 +26,9 @@ ticketed exact claim -> spend budget -> consume one-time or read fallback
 One-use reference history, upload nonces, and ticket-use counters are durable.
 Active device identities are globally unique and resolve to one authoritative
 sender account for outbound ownership validation.
+Cloudflare's singleton control store reuses the canonical SQLite control reads
+and the same session-state policy resolver while adapting execution to
+synchronous Durable Object SQL cursors and `transactionSync`.
 Session deletion request IDs and hashed account-deletion tombstones remain
 replay-protected for the maximum delivery retention window. Account deletion
 atomically removes the roster, its dependent directory rows, every owned inbox,

@@ -33,8 +33,27 @@ export interface DurableObjectTransactionLike {
 /** Minimal Durable Object storage surface used by both object classes. */
 export interface DurableObjectStorageLike extends DurableObjectTransactionLike {
     transaction<T>(closure: (transaction: DurableObjectTransactionLike) => Promise<T>): Promise<T>;
+    readonly sql: DurableObjectSqlLike;
+    transactionSync<T>(closure: () => T): T;
     getAlarm(): Promise<number | null>;
     setAlarm(scheduledTime: number): Promise<void>;
+}
+
+/** Values accepted by Durable Object SQLite bindings. */
+export type DurableObjectSqlValue = ArrayBuffer | string | number | null;
+
+/** Synchronous Durable Object SQLite cursor. */
+export interface DurableObjectSqlCursorLike<Row extends Record<string, unknown>> {
+    toArray(): Row[];
+    one(): Row;
+}
+
+/** Minimal Durable Object SQLite execution surface. */
+export interface DurableObjectSqlLike {
+    exec<Row extends Record<string, unknown>>(
+        query: string,
+        ...bindings: readonly DurableObjectSqlValue[]
+    ): DurableObjectSqlCursorLike<Row>;
 }
 
 /** Attachment retained with a hibernated WebSocket. */

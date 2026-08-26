@@ -4,7 +4,7 @@ import {
 } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
-import { utf8Encode } from "../../utils/index.js";
+import { encodeBase64Url, utf8Encode } from "../../utils/index.js";
 import {
     HttpRelaySessionProvider,
     WebSocketDeliveryTransport,
@@ -30,7 +30,17 @@ const GENERATION = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 interface RequestFrame {
     readonly version: 1;
     readonly id: string;
-    readonly operation: "publish" | "read" | "acknowledge" | "stream";
+    readonly operation:
+        | "publish"
+        | "delete_session"
+        | "delete_account"
+        | "read_device_roster"
+        | "mutate_device_roster"
+        | "upload_directory_prekeys"
+        | "claim_directory"
+        | "read"
+        | "acknowledge"
+        | "stream";
     readonly body: unknown;
 }
 
@@ -225,5 +235,86 @@ describe("negotiated WebSocket delivery", () => {
                 "murmur-ticket.claims.signature",
             ]),
         );
+    });
+
+    test("carries roster and directory operations over negotiated sockets", async () => {
+        const identity = generateIdentityKeyPair();
+        const delivery = createSignedDelivery(identity, [], utf8Encode("control"), {
+            createdAt: NOW,
+            expiresAt: NOW + 60_000,
+        });
+        const provider: RelaySessionProvider = {
+            issue: () =>
+                Promise.resolve({
+                    version: 1,
+                    protocol: "murmur-websocket-v1",
+                    endpoint: "wss://relay.test/v2/connect",
+                    token: "claims.signature",
+                    expiresAt: NOW + 60_000,
+                }),
+        };
+        const operations: RequestFrame["operation"][] = [];
+        const roster = {
+            version: 1,
+            accountKey: encodeBase64Url(identity.publicKey),
+            revision: 1,
+            devices: [{ deviceKey: encodeBase64Url(identity.publicKey), resetGeneration: 0 }],
+            admissions: [
+                {
+                    deviceKey: encodeBase64Url(identity.publicKey),
+                    keyPackage: encodeBase64Url(new Uint8Array([1])),
+                },
+            ],
+        };
+        const transport = new WebSocketDeliveryTransport(identity, provider, {
+            now: () => NOW,
+            webSocketFactory: () =>
+                new FakeWebSocket((frame, socket) => {
+                    operations.push(frame.operation);
+                    const body =
+                        frame.operation === "read_device_roster" ||
+                        frame.operation === "mutate_device_roster"
+                            ? { roster }
+                            : frame.operation === "upload_directory_prekeys"
+                              ? { uploaded: true }
+                              : {
+                                    version: 1,
+                                    accountKey: encodeBase64Url(identity.publicKey),
+                                    rosterRevision: 1,
+                                    devices: [
+                                        {
+                                            deviceKey: encodeBase64Url(identity.publicKey),
+                                            resetGeneration: 0,
+                                            keyPackage: encodeBase64Url(new Uint8Array([2])),
+                                            source: "one_time",
+                                        },
+                                    ],
+                                };
+                    socket.receive({
+                        version: 1,
+                        id: frame.id,
+                        type: "response",
+                        status: 200,
+                        body,
+                    });
+                }),
+        });
+
+        await expect(transport.readDeviceRoster(identity.publicKey)).resolves.toMatchObject({
+            revision: 1,
+        });
+        await expect(transport.mutateDeviceRoster(delivery)).resolves.toMatchObject({
+            revision: 1,
+        });
+        await expect(transport.uploadDirectoryPrekeys(delivery)).resolves.toBeUndefined();
+        await expect(
+            transport.claimDirectory(identity.publicKey, new Uint8Array([1])),
+        ).resolves.toMatchObject({ devices: [{ source: "one_time" }] });
+        expect(operations).toEqual([
+            "read_device_roster",
+            "mutate_device_roster",
+            "upload_directory_prekeys",
+            "claim_directory",
+        ]);
     });
 });
