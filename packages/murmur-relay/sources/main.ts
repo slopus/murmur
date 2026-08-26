@@ -2,10 +2,10 @@ import { mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
 import { Pool } from "pg";
 import { createRelayFetchHandler, parseRelayAllowedOrigins } from "./http/index.js";
+import { PostgresPrivateGroupStateStore } from "./privateGroupState/impl/privateGroupStateStorePostgres.js";
+import { SqlitePrivateGroupStateStore } from "./privateGroupState/impl/privateGroupStateStoreSqlite.js";
 import {
-    PostgresPrivateGroupStateStore,
     PrivateGroupStateService,
-    SqlitePrivateGroupStateStore,
     createPrivateGroupStateFetchHandler,
     createPrivateGroupStateServiceFromSecret,
 } from "./privateGroupState/index.js";

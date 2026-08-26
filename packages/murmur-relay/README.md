@@ -6,13 +6,15 @@ TTL, and queue progress. It never sees MLS or application plaintext.
 
 ## Cloudflare Durable Objects
 
-The additive WebSocket deployment uses one inbox Durable Object per device and
-one deployment-wide sequencing/fanout Durable Object. Production and staging
-are isolated by `wrangler.production.jsonc` and `wrangler.staging.jsonc`, with
-separate Worker names, Durable Object namespaces, endpoints, and ticket
-secrets. Configure each exact public `MURMUR_RELAY_ENDPOINT`, install its shared
-ticket secret with `wrangler secret put MURMUR_RELAY_TOKEN_SECRET --config
-<config>`, and run `pnpm cloudflare:deploy:production` or
+The additive Worker deployment uses one inbox Durable Object per device, one
+deployment-wide sequencing/fanout Durable Object, and one private-group
+Durable Object per opaque group. Production and staging are isolated by
+`wrangler.production.jsonc` and `wrangler.staging.jsonc`, with separate Worker
+names, Durable Object namespaces, endpoints, ticket secrets, and private-group
+secrets. Configure each exact public `MURMUR_RELAY_ENDPOINT`, then install both
+`MURMUR_RELAY_TOKEN_SECRET` and a distinct canonical 32-byte base64url
+`MURMUR_PRIVATE_GROUP_SECRET` with `wrangler secret put <name> --config
+<config>`. Run `pnpm cloudflare:deploy:production` or
 `pnpm cloudflare:deploy:staging` from this package.
 
 The application server issues tickets with `createRelaySessionFetchHandler`.
@@ -73,6 +75,7 @@ acknowledgements are replayable inside their short clock-skew window.
 pnpm --filter @slopus/murmur-relay build
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+MURMUR_PRIVATE_GROUP_SECRET='<canonical-32-byte-base64url>' \
 MURMUR_RELAY_ORIGINS='https://app.example' \
 pnpm --filter @slopus/murmur-relay start
 ```

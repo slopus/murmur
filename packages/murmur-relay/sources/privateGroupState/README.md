@@ -29,6 +29,8 @@ the original accepted result. Stale or conflicting writes fail closed.
 - `http.ts` — strict fetch-compatible credential, proof, and record routes.
 - `impl/privateGroupStateStoreSqlite.ts` — bounded SQLite store.
 - `impl/privateGroupStateStorePostgres.ts` — Postgres/PGlite store.
+- `../cloudflare/privateGroupDurableObject.ts` — one clean persistent Durable
+  Object store per opaque group, plus stateless Worker ingress routing.
 - `tests/` — real PGlite store coverage; the browser package runs the complete
   client/service flow against real in-memory SQLite and HTTP handlers.
 

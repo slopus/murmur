@@ -5,9 +5,13 @@ import { relaySessionTokenFromWebSocketProtocols } from "../websocket/index.js";
 import { MurmurFanoutDurableObject } from "./fanoutDurableObject.js";
 import { MurmurInboxDurableObject } from "./inboxDurableObject.js";
 import { parseTokenSecret } from "./impl/cloudflareCodec.js";
+import {
+    MurmurPrivateGroupDurableObject,
+    handleCloudflarePrivateGroupRequest,
+} from "./privateGroupDurableObject.js";
 import type { MurmurCloudflareEnvironment } from "./types.js";
 
-export { MurmurFanoutDurableObject, MurmurInboxDurableObject };
+export { MurmurFanoutDurableObject, MurmurInboxDurableObject, MurmurPrivateGroupDurableObject };
 
 function json(body: unknown, status: number): Response {
     return new Response(JSON.stringify(body), {
@@ -26,6 +30,11 @@ export default {
         if (request.method === "GET" && url.pathname === "/health") {
             return json({ ok: true }, 200);
         }
+        const privateGroupResponse = await handleCloudflarePrivateGroupRequest(
+            request,
+            environment,
+        );
+        if (privateGroupResponse !== undefined) return privateGroupResponse;
         if (
             request.method !== "GET" ||
             url.pathname !== "/v2/connect" ||

@@ -23,9 +23,6 @@ import type {
     StoredPrivateGroupStateRecord,
 } from "./types.js";
 
-export { SqlitePrivateGroupStateStore } from "./impl/privateGroupStateStoreSqlite.js";
-export type { SqlitePrivateGroupStateStoreOptions } from "./impl/privateGroupStateStoreSqlite.js";
-export { PostgresPrivateGroupStateStore } from "./impl/privateGroupStateStorePostgres.js";
 export { createPrivateGroupStateFetchHandler } from "./http.js";
 export { createPrivateGroupCredentialAuthorityFromSecret } from "@slopus/murmur";
 export type { PrivateGroupCredentialAuthorityAdapter } from "@slopus/murmur";

@@ -105,8 +105,6 @@ export type {
 } from "./websocket/index.js";
 export {
     PrivateGroupStateService,
-    PostgresPrivateGroupStateStore,
-    SqlitePrivateGroupStateStore,
     createPrivateGroupCredentialAuthorityFromSecret,
     createPrivateGroupStateFetchHandler,
     createPrivateGroupStateServiceFromSecret,
@@ -114,6 +112,9 @@ export {
     encodeUnsignedPrivateGroupStateRecord,
     privateGroupStateRecordHash,
 } from "./privateGroupState/index.js";
+export { PostgresPrivateGroupStateStore } from "./privateGroupState/impl/privateGroupStateStorePostgres.js";
+export { SqlitePrivateGroupStateStore } from "./privateGroupState/impl/privateGroupStateStoreSqlite.js";
+export type { SqlitePrivateGroupStateStoreOptions } from "./privateGroupState/impl/privateGroupStateStoreSqlite.js";
 export type {
     PrivateGroupAccessToken,
     PrivateGroupChallengeOperation,
@@ -128,6 +129,5 @@ export type {
     PrivateGroupStateSecretServiceOptions,
     PrivateGroupStateStore,
     PrivateGroupCredentialAuthorityAdapter,
-    SqlitePrivateGroupStateStoreOptions,
     StoredPrivateGroupStateRecord,
 } from "./privateGroupState/index.js";

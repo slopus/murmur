@@ -8,22 +8,34 @@ Postgres.
 The alternative negotiated transport has isolated production and staging
 deployments configured in `packages/murmur-relay/wrangler.production.jsonc`
 and `packages/murmur-relay/wrangler.staging.jsonc`. Each deployment uses one
-Durable Object per device inbox plus one deployment-wide Durable Object for
-UUIDv7 sequencing and durable ordered fanout retry. The public Worker is the
-required ingress; clients do not address a Durable Object instance directly.
+Durable Object per device inbox, one deployment-wide Durable Object for UUIDv7
+sequencing and durable ordered fanout retry, and one private-group Durable
+Object per opaque group identifier. The public Worker is the required ingress;
+clients do not address a Durable Object instance directly.
 
 Set the exact public `wss:` URL in each deployment's `MURMUR_RELAY_ENDPOINT`,
 then provision a 32-byte-or-longer base64url HMAC secret in that relay Worker
-and the corresponding application server. Production and staging use separate
-secrets:
+and the corresponding application server. Private-group state additionally
+requires an independent, canonical unpadded base64url secret containing
+exactly 32 bytes. Production and staging use separate values, and the
+private-group secret must not reuse the relay ticket secret:
 
 ```bash
 cd packages/murmur-relay
 wrangler secret put MURMUR_RELAY_TOKEN_SECRET --config wrangler.production.jsonc
+wrangler secret put MURMUR_PRIVATE_GROUP_SECRET --config wrangler.production.jsonc
 pnpm cloudflare:deploy:production
 wrangler secret put MURMUR_RELAY_TOKEN_SECRET --config wrangler.staging.jsonc
+wrangler secret put MURMUR_PRIVATE_GROUP_SECRET --config wrangler.staging.jsonc
 pnpm cloudflare:deploy:staging
 ```
+
+Credential challenges and account-signed blind issuance are stateless Worker
+operations. Proof, token, and canonical-record requests carry the opaque group
+header and are routed to that group's Durable Object. Each fresh object stores
+only its pinned opaque ID, current encrypted record, opaque member index, and
+bounded one-use presentation challenges. There is no legacy private-group
+record decoder or Durable Object storage migration path during beta.
 
 The application server mounts `createRelaySessionFetchHandler`. Its
 `authorize` callback authenticates the user, verifies that the signed device
@@ -44,6 +56,7 @@ pnpm --filter @slopus/murmur-relay build
 
 MURMUR_RELAY_STORE=sqlite \
 MURMUR_RELAY_DB=./data/murmur-relay.sqlite \
+MURMUR_PRIVATE_GROUP_SECRET=<canonical-32-byte-base64url> \
 MURMUR_RELAY_ORIGINS=https://app.example \
 pnpm --filter @slopus/murmur-relay start
 ```
@@ -56,6 +69,7 @@ foreign-key enforcement, a busy timeout, and bounded write transactions.
 ```bash
 MURMUR_RELAY_STORE=postgres \
 MURMUR_RELAY_DB=postgres://user:password@db.example/murmur \
+MURMUR_PRIVATE_GROUP_SECRET=<canonical-32-byte-base64url> \
 MURMUR_RELAY_ORIGINS=https://app.example \
 pnpm --filter @slopus/murmur-relay start
 ```

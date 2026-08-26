@@ -2,8 +2,8 @@ import { PGlite } from "@electric-sql/pglite";
 import { sha256 } from "@noble/hashes/sha2";
 import { describe, expect, test } from "vitest";
 import { PGliteDatabase } from "../../storage/index.js";
+import { PostgresPrivateGroupStateStore } from "../impl/privateGroupStateStorePostgres.js";
 import {
-    PostgresPrivateGroupStateStore,
     type PrivateGroupPresentationChallenge,
     type PrivateGroupStateLimits,
     type PrivateGroupStateRecord,
