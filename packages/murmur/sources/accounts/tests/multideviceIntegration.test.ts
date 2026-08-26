@@ -121,93 +121,80 @@ async function establishContact(invited: Messenger, requester: Messenger): Promi
 }
 
 describe("multidevice messenger", () => {
-    test(
-        "links, converges, messages, and revokes transparently",
-        { timeout: 120_000 },
-        async () => {
-            const relay = new RelayService(
-                new SqliteRelayStore(":memory:"),
-                {},
-                undefined,
-                () => NOW,
+    test("links, converges, messages, and revokes transparently", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const fetch = relayFetch(relay);
+        const open = async (): Promise<MurmurClient> =>
+            MurmurClient.open({
+                relay: "https://relay.test",
+                fetch,
+                store: new MemoryMurmurStore(),
+                now: () => NOW,
+            });
+        const alice1 = new Messenger(await open());
+        const alice2 = new Messenger(await open());
+        const bob = new Messenger(await open());
+        try {
+            await establishContact(bob, alice1);
+
+            const chat = await alice1.client.createSession({
+                descriptor: CHAT_DESCRIPTOR,
+                contacts: [bob.client.accountKey],
+            });
+            await pumpAll([alice1, bob], 4);
+            await alice1.client.send(chat.id, utf8Encode("hello bob"));
+            await pumpAll([alice1, bob], 4);
+            expect(bob.messages.map(({ text }) => text)).toContain("hello bob");
+
+            // Only the QR-sized request travels out of band; the encrypted
+            // envelope arrives automatically through the new device's inbox.
+            const request = await alice2.client.linkDevice();
+            expect(request.length).toBeLessThan(1_200);
+            await alice1.client.authorizeDevice(request);
+            await pumpAll([alice2], 2);
+            expect(alice2.client.accountKey).toEqual(alice1.client.accountKey);
+            await pumpAll([alice1, alice2, bob], 8);
+
+            const aliceDevices = await alice1.client.devices();
+            expect(aliceDevices.map(({ status }) => status)).toEqual(["active", "active"]);
+            expect(alice1.deviceAdded.length).toBeGreaterThan(0);
+            expect(bob.contactRosterChanges.some(({ change }) => change === "added")).toBe(true);
+
+            // Chat membership stays two accounts even with three device leaves.
+            const bobChat = await bob.client.session(chat.id);
+            expect(bobChat?.members.length).toBe(2);
+
+            // Messages from anyone reach every device of every member account.
+            await bob.client.send(chat.id, utf8Encode("hi alice devices"));
+            await pumpAll([alice1, alice2, bob], 6);
+            expect(alice1.messages.map(({ text }) => text)).toContain("hi alice devices");
+            expect(alice2.messages.map(({ text }) => text)).toContain("hi alice devices");
+
+            await alice2.client.send(chat.id, utf8Encode("from second device"));
+            await pumpAll([alice1, alice2, bob], 6);
+            const fromSecond = bob.messages.find(({ text }) => text === "from second device");
+            expect(fromSecond).toBeDefined();
+            expect(fromSecond?.sender).toEqual(encodeBase64Url(alice1.client.accountKey));
+
+            // Any active device may revoke another; peers observe it.
+            await alice1.client.revokeDevice(alice2.client.identity);
+            await pumpAll([alice1, bob], 8);
+            expect(alice1.deviceRevoked.length).toBeGreaterThan(0);
+            expect(bob.contactRosterChanges.some(({ change }) => change === "revoked")).toBe(true);
+
+            const revokedCount = alice2.messages.length;
+            await bob.client.send(chat.id, utf8Encode("after revocation"));
+            await pumpAll([alice1, bob], 6);
+            await alice2.pump().catch(() => undefined);
+            expect(alice1.messages.map(({ text }) => text)).toContain("after revocation");
+            expect(alice2.messages.slice(revokedCount).map(({ text }) => text)).not.toContain(
+                "after revocation",
             );
-            const fetch = relayFetch(relay);
-            const open = async (): Promise<MurmurClient> =>
-                MurmurClient.open({
-                    relay: "https://relay.test",
-                    fetch,
-                    store: new MemoryMurmurStore(),
-                    now: () => NOW,
-                });
-            const alice1 = new Messenger(await open());
-            const alice2 = new Messenger(await open());
-            const bob = new Messenger(await open());
-            try {
-                await establishContact(bob, alice1);
-
-                const chat = await alice1.client.createSession({
-                    descriptor: CHAT_DESCRIPTOR,
-                    contacts: [bob.client.accountKey],
-                });
-                await pumpAll([alice1, bob], 4);
-                await alice1.client.send(chat.id, utf8Encode("hello bob"));
-                await pumpAll([alice1, bob], 4);
-                expect(bob.messages.map(({ text }) => text)).toContain("hello bob");
-
-                // Only the QR-sized request travels out of band; the encrypted
-                // envelope arrives automatically through the new device's inbox.
-                const request = await alice2.client.linkDevice();
-                expect(request.length).toBeLessThan(1_200);
-                await alice1.client.authorizeDevice(request);
-                await pumpAll([alice2], 2);
-                expect(alice2.client.accountKey).toEqual(alice1.client.accountKey);
-                await pumpAll([alice1, alice2, bob], 8);
-
-                const aliceDevices = await alice1.client.devices();
-                expect(aliceDevices.map(({ status }) => status)).toEqual(["active", "active"]);
-                expect(alice1.deviceAdded.length).toBeGreaterThan(0);
-                expect(bob.contactRosterChanges.some(({ change }) => change === "added")).toBe(
-                    true,
-                );
-
-                // Chat membership stays two accounts even with three device leaves.
-                const bobChat = await bob.client.session(chat.id);
-                expect(bobChat?.members.length).toBe(2);
-
-                // Messages from anyone reach every device of every member account.
-                await bob.client.send(chat.id, utf8Encode("hi alice devices"));
-                await pumpAll([alice1, alice2, bob], 6);
-                expect(alice1.messages.map(({ text }) => text)).toContain("hi alice devices");
-                expect(alice2.messages.map(({ text }) => text)).toContain("hi alice devices");
-
-                await alice2.client.send(chat.id, utf8Encode("from second device"));
-                await pumpAll([alice1, alice2, bob], 6);
-                const fromSecond = bob.messages.find(({ text }) => text === "from second device");
-                expect(fromSecond).toBeDefined();
-                expect(fromSecond?.sender).toEqual(encodeBase64Url(alice1.client.accountKey));
-
-                // Any active device may revoke another; peers observe it.
-                await alice1.client.revokeDevice(alice2.client.identity);
-                await pumpAll([alice1, bob], 8);
-                expect(alice1.deviceRevoked.length).toBeGreaterThan(0);
-                expect(bob.contactRosterChanges.some(({ change }) => change === "revoked")).toBe(
-                    true,
-                );
-
-                const revokedCount = alice2.messages.length;
-                await bob.client.send(chat.id, utf8Encode("after revocation"));
-                await pumpAll([alice1, bob], 6);
-                await alice2.pump().catch(() => undefined);
-                expect(alice1.messages.map(({ text }) => text)).toContain("after revocation");
-                expect(alice2.messages.slice(revokedCount).map(({ text }) => text)).not.toContain(
-                    "after revocation",
-                );
-            } finally {
-                alice1.client.close();
-                alice2.client.close();
-                bob.client.close();
-                await relay.close();
-            }
-        },
-    );
+        } finally {
+            alice1.client.close();
+            alice2.client.close();
+            bob.client.close();
+            await relay.close();
+        }
+    });
 });
