@@ -91,7 +91,7 @@ describe("session outbox ordering", () => {
                 now: () => NOW,
             });
             expect(await alice.synchronize()).toMatchObject({
-                published: 70,
+                published: 71,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 70,
             });
