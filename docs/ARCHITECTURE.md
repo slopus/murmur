@@ -106,17 +106,23 @@ Membership publication is an operation:
 ```text
 validate full operation manifest
           |
-publish every Welcome
-          |
-publish Commit only after all Welcome markers
+publish Commit
           |
 adopt only from the sender's own queue echo
+          |
+publish every required Welcome
+          |
+publish authenticated admission completion
+          |
+release dependent application work and later Commits
 ```
 
 Membership and role APIs persist bounded intents before network I/O. A losing
 concurrent Commit is cancelled when the earlier relay event arrives; dependent
 application outboxes are re-encrypted against the winning epoch and the intent
-is retried, including a replacement Welcome for a pending joiner. Application
+is retried with a fresh Commit. An Add's Welcome publishes only after that exact
+Commit is adopted, and an authenticated completion control prevents another
+member from publishing a later Commit before the admission finishes. Application
 and control outboxes are durably ordered per client. A transient head failure
 blocks later records for the same session while unrelated sessions continue.
 

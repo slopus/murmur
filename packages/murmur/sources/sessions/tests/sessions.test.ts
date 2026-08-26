@@ -79,7 +79,7 @@ async function prefixCount(store: MurmurStore, prefix: string): Promise<number> 
 }
 
 describe("stateful MLS sessions", () => {
-    test("queues initial group messages offline and relays Welcome, Commit, then messages after restart", async () => {
+    test("queues initial group messages offline and relays Commit, Welcome, then messages after restart", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const aliceStore = new MemoryMurmurStore();
         const published: SignedDelivery[] = [];
@@ -116,14 +116,14 @@ describe("stateful MLS sessions", () => {
                         limit: 10,
                     })
                 ).size,
-            ).toBe(4);
+            ).toBe(5);
             expect(
                 (
                     await aliceStore.scan("murmur/post-commit-outboxes/", {
                         limit: 10,
                     })
                 ).size,
-            ).toBe(2);
+            ).toBe(3);
 
             const aliceIdentity = alice.identity;
             alice.close();
@@ -134,18 +134,27 @@ describe("stateful MLS sessions", () => {
             });
 
             expect(await alice.synchronize()).toMatchObject({
-                published: 4,
+                published: 3,
+                pendingOutboxes: 3,
+                transientPublicationFailures: 0,
+                terminalPublicationFailures: 0,
+            });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([3, 1, 2]);
+            expect(await alice.synchronize()).toMatchObject({
+                published: 3,
                 pendingOutboxes: 0,
                 transientPublicationFailures: 0,
                 terminalPublicationFailures: 0,
             });
-            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2, 2]);
-            expect(published.slice(2).map((delivery) => delivery.id)).toEqual([first, second]);
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([3, 1, 2, 2, 2, 2]);
+            expect(published.slice(3, 5).map((delivery) => delivery.id)).toEqual([first, second]);
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
             ).toEqual([
-                [encodeBase64Url(bob.identity)],
                 [encodeBase64Url(aliceIdentity)],
+                [encodeBase64Url(bob.identity)],
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
+                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
                 [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
                 [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.identity)].sort(),
             ]);
@@ -338,7 +347,7 @@ describe("stateful MLS sessions", () => {
             });
             await alice.synchronize();
             const synchronized = await bob.synchronize();
-            expect(synchronized.inbox.rejected).toBe(1);
+            expect(synchronized.inbox.rejected).toBe(2);
             expect(await bob.session(session.id)).toBeUndefined();
             expect(await bobStore.scan("murmur/key-packages/", { limit: 10 })).toHaveLength(0);
             expect(await bobStore.scan("murmur/key-package-expiries/", { limit: 10 })).toHaveLength(
@@ -641,7 +650,7 @@ describe("stateful MLS sessions", () => {
             carol.close();
             await relay.close();
         }
-    });
+    }, 10_000);
 
     test("rejects an unauthorized membership Commit on every honest member", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
@@ -964,7 +973,7 @@ describe("stateful MLS sessions", () => {
         await run("admin");
     }, 120_000);
 
-    test("replaces a pending Welcome after its Add Commit loses", async () => {
+    test("publishes a Welcome only after the retried Add Commit is adopted", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const base = new HttpDeliveryTransport("https://relay.test", {
             fetch: relayFetch(relay),
@@ -981,20 +990,22 @@ describe("stateful MLS sessions", () => {
             acknowledge: (request, signal) => base.acknowledge(request, signal),
         };
         const alice = await client(relay);
+        const bobStore = new MemoryMurmurStore();
         const bob = await MurmurClient.open({
             transport: bobTransport,
-            store: new MemoryMurmurStore(),
+            store: bobStore,
             now: () => NOW,
         });
         const carol = await client(relay);
         try {
             const session = await alice.createSession({
-                descriptor: utf8Encode("replacement welcome"),
+                descriptor: utf8Encode("retried welcome"),
                 anyoneCanAddMembers: true,
                 members: [await bob.discovery()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
+            expect(await prefixCount(bobStore, "murmur/admission-barriers/")).toBe(0);
             await activate(bob, session.id);
 
             blockBobCommit = true;
@@ -1003,13 +1014,7 @@ describe("stateful MLS sessions", () => {
                 transientPublicationFailures: 1,
             });
             await carol.synchronize({ waitMilliseconds: 0 });
-            expect(await carol.session(session.id)).toMatchObject({
-                status: "pending",
-                policies: {
-                    adminsAssignAdmins: false,
-                    anyoneCanAddMembers: true,
-                },
-            });
+            expect(await carol.session(session.id)).toBeUndefined();
 
             await alice.setPolicies(session.id, {
                 adminsAssignAdmins: true,
@@ -1019,6 +1024,10 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize({ waitMilliseconds: 0 });
 
             blockBobCommit = false;
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            expect(await carol.session(session.id)).toBeUndefined();
+
             await bob.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
             expect(await carol.session(session.id)).toMatchObject({
@@ -1143,19 +1152,24 @@ describe("stateful MLS sessions", () => {
 
             expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
-                pendingOutboxes: 1,
+                pendingOutboxes: 3,
             });
-            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([2, 1, 3]);
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([2, 2, 3]);
             expect(published[0]?.id).toBe(messageId);
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
             ).toEqual([
                 [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
-                [encodeBase64Url(carol.identity)],
+                [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
                 [encodeBase64Url(alice.identity), encodeBase64Url(bob.identity)].sort(),
             ]);
 
-            await alice.synchronize({ waitMilliseconds: 0 });
+            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                published: 3,
+                pendingOutboxes: 1,
+            });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([2, 2, 3, 3, 1, 2]);
+            expect(published.at(-2)?.recipients).toEqual([carol.identity]);
             await bob.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
             const bobReceived: string[] = [];
@@ -1212,7 +1226,7 @@ describe("stateful MLS sessions", () => {
             );
             await expect(alice.synchronize()).resolves.toMatchObject({
                 pendingOutboxes: 1,
-                transientPublicationFailures: 1,
+                transientPublicationFailures: 2,
                 terminalPublicationFailures: 0,
             });
             alice.close();
@@ -1457,7 +1471,7 @@ describe("stateful MLS sessions", () => {
             const outcome = await alice.synchronize();
             expect(outcome).toMatchObject({
                 pendingOutboxes: 0,
-                terminalPublicationFailures: 1,
+                terminalPublicationFailures: 2,
                 transientPublicationFailures: 0,
             });
             expect(outcome.issues[0]?.code).toContain("outbox_application_limit");
@@ -1785,7 +1799,7 @@ describe("stateful MLS sessions", () => {
             });
             const outcome = await alice.synchronize();
             expect(outcome).toMatchObject({
-                published: 0,
+                published: 1,
                 terminalPublicationFailures: 0,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 2,
@@ -1797,8 +1811,8 @@ describe("stateful MLS sessions", () => {
             await bob.synchronize();
             expect(await bob.session(session.id)).toBeUndefined();
             expect(await alice.session(session.id)).toMatchObject({
-                status: "creating",
-                members: [alice.identity],
+                status: "active",
+                members: [alice.identity, bob.identity],
             });
             const queued = await alice.send(session.id, utf8Encode("queued while offline"));
             expect(queued).toEqual(expect.any(String));
@@ -1808,12 +1822,12 @@ describe("stateful MLS sessions", () => {
                         limit: 10,
                     })
                 ).size,
-            ).toBe(1);
+            ).toBe(2);
 
             failWelcome = false;
             expect(await alice.synchronize()).toMatchObject({
                 published: 3,
-                pendingOutboxes: 0,
+                pendingOutboxes: 1,
             });
             await bob.synchronize();
             expect(await alice.session(session.id)).toMatchObject({
@@ -1874,7 +1888,7 @@ describe("stateful MLS sessions", () => {
             expect(sendId).toEqual(expect.any(String));
             failPrivateOnce = true;
             expect(await alice.synchronize()).toMatchObject({
-                published: 1,
+                published: 2,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 2,
             });
@@ -1895,7 +1909,7 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("retains and recovers a Commit after its Welcome was published", async () => {
+    test("does not publish a Welcome until its recoverable Commit is adopted", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const base = new HttpDeliveryTransport("https://relay.test", {
             fetch: relayFetch(relay),
@@ -1924,21 +1938,25 @@ describe("stateful MLS sessions", () => {
             });
             const blocked = await alice.synchronize();
             expect(blocked).toMatchObject({
-                published: 1,
+                published: 0,
                 transientPublicationFailures: 1,
-                pendingOutboxes: 1,
+                pendingOutboxes: 3,
             });
             expect(blocked.issues.some((issue) => issue.kind === "commit")).toBe(true);
             await bob.synchronize();
-            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
+            expect(await bob.session(session.id)).toBeUndefined();
             expect(await alice.session(session.id)).toMatchObject({ status: "creating" });
 
             failCommit = false;
-            await alice.synchronize();
+            expect(await alice.synchronize()).toMatchObject({
+                published: 3,
+                pendingOutboxes: 1,
+            });
             expect(await alice.session(session.id)).toMatchObject({
                 status: "active",
                 members: [alice.identity, bob.identity],
             });
+            await bob.synchronize();
             expect(await bob.session(session.id)).toMatchObject({
                 status: "pending",
                 members: [alice.identity, bob.identity],

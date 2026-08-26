@@ -227,7 +227,7 @@ interface RaceModel {
     readonly candidates: readonly ActorName[];
     readonly eventIds: readonly string[];
     readonly winner: ActorName;
-    readonly replacementWelcome: boolean;
+    readonly includesAdd: boolean;
     readonly stagedLabel: string;
 }
 
@@ -271,7 +271,7 @@ type SoakAction =
           readonly kind: "race";
           readonly session: number;
           readonly actors: readonly [number, number];
-          readonly replacementWelcome: boolean;
+          readonly includesAdd: boolean;
           readonly label: string;
       }
     | { readonly kind: "crash" | "reopen"; readonly actor: number }
@@ -421,14 +421,14 @@ function generateActions(seed: number, config: ProfileConfig): readonly SoakActi
             kind: "race",
             session: 0,
             actors: [0, 1],
-            replacementWelcome: false,
+            includesAdd: false,
             label: `seed-${seed}-staged-role`,
         },
         {
             kind: "race",
             session: Math.min(1, config.sessions - 1),
             actors: [1, 2],
-            replacementWelcome: true,
+            includesAdd: true,
             label: `seed-${seed}-staged-welcome`,
         },
         { kind: "crash", actor: 2 },
@@ -1010,7 +1010,7 @@ class SoakHarness {
         };
         this.#intents.push(losingIntent);
         session.epoch += 1;
-        if (action.replacementWelcome) session.members.add(accountName(3));
+        if (action.includesAdd) session.members.add(accountName(3));
         session.policy = {
             adminsAssignAdmins: !session.policy.adminsAssignAdmins,
             anyoneCanAddMembers: session.policy.anyoneCanAddMembers,
@@ -1024,17 +1024,17 @@ class SoakHarness {
             candidates: actors.map((actor) => actor.name),
             eventIds,
             winner: winner.name,
-            replacementWelcome: action.replacementWelcome,
+            includesAdd: action.includesAdd,
             stagedLabel: action.label,
         });
         this.#relayRelations.push(
-            `${session.name}:${winner.name}<${loser.name}:${action.replacementWelcome ? "replacement" : "plain"}`,
+            `${session.name}:${winner.name}<${loser.name}:${action.includesAdd ? "add" : "plain"}`,
         );
         this.#check("I09", this.#labels.has(action.label), "losing staged send disappeared");
         this.#check(
             "I10",
-            !action.replacementWelcome || session.members.has(accountName(3)),
-            "replacement Welcome did not preserve the join",
+            !action.includesAdd || session.members.has(accountName(3)),
+            "adopted Add did not preserve the join",
         );
     }
 
@@ -1548,8 +1548,8 @@ class SoakHarness {
         );
         this.#check(
             "I10",
-            this.#races.some((race) => race.replacementWelcome),
-            "replacement Welcome opportunity was not exercised",
+            this.#races.some((race) => race.includesAdd),
+            "adopted Add race opportunity was not exercised",
         );
         this.#check("I11", this.#invalidAttempts >= 2, "invalid local attempts were not exercised");
         this.#check("I17", this.#mutationRejections >= 4, "mutation families were not exercised");
@@ -1648,7 +1648,7 @@ class SoakHarness {
                 parentEpoch: race.parentEpoch,
                 candidates: race.candidates,
                 winner: race.winner,
-                replacementWelcome: race.replacementWelcome,
+                includesAdd: race.includesAdd,
                 stagedLabel: race.stagedLabel,
             })),
             privateRevisions: [...this.#sessions.values()].map((session) => [

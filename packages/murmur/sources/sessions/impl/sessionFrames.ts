@@ -136,6 +136,7 @@ export interface BootstrapFrame {
 export type PrivateSessionFrame =
     | { readonly version: 1; readonly type: "application"; readonly bytes: Uint8Array }
     | { readonly version: 1; readonly type: "leave" }
+    | { readonly version: 1; readonly type: "welcome_complete" }
     | {
           readonly version: 1;
           readonly type: "account_roster";
@@ -454,6 +455,9 @@ export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
     if (frame.type === "leave") {
         return canonicalJsonBytes({ version: 1, type: frame.type });
     }
+    if (frame.type === "welcome_complete") {
+        return canonicalJsonBytes({ version: 1, type: frame.type });
+    }
     throw new Error("Unsupported private session frame");
 }
 
@@ -489,6 +493,10 @@ export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
     if (input.type === "leave") {
         exact(input, ["version", "type"], "leave control");
         return { version: 1, type: "leave" };
+    }
+    if (input.type === "welcome_complete") {
+        exact(input, ["version", "type"], "Welcome-complete control");
+        return { version: 1, type: "welcome_complete" };
     }
     throw new Error("Unsupported private session frame");
 }

@@ -1041,7 +1041,7 @@ describe("crash and transaction recovery chaos", () => {
                         const acceptedKinds = alice.observer.publishAttempts.map(
                             (delivery) => delivery.ciphertext[0],
                         );
-                        expect(acceptedKinds.indexOf(1)).toBeLessThan(acceptedKinds.indexOf(3));
+                        expect(acceptedKinds.indexOf(3)).toBeLessThan(acceptedKinds.indexOf(1));
                         expect((await assertStoreShape(alice.delegate)).outboxes).toBe(0);
                     } finally {
                         await closeFixture(fixture);
@@ -1052,7 +1052,7 @@ describe("crash and transaction recovery chaos", () => {
     );
 
     test(
-        "CR-08 a published Welcome remains pending until its recoverable parent Commit",
+        "CR-08 Welcome remains unpublished across a crash before its parent Commit",
         { timeout: 120_000 },
         async () => {
             await withSeed(0x4352_0800, async () => {
@@ -1061,6 +1061,7 @@ describe("crash and transaction recovery chaos", () => {
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
                         const carol = await createActor(fixture, "carol");
+                        const publicationOffset = alice.observer.publishAttempts.length;
                         await alice.client.addMember(session.id, await carol.client.discovery());
                         const reached = alice.delay.block();
                         alice.transportSchedule.arm([
@@ -1081,13 +1082,12 @@ describe("crash and transaction recovery chaos", () => {
                         await reached;
                         alice.transportSchedule.consume();
                         expect(
-                            alice.observer.publishAttempts.some(
-                                (delivery) => delivery.ciphertext[0] === 1,
-                            ),
-                        ).toBe(true);
-                        expect(alice.observer.accepted.size).toBeGreaterThan(0);
+                            alice.observer.publishAttempts
+                                .slice(publicationOffset)
+                                .some((delivery) => delivery.ciphertext[0] === 1),
+                        ).toBe(false);
                         await synchronize(carol);
-                        expect((await carol.client.session(session.id))?.status).toBe("pending");
+                        expect(await carol.client.session(session.id)).toBeUndefined();
                         expect(carol.updates).toHaveLength(0);
 
                         await reopen(alice, fixture.clock);
@@ -1102,6 +1102,10 @@ describe("crash and transaction recovery chaos", () => {
                         await carol.client.activateSession(session.id);
                         await synchronize(carol);
                         expect(carol.updates).toHaveLength(0);
+                        const attemptedKinds = alice.observer.publishAttempts
+                            .slice(publicationOffset)
+                            .map((delivery) => delivery.ciphertext[0]);
+                        expect(attemptedKinds.indexOf(3)).toBeLessThan(attemptedKinds.indexOf(1));
                         expect((await assertStoreShape(alice.delegate)).bootstrap).toBe(0);
                     } finally {
                         await closeFixture(fixture);

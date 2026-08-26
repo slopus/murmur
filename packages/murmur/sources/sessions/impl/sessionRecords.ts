@@ -24,7 +24,6 @@ export interface SessionRecord {
     readonly previousMessagesRemaining?: number;
     readonly roles: SessionRoles;
     readonly removalGenerations: readonly SessionRemovalGeneration[];
-    readonly bootstrapEventId?: string;
     readonly bootstrapKeyPackageReference?: Uint8Array;
     readonly reAdmission?: boolean;
 }
@@ -162,7 +161,6 @@ export function encodeSessionRecord(record: SessionRecord): Uint8Array {
         ...common,
         roles: encodeBase64Url(encodeSessionRoles(record.roles)),
         removalGenerations,
-        bootstrapEventId: record.bootstrapEventId ?? null,
         bootstrapKeyPackageReference:
             record.bootstrapKeyPackageReference === undefined
                 ? null
@@ -187,7 +185,6 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         "previousMessagesRemaining",
         "roles",
         "removalGenerations",
-        "bootstrapEventId",
         "bootstrapKeyPackageReference",
         ...(Object.hasOwn(input, "reAdmission") ? ["reAdmission"] : []),
     ];
@@ -211,8 +208,6 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         typeof input.roles !== "string" ||
         !Array.isArray(input.removalGenerations) ||
         input.removalGenerations.length > 256 ||
-        (input.bootstrapEventId !== null &&
-            (typeof input.bootstrapEventId !== "string" || input.bootstrapEventId.length > 128)) ||
         (input.bootstrapKeyPackageReference !== null &&
             typeof input.bootstrapKeyPackageReference !== "string") ||
         (input.reAdmission !== undefined && input.reAdmission !== true)
@@ -270,9 +265,6 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         roles: decodeSessionRoles(bytes(input.roles, 64 * 1024, "session roles")),
         removalGenerations,
         ...(input.reAdmission === true ? { reAdmission: true } : {}),
-        ...(input.bootstrapEventId === null
-            ? {}
-            : { bootstrapEventId: input.bootstrapEventId as string }),
         ...(input.bootstrapKeyPackageReference === null
             ? {}
             : {

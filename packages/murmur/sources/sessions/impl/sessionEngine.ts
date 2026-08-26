@@ -124,6 +124,7 @@ const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
 const USED_DISCOVERY_PREFIX = "murmur/used-discovery/";
 const BOOTSTRAP_INDEX_PREFIX = "murmur/bootstrap-outboxes/";
+const ADMISSION_BARRIER_PREFIX = "murmur/admission-barriers/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
 const POST_COMMIT_OUTBOX_INDEX_PREFIX = "murmur/post-commit-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
@@ -255,6 +256,20 @@ function outboxOrderKey(order: string, deliveryId: string): string {
 
 function bootstrapIndexKey(parentCommitId: string, deliveryId: string): string {
     return `${BOOTSTRAP_INDEX_PREFIX}${parentCommitId}/${deliveryId}`;
+}
+
+function admissionBarrierKey(id: Uint8Array): string {
+    return `${ADMISSION_BARRIER_PREFIX}${sessionId(id)}`;
+}
+
+function encodeAdmissionBarrier(sender: Uint8Array): Uint8Array {
+    if (sender.length !== 32) throw new Error("Invalid admission barrier");
+    return sender.slice();
+}
+
+function decodeAdmissionBarrier(value: Uint8Array): Uint8Array {
+    if (value.length !== 32) throw new Error("Invalid admission barrier");
+    return value.slice();
 }
 
 function epochOutboxIndexKey(id: Uint8Array, deliveryId: string): string {
@@ -1157,13 +1172,20 @@ export class SessionEngine {
             const bytes = await transaction.get(stateKey(id));
             if (bytes === undefined) throw new Error("Unknown session");
             const record = decodeSessionRecord(bytes);
+            const barrier = await transaction.get(admissionBarrierKey(id));
             try {
-                if (record.status !== "creating" && record.stagedCommitId === undefined) {
+                if (
+                    record.status !== "creating" &&
+                    record.stagedCommitId === undefined &&
+                    barrier === undefined &&
+                    (await this.#readyBootstrapParentForSession(transaction, id)) === undefined
+                ) {
                     throw new Error("Session has no blocked membership operation");
                 }
             } finally {
                 this.#zeroSessionRecord(record);
                 zeroBytes(bytes);
+                if (barrier !== undefined) zeroBytes(barrier);
             }
             await this.#deleteSession(transaction, id);
             await this.#rejectSession(transaction, id);
@@ -2201,6 +2223,7 @@ export class SessionEngine {
                     if (record.status === "creating") {
                         throw new Error("Creating session is missing its staged epoch");
                     }
+                    parentCommitId = await this.#readyBootstrapParentForSession(transaction, id);
                     epoch = restoreEpoch(this.#identity, record);
                 } else {
                     parentCommitId = record.stagedCommitId;
@@ -2496,7 +2519,7 @@ export class SessionEngine {
                 ) {
                     throw new Error("Session membership exceeds the configured limit");
                 }
-                const requiredOutboxes = 1 + additions.length;
+                const requiredOutboxes = 1 + additions.length + (additions.length > 0 ? 1 : 0);
                 const outboxCount = (
                     await transaction.scan(OUTBOX_PREFIX, {
                         limit: this.#limits.maximumOutboxes,
@@ -2550,7 +2573,6 @@ export class SessionEngine {
                     createdAt: now,
                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
                 });
-                stagedCheckpoint = transition.transition.serialize();
                 const commitOrder = await this.#nextOutboxOrder(transaction);
                 await setAndZero(
                     transaction,
@@ -2630,6 +2652,7 @@ export class SessionEngine {
                         zeroBytes(bootstrap);
                     }
                 }
+                stagedCheckpoint = transition.transition.serialize();
                 await setAndZero(
                     transaction,
                     outboxKey(delivery.id),
@@ -2648,6 +2671,14 @@ export class SessionEngine {
                     }),
                 );
                 await transaction.set(outboxOrderKey(commitOrder, delivery.id), new Uint8Array());
+                if (additions.length > 0) {
+                    await this.#queuePrivate(
+                        id,
+                        { version: 1, type: "welcome_complete" },
+                        "application",
+                        transaction,
+                    );
+                }
             } finally {
                 transition?.transition.cancel();
                 epoch.destroy();
@@ -2795,8 +2826,6 @@ export class SessionEngine {
         } catch {
             throw new TerminalInboxDeliveryError("invalid_bootstrap_box");
         }
-        let replacementRemovalGenerations: SessionRecord["removalGenerations"] = [];
-        let replacementReAdmission = false;
         try {
             let frame: ReturnType<typeof decodeBootstrapFrame>;
             let commit: ReturnType<typeof decodeMlsTreeCommit>;
@@ -2813,48 +2842,22 @@ export class SessionEngine {
                 throw new TerminalInboxDeliveryError("rejected_bootstrap");
             }
             const existingState = await transaction.get(stateKey(frame.groupId));
-            let replacing = false;
             if (existingState !== undefined) {
-                let existing: SessionRecord | undefined;
-                let existingEpoch: MlsEpochState | undefined;
-                try {
-                    existing = decodeSessionRecord(existingState);
-                    existingEpoch = restoreEpoch(this.#identity, existing);
-                    if (
-                        existing.status !== "pending" ||
-                        existing.bootstrapEventId === undefined ||
-                        queued.eventId <= existing.bootstrapEventId ||
-                        commit.epoch < existingEpoch.context.epoch ||
-                        !equalBytes(existing.roles.owner, frame.roles.owner)
-                    ) {
-                        return;
-                    }
-                    replacementRemovalGenerations = existing.removalGenerations.map((entry) => ({
-                        account: entry.account.slice(),
-                        generation: entry.generation,
-                    }));
-                    replacementReAdmission = existing.reAdmission === true;
-                    replacing = true;
-                } finally {
-                    existingEpoch?.destroy();
-                    if (existing !== undefined) this.#zeroSessionRecord(existing);
-                    zeroBytes(existingState);
-                }
+                zeroBytes(existingState);
+                return;
             }
-            if (!replacing) {
-                const pending = await transaction.scan(PENDING_SESSION_PREFIX, {
-                    limit: this.#limits.maximumPendingSessions,
-                });
-                if (pending.size >= this.#limits.maximumPendingSessions) {
-                    await this.#quarantine(
-                        transaction,
-                        queued.eventId,
-                        "pending_session_capacity",
-                        frame.groupId,
-                        "session",
-                    );
-                    return;
-                }
+            const pending = await transaction.scan(PENDING_SESSION_PREFIX, {
+                limit: this.#limits.maximumPendingSessions,
+            });
+            if (pending.size >= this.#limits.maximumPendingSessions) {
+                await this.#quarantine(
+                    transaction,
+                    queued.eventId,
+                    "pending_session_capacity",
+                    frame.groupId,
+                    "session",
+                );
+                return;
             }
             const bundleBytes = await transaction.get(keyPackageKey(frame.keyPackageReference));
             if (bundleBytes === undefined) {
@@ -2940,9 +2943,6 @@ export class SessionEngine {
                     equalBytes(reAdmissionDescriptor, frame.descriptor);
                 if (reAdmissionDescriptor !== undefined) zeroBytes(reAdmissionDescriptor);
                 if (reAdmission) await transaction.delete(reAdmissionKey);
-                if (replacing) {
-                    await this.#deletePrefix(transaction, bufferPrefix(frame.groupId));
-                }
                 await setAndZero(
                     transaction,
                     stateKey(frame.groupId),
@@ -2955,20 +2955,22 @@ export class SessionEngine {
                         bufferedEvents: 0,
                         bufferedBytes: 0,
                         roles: frame.roles,
-                        removalGenerations: replacementRemovalGenerations,
-                        bootstrapEventId: queued.eventId,
+                        removalGenerations: [],
                         bootstrapKeyPackageReference: frame.keyPackageReference,
-                        ...(reAdmission || replacementReAdmission ? { reAdmission: true } : {}),
+                        ...(reAdmission ? { reAdmission: true } : {}),
                     }),
                 );
+                await setAndZero(
+                    transaction,
+                    admissionBarrierKey(frame.groupId),
+                    encodeAdmissionBarrier(frame.inviter),
+                );
                 await transaction.set(pendingKey(frame.groupId), new Uint8Array());
-                if (!replacing) {
-                    await setAndZero(
-                        transaction,
-                        routingMarkerKey(queued.eventId),
-                        encodeSessionRouting({ version: 1, sessionId: frame.groupId }),
-                    );
-                }
+                await setAndZero(
+                    transaction,
+                    routingMarkerKey(queued.eventId),
+                    encodeSessionRouting({ version: 1, sessionId: frame.groupId }),
+                );
             } catch (error: unknown) {
                 if (error instanceof TerminalInboxDeliveryError || protocolComplete) throw error;
                 throw new TerminalInboxDeliveryError("invalid_bootstrap");
@@ -2979,7 +2981,6 @@ export class SessionEngine {
                 zeroBytes(bundleBytes);
             }
         } finally {
-            for (const entry of replacementRemovalGenerations) zeroBytes(entry.account);
             zeroBytes(plaintext);
         }
     }
@@ -3066,10 +3067,18 @@ export class SessionEngine {
                             new Uint8Array(),
                         );
                     }
-                    await this.#activatePostCommitOutboxes(
+                    if ((outbox.bootstrapDeliveryIds?.length ?? 0) > 0) {
+                        await setAndZero(
+                            transaction,
+                            admissionBarrierKey(outbox.sessionId),
+                            encodeAdmissionBarrier(this.#identity.publicKey),
+                        );
+                    }
+                    await this.#activateBootstrapOutboxes(
                         transaction,
                         queued.delivery.id,
                         outbox.sessionId,
+                        outbox.bootstrapDeliveryIds,
                     );
                 } finally {
                     next.destroy();
@@ -3091,13 +3100,13 @@ export class SessionEngine {
                     } finally {
                         zeroBytes(frame.bytes);
                     }
+                } else if (frame.type === "welcome_complete") {
+                    await this.#completeAdmissionBarrier(
+                        transaction,
+                        outbox.sessionId,
+                        this.#identity.publicKey,
+                    );
                 }
-            }
-            if (outbox.kind === "commit") {
-                await this.#deletePrefix(
-                    transaction,
-                    `${BOOTSTRAP_INDEX_PREFIX}${queued.delivery.id}/`,
-                );
             }
             await transaction.delete(outboxKey(queued.delivery.id));
             await transaction.delete(outboxOrderKey(outbox.order, queued.delivery.id));
@@ -3270,6 +3279,8 @@ export class SessionEngine {
                             account,
                         });
                     }
+                } else if (frame.type === "welcome_complete") {
+                    await this.#completeAdmissionBarrier(transaction, epoch.groupId, senderDevice);
                 }
             } finally {
                 zeroBytes(opened.state);
@@ -3438,6 +3449,13 @@ export class SessionEngine {
                                   }),
                         }),
                     );
+                    if (commit.proposals.some((proposal) => proposal.type === "add")) {
+                        await setAndZero(
+                            transaction,
+                            admissionBarrierKey(frame.groupId),
+                            encodeAdmissionBarrier(queued.delivery.sender),
+                        );
+                    }
                 } finally {
                     next.destroy();
                     if (checkpoint !== undefined) zeroBytes(checkpoint);
@@ -3484,6 +3502,23 @@ export class SessionEngine {
                         !equalBytes(dependent.sessionId, id)
                     ) {
                         throw new Error("Invalid losing-Commit application outbox");
+                    }
+                    const frame = decodePrivateFrame(dependent.applicationData);
+                    try {
+                        if (frame.type === "welcome_complete") {
+                            await transaction.delete(outboxKey(previousId));
+                            await transaction.delete(
+                                outboxOrderKey(dependent.order, dependent.delivery.id),
+                            );
+                            await transaction.delete(indexKey);
+                            continue;
+                        }
+                    } finally {
+                        if (frame.type === "application") zeroBytes(frame.bytes);
+                        if (frame.type === "account_roster") {
+                            zeroBytes(frame.roster);
+                            if (frame.keyPackage !== undefined) zeroBytes(frame.keyPackage);
+                        }
                     }
                     const message = next.seal(dependent.applicationData);
                     const ciphertext = encodePrivateCiphertext(message);
@@ -3630,11 +3665,8 @@ export class SessionEngine {
                     zeroBytes(reusable);
                 }
             }
-            const {
-                bootstrapEventId: _bootstrapEventId,
-                bootstrapKeyPackageReference: _bootstrapKeyPackageReference,
-                ...active
-            } = record;
+            const { bootstrapKeyPackageReference: _bootstrapKeyPackageReference, ...active } =
+                record;
             await setAndZero(
                 transaction,
                 stateKey(id),
@@ -3723,11 +3755,10 @@ export class SessionEngine {
     async #flushOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
         const reset = await this.#flushAccountResetOutboxes(signal);
         const publishedIds = new Set<string>(reset.publishedIds);
-        const publishedCommitIds = new Set<string>();
         const transientFailureIds = new Set<string>(reset.transientFailureIds);
         const terminalFailureIds = await this.#preflightMembershipOutboxes();
         for (const id of reset.terminalFailureIds) terminalFailureIds.add(id);
-        const phases = ["current", "bootstrap", "commit", "post-commit"] as const;
+        const phases = ["current", "commit", "bootstrap", "completion"] as const;
         for (const phase of phases) {
             const blockedSessions = new Set<string>();
             let after: string | undefined;
@@ -3757,15 +3788,17 @@ export class SessionEngine {
                             continue;
                         }
                         const decodedRecord = record;
+                        const welcomeComplete = this.#isWelcomeCompleteOutbox(decodedRecord);
                         const matchesPhase =
                             (phase === "bootstrap" && decodedRecord.kind === "bootstrap") ||
                             (phase === "current" &&
                                 decodedRecord.kind === "application" &&
-                                decodedRecord.parentCommitId === undefined) ||
+                                decodedRecord.parentCommitId === undefined &&
+                                !welcomeComplete) ||
                             (phase === "commit" && decodedRecord.kind === "commit") ||
-                            (phase === "post-commit" &&
-                                decodedRecord.kind === "application" &&
-                                decodedRecord.parentCommitId !== undefined);
+                            (phase === "completion" &&
+                                welcomeComplete &&
+                                decodedRecord.parentCommitId === undefined);
                         if (!matchesPhase) continue;
                         const encodedSessionId = sessionId(decodedRecord.sessionId);
                         if (
@@ -3782,15 +3815,16 @@ export class SessionEngine {
                                 { limit: 1 },
                             );
                             if (
-                                !(await this.#membershipOperationReady(decodedRecord)) ||
-                                pendingEpoch.size > 0
+                                pendingEpoch.size > 0 ||
+                                (await this.#admissionBarrierPending(decodedRecord.sessionId)) ||
+                                (await this.#hasReadyBootstrapForSession(decodedRecord.sessionId))
                             ) {
                                 continue;
                             }
                         }
                         if (
-                            phase === "post-commit" &&
-                            !publishedCommitIds.has(decodedRecord.parentCommitId!)
+                            decodedRecord.kind === "bootstrap" &&
+                            !(await this.#bootstrapReady(decodedRecord))
                         ) {
                             continue;
                         }
@@ -3810,20 +3844,31 @@ export class SessionEngine {
                         try {
                             await this.#transport.publish(decodedRecord.delivery, signal);
                             publishedIds.add(decodedRecord.delivery.id);
-                            if (decodedRecord.kind === "commit") {
-                                publishedCommitIds.add(decodedRecord.delivery.id);
-                            }
                             if (decodedRecord.kind === "bootstrap") {
                                 await this.#store.transaction(async (transaction) => {
                                     await transaction.delete(key);
                                     await transaction.delete(orderKey);
-                                    await transaction.set(
+                                    await transaction.delete(
                                         bootstrapIndexKey(
                                             decodedRecord.parentCommitId!,
                                             decodedRecord.delivery.id,
                                         ),
-                                        new Uint8Array([1]),
                                     );
+                                    const remaining = await transaction.scan(
+                                        `${BOOTSTRAP_INDEX_PREFIX}${decodedRecord.parentCommitId!}/`,
+                                        { limit: 1 },
+                                    );
+                                    try {
+                                        if (remaining.size === 0) {
+                                            await this.#activatePostCommitOutboxes(
+                                                transaction,
+                                                decodedRecord.parentCommitId!,
+                                                decodedRecord.sessionId,
+                                            );
+                                        }
+                                    } finally {
+                                        for (const value of remaining.values()) zeroBytes(value);
+                                    }
                                 });
                             }
                         } catch (error: unknown) {
@@ -3875,6 +3920,23 @@ export class SessionEngine {
             }
         }
         return { publishedIds, transientFailureIds, terminalFailureIds };
+    }
+
+    #isWelcomeCompleteOutbox(record: SessionOutboxRecord): boolean {
+        if (record.kind !== "application" || record.applicationData === undefined) return false;
+        let frame: PrivateSessionFrame | undefined;
+        try {
+            frame = decodePrivateFrame(record.applicationData);
+            return frame.type === "welcome_complete";
+        } catch {
+            return false;
+        } finally {
+            if (frame?.type === "application") zeroBytes(frame.bytes);
+            if (frame?.type === "account_roster") {
+                zeroBytes(frame.roster);
+                if (frame.keyPackage !== undefined) zeroBytes(frame.keyPackage);
+            }
+        }
     }
 
     async #flushAccountResetOutboxes(signal?: AbortSignal): Promise<FlushOutboxResult> {
@@ -4068,6 +4130,8 @@ export class SessionEngine {
                                 }
                                 zeroBytes(parentBytes);
                             }
+                        } else {
+                            valid = await this.#validAdoptedBootstrap(record);
                         }
                         if (!valid) {
                             await this.#store.transaction(async (transaction) => {
@@ -4257,13 +4321,7 @@ export class SessionEngine {
         for (const [indexKey, indexValue] of entries) {
             const bootstrapId = indexKey.slice(indexKey.lastIndexOf("/") + 1);
             if (!expected.has(bootstrapId)) valid = false;
-            if (indexValue.length === 1 && indexValue[0] === 1) {
-                const stale = await this.#store.get(outboxKey(bootstrapId));
-                if (stale !== undefined) {
-                    valid = false;
-                    zeroBytes(stale);
-                }
-            } else if (indexValue.length === 0) {
+            if (indexValue.length === 0) {
                 const bootstrapBytes = await this.#store.get(outboxKey(bootstrapId));
                 if (bootstrapBytes === undefined) {
                     valid = false;
@@ -4308,21 +4366,104 @@ export class SessionEngine {
         return valid;
     }
 
-    async #membershipOperationReady(record: SessionOutboxRecord): Promise<boolean> {
-        if (record.kind !== "commit" || record.bootstrapDeliveryIds === undefined) return false;
-        const expected = new Set(record.bootstrapDeliveryIds);
-        const entries = await this.#store.scan(`${BOOTSTRAP_INDEX_PREFIX}${record.delivery.id}/`, {
-            limit: 257,
-        });
-        let ready = entries.size === expected.size;
-        for (const [key, value] of entries) {
-            const bootstrapId = key.slice(key.lastIndexOf("/") + 1);
-            if (!expected.has(bootstrapId) || value.length !== 1 || value[0] !== 1) {
-                ready = false;
-            }
-            zeroBytes(value);
+    async #validAdoptedBootstrap(record: SessionOutboxRecord): Promise<boolean> {
+        if (record.kind !== "bootstrap" || record.parentCommitId === undefined) return false;
+        const parent = await this.#store.get(outboxKey(record.parentCommitId));
+        if (parent !== undefined) {
+            zeroBytes(parent);
+            return false;
         }
-        return ready;
+        const stateBytes = await this.#store.get(stateKey(record.sessionId));
+        if (stateBytes === undefined) return false;
+        let state: SessionRecord | undefined;
+        try {
+            state = decodeSessionRecord(stateBytes);
+            if (state.status !== "active") return false;
+        } catch {
+            return false;
+        } finally {
+            if (state !== undefined) this.#zeroSessionRecord(state);
+            zeroBytes(stateBytes);
+        }
+        const order = await this.#store.get(outboxOrderKey(record.order, record.delivery.id));
+        if (order === undefined) return false;
+        zeroBytes(order);
+        const marker = await this.#store.get(
+            bootstrapIndexKey(record.parentCommitId, record.delivery.id),
+        );
+        if (marker === undefined) return false;
+        try {
+            return marker.length === 1 && marker[0] === 1;
+        } finally {
+            zeroBytes(marker);
+        }
+    }
+
+    async #bootstrapReady(record: SessionOutboxRecord): Promise<boolean> {
+        if (record.kind !== "bootstrap" || record.parentCommitId === undefined) return false;
+        const marker = await this.#store.get(
+            bootstrapIndexKey(record.parentCommitId, record.delivery.id),
+        );
+        if (marker === undefined) return false;
+        try {
+            return marker.length === 1 && marker[0] === 1;
+        } finally {
+            zeroBytes(marker);
+        }
+    }
+
+    async #readyBootstrapParentForSession(
+        store: Pick<StoreTransaction, "get" | "scan">,
+        id: Uint8Array,
+    ): Promise<string | undefined> {
+        let after: string | undefined;
+        for (;;) {
+            const page = await store.scan(BOOTSTRAP_INDEX_PREFIX, {
+                ...(after === undefined ? {} : { after }),
+                limit: OUTBOX_SCAN_ITEMS,
+            });
+            if (page.size === 0) return undefined;
+            let matchedParent: string | undefined;
+            for (const [key, marker] of page) {
+                after = key;
+                try {
+                    if (marker.length !== 1 || marker[0] !== 1) continue;
+                    const bootstrapId = key.slice(key.lastIndexOf("/") + 1);
+                    const bytes = await store.get(outboxKey(bootstrapId));
+                    if (bytes === undefined) continue;
+                    let bootstrap: SessionOutboxRecord | undefined;
+                    try {
+                        bootstrap = decodeOutboxRecord(bytes);
+                        if (bootstrap.kind === "bootstrap" && equalBytes(bootstrap.sessionId, id)) {
+                            matchedParent = bootstrap.parentCommitId;
+                        }
+                    } finally {
+                        if (bootstrap?.stagedEpoch !== undefined) {
+                            zeroBytes(bootstrap.stagedEpoch);
+                        }
+                        if (bootstrap?.applicationData !== undefined) {
+                            zeroBytes(bootstrap.applicationData);
+                        }
+                        zeroBytes(bytes);
+                    }
+                } finally {
+                    zeroBytes(marker);
+                }
+            }
+            if (matchedParent !== undefined) return matchedParent;
+            if (page.size < OUTBOX_SCAN_ITEMS) return undefined;
+        }
+    }
+
+    async #hasReadyBootstrapForSession(id: Uint8Array): Promise<boolean> {
+        return (await this.#readyBootstrapParentForSession(this.#store, id)) !== undefined;
+    }
+
+    async #admissionBarrierPending(id: Uint8Array): Promise<boolean> {
+        const barrier = await this.#store.get(admissionBarrierKey(id));
+        if (barrier === undefined) return false;
+        zeroBytes(barrier);
+        return true;
     }
 
     async #refreshMembershipOutbox(key: string, record: SessionOutboxRecord): Promise<void> {
@@ -4349,38 +4490,18 @@ export class SessionEngine {
             );
             await transaction.set(outboxOrderKey(record.order, delivery.id), new Uint8Array());
             if (record.kind === "bootstrap") {
-                await transaction.delete(
-                    bootstrapIndexKey(record.parentCommitId!, record.delivery.id),
-                );
+                const markerKey = bootstrapIndexKey(record.parentCommitId!, record.delivery.id);
+                const marker = await transaction.get(markerKey);
+                if (marker === undefined || marker.length !== 1 || marker[0] !== 1) {
+                    if (marker !== undefined) zeroBytes(marker);
+                    throw new Error("Only an adopted bootstrap may be refreshed");
+                }
+                await transaction.delete(markerKey);
                 await transaction.set(
                     bootstrapIndexKey(record.parentCommitId!, delivery.id),
-                    new Uint8Array(),
+                    new Uint8Array([1]),
                 );
-                const parentBytes = await transaction.get(outboxKey(record.parentCommitId!));
-                if (parentBytes === undefined) throw new Error("Unknown bootstrap parent Commit");
-                const parent = decodeOutboxRecord(parentBytes);
-                try {
-                    if (
-                        parent.kind !== "commit" ||
-                        parent.bootstrapDeliveryIds === undefined ||
-                        !parent.bootstrapDeliveryIds.includes(record.delivery.id)
-                    ) {
-                        throw new Error("Invalid bootstrap parent Commit");
-                    }
-                    await setAndZero(
-                        transaction,
-                        outboxKey(parent.delivery.id),
-                        encodeOutboxRecord({
-                            ...parent,
-                            bootstrapDeliveryIds: parent.bootstrapDeliveryIds.map((value) =>
-                                value === record.delivery.id ? delivery.id : value,
-                            ),
-                        }),
-                    );
-                } finally {
-                    if (parent.stagedEpoch !== undefined) zeroBytes(parent.stagedEpoch);
-                    zeroBytes(parentBytes);
-                }
+                zeroBytes(marker);
             } else {
                 const stateBytes = await transaction.get(stateKey(record.sessionId));
                 if (stateBytes === undefined) throw new Error("Unknown staged session");
@@ -4445,6 +4566,82 @@ export class SessionEngine {
                 record.operationId,
             );
         });
+    }
+
+    async #completeAdmissionBarrier(
+        transaction: StoreTransaction,
+        id: Uint8Array,
+        sender: Uint8Array,
+    ): Promise<void> {
+        const key = admissionBarrierKey(id);
+        const bytes = await transaction.get(key);
+        if (bytes === undefined) {
+            throw new TerminalInboxDeliveryError("unexpected_welcome_complete");
+        }
+        const expectedSender = decodeAdmissionBarrier(bytes);
+        try {
+            if (!equalBytes(expectedSender, sender)) {
+                throw new TerminalInboxDeliveryError("invalid_welcome_complete");
+            }
+            await transaction.delete(key);
+        } finally {
+            zeroBytes(expectedSender);
+            zeroBytes(bytes);
+        }
+    }
+
+    async #activateBootstrapOutboxes(
+        transaction: StoreTransaction,
+        commitId: string,
+        id: Uint8Array,
+        bootstrapDeliveryIds: readonly string[] | undefined,
+    ): Promise<void> {
+        if (bootstrapDeliveryIds === undefined) {
+            throw new TerminalInboxDeliveryError("invalid_commit_echo");
+        }
+        const expected = new Set(bootstrapDeliveryIds);
+        const prefix = `${BOOTSTRAP_INDEX_PREFIX}${commitId}/`;
+        const entries = await transaction.scan(prefix, { limit: 257 });
+        try {
+            if (entries.size !== expected.size) {
+                throw new TerminalInboxDeliveryError("invalid_commit_echo");
+            }
+            for (const [key, marker] of entries) {
+                const bootstrapId = key.slice(prefix.length);
+                if (!expected.has(bootstrapId) || marker.length !== 0) {
+                    throw new TerminalInboxDeliveryError("invalid_commit_echo");
+                }
+                const bytes = await transaction.get(outboxKey(bootstrapId));
+                if (bytes === undefined) {
+                    throw new TerminalInboxDeliveryError("invalid_commit_echo");
+                }
+                let bootstrap: SessionOutboxRecord | undefined;
+                try {
+                    bootstrap = decodeOutboxRecord(bytes);
+                    if (
+                        bootstrap.kind !== "bootstrap" ||
+                        bootstrap.parentCommitId !== commitId ||
+                        !equalBytes(bootstrap.sessionId, id)
+                    ) {
+                        throw new TerminalInboxDeliveryError("invalid_commit_echo");
+                    }
+                    await transaction.set(key, new Uint8Array([1]));
+                } finally {
+                    if (bootstrap?.stagedEpoch !== undefined) {
+                        zeroBytes(bootstrap.stagedEpoch);
+                    }
+                    if (bootstrap?.applicationData !== undefined) {
+                        zeroBytes(bootstrap.applicationData);
+                    }
+                    zeroBytes(bytes);
+                }
+            }
+            if (entries.size === 0) {
+                await this.#activatePostCommitOutboxes(transaction, commitId, id);
+            }
+        } finally {
+            for (const marker of entries.values()) zeroBytes(marker);
+        }
     }
 
     async #activatePostCommitOutboxes(
@@ -4521,6 +4718,7 @@ export class SessionEngine {
         await this.#deletePrefix(transaction, `${SESSION_DATA_PREFIX}${sessionId(id)}/`);
         await transaction.delete(stateKey(id));
         await transaction.delete(pendingKey(id));
+        await transaction.delete(admissionBarrierKey(id));
         await transaction.delete(sessionOwnerKey(id));
         await this.#deleteRoutingMarkers(transaction, id);
         let after: string | undefined;
@@ -4643,6 +4841,38 @@ export class SessionEngine {
             for (const [key, value] of page) {
                 after = key;
                 const bootstrapId = key.slice(previousPrefix.length);
+                if (value.length !== 0) {
+                    zeroBytes(value);
+                    throw new Error("An adopted bootstrap parent Commit cannot be refreshed");
+                }
+                const bytes = await transaction.get(outboxKey(bootstrapId));
+                if (bytes === undefined) {
+                    zeroBytes(value);
+                    throw new Error("Missing bootstrap while refreshing its parent Commit");
+                }
+                const bootstrap = decodeOutboxRecord(bytes);
+                try {
+                    if (
+                        bootstrap.kind !== "bootstrap" ||
+                        bootstrap.parentCommitId !== previousCommitId
+                    ) {
+                        throw new Error("Invalid bootstrap parent Commit");
+                    }
+                    await setAndZero(
+                        transaction,
+                        outboxKey(bootstrapId),
+                        encodeOutboxRecord({
+                            ...bootstrap,
+                            parentCommitId: nextCommitId,
+                        }),
+                    );
+                } finally {
+                    if (bootstrap.stagedEpoch !== undefined) zeroBytes(bootstrap.stagedEpoch);
+                    if (bootstrap.applicationData !== undefined) {
+                        zeroBytes(bootstrap.applicationData);
+                    }
+                    zeroBytes(bytes);
+                }
                 await transaction.set(bootstrapIndexKey(nextCommitId, bootstrapId), value);
                 await transaction.delete(key);
                 zeroBytes(value);

@@ -158,14 +158,14 @@ describe("built-in contacts", () => {
                         limit: 10,
                     })
                 ).size,
-            ).toBe(3);
+            ).toBe(4);
             expect(
                 (
                     await requesterStore.scan("murmur/post-commit-outboxes/", {
                         limit: 10,
                     })
                 ).size,
-            ).toBe(1);
+            ).toBe(2);
 
             const requesterIdentity = requester.identity;
             requester.close();
@@ -177,14 +177,21 @@ describe("built-in contacts", () => {
             });
             expect(await requester.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
+                pendingOutboxes: 2,
+            });
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([3, 1, 2]);
+            expect(await requester.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+                published: 2,
                 pendingOutboxes: 0,
             });
-            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2]);
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([3, 1, 2, 2, 2]);
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
             ).toEqual([
-                [encodeBase64Url(invited.identity)],
                 [encodeBase64Url(requesterIdentity)],
+                [encodeBase64Url(invited.identity)],
+                [encodeBase64Url(invited.identity), encodeBase64Url(requesterIdentity)].sort(),
+                [encodeBase64Url(invited.identity), encodeBase64Url(requesterIdentity)].sort(),
                 [encodeBase64Url(invited.identity), encodeBase64Url(requesterIdentity)].sort(),
             ]);
 
@@ -205,10 +212,10 @@ describe("built-in contacts", () => {
             });
 
             await invited.acceptContact(session.id, { name: "Invited" });
-            expect(published).toHaveLength(3);
+            expect(published).toHaveLength(5);
             await invited.synchronize({ waitMilliseconds: 0 });
-            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([1, 3, 2, 2]);
-            expect(published[3]?.recipients.map(encodeBase64Url).sort()).toEqual(
+            expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([3, 1, 2, 2, 2, 2]);
+            expect(published[5]?.recipients.map(encodeBase64Url).sort()).toEqual(
                 [encodeBase64Url(invited.identity), encodeBase64Url(requesterIdentity)].sort(),
             );
 
@@ -474,7 +481,7 @@ describe("built-in contacts", () => {
             carol.close();
             await relay.close();
         }
-    });
+    }, 120_000);
 
     test("creates groups while a contact is offline, reuses fallback, and refills", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
@@ -582,7 +589,7 @@ describe("built-in contacts", () => {
             bob.close();
             await relay.close();
         }
-    });
+    }, 120_000);
 
     test("establishes mutual proof, restores offline, and removes the contact", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
@@ -698,7 +705,7 @@ describe("built-in contacts", () => {
             bob.close();
             await relay.close();
         }
-    });
+    }, 120_000);
 
     test("retries a requested callback and explicitly rejects the pending session", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);

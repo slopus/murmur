@@ -816,9 +816,8 @@ describe("Commit race and intent convergence chaos", () => {
         },
     );
 
-    scenarioFails(
+    scenario(
         "RACE-06 plain-member Add is terminally re-authorized after a policy winner",
-        "PRODUCT FINDING RACE-06/I08",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture();
@@ -844,13 +843,10 @@ describe("Commit race and intent convergence chaos", () => {
                 const terminalIssues = (await fixture.carol.client.issues()).filter(
                     ({ operationId }) => operationId !== undefined,
                 );
-                expect(
-                    {
-                        intents: (await storeCounts(fixture.carol.store))[INTENT_PREFIX],
-                        issues: terminalIssues.length,
-                    },
-                    "PRODUCT FINDING RACE-06/I08: the safely rejected losing Add remains a zombie intent and has no durable operation issue",
-                ).toEqual({ intents: 0, issues: 1 });
+                expect({
+                    intents: (await storeCounts(fixture.carol.store))[INTENT_PREFIX],
+                    issues: terminalIssues.length,
+                }).toEqual({ intents: 0, issues: 1 });
             } finally {
                 await closeFixture(fixture);
             }
@@ -955,9 +951,8 @@ describe("Commit race and intent convergence chaos", () => {
         },
     );
 
-    scenarioFails(
+    scenario(
         "RACE-08 revoke-first terminalizes the rebased unauthorized admin action",
-        "PRODUCT FINDING RACE-08/I08",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture({ anyoneCanAddMembers: false });
@@ -983,13 +978,10 @@ describe("Commit race and intent convergence chaos", () => {
                 const terminalIssues = (await fixture.bob.client.issues()).filter(
                     ({ operationId }) => operationId !== undefined,
                 );
-                expect(
-                    {
-                        intents: (await storeCounts(fixture.bob.store))[INTENT_PREFIX],
-                        issues: terminalIssues.length,
-                    },
-                    "PRODUCT FINDING RACE-08/I08: the safely rejected losing admin Add remains a zombie intent and has no durable operation issue",
-                ).toEqual({ intents: 0, issues: 1 });
+                expect({
+                    intents: (await storeCounts(fixture.bob.store))[INTENT_PREFIX],
+                    issues: terminalIssues.length,
+                }).toEqual({ intents: 0, issues: 1 });
             } finally {
                 await closeFixture(fixture);
             }
@@ -1193,7 +1185,7 @@ describe("Commit race and intent convergence chaos", () => {
     );
 
     scenario(
-        "RACE-13 a losing Add replaces its pending Welcome before activation",
+        "RACE-13 a blocked Add publishes no Welcome before its adopted retry",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture();
@@ -1210,9 +1202,12 @@ describe("Commit race and intent convergence chaos", () => {
                 await losing;
                 fixture.gate.disarm();
                 await synchronize(fixture.dave);
-                expect(await fixture.dave.client.session(fixture.session.id)).toMatchObject({
-                    status: "pending",
-                });
+                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                expect(
+                    fixture.bob.transport.publications.filter(
+                        ({ ciphertext }) => ciphertext[0] === 1,
+                    ),
+                ).toHaveLength(0);
 
                 await fixture.alice.client.setPolicies(fixture.session.id, {
                     adminsAssignAdmins: false,
@@ -1246,12 +1241,12 @@ describe("Commit race and intent convergence chaos", () => {
         async () => {
             const checkpoints = [
                 "before-publish",
-                "after-welcome",
-                "after-commit",
+                "after-first-commit",
                 "before-echo",
                 "after-winner",
                 "during-rebase",
-                "after-replacement",
+                "after-retry-commit",
+                "after-welcome",
             ] as const;
             const fixture = await activeFixture();
             try {
@@ -1484,9 +1479,8 @@ describe("Commit race and intent convergence chaos", () => {
         },
     );
 
-    scenarioFails(
+    scenario(
         "RACE-18 four full-client candidates converge through duplicate Adds",
-        "PRODUCT FINDING RACE-18/I06/I10",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture();
@@ -1565,12 +1559,9 @@ describe("Commit race and intent convergence chaos", () => {
                 const frankTerminal = await frank.client.session(fixture.session.id);
                 expect(frankTerminal?.status).toBe("active");
                 expect(memberCount(frankTerminal, frank)).toBe(1);
-                expect(memberCount(frankTerminal, fixture.erin)).toBe(0);
-                expect(frankTerminal?.policies.adminsAssignAdmins).toBe(true);
-                expect(
-                    publicSession(frankTerminal),
-                    "PRODUCT FINDING RACE-18/I06/I10: the first winning Add joiner stays on its activation epoch and misses later rebased Commits",
-                ).toEqual(publicSession(terminal));
+                expect(memberCount(frankTerminal, fixture.erin)).toBe(1);
+                expect(frankTerminal?.policies.adminsAssignAdmins).toBe(false);
+                expect(publicSession(frankTerminal)).toEqual(publicSession(terminal));
             } finally {
                 await closeFixture(fixture);
             }
@@ -1724,7 +1715,7 @@ describe("Commit race and intent convergence chaos", () => {
     );
 
     scenario(
-        "RACE-20 two losing bootstraps are replaced before one activation",
+        "RACE-20 a losing Add publishes no Welcome before its adopted retry",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture();
@@ -1734,67 +1725,33 @@ describe("Commit race and intent convergence chaos", () => {
                     fixture.session.id,
                     await fixture.dave.client.discovery(),
                 );
-                fixture.gate.arm();
-                const firstCandidate = synchronize(fixture.bob);
-                void firstCandidate.catch(() => undefined);
-                await fixture.gate.waitFor(1);
-                fixture.gate.reject(
-                    "bob",
-                    new DeliveryTransportError(429, "first losing Add candidate"),
-                );
-                await firstCandidate;
-                fixture.gate.disarm();
-                await synchronize(fixture.dave);
-                await expect(
-                    fixture.dave.client.session(fixture.session.id),
-                ).resolves.toMatchObject({
-                    status: "pending",
-                });
-
                 await fixture.alice.client.setPolicies(fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
-                await synchronize(fixture.alice);
-                await synchronize(fixture.alice);
-
-                fixture.gate.arm();
-                const staleCandidate = synchronize(fixture.bob);
-                void staleCandidate.catch(() => undefined);
-                await fixture.gate.waitFor(1);
-                fixture.gate.reject(
-                    "bob",
-                    new DeliveryTransportError(429, "observe first replacement parent"),
-                );
-                await fixture.gate.waitFor(1);
-                expect(fixture.gate.pendingActors()).toEqual(["bob"]);
-                await fixture.alice.client.setPolicies(fixture.session.id, {
-                    adminsAssignAdmins: true,
-                    anyoneCanAddMembers: true,
-                });
-                const policySync = synchronize(fixture.alice);
-                void policySync.catch(() => undefined);
-                await fixture.gate.waitFor(2);
-                expect(new Set(fixture.gate.pendingActors())).toEqual(new Set(["bob", "alice"]));
-                const winner = await fixture.gate.accept("alice");
-                const loser = await fixture.gate.accept("bob");
-                await Promise.all([policySync, staleCandidate]);
-                fixture.gate.disarm();
+                const pending = await stageTwo(fixture, fixture.bob, fixture.alice);
+                const [winner, loser] = await releaseTwo(fixture, fixture.alice, fixture.bob, [
+                    pending[1],
+                    pending[0],
+                ]);
                 expectComparable(winner, loser);
-                expect(winner.actor).toBe("alice");
                 await synchronize(fixture.dave);
-                await expect(
-                    fixture.dave.client.session(fixture.session.id),
-                ).resolves.toMatchObject({
-                    status: "pending",
-                });
+                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                expect(
+                    fixture.bob.transport.publications.filter(
+                        ({ ciphertext }) => ciphertext[0] === 1,
+                    ),
+                ).toHaveLength(0);
 
                 await settle(fixture, fixture.session.id, ["carol", "alice", "bob", "dave"], 80);
+                expect(await fixture.dave.client.session(fixture.session.id)).toMatchObject({
+                    status: "pending",
+                });
                 await activateIfPending(fixture.dave, fixture.session.id);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 80);
                 const terminal = await fixture.alice.client.session(fixture.session.id);
                 expect(terminal?.policies).toEqual({
-                    adminsAssignAdmins: true,
+                    adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol, fixture.dave]) {
@@ -1804,9 +1761,9 @@ describe("Commit race and intent convergence chaos", () => {
                 }
                 expect(
                     fixture.bob.transport.publications.filter(
-                        ({ ciphertext }) => ciphertext[0] !== COMMIT_KIND,
-                    ).length,
-                ).toBeGreaterThanOrEqual(3);
+                        ({ ciphertext }) => ciphertext[0] === 1,
+                    ),
+                ).toHaveLength(1);
                 await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol, fixture.dave]);
             } finally {
                 await closeFixture(fixture);
