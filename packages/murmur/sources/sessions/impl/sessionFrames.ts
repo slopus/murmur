@@ -18,6 +18,7 @@ const PROVISIONING_KIND = 4;
 const ACCOUNT_RESET_KIND = 5;
 const MAXIMUM_PROVISIONING_BYTES = 256 * 1024;
 const MAXIMUM_FRAME_BYTES = 70 * 1024 * 1024;
+const MAXIMUM_UINT64 = 0xffff_ffff_ffff_ffffn;
 const COMMIT_DOMAIN = utf8Encode("murmur/session-commit/v1");
 
 /** MLS-protected role state carried by every Commit of a role-managed session. */
@@ -201,6 +202,15 @@ function parseJson(value: Uint8Array, name: string): Record<string, unknown> {
     }
 }
 
+function decimalUint64(value: unknown, name: string): bigint {
+    if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const decoded = BigInt(value);
+    if (decoded > MAXIMUM_UINT64) throw new Error(`Invalid ${name}`);
+    return decoded;
+}
+
 function prefixed(kind: number, bytesValue: Uint8Array): Uint8Array {
     return concatBytes(new Uint8Array([kind]), bytesValue);
 }
@@ -257,6 +267,9 @@ function commitAad(groupId: Uint8Array, epoch: bigint): Uint8Array {
 
 export function sealCommitCiphertext(key: Uint8Array, frame: CommitFrame): Uint8Array {
     if (key.length !== 32) throw new Error("Invalid Commit frame key");
+    if (frame.epoch < 0n || frame.epoch > MAXIMUM_UINT64) {
+        throw new Error("Invalid Commit frame");
+    }
     const nonce = randomBytes(12);
     const plaintext = canonicalJsonBytes({
         version: 1,
@@ -316,17 +329,12 @@ export function parseSessionCiphertext(value: Uint8Array): SessionCiphertext {
     }
     if (kind !== COMMIT_KIND) throw new Error("Unknown session ciphertext kind");
     exact(input, ["version", "groupId", "epoch", "nonce", "ciphertext"], "Commit ciphertext");
-    if (
-        input.version !== 1 ||
-        typeof input.epoch !== "string" ||
-        !/^(0|[1-9]\d*)$/.test(input.epoch)
-    ) {
-        throw new Error("Invalid Commit ciphertext");
-    }
+    if (input.version !== 1) throw new Error("Invalid Commit ciphertext");
+    const epoch = decimalUint64(input.epoch, "Commit ciphertext");
     return {
         kind: "commit",
         groupId: bytes(input.groupId, 255, "Commit group ID"),
-        epoch: BigInt(input.epoch),
+        epoch,
         nonce: bytes(input.nonce, 12, "Commit nonce"),
         ciphertext: bytes(input.ciphertext, 64 * 1024 * 1024, "Commit ciphertext"),
     };
@@ -343,17 +351,11 @@ export function openCommitCiphertext(
     try {
         const input = parseJson(plaintext, "Commit frame");
         exact(input, ["version", "groupId", "epoch", "commit", "roles"], "Commit frame");
-        if (
-            input.version !== 1 ||
-            typeof input.epoch !== "string" ||
-            !/^(0|[1-9]\d*)$/.test(input.epoch)
-        ) {
-            throw new Error("Invalid Commit frame");
-        }
+        if (input.version !== 1) throw new Error("Invalid Commit frame");
         const frame: CommitFrame = {
             version: 1,
             groupId: bytes(input.groupId, 255, "Commit group ID"),
-            epoch: BigInt(input.epoch),
+            epoch: decimalUint64(input.epoch, "Commit frame"),
             commit: bytes(input.commit, 64 * 1024 * 1024, "Commit"),
             roles: rolesFromJson(input.roles, "Commit roles"),
         };
