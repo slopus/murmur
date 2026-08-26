@@ -42,3 +42,9 @@ membership and role mutations first persist bounded asynchronous intents. Any
 authorized current member may create a Commit; the first valid shared relay
 event ID for an epoch wins, while losing staged work is rebased and retried.
 There is no session-level committer role or retained proposal queue.
+
+An Add prepares its Commit, sealed Welcomes, and staged post-Commit work in one
+durable operation. Publication is strictly Commit, sender queue-echo adoption,
+Welcomes, authenticated admission completion, then dependent application work.
+A losing Commit publishes no Welcome, and the completion barrier prevents a
+later Commit from overtaking an unfinished admission.

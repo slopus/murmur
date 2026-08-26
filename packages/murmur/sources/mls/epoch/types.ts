@@ -47,7 +47,7 @@ export interface MlsEpochTransition {
     cancel(): void;
 }
 
-/** Prepared full TreeKEM Commit; adoption remains transactional until publish succeeds. */
+/** Prepared full TreeKEM Commit; adoption remains staged until its winning relay echo. */
 export interface PreparedMlsTreeEpoch {
     readonly commit: Uint8Array;
     readonly welcome?: Uint8Array;

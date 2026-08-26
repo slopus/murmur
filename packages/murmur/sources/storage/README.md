@@ -11,10 +11,11 @@ transaction(async store => ...)
 ```
 
 `scan` is lexicographic, prefix-filtered, and page-bounded. Compound durable
-keys use `/` separators because v0.3.3 established that persisted namespace.
-Contacts, services, routing, MLS checkpoints, inbox state, and outboxes are all
-records layered on this same application-supplied `MurmurStore`; none introduces
-another database abstraction.
+keys use `/` separators inside Murmur's opaque persisted namespace. Contacts,
+services, routing, MLS checkpoints, inbox state, and outboxes are all records
+layered on this same application-supplied `MurmurStore`; none introduces another
+database abstraction. The 0.5.0 beta format is the first compatibility baseline;
+pre-beta records are not decoded or migrated.
 
 The core depends on a minimal asynchronous byte key-value store. Browser
 applications can back it with IndexedDB; Node applications can use SQLite. The

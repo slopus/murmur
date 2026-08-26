@@ -113,13 +113,11 @@ invitation cache. Applications using it must configure a compatible external
 `DiscoveryTransport`; deploying the Worker alone does not provide invitation
 revocation.
 
-Relay schema v3, shipped with Murmur v0.3.3, is the compatibility baseline.
-The current schema v5 migrates an existing SQLite database or Postgres schema
-in place and preserves pending deliveries and invitations while adding public
-revocation metadata, expiring tombstones, queue sequences, and loss generations.
-Upgrading from the baseline never
-requires a clean database. Pre-v0.3 `murmur_relay_*` topic schemas remain
-unsupported.
+The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
+baseline. Pre-beta SQLite databases, Postgres schemas, client state, and wire
+formats are unsupported and are not migrated; deploy the baseline with an empty
+relay. Every later schema upgrade must migrate in place while preserving
+pending relay data and must not require a clean database.
 
 The standalone process drains expired data every ten seconds in fixed
 transactions, continuing for at most one second per tick. It skips overlapping

@@ -620,11 +620,13 @@ await chatApplication.onGroup(bytesKey(group.id), descriptor);
 ```
 
 `createSession()` consumes one cached admission package per contact and
-durably queues the Welcomes. Bob and Carol may be completely offline. Normal
-packages are one-use; refill begins at five remaining. If the fifteen-package
-pool is exhausted before a response arrives, Murmur reuses that contact's
-last-resort package and keeps requesting a rotated inventory. Group creation
-does not wait for the contact to reconnect.
+durably prepares the role-authenticated Commit plus sealed Welcomes. During
+synchronization Murmur publishes the Commit first, adopts it only from Alice's
+own relay echo, then publishes the Welcomes. Bob and Carol may be completely
+offline. Normal packages are one-use; refill begins at five remaining. If the
+fifteen-package pool is exhausted before a response arrives, Murmur reuses that
+contact's last-resort package and keeps requesting a rotated inventory. Group
+creation does not wait for the contact to reconnect.
 
 ### 3. Send and receive messages
 
@@ -683,9 +685,8 @@ immutable owner account, an admin set, and owner-controlled policies.
 ### Creating a session
 
 Creating a session takes the descriptor and at least one confirmed contact.
-Murmur consumes cached admission material, creates the MLS group, commits the
-adds, and publishes each new member's encrypted Welcome to their authenticated
-relay queue:
+Murmur consumes cached admission material, creates the MLS group, and durably
+queues its initial Commit and each new member's encrypted Welcome:
 
 ```ts
 const session = await alice.createSession({
@@ -747,10 +748,13 @@ Do not wait for `session.status === "active"` before sending. `send()` also
 works immediately after `createSession()` and while a membership Commit from
 `addMember()` or `removeMember()` is still staged. Murmur encrypts those
 packets with the staged post-Commit epoch, advances that ratchet durably, and
-records the dependency. Once connected, it publishes older current-epoch work,
-any required Welcomes, the Commit, and then dependent packets. If another
-Commit wins first, Murmur re-encrypts dependent sends against the winning epoch
-and retries the intent. The whole sequence survives a restart.
+records the dependency. Once connected, it publishes older current-epoch work
+and then the Commit. Only after adopting that exact Commit from its own relay
+echo does Murmur publish every required Welcome, an authenticated
+admission-completion control, and then dependent packets. If another Commit
+wins first, the losing Commit publishes no Welcome; Murmur re-encrypts
+dependent sends against the winning epoch and retries the intent. The whole
+sequence survives a restart.
 
 ### Membership, roles, and concurrent Commits
 
@@ -778,9 +782,11 @@ validates it against the prior epoch's roles. For concurrent Commits extending
 one epoch, the first valid shared relay event ID wins everywhere. A publisher
 also adopts only from its queue echo; a loser cancels its staged epoch,
 re-encrypts dependent sends, and retries its durable intent. Concurrent adds of
-one account become a no-op after the first succeeds. A stale add created before
-observing that account's removal becomes a durable issue; explicitly adding
-again after observing removal is permitted.
+one account become a no-op after the first succeeds. An Add publishes its
+Welcome only after its Commit is adopted, and every member observes an
+authenticated admission-completion barrier before another Commit may publish.
+A stale add created before observing that account's removal becomes a durable
+issue; explicitly adding again after observing removal is permitted.
 
 `abandonSession(id)` destroys a session stuck on a blocked local membership
 operation, and `issues()` lists durable session and publication diagnostics.
@@ -1137,8 +1143,11 @@ Deeper reference material lives in the repository docs:
 
 ## Protocol versions
 
-Murmur v0.4 uses contact protocol and contact storage version 2. It is a clean
-break from the v0.3 contact format. Relay schema v5 adds owner-authorized
-invitation metadata, expiring revocation tombstones, queue sequences, and loss
-generations. SQLite and Postgres
-migrate schema v3 in place without deleting pending deliveries or invitations.
+The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
+baseline. Pre-beta client state, wire formats, and relay schemas are not read or
+migrated. Relay, discovery, delivery, and MLS session formats are version `1`;
+the built-in contact protocol and contact records are version `2`.
+
+From the beta baseline onward, releases preserve the public API and wire
+formats, read or migrate persisted client state, and migrate relay schemas in
+place without deleting pending data or requiring a clean database.

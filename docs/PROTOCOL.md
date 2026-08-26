@@ -3,6 +3,11 @@
 Relay, discovery, delivery, and MLS session formats are version `1`. The
 built-in contact protocol and its persisted records are version `2`.
 
+The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
+baseline. Pre-beta client state, wire formats, and relay schemas are not read or
+migrated. From this baseline onward, public wire formats remain compatible and
+relay schema upgrades migrate in place while preserving pending data.
+
 ## Identity and discovery
 
 One 32-byte identity root derives one Ed25519 public identity and the X25519
@@ -48,18 +53,22 @@ same public KeyPackage cannot be rewrapped and reused.
 
 Creating or adding a member prepares one MLS Commit plus one sealed Welcome for
 each addition. The Commit outbox contains the complete expected Welcome ID
-manifest. Before publishing any Welcome, Murmur validates the Commit, local
-staged state, every child record, and every secondary index.
+manifest. Before its first network attempt, Murmur validates the Commit, local
+staged state, every sealed Welcome record, and every secondary index.
 
-Successful Welcome publications leave durable markers. The Commit publishes
-only after all markers are present and all older current-epoch application
-outboxes have settled. The sender adopts the Commit only from its own identity
-queue echo; a publish response never advances the epoch.
+After older current-epoch application outboxes settle, Murmur publishes the
+Commit while retaining the staged next epoch. A publication response never
+advances the epoch. The sender adopts only when that exact Commit returns
+through its authenticated identity queue as the winning relay event; only that
+adoption releases its sealed Welcomes for publication. A losing or otherwise
+unadopted Commit therefore publishes no Welcome.
 
-A pending session may replace its bootstrap only with a newer relay event whose
-Commit extends at least the pending session's base epoch and names the same
-owner. This permits a fresh Welcome after a losing Add race while rejecting a
-later-delivered sibling Welcome from another Commit against the old epoch.
+After every required Welcome publishes, Murmur sends an MLS-authenticated
+admission-completion control before dependent staged-epoch application work or
+another membership Commit. Every retained member holds an admission barrier
+until that control is processed. A losing Add retries from its durable intent
+with a fresh Commit, and the retry's adopted Commit sends the joiner's only
+Welcome. Pending sessions never replace an earlier bootstrap.
 
 A valid received Welcome creates a bounded `pending` session. MLS protocol
 traffic continues while pending. A built-in contact descriptor keeps its
@@ -159,6 +168,12 @@ epoch and treats later siblings as stale. A member whose staged Commit loses
 re-encrypts dependent sends against the winning epoch and retries its durable
 intent. Add intents snapshot a per-account removal generation, preventing a
 stale intent from silently re-admitting a recently removed account.
+
+For an Add, publication order is older current-epoch work, the Commit, adoption
+from the sender's own relay echo, every sealed Welcome, the authenticated
+admission-completion control, and then dependent staged-epoch work. Only the
+Commit echo gates its Welcomes; no recipient must be online. The completion
+barrier prevents a later Commit from overtaking an unfinished admission.
 
 Application sends clone and persist the post-ratchet epoch plus exact outbox
 before publication. Commit preparation persists active and staged epochs

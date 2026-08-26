@@ -41,12 +41,11 @@ storage ceiling.
 Multicast target creation, quota reads, reference insertion, head updates, and
 wake publication are set-based SQL rather than one statement per recipient.
 
-Schema version 3 is the compatibility baseline. Version 5 migrates SQLite and
-Postgres stores in place while retaining pending deliveries, references, and
-invitations, adding invitation revocation metadata, sequence numbers, and loss
-generations. An
-upgrade must not require a clean database. Pre-v0.3 topic-relay schemas remain
-unsupported.
+The fresh Murmur 0.5.0 beta relay schema is the compatibility baseline.
+Pre-beta SQLite and Postgres stores are unsupported and are not migrated.
+Every later schema upgrade must migrate in place while retaining pending
+deliveries, references, invitations, and other relay data; it must not require
+a clean database.
 
 Only pending, unexpired delivery data is authoritative. Continuity metadata is
 retained indefinitely after first publication. Acknowledged trimming advances

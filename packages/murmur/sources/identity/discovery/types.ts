@@ -25,7 +25,7 @@ export interface AccountDiscoveryBundle {
     readonly signature: Uint8Array;
 }
 
-/** Backward-compatible legacy or account-device discovery material. */
+/** Supported single-device or account-device discovery material. */
 export type DiscoveryBundle = LegacyDiscoveryBundle | AccountDiscoveryBundle;
 
 /** Construction policy for one discovery bundle. */
