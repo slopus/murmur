@@ -58,7 +58,9 @@ new model. Sessions persisted by earlier releases are not decoded or migrated.
 - An add intent created before observing that account's removal fails with a
   durable issue; one created afterwards succeeds.
 - Losing a concurrent-Commit race cancels the staged Commit, preserves and
-  re-encrypts its dependent application sends, and retries the intent, and a
-  joiner Welcomed by the losing Commit is re-Welcomed and joins.
+  re-encrypts its dependent application sends, and retries the intent. A
+  losing Commit never Welcomed its joiner — Welcomes publish only after the
+  Commit is adopted from the relay echo — so the retried intent's adopted
+  Commit sends the joiner's only Welcome and the joiner joins.
 - No single-committer code path, committer transfer API, proposal queue, or
   legacy session decode remains in the package.

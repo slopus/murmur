@@ -98,10 +98,13 @@ dictated by the sessions plan. Exact authentication, token format, signatures,
 and wire encoding remain implementation details.
 
 Publication never waits for a recipient to be online. Murmur may create an
-entire dependency-ordered outbox while offline, including Welcome deliveries, a
-Commit, and application deliveries encrypted for the staged post-Commit epoch.
-When the relay becomes reachable, Murmur publishes each recipient's
-prerequisites before the deliveries that depend on them. The relay durably
+entire dependency-ordered outbox while offline, including a Commit and
+application deliveries encrypted for the staged post-Commit epoch. When the
+relay becomes reachable, Murmur publishes each recipient's prerequisites
+before the deliveries that depend on them; per the sessions plan, a Welcome
+publishes only after its Commit has been adopted from the sender's own relay
+echo, so the echo — never any recipient's presence — is the only thing a
+Welcome waits for. The relay durably
 queues those accepted deliveries within its configured bounds; recipient
 consumption is not part of sender publication.
 
@@ -188,9 +191,10 @@ relay into durable history, an identity directory, or a recovery system.
 - Every ongoing MLS delivery includes the publisher and every other current
   epoch member. The relay applies no Commit semantics; members resolve
   concurrent Commits from the shared per-multicast event IDs.
-- A sender may durably prepare Welcome, Commit, and post-Commit application
-  deliveries entirely offline. Later publication preserves their dependency
-  order and never waits for any recipient to connect or consume them.
+- A sender may durably prepare Commit and post-Commit application deliveries
+  entirely offline. Later publication preserves their dependency order —
+  Commit, then after its relay echo the Welcomes, then staged-epoch work — and
+  never waits for any recipient to connect or consume them.
 - Queue reads may redeliver until the recipient durably processes and
   acknowledges them.
 - Recipient-authenticated SSE and negotiated WebSocket transport stream the
