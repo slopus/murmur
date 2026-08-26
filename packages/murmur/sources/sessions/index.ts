@@ -318,16 +318,34 @@ function decodeResetEvent(bytes: Uint8Array): MurmurResetEvent {
 
 /** Construction inputs for the stateful Murmur MLS client. */
 export interface MurmurClientOptions {
+    /** Relay base URL used to construct the built-in HTTP delivery and discovery transports. */
     readonly relay?: string | URL;
+    /** Custom delivery transport, mutually exclusive with `relay` and `sessionProvider`. */
     readonly transport?: DeliveryTransport;
     /** Application-authenticated issuer for an additive negotiated WebSocket relay. */
     readonly sessionProvider?: RelaySessionProvider;
+    /** Connection and retry policy for the negotiated WebSocket delivery transport. */
     readonly webSocket?: WebSocketDeliveryTransportOptions;
+    /**
+     * Custom transport for publishing and resolving invitation bundles.
+     *
+     * Supply this when using a custom delivery transport or relay-session provider
+     * and the application needs Murmur's invitation or contact-request methods.
+     */
     readonly discoveryTransport?: DiscoveryTransport;
+    /** Fetch implementation used by the built-in HTTP delivery and discovery transports. */
     readonly fetch?: DeliveryFetch;
+    /** Exclusive durable state store for this client identity. */
     readonly store: MurmurStore;
+    /**
+     * Identity root used to initialize an empty store.
+     *
+     * When the store already contains an identity, the supplied public key must match it.
+     */
     readonly identity?: IdentityKeyPair;
+    /** Optional resource bounds; omitted fields use Murmur's defaults. */
     readonly limits?: MurmurSessionLimits;
+    /** Clock override used for protocol timestamps and expiry checks. Defaults to `Date.now`. */
     readonly now?: () => number;
     /** Optional typed services available to claim and process sessions. */
     readonly services?: readonly MurmurServiceRegistration[];
@@ -1231,19 +1249,23 @@ export class MurmurClient {
         return session;
     }
 
+    /** Return a defensive snapshot of one local session, or `undefined` when it is unknown. */
     async session(id: Uint8Array): Promise<MurmurSession | undefined> {
         return this.#tracked(() => this.#engine.get(id));
     }
 
+    /** List one bounded page of local sessions in durable key order. */
     async sessions(options: MurmurSessionListOptions = {}): Promise<MurmurSessionPage> {
         return this.#tracked(() => this.#engine.list(options));
     }
 
+    /** Activate an application-owned pending session and release its buffered updates. */
     async activateSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.activate(id));
         this.#signalSync();
     }
 
+    /** Terminally reject and destroy an application-owned pending session. */
     async ignoreSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.ignore(id));
     }
@@ -1257,7 +1279,7 @@ export class MurmurClient {
      * Encrypt and durably queue application bytes without waiting for relay or peer state.
      *
      * Sends made while a membership Commit is staged use its post-Commit epoch and publish
-     * only after that Commit's Welcome dependencies.
+     * only after that Commit is adopted from its relay echo and every required Welcome publishes.
      */
     async send(id: Uint8Array, bytes: Uint8Array): Promise<string> {
         const deliveryId = await this.#exclusive(() => this.#engine.send(id, bytes));
@@ -1323,6 +1345,7 @@ export class MurmurClient {
         this.#signalSync();
     }
 
+    /** Return the bounded, durable diagnostics retained for terminal session failures. */
     async issues(): Promise<readonly MurmurSessionIssue[]> {
         return this.#tracked(() => this.#engine.issues());
     }
@@ -1574,6 +1597,12 @@ export class MurmurClient {
         throw new MurmurResetRequiredError(reset, true);
     }
 
+    /**
+     * Run one bounded publish-and-inbox synchronization cycle.
+     *
+     * Lifecycle callbacks obey the same durable retry rules as `sync()`. This
+     * foreground form cannot run while the persistent synchronization loop is active.
+     */
     async synchronize(
         options: MurmurSynchronizeOptions = {},
         lifecycle: Pick<
