@@ -32,6 +32,47 @@ pnpm add @slopus/murmur
 Murmur is ESM-only and requires a `MurmurStore`. `MemoryMurmurStore` is useful
 for tests; production applications should provide durable secure storage.
 
+## Account secret
+
+Applications can protect one identity root with a 256-bit generated string and
+a user password. Murmur returns one opaque blob for application-owned storage;
+it stores no password, generated secret, or recovery copy itself:
+
+```ts
+import {
+    createAccountSecret,
+    destroyIdentity,
+    generateIdentityKeyPair,
+    rewrapAccountSecret,
+    unlockAccountSecret,
+} from "@slopus/murmur";
+
+const identity = generateIdentityKeyPair();
+const accountSecret = await createAccountSecret(identity, password);
+
+saveBlob(accountSecret.blob);
+showGeneratedSecretOnce(accountSecret.generatedSecret);
+
+const restored = await unlockAccountSecret(
+    accountSecret.blob,
+    accountSecret.generatedSecret,
+    password,
+);
+
+const changedBlob = await rewrapAccountSecret(
+    accountSecret.blob,
+    accountSecret.generatedSecret,
+    password,
+    newPassword,
+);
+
+destroyIdentity(restored);
+```
+
+Unlocking requires both inputs. Password changes authenticate and preserve the
+complete encrypted root payload while rotating its salt and nonce. There is no
+server involvement or reset path; losing either input is final.
+
 ## Direct session example
 
 Until the identity directory is implemented, applications transport bare MLS

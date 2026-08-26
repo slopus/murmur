@@ -5,7 +5,7 @@ accounts/   authenticated account-device rosters and provisioning
 chaos/      deterministic fault-injection support
 crypto/     identity roots, signatures, key agreement, and hashing
 delivery/   signed queue transport, processing, SSE, and WebSocket clients
-identity/   identity-domain boundary
+identity/   application-owned account-secret wrapping and identity boundary
 mls/        MLS cryptographic state and protocol operations
 services/   typed application routing
 sessions/   stateful public client facade and durable session engine

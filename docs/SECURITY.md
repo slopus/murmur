@@ -13,6 +13,22 @@ or loss of that store exposes or destroys the local cryptographic state it
 contains. Protect it with application-grade encryption, access control, atomic
 backup, and rollback detection.
 
+## Account secret
+
+`createAccountSecret` combines a generated 256-bit string and the user's
+password; neither input alone can derive the AES-256-GCM wrapping key. The
+generated component passes through domain-separated HKDF-SHA-256, the password
+component passes through scrypt with authenticated fixed cost parameters, and a
+second HKDF combines them. A random salt and nonce are generated for every new
+blob and every password change.
+
+The application owns the opaque blob and generated string. Store them according
+to the application's recovery policy, never log either one, and do not treat a
+password change as a substitute for protecting the generated string. Murmur has
+no copy, server endpoint, reset path, or recovery key. Restoring the blob yields
+the identity root only; it does not restore MLS epochs, ratchets, history, or
+queue progress.
+
 ## Identity and MLS
 
 - Generate identity roots with a cryptographically secure random source.

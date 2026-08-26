@@ -68,6 +68,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "TerminalInboxDeliveryError",
     "WebSocketDeliveryTransport",
     "containsRecipient",
+    "createAccountSecret",
     "createSignedDelivery",
     "createSignedInboxAck",
     "createSignedInboxRead",
@@ -82,10 +83,12 @@ if (JSON.stringify(names) !== JSON.stringify([
     "parseRelaySessionTicket",
     "parseSignedDelivery",
     "parseSignedRelaySessionRequest",
+    "rewrapAccountSecret",
     "signedDeliveryToJson",
     "signedInboxAckToJson",
     "signedInboxReadToJson",
     "signedRelaySessionRequestToJson",
+    "unlockAccountSecret",
     "validateMurmurServiceRegistration",
     "validateServiceId",
     "validateSignedDelivery",
@@ -165,8 +168,12 @@ import {
     MemoryMurmurStore,
     MurmurClient,
     WebSocketDeliveryTransport,
+    createAccountSecret,
     destroyIdentity,
     generateIdentityKeyPair,
+    rewrapAccountSecret,
+    unlockAccountSecret,
+    type CreatedAccountSecret,
     type DeliveryFetch,
     type IdentityKeyPair,
     type MurmurClientOptions,
@@ -184,6 +191,9 @@ const store: MurmurStore = new MemoryMurmurStore();
 const deliveryFetch: DeliveryFetch = globalThis.fetch;
 const transport = new HttpDeliveryTransport("https://relay.example", { fetch: deliveryFetch });
 const identity: IdentityKeyPair = generateIdentityKeyPair();
+const protectedIdentity: Promise<CreatedAccountSecret> = createAccountSecret(identity, "password");
+const unlockIdentity: typeof unlockAccountSecret = unlockAccountSecret;
+const changePassword: typeof rewrapAccountSecret = rewrapAccountSecret;
 const sessionProvider: RelaySessionProvider = new HttpRelaySessionProvider(
     "https://app.example/murmur/session",
     { fetch: deliveryFetch },
@@ -223,6 +233,9 @@ void service;
 void negotiatedOptions;
 void ticket;
 void proof;
+void protectedIdentity;
+void unlockIdentity;
+void changePassword;
 void createSession;
 void WebSocketDeliveryTransport;
 destroyIdentity(identity);
@@ -275,8 +288,8 @@ destroyIdentity(identity);
             platform: "browser",
             stdin: {
                 contents:
-                    'import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";\n' +
-                    "globalThis.__MURMUR_PACKAGE_EXPORTS__ = { MemoryMurmurStore, MurmurClient };",
+                    'import { MemoryMurmurStore, MurmurClient, createAccountSecret } from "@slopus/murmur";\n' +
+                    "globalThis.__MURMUR_PACKAGE_EXPORTS__ = { MemoryMurmurStore, MurmurClient, createAccountSecret };",
                 loader: "js",
                 resolveDir: packageDirectory,
                 sourcefile: "murmur-browser-smoke.js",
@@ -305,8 +318,13 @@ destroyIdentity(identity);
         const exports = browser.__MURMUR_PACKAGE_EXPORTS__ as
             | Readonly<Record<string, unknown>>
             | undefined;
-        expect(Object.keys(exports ?? {}).sort()).toEqual(["MemoryMurmurStore", "MurmurClient"]);
+        expect(Object.keys(exports ?? {}).sort()).toEqual([
+            "MemoryMurmurStore",
+            "MurmurClient",
+            "createAccountSecret",
+        ]);
         expect(typeof exports?.MemoryMurmurStore).toBe("function");
         expect(typeof exports?.MurmurClient).toBe("function");
+        expect(typeof exports?.createAccountSecret).toBe("function");
     }, 30_000);
 });

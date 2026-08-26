@@ -6,6 +6,12 @@ A local device has one Ed25519 public identity key. Its signing key and X25519
 agreement key derive from one 32-byte root. Secret keys are byte arrays in
 memory and base64url appears only at wire or storage boundaries.
 
+The optional local account-secret envelope combines a generated 256-bit string
+and user password through HKDF-SHA-256 and scrypt, then protects the root with
+AES-256-GCM. Its versioned canonical binary blob is application-owned and has no
+relay operation or recovery endpoint. Password rewrapping preserves the full
+typed root-material payload while rotating the salt and nonce.
+
 MLS KeyPackages are signed by the device identity. `createKeyPackage()` stores
 the matching one-use private bundle durably and returns bare public admission
 material containing the account identity and encoded KeyPackage.

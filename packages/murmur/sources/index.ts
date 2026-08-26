@@ -6,6 +6,8 @@ export {
     importIdentityKeyPair,
 } from "./crypto/index.js";
 export type { IdentityKeyPair, IdentityPublicKey } from "./crypto/index.js";
+export { createAccountSecret, rewrapAccountSecret, unlockAccountSecret } from "./identity/index.js";
+export type { CreatedAccountSecret } from "./identity/index.js";
 /**
  * Low-level relay queue primitives for custom `DeliveryTransport`,
  * `RelaySessionProvider`, and `InboxProcessor` implementations.

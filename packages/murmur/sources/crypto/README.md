@@ -18,7 +18,10 @@ secret intermediate is zeroed after use.
 
 `encodeIdentityRoot` and `decodeIdentityRoot` provide the strict
 application-owned storage representation. It contains only the one root secret;
-applications are responsible for protecting those stored bytes.
+applications are responsible for protecting those stored bytes. Portable
+password-backed persistence should use the higher-level
+`identity/accountSecret` API, which combines a generated secret and password
+without changing these raw key operations.
 
 ```text
                   32-byte identity root

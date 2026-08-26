@@ -22,6 +22,12 @@ membership intents, replay protection, exact outboxes, account synchronization,
 and inbox progress. Application updates cross one identity-wide durable
 callback boundary. The application owns their meaning and downstream effects.
 
+Account-secret operations are stateless: a generated string plus password wraps
+an identity root into one opaque blob, and the application chooses where to
+persist it. Murmur retains no password, recovery copy, or server-side reset
+state. Unlocking reconstructs the same identity but never reconstructs device
+stores or MLS ratchets.
+
 An application send clones and ratchets the active epoch, then persists both
 the new epoch and exact unpublished ciphertext before returning. A membership
 Commit persists active and staged epochs separately. The sender adopts its own
