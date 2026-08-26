@@ -1,6 +1,8 @@
 import {
     DELIVERY_RETENTION_MILLISECONDS,
+    PrivateGroupStateService,
     RelayService,
+    SqlitePrivateGroupStateStore,
     SqliteRelayStore,
     createRelayFetchHandler,
     type RelayOptions,
@@ -12,10 +14,13 @@ import {
     completeDeviceProvisioning,
     createDeviceLinkMaterial,
     createInitialDeviceRoster,
+    decodeAccountSyncPacket,
+    encodeAccountSyncPacket,
     isActiveDevice,
     parseDeviceLinkRequest,
     parseDeviceRoster,
     parseProvisioningEnvelope,
+    resetDeviceInRoster,
     revokeDeviceFromRoster,
     selectDeviceRosterChild,
     serializeDeviceLinkRequest,
@@ -30,8 +35,10 @@ import {
 } from "../../crypto/index.js";
 import {
     HttpDeliveryTransport,
+    InboxContinuityLossError,
     InboxProcessor,
     TerminalInboxDeliveryError,
+    WebSocketDeliveryTransport,
     containsRecipient,
     createSignedDelivery,
     createSignedInboxAck,
@@ -39,6 +46,10 @@ import {
     parseSignedDelivery,
     signedDeliveryToJson,
     type DeliveryFetch,
+    type DeliveryWebSocket,
+    type DeliveryWebSocketCloseEvent,
+    type DeliveryWebSocketMessageEvent,
+    type RelaySessionProvider,
     type SignedDelivery,
 } from "../../delivery/index.js";
 import {
@@ -61,6 +72,11 @@ import {
 } from "../../mls/privateMessage/index.js";
 import { MlsSecretTree, destroyMlsGenerationKey } from "../../mls/secretTree/index.js";
 import {
+    PrivateGroupStateClient,
+    createPrivateGroupCredentialAuthority,
+    type PrivateGroupRecordContent,
+} from "../../privateGroupState/index.js";
+import {
     createCredentialIssuanceRequest,
     createEncryptedUid,
     createUidPresentation,
@@ -78,6 +94,7 @@ import {
 import { MurmurClient, type MurmurUpdate } from "../../sessions/index.js";
 import {
     decodeSessionRoles,
+    encodeAccountResetCiphertext,
     encodeSessionRoles,
     openCommitCiphertext,
     parseSessionCiphertext,
@@ -97,6 +114,56 @@ import { SeededRandom } from "../index.js";
 const NOW = 1_700_000_000_000;
 const MINUTE_MILLISECONDS = 60_000;
 const SIX_MONTHS_MILLISECONDS = 180 * 24 * 60 * MINUTE_MILLISECONDS;
+const STREAM_EVENT_ID = "018bcfe5-6800-7000-8000-000000000001";
+const STREAM_GENERATION = encodeBase64Url(new Uint8Array(32));
+
+interface WebSocketRequestFrame {
+    readonly version: 1;
+    readonly id: string;
+    readonly operation: "publish" | "read" | "acknowledge" | "stream";
+    readonly body: unknown;
+}
+
+class ScriptedWebSocket implements DeliveryWebSocket {
+    readyState = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: DeliveryWebSocketMessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    onclose: ((event: DeliveryWebSocketCloseEvent) => void) | null = null;
+    readonly #handle: (frame: WebSocketRequestFrame, socket: ScriptedWebSocket) => void;
+
+    constructor(handle: (frame: WebSocketRequestFrame, socket: ScriptedWebSocket) => void) {
+        this.#handle = handle;
+        queueMicrotask(() => {
+            this.readyState = 1;
+            this.onopen?.();
+        });
+    }
+
+    send(data: string): void {
+        this.#handle(JSON.parse(data) as WebSocketRequestFrame, this);
+    }
+
+    close(): void {
+        this.readyState = 3;
+    }
+
+    receive(data: unknown): void {
+        this.onmessage?.({ data });
+    }
+}
+
+function relaySessionProvider(): RelaySessionProvider {
+    return {
+        issue: async () => ({
+            version: 1,
+            protocol: "murmur-websocket-v1",
+            endpoint: "wss://relay.test/v2/connect",
+            token: "adversarial.ticket",
+            expiresAt: NOW + MINUTE_MILLISECONDS,
+        }),
+    };
+}
 
 function relayFetch(relay: RelayService): DeliveryFetch {
     const handler = createRelayFetchHandler(relay, {
@@ -419,18 +486,29 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
-    test.fails("ADV-05 Commit framing rejects a uint64 epoch wrap value", () => {
-        const overflow = new Uint8Array([
-            3,
-            ...canonicalJsonBytes({
-                version: 1,
-                groupId: encodeBase64Url(utf8Encode("overflow-group")),
-                epoch: (2n ** 64n).toString(),
-                nonce: encodeBase64Url(new Uint8Array(12)),
-                ciphertext: encodeBase64Url(new Uint8Array(16)),
-            }),
-        ]);
-        expect(() => parseSessionCiphertext(overflow)).toThrow();
+    // PRODUCT FINDING: parseSessionCiphertext currently accepts unbounded decimal epochs,
+    // including the uint64 wrap at 2^64. Keep the exact uint64 maximum as the live control.
+    test.fails("ADV-05 PRODUCT FINDING Commit framing enforces the uint64 epoch ceiling", () => {
+        const frame = (epoch: bigint): Uint8Array =>
+            new Uint8Array([
+                3,
+                ...canonicalJsonBytes({
+                    version: 1,
+                    groupId: encodeBase64Url(utf8Encode("overflow-group")),
+                    epoch: epoch.toString(),
+                    nonce: encodeBase64Url(new Uint8Array(12)),
+                    ciphertext: encodeBase64Url(new Uint8Array(16)),
+                }),
+            ]);
+        expect(parseSessionCiphertext(frame(2n ** 64n - 1n))).toMatchObject({
+            kind: "commit",
+            epoch: 2n ** 64n - 1n,
+        });
+        for (const overflow of [2n ** 64n, 2n ** 64n + 1n, 2n ** 128n]) {
+            expect(() => parseSessionCiphertext(frame(overflow))).toThrow(
+                "Invalid Commit ciphertext",
+            );
+        }
     });
 
     test("ADV-06 discovery count, identity, time, encoding, cache, and size boundaries fail closed", async () => {
@@ -702,7 +780,77 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
-    test("ADV-09 discovery KeyPackages are one-use even when the signed bundle is replayed", async () => {
+    test("ADV-07 late replay advances sequence once and a restored generation stops processing", async () => {
+        const fixture = relayFixture();
+        const sender = generateIdentityKeyPair();
+        const recipient = generateIdentityKeyPair();
+        const effects: string[] = [];
+        const processor = new InboxProcessor(
+            {
+                identity: recipient,
+                transport: fixture.transport,
+                store: new MemoryMurmurStore(),
+            },
+            async (_transaction, queued) => {
+                effects.push(queued.delivery.id);
+            },
+            { now: () => NOW },
+        );
+        try {
+            const replayed = delivery(sender, [recipient.publicKey], utf8Encode("late replay"));
+            const firstPublication = await fixture.transport.publish(replayed);
+            await expect(processor.synchronize()).resolves.toMatchObject({
+                processed: 1,
+                rejected: 0,
+            });
+            const firstContinuity = await processor.continuity();
+            expect(firstContinuity).toMatchObject({ sequence: 1 });
+
+            const latePublication = await fixture.transport.publish(replayed);
+            expect(latePublication).toMatchObject({ duplicate: false });
+            expect(latePublication.eventId).not.toBe(firstPublication.eventId);
+            await expect(processor.synchronize()).resolves.toMatchObject({
+                processed: 0,
+                rejected: 1,
+            });
+            expect(effects).toEqual([replayed.id]);
+            const replayContinuity = await processor.continuity();
+            expect(replayContinuity).toMatchObject({ sequence: 2 });
+            expect(replayContinuity?.generation).toEqual(firstContinuity?.generation);
+
+            await expect(fixture.relay.declareRestored()).resolves.toBe(1);
+            const afterRestore = delivery(
+                sender,
+                [recipient.publicKey],
+                utf8Encode("must wait for reset"),
+            );
+            await fixture.transport.publish(afterRestore);
+            const loss = await processor.synchronize().catch((error: unknown) => error);
+            expect(loss).toBeInstanceOf(InboxContinuityLossError);
+            expect(loss).toMatchObject({
+                reason: "generation_changed",
+                expectedSequence: 3,
+                observedSequence: 3,
+            });
+            expect(await processor.continuity()).toEqual(replayContinuity);
+            expect(effects).toEqual([replayed.id]);
+
+            const pending = await fixture.transport.read(
+                createSignedInboxRead(recipient, {
+                    after: latePublication.eventId,
+                    createdAt: NOW,
+                }),
+            );
+            expect(pending.deliveries).toMatchObject([
+                { sequence: 3, delivery: { id: afterRestore.id } },
+            ]);
+            expect(pending.generation).not.toEqual(replayContinuity?.generation);
+        } finally {
+            await closeFixture(fixture, [sender, recipient]);
+        }
+    });
+
+    test("ADV-09 concurrent and sequential discovery claims admit one KeyPackage exactly once", async () => {
         const fixture = relayFixture();
         const alice = await MurmurClient.open({
             transport: fixture.transport,
@@ -716,10 +864,24 @@ describe("adversarial inputs and resource limits", () => {
         });
         try {
             const replayed = await bob.discovery();
-            await alice.createSession({
-                descriptor: utf8Encode("first KeyPackage claim"),
-                members: [replayed],
+            const concurrent = await Promise.allSettled([
+                alice.createSession({
+                    descriptor: utf8Encode("concurrent KeyPackage claim A"),
+                    members: [replayed],
+                }),
+                alice.createSession({
+                    descriptor: utf8Encode("concurrent KeyPackage claim B"),
+                    members: [replayed],
+                }),
+            ]);
+            expect(concurrent.filter((outcome) => outcome.status === "fulfilled")).toHaveLength(1);
+            expect(concurrent.filter((outcome) => outcome.status === "rejected")).toHaveLength(1);
+            expect(concurrent.find((outcome) => outcome.status === "rejected")).toMatchObject({
+                reason: expect.objectContaining({
+                    message: expect.stringContaining("already used"),
+                }),
             });
+            expect((await alice.sessions()).sessions).toHaveLength(1);
             await expect(
                 alice.createSession({
                     descriptor: utf8Encode("replayed KeyPackage claim"),
@@ -920,6 +1082,102 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
+    test("ADV-11 reset-announcement poison is terminal and cannot starve later session traffic", async () => {
+        const fixture = relayFixture();
+        const aliceIdentity = generateIdentityKeyPair();
+        const bobIdentity = generateIdentityKeyPair();
+        const attacker = generateIdentityKeyPair();
+        const attackerAccount = generateIdentityKeyPair();
+        const alice = await MurmurClient.open({
+            identity: aliceIdentity,
+            transport: fixture.transport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        const bob = await MurmurClient.open({
+            identity: bobIdentity,
+            transport: fixture.transport,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+        });
+        try {
+            const initialRoster = createInitialDeviceRoster(
+                attackerAccount,
+                attacker,
+                NOW,
+                new Uint8Array(16).fill(1),
+            );
+            const resetRoster = resetDeviceInRoster(
+                initialRoster,
+                attackerAccount,
+                attacker,
+                attacker.publicKey,
+                NOW + 1,
+                new Uint8Array(16).fill(2),
+            );
+            expect(resetRoster.devices[0]).toMatchObject({ resetGeneration: 1 });
+            const packet = encodeAccountSyncPacket({
+                version: 1,
+                type: "admission",
+                roster: serializeDeviceRoster(resetRoster),
+                keyPackage: utf8Encode("adversarial reset KeyPackage"),
+            });
+            expect(decodeAccountSyncPacket(packet)).toMatchObject({ type: "admission" });
+            const packetJson = objectJson(packet);
+            for (const malformed of [
+                packet.slice(0, -1),
+                utf8Encode(JSON.stringify({ ...packetJson, unknown: true })),
+                utf8Encode(utf8Decode(packet).replace("{", '{"version":1,')),
+            ]) {
+                expect(() => decodeAccountSyncPacket(malformed)).toThrow();
+            }
+
+            const session = await alice.createSession({
+                descriptor: utf8Encode("reset-announcement-adversarial"),
+                members: [await bob.discovery()],
+            });
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.activateSession(session.id);
+
+            await fixture.transport.publish(
+                delivery(attacker, [bobIdentity.publicKey], new Uint8Array([5, 0x7b])),
+            );
+            await fixture.transport.publish(
+                delivery(
+                    attacker,
+                    [bobIdentity.publicKey],
+                    encodeAccountResetCiphertext({
+                        ephemeralPublicKey: new Uint8Array(32),
+                        nonce: new Uint8Array(12),
+                        ciphertext: new Uint8Array(16),
+                    }),
+                ),
+            );
+            await alice.send(session.id, utf8Encode("valid-after-reset-poison"));
+            await alice.synchronize({ waitMilliseconds: 0 });
+
+            const updates: MurmurUpdate[] = [];
+            const synchronized = await bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onUpdates: async (batch) => {
+                        updates.push(...batch);
+                    },
+                },
+            );
+            expect(synchronized.inbox).toMatchObject({ processed: 1, rejected: 2 });
+            expect(updates.map((update) => utf8Decode(update.bytes))).toEqual([
+                "valid-after-reset-poison",
+            ]);
+            expect(await bob.session(session.id)).toMatchObject({ status: "active" });
+        } finally {
+            alice.close();
+            bob.close();
+            await closeFixture(fixture, [aliceIdentity, bobIdentity, attacker, attackerAccount]);
+        }
+    });
+
     test("ADV-12 private-group proof, group, replay, context, expiry, and encoding swaps fail closed", () => {
         const accountIdentifier = hashBytes(utf8Encode("private-account"));
         const otherIdentifier = hashBytes(utf8Encode("other-private-account"));
@@ -1012,6 +1270,72 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
+    // PRODUCT FINDING: presentation challenges are one-use, but the resulting bearer token
+    // currently authorizes unlimited reads until expiry. This sentinel turns red if replay is
+    // bound or if the product explicitly adopts reusable bearer semantics and removes the test.
+    test.fails("ADV-12 PRODUCT FINDING private-group access tokens reject replay before expiry", async () => {
+        let now = NOW;
+        const account = hashBytes(utf8Encode("token-replay-account"));
+        const issuer = deriveCredentialIssuer(hashBytes(utf8Encode("token-replay-issuer")));
+        const service = new PrivateGroupStateService({
+            store: new SqlitePrivateGroupStateStore(":memory:"),
+            credentialAuthority: createPrivateGroupCredentialAuthority(issuer),
+            tokenSecret: hashBytes(utf8Encode("token-replay-service-secret")),
+            now: () => now,
+            tokenLifetimeMilliseconds: MINUTE_MILLISECONDS,
+        });
+        const client = new PrivateGroupStateClient({
+            accountIdentifier: account,
+            groupMasterSecret: hashBytes(utf8Encode("token-replay-group-secret")),
+            transport: service,
+            now: () => now,
+        });
+        const content: PrivateGroupRecordContent = {
+            attributes: utf8Encode("token replay sentinel"),
+            session: {
+                id: hashBytes(utf8Encode("token-replay-session")),
+                status: "active",
+                descriptor: utf8Encode("token-replay-descriptor"),
+                members: [account],
+                owner: account,
+                admins: [account],
+                policies: { adminsAssignAdmins: false, anyoneCanAddMembers: false },
+            },
+            roles: [{ accountIdentifier: account, role: "owner" }],
+        };
+        try {
+            const credential = await client.obtainCredential(utf8Encode("token replay auth"));
+            await client.createGroup(credential, content);
+            const token = await client.authorize(credential, "owner", "access");
+            const outcomes: string[] = [];
+            for (let attempt = 0; attempt < 2; attempt += 1) {
+                try {
+                    await service.readRecord({
+                        opaqueGroupId: client.opaqueGroupId,
+                        token: token.bytes,
+                    });
+                    outcomes.push("accepted");
+                } catch {
+                    outcomes.push("rejected");
+                }
+            }
+            now = token.expiresAt;
+            try {
+                await service.readRecord({
+                    opaqueGroupId: client.opaqueGroupId,
+                    token: token.bytes,
+                });
+                outcomes.push("accepted");
+            } catch {
+                outcomes.push("rejected");
+            }
+            expect(outcomes).toEqual(["accepted", "rejected", "rejected"]);
+        } finally {
+            client.close();
+            service.close();
+        }
+    });
+
     test("ADV-13 strict HTTP and response framing recovers after malformed inputs", async () => {
         const maximumJsonBodyBytes = 4_200;
         const fixture = relayFixture({
@@ -1085,7 +1409,195 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
-    test.fails("ADV-13 HTTP rejects duplicate JSON fields before publication", async () => {
+    test("ADV-13 WebSocket responses and streams reject oversize, truncation, binary, and pre-connect data", async () => {
+        const identity = generateIdentityKeyPair();
+        const page = {
+            deliveries: [],
+            head: STREAM_EVENT_ID,
+            headSequence: 1,
+            acknowledgedThrough: null,
+            acknowledgedSequence: 0,
+            generation: STREAM_GENERATION,
+            exhausted: true,
+        };
+        const responseText = (id: string): string =>
+            JSON.stringify({ version: 1, id, type: "response", status: 200, body: page });
+        const exactBytes = utf8Encode(responseText("A".repeat(24))).length;
+        const transport = (
+            maximumMessageBytes: number,
+            response: (valid: string) => unknown,
+        ): WebSocketDeliveryTransport =>
+            new WebSocketDeliveryTransport(identity, relaySessionProvider(), {
+                now: () => NOW,
+                maximumMessageBytes,
+                webSocketFactory: () =>
+                    new ScriptedWebSocket((frame, socket) => {
+                        socket.receive(response(responseText(frame.id)));
+                    }),
+            });
+        const read = createSignedInboxRead(identity, { createdAt: NOW, limit: 1 });
+        try {
+            await expect(transport(exactBytes, (valid) => valid).read(read)).resolves.toMatchObject(
+                {
+                    head: STREAM_EVENT_ID,
+                    headSequence: 1,
+                },
+            );
+            await expect(
+                transport(exactBytes - 1, (valid) => valid).read(read),
+            ).rejects.toMatchObject({ code: "invalid_response" });
+            await expect(
+                transport(exactBytes, (valid) => valid.slice(0, -1)).read(read),
+            ).rejects.toMatchObject({ code: "invalid_response" });
+            await expect(
+                transport(exactBytes, (valid) => utf8Encode(valid)).read(read),
+            ).rejects.toMatchObject({ code: "invalid_response" });
+
+            await expect(transport(exactBytes, (valid) => valid).read(read)).resolves.toMatchObject(
+                {
+                    deliveries: [],
+                    exhausted: true,
+                },
+            );
+
+            const streamTransport = (
+                script: (frame: WebSocketRequestFrame, socket: ScriptedWebSocket) => void,
+            ): WebSocketDeliveryTransport =>
+                new WebSocketDeliveryTransport(identity, relaySessionProvider(), {
+                    now: () => NOW,
+                    maximumMessageBytes: exactBytes,
+                    webSocketFactory: () => new ScriptedWebSocket(script),
+                });
+            const streamRead = createSignedInboxRead(identity, {
+                createdAt: NOW,
+                limit: 1,
+                waitMilliseconds: 0,
+            });
+            await expect(
+                streamTransport((_frame, socket) => socket.receive("{"))
+                    .stream(streamRead)
+                    .next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+            await expect(
+                streamTransport((_frame, socket) => socket.receive(new Uint8Array([1, 2, 3])))
+                    .stream(streamRead)
+                    .next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+            await expect(
+                streamTransport((frame, socket) =>
+                    socket.receive(
+                        JSON.stringify({
+                            version: 1,
+                            id: frame.id,
+                            type: "continuity",
+                            body: page,
+                        }),
+                    ),
+                )
+                    .stream(streamRead)
+                    .next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+            await expect(
+                streamTransport((_frame, socket) => socket.receive("x".repeat(exactBytes + 1)))
+                    .stream(streamRead)
+                    .next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+
+            const live = streamTransport((frame, socket) => {
+                socket.receive(
+                    JSON.stringify({
+                        version: 1,
+                        id: frame.id,
+                        type: "response",
+                        status: 200,
+                        body: { connected: true },
+                    }),
+                );
+                queueMicrotask(() =>
+                    socket.receive(
+                        JSON.stringify({
+                            version: 1,
+                            id: frame.id,
+                            type: "continuity",
+                            body: {
+                                generation: STREAM_GENERATION,
+                                head: STREAM_EVENT_ID,
+                                headSequence: 1,
+                                acknowledgedThrough: null,
+                                acknowledgedSequence: 0,
+                            },
+                        }),
+                    ),
+                );
+            }).stream(streamRead);
+            await expect(live.next()).resolves.toMatchObject({
+                value: { type: "continuity", head: STREAM_EVENT_ID },
+            });
+            await live.return(undefined);
+        } finally {
+            destroyIdentity(identity);
+        }
+    });
+
+    test("ADV-13 SSE frames enforce exact event bounds and reject truncation or invalid UTF-8", async () => {
+        const identity = generateIdentityKeyPair();
+        const event = utf8Encode(
+            `event: continuity\ndata: ${JSON.stringify({
+                generation: STREAM_GENERATION,
+                head: STREAM_EVENT_ID,
+                headSequence: 1,
+                acknowledgedThrough: null,
+                acknowledgedSequence: 0,
+            })}\n\n`,
+        );
+        const request = createSignedInboxRead(identity, {
+            createdAt: NOW,
+            limit: 1,
+            waitMilliseconds: 0,
+        });
+        const transport = (body: Uint8Array, maximumResponseBytes: number): HttpDeliveryTransport =>
+            new HttpDeliveryTransport("https://relay.test", {
+                maximumResponseBytes,
+                fetch: async () =>
+                    new Response(body.slice(), {
+                        headers: { "content-type": "text/event-stream" },
+                    }),
+            });
+        try {
+            const exact = transport(event, event.length).stream(request);
+            await expect(exact.next()).resolves.toMatchObject({
+                done: false,
+                value: { type: "continuity", headSequence: 1 },
+            });
+            await exact.return(undefined);
+
+            await expect(
+                transport(event, event.length - 1)
+                    .stream(request)
+                    .next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+            await expect(
+                transport(event.slice(0, -1), event.length).stream(request).next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+            await expect(
+                transport(new Uint8Array([0xc3]), event.length)
+                    .stream(request)
+                    .next(),
+            ).rejects.toMatchObject({ code: "invalid_stream" });
+
+            const live = transport(event, event.length).stream(request);
+            await expect(live.next()).resolves.toMatchObject({
+                value: { type: "continuity", head: STREAM_EVENT_ID },
+            });
+            await live.return(undefined);
+        } finally {
+            destroyIdentity(identity);
+        }
+    });
+
+    // PRODUCT FINDING: JSON.parse keeps the final duplicate field, so a hostile earlier value
+    // is invisible to the relay's otherwise-exact object validation and can publish valid bytes.
+    test.fails("ADV-13 PRODUCT FINDING HTTP rejects duplicate security fields atomically", async () => {
         const fixture = relayFixture();
         const sender = generateIdentityKeyPair();
         const recipient = generateIdentityKeyPair();
@@ -1096,15 +1608,28 @@ describe("adversarial inputs and resource limits", () => {
         try {
             const valid = delivery(sender, [recipient.publicKey], new Uint8Array([1]));
             const canonical = JSON.stringify(signedDeliveryToJson(valid));
-            const duplicateVersion = canonical.replace("{", '{"version":1,');
-            const response = await handler(
-                new Request("https://relay.test/v1/deliveries", {
-                    method: "POST",
-                    headers: { "content-type": "application/json" },
-                    body: duplicateVersion,
-                }),
+            const duplicateBodies = [
+                canonical.replace("{", '{"version":2,'),
+                canonical.replace('"recipients":', '"recipients":[],"recipients":'),
+                canonical.replace('"ciphertext":', '"ciphertext":"","ciphertext":'),
+                canonical.replace('"signature":', '"signature":"AA","signature":'),
+            ];
+            const statuses: number[] = [];
+            for (const body of duplicateBodies) {
+                const response = await handler(
+                    new Request("https://relay.test/v1/deliveries", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body,
+                    }),
+                );
+                statuses.push(response.status);
+            }
+            const page = await fixture.transport.read(
+                createSignedInboxRead(recipient, { createdAt: NOW }),
             );
-            expect(response.status).toBeGreaterThanOrEqual(400);
+            expect(statuses.every((status) => status >= 400)).toBe(true);
+            expect(page.deliveries).toHaveLength(0);
         } finally {
             await closeFixture(fixture, [sender, recipient]);
         }
