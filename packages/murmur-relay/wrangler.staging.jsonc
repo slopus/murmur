@@ -14,10 +14,20 @@
             },
         ],
     },
+    // Cloudflare tracks applied migration tags per deployment, so historical
+    // entries stay as a ledger even though their classes are gone from the code.
     "migrations": [
         {
             "tag": "v1",
             "new_sqlite_classes": ["MurmurInboxDurableObject", "MurmurFanoutDurableObject"],
+        },
+        {
+            "tag": "v2",
+            "new_sqlite_classes": ["MurmurPrivateGroupDurableObject"],
+        },
+        {
+            "tag": "v3",
+            "deleted_classes": ["MurmurPrivateGroupDurableObject"],
         },
     ],
     "vars": {

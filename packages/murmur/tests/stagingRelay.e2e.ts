@@ -201,13 +201,13 @@ describe("deployed Cloudflare staging relay", () => {
                 bobTransport.acknowledge(
                     createSignedInboxAck(bob, secondOutcome.eventId, Date.now()),
                 ),
-            ).resolves.toEqual({ removed: 2 });
+            ).resolves.toMatchObject({ removed: 2, sequence: 2 });
             stage = "acknowledge Alice's initial inbox";
             await expect(
                 aliceTransport.acknowledge(
                     createSignedInboxAck(alice, secondOutcome.eventId, Date.now()),
                 ),
-            ).resolves.toEqual({ removed: 2 });
+            ).resolves.toMatchObject({ removed: 2, sequence: 2 });
 
             const streamAbort = new AbortController();
             let markConnected: (() => void) | undefined;
@@ -226,7 +226,14 @@ describe("deployed Cloudflare staging relay", () => {
                 streamAbort.signal,
                 { onConnected: () => markConnected?.() },
             );
-            const nextDelivery = stream.next();
+            // The stream carries continuity updates alongside deliveries, so pull
+            // until the delivery frame itself arrives.
+            const nextDelivery = (async () => {
+                for (;;) {
+                    const item = await stream.next();
+                    if (item.done === true || "eventId" in item.value) return item;
+                }
+            })();
             void nextDelivery.catch((error: unknown) => rejectConnection?.(error));
             stage = "connect Bob's delivery stream";
             await within(connected, REQUEST_TIMEOUT_MILLISECONDS);

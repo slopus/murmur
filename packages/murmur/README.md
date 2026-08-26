@@ -21,7 +21,9 @@ private deployment infrastructure.
 - Incoming bootstraps remain pending until the application activates or ignores
   them. Protocol traffic continues and application updates remain buffered
   while pending.
-- The relay exposes one ordered encrypted queue per exact public identity.
+- The relay exposes one ordered encrypted inbox per device, addressed by its
+  canonical public key. Session sends name only the session; the relay derives
+  the complete device fanout from its own membership and roster state.
   Delivery acknowledgement is signed and separate from processing.
 
 ## Install
