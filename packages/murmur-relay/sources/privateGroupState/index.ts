@@ -4,6 +4,7 @@ import { randomBytes } from "@noble/hashes/utils";
 import { canonicalJson } from "../utils/canonicalJson.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
+import { isUuidV7 } from "../utils/uuidV7.js";
 import type {
     PrivateGroupChallengeOperation,
     PrivateGroupCredentialAuthority,
@@ -12,6 +13,7 @@ import type {
     PrivateGroupStateLimits,
     PrivateGroupStateRecord,
     PrivateGroupStateServiceOptions,
+    StoredPrivateGroupStateRecord,
 } from "./types.js";
 
 export { SqlitePrivateGroupStateStore } from "./impl/privateGroupStateStoreSqlite.js";
@@ -334,11 +336,13 @@ export class PrivateGroupStateService {
         role(options.role);
         if (options.operation === "create") {
             if (options.role !== "owner") throw new Error("Only an owner entry may create a group");
-            if (this.#store.read(options.opaqueGroupId) !== undefined) {
+            if ((await this.#store.read(options.opaqueGroupId)) !== undefined) {
                 throw new Error("Private group already exists");
             }
         } else if (options.operation === "access") {
-            if (!this.#store.hasMember(options.opaqueGroupId, options.entry, options.role)) {
+            if (
+                !(await this.#store.hasMember(options.opaqueGroupId, options.entry, options.role))
+            ) {
                 throw new Error("Opaque member entry is not authorized for this group and role");
             }
         } else {
@@ -355,7 +359,7 @@ export class PrivateGroupStateService {
             context: challengeContext({ ...options, replayNonce }),
             expiresAt: now + this.#challengeLifetime,
         };
-        this.#store.storeChallenge(challenge, this.#limits.maximumPendingChallenges, now);
+        await this.#store.storeChallenge(challenge, this.#limits.maximumPendingChallenges, now);
         return challenge;
     }
 
@@ -367,7 +371,7 @@ export class PrivateGroupStateService {
     }): Promise<{ readonly bytes: Uint8Array; readonly expiresAt: number }> {
         this.#assertOpen();
         const now = this.#safeNow();
-        const stored = this.#store.consumeChallenge(options.challenge.replayNonce, now);
+        const stored = await this.#store.consumeChallenge(options.challenge.replayNonce, now);
         if (stored === undefined || !this.#sameChallenge(stored, options.challenge)) {
             throw new Error("Private-group presentation challenge is invalid or replayed");
         }
@@ -383,11 +387,14 @@ export class PrivateGroupStateService {
         }
         if (
             stored.operation === "access" &&
-            !this.#store.hasMember(stored.opaqueGroupId, stored.entry, stored.role)
+            !(await this.#store.hasMember(stored.opaqueGroupId, stored.entry, stored.role))
         ) {
             throw new Error("Opaque member entry is no longer authorized");
         }
-        if (stored.operation === "create" && this.#store.read(stored.opaqueGroupId) !== undefined) {
+        if (
+            stored.operation === "create" &&
+            (await this.#store.read(stored.opaqueGroupId)) !== undefined
+        ) {
             throw new Error("Private group already exists");
         }
         const credentialExpiry = await this.#authority.verifyPresentation({
@@ -417,10 +424,7 @@ export class PrivateGroupStateService {
     async createRecord(options: {
         readonly record: PrivateGroupStateRecord;
         readonly token: Uint8Array;
-    }): Promise<{
-        readonly record: PrivateGroupStateRecord;
-        readonly revisionHash: Uint8Array;
-    }> {
+    }): Promise<StoredPrivateGroupStateRecord> {
         this.#assertOpen();
         validateRecord(options.record, this.#limits);
         if (options.record.revision !== 1 || options.record.previousRevisionHash !== null) {
@@ -445,57 +449,48 @@ export class PrivateGroupStateService {
         }
         const raw = encodePrivateGroupStateRecord(options.record);
         const revisionHash = sha256(raw);
-        this.#store.create(options.record, revisionHash, raw, this.#limits);
-        const stored = this.#store.read(options.record.opaqueGroupId);
-        if (stored === undefined) throw new Error("Created private-group record was not persisted");
-        return stored;
+        return await this.#store.create(
+            options.record,
+            revisionHash,
+            raw,
+            this.#limits,
+            this.#safeNow(),
+        );
     }
 
     /** Read the current canonical encrypted revision using an exact member/role token. */
     async readRecord(options: {
         readonly opaqueGroupId: Uint8Array;
         readonly token: Uint8Array;
-    }): Promise<{
-        readonly record: PrivateGroupStateRecord;
-        readonly revisionHash: Uint8Array;
-    }> {
+    }): Promise<StoredPrivateGroupStateRecord> {
         this.#assertOpen();
         const claims = this.#authorize(options.token, options.opaqueGroupId);
-        if (!this.#store.hasMember(options.opaqueGroupId, claims.entry, claims.role)) {
+        if (!(await this.#store.hasMember(options.opaqueGroupId, claims.entry, claims.role))) {
             throw new Error("Private-group token member entry is no longer authorized");
         }
-        const stored = this.#store.read(options.opaqueGroupId);
+        const stored = await this.#store.read(options.opaqueGroupId);
         if (stored === undefined) throw new Error("Unknown private group");
         return stored;
     }
 
     /** Atomically replace the canonical tip using an administrator or owner token. */
     async replaceRecord(options: {
-        readonly expectedRevision: number;
+        readonly replacesVersion: string;
         readonly expectedRevisionHash: Uint8Array;
         readonly record: PrivateGroupStateRecord;
         readonly token: Uint8Array;
-    }): Promise<{
-        readonly record: PrivateGroupStateRecord;
-        readonly revisionHash: Uint8Array;
-    }> {
+    }): Promise<StoredPrivateGroupStateRecord> {
         this.#assertOpen();
         validateRecord(options.record, this.#limits);
+        if (!isUuidV7(options.replacesVersion)) {
+            throw new Error("Invalid replaced private-group canonical version");
+        }
+        validateBytes(options.expectedRevisionHash, 32, "expected private-group revision hash");
         const claims = this.#authorize(options.token, options.record.opaqueGroupId);
         if (claims.role !== "owner" && claims.role !== "administrator") {
             throw new Error("Private-group mutation requires owner or administrator role");
         }
-        if (!this.#store.hasMember(options.record.opaqueGroupId, claims.entry, claims.role)) {
-            throw new Error("Private-group mutation token member is no longer authorized");
-        }
-        if (
-            options.record.revision !== options.expectedRevision + 1 ||
-            options.record.previousRevisionHash === null ||
-            !equalBytes(options.record.previousRevisionHash, options.expectedRevisionHash)
-        ) {
-            throw new Error("Private-group mutation does not extend the expected revision");
-        }
-        const current = this.#store.read(options.record.opaqueGroupId);
+        const current = await this.#store.read(options.record.opaqueGroupId);
         if (
             current === undefined ||
             !equalBytes(current.record.publicParameters, options.record.publicParameters)
@@ -504,18 +499,35 @@ export class PrivateGroupStateService {
         }
         const raw = encodePrivateGroupStateRecord(options.record);
         const revisionHash = sha256(raw);
-        this.#store.replace(
-            options.expectedRevision,
+        if (
+            current.replacesVersion === options.replacesVersion &&
+            equalBytes(current.revisionHash, revisionHash)
+        ) {
+            return current;
+        }
+        if (
+            current.canonicalVersion !== options.replacesVersion ||
+            options.record.revision !== current.record.revision + 1 ||
+            options.record.previousRevisionHash === null ||
+            !equalBytes(current.revisionHash, options.expectedRevisionHash) ||
+            !equalBytes(options.record.previousRevisionHash, options.expectedRevisionHash)
+        ) {
+            throw new Error("Private-group mutation does not extend the expected version");
+        }
+        if (
+            !(await this.#store.hasMember(options.record.opaqueGroupId, claims.entry, claims.role))
+        ) {
+            throw new Error("Private-group mutation token member is no longer authorized");
+        }
+        return await this.#store.replace(
+            options.replacesVersion,
             options.expectedRevisionHash,
             options.record,
             revisionHash,
             raw,
             this.#limits,
+            this.#safeNow(),
         );
-        const stored = this.#store.read(options.record.opaqueGroupId);
-        if (stored === undefined)
-            throw new Error("Replaced private-group record was not persisted");
-        return stored;
     }
 
     /** Close the service, zero its token secret, and close its configured store. */

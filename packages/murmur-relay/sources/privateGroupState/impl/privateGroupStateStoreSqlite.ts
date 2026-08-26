@@ -1,5 +1,6 @@
 import { DatabaseSync, type SQLInputValue, type StatementResultingChanges } from "node:sqlite";
 import { copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
+import { isUuidV7, nextUuidV7 } from "../../utils/uuidV7.js";
 import type {
     PrivateGroupChallengeOperation,
     PrivateGroupMemberEntry,
@@ -41,6 +42,15 @@ function nullableBytes(value: unknown, name: string): Uint8Array | null {
     return value === null ? null : copyBytes(value, name);
 }
 
+function text(value: unknown, name: string): string {
+    if (typeof value !== "string") throw new Error(`Invalid ${name} in SQLite`);
+    return value;
+}
+
+function nullableText(value: unknown, name: string): string | null {
+    return value === null ? null : text(value, name);
+}
+
 /** SQLite storage for canonical opaque private-group state and one-use challenges. */
 export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
     readonly #database: DatabaseSync;
@@ -59,23 +69,48 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
         revisionHash: Uint8Array,
         rawRecord: Uint8Array,
         limits: PrivateGroupStateLimits,
-    ): void {
+        now: number,
+    ): StoredPrivateGroupStateRecord {
         this.#assertOpen();
         this.#database.exec("BEGIN IMMEDIATE");
         try {
+            const existing = this.#get(
+                `SELECT revision_hash FROM murmur_private_group_records WHERE group_id = ?`,
+                record.opaqueGroupId,
+            );
+            if (existing !== undefined) {
+                if (
+                    !equalBytes(
+                        copyBytes(existing.revision_hash, "private-group revision hash"),
+                        revisionHash,
+                    )
+                ) {
+                    throw new Error("Private group already exists with different state");
+                }
+                this.#database.exec("COMMIT");
+                const duplicate = this.read(record.opaqueGroupId);
+                if (duplicate === undefined) throw new Error("Private group disappeared");
+                return duplicate;
+            }
             const usage = this.#requiredGet(
                 "SELECT COUNT(*) AS group_count FROM murmur_private_group_records",
             );
             if (safeNumberColumn(usage.group_count) >= limits.maximumGroups) {
                 throw new Error("Private-group service group quota exceeded");
             }
+            const global = this.#requiredGet(
+                "SELECT last_version FROM murmur_private_group_global WHERE singleton = 1",
+            );
+            const previousVersion = nullableText(global.last_version, "last private-group version");
+            const canonicalVersion = nextUuidV7(now, previousVersion);
             this.#run(
                 `INSERT INTO murmur_private_group_records
-                    (group_id, public_parameters, revision, previous_revision_hash,
-                     revision_hash, sealed_state, revision_authenticator, raw_record,
-                     encoded_bytes)
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                    (group_id, canonical_version, replaces_version, commit_event_id,
+                     public_parameters, revision, previous_revision_hash, revision_hash,
+                     sealed_state, revision_authenticator, raw_record, encoded_bytes)
+                 VALUES (?, ?, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 record.opaqueGroupId,
+                canonicalVersion,
                 record.publicParameters,
                 BigInt(record.revision),
                 record.previousRevisionHash,
@@ -84,6 +119,10 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
                 record.revisionAuthenticator,
                 rawRecord,
                 BigInt(rawRecord.length),
+            );
+            this.#run(
+                "UPDATE murmur_private_group_global SET last_version = ? WHERE singleton = 1",
+                canonicalVersion,
             );
             this.#insertMembers(record.opaqueGroupId, record.members);
             this.#database.exec("COMMIT");
@@ -94,41 +133,69 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
             }
             throw error;
         }
+        const stored = this.read(record.opaqueGroupId);
+        if (stored === undefined) throw new Error("Created private-group record was not persisted");
+        return stored;
     }
 
     replace(
-        expectedRevision: number,
+        replacesVersion: string,
         expectedRevisionHash: Uint8Array,
         record: PrivateGroupStateRecord,
         revisionHash: Uint8Array,
         rawRecord: Uint8Array,
         _limits: PrivateGroupStateLimits,
-    ): void {
+        now: number,
+    ): StoredPrivateGroupStateRecord {
         this.#assertOpen();
         this.#database.exec("BEGIN IMMEDIATE");
         try {
             const current = this.#get(
-                `SELECT revision, revision_hash FROM murmur_private_group_records
+                `SELECT canonical_version, replaces_version, revision, revision_hash
+                 FROM murmur_private_group_records
                  WHERE group_id = ?`,
                 record.opaqueGroupId,
             );
             if (current === undefined) throw new Error("Unknown private group");
-            if (
-                safeNumberColumn(current.revision) !== expectedRevision ||
-                !equalBytes(
-                    copyBytes(current.revision_hash, "private-group revision hash"),
-                    expectedRevisionHash,
-                )
-            ) {
-                throw new Error("Private-group revision fork or stale mutation");
+            const currentVersion = text(
+                current.canonical_version,
+                "private-group canonical version",
+            );
+            const currentParent = nullableText(
+                current.replaces_version,
+                "replaced private-group version",
+            );
+            const currentHash = copyBytes(current.revision_hash, "private-group revision hash");
+            if (currentParent === replacesVersion && equalBytes(currentHash, revisionHash)) {
+                this.#database.exec("COMMIT");
+                const duplicate = this.read(record.opaqueGroupId);
+                if (duplicate === undefined) throw new Error("Private group disappeared");
+                return duplicate;
             }
+            if (
+                currentVersion !== replacesVersion ||
+                safeNumberColumn(current.revision) + 1 !== record.revision ||
+                !equalBytes(currentHash, expectedRevisionHash)
+            ) {
+                throw new Error("Private-group canonical version conflict");
+            }
+            const global = this.#requiredGet(
+                "SELECT last_version FROM murmur_private_group_global WHERE singleton = 1",
+            );
+            const canonicalVersion = nextUuidV7(
+                now,
+                nullableText(global.last_version, "last private-group version"),
+            );
             const changed = safeNumberColumn(
                 this.#run(
                     `UPDATE murmur_private_group_records
-                 SET public_parameters = ?, revision = ?, previous_revision_hash = ?,
+                 SET canonical_version = ?, replaces_version = ?, commit_event_id = NULL,
+                     public_parameters = ?, revision = ?, previous_revision_hash = ?,
                      revision_hash = ?, sealed_state = ?, revision_authenticator = ?,
                      raw_record = ?, encoded_bytes = ?
-                 WHERE group_id = ? AND revision = ? AND revision_hash = ?`,
+                 WHERE group_id = ? AND canonical_version = ? AND revision_hash = ?`,
+                    canonicalVersion,
+                    replacesVersion,
                     record.publicParameters,
                     BigInt(record.revision),
                     record.previousRevisionHash,
@@ -138,11 +205,15 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
                     rawRecord,
                     BigInt(rawRecord.length),
                     record.opaqueGroupId,
-                    BigInt(expectedRevision),
+                    replacesVersion,
                     expectedRevisionHash,
                 ).changes,
             );
-            if (changed !== 1) throw new Error("Private-group revision fork or stale mutation");
+            if (changed !== 1) throw new Error("Private-group canonical version conflict");
+            this.#run(
+                "UPDATE murmur_private_group_global SET last_version = ? WHERE singleton = 1",
+                canonicalVersion,
+            );
             this.#run(
                 "DELETE FROM murmur_private_group_members WHERE group_id = ?",
                 record.opaqueGroupId,
@@ -156,17 +227,35 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
             }
             throw error;
         }
+        const stored = this.read(record.opaqueGroupId);
+        if (stored === undefined)
+            throw new Error("Replaced private-group record was not persisted");
+        return stored;
     }
 
     read(opaqueGroupId: Uint8Array): StoredPrivateGroupStateRecord | undefined {
         this.#assertOpen();
         const stored = this.#get(
-            `SELECT public_parameters, revision, previous_revision_hash, revision_hash,
-                    sealed_state, revision_authenticator
+            `SELECT canonical_version, replaces_version, commit_event_id, public_parameters,
+                    revision, previous_revision_hash, revision_hash, sealed_state,
+                    revision_authenticator
              FROM murmur_private_group_records WHERE group_id = ?`,
             opaqueGroupId,
         );
         if (stored === undefined) return undefined;
+        const canonicalVersion = text(stored.canonical_version, "private-group canonical version");
+        const replacesVersion = nullableText(
+            stored.replaces_version,
+            "replaced private-group version",
+        );
+        const commitEventId = nullableText(stored.commit_event_id, "private-group Commit event ID");
+        if (
+            !isUuidV7(canonicalVersion) ||
+            (replacesVersion !== null && !isUuidV7(replacesVersion)) ||
+            (commitEventId !== null && !isUuidV7(commitEventId))
+        ) {
+            throw new Error("Invalid private-group canonical metadata in SQLite");
+        }
         const members = this.#all(
             `SELECT entry, role FROM murmur_private_group_members
              WHERE group_id = ? ORDER BY entry`,
@@ -198,6 +287,9 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
                 ),
             },
             revisionHash: copyBytes(stored.revision_hash, "private-group revision hash"),
+            canonicalVersion,
+            replacesVersion,
+            commitEventId,
         };
     }
 
@@ -321,8 +413,23 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
             version INTEGER NOT NULL
         ) STRICT;
         INSERT OR IGNORE INTO murmur_private_group_schema (singleton, version) VALUES (1, 1);
+        CREATE TABLE IF NOT EXISTS murmur_private_group_global (
+            singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+            last_version TEXT CHECK (
+                last_version IS NULL OR length(last_version) = 36
+            )
+        ) STRICT;
+        INSERT OR IGNORE INTO murmur_private_group_global (singleton, last_version)
+            VALUES (1, NULL);
         CREATE TABLE IF NOT EXISTS murmur_private_group_records (
             group_id BLOB PRIMARY KEY CHECK (length(group_id) = 32),
+            canonical_version TEXT NOT NULL UNIQUE CHECK (length(canonical_version) = 36),
+            replaces_version TEXT CHECK (
+                replaces_version IS NULL OR length(replaces_version) = 36
+            ),
+            commit_event_id TEXT CHECK (
+                commit_event_id IS NULL OR length(commit_event_id) = 36
+            ),
             public_parameters BLOB NOT NULL,
             revision INTEGER NOT NULL CHECK (revision >= 1),
             previous_revision_hash BLOB CHECK (
@@ -368,6 +475,16 @@ export class SqlitePrivateGroupStateStore implements PrivateGroupStateStore {
         );
         if (safeNumberColumn(schema.version) !== 1) {
             throw new Error("Unsupported SQLite private-group schema version");
+        }
+        const columns = new Set(
+            this.#all("PRAGMA table_info(murmur_private_group_records)").map((column) =>
+                text(column.name, "private-group schema column"),
+            ),
+        );
+        for (const required of ["canonical_version", "replaces_version", "commit_event_id"]) {
+            if (!columns.has(required)) {
+                throw new Error("Unsupported pre-beta SQLite private-group schema");
+            }
         }
     }
 

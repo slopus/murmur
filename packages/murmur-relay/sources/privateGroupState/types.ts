@@ -23,6 +23,12 @@ export interface PrivateGroupStateRecord {
 export interface StoredPrivateGroupStateRecord {
     readonly record: PrivateGroupStateRecord;
     readonly revisionHash: Uint8Array;
+    /** Server-assigned canonical UUIDv7 version. */
+    readonly canonicalVersion: string;
+    /** Canonical UUIDv7 version this write replaced, or null for creation. */
+    readonly replacesVersion: string | null;
+    /** Winning relay Commit event once backend arbitration is enabled. */
+    readonly commitEventId: string | null;
 }
 
 /** Operations bound into a one-use anonymous presentation challenge. */
@@ -85,26 +91,40 @@ export interface PrivateGroupStateStore {
         revisionHash: Uint8Array,
         rawRecord: Uint8Array,
         limits: PrivateGroupStateLimits,
-    ): void;
+        now: number,
+    ): StoredPrivateGroupStateRecord | Promise<StoredPrivateGroupStateRecord>;
     replace(
-        expectedRevision: number,
+        replacesVersion: string,
         expectedRevisionHash: Uint8Array,
         record: PrivateGroupStateRecord,
         revisionHash: Uint8Array,
         rawRecord: Uint8Array,
         limits: PrivateGroupStateLimits,
-    ): void;
-    read(opaqueGroupId: Uint8Array): StoredPrivateGroupStateRecord | undefined;
-    hasMember(opaqueGroupId: Uint8Array, entry: Uint8Array, role: PrivateGroupRole): boolean;
+        now: number,
+    ): StoredPrivateGroupStateRecord | Promise<StoredPrivateGroupStateRecord>;
+    read(
+        opaqueGroupId: Uint8Array,
+    ):
+        | StoredPrivateGroupStateRecord
+        | undefined
+        | Promise<StoredPrivateGroupStateRecord | undefined>;
+    hasMember(
+        opaqueGroupId: Uint8Array,
+        entry: Uint8Array,
+        role: PrivateGroupRole,
+    ): boolean | Promise<boolean>;
     storeChallenge(
         challenge: PrivateGroupPresentationChallenge,
         maximumPendingChallenges: number,
         now: number,
-    ): void;
+    ): void | Promise<void>;
     consumeChallenge(
         replayNonce: Uint8Array,
         now: number,
-    ): PrivateGroupPresentationChallenge | undefined;
+    ):
+        | PrivateGroupPresentationChallenge
+        | undefined
+        | Promise<PrivateGroupPresentationChallenge | undefined>;
     close(): void;
 }
 

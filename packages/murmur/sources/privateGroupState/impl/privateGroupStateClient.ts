@@ -36,7 +36,13 @@ import {
     privateGroupStateRecordHash,
 } from "./recordCodec.js";
 
-/** Internal private-group state client bound to one account and one group secret. */
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+function isUuidV7(value: string): boolean {
+    return UUID_V7.test(value);
+}
+
+/** Experimental private-group state client bound to one account and one group secret. */
 export class PrivateGroupStateClient {
     readonly #accountIdentifier: Uint8Array;
     readonly #parameters: PrivateGroupParameters;
@@ -44,6 +50,7 @@ export class PrivateGroupStateClient {
     readonly #issuer: CredentialIssuerPublicParameters;
     readonly #transport: PrivateGroupStateTransport;
     readonly #now: () => number;
+    #trustedCanonicalVersion: string | undefined;
     #trustedRevision: number | undefined;
     #trustedRevisionHash: Uint8Array | undefined;
     #closed = false;
@@ -64,12 +71,14 @@ export class PrivateGroupStateClient {
         this.#now = options.now ?? Date.now;
         if (options.trustedTip !== undefined) {
             if (
+                !isUuidV7(options.trustedTip.canonicalVersion) ||
                 !Number.isSafeInteger(options.trustedTip.revision) ||
                 options.trustedTip.revision < 1 ||
                 options.trustedTip.revisionHash.length !== 32
             ) {
                 throw new Error("Invalid trusted private-group revision tip");
             }
+            this.#trustedCanonicalVersion = options.trustedTip.canonicalVersion;
             this.#trustedRevision = options.trustedTip.revision;
             this.#trustedRevisionHash = options.trustedTip.revisionHash.slice();
         }
@@ -88,11 +97,20 @@ export class PrivateGroupStateClient {
     }
 
     /** Current rollback-protected local tip, if this client has accepted one. */
-    get trustedTip(): { readonly revision: number; readonly revisionHash: Uint8Array } | undefined {
+    get trustedTip():
+        | {
+              readonly canonicalVersion: string;
+              readonly revision: number;
+              readonly revisionHash: Uint8Array;
+          }
+        | undefined {
         this.#assertOpen();
-        return this.#trustedRevision === undefined || this.#trustedRevisionHash === undefined
+        return this.#trustedCanonicalVersion === undefined ||
+            this.#trustedRevision === undefined ||
+            this.#trustedRevisionHash === undefined
             ? undefined
             : {
+                  canonicalVersion: this.#trustedCanonicalVersion,
                   revision: this.#trustedRevision,
                   revisionHash: this.#trustedRevisionHash.slice(),
               };
@@ -199,6 +217,7 @@ export class PrivateGroupStateClient {
             throw new Error("Cannot extend an invalid private-group revision");
         }
         if (
+            this.#trustedCanonicalVersion !== current.canonicalVersion ||
             this.#trustedRevision !== current.record.revision ||
             this.#trustedRevisionHash === undefined ||
             !equalBytes(this.#trustedRevisionHash, current.revisionHash)
@@ -279,7 +298,7 @@ export class PrivateGroupStateClient {
     ): Promise<PrivateGroupAcceptedState> {
         this.#assertOpen();
         const stored = await this.#transport.replaceRecord({
-            expectedRevision: current.record.revision,
+            replacesVersion: current.canonicalVersion,
             expectedRevisionHash: current.revisionHash,
             record: this.buildSuccessorRecord(current, content),
             token: token.bytes,
@@ -335,18 +354,40 @@ export class PrivateGroupStateClient {
     }
 
     #acceptRevisionTip(stored: StoredPrivateGroupStateRecord): void {
+        if (
+            !isUuidV7(stored.canonicalVersion) ||
+            (stored.replacesVersion !== null && !isUuidV7(stored.replacesVersion)) ||
+            (stored.commitEventId !== null && !isUuidV7(stored.commitEventId))
+        ) {
+            throw new Error("Invalid private-group canonical metadata");
+        }
         const revision = stored.record.revision;
         const hash = stored.revisionHash;
-        if (this.#trustedRevision === undefined || this.#trustedRevisionHash === undefined) {
+        if (
+            this.#trustedCanonicalVersion === undefined ||
+            this.#trustedRevision === undefined ||
+            this.#trustedRevisionHash === undefined
+        ) {
+            if (
+                (revision === 1 && stored.replacesVersion !== null) ||
+                (revision > 1 && stored.replacesVersion === null)
+            ) {
+                throw new Error("Invalid private-group canonical predecessor");
+            }
+            this.#trustedCanonicalVersion = stored.canonicalVersion;
             this.#trustedRevision = revision;
             this.#trustedRevisionHash = hash.slice();
             return;
         }
-        if (revision < this.#trustedRevision) {
+        const versionOrder = stored.canonicalVersion.localeCompare(this.#trustedCanonicalVersion);
+        if (versionOrder < 0 || revision < this.#trustedRevision) {
             throw new Error("Private-group revision rollback detected");
         }
-        if (revision === this.#trustedRevision) {
-            if (!equalBytes(hash, this.#trustedRevisionHash)) {
+        if (versionOrder === 0) {
+            if (
+                revision !== this.#trustedRevision ||
+                !equalBytes(hash, this.#trustedRevisionHash)
+            ) {
                 throw new Error("Private-group revision fork detected");
             }
             return;
@@ -355,12 +396,14 @@ export class PrivateGroupStateClient {
             throw new Error("Private-group revision gap detected");
         }
         if (
+            stored.replacesVersion !== this.#trustedCanonicalVersion ||
             stored.record.previousRevisionHash === null ||
             !equalBytes(stored.record.previousRevisionHash, this.#trustedRevisionHash)
         ) {
             throw new Error("Private-group revision fork detected");
         }
         this.#trustedRevisionHash.fill(0);
+        this.#trustedCanonicalVersion = stored.canonicalVersion;
         this.#trustedRevision = revision;
         this.#trustedRevisionHash = hash.slice();
     }

@@ -26,6 +26,12 @@ export interface PrivateGroupStateRecord {
 export interface StoredPrivateGroupStateRecord {
     readonly record: PrivateGroupStateRecord;
     readonly revisionHash: Uint8Array;
+    /** Server-assigned canonical UUIDv7 version. */
+    readonly canonicalVersion: string;
+    /** Canonical UUIDv7 version this write replaced, or null for creation. */
+    readonly replacesVersion: string | null;
+    /** Winning relay Commit event once backend arbitration is enabled. */
+    readonly commitEventId: string | null;
 }
 
 /** One role assignment for a logical account in an authenticated MLS snapshot. */
@@ -80,7 +86,7 @@ export interface PrivateGroupStateTransport {
         readonly token: Uint8Array;
     }): Promise<StoredPrivateGroupStateRecord>;
     replaceRecord(options: {
-        readonly expectedRevision: number;
+        readonly replacesVersion: string;
         readonly expectedRevisionHash: Uint8Array;
         readonly record: PrivateGroupStateRecord;
         readonly token: Uint8Array;
@@ -100,6 +106,7 @@ export interface PrivateGroupStateClientOptions {
     readonly transport: PrivateGroupStateTransport;
     readonly now?: () => number;
     readonly trustedTip?: {
+        readonly canonicalVersion: string;
         readonly revision: number;
         readonly revisionHash: Uint8Array;
     };

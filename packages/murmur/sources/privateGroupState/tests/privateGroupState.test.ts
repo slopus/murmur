@@ -125,8 +125,17 @@ async function createGroup(value: Fixture): Promise<{
     return { credentialA, initial: accepted.record };
 }
 
-function stored(record: PrivateGroupStateRecord): StoredPrivateGroupStateRecord {
-    return { record, revisionHash: privateGroupStateRecordHash(record) };
+function stored(
+    record: PrivateGroupStateRecord,
+    canonical: StoredPrivateGroupStateRecord,
+): StoredPrivateGroupStateRecord {
+    return {
+        record,
+        revisionHash: privateGroupStateRecordHash(record),
+        canonicalVersion: canonical.canonicalVersion,
+        replacesVersion: canonical.replacesVersion,
+        commitEventId: canonical.commitEventId,
+    };
 }
 
 describe("private-group canonical state service", () => {
@@ -167,7 +176,7 @@ describe("private-group canonical state service", () => {
             );
             await expect(
                 value.service.replaceRecord({
-                    expectedRevision: 1,
+                    replacesVersion: created.initial.canonicalVersion,
                     expectedRevisionHash: created.initial.revisionHash,
                     record: duplicate,
                     token: ownerToken.bytes,
@@ -218,7 +227,7 @@ describe("private-group canonical state service", () => {
             );
             await expect(
                 value.service.replaceRecord({
-                    expectedRevision: 1,
+                    replacesVersion: created.initial.canonicalVersion,
                     expectedRevisionHash: created.initial.revisionHash,
                     record: successor,
                     token: memberToken.bytes,
@@ -321,7 +330,7 @@ describe("private-group canonical state service", () => {
                 }),
             );
             await value.service.replaceRecord({
-                expectedRevision: created.initial.record.revision,
+                replacesVersion: created.initial.canonicalVersion,
                 expectedRevisionHash: created.initial.revisionHash,
                 record: successor,
                 token: ownerToken.bytes,
@@ -354,7 +363,7 @@ describe("private-group canonical state service", () => {
                 content(value, "title: fork"),
             );
             const accepted = await value.service.replaceRecord({
-                expectedRevision: 1,
+                replacesVersion: created.initial.canonicalVersion,
                 expectedRevisionHash: created.initial.revisionHash,
                 record: primary,
                 token: ownerToken.bytes,
@@ -364,7 +373,7 @@ describe("private-group canonical state service", () => {
                 roles: value.rolesAB,
             });
             expect(() =>
-                value.clientA.acceptRecord(stored(fork), {
+                value.clientA.acceptRecord(stored(fork, accepted), {
                     session: value.sessionAB,
                     roles: value.rolesAB,
                 }),
@@ -377,12 +386,12 @@ describe("private-group canonical state service", () => {
             ).toThrow("rollback detected");
             await expect(
                 value.service.replaceRecord({
-                    expectedRevision: 1,
+                    replacesVersion: created.initial.canonicalVersion,
                     expectedRevisionHash: created.initial.revisionHash,
                     record: fork,
                     token: ownerToken.bytes,
                 }),
-            ).rejects.toThrow("fork or stale mutation");
+            ).rejects.toThrow("does not extend the expected version");
         } finally {
             value.close();
         }

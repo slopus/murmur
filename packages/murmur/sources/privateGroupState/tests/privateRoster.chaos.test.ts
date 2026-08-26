@@ -54,7 +54,11 @@ interface PrivateFixture {
     readonly clientC: PrivateGroupStateClient;
     newClient(
         accountIndex: number,
-        trustedTip?: { readonly revision: number; readonly revisionHash: Uint8Array },
+        trustedTip?: {
+            readonly canonicalVersion: string;
+            readonly revision: number;
+            readonly revisionHash: Uint8Array;
+        },
     ): PrivateGroupStateClient;
     close(): void;
 }
@@ -133,7 +137,7 @@ class TracingPrivateTransport implements PrivateGroupStateTransport {
     }
 
     async replaceRecord(options: {
-        readonly expectedRevision: number;
+        readonly replacesVersion: string;
         readonly expectedRevisionHash: Uint8Array;
         readonly record: PrivateGroupStateRecord;
         readonly token: Uint8Array;
@@ -187,7 +191,11 @@ function privateFixture(): PrivateFixture {
     const clients: PrivateGroupStateClient[] = [];
     const newClient = (
         accountIndex: number,
-        trustedTip?: { readonly revision: number; readonly revisionHash: Uint8Array },
+        trustedTip?: {
+            readonly canonicalVersion: string;
+            readonly revision: number;
+            readonly revisionHash: Uint8Array;
+        },
     ): PrivateGroupStateClient => {
         const client = new PrivateGroupStateClient({
             accountIdentifier: accounts[accountIndex]!,
@@ -281,8 +289,17 @@ async function createBaseline(fixture: PrivateFixture): Promise<Baseline> {
     };
 }
 
-function stored(record: PrivateGroupStateRecord): StoredPrivateGroupStateRecord {
-    return { record, revisionHash: privateGroupStateRecordHash(record) };
+function stored(
+    record: PrivateGroupStateRecord,
+    canonical: StoredPrivateGroupStateRecord,
+): StoredPrivateGroupStateRecord {
+    return {
+        record,
+        revisionHash: privateGroupStateRecordHash(record),
+        canonicalVersion: canonical.canonicalVersion,
+        replacesVersion: canonical.replacesVersion,
+        commitEventId: canonical.commitEventId,
+    };
 }
 
 function replacementOptions(
@@ -290,13 +307,13 @@ function replacementOptions(
     record: PrivateGroupStateRecord,
     token: PrivateGroupAccessToken,
 ): {
-    readonly expectedRevision: number;
+    readonly replacesVersion: string;
     readonly expectedRevisionHash: Uint8Array;
     readonly record: PrivateGroupStateRecord;
     readonly token: Uint8Array;
 } {
     return {
-        expectedRevision: current.record.revision,
+        replacesVersion: current.canonicalVersion,
         expectedRevisionHash: current.revisionHash,
         record,
         token: token.bytes,
@@ -359,7 +376,9 @@ describe("private canonical roster chaos", () => {
             ).rejects.toThrow();
             const opened = fixture.clientA.acceptRecord(accepted, winnerContent);
             expect(utf8Decode(opened.attributes)).toBe("winner adds D");
-            expect(() => fixture.clientA.acceptRecord(stored(loser), winnerContent)).toThrow();
+            expect(() =>
+                fixture.clientA.acceptRecord(stored(loser, accepted), winnerContent),
+            ).toThrow();
             const canonical = fixture.store.read(fixture.clientA.opaqueGroupId)!;
             expect(canonical.record.revision).toBe(2);
             expect(canonical.revisionHash).toEqual(accepted.revisionHash);
@@ -389,11 +408,10 @@ describe("private canonical roster chaos", () => {
             const canonical = fixture.store.read(fixture.clientA.opaqueGroupId)!;
             expect(canonical.record.revision).toBe(2);
             expect(canonical.revisionHash).toEqual(privateGroupStateRecordHash(next));
-            await expect(
-                fixture.transport.replaceRecord(
-                    replacementOptions(baseline.current, next, baseline.ownerToken),
-                ),
-            ).rejects.toThrow();
+            const retried = await fixture.transport.replaceRecord(
+                replacementOptions(baseline.current, next, baseline.ownerToken),
+            );
+            expect(retried).toEqual(canonical);
             const reconciled = fixture.clientA.acceptRecord(canonical, nextContent);
             expect(reconciled.record.revisionHash).toEqual(canonical.revisionHash);
             expect(fixture.store.read(fixture.clientA.opaqueGroupId)?.record.revision).toBe(2);
@@ -415,11 +433,10 @@ describe("private canonical roster chaos", () => {
                 replacementOptions(baseline.current, secondRecord, baseline.ownerToken),
             );
             fixture.clientA.acceptRecord(second, secondContent);
-            await expect(
-                fixture.transport.replaceRecord(
-                    replacementOptions(baseline.current, secondRecord, baseline.ownerToken),
-                ),
-            ).rejects.toThrow();
+            const exactRetry = await fixture.transport.replaceRecord(
+                replacementOptions(baseline.current, secondRecord, baseline.ownerToken),
+            );
+            expect(exactRetry).toEqual(second);
 
             const thirdContent = content(fixture, baselineAssignments(fixture), "revision 3");
             const thirdRecord = fixture.clientA.buildSuccessorRecord(second, thirdContent);
@@ -685,6 +702,7 @@ describe("private canonical roster chaos", () => {
                 expect(canonical.record.revision).toBe(cut === "before-persist" ? 1 : 2);
                 if (canonical.record.revision === 2) {
                     const reopened = fixture.newClient(0, {
+                        canonicalVersion: baseline.current.canonicalVersion,
                         revision: baseline.current.record.revision,
                         revisionHash: baseline.current.revisionHash,
                     });
@@ -765,6 +783,7 @@ describe("private canonical roster chaos", () => {
                 if (crashRevisions.has(revision)) {
                     owner.close();
                     owner = fixture.newClient(0, {
+                        canonicalVersion: current.canonicalVersion,
                         revision: current.record.revision,
                         revisionHash: current.revisionHash,
                     });
@@ -797,7 +816,7 @@ describe("private canonical roster chaos", () => {
         }
     }, 120_000);
 
-    test.fails("ROSTER-08 PRODUCT FINDING canonical records carry a server-assigned UUIDv7 version", async () => {
+    test("ROSTER-08 canonical records carry a server-assigned UUIDv7 version", async () => {
         const fixture = privateFixture();
         try {
             const baseline = await createBaseline(fixture);
@@ -807,7 +826,7 @@ describe("private canonical roster chaos", () => {
         }
     });
 
-    test.fails("ROSTER-09 PRODUCT FINDING an exact accepted replacement retry returns the same result", async () => {
+    test("ROSTER-09 an exact accepted replacement retry returns the same result", async () => {
         const fixture = privateFixture();
         try {
             const baseline = await createBaseline(fixture);
@@ -823,6 +842,7 @@ describe("private canonical roster chaos", () => {
             const retried = await fixture.transport.replaceRecord(options);
             expect(retried.revisionHash).toEqual(accepted.revisionHash);
             expect(retried.record).toEqual(accepted.record);
+            expect(retried.canonicalVersion).toBe(accepted.canonicalVersion);
             expect(fixture.store.read(fixture.clientA.opaqueGroupId)?.record.revision).toBe(2);
         } finally {
             fixture.close();
@@ -847,6 +867,7 @@ describe("private canonical roster chaos", () => {
 
             fixture.clock.value += 365 * 24 * 60 * 60_000;
             const reopened = fixture.newClient(0, {
+                canonicalVersion: accepted.canonicalVersion,
                 revision: accepted.record.revision,
                 revisionHash: accepted.revisionHash,
             });
