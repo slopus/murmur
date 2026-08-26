@@ -4,6 +4,10 @@ Policy and orchestration coverage for signed identity access, TTL and size
 limits, pending idempotency, monotonic trimming, race-free long polling, and
 destructive expiration.
 
+Directory orchestration tests also pin ticket-verifier absence, upload
+validation, and exact claim wake behavior; HTTP and store tests cover the full
+ticket and consumption lifecycle.
+
 Test stores implement only the current queue seam.
 
 ```text

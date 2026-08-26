@@ -24,6 +24,12 @@ export {
     parseDeviceRosterMutation,
     validateDeviceRoster,
 } from "./impl/rosterCodec.js";
+export {
+    directoryClaimToJson,
+    parseDirectoryClaimRequest,
+    parseDirectoryPrekeyUpload,
+    parseDirectorySpentNotification,
+} from "./impl/directoryCodec.js";
 export type {
     DeliveryAccountTarget,
     SignedDelivery,
@@ -37,4 +43,9 @@ export type {
     DeviceRosterEntry,
     DeviceRosterJson,
     DeviceRosterMutation,
+    DirectoryClaim,
+    DirectoryClaimDevice,
+    DirectoryLastResortPrekey,
+    DirectoryOneTimePrekey,
+    DirectoryPrekeyUpload,
 } from "./types.js";

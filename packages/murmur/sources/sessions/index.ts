@@ -6,6 +6,7 @@ import {
     createSignedDelivery,
     type DeliveryFetch,
     type DeliveryDeviceRoster,
+    type DeliveryDirectoryClaim,
     type RelaySessionProvider,
     type DeliveryTransport,
     type WebSocketDeliveryTransportOptions,
@@ -24,6 +25,7 @@ import {
     encodeMlsKeyPackage,
     mlsKeyPackageReference,
     serializeMlsKeyPackageBundle,
+    verifyMlsKeyPackage,
 } from "../mls/index.js";
 import type { MurmurStore } from "../storage/index.js";
 import {
@@ -44,6 +46,15 @@ import {
 import {
     ACCOUNT_PEER_ROSTER_PREFIX,
     ACCOUNT_ROSTER_KEY,
+    DIRECTORY_INITIALIZED_KEY,
+    DIRECTORY_LAST_RESORT_KEY,
+    DIRECTORY_ONE_TIME_PREFIX,
+    DIRECTORY_PENDING_PREFIX,
+    DIRECTORY_SPENT_PREFIX,
+    decodeDirectoryLocalPrekey,
+    encodeDirectoryLocalPrekey,
+    encodeDirectoryPrekeyUpload,
+    encodeDirectorySpentNotification,
     deletePreparedAccountEvents,
     encodeDeviceRosterMutation,
     observeDeviceRoster,
@@ -54,8 +65,10 @@ import {
     type MurmurDeviceRosterEntry,
     type MurmurDormantDevice,
     type PreparedAccountEvents,
+    type DirectoryLocalPrekey,
+    type MurmurDirectoryOneTimePrekey,
 } from "../accounts/index.js";
-import { randomBytes } from "../crypto/index.js";
+import { randomBytes, validateIdentityPublicKey } from "../crypto/index.js";
 import {
     SessionEngine,
     type PreparedUpdates,
@@ -69,6 +82,9 @@ import type {
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionMember,
+    MurmurSessionAdmission,
+    MurmurAccountClaim,
+    MurmurClaimedSessionMember,
     MurmurSessionPolicies,
     MurmurResetEvent,
     MurmurResetSession,
@@ -87,6 +103,9 @@ export type {
     MurmurSessionListOptions,
     MurmurSessionPage,
     MurmurSessionMember,
+    MurmurSessionAdmission,
+    MurmurAccountClaim,
+    MurmurClaimedSessionMember,
     MurmurSessionPolicies,
     MurmurResetEvent,
     MurmurResetSession,
@@ -107,6 +126,16 @@ const DEVICE_DORMANCY_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 // KeyPackages outlive the six-month delivery window by thirty days.
 const KEY_PACKAGE_LIFETIME_SECONDS = 210 * 24 * 60 * 60;
 const SYNC_RECONNECT_DELAY_MILLISECONDS = 1_000;
+const DIRECTORY_ONE_TIME_POOL_SIZE = 4;
+const DIRECTORY_NOTIFICATION_TTL_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000 - 60_000;
+
+function compareDirectoryReferences(left: Uint8Array, right: Uint8Array): number {
+    for (let index = 0; index < left.length; index += 1) {
+        const difference = left[index]! - right[index]!;
+        if (difference !== 0) return difference;
+    }
+    return 0;
+}
 
 function encodeResetEvent(reset: MurmurResetEvent): Uint8Array {
     return canonicalJsonBytes({
@@ -419,6 +448,7 @@ export class MurmurClient {
                 account,
             );
             await client.#ensureRegistered();
+            await client.#ensureDirectoryEntry();
             return client;
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
@@ -511,6 +541,345 @@ export class MurmurClient {
         }
     }
 
+    async #localDirectoryPrekey(key: string): Promise<DirectoryLocalPrekey | undefined> {
+        const bytes = await this.#store.get(key);
+        if (bytes === undefined) return undefined;
+        try {
+            return decodeDirectoryLocalPrekey(bytes);
+        } finally {
+            zeroBytes(bytes);
+        }
+    }
+
+    async #directoryOneTimePrekeys(
+        count: number,
+        pending: boolean,
+    ): Promise<readonly MurmurDirectoryOneTimePrekey[]> {
+        const now = this.#now();
+        const bundles: ReturnType<typeof createMlsKeyPackage>[] = [];
+        const stored: {
+            readonly reference: Uint8Array;
+            readonly bytes: Uint8Array;
+            readonly expiresAt: number;
+        }[] = [];
+        const prekeys: MurmurDirectoryOneTimePrekey[] = [];
+        try {
+            for (let index = 0; index < count; index += 1) {
+                const bundle = createMlsKeyPackage(
+                    this.#identity,
+                    Math.floor(now / 1_000),
+                    KEY_PACKAGE_LIFETIME_SECONDS,
+                    this.#account.publicKey,
+                );
+                bundles.push(bundle);
+                const reference = mlsKeyPackageReference(bundle.keyPackage);
+                const keyPackage = encodeMlsKeyPackage(bundle.keyPackage);
+                const privateBytes = serializeMlsKeyPackageBundle(bundle);
+                const notificationExpiresAt = now + DIRECTORY_NOTIFICATION_TTL_MILLISECONDS;
+                const expiresAt = Math.min(
+                    Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n),
+                    notificationExpiresAt,
+                );
+                stored.push({ reference, bytes: privateBytes, expiresAt });
+                prekeys.push({
+                    reference,
+                    keyPackage,
+                    expiresAt,
+                    spentNotification: createSignedDelivery(
+                        this.#identity,
+                        [this.#identity.publicKey],
+                        encodeDirectorySpentNotification(reference),
+                        { createdAt: now, expiresAt: notificationExpiresAt },
+                    ),
+                });
+            }
+            await this.#engine.storeKeyPackages(stored);
+            await this.#store.transaction(async (transaction) => {
+                for (const prekey of prekeys) {
+                    const metadata = encodeDirectoryLocalPrekey(prekey);
+                    const suffix = encodeBase64Url(prekey.reference);
+                    try {
+                        await transaction.set(`${DIRECTORY_ONE_TIME_PREFIX}${suffix}`, metadata);
+                        if (pending) {
+                            await transaction.set(`${DIRECTORY_PENDING_PREFIX}${suffix}`, metadata);
+                        }
+                    } finally {
+                        zeroBytes(metadata);
+                    }
+                }
+            });
+            return prekeys.sort((left, right) =>
+                compareDirectoryReferences(left.reference, right.reference),
+            );
+        } finally {
+            for (const value of stored) zeroBytes(value.bytes);
+            for (const bundle of bundles) destroyMlsKeyPackageBundle(bundle);
+        }
+    }
+
+    async #createDirectoryLastResort(): Promise<DirectoryLocalPrekey> {
+        const bundle = createMlsKeyPackage(
+            this.#identity,
+            Math.floor(this.#now() / 1_000),
+            KEY_PACKAGE_LIFETIME_SECONDS,
+            this.#account.publicKey,
+        );
+        try {
+            const reference = mlsKeyPackageReference(bundle.keyPackage);
+            const keyPackage = encodeMlsKeyPackage(bundle.keyPackage);
+            const expiresAt = Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n);
+            const privateBytes = serializeMlsKeyPackageBundle(bundle);
+            try {
+                await this.#engine.storeKeyPackages([
+                    { reference, bytes: privateBytes, expiresAt, reusable: true },
+                ]);
+            } finally {
+                zeroBytes(privateBytes);
+            }
+            const lastResort = { reference, keyPackage, expiresAt };
+            const metadata = encodeDirectoryLocalPrekey(lastResort);
+            try {
+                await this.#store.set(DIRECTORY_LAST_RESORT_KEY, metadata);
+            } finally {
+                zeroBytes(metadata);
+            }
+            return lastResort;
+        } finally {
+            destroyMlsKeyPackageBundle(bundle);
+        }
+    }
+
+    async #directoryUpload(
+        mode: "replenish" | "rotate",
+        lastResort: DirectoryLocalPrekey,
+        oneTimePrekeys: readonly MurmurDirectoryOneTimePrekey[],
+    ): Promise<void> {
+        if (this.#transport.uploadDirectoryPrekeys === undefined) return;
+        const roster = await this.#ownRoster();
+        const entry = roster?.devices.find((device) =>
+            equalBytes(device.deviceKey, this.#identity.publicKey),
+        );
+        if (entry === undefined) throw new Error("Local device is absent from its account roster");
+        const now = this.#now();
+        const delivery = createSignedDelivery(
+            this.#account,
+            [],
+            encodeDirectoryPrekeyUpload({
+                version: 1,
+                type: "directory_prekey_upload",
+                mode,
+                deviceKey: this.#identity.publicKey,
+                resetGeneration: entry.resetGeneration,
+                oneTimePrekeys,
+                lastResort,
+            }),
+            { createdAt: now, expiresAt: now + DIRECTORY_NOTIFICATION_TTL_MILLISECONDS },
+        );
+        await this.#transport.uploadDirectoryPrekeys(delivery);
+        if (roster !== undefined) {
+            const updated: MurmurDeviceRoster = {
+                ...roster,
+                admissions: roster.admissions.map((admission) =>
+                    equalBytes(admission.deviceKey, this.#identity.publicKey)
+                        ? {
+                              deviceKey: admission.deviceKey,
+                              keyPackage: lastResort.keyPackage,
+                          }
+                        : admission,
+                ),
+            };
+            const bytes = serializeDeviceRoster(updated);
+            try {
+                await this.#store.set(ACCOUNT_ROSTER_KEY, bytes);
+            } finally {
+                zeroBytes(bytes);
+            }
+        }
+    }
+
+    async #directoryMetadata(prefix: string): Promise<Map<string, DirectoryLocalPrekey>> {
+        const page = await this.#store.scan(prefix, { limit: 512 });
+        const values = new Map<string, DirectoryLocalPrekey>();
+        try {
+            for (const [key, bytes] of page) values.set(key, decodeDirectoryLocalPrekey(bytes));
+            return values;
+        } finally {
+            for (const bytes of page.values()) zeroBytes(bytes);
+        }
+    }
+
+    #spentNotification(prekey: DirectoryLocalPrekey): MurmurDirectoryOneTimePrekey {
+        const now = this.#now();
+        const expiresAt = Math.min(prekey.expiresAt, now + DIRECTORY_NOTIFICATION_TTL_MILLISECONDS);
+        return {
+            ...prekey,
+            expiresAt,
+            spentNotification: createSignedDelivery(
+                this.#identity,
+                [this.#identity.publicKey],
+                encodeDirectorySpentNotification(prekey.reference),
+                { createdAt: now, expiresAt },
+            ),
+        };
+    }
+
+    async #replenishDirectoryEntry(lastResort: DirectoryLocalPrekey): Promise<void> {
+        const spentPage = await this.#store.scan(DIRECTORY_SPENT_PREFIX, { limit: 256 });
+        const pendingSpent: string[] = [];
+        try {
+            for (const [key, bytes] of spentPage) {
+                if (utf8Decode(bytes) === "pending") pendingSpent.push(key);
+            }
+        } finally {
+            for (const bytes of spentPage.values()) zeroBytes(bytes);
+        }
+        if (pendingSpent.length === 0) return;
+        let pending = await this.#directoryMetadata(DIRECTORY_PENDING_PREFIX);
+        if (pending.size < pendingSpent.length) {
+            await this.#directoryOneTimePrekeys(pendingSpent.length - pending.size, true);
+            pending = await this.#directoryMetadata(DIRECTORY_PENDING_PREFIX);
+        }
+        const selected = [...pending.entries()].slice(0, pendingSpent.length);
+        await this.#directoryUpload(
+            "replenish",
+            lastResort,
+            selected
+                .map(([, prekey]) => this.#spentNotification(prekey))
+                .sort((left, right) => compareDirectoryReferences(left.reference, right.reference)),
+        );
+        await this.#store.transaction(async (transaction) => {
+            for (const [key] of selected) await transaction.delete(key);
+            for (const key of pendingSpent) await transaction.set(key, utf8Encode("replenished"));
+        });
+    }
+
+    async #ensureDirectoryEntry(): Promise<void> {
+        if (this.#transport.uploadDirectoryPrekeys === undefined) return;
+        let lastResort = await this.#localDirectoryPrekey(DIRECTORY_LAST_RESORT_KEY);
+        if (lastResort === undefined) {
+            const roster = await this.#ownRoster();
+            const admission = roster?.admissions.find((entry) =>
+                equalBytes(entry.deviceKey, this.#identity.publicKey),
+            );
+            if (admission === undefined) throw new Error("Local device admission is missing");
+            const keyPackage = decodeMlsKeyPackage(admission.keyPackage);
+            if (
+                !verifyMlsKeyPackage(keyPackage, Math.floor(this.#now() / 1_000)) ||
+                !equalBytes(keyPackage.leafNode.signatureKey, this.#identity.publicKey) ||
+                !equalBytes(keyPackage.leafNode.credential.identity, this.#account.publicKey)
+            ) {
+                throw new Error("Local last-resort KeyPackage is invalid");
+            }
+            lastResort = {
+                reference: mlsKeyPackageReference(keyPackage),
+                keyPackage: admission.keyPackage,
+                expiresAt: Number((keyPackage.leafNode.notAfter + 1n) * 1_000n),
+            };
+            const metadata = encodeDirectoryLocalPrekey(lastResort);
+            try {
+                await this.#store.set(DIRECTORY_LAST_RESORT_KEY, metadata);
+            } finally {
+                zeroBytes(metadata);
+            }
+        }
+        const initialized = await this.#store.get(DIRECTORY_INITIALIZED_KEY);
+        if (initialized !== undefined) {
+            zeroBytes(initialized);
+            if (lastResort.expiresAt <= this.#now()) {
+                await this.#rotateDirectoryEntry();
+            } else {
+                await this.#replenishDirectoryEntry(lastResort);
+            }
+            return;
+        }
+        const previous = await this.#directoryMetadata(DIRECTORY_ONE_TIME_PREFIX);
+        const oneTimePrekeys = await this.#directoryOneTimePrekeys(
+            DIRECTORY_ONE_TIME_POOL_SIZE,
+            false,
+        );
+        await this.#directoryUpload("rotate", lastResort, oneTimePrekeys);
+        await this.#store.set(DIRECTORY_INITIALIZED_KEY, new Uint8Array([1]));
+        const oldReferences = [...previous.values()].map((entry) => entry.reference);
+        if (oldReferences.length > 0) await this.#engine.deleteKeyPackages(oldReferences);
+    }
+
+    async #rotateDirectoryEntry(): Promise<void> {
+        if (this.#transport.uploadDirectoryPrekeys === undefined) {
+            throw new Error("Delivery transport does not support identity-directory uploads");
+        }
+        const previousOneTime = await this.#directoryMetadata(DIRECTORY_ONE_TIME_PREFIX);
+        const previousLast = await this.#localDirectoryPrekey(DIRECTORY_LAST_RESORT_KEY);
+        const lastResort = await this.#createDirectoryLastResort();
+        const oneTimePrekeys = await this.#directoryOneTimePrekeys(
+            DIRECTORY_ONE_TIME_POOL_SIZE,
+            false,
+        );
+        await this.#directoryUpload("rotate", lastResort, oneTimePrekeys);
+        await this.#store.set(DIRECTORY_INITIALIZED_KEY, new Uint8Array([1]));
+        const references = [
+            ...[...previousOneTime.values()].map((entry) => entry.reference),
+            ...(previousLast === undefined ? [] : [previousLast.reference]),
+        ];
+        if (references.length > 0) await this.#engine.deleteKeyPackages(references);
+    }
+
+    #publicAccountClaim(
+        requestedIdentity: Uint8Array,
+        claim: DeliveryDirectoryClaim,
+    ): MurmurAccountClaim {
+        if (!equalBytes(requestedIdentity, claim.accountKey)) {
+            throw new Error("Directory claim names a different account");
+        }
+        const devices = new Set<string>();
+        const members = claim.devices.map((device): MurmurClaimedSessionMember => {
+            const keyPackage = decodeMlsKeyPackage(device.keyPackage);
+            const encodedDevice = encodeBase64Url(device.deviceKey);
+            if (
+                devices.has(encodedDevice) ||
+                !verifyMlsKeyPackage(keyPackage, Math.floor(this.#now() / 1_000)) ||
+                !equalBytes(keyPackage.leafNode.signatureKey, device.deviceKey) ||
+                !equalBytes(keyPackage.leafNode.credential.identity, requestedIdentity)
+            ) {
+                throw new Error("Directory returned invalid MLS admission material");
+            }
+            devices.add(encodedDevice);
+            return Object.freeze({
+                identity: requestedIdentity.slice(),
+                device: device.deviceKey.slice(),
+                resetGeneration: device.resetGeneration,
+                source: device.source,
+                keyPackage: device.keyPackage.slice(),
+            });
+        });
+        return Object.freeze({
+            identity: requestedIdentity.slice(),
+            rosterRevision: claim.rosterRevision,
+            members: Object.freeze(members),
+        });
+    }
+
+    #flattenAdmissions(
+        admissions: readonly MurmurSessionAdmission[],
+    ): readonly MurmurSessionMember[] {
+        const flattened: MurmurSessionMember[] = [];
+        for (const admission of admissions) {
+            if ("members" in admission) {
+                if (
+                    admission.members.length < 1 ||
+                    admission.members.some(
+                        (member) => !equalBytes(member.identity, admission.identity),
+                    )
+                ) {
+                    throw new Error("Invalid claimed account admission");
+                }
+                flattened.push(...admission.members);
+            } else {
+                flattened.push(admission);
+            }
+        }
+        return flattened;
+    }
+
     async #observeRoster(
         eventId: string,
         roster: MurmurDeviceRoster | DeliveryDeviceRoster,
@@ -553,10 +922,21 @@ export class MurmurClient {
                     },
                 ]);
             } finally {
-                zeroBytes(reference);
                 zeroBytes(stored);
             }
             const keyPackage = encodeMlsKeyPackage(bundle.keyPackage);
+            const expiresAt = Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n);
+            const directoryMetadata = encodeDirectoryLocalPrekey({
+                reference,
+                keyPackage,
+                expiresAt,
+            });
+            try {
+                await this.#store.set(DIRECTORY_LAST_RESORT_KEY, directoryMetadata);
+            } finally {
+                zeroBytes(directoryMetadata);
+            }
+            await this.#store.delete(DIRECTORY_INITIALIZED_KEY);
             const recipients = [
                 ...new Map(
                     [
@@ -694,6 +1074,26 @@ export class MurmurClient {
         });
     }
 
+    /** Claim one exact account from the relay directory using an authentication ticket. */
+    async claimAccount(identityKey: Uint8Array, ticket: Uint8Array): Promise<MurmurAccountClaim> {
+        return this.#tracked(async () => {
+            validateIdentityPublicKey({ publicKey: identityKey });
+            if (ticket.length < 1 || ticket.length > 8 * 1024) {
+                throw new Error("Invalid directory claim ticket");
+            }
+            if (this.#transport.claimDirectory === undefined) {
+                throw new Error("Delivery transport does not support identity-directory claims");
+            }
+            const claim = await this.#transport.claimDirectory(identityKey, ticket);
+            return this.#publicAccountClaim(identityKey, claim);
+        });
+    }
+
+    /** Rotate all unclaimed one-use prekeys and this device's multi-use fallback. */
+    async rotate(): Promise<void> {
+        await this.#exclusive(() => this.#rotateDirectoryEntry());
+    }
+
     /** Create a two-or-more-member MLS session from bare MLS admission material. */
     async createSession(options: CreateMurmurSessionOptions): Promise<MurmurSession> {
         const owner =
@@ -713,7 +1113,7 @@ export class MurmurClient {
                     ...(options.anyoneCanAddMembers === undefined
                         ? {}
                         : { anyoneCanAddMembers: options.anyoneCanAddMembers }),
-                    members: options.members.map((member) => {
+                    members: this.#flattenAdmissions(options.members).map((member) => {
                         const keyPackage = decodeMlsKeyPackage(member.keyPackage);
                         if (!equalBytes(keyPackage.leafNode.credential.identity, member.identity)) {
                             throw new Error("Session member account does not match its KeyPackage");
@@ -767,16 +1167,18 @@ export class MurmurClient {
     }
 
     /** Durably request one MLS member addition from bare admission material. */
-    async addMember(id: Uint8Array, member: MurmurSessionMember): Promise<void> {
-        await this.#exclusive(() => {
-            const keyPackage = decodeMlsKeyPackage(member.keyPackage);
-            if (!equalBytes(keyPackage.leafNode.credential.identity, member.identity)) {
-                throw new Error("Session member account does not match its KeyPackage");
+    async addMember(id: Uint8Array, member: MurmurSessionAdmission): Promise<void> {
+        await this.#exclusive(async () => {
+            for (const admission of this.#flattenAdmissions([member])) {
+                const keyPackage = decodeMlsKeyPackage(admission.keyPackage);
+                if (!equalBytes(keyPackage.leafNode.credential.identity, admission.identity)) {
+                    throw new Error("Session member account does not match its KeyPackage");
+                }
+                await this.#engine.add(id, {
+                    identity: keyPackage.leafNode.signatureKey,
+                    keyPackage,
+                });
             }
-            return this.#engine.add(id, {
-                identity: keyPackage.leafNode.signatureKey,
-                keyPackage,
-            });
         });
         this.#signalSync();
     }
@@ -1225,6 +1627,7 @@ export class MurmurClient {
         );
         const roster = await this.#transport.readDeviceRoster?.(this.#account.publicKey);
         if (roster !== undefined) await this.#observeRoster(`lookup-${roster.revision}`, roster);
+        await this.#ensureDirectoryEntry();
     }
 
     #waitSyncWake(): Promise<void> {

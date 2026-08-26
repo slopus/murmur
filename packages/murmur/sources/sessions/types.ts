@@ -136,9 +136,26 @@ export interface MurmurSessionMember {
     readonly keyPackage: Uint8Array;
 }
 
+/** One device-level prekey returned by an exact account directory claim. */
+export interface MurmurClaimedSessionMember extends MurmurSessionMember {
+    readonly device: Uint8Array;
+    readonly resetGeneration: number;
+    readonly source: "one_time" | "last_resort";
+}
+
+/** Ticket-authorized account claim accepted directly by session construction and Add. */
+export interface MurmurAccountClaim {
+    readonly identity: Uint8Array;
+    readonly rosterRevision: number;
+    readonly members: readonly MurmurClaimedSessionMember[];
+}
+
+/** Direct or directory-claimed admission material. */
+export type MurmurSessionAdmission = MurmurSessionMember | MurmurAccountClaim;
+
 /** Construction inputs for one new local session. */
 export interface CreateMurmurSessionOptions extends CreateMurmurSessionCommonOptions {
-    readonly members: readonly MurmurSessionMember[];
+    readonly members: readonly MurmurSessionAdmission[];
 }
 
 /** Stateful-session resource limits. */

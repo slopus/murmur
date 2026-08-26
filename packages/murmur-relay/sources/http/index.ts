@@ -1,6 +1,8 @@
 import {
     RelayError,
+    directoryClaimToJson,
     deviceRosterToJson,
+    parseDirectoryClaimRequest,
     parseDeviceRosterLookup,
     parseSignedDelivery,
     parseSignedQueueAck,
@@ -284,6 +286,9 @@ export function createRelayFetchHandler(
                     ? context?.remoteAddress
                     : (request.headers.get(remoteAddressHeader) ?? undefined);
             const admissionPrincipal = remoteAddress ?? defaultAdmissionPrincipal;
+            const directoryRequest =
+                request.method === "POST" &&
+                (url.pathname === "/v1/directory/claim" || url.pathname === "/v1/directory/upload");
             if (
                 remoteAddress !== undefined &&
                 (remoteAddress.length < 1 || remoteAddress.length > 255)
@@ -305,13 +310,18 @@ export function createRelayFetchHandler(
             if (
                 request.method !== "OPTIONS" &&
                 requireRemoteAddress &&
-                remoteAddress === undefined
+                remoteAddress === undefined &&
+                !directoryRequest
             ) {
                 throw new RelayError(503, "Remote address admission context is required", {
                     error: "admission_context_required",
                 });
             }
-            if (request.method !== "OPTIONS" && admissionPrincipal !== undefined) {
+            if (
+                request.method !== "OPTIONS" &&
+                admissionPrincipal !== undefined &&
+                !directoryRequest
+            ) {
                 const now = Date.now();
                 let window = addressWindows.get(admissionPrincipal);
                 if (window !== undefined && now - window.startedAt >= MINUTE_MILLISECONDS) {
@@ -389,6 +399,31 @@ export function createRelayFetchHandler(
                 const roster = await relay.mutateDeviceRoster(delivery, admissionPrincipal);
                 return boundedJson(
                     { roster: deviceRosterToJson(roster) },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/directory/upload") {
+                const delivery = parseSignedDelivery(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                await relay.uploadDirectoryPrekeys(delivery);
+                return boundedJson(
+                    { uploaded: true },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
+            if (request.method === "POST" && url.pathname === "/v1/directory/claim") {
+                const claimRequest = parseDirectoryClaimRequest(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const claim = await relay.claimDirectory(
+                    claimRequest.accountKey,
+                    claimRequest.ticket,
+                );
+                return boundedJson(
+                    directoryClaimToJson(claim),
                     relay.options.maximumJsonBodyBytes,
                     corsHeaders,
                 );

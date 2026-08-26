@@ -22,6 +22,13 @@ export type {
     SignedQueueRead,
     SignedQueueReadJson,
 } from "./protocol/index.js";
+export { LocalDirectoryTicketIssuer } from "./directory/index.js";
+export type {
+    DirectoryTicketClaims,
+    DirectoryTicketVerifier,
+    IssueDirectoryTicketOptions,
+    LocalDirectoryTicketIssuerOptions,
+} from "./directory/index.js";
 export {
     DELIVERY_RETENTION_MILLISECONDS,
     InProcessWakeSource,

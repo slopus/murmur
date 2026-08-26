@@ -18,6 +18,11 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 rosters: unknown;
                 roster_devices: unknown;
                 roster_nonces: unknown;
+                directory_devices: unknown;
+                directory_prekeys: unknown;
+                directory_references: unknown;
+                directory_nonces: unknown;
+                directory_tickets: unknown;
             }>(
                 `SELECT
                     to_regclass('murmur_queue_schema') AS marker,
@@ -27,7 +32,12 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     to_regclass('murmur_queue_references') AS references,
                     to_regclass('murmur_device_rosters') AS rosters,
                     to_regclass('murmur_device_roster_devices') AS roster_devices,
-                    to_regclass('murmur_device_roster_nonces') AS roster_nonces`,
+                    to_regclass('murmur_device_roster_nonces') AS roster_nonces,
+                    to_regclass('murmur_directory_devices') AS directory_devices,
+                    to_regclass('murmur_directory_prekeys') AS directory_prekeys,
+                    to_regclass('murmur_directory_prekey_references') AS directory_references,
+                    to_regclass('murmur_directory_upload_nonces') AS directory_nonces,
+                    to_regclass('murmur_directory_ticket_uses') AS directory_tickets`,
             );
             const row = presence.rows[0];
             if (row === undefined) throw new Error("Missing Postgres schema inspection");
@@ -39,7 +49,12 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     row.references !== null ||
                     row.rosters !== null ||
                     row.roster_devices !== null ||
-                    row.roster_nonces !== null)
+                    row.roster_nonces !== null ||
+                    row.directory_devices !== null ||
+                    row.directory_prekeys !== null ||
+                    row.directory_references !== null ||
+                    row.directory_nonces !== null ||
+                    row.directory_tickets !== null)
             ) {
                 throw new Error("Incomplete Postgres queue schema");
             }
@@ -52,7 +67,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 const schemaVersion = bigintColumn(versionRow.version);
-                if (schemaVersion !== 2n) {
+                if (schemaVersion !== 2n && schemaVersion !== 3n) {
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 if (
@@ -66,6 +81,35 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 ) {
                     throw new Error("Incomplete Postgres queue schema");
                 }
+                if (schemaVersion === 2n) {
+                    if (
+                        row.directory_devices !== null ||
+                        row.directory_prekeys !== null ||
+                        row.directory_references !== null ||
+                        row.directory_nonces !== null ||
+                        row.directory_tickets !== null
+                    ) {
+                        throw new Error("Incomplete Postgres directory schema");
+                    }
+                    await connection.transaction(async (transaction) => {
+                        for (const statement of directoryStatements()) {
+                            await transaction.query(statement);
+                        }
+                        await transaction.query(
+                            "UPDATE murmur_queue_schema SET version = 3 WHERE singleton = 1",
+                        );
+                    });
+                    return;
+                }
+                if (
+                    row.directory_devices === null ||
+                    row.directory_prekeys === null ||
+                    row.directory_references === null ||
+                    row.directory_nonces === null ||
+                    row.directory_tickets === null
+                ) {
+                    throw new Error("Incomplete Postgres directory schema");
+                }
                 return;
             }
             const statements = [
@@ -73,7 +117,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 2)`,
+                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3)`,
                 `CREATE TABLE murmur_queue_global (
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     last_event_id uuid,
@@ -152,6 +196,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     created_at bigint NOT NULL,
                     PRIMARY KEY (account_key, nonce)
                 )`,
+                ...directoryStatements(),
             ];
             await connection.transaction(async (transaction) => {
                 for (const statement of statements) {
@@ -166,4 +211,60 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
             await connection.query("SELECT pg_advisory_unlock($1::bigint)", [SCHEMA_LOCK]);
         }
     });
+}
+
+function directoryStatements(): readonly string[] {
+    return [
+        `CREATE TABLE murmur_directory_devices (
+            account_key bytea NOT NULL,
+            device_key bytea NOT NULL,
+            last_resort_reference bytea NOT NULL
+                CHECK (octet_length(last_resort_reference) = 32),
+            last_resort_expires_at bigint NOT NULL,
+            PRIMARY KEY (account_key, device_key),
+            FOREIGN KEY (account_key, device_key)
+                REFERENCES murmur_device_roster_devices(account_key, device_key)
+                ON DELETE CASCADE
+        )`,
+        `CREATE TABLE murmur_directory_prekeys (
+            account_key bytea NOT NULL,
+            device_key bytea NOT NULL,
+            reference bytea NOT NULL CHECK (octet_length(reference) = 32),
+            key_package bytea NOT NULL CHECK (octet_length(key_package) > 0),
+            notification_json jsonb NOT NULL,
+            expires_at bigint NOT NULL,
+            created_at bigint NOT NULL,
+            PRIMARY KEY (account_key, device_key, reference),
+            FOREIGN KEY (account_key, device_key)
+                REFERENCES murmur_directory_devices(account_key, device_key)
+                ON DELETE CASCADE
+        )`,
+        `CREATE INDEX murmur_directory_prekey_claim
+            ON murmur_directory_prekeys(account_key, device_key, created_at, reference)`,
+        `CREATE TABLE murmur_directory_prekey_references (
+            account_key bytea NOT NULL REFERENCES murmur_device_rosters(account_key)
+                ON DELETE CASCADE,
+            device_key bytea NOT NULL CHECK (octet_length(device_key) = 32),
+            reference bytea NOT NULL CHECK (octet_length(reference) = 32),
+            first_seen_at bigint NOT NULL,
+            PRIMARY KEY (account_key, device_key, reference)
+        )`,
+        `CREATE TABLE murmur_directory_upload_nonces (
+            account_key bytea NOT NULL REFERENCES murmur_device_rosters(account_key)
+                ON DELETE CASCADE,
+            nonce text NOT NULL,
+            created_at bigint NOT NULL,
+            PRIMARY KEY (account_key, nonce)
+        )`,
+        `CREATE TABLE murmur_directory_ticket_uses (
+            issuer text NOT NULL,
+            ticket_id bytea NOT NULL CHECK (octet_length(ticket_id) = 32),
+            claim_budget bigint NOT NULL CHECK (claim_budget >= 1),
+            claims_used bigint NOT NULL CHECK (
+                claims_used >= 1 AND claims_used <= claim_budget
+            ),
+            expires_at bigint NOT NULL,
+            PRIMARY KEY (issuer, ticket_id)
+        )`,
+    ];
 }

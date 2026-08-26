@@ -328,6 +328,12 @@ describe("identity queue relay", () => {
             async mutateDeviceRoster() {
                 throw new Error("not used");
             },
+            async uploadDirectoryPrekeys() {
+                throw new Error("not used");
+            },
+            async claimDirectory() {
+                throw new Error("not used");
+            },
             async publish(
                 _delivery: SignedDelivery,
                 _now: number,

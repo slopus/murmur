@@ -46,6 +46,7 @@ export type {
     DeliveryAccountTarget,
     DeliveryFetch,
     DeliveryDeviceRoster,
+    DeliveryDirectoryClaim,
     DeliveryPublishOutcome,
     DeliveryStreamHooks,
     DeliveryTransport,

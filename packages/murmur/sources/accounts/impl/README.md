@@ -8,5 +8,11 @@ notification.
 `accountRecords.ts` prepares only account-device lifecycle events and durable
 roster convergence jobs.
 
+`directoryCodec.ts` owns strict directory upload and spent-notification
+plaintext. `directoryRecords.ts` stores non-secret reference metadata for the
+current last-resort package, one-use pool, pending replenishment, and spent
+markers. Matching private KeyPackage bundles remain in the session engine's
+durable KeyPackage storage.
+
 There is no provisioning transcript, roster chain, device credential, or
 approval ceremony.

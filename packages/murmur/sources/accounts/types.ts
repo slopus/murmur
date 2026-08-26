@@ -53,3 +53,29 @@ export interface MurmurDormantDevice {
     readonly lastActivityAt: number;
     readonly dormantSince: number;
 }
+
+/** One one-use directory KeyPackage and its pre-authorized inbox notification. */
+export interface MurmurDirectoryOneTimePrekey {
+    readonly reference: Uint8Array;
+    readonly keyPackage: Uint8Array;
+    readonly expiresAt: number;
+    readonly spentNotification: import("../delivery/types.js").SignedDelivery;
+}
+
+/** Multi-use fallback retained until the device rotates its directory entry. */
+export interface MurmurDirectoryLastResortPrekey {
+    readonly reference: Uint8Array;
+    readonly keyPackage: Uint8Array;
+    readonly expiresAt: number;
+}
+
+/** Account-signed replacement or replenishment for one exact roster device. */
+export interface MurmurDirectoryPrekeyUpload {
+    readonly version: 1;
+    readonly type: "directory_prekey_upload";
+    readonly mode: "replenish" | "rotate";
+    readonly deviceKey: Uint8Array;
+    readonly resetGeneration: number;
+    readonly oneTimePrekeys: readonly MurmurDirectoryOneTimePrekey[];
+    readonly lastResort: MurmurDirectoryLastResortPrekey;
+}

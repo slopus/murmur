@@ -2,6 +2,7 @@ import { decodeBase64Url, encodeBase64Url, utf8Decode } from "../../utils/index.
 import type {
     DeliveryFetch,
     DeliveryDeviceRoster,
+    DeliveryDirectoryClaim,
     DeliveryPublishOutcome,
     DeliveryTransport,
     InboxStreamEvent,
@@ -203,6 +204,49 @@ function roster(value: unknown): DeliveryDeviceRoster {
     };
 }
 
+function directoryClaim(value: unknown): DeliveryDirectoryClaim {
+    const input = object(value);
+    exact(input, ["version", "accountKey", "rosterRevision", "devices"]);
+    if (
+        input.version !== 1 ||
+        typeof input.accountKey !== "string" ||
+        !Array.isArray(input.devices)
+    ) {
+        throw new Error("Invalid relay response");
+    }
+    const accountKey = decodeBase64Url(input.accountKey);
+    if (accountKey.length !== 32 || input.devices.length > 256) {
+        throw new Error("Invalid relay response");
+    }
+    return {
+        version: 1,
+        accountKey,
+        rosterRevision: safeInteger(input.rosterRevision),
+        devices: input.devices.map((candidate) => {
+            const entry = object(candidate);
+            exact(entry, ["deviceKey", "resetGeneration", "keyPackage", "source"]);
+            if (
+                typeof entry.deviceKey !== "string" ||
+                typeof entry.keyPackage !== "string" ||
+                (entry.source !== "one_time" && entry.source !== "last_resort")
+            ) {
+                throw new Error("Invalid relay response");
+            }
+            const deviceKey = decodeBase64Url(entry.deviceKey);
+            const keyPackage = decodeBase64Url(entry.keyPackage);
+            if (deviceKey.length !== 32 || keyPackage.length < 1) {
+                throw new Error("Invalid relay response");
+            }
+            return {
+                deviceKey,
+                resetGeneration: safeInteger(entry.resetGeneration),
+                keyPackage,
+                source: entry.source,
+            };
+        }),
+    };
+}
+
 async function boundedResponseJson(response: Response, maximumBytes: number): Promise<unknown> {
     const declared = response.headers.get("content-length");
     if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maximumBytes)) {
@@ -313,6 +357,41 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         );
         exact(value, ["roster"]);
         return roster(value.roster);
+    }
+
+    /** Upload one account-signed per-device directory replacement or replenishment. */
+    async uploadDirectoryPrekeys(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+        const value = object(
+            await this.#post("/v1/directory/upload", signedDeliveryToJson(delivery), signal),
+        );
+        exact(value, ["uploaded"]);
+        if (value.uploaded !== true) throw new Error("Invalid relay response");
+    }
+
+    /** Spend one opaque authentication ticket on an exact account identity claim. */
+    async claimDirectory(
+        accountKey: Uint8Array,
+        ticket: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDirectoryClaim> {
+        if (accountKey.length !== 32 || ticket.length < 1) {
+            throw new Error("Invalid directory claim");
+        }
+        const claim = directoryClaim(
+            await this.#post(
+                "/v1/directory/claim",
+                {
+                    version: 1,
+                    accountKey: encodeBase64Url(accountKey),
+                    ticket: encodeBase64Url(ticket),
+                },
+                signal,
+            ),
+        );
+        if (!accountKey.every((value, index) => claim.accountKey[index] === value)) {
+            throw new Error("Directory response names a different account");
+        }
+        return claim;
     }
 
     /** Read one bounded page from an identity inbox. */

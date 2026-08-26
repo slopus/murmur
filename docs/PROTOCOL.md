@@ -12,9 +12,38 @@ AES-256-GCM. Its versioned canonical binary blob is application-owned and has no
 relay operation or recovery endpoint. Password rewrapping preserves the full
 typed root-material payload while rotating the salt and nonce.
 
-MLS KeyPackages are signed by the device identity. `createKeyPackage()` stores
-the matching one-use private bundle durably and returns bare public admission
-material containing the account identity and encoded KeyPackage.
+MLS KeyPackages are signed by the device identity and bind the stable account
+identity in their credential. `createKeyPackage()` stores one matching private
+bundle for direct application-routed admission. Directory admission instead
+maintains a pool of one-use KeyPackages and exactly one reusable last-resort
+KeyPackage for every active account device.
+
+## Identity directory
+
+Opening an HTTP-backed client automatically uploads each device's initial
+directory pool. The upload is an account-signed, recipientless delivery bound
+to the current device roster generation. `rotate()` replaces all unclaimed
+one-use packages and the last-resort package; automatic replenishment appends
+fresh one-use packages while naming the unchanged last-resort reference.
+Upload operation IDs and retired directory references are replay-protected
+permanently. After an ambiguous transport response, byte-identical active
+one-use entries and the exact current last-resort entry may be reasserted
+idempotently; they cannot be changed under an existing reference.
+
+An authentication server issues opaque, signed tickets with an expiry and an
+exact-claim budget. The relay verifies a ticket through a pluggable verifier and
+atomically spends one budget use when claiming an exact 32-byte account key.
+Each active device contributes its oldest unexpired one-use KeyPackage, or its
+nonconsuming last-resort package when the pool is empty. Unknown accounts return
+the same response envelope with revision zero and no devices; there is no
+listing, search, prefix, or existence endpoint.
+
+Consuming a one-use package atomically queues its device-signed spent notice to
+the owning device's ordinary inbox. Murmur retains the matching private bundle
+until it accepts the corresponding Welcome, or until explicit rotation removes
+it, and automatically replenishes spent pool slots. A last-resort private
+bundle remains reusable until rotation, so independent Welcomes produced from
+the same fallback package are valid.
 
 ## Delivery envelope
 
@@ -38,10 +67,11 @@ monotonic and destructively trims the processed prefix.
 
 ## MLS bootstrap
 
-Session creation consumes bare admission material for every new member. Murmur
-creates the initial MLS epoch, a Welcome for each recipient, and exact durable
-outboxes. A recipient authenticates and decrypts the Welcome using the retained
-one-use private KeyPackage bundle.
+Session creation consumes either bare admission material or an exact-account
+directory claim. A claim expands to one current admission per account device.
+Murmur creates the initial MLS epoch, a Welcome for each recipient, and exact
+durable outboxes. A recipient authenticates and decrypts the Welcome using its
+retained one-use or reusable last-resort private KeyPackage bundle.
 
 The resulting session starts pending. Protocol frames continue to advance the
 pending epoch, while application frames remain buffered and hidden. The

@@ -1,6 +1,8 @@
 import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
+    parseDirectoryPrekeyUpload,
+    parseDirectorySpentNotification,
     parseDeviceRosterMutation,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
@@ -10,7 +12,9 @@ import {
     type SignedQueueAck,
     type SignedQueueRead,
     type DeviceRoster,
+    type DirectoryClaim,
 } from "../protocol/index.js";
+import type { DirectoryTicketVerifier } from "../directory/index.js";
 import type {
     AcknowledgeOutcome,
     PublishOutcome,
@@ -164,6 +168,7 @@ export class RelayService {
     readonly #wakeSource: WakeSource;
     readonly #now: () => number;
     readonly #options: ResolvedRelayOptions;
+    readonly #directoryTicketVerifier: DirectoryTicketVerifier | undefined;
     readonly #wakeSubscription: Promise<void>;
     readonly #waiters = new Map<string, Set<Waiter>>();
     readonly #streamCounts = new Map<string, number>();
@@ -177,11 +182,13 @@ export class RelayService {
         options: RelayOptions = {},
         wakeSource: WakeSource = new InProcessWakeSource(),
         now: () => number = Date.now,
+        directoryTicketVerifier?: DirectoryTicketVerifier,
     ) {
         this.#store = store;
         this.#options = resolveOptions(options);
         this.#wakeSource = wakeSource;
         this.#now = now;
+        this.#directoryTicketVerifier = directoryTicketVerifier;
         this.#wakeSubscription = wakeSource.subscribe((queueId) => this.#wake(queueId));
         void this.#wakeSubscription.catch(() => undefined);
     }
@@ -332,6 +339,122 @@ export class RelayService {
             await this.#wakeSource.notify(queueId).catch(() => undefined);
         }
         return roster;
+    }
+
+    /** Validate and atomically publish one account-signed per-device prekey upload. */
+    async uploadDirectoryPrekeys(delivery: SignedDelivery): Promise<void> {
+        this.#assertOpen();
+        validateSignedDeliveryShape(delivery);
+        if (!verifyDeliverySignature(delivery)) {
+            throw new RelayError(401, "Invalid directory upload signature", {
+                error: "unauthorized",
+            });
+        }
+        if (delivery.recipients.length !== 0 || delivery.targetAccounts.length !== 0) {
+            throw new RelayError(400, "Directory uploads may not target inboxes", {
+                error: "malformed",
+            });
+        }
+        if (delivery.ciphertext.length > this.#options.maximumCiphertextBytes) {
+            throw new RelayError(413, "Directory upload exceeds relay limit", {
+                error: "limit",
+            });
+        }
+        const now = this.#now();
+        if (
+            delivery.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt < now - this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > this.#options.maximumDeliveryTtlMilliseconds
+        ) {
+            throw new RelayError(401, "Directory upload violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        const upload = parseDirectoryPrekeyUpload(delivery.ciphertext);
+        for (const entry of upload.oneTimePrekeys) {
+            const notification = entry.spentNotification;
+            if (
+                !equalBytes(notification.sender, upload.deviceKey) ||
+                notification.recipients.length !== 1 ||
+                !equalBytes(notification.recipients[0]!, upload.deviceKey) ||
+                notification.targetAccounts.length !== 0 ||
+                notification.ciphertext.length > this.#options.maximumCiphertextBytes ||
+                notification.createdAt >
+                    now + this.#options.maximumAuthenticationSkewMilliseconds ||
+                notification.expiresAt <= now ||
+                notification.expiresAt - now > this.#options.maximumDeliveryTtlMilliseconds ||
+                notification.expiresAt < entry.expiresAt ||
+                !equalBytes(
+                    parseDirectorySpentNotification(notification.ciphertext),
+                    entry.reference,
+                ) ||
+                !verifyDeliverySignature(notification)
+            ) {
+                throw new RelayError(401, "Invalid spent-prekey notification", {
+                    error: "unauthorized",
+                });
+            }
+        }
+        await this.#store.uploadDirectoryPrekeys(delivery, upload, now);
+    }
+
+    /** Verify one authentication-server ticket and atomically claim an exact identity. */
+    async claimDirectory(accountKey: Uint8Array, ticket: Uint8Array): Promise<DirectoryClaim> {
+        this.#assertOpen();
+        if (this.#directoryTicketVerifier === undefined) {
+            throw new RelayError(503, "Directory ticket verification is unavailable", {
+                error: "ticket_verifier_unavailable",
+            });
+        }
+        const now = this.#now();
+        let claims;
+        try {
+            claims = await this.#directoryTicketVerifier.verify(ticket, now);
+        } catch {
+            throw new RelayError(401, "Invalid directory claim ticket", {
+                error: "invalid_ticket",
+            });
+        }
+        if (
+            claims.issuer.length < 1 ||
+            claims.issuer.length > 128 ||
+            claims.ticketId.length !== 32 ||
+            !Number.isSafeInteger(claims.expiresAt) ||
+            claims.expiresAt <= now ||
+            !Number.isSafeInteger(claims.claimBudget) ||
+            claims.claimBudget < 1 ||
+            claims.claimBudget > 1_000_000
+        ) {
+            throw new RelayError(401, "Expired or invalid directory claim ticket", {
+                error: "invalid_ticket",
+            });
+        }
+        const claim = await this.#store.claimDirectory(
+            accountKey,
+            claims,
+            now,
+            {
+                maximumItems: this.#options.maximumQueueItems,
+                maximumBytes: this.#options.maximumQueueBytes,
+                maximumSenderItems: this.#options.maximumSenderItems,
+                maximumSenderBytes: this.#options.maximumSenderBytes,
+                maximumSenderReferences: this.#options.maximumSenderReferences,
+                maximumAdmissionReferences: this.#options.maximumAdmissionReferences,
+                maximumGlobalItems: this.#options.maximumGlobalItems,
+                maximumGlobalBytes: this.#options.maximumGlobalBytes,
+                maximumGlobalReferences: this.#options.maximumGlobalReferences,
+            },
+            sha256(new TextEncoder().encode(`directory-ticket:${claims.issuer}`)),
+        );
+        for (const device of claim.devices) {
+            if (device.source !== "one_time") continue;
+            const queueId = encodeBase64Url(device.deviceKey);
+            this.#wake(queueId);
+            await this.#wakeSource.notify(queueId).catch(() => undefined);
+        }
+        return claim;
     }
 
     /** Authenticate and read one identity's queue, optionally long-polling. */

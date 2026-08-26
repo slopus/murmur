@@ -43,8 +43,16 @@ ignore destroys the pending secrets and data.
 The relay authenticates queue reads and acknowledgements, validates signed
 delivery envelopes, atomically fans one event out to exact recipient inboxes,
 and retains only unacknowledged unexpired ciphertext. It also owns one current
-device roster per exact account identity, without learning MLS, descriptor,
-membership, role, application, or conversation semantics.
+device roster and its per-device directory prekey pools per exact account
+identity, without learning MLS, descriptor, membership, role, application, or
+conversation semantics.
+
+Directory claims are authorized by opaque authentication-server tickets. A
+pluggable verifier supplies issuer, expiry, ticket ID, and claim budget; storage
+atomically accounts ticket use, consumes at most one one-use KeyPackage per
+active device, and queues each pre-authorized spent notice. Ticket issuance is
+the directory's rate-limiting boundary. Exact claims do not expose listing or
+search and return the same envelope shape for known and unknown identities.
 
 UUIDv7 event IDs order deliveries only within one inbox. Signed acknowledgement
 is monotonic and separate from delivery. A continuity generation detects a
@@ -64,6 +72,11 @@ Restoring an account on a new store generates an independent device key and
 self-registers it through an account-signed relay mutation. Ordinary roster
 notifications drive MLS convergence, while public session views continue to
 expose account identities instead of individual device leaves.
+
+Each HTTP-backed client publishes an initial one-use KeyPackage pool plus one
+multi-use last-resort package after registration. Spent notices received from
+the ordinary inbox trigger replenishment. Explicit rotation replaces both the
+unclaimed pool and fallback while deleting superseded private material.
 
 ## Failure boundaries
 

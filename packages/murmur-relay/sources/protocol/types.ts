@@ -122,3 +122,45 @@ export type DeviceRosterMutation =
           readonly deviceKey: Uint8Array;
           readonly resetGeneration: number;
       };
+
+/** One one-use directory KeyPackage and its pre-authorized spent notification. */
+export interface DirectoryOneTimePrekey {
+    readonly reference: Uint8Array;
+    readonly keyPackage: Uint8Array;
+    readonly expiresAt: number;
+    readonly spentNotification: SignedDelivery;
+}
+
+/** One multi-use last-resort directory KeyPackage. */
+export interface DirectoryLastResortPrekey {
+    readonly reference: Uint8Array;
+    readonly keyPackage: Uint8Array;
+    readonly expiresAt: number;
+}
+
+/** Account-signed directory state carried by an otherwise recipient-less delivery. */
+export interface DirectoryPrekeyUpload {
+    readonly version: 1;
+    readonly type: "directory_prekey_upload";
+    readonly mode: "replenish" | "rotate";
+    readonly deviceKey: Uint8Array;
+    readonly resetGeneration: number;
+    readonly oneTimePrekeys: readonly DirectoryOneTimePrekey[];
+    readonly lastResort: DirectoryLastResortPrekey;
+}
+
+/** One exact device entry returned by a ticket-authorized directory claim. */
+export interface DirectoryClaimDevice {
+    readonly deviceKey: Uint8Array;
+    readonly resetGeneration: number;
+    readonly keyPackage: Uint8Array;
+    readonly source: "one_time" | "last_resort";
+}
+
+/** Exact-account directory result; unknown accounts use revision zero and no devices. */
+export interface DirectoryClaim {
+    readonly version: 1;
+    readonly accountKey: Uint8Array;
+    readonly rosterRevision: number;
+    readonly devices: readonly DirectoryClaimDevice[];
+}

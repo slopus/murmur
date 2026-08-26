@@ -1,6 +1,7 @@
 # Delivery implementation
 
-`deliveryHttpTransport.ts` implements the current HTTP/SSE transport.
+`deliveryHttpTransport.ts` implements the current HTTP/SSE transport, including
+strict directory upload and exact-account claim responses.
 `deliveryNegotiation.ts` signs temporary-session requests and validates routed
 WebSocket tickets. `deliveryWebSocketTransport.ts` implements the current
 WebSocket framing while keeping every queue operation device-signed.

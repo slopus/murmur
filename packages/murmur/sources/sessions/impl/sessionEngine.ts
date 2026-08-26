@@ -17,6 +17,10 @@ import {
     accountConvergenceJobs,
     ACCOUNT_PEER_ROSTER_PREFIX,
     ACCOUNT_ROSTER_KEY,
+    DIRECTORY_ONE_TIME_PREFIX,
+    DIRECTORY_SPENT_PREFIX,
+    decodeDirectorySpentNotification,
+    deleteDirectoryPrekeyMarkers,
     decodeDeviceRosterMutation,
     isActiveDevice,
     observeDeviceRoster,
@@ -740,6 +744,7 @@ export class SessionEngine {
                 await transaction.delete(keyPackageKey(reference));
                 await transaction.delete(keyPackageExpiryKey(reference));
                 await transaction.delete(keyPackageReusableKey(reference));
+                await deleteDirectoryPrekeyMarkers(transaction, reference);
             }
         });
     }
@@ -779,6 +784,11 @@ export class SessionEngine {
                     await transaction.delete(expiryKey);
                     await transaction.delete(packageKey);
                     await transaction.delete(`${KEY_PACKAGE_REUSABLE_PREFIX}${suffix}`);
+                    try {
+                        await deleteDirectoryPrekeyMarkers(transaction, decodeBase64Url(suffix));
+                    } catch {
+                        // The malformed suffix is already being removed from private state.
+                    }
                 } else {
                     try {
                         if (decodeBase64Url(suffix).length !== 32) {
@@ -2492,6 +2502,26 @@ export class SessionEngine {
             utf8Encode(String(queued.delivery.createdAt).padStart(16, "0")),
         );
         try {
+            const reference = decodeDirectorySpentNotification(queued.delivery.ciphertext);
+            if (!equalBytes(queued.delivery.sender, this.#identity.publicKey)) {
+                throw new TerminalInboxDeliveryError("foreign_spent_prekey_notification");
+            }
+            const metadata = await transaction.get(
+                `${DIRECTORY_ONE_TIME_PREFIX}${encodeBase64Url(reference)}`,
+            );
+            if (metadata === undefined) {
+                throw new TerminalInboxDeliveryError("unknown_spent_prekey");
+            }
+            zeroBytes(metadata);
+            await transaction.set(
+                `${DIRECTORY_SPENT_PREFIX}${encodeBase64Url(reference)}`,
+                utf8Encode("pending"),
+            );
+            return;
+        } catch (error: unknown) {
+            if (error instanceof TerminalInboxDeliveryError) throw error;
+        }
+        try {
             decodeDeviceRosterMutation(queued.delivery.ciphertext);
             if (!equalBytes(queued.delivery.sender, this.#accountKey)) {
                 throw new TerminalInboxDeliveryError("foreign_roster_mutation");
@@ -3370,6 +3400,10 @@ export class SessionEngine {
                     await transaction.delete(keyPackageKey(record.bootstrapKeyPackageReference));
                     await transaction.delete(
                         keyPackageExpiryKey(record.bootstrapKeyPackageReference),
+                    );
+                    await deleteDirectoryPrekeyMarkers(
+                        transaction,
+                        record.bootstrapKeyPackageReference,
                     );
                 } else {
                     zeroBytes(reusable);

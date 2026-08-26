@@ -1,4 +1,11 @@
-import type { DeviceRoster, DeviceRosterMutation, SignedDelivery } from "../protocol/index.js";
+import type {
+    DeviceRoster,
+    DeviceRosterMutation,
+    DirectoryClaim,
+    DirectoryPrekeyUpload,
+    SignedDelivery,
+} from "../protocol/index.js";
+import type { DirectoryTicketClaims } from "../directory/index.js";
 
 /** Maximum expired delivery records removed by one writer transaction. */
 export const RELAY_EXPIRATION_BATCH_ITEMS = 100;
@@ -70,6 +77,20 @@ export interface RelayStore {
         limits: QueueLimits,
         admissionPrincipal: Uint8Array,
     ): Promise<DeviceRoster>;
+    /** Replace or replenish one active device's account-signed directory state. */
+    uploadDirectoryPrekeys(
+        delivery: SignedDelivery,
+        upload: DirectoryPrekeyUpload,
+        now: number,
+    ): Promise<void>;
+    /** Spend one ticket use and atomically claim one prekey per active device. */
+    claimDirectory(
+        accountKey: Uint8Array,
+        ticket: DirectoryTicketClaims,
+        now: number,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<DirectoryClaim>;
     readQueue(
         recipient: Uint8Array,
         after: string | null,

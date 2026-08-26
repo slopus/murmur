@@ -1,11 +1,12 @@
 # Sessions
 
 `MurmurClient` is the stateful public facade. It owns account restoration,
-device self-registration, bare KeyPackage creation, session lifecycle, service
-routing, durable synchronization, and cleanup.
+device self-registration, direct and directory KeyPackage admission, session
+lifecycle, service routing, durable synchronization, and cleanup.
 
 ```text
 bare KeyPackage -> sealed Welcome -> pending session -> activate or ignore
+ticket + exact account -> per-device claim -> sealed Welcomes
 active epoch -> persisted ratchet + exact outbox -> relay echo -> convergence
 ```
 
@@ -16,3 +17,9 @@ resolves.
 
 The implementation persists session records, active and staged epochs, intents,
 outboxes, replay markers, routing decisions, and queue progress atomically.
+
+`claimAccount()` validates every returned MLS signature, lifetime, device key,
+and account credential before exposing an immutable claim. `createSession()`
+and `addMember()` flatten that claim into device-level MLS additions. Client
+open publishes initial directory material, ordinary spent notices trigger
+replenishment, and `rotate()` replaces the local directory generation.

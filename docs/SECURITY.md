@@ -37,6 +37,11 @@ queue progress.
   key bindings before cryptographic operations.
 - Destroy one-use private KeyPackage material after successful Welcome
   processing.
+- Retain a claimed directory bundle until its Welcome is processed; a spent
+  notice means the public package was claimed, not that the private bundle is
+  already safe to destroy.
+- Retain last-resort private material until explicit rotation because several
+  independent Welcomes may legitimately reference the same fallback package.
 - Zero temporary secret arrays at the end of their lifetime.
 - Reject replayed KeyPackages and protocol frames durably.
 
@@ -73,6 +78,26 @@ Protect account-restoration material: possession authorizes registering and
 removing devices without a sibling approval step. Review dormant-device reports
 and remove lost devices promptly. The relay rejects account-targeted traffic
 whose signed roster revision is stale while MLS membership converges.
+
+## Identity directory
+
+Directory access reveals the exact queried identity to the relay. Tickets
+authorize and rate-limit exact claims but do not make them anonymous. Ticket
+issuers should authenticate callers, use short expiries and conservative claim
+budgets, and avoid embedding user-readable identity data in opaque tickets.
+
+The relay offers no listing or prefix lookup. Known and unknown exact identities
+share one response envelope, and unknown claims spend ticket budget, reducing
+the existence oracle to unavoidable response characteristics such as timing.
+Deployments should monitor and normalize those characteristics where account
+existence is especially sensitive.
+
+Uploads are account-signed and tied to a current roster device generation.
+One-use references can never be reused, rotations invalidate unclaimed private
+material locally, and spent notifications are signed in advance by the owning
+device so the relay cannot forge inbox control messages. The last-resort
+KeyPackage deliberately trades one-use semantics for availability; rotate it
+after suspected compromise or according to application policy.
 
 ## Operations
 

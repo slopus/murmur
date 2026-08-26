@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { LocalDirectoryTicketIssuer } from "../../directory/index.js";
 import {
     signedDeliveryToJson,
     signedQueueAckToJson,
@@ -14,6 +15,8 @@ import {
 } from "../../protocol/tests/helpers.js";
 import { RelayService } from "../../relay/index.js";
 import { SqliteRelayStore } from "../../storage/index.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
+import { canonicalJson } from "../../utils/canonicalJson.js";
 import { createRelayFetchHandler, parseRelayAllowedOrigins } from "../index.js";
 
 const NOW = 10_000;
@@ -42,6 +45,10 @@ describe("identity queue HTTP API", () => {
                 "/v1/queue/read",
                 "/v1/queue/events",
                 "/v1/queue/ack",
+                "/v1/device-rosters/read",
+                "/v1/device-rosters/mutate",
+                "/v1/directory/upload",
+                "/v1/directory/claim",
             ]) {
                 const response = await handler(
                     new Request(`https://relay.example${path}`, {
@@ -53,6 +60,81 @@ describe("identity queue HTTP API", () => {
                 expect(response.status, path).toBe(400);
                 expect(await response.json(), path).toEqual({ error: "duplicate_json_key" });
             }
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("verifies budgeted directory tickets without an account-enumeration error oracle", async () => {
+        const issuer = new LocalDirectoryTicketIssuer({
+            issuer: "http-test-auth",
+            secretKey: secret(70),
+        });
+        const accountSecret = secret(71);
+        const account = identity(accountSecret);
+        const device = identity(secret(72));
+        const relay = new RelayService(
+            new SqliteRelayStore(":memory:"),
+            {},
+            undefined,
+            () => NOW,
+            issuer,
+        );
+        const handler = createRelayFetchHandler(relay, {
+            maximumRequestsPerMinutePerAddress: 1,
+        });
+        const claim = (accountKey: Uint8Array, ticket: Uint8Array): Request =>
+            post("/v1/directory/claim", {
+                version: 1,
+                accountKey: encodeBase64Url(accountKey),
+                ticket: encodeBase64Url(ticket),
+            });
+        try {
+            const mutation = signedDelivery(accountSecret, recipients(device), {
+                id: 73,
+                now: NOW,
+                ciphertext: canonicalJson({
+                    version: 1,
+                    type: "register",
+                    deviceKey: encodeBase64Url(device),
+                    resetGeneration: 0,
+                    keyPackage: encodeBase64Url(new Uint8Array([7])),
+                }),
+            });
+            await relay.mutateDeviceRoster(mutation, "directory-http-tests");
+
+            const knownResponse = await handler(
+                claim(account, issuer.issue({ expiresAt: NOW + 1_000, claimBudget: 1 })),
+            );
+            const unknownResponse = await handler(
+                claim(
+                    identity(secret(74)),
+                    issuer.issue({ expiresAt: NOW + 1_000, claimBudget: 1 }),
+                ),
+            );
+            expect(knownResponse.status).toBe(200);
+            expect(unknownResponse.status).toBe(200);
+            const known = (await knownResponse.json()) as Record<string, unknown>;
+            const unknown = (await unknownResponse.json()) as Record<string, unknown>;
+            expect(Object.keys(known)).toEqual(Object.keys(unknown));
+            expect(known).toMatchObject({ rosterRevision: 1, devices: [expect.any(Object)] });
+            expect(unknown).toMatchObject({ rosterRevision: 0, devices: [] });
+
+            const expired = await handler(
+                claim(account, issuer.issue({ expiresAt: NOW, claimBudget: 1 })),
+            );
+            expect(expired.status).toBe(401);
+            expect(await expired.json()).toEqual({ error: "invalid_ticket" });
+
+            const forged = issuer.issue({ expiresAt: NOW + 1_000, claimBudget: 1 });
+            forged[forged.length - 2] = forged[forged.length - 2]! ^ 1;
+            expect((await handler(claim(account, forged))).status).toBe(401);
+
+            const budgeted = issuer.issue({ expiresAt: NOW + 1_000, claimBudget: 1 });
+            expect((await handler(claim(account, budgeted))).status).toBe(200);
+            const exhausted = await handler(claim(account, budgeted));
+            expect(exhausted.status).toBe(429);
+            expect(await exhausted.json()).toEqual({ error: "ticket_exhausted" });
         } finally {
             await relay.close();
         }

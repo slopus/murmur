@@ -3,10 +3,14 @@ import {
     deviceRosterToJson,
     deliveryFingerprint,
     parseSignedDelivery,
+    signedDeliveryToJson,
     type SignedDelivery,
     type DeviceRoster,
     type DeviceRosterMutation,
+    type DirectoryClaim,
+    type DirectoryPrekeyUpload,
 } from "../../protocol/index.js";
+import type { DirectoryTicketClaims } from "../../directory/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { bigintColumn, copyBytes, equalBytes, safeNumberColumn } from "../../utils/bytes.js";
 import { nextUuidV7 } from "../../utils/uuidV7.js";
@@ -47,6 +51,7 @@ export {
 /** Shared LISTEN/NOTIFY channel used only to reduce queue long-poll latency. */
 export const POSTGRES_WAKE_CHANNEL = "murmur_queue_wake_v1";
 const SQL_VALUE_CHUNK = 10_000;
+const MAXIMUM_DIRECTORY_PREKEYS_PER_DEVICE = 256;
 
 function jsonValue(value: unknown): unknown {
     return typeof value === "string" ? (JSON.parse(value) as unknown) : value;
@@ -606,17 +611,23 @@ export class PostgresRelayStore implements RelayStore {
                  ON CONFLICT (account_key) DO UPDATE SET revision = excluded.revision`,
                 [delivery.sender, revision],
             );
-            await transaction.query(
-                "DELETE FROM murmur_device_roster_devices WHERE account_key = $1",
-                [delivery.sender],
-            );
+            if (mutation.type === "remove" || existing !== undefined) {
+                await transaction.query(
+                    `DELETE FROM murmur_device_roster_devices
+                     WHERE account_key = $1 AND device_key = $2`,
+                    [delivery.sender, mutation.deviceKey],
+                );
+            }
             for (const entry of sortedDevices) {
                 const storedAdmission = admissions.get(encodeBase64Url(entry.deviceKey));
                 if (storedAdmission === undefined) throw new Error("Missing roster admission");
                 await transaction.query(
                     `INSERT INTO murmur_device_roster_devices
                         (account_key, device_key, reset_generation, key_package)
-                     VALUES ($1, $2, $3, $4)`,
+                     VALUES ($1, $2, $3, $4)
+                     ON CONFLICT (account_key, device_key) DO UPDATE SET
+                        reset_generation = excluded.reset_generation,
+                        key_package = excluded.key_package`,
                     [
                         delivery.sender,
                         entry.deviceKey,
@@ -657,6 +668,343 @@ export class PostgresRelayStore implements RelayStore {
                 );
             }
             return roster;
+        });
+    }
+
+    async uploadDirectoryPrekeys(
+        delivery: SignedDelivery,
+        upload: DirectoryPrekeyUpload,
+        now: number,
+    ): Promise<void> {
+        this.#assertOpen();
+        await this.pruneExpired(now);
+        await this.#database.transaction(async (transaction) => {
+            const current = await this.#readDeviceRosterWithQuery(
+                transaction,
+                delivery.sender,
+                true,
+            );
+            const replay = await transaction.query(
+                `SELECT 1 AS present FROM murmur_directory_upload_nonces
+                 WHERE account_key = $1 AND nonce = $2`,
+                [delivery.sender, delivery.id],
+            );
+            if (replay.rows.length > 0) {
+                throw new RelayError(409, "Directory upload was already used", {
+                    error: "replay",
+                });
+            }
+            const device = current?.devices.find((entry) =>
+                equalBytes(entry.deviceKey, upload.deviceKey),
+            );
+            if (device === undefined || device.resetGeneration !== upload.resetGeneration) {
+                throw new RelayError(409, "Directory upload names stale roster state", {
+                    error: "reset_generation",
+                    expectedGeneration: device?.resetGeneration ?? null,
+                });
+            }
+            await transaction.query("DELETE FROM murmur_directory_prekeys WHERE expires_at <= $1", [
+                now,
+            ]);
+            const currentDirectory = await transaction.query<{
+                last_resort_reference: unknown;
+                last_resort_expires_at: unknown;
+            }>(
+                `SELECT last_resort_reference, last_resort_expires_at
+                 FROM murmur_directory_devices
+                 WHERE account_key = $1 AND device_key = $2 FOR UPDATE`,
+                [delivery.sender, upload.deviceKey],
+            );
+            const currentDirectoryRow = currentDirectory.rows[0];
+            const currentAdmission = current?.admissions.find((entry) =>
+                equalBytes(entry.deviceKey, upload.deviceKey),
+            );
+            if (upload.mode === "replenish") {
+                if (
+                    currentDirectoryRow === undefined ||
+                    currentAdmission === undefined ||
+                    !equalBytes(
+                        copyBytes(
+                            currentDirectoryRow.last_resort_reference,
+                            "last-resort reference",
+                        ),
+                        upload.lastResort.reference,
+                    ) ||
+                    safeNumberColumn(currentDirectoryRow.last_resort_expires_at) !==
+                        upload.lastResort.expiresAt ||
+                    !equalBytes(currentAdmission.keyPackage, upload.lastResort.keyPackage)
+                ) {
+                    throw new RelayError(409, "Directory last-resort prekey is stale", {
+                        error: "last_resort_stale",
+                    });
+                }
+            } else {
+                await transaction.query(
+                    `DELETE FROM murmur_directory_prekeys
+                     WHERE account_key = $1 AND device_key = $2`,
+                    [delivery.sender, upload.deviceKey],
+                );
+                const reassertsCurrentLastResort =
+                    currentDirectoryRow !== undefined &&
+                    currentAdmission !== undefined &&
+                    equalBytes(
+                        copyBytes(
+                            currentDirectoryRow.last_resort_reference,
+                            "last-resort reference",
+                        ),
+                        upload.lastResort.reference,
+                    ) &&
+                    safeNumberColumn(currentDirectoryRow.last_resort_expires_at) ===
+                        upload.lastResort.expiresAt &&
+                    equalBytes(currentAdmission.keyPackage, upload.lastResort.keyPackage);
+                const reused = await transaction.query(
+                    `SELECT 1 AS present FROM murmur_directory_prekey_references
+                     WHERE account_key = $1 AND device_key = $2 AND reference = $3`,
+                    [delivery.sender, upload.deviceKey, upload.lastResort.reference],
+                );
+                if (reused.rows.length > 0 && !reassertsCurrentLastResort) {
+                    throw new RelayError(409, "Directory prekey reference was already published", {
+                        error: "prekey_reuse",
+                    });
+                }
+                if (reused.rows.length === 0) {
+                    await transaction.query(
+                        `INSERT INTO murmur_directory_prekey_references
+                            (account_key, device_key, reference, first_seen_at)
+                         VALUES ($1, $2, $3, $4)`,
+                        [delivery.sender, upload.deviceKey, upload.lastResort.reference, now],
+                    );
+                }
+            }
+            if (upload.lastResort.expiresAt <= now) {
+                throw new RelayError(409, "Last-resort prekey is expired", {
+                    error: "prekey_expired",
+                });
+            }
+            await transaction.query(
+                `INSERT INTO murmur_directory_devices
+                    (account_key, device_key, last_resort_reference, last_resort_expires_at)
+                 VALUES ($1, $2, $3, $4)
+                 ON CONFLICT (account_key, device_key) DO UPDATE SET
+                    last_resort_reference = excluded.last_resort_reference,
+                    last_resort_expires_at = excluded.last_resort_expires_at`,
+                [
+                    delivery.sender,
+                    upload.deviceKey,
+                    upload.lastResort.reference,
+                    upload.lastResort.expiresAt,
+                ],
+            );
+            await transaction.query(
+                `UPDATE murmur_device_roster_devices SET key_package = $1
+                 WHERE account_key = $2 AND device_key = $3`,
+                [upload.lastResort.keyPackage, delivery.sender, upload.deviceKey],
+            );
+            const newPrekeys: DirectoryPrekeyUpload["oneTimePrekeys"][number][] = [];
+            for (const entry of upload.oneTimePrekeys) {
+                if (entry.expiresAt <= now) {
+                    throw new RelayError(409, "Directory prekey is expired", {
+                        error: "prekey_expired",
+                    });
+                }
+                const activePrekey = await transaction.query<{
+                    key_package: unknown;
+                    expires_at: unknown;
+                }>(
+                    `SELECT key_package, expires_at FROM murmur_directory_prekeys
+                     WHERE account_key = $1 AND device_key = $2 AND reference = $3
+                     FOR UPDATE`,
+                    [delivery.sender, upload.deviceKey, entry.reference],
+                );
+                const activePrekeyRow = activePrekey.rows[0];
+                if (activePrekeyRow !== undefined) {
+                    if (
+                        !equalBytes(
+                            copyBytes(activePrekeyRow.key_package, "directory KeyPackage"),
+                            entry.keyPackage,
+                        ) ||
+                        safeNumberColumn(activePrekeyRow.expires_at) !== entry.expiresAt
+                    ) {
+                        throw new RelayError(
+                            409,
+                            "Directory prekey reference was already published",
+                            { error: "prekey_reuse" },
+                        );
+                    }
+                    continue;
+                }
+                const reused = await transaction.query(
+                    `SELECT 1 AS present FROM murmur_directory_prekey_references
+                     WHERE account_key = $1 AND device_key = $2 AND reference = $3`,
+                    [delivery.sender, upload.deviceKey, entry.reference],
+                );
+                if (reused.rows.length > 0) {
+                    throw new RelayError(409, "Directory prekey reference was already published", {
+                        error: "prekey_reuse",
+                    });
+                }
+                newPrekeys.push(entry);
+            }
+            const active = await transaction.query<{ item_count: unknown }>(
+                `SELECT COUNT(*) AS item_count FROM murmur_directory_prekeys
+                 WHERE account_key = $1 AND device_key = $2`,
+                [delivery.sender, upload.deviceKey],
+            );
+            if (
+                safeNumberColumn(active.rows[0]?.item_count) + newPrekeys.length >
+                MAXIMUM_DIRECTORY_PREKEYS_PER_DEVICE
+            ) {
+                throw new RelayError(413, "Directory prekey pool exceeds relay limit", {
+                    error: "limit",
+                });
+            }
+            for (const entry of newPrekeys) {
+                await transaction.query(
+                    `INSERT INTO murmur_directory_prekey_references
+                        (account_key, device_key, reference, first_seen_at)
+                     VALUES ($1, $2, $3, $4)`,
+                    [delivery.sender, upload.deviceKey, entry.reference, now],
+                );
+                await transaction.query(
+                    `INSERT INTO murmur_directory_prekeys
+                        (account_key, device_key, reference, key_package, notification_json,
+                         expires_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
+                    [
+                        delivery.sender,
+                        upload.deviceKey,
+                        entry.reference,
+                        entry.keyPackage,
+                        JSON.stringify(signedDeliveryToJson(entry.spentNotification)),
+                        entry.expiresAt,
+                        now,
+                    ],
+                );
+            }
+            await transaction.query(
+                `INSERT INTO murmur_directory_upload_nonces (account_key, nonce, created_at)
+                 VALUES ($1, $2, $3)`,
+                [delivery.sender, delivery.id, now],
+            );
+        });
+    }
+
+    async claimDirectory(
+        accountKey: Uint8Array,
+        ticket: DirectoryTicketClaims,
+        now: number,
+        limits: QueueLimits,
+        admissionPrincipal: Uint8Array,
+    ): Promise<DirectoryClaim> {
+        this.#assertOpen();
+        await this.pruneExpired(now);
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
+            );
+            const usage = await transaction.query<{
+                claim_budget: unknown;
+                claims_used: unknown;
+                expires_at: unknown;
+            }>(
+                `SELECT claim_budget, claims_used, expires_at
+                 FROM murmur_directory_ticket_uses
+                 WHERE issuer = $1 AND ticket_id = $2 FOR UPDATE`,
+                [ticket.issuer, ticket.ticketId],
+            );
+            const usageRow = usage.rows[0];
+            if (usageRow === undefined) {
+                await transaction.query(
+                    `INSERT INTO murmur_directory_ticket_uses
+                        (issuer, ticket_id, claim_budget, claims_used, expires_at)
+                     VALUES ($1, $2, $3, 1, $4)`,
+                    [ticket.issuer, ticket.ticketId, ticket.claimBudget, ticket.expiresAt],
+                );
+            } else {
+                if (
+                    safeNumberColumn(usageRow.claim_budget) !== ticket.claimBudget ||
+                    safeNumberColumn(usageRow.expires_at) !== ticket.expiresAt ||
+                    safeNumberColumn(usageRow.claims_used) >= ticket.claimBudget
+                ) {
+                    throw new RelayError(429, "Directory ticket claim budget is exhausted", {
+                        error: "ticket_exhausted",
+                    });
+                }
+                await transaction.query(
+                    `UPDATE murmur_directory_ticket_uses SET claims_used = claims_used + 1
+                     WHERE issuer = $1 AND ticket_id = $2`,
+                    [ticket.issuer, ticket.ticketId],
+                );
+            }
+            await transaction.query("DELETE FROM murmur_directory_prekeys WHERE expires_at <= $1", [
+                now,
+            ]);
+            const roster = await this.#readDeviceRosterWithQuery(transaction, accountKey, true);
+            if (roster === undefined) {
+                return {
+                    version: 1,
+                    accountKey: accountKey.slice(),
+                    rosterRevision: 0,
+                    devices: [],
+                };
+            }
+            const claimed: DirectoryClaim["devices"][number][] = [];
+            const notifications: SignedDelivery[] = [];
+            for (const device of roster.devices) {
+                const prekey = await transaction.query<{
+                    reference: unknown;
+                    key_package: unknown;
+                    notification_json: unknown;
+                }>(
+                    `SELECT reference, key_package, notification_json
+                     FROM murmur_directory_prekeys
+                     WHERE account_key = $1 AND device_key = $2 AND expires_at > $3
+                     ORDER BY created_at, reference LIMIT 1 FOR UPDATE`,
+                    [accountKey, device.deviceKey, now],
+                );
+                const row = prekey.rows[0];
+                if (row === undefined) {
+                    const admission = roster.admissions.find((entry) =>
+                        equalBytes(entry.deviceKey, device.deviceKey),
+                    );
+                    if (admission === undefined) throw new Error("Missing last-resort KeyPackage");
+                    claimed.push({
+                        deviceKey: device.deviceKey.slice(),
+                        resetGeneration: device.resetGeneration,
+                        keyPackage: admission.keyPackage.slice(),
+                        source: "last_resort",
+                    });
+                    continue;
+                }
+                const reference = copyBytes(row.reference, "directory prekey reference");
+                await transaction.query(
+                    `DELETE FROM murmur_directory_prekeys
+                     WHERE account_key = $1 AND device_key = $2 AND reference = $3`,
+                    [accountKey, device.deviceKey, reference],
+                );
+                claimed.push({
+                    deviceKey: device.deviceKey.slice(),
+                    resetGeneration: device.resetGeneration,
+                    keyPackage: copyBytes(row.key_package, "directory KeyPackage"),
+                    source: "one_time",
+                });
+                notifications.push(parseSignedDelivery(jsonValue(row.notification_json)));
+            }
+            for (const notification of notifications) {
+                await this.#publishWithQuery(
+                    transaction,
+                    notification,
+                    now,
+                    limits,
+                    admissionPrincipal,
+                );
+            }
+            return {
+                version: 1,
+                accountKey: accountKey.slice(),
+                rosterRevision: roster.revision,
+                devices: claimed,
+            };
         });
     }
 

@@ -73,10 +73,11 @@ Unlocking requires both inputs. Password changes authenticate and preserve the
 complete encrypted root payload while rotating its salt and nonce. There is no
 server involvement or reset path; losing either input is final.
 
-## Direct session example
+## Directory session example
 
-Until the identity directory is implemented, applications transport bare MLS
-admission material between clients themselves:
+The application obtains a claim ticket from its authentication server and
+names the exact account identity it already knows. The resulting account claim
+is accepted directly by both session creation and member addition:
 
 ```ts
 import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";
@@ -92,7 +93,7 @@ const bob = await MurmurClient.open({
     store: new MemoryMurmurStore(),
 });
 
-const bobAdmission = await bob.createKeyPackage();
+const bobAdmission = await alice.claimAccount(bob.identity, ticket);
 const session = await alice.createSession({
     descriptor: encode('{"protocol":"chat","version":1}'),
     members: [bobAdmission],
@@ -114,11 +115,24 @@ await bob.synchronize(
         },
     },
 );
+
+const carolAdmission = await alice.claimAccount(carolIdentity, anotherTicket);
+await alice.addMember(session.id, carolAdmission);
 ```
 
-`createKeyPackage()` durably stores the matching one-use private material and
-returns `{ identity, keyPackage }`. `createSession()` and `addMember()` consume
-that bare public material. Reusing one KeyPackage is rejected.
+Opening an HTTP-backed client automatically publishes a small one-use
+KeyPackage pool and one multi-use last-resort package per device. Claims prefer
+one-use packages. Their ordinary inbox spent notices trigger automatic
+replenishment. `rotate()` replaces every unclaimed one-use package and the
+last-resort package:
+
+```ts
+await bob.rotate();
+```
+
+For application-routed admission, `createKeyPackage()` remains available and
+returns bare `{ identity, keyPackage }` material. `createSession()` and
+`addMember()` accept that form too; each bare KeyPackage is one-use.
 
 ## Durable synchronization
 
@@ -149,6 +163,7 @@ IDs support application-level idempotency.
 The application owns opaque descriptors and update bytes. Murmur exposes:
 
 - `createSession`, `session`, and bounded `sessions` listing;
+- `claimAccount` and explicit directory `rotate`;
 - `activateSession`, `ignoreSession`, and `abandonSession`;
 - `send`, `addMember`, `removeMember`, and `leaveSession`;
 - `grantAdmin`, `revokeAdmin`, and `setPolicies`;

@@ -62,6 +62,19 @@ export interface DeliveryDeviceRoster {
     }[];
 }
 
+/** Ticket-authorized exact-account directory result. */
+export interface DeliveryDirectoryClaim {
+    readonly version: 1;
+    readonly accountKey: Uint8Array;
+    readonly rosterRevision: number;
+    readonly devices: readonly {
+        readonly deviceKey: Uint8Array;
+        readonly resetGeneration: number;
+        readonly keyPackage: Uint8Array;
+        readonly source: "one_time" | "last_resort";
+    }[];
+}
+
 /** One retained delivery reference in an inbox. */
 export interface InboxDelivery {
     readonly eventId: string;
@@ -196,6 +209,14 @@ export interface DeliveryTransport {
         delivery: SignedDelivery,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster>;
+    /** Upload one account-signed replacement or replenishment for this device. */
+    uploadDirectoryPrekeys?(delivery: SignedDelivery, signal?: AbortSignal): Promise<void>;
+    /** Spend one opaque authentication ticket on an exact identity-directory claim. */
+    claimDirectory?(
+        accountKey: Uint8Array,
+        ticket: Uint8Array,
+        signal?: AbortSignal,
+    ): Promise<DeliveryDirectoryClaim>;
     /** Stream exact queued events in recipient inbox order when supported. */
     stream?(
         request: SignedInboxRead,

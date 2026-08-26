@@ -8,6 +8,8 @@ import {
     secret,
     signedDelivery,
 } from "../../protocol/tests/helpers.js";
+import type { DirectoryPrekeyUpload, SignedDelivery } from "../../protocol/index.js";
+import type { DirectoryTicketClaims } from "../../directory/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { canonicalJson } from "../../utils/canonicalJson.js";
 import {
@@ -41,6 +43,347 @@ async function stores(): Promise<readonly RelayStore[]> {
 }
 
 describe("identity queue store conformance", () => {
+    test("rotates, replenishes, and atomically claims one directory prekey per device", async () => {
+        const accountSecret = secret(80);
+        const account = identity(accountSecret);
+        const firstSecret = secret(81);
+        const first = identity(firstSecret);
+        const secondSecret = secret(82);
+        const second = identity(secondSecret);
+        const thirdSecret = secret(83);
+        const third = identity(thirdSecret);
+        const mutationBytes = (deviceKey: Uint8Array): Uint8Array =>
+            canonicalJson({
+                version: 1,
+                type: "register",
+                deviceKey: encodeBase64Url(deviceKey),
+                resetGeneration: 0,
+                keyPackage: encodeBase64Url(new Uint8Array([9])),
+            });
+        const spent = (
+            deviceSecret: Uint8Array,
+            deviceKey: Uint8Array,
+            reference: Uint8Array,
+            id: number,
+        ): SignedDelivery =>
+            signedDelivery(deviceSecret, recipients(deviceKey), {
+                id,
+                ciphertext: canonicalJson({
+                    version: 1,
+                    type: "directory_prekey_spent",
+                    reference: encodeBase64Url(reference),
+                }),
+                expiresAt: NOW + 1_000,
+            });
+        const upload = (
+            deviceKey: Uint8Array,
+            deviceSecret: Uint8Array,
+            resetGeneration: number,
+            mode: "replenish" | "rotate",
+            values: readonly { readonly value: number; readonly id: number }[],
+            lastResortValue: number,
+        ): DirectoryPrekeyUpload => ({
+            version: 1,
+            type: "directory_prekey_upload",
+            mode,
+            deviceKey,
+            resetGeneration,
+            oneTimePrekeys: values
+                .map(({ value, id }) => {
+                    const reference = new Uint8Array(32).fill(value);
+                    return {
+                        reference,
+                        keyPackage: new Uint8Array([value]),
+                        expiresAt: NOW + 1_000,
+                        spentNotification: spent(deviceSecret, deviceKey, reference, id),
+                    };
+                })
+                .sort((left, right) => left.reference[0]! - right.reference[0]!),
+            lastResort: {
+                reference: new Uint8Array(32).fill(lastResortValue),
+                keyPackage: new Uint8Array([lastResortValue]),
+                expiresAt: NOW + 1_000,
+            },
+        });
+        const ticket: DirectoryTicketClaims = {
+            issuer: "test",
+            ticketId: new Uint8Array(32).fill(83),
+            expiresAt: NOW + 1_000,
+            claimBudget: 10,
+        };
+        for (const store of await stores()) {
+            try {
+                await store.mutateDeviceRoster(
+                    signedDelivery(accountSecret, recipients(first), {
+                        id: 80,
+                        ciphertext: mutationBytes(first),
+                    }),
+                    {
+                        version: 1,
+                        type: "register",
+                        deviceKey: first,
+                        resetGeneration: 0,
+                        keyPackage: new Uint8Array([9]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await store.mutateDeviceRoster(
+                    signedDelivery(accountSecret, recipients(first, second), {
+                        id: 81,
+                        ciphertext: mutationBytes(second),
+                    }),
+                    {
+                        version: 1,
+                        type: "register",
+                        deviceKey: second,
+                        resetGeneration: 0,
+                        keyPackage: new Uint8Array([9]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                const firstRotation = upload(
+                    first,
+                    firstSecret,
+                    0,
+                    "rotate",
+                    [
+                        { value: 1, id: 84 },
+                        { value: 2, id: 85 },
+                    ],
+                    10,
+                );
+                const secondRotation = upload(
+                    second,
+                    secondSecret,
+                    0,
+                    "rotate",
+                    [{ value: 3, id: 86 }],
+                    11,
+                );
+                const firstOuter = signedDelivery(accountSecret, [], { id: 87 });
+                const secondOuter = signedDelivery(accountSecret, [], { id: 88 });
+                await store.uploadDirectoryPrekeys(firstOuter, firstRotation, NOW);
+                await store.uploadDirectoryPrekeys(secondOuter, secondRotation, NOW);
+                await store.mutateDeviceRoster(
+                    signedDelivery(accountSecret, recipients(first, second, third), {
+                        id: 93,
+                        ciphertext: mutationBytes(third),
+                    }),
+                    {
+                        version: 1,
+                        type: "register",
+                        deviceKey: third,
+                        resetGeneration: 0,
+                        keyPackage: new Uint8Array([9]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+
+                await expect(
+                    store.claimDirectory(
+                        account,
+                        ticket,
+                        NOW,
+                        { ...LIMITS, maximumGlobalItems: 0 },
+                        ADMISSION_PRINCIPAL,
+                    ),
+                ).rejects.toMatchObject({ status: 503, body: { error: "relay_full" } });
+                const firstClaim = await store.claimDirectory(
+                    account,
+                    ticket,
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(
+                    firstClaim.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "one_time", keyPackage: new Uint8Array([1]) });
+                expect(
+                    firstClaim.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(second),
+                    ),
+                ).toMatchObject({ source: "one_time", keyPackage: new Uint8Array([3]) });
+                expect(
+                    firstClaim.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(third),
+                    ),
+                ).toMatchObject({ source: "last_resort", keyPackage: new Uint8Array([9]) });
+                const secondClaim = await store.claimDirectory(
+                    account,
+                    ticket,
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(
+                    secondClaim.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "one_time", keyPackage: new Uint8Array([2]) });
+                expect(
+                    secondClaim.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(second),
+                    ),
+                ).toMatchObject({ source: "last_resort", keyPackage: new Uint8Array([11]) });
+                const fallback = await store.claimDirectory(
+                    account,
+                    ticket,
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(
+                    fallback.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "last_resort", keyPackage: new Uint8Array([10]) });
+                expect(
+                    fallback.devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(second),
+                    ),
+                ).toMatchObject({ source: "last_resort", keyPackage: new Uint8Array([11]) });
+
+                const changedFallback = upload(first, firstSecret, 0, "replenish", [], 10);
+                await expect(
+                    store.uploadDirectoryPrekeys(
+                        signedDelivery(accountSecret, [], { id: 97 }),
+                        {
+                            ...changedFallback,
+                            lastResort: {
+                                ...changedFallback.lastResort,
+                                keyPackage: new Uint8Array([99]),
+                            },
+                        },
+                        NOW,
+                    ),
+                ).rejects.toMatchObject({
+                    status: 409,
+                    body: { error: "last_resort_stale" },
+                });
+
+                const replenishment = upload(
+                    first,
+                    firstSecret,
+                    0,
+                    "replenish",
+                    [{ value: 4, id: 89 }],
+                    10,
+                );
+                await store.uploadDirectoryPrekeys(
+                    signedDelivery(accountSecret, [], { id: 90 }),
+                    replenishment,
+                    NOW,
+                );
+                await expect(
+                    store.uploadDirectoryPrekeys(
+                        signedDelivery(accountSecret, [], { id: 94 }),
+                        replenishment,
+                        NOW,
+                    ),
+                ).resolves.toBeUndefined();
+                expect(
+                    (
+                        await store.claimDirectory(
+                            account,
+                            ticket,
+                            NOW,
+                            LIMITS,
+                            ADMISSION_PRINCIPAL,
+                        )
+                    ).devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "one_time", keyPackage: new Uint8Array([4]) });
+                const rotated = upload(first, firstSecret, 0, "rotate", [{ value: 5, id: 91 }], 12);
+                await store.uploadDirectoryPrekeys(
+                    signedDelivery(accountSecret, [], { id: 92 }),
+                    rotated,
+                    NOW,
+                );
+                expect(
+                    (
+                        await store.claimDirectory(
+                            account,
+                            ticket,
+                            NOW,
+                            LIMITS,
+                            ADMISSION_PRINCIPAL,
+                        )
+                    ).devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "one_time", keyPackage: new Uint8Array([5]) });
+                expect(
+                    (
+                        await store.claimDirectory(
+                            account,
+                            ticket,
+                            NOW,
+                            LIMITS,
+                            ADMISSION_PRINCIPAL,
+                        )
+                    ).devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "last_resort", keyPackage: new Uint8Array([12]) });
+                const recoveredRotation = upload(
+                    first,
+                    firstSecret,
+                    0,
+                    "rotate",
+                    [{ value: 6, id: 95 }],
+                    12,
+                );
+                await expect(
+                    store.uploadDirectoryPrekeys(
+                        signedDelivery(accountSecret, [], { id: 96 }),
+                        recoveredRotation,
+                        NOW,
+                    ),
+                ).resolves.toBeUndefined();
+                expect(
+                    (
+                        await store.claimDirectory(
+                            account,
+                            ticket,
+                            NOW,
+                            LIMITS,
+                            ADMISSION_PRINCIPAL,
+                        )
+                    ).devices.find(
+                        (device) => encodeBase64Url(device.deviceKey) === encodeBase64Url(first),
+                    ),
+                ).toMatchObject({ source: "one_time", keyPackage: new Uint8Array([6]) });
+                await expect(
+                    store.uploadDirectoryPrekeys(firstOuter, firstRotation, NOW),
+                ).rejects.toMatchObject({ status: 409, body: { error: "replay" } });
+
+                const firstQueue = await store.readQueue(first, null, 20, NOW, PAGE);
+                expect(firstQueue.deliveries.map(({ delivery }) => delivery.id)).toEqual(
+                    expect.arrayContaining([
+                        firstRotation.oneTimePrekeys[0]!.spentNotification.id,
+                        firstRotation.oneTimePrekeys[1]!.spentNotification.id,
+                        replenishment.oneTimePrekeys[0]!.spentNotification.id,
+                    ]),
+                );
+                const secondQueue = await store.readQueue(second, null, 20, NOW, PAGE);
+                expect(secondQueue.deliveries.map(({ delivery }) => delivery.id)).toContain(
+                    secondRotation.oneTimePrekeys[0]!.spentNotification.id,
+                );
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
     test("stores one replay-protected current roster and rejects stale account targeting", async () => {
         const accountSecret = secret(91);
         const account = identity(accountSecret);
@@ -233,6 +576,34 @@ describe("identity queue store conformance", () => {
         database.exec("CREATE TABLE murmur_queue_partial (id TEXT PRIMARY KEY)");
         expect(() => new SqliteRelayStore(":memory:", { database })).toThrow("Incomplete");
         database.close();
+    });
+
+    test("migrates the step-3 roster schema to directory schema v3 in place", async () => {
+        const sqlite = new DatabaseSync(":memory:");
+        new SqliteRelayStore(":memory:", { database: sqlite });
+        sqlite.exec(`
+            DROP TABLE murmur_directory_prekeys;
+            DROP TABLE murmur_directory_devices;
+            DROP TABLE murmur_directory_prekey_references;
+            DROP TABLE murmur_directory_upload_nonces;
+            DROP TABLE murmur_directory_ticket_uses;
+            UPDATE murmur_queue_schema SET version = 2 WHERE singleton = 1;
+        `);
+        const migratedSqlite = new SqliteRelayStore(":memory:", { database: sqlite });
+        await expect(migratedSqlite.health()).resolves.toBeUndefined();
+        await migratedSqlite.close();
+
+        const pglite = new PGliteDatabase(new PGlite());
+        await PostgresRelayStore.create(pglite);
+        await pglite.query("DROP TABLE murmur_directory_prekeys");
+        await pglite.query("DROP TABLE murmur_directory_devices");
+        await pglite.query("DROP TABLE murmur_directory_prekey_references");
+        await pglite.query("DROP TABLE murmur_directory_upload_nonces");
+        await pglite.query("DROP TABLE murmur_directory_ticket_uses");
+        await pglite.query("UPDATE murmur_queue_schema SET version = 2 WHERE singleton = 1");
+        const migratedPostgres = await PostgresRelayStore.create(pglite);
+        await expect(migratedPostgres.health()).resolves.toBeUndefined();
+        await migratedPostgres.close();
     });
 
     test("atomically multicasts one event ID and trims each recipient independently", async () => {

@@ -2,7 +2,8 @@
 
 `@slopus/murmur-relay` is private deployment infrastructure for authenticated
 encrypted identity queues. It stores only bounded, unacknowledged, unexpired
-ciphertext and continuity metadata.
+ciphertext, continuity metadata, current device rosters, and account-linked
+directory prekey pools.
 
 ## Backends
 
@@ -25,13 +26,22 @@ fanout limits before exposing the process publicly.
 
 ## HTTP routes
 
-| Method | Path               | Purpose                            |
-| ------ | ------------------ | ---------------------------------- |
-| `GET`  | `/health`          | Storage and wake-source readiness  |
-| `POST` | `/v1/deliveries`   | Atomic signed ciphertext multicast |
-| `POST` | `/v1/queue/read`   | Signed bounded inbox read          |
-| `POST` | `/v1/queue/events` | Authenticated ordered SSE stream   |
-| `POST` | `/v1/queue/ack`    | Signed monotonic prefix trim       |
+| Method | Path                        | Purpose                            |
+| ------ | --------------------------- | ---------------------------------- |
+| `GET`  | `/health`                   | Storage and wake-source readiness  |
+| `POST` | `/v1/deliveries`            | Atomic signed ciphertext multicast |
+| `POST` | `/v1/queue/read`            | Signed bounded inbox read          |
+| `POST` | `/v1/queue/events`          | Authenticated ordered SSE stream   |
+| `POST` | `/v1/queue/ack`             | Signed monotonic prefix trim       |
+| `POST` | `/v1/device-rosters/read`   | Exact current roster lookup        |
+| `POST` | `/v1/device-rosters/mutate` | Signed roster mutation             |
+| `POST` | `/v1/directory/upload`      | Signed per-device prekey state     |
+| `POST` | `/v1/directory/claim`       | Ticketed exact-account claim       |
+
+Directory construction requires a `DirectoryTicketVerifier`. Production
+deployments should connect it to their authentication server. The exported
+`LocalDirectoryTicketIssuer` is suitable for local deployments and tests; its
+tickets carry an expiry and atomic exact-claim budget.
 
 See [deployment](../../docs/DEPLOYMENT.md) and the complete
 [relay API](../../docs/RELAY_API.md).
