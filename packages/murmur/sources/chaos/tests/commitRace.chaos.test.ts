@@ -70,6 +70,12 @@ interface AcceptedCommit {
     readonly recipients: readonly string[];
 }
 
+interface RejectedCommit {
+    readonly actor: ActorName;
+    readonly candidateId: string;
+    readonly code: "session_unauthorized" | "stale_session_epoch";
+}
+
 interface PendingCommit {
     readonly actor: ActorName;
     readonly delivery: SignedDelivery;
@@ -78,7 +84,17 @@ interface PendingCommit {
     readonly reject: (error: unknown) => void;
 }
 
-interface HeldResponse {
+type HeldResponse =
+    | {
+          readonly pending: PendingCommit;
+          readonly outcome: DeliveryPublishOutcome;
+      }
+    | {
+          readonly pending: PendingCommit;
+          readonly error: DeliveryTransportError;
+      };
+
+interface AcceptedResponse {
     readonly pending: PendingCommit;
     readonly outcome: DeliveryPublishOutcome;
 }
@@ -145,18 +161,51 @@ class RaceGate {
         } satisfies AcceptedCommit;
         this.accepted.push(accepted);
         if (holdResponse) {
-            this.#held.set(actor, { pending, outcome });
+            this.#held.set(actor, { pending, outcome } satisfies AcceptedResponse);
         } else {
             pending.resolve(outcome);
         }
         return accepted;
     }
 
+    async rejectAtRelay(actor: ActorName, holdResponse: boolean = false): Promise<RejectedCommit> {
+        const index = this.#pending.findIndex((pending) => pending.actor === actor);
+        if (index < 0) throw new Error(`No pending Commit for ${actor}`);
+        const [pending] = this.#pending.splice(index, 1);
+        if (pending === undefined) throw new Error(`Missing pending Commit for ${actor}`);
+        try {
+            await pending.delegate.publish(pending.delivery);
+        } catch (error: unknown) {
+            if (
+                !(error instanceof DeliveryTransportError) ||
+                !(
+                    (error.status === 409 && error.code === "stale_session_epoch") ||
+                    (error.status === 403 && error.code === "session_unauthorized")
+                )
+            ) {
+                pending.reject(error);
+                throw error;
+            }
+            if (holdResponse) {
+                this.#held.set(actor, { pending, error });
+            } else {
+                pending.reject(error);
+            }
+            return {
+                actor,
+                candidateId: pending.delivery.id,
+                code: error.code,
+            };
+        }
+        throw new Error(`Relay accepted concurrent Commit for ${actor}`);
+    }
+
     releaseResponse(actor: ActorName): void {
         const held = this.#held.get(actor);
         if (held === undefined) throw new Error(`No held response for ${actor}`);
         this.#held.delete(actor);
-        held.pending.resolve(held.outcome);
+        if ("outcome" in held) held.pending.resolve(held.outcome);
+        else held.pending.reject(held.error);
     }
 
     reject(actor: ActorName, error: unknown): void {
@@ -442,12 +491,6 @@ async function closeFixture(fixture: RaceFixture): Promise<void> {
     await fixture.relay.close();
 }
 
-function expectComparable(first: AcceptedCommit, second: AcceptedCommit): void {
-    expect(first.recipients).toEqual(second.recipients);
-    expect(first.eventId < second.eventId).toBe(true);
-    expect(first.candidateId).not.toBe(second.candidateId);
-}
-
 async function stageTwo(
     fixture: RaceFixture,
     first: RaceActor,
@@ -468,13 +511,13 @@ async function releaseTwo(
     first: RaceActor,
     second: RaceActor,
     pending: readonly [Promise<unknown>, Promise<unknown>],
-): Promise<readonly [AcceptedCommit, AcceptedCommit]> {
+): Promise<readonly [AcceptedCommit, RejectedCommit]> {
     const firstAccepted = await fixture.gate.accept(first.name);
-    const secondAccepted = await fixture.gate.accept(second.name);
+    const secondRejected = await fixture.gate.rejectAtRelay(second.name);
     await Promise.all(pending);
     fixture.gate.disarm();
-    expectComparable(firstAccepted, secondAccepted);
-    return [firstAccepted, secondAccepted];
+    expect(firstAccepted.candidateId).not.toBe(secondRejected.candidateId);
+    return [firstAccepted, secondRejected];
 }
 
 async function stageMany(
@@ -495,15 +538,15 @@ async function releaseMany(
     fixture: RaceFixture,
     order: readonly RaceActor[],
     pending: readonly Promise<unknown>[],
-): Promise<readonly AcceptedCommit[]> {
-    const accepted: AcceptedCommit[] = [];
-    for (const actor of order) accepted.push(await fixture.gate.accept(actor.name));
+): Promise<readonly [AcceptedCommit, ...RejectedCommit[]]> {
+    const [first, ...rest] = order;
+    if (first === undefined) throw new Error("A race requires at least one candidate");
+    const accepted = await fixture.gate.accept(first.name);
+    const rejected: RejectedCommit[] = [];
+    for (const actor of rest) rejected.push(await fixture.gate.rejectAtRelay(actor.name));
     await Promise.all(pending);
     fixture.gate.disarm();
-    for (let index = 1; index < accepted.length; index += 1) {
-        expectComparable(accepted[index - 1]!, accepted[index]!);
-    }
-    return accepted;
+    return [accepted, ...rejected];
 }
 
 async function activateIfPending(actor: RaceActor, sessionId: Uint8Array): Promise<void> {
@@ -600,15 +643,6 @@ describe("Commit race and intent convergence chaos", () => {
     ): void => {
         scenarios.push({ name, expectedFailure: undefined, run });
     };
-    const scenarioFails = (
-        name: string,
-        productFinding: string,
-        _options: { readonly timeout: number },
-        run: () => Promise<void>,
-    ): void => {
-        scenarios.push({ name, expectedFailure: productFinding, run });
-    };
-
     scenario(
         "RACE-01 owner policy intents serialize by real relay order",
         { timeout: 120_000 },
@@ -784,9 +818,12 @@ describe("Commit race and intent convergence chaos", () => {
                     fixture.session.id,
                     utf8Encode("after-removal-parent"),
                 );
-                await synchronize(fixture.dave);
+                await expect(synchronize(fixture.dave)).resolves.toMatchObject({
+                    terminalPublicationFailures: 1,
+                    transientPublicationFailures: 0,
+                });
                 const outcome = await synchronize(fixture.alice);
-                expect(outcome.inbox.rejected).toBe(1);
+                expect(outcome.inbox.rejected).toBe(0);
                 expect(fixture.alice.updates.map(({ text }) => text)).not.toContain(
                     "after-removal-parent",
                 );
@@ -1161,7 +1198,7 @@ describe("Commit race and intent convergence chaos", () => {
                 const attempted =
                     fixture.bob.transport.acknowledgements.slice(acknowledgementCount);
                 expect(attempted.every((through) => through === priorCursor)).toBe(true);
-                expect(attempted).not.toContain(second.eventId);
+                expect(second.code).toBe("stale_session_epoch");
                 expect(
                     memberCount(await fixture.bob.client.session(fixture.session.id), fixture.dave),
                 ).toBe(0);
@@ -1557,9 +1594,8 @@ describe("Commit race and intent convergence chaos", () => {
         },
     );
 
-    scenarioFails(
+    scenario(
         "RACE-19 relay-first winner survives loser continuity reset and roster convergence",
-        "PRODUCT FINDING RACE-19/I06/I15/I24",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture();
@@ -1581,8 +1617,8 @@ describe("Commit race and intent convergence chaos", () => {
                 });
                 const pending = await stageTwo(fixture, fixture.bob, fixture.alice);
                 const winner = await fixture.gate.accept("alice");
-                const loser = await fixture.gate.accept("bob", true);
-                expectComparable(winner, loser);
+                const loser = await fixture.gate.rejectAtRelay("bob", true);
+                expect(winner.candidateId).not.toBe(loser.candidateId);
                 await pending[1];
 
                 const transport = new HttpDeliveryTransport("https://relay.test", {
@@ -1653,9 +1689,7 @@ describe("Commit race and intent convergence chaos", () => {
                     }
                 }
                 await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
-                    {
-                        status: "pending",
-                    },
+                    { status: "pending" },
                 );
                 await fixture.bob.client.activateSession(fixture.session.id);
                 await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
@@ -1708,7 +1742,7 @@ describe("Commit race and intent convergence chaos", () => {
                     pending[1],
                     pending[0],
                 ]);
-                expectComparable(winner, loser);
+                expect(winner.candidateId).not.toBe(loser.candidateId);
                 await synchronize(fixture.dave);
                 expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
                 expect(

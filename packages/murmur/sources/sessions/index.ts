@@ -127,9 +127,11 @@ const IDENTITY_KEY = "murmur/identity/root";
 const ACCOUNT_ROOT_KEY = "murmur/accounts/v1/root";
 const ACCOUNT_DELETION_KEY = "murmur/accounts/v1/deletion";
 const RESET_PENDING_KEY = "murmur/reset/v1/pending";
+const RESET_READMISSION_PREFIX = "murmur/reset/v1/re-admissions/";
 const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
 const MURMUR_KEY_PREFIX = "murmur/";
 const RESET_PURGE_SCAN_LIMIT = 10_000;
+const PEER_ROSTER_REFRESH_INTERVAL = 8;
 const DEVICE_DORMANCY_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 // KeyPackages outlive the six-month delivery window by thirty days.
 const KEY_PACKAGE_LIFETIME_SECONDS = 210 * 24 * 60 * 60;
@@ -336,6 +338,8 @@ export class MurmurClient {
     #syncRetryTimer: ReturnType<typeof setTimeout> | undefined;
     #updatesActive = false;
     #accountDeletionActive = false;
+    #peerRosterRefreshOrdinal = 0;
+    #peerRosterCursor = 0;
 
     private constructor(
         identity: IdentityKeyPair,
@@ -1426,6 +1430,12 @@ export class MurmurClient {
                 }
                 if (page.size < RESET_PURGE_SCAN_LIMIT) break;
             }
+            for (const session of reset.sessions) {
+                await transaction.set(
+                    `${RESET_READMISSION_PREFIX}${encodeBase64Url(session.id)}`,
+                    session.descriptor,
+                );
+            }
             await this.#engine.adoptInboxBaselineInTransaction(
                 transaction,
                 reset.generation,
@@ -1768,8 +1778,47 @@ export class MurmurClient {
             `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(this.#identity.publicKey)}`,
             utf8Encode(String(this.#now()).padStart(16, "0")),
         );
-        const roster = await this.#transport.readDeviceRoster?.(this.#account.publicKey);
+        const readDeviceRoster = this.#transport.readDeviceRoster;
+        const roster = await readDeviceRoster?.call(this.#transport, this.#account.publicKey);
         if (roster !== undefined) await this.#observeRoster(`lookup-${roster.revision}`, roster);
+        this.#peerRosterRefreshOrdinal =
+            (this.#peerRosterRefreshOrdinal + 1) % PEER_ROSTER_REFRESH_INTERVAL;
+        if (readDeviceRoster !== undefined && this.#peerRosterRefreshOrdinal === 0) {
+            const peers = new Map<string, Uint8Array>();
+            let cursor: string | undefined;
+            do {
+                let page: MurmurSessionPage;
+                try {
+                    page = await this.#engine.list(cursor === undefined ? {} : { after: cursor });
+                } catch {
+                    // Session synchronization owns corruption quarantine. An opportunistic
+                    // peer-roster refresh must not preempt that isolated recovery path.
+                    peers.clear();
+                    break;
+                }
+                for (const session of page.sessions) {
+                    for (const member of session.members) {
+                        if (!equalBytes(member, this.#account.publicKey)) {
+                            peers.set(encodeBase64Url(member), member);
+                        }
+                    }
+                }
+                cursor = page.cursor ?? undefined;
+            } while (cursor !== undefined);
+            const orderedPeers = [...peers].sort(([left], [right]) => left.localeCompare(right));
+            const selected = orderedPeers[this.#peerRosterCursor % orderedPeers.length];
+            if (selected !== undefined) {
+                this.#peerRosterCursor += 1;
+                const [encodedAccount, account] = selected;
+                const peerRoster = await readDeviceRoster.call(this.#transport, account);
+                if (peerRoster !== undefined) {
+                    await this.#observeRoster(
+                        `lookup-${encodedAccount}-${peerRoster.revision}`,
+                        peerRoster,
+                    );
+                }
+            }
+        }
         await this.#ensureDirectoryEntry();
     }
 

@@ -9,6 +9,7 @@ import {
 } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import {
+    decodeIdentityRoot,
     destroyIdentity,
     generateIdentityKeyPair,
     type IdentityKeyPair,
@@ -41,7 +42,7 @@ import {
     type MurmurUpdate,
 } from "../../sessions/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
-import { equalBytes, utf8Decode, utf8Encode } from "../../utils/index.js";
+import { equalBytes, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
 import {
     ChaosInjectedError,
     FaultInjectingDeliveryTransport,
@@ -112,10 +113,28 @@ class RecordingDeliveryTransport implements DeliveryTransport {
     readonly reads: SignedInboxRead[] = [];
     readonly acknowledgements: SignedInboxAck[] = [];
     readonly #delegate: DeliveryTransport;
+    readonly deleteAccount?: NonNullable<DeliveryTransport["deleteAccount"]>;
+    readonly deleteSession?: NonNullable<DeliveryTransport["deleteSession"]>;
+    readonly mutateDeviceRoster?: NonNullable<DeliveryTransport["mutateDeviceRoster"]>;
+    readonly readDeviceRoster?: NonNullable<DeliveryTransport["readDeviceRoster"]>;
     readonly stream?: NonNullable<DeliveryTransport["stream"]>;
 
     constructor(delegate: DeliveryTransport) {
         this.#delegate = delegate;
+        if (delegate.deleteAccount !== undefined) {
+            this.deleteAccount = (delivery, signal) => delegate.deleteAccount!(delivery, signal);
+        }
+        if (delegate.deleteSession !== undefined) {
+            this.deleteSession = (delivery, signal) => delegate.deleteSession!(delivery, signal);
+        }
+        if (delegate.mutateDeviceRoster !== undefined) {
+            this.mutateDeviceRoster = (delivery, signal) =>
+                delegate.mutateDeviceRoster!(delivery, signal);
+        }
+        if (delegate.readDeviceRoster !== undefined) {
+            this.readDeviceRoster = (accountKey, signal) =>
+                delegate.readDeviceRoster!(accountKey, signal);
+        }
         if (delegate.stream !== undefined) {
             this.stream = (request, signal, hooks) => {
                 this.reads.push(cloneRead(request));
@@ -279,6 +298,23 @@ async function inbox(
                 createdAt: now,
             }),
         );
+    }
+}
+
+async function clientInbox(
+    transport: DeliveryTransport,
+    store: MemoryMurmurStore,
+    now: number,
+    after: string | null = null,
+): Promise<InboxPage> {
+    const root = await store.get("murmur/identity/root");
+    if (root === undefined) throw new Error("Missing Murmur device identity");
+    const identity = decodeIdentityRoot(root);
+    try {
+        return await inbox(transport, identity, now, after);
+    } finally {
+        destroyIdentity(identity);
+        zeroBytes(root);
     }
 }
 
@@ -1101,6 +1137,7 @@ describe("network and delivery contract chaos", () => {
         const aliceIdentity = generateIdentityKeyPair();
         const bobIdentity = generateIdentityKeyPair();
         const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
         const schedule = new SeededChaosSchedule(0x4e455416, [
             {
                 id: "disconnect-after-commit-acceptance",
@@ -1124,12 +1161,7 @@ describe("network and delivery contract chaos", () => {
             classifyDelivery: (delivery) => delivery.ciphertext[0],
         });
         const alice = await murmurClient(aliceIdentity, fault, aliceStore, fixture.clock.now);
-        const bob = await murmurClient(
-            bobIdentity,
-            fixture.http,
-            new MemoryMurmurStore(),
-            fixture.clock.now,
-        );
+        const bob = await murmurClient(bobIdentity, fixture.http, bobStore, fixture.clock.now);
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("negotiated commit reconnect"),
@@ -1139,13 +1171,18 @@ describe("network and delivery contract chaos", () => {
                 "negotiated reconnect",
             );
             expect(await alice.session(session.id)).toMatchObject({ status: "creating" });
+            const bobBeforeWelcome = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(
-                (await inbox(fixture.http, bobIdentity, fixture.clock.now())).deliveries,
+                bobBeforeWelcome.deliveries
+                    .map(({ delivery }) => delivery.ciphertext[0])
+                    .filter((kind) => kind === 1 || kind === 2),
             ).toEqual([]);
-            const acceptedCommit = await inbox(fixture.http, aliceIdentity, fixture.clock.now());
-            expect(acceptedCommit.deliveries.map(({ delivery }) => delivery.ciphertext[0])).toEqual(
-                [3],
-            );
+            const acceptedCommit = await clientInbox(fixture.http, aliceStore, fixture.clock.now());
+            expect(
+                acceptedCommit.deliveries
+                    .map(({ delivery }) => delivery.ciphertext[0])
+                    .filter((kind) => kind === 3),
+            ).toEqual([3]);
 
             expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
@@ -1160,10 +1197,12 @@ describe("network and delivery contract chaos", () => {
                 3, 3, 1, 2,
             ]);
             expect(fixture.recording.published[1]?.id).toBe(fixture.recording.published[0]?.id);
-            const bobPage = await inbox(fixture.http, bobIdentity, fixture.clock.now());
-            expect(bobPage.deliveries.map(({ delivery }) => delivery.ciphertext[0])).toEqual([
-                1, 2,
-            ]);
+            const bobPage = await clientInbox(fixture.http, bobStore, fixture.clock.now());
+            expect(
+                bobPage.deliveries
+                    .map(({ delivery }) => delivery.ciphertext[0])
+                    .filter((kind) => kind === 1 || kind === 2),
+            ).toEqual([1, 2]);
             await bob.synchronize({ waitMilliseconds: 0 });
             expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
             await alice.synchronize({ waitMilliseconds: 0 });
@@ -1181,6 +1220,8 @@ describe("network and delivery contract chaos", () => {
         const fixture = networkFixture();
         const aliceIdentity = generateIdentityKeyPair();
         const bobIdentity = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const bobStore = new MemoryMurmurStore();
         const schedule = new SeededChaosSchedule(0x4e455417, [
             {
                 id: "disconnect-before-welcome",
@@ -1198,18 +1239,8 @@ describe("network and delivery contract chaos", () => {
             schedule,
             classifyDelivery: (delivery) => delivery.ciphertext[0],
         });
-        const alice = await murmurClient(
-            aliceIdentity,
-            fault,
-            new MemoryMurmurStore(),
-            fixture.clock.now,
-        );
-        const bob = await murmurClient(
-            bobIdentity,
-            fixture.http,
-            new MemoryMurmurStore(),
-            fixture.clock.now,
-        );
+        const alice = await murmurClient(aliceIdentity, fault, aliceStore, fixture.clock.now);
+        const bob = await murmurClient(bobIdentity, fixture.http, bobStore, fixture.clock.now);
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("Welcome reconnect"),
@@ -1222,8 +1253,11 @@ describe("network and delivery contract chaos", () => {
             });
             expect(await alice.session(session.id)).toMatchObject({ status: "active" });
             expect(fixture.recording.published.map(({ ciphertext }) => ciphertext[0])).toEqual([3]);
+            const bobBeforeWelcome = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(
-                (await inbox(fixture.http, bobIdentity, fixture.clock.now())).deliveries,
+                bobBeforeWelcome.deliveries
+                    .map(({ delivery }) => delivery.ciphertext[0])
+                    .filter((kind) => kind === 1 || kind === 2),
             ).toEqual([]);
 
             const queued = await alice.send(session.id, utf8Encode("after Welcome"));
@@ -1476,28 +1510,27 @@ describe("network and delivery contract chaos", () => {
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
 
-            const baseline = await inbox(fixture.http, bobIdentity, fixture.clock.now());
+            const baseline = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(baseline.generation).toBeDefined();
             expect(baseline.headSequence).toBe(baseline.acknowledgedSequence);
             const expiresAt = NOW + SIX_MONTHS;
             await fixture.http.publish(
-                labeledDelivery(
+                createSignedDelivery(
                     expiringSender,
-                    [bobIdentity],
-                    "expires at six months",
-                    NOW,
-                    expiresAt,
+                    [bob.deviceKey],
+                    utf8Encode("expires at six months"),
+                    { createdAt: NOW, expiresAt },
                 ),
             );
             fixture.clock.set(expiresAt - 1);
-            const retained = await inbox(fixture.http, bobIdentity, fixture.clock.now());
+            const retained = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(retained.deliveries).toHaveLength(1);
             expect(retained.deliveries[0]?.sequence).toBe((baseline.headSequence ?? 0) + 1);
             expect(equalBytes(retained.generation!, baseline.generation!)).toBe(true);
 
             fixture.clock.set(expiresAt);
             await expect(fixture.relay.pruneExpired()).resolves.toBe(1);
-            const lost = await inbox(fixture.http, bobIdentity, fixture.clock.now());
+            const lost = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(lost.deliveries).toHaveLength(0);
             expect(equalBytes(lost.generation!, baseline.generation!)).toBe(false);
 
@@ -1520,8 +1553,9 @@ describe("network and delivery contract chaos", () => {
             expect(await bob.session(session.id)).toBeUndefined();
             expect(await bobStore.get("murmur/reset/v1/pending")).toBeUndefined();
             await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
-                inbox: { processed: 0 },
+                inbox: { processed: 1 },
             });
+            expect(await bob.session(session.id)).toBeUndefined();
 
             for (let round = 0; round < 8; round += 1) {
                 await alice.synchronize({ waitMilliseconds: 0 });

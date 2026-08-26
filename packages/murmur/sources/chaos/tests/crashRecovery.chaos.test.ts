@@ -138,9 +138,31 @@ class ObservingTransport implements DeliveryTransport {
     readonly accepted = new Map<string, string>();
     readonly reads: InboxPage[] = [];
     readonly acknowledgements: string[] = [];
+    readonly deleteAccount?: NonNullable<DeliveryTransport["deleteAccount"]>;
+    readonly deleteSession?: NonNullable<DeliveryTransport["deleteSession"]>;
+    readonly mutateDeviceRoster?: NonNullable<DeliveryTransport["mutateDeviceRoster"]>;
+    readonly readDeviceRoster?: NonNullable<DeliveryTransport["readDeviceRoster"]>;
+    readonly stream?: NonNullable<DeliveryTransport["stream"]>;
 
     constructor(delegate: DeliveryTransport) {
         this.#delegate = delegate;
+        if (delegate.deleteAccount !== undefined) {
+            this.deleteAccount = (delivery, signal) => delegate.deleteAccount!(delivery, signal);
+        }
+        if (delegate.deleteSession !== undefined) {
+            this.deleteSession = (delivery, signal) => delegate.deleteSession!(delivery, signal);
+        }
+        if (delegate.mutateDeviceRoster !== undefined) {
+            this.mutateDeviceRoster = (delivery, signal) =>
+                delegate.mutateDeviceRoster!(delivery, signal);
+        }
+        if (delegate.readDeviceRoster !== undefined) {
+            this.readDeviceRoster = (accountKey, signal) =>
+                delegate.readDeviceRoster!(accountKey, signal);
+        }
+        if (delegate.stream !== undefined) {
+            this.stream = (request, signal, hooks) => delegate.stream!(request, signal, hooks);
+        }
     }
 
     async publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
@@ -779,7 +801,7 @@ describe("crash and transaction recovery chaos", () => {
                             } else {
                                 const target = offsetStoreTarget(
                                     bob,
-                                    3,
+                                    4,
                                     "transaction.set",
                                     undefined,
                                     APPLICATION_UPDATE_PREFIX,
@@ -1020,7 +1042,7 @@ describe("crash and transaction recovery chaos", () => {
                         );
                         const target = offsetStoreTarget(
                             alice,
-                            3,
+                            4,
                             "transaction.set",
                             `${SESSION_STATE_PREFIX}${encodeBase64Url(session.id)}`,
                         );
@@ -1272,7 +1294,7 @@ describe("crash and transaction recovery chaos", () => {
                         );
                         const target = offsetStoreTarget(
                             alice,
-                            5,
+                            6,
                             "transaction.set",
                             undefined,
                             QUARANTINE_PREFIX,

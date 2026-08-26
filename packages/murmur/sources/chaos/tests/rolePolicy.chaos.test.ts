@@ -555,17 +555,18 @@ describe("role, policy, and private-roster session races", () => {
                     sendPolicy: "everyone",
                 }));
                 await forged.client.send(fixture.sessionId, utf8Encode("forged-remote"));
-                await forged.client.synchronize({ waitMilliseconds: 0 });
+                await expect(
+                    forged.client.synchronize({ waitMilliseconds: 0 }),
+                ).resolves.toMatchObject({
+                    published: 0,
+                    terminalPublicationFailures: 1,
+                });
                 await synchronize([fixture.alice, fixture.bob, fixture.dave], 2);
 
                 expect(
                     (await consume(fixture.dave)).map((update) => utf8Decode(update.bytes)),
                 ).not.toContain("forged-remote");
-                expect(await fixture.alice.client.issues()).toEqual(
-                    expect.arrayContaining([
-                        expect.objectContaining({ code: "unauthorized_application_sender" }),
-                    ]),
-                );
+                expect(await fixture.alice.client.issues()).toEqual([]);
             } finally {
                 forged.client.close();
             }
@@ -714,18 +715,19 @@ describe("role, policy, and private-roster session races", () => {
                         });
                     }
                 }
-                await attacker.client.synchronize({ waitMilliseconds: 0 });
+                await expect(
+                    attacker.client.synchronize({ waitMilliseconds: 0 }),
+                ).resolves.toMatchObject({
+                    published: 0,
+                    transientPublicationFailures: 1,
+                });
                 const honest = [fixture.alice, fixture.dave];
                 await synchronize(honest, 2);
                 for (const actor of honest) {
                     expect(roleSnapshot(await requireSession(actor, fixture.sessionId))).toEqual(
                         before,
                     );
-                    expect(await actor.client.issues()).toEqual(
-                        expect.arrayContaining([
-                            expect.objectContaining({ code: "unauthorized_commit" }),
-                        ]),
-                    );
+                    expect(await actor.client.issues()).toEqual([]);
                 }
 
                 await fixture.alice.client.send(
@@ -1006,10 +1008,15 @@ describe("role, policy, and private-roster session races", () => {
                     fixture.sessionId,
                     utf8Encode("old epoch within grace"),
                 );
-                await oldWithin.client.synchronize({ waitMilliseconds: 0 });
+                await expect(
+                    oldWithin.client.synchronize({ waitMilliseconds: 0 }),
+                ).resolves.toMatchObject({
+                    published: 0,
+                    terminalPublicationFailures: 1,
+                });
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 2);
                 const within = await consume(fixture.dave);
-                expect(within.length).toBeLessThanOrEqual(1);
+                expect(within).toEqual([]);
 
                 await copyDeliveryProgress(oldWithin.store, oldOutside.store);
                 fixture.now.value += PREVIOUS_EPOCH_GRACE_MILLISECONDS + 1;
@@ -1017,7 +1024,12 @@ describe("role, policy, and private-roster session races", () => {
                     fixture.sessionId,
                     utf8Encode("old epoch outside grace"),
                 );
-                await oldOutside.client.synchronize({ waitMilliseconds: 0 });
+                await expect(
+                    oldOutside.client.synchronize({ waitMilliseconds: 0 }),
+                ).resolves.toMatchObject({
+                    published: 0,
+                    terminalPublicationFailures: 1,
+                });
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 2);
                 const outside = await consume(fixture.dave);
                 expect(outside.map((update) => utf8Decode(update.bytes))).not.toContain(
@@ -1029,7 +1041,12 @@ describe("role, policy, and private-roster session races", () => {
                     fixture.sessionId,
                     fixture.carol.client.accountKey,
                 );
-                await oldControl.client.synchronize({ waitMilliseconds: 0 });
+                await expect(
+                    oldControl.client.synchronize({ waitMilliseconds: 0 }),
+                ).resolves.toMatchObject({
+                    published: 0,
+                    transientPublicationFailures: 1,
+                });
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
                 for (const actor of [fixture.alice, fixture.carol, fixture.dave]) {
                     expect(roleSnapshot(await requireSession(actor, fixture.sessionId))).toEqual(
@@ -1038,8 +1055,10 @@ describe("role, policy, and private-roster session races", () => {
                 }
                 const captured = oldControl.gate.published.at(-1);
                 if (captured === undefined) throw new Error("Old admin Commit was not captured");
-                const replay = await fixture.base.publish(captured);
-                expect(replay.duplicate).toBe(true);
+                await expect(fixture.base.publish(captured)).rejects.toMatchObject({
+                    status: 403,
+                    code: "session_unauthorized",
+                });
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 2);
                 expect(
                     roleSnapshot(await requireSession(fixture.alice, fixture.sessionId)),

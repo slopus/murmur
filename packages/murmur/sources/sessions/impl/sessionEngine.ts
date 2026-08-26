@@ -4246,6 +4246,13 @@ export class SessionEngine {
                             continue;
                         }
                         if (decodedRecord.kind === "commit") {
+                            await this.#store.transaction((transaction) =>
+                                this.#attachCoverageBlockedOutboxes(
+                                    transaction,
+                                    decodedRecord.sessionId,
+                                    decodedRecord.delivery.id,
+                                ),
+                            );
                             const pendingEpoch = await this.#store.scan(
                                 `${EPOCH_OUTBOX_INDEX_PREFIX}${sessionId(
                                     decodedRecord.sessionId,
@@ -4347,6 +4354,21 @@ export class SessionEngine {
                                         error.rosters,
                                     );
                                 }
+                                transientFailureIds.add(decodedRecord.delivery.id);
+                                blockedSessions.add(encodedSessionId);
+                                continue;
+                            }
+                            if (
+                                decodedRecord.kind === "commit" &&
+                                error instanceof DeliveryTransportError &&
+                                ((error.status === 409 && error.code === "stale_session_epoch") ||
+                                    (error.status === 403 && error.code === "session_unauthorized"))
+                            ) {
+                                // The relay has already accepted a competing Commit or applied
+                                // state that can invalidate this candidate. Keep the candidate and
+                                // its dependent sends durable until the authenticated queue echo
+                                // arrives; receiveCommit then cancels it, re-encrypts the sends,
+                                // and leaves the membership intent available for re-authorization.
                                 transientFailureIds.add(decodedRecord.delivery.id);
                                 blockedSessions.add(encodedSessionId);
                                 continue;

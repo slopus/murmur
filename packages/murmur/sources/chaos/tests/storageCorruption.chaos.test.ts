@@ -711,7 +711,7 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
         const message = `capacity-replay-${label}`;
         await alice.send(session.id, utf8Encode(message));
         await alice.synchronize({ waitMilliseconds: 0 });
-        const beforePage = await relayStore.readQueue(bob.identity, previousCursor, 2, NOW, {
+        const beforePage = await relayStore.readQueue(bob.deviceKey, previousCursor, 2, NOW, {
             maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
         });
         expect(beforePage.deliveries).toHaveLength(1);
@@ -733,7 +733,7 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
         ).rejects.toThrow(`prefix ${APPLICATION_UPDATE_PREFIX}`);
         const after = await storeFingerprint(bobDelegate);
         const failedCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
-        const retainedPage = await relayStore.readQueue(bob.identity, previousCursor, 2, NOW, {
+        const retainedPage = await relayStore.readQueue(bob.deviceKey, previousCursor, 2, NOW, {
             maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
         });
         expect(callbacks).toBe(0);
@@ -758,9 +758,15 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
         );
         expect(callbacks).toBe(1);
         const recoveredCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
-        const acknowledgedPage = await relayStore.readQueue(bob.identity, recoveredCursor, 2, NOW, {
-            maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
-        });
+        const acknowledgedPage = await relayStore.readQueue(
+            bob.deviceKey,
+            recoveredCursor,
+            2,
+            NOW,
+            {
+                maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
+            },
+        );
         expect(acknowledgedPage.deliveries).toHaveLength(0);
         expect(acknowledgedPage.acknowledgedThrough).toBe(recoveredCursor);
         zeroBytes(acknowledgedPage.generation);
@@ -849,7 +855,7 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
             ),
         ).rejects.toThrow("write 1");
         const bufferedAfterFailure = (await bob.session(session.id))?.bufferedEvents;
-        const acknowledgedPage = await relayStore.readQueue(bob.identity, queuedCursor, 2, NOW, {
+        const acknowledgedPage = await relayStore.readQueue(bob.deviceKey, queuedCursor, 2, NOW, {
             maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
         });
         const relayAcknowledgedBeforeDrain =
