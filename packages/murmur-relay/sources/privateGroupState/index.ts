@@ -18,6 +18,7 @@ import type {
 
 export { SqlitePrivateGroupStateStore } from "./impl/privateGroupStateStoreSqlite.js";
 export type { SqlitePrivateGroupStateStoreOptions } from "./impl/privateGroupStateStoreSqlite.js";
+export { PostgresPrivateGroupStateStore } from "./impl/privateGroupStateStorePostgres.js";
 export type {
     PrivateGroupAccessToken,
     PrivateGroupChallengeOperation,

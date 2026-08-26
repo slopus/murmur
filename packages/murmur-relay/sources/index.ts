@@ -105,6 +105,7 @@ export type {
 } from "./websocket/index.js";
 export {
     PrivateGroupStateService,
+    PostgresPrivateGroupStateStore,
     SqlitePrivateGroupStateStore,
     encodePrivateGroupStateRecord,
     encodeUnsignedPrivateGroupStateRecord,
