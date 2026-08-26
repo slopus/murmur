@@ -45,37 +45,6 @@ const OUTBOX_PREFIXES = [
 ] as const;
 const INTENT_PREFIX = "murmur/session-intents/";
 
-interface VitestRuntimeRpcMethod {
-    (...arguments_: readonly unknown[]): Promise<unknown>;
-    readonly asEvent: (...arguments_: readonly unknown[]) => void;
-}
-
-interface VitestWorkerState {
-    rpc: object;
-}
-
-// Vitest 3.2.7 hard-codes a 60-second acknowledgement timeout for task updates,
-// while its default reporter acknowledges only after this long single-file run.
-// The RPC's event form carries the same ordered update without retaining a dead
-// acknowledgement promise. This is isolated to the worker that loaded this file.
-const workerState = (
-    globalThis as typeof globalThis & { readonly __vitest_worker__?: VitestWorkerState }
-).__vitest_worker__;
-if (workerState !== undefined) {
-    const delegate = workerState.rpc;
-    workerState.rpc = new Proxy(delegate, {
-        get(target, property, receiver): unknown {
-            const value = Reflect.get(target, property, receiver) as unknown;
-            if (property !== "onTaskUpdate" || typeof value !== "function") return value;
-            const update = value as VitestRuntimeRpcMethod;
-            return (...arguments_: readonly unknown[]): Promise<void> => {
-                update.asEvent(...arguments_);
-                return Promise.resolve();
-            };
-        },
-    });
-}
-
 type ActorName = "alice" | "bob" | "carol" | "dave" | "erin" | "frank";
 type RaceSender = "alice" | "bob" | "carol";
 

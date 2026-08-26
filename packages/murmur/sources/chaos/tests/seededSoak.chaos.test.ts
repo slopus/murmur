@@ -60,37 +60,6 @@ const FAST_SEEDS = [
     10_946, 17_711, 28_657, 46_368, 75_025,
 ] as const;
 
-interface VitestRuntimeRpcMethod {
-    (...arguments_: readonly unknown[]): Promise<unknown>;
-    readonly asEvent: (...arguments_: readonly unknown[]) => void;
-}
-
-interface VitestWorkerState {
-    rpc: object;
-}
-
-// Vitest 3.2.7 times out waiting for a reporter acknowledgement when one test
-// legitimately runs longer than 60 seconds. The event form preserves the same
-// ordered task update without retaining the acknowledgement promise. This is
-// isolated to the worker executing this opt-in soak file.
-const workerState = (
-    globalThis as typeof globalThis & { readonly __vitest_worker__?: VitestWorkerState }
-).__vitest_worker__;
-if (workerState !== undefined) {
-    const delegate = workerState.rpc;
-    workerState.rpc = new Proxy(delegate, {
-        get(target, property, receiver): unknown {
-            const value = Reflect.get(target, property, receiver) as unknown;
-            if (property !== "onTaskUpdate" || typeof value !== "function") return value;
-            const update = value as VitestRuntimeRpcMethod;
-            return (...arguments_: readonly unknown[]): Promise<void> => {
-                update.asEvent(...arguments_);
-                return Promise.resolve();
-            };
-        },
-    });
-}
-
 type InvariantId =
     | "I01"
     | "I02"

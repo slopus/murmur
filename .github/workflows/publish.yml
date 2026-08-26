@@ -103,6 +103,12 @@ jobs:
               with:
                   node-version: 24
                   cache: pnpm
+                  registry-url: https://registry.npmjs.org
+            - name: Require an npm CLI that supports trusted publishing
+              shell: bash
+              run: |
+                  npm install --global npm@^11.5.1
+                  npm --version
             - run: pnpm install --frozen-lockfile
             - run: pnpm --filter @slopus/murmur-relay build
             - run: pnpm --filter @slopus/murmur build
@@ -119,10 +125,13 @@ jobs:
             - name: Publish @slopus/murmur
               if: steps.npm-version.outputs.exists != 'true'
               working-directory: packages/murmur
-              run: >-
-                  pnpm publish --access public
-                  --tag ${{ needs.verify.outputs.npm-tag }}
-                  --provenance --no-git-checks --ignore-scripts
+              env:
+                  NPM_TAG: ${{ needs.verify.outputs.npm-tag }}
+              shell: bash
+              run: |
+                  npm pack --ignore-scripts --pack-destination "$RUNNER_TEMP"
+                  tarball="$(find "$RUNNER_TEMP" -maxdepth 1 -name 'slopus-murmur-*.tgz' -print -quit)"
+                  npm publish "$tarball" --access public --tag "$NPM_TAG"
 
     publish-container:
         name: Publish relay container
