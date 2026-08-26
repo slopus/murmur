@@ -21,5 +21,6 @@ publish fails with a 404.
 `verify.yml` runs on every `main` push and pull request. It verifies the local
 source tree and then exercises the permanently deployed Cloudflare staging
 relay with the repository's protected staging token secret. Fork pull requests
-run the local checks without receiving that secret. The release workflow runs
-the same staging gate before publishing.
+run the local checks without receiving that secret. The release workflow keeps
+its tag gate short: ordinary unit tests, static checks, and package compatibility.
+Integration, staging, and chaos suites are opt-in and do not run during release.

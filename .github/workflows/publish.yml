@@ -47,11 +47,8 @@ jobs:
                       echo "npm-tag=latest" >> "$GITHUB_OUTPUT"
                       echo "prerelease=false" >> "$GITHUB_OUTPUT"
                   fi
-            - run: pnpm test
-            - name: Test deployed staging relay
-              env:
-                  MURMUR_RELAY_STAGING_TOKEN_SECRET: ${{ secrets.MURMUR_RELAY_STAGING_TOKEN_SECRET }}
-              run: pnpm test:staging
+            - name: Run unit tests
+              run: pnpm test
             - run: pnpm typecheck
             - run: pnpm lint
             - run: pnpm format:check

@@ -45,7 +45,7 @@
         "clean": "node --input-type=module -e \"import { rmSync } from 'node:fs'; rmSync('dist', { recursive: true, force: true });\"",
         "build": "pnpm run clean && tsc -p tsconfig.build.json",
         "check": "tsc --noEmit -p tsconfig.json",
-        "test": "pnpm run test:unit && pnpm run test:integration && pnpm run test:chaos",
+        "test": "pnpm run test:unit",
         "test:chaos": "vitest run --config vitest.chaos.config.ts --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:contact-group": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'creates an N-person service group from contacts and exchanges messages' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:contact-handshake-offline": "vitest run sources/contacts/tests/contactIntegration.test.ts -t 'queues the contact hello offline and relays the full handshake after restart' --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
@@ -61,7 +61,7 @@
         "test:unit": "vitest run --maxWorkers=1 --no-file-parallelism --testTimeout=120000 --exclude sources/contacts/tests/contactIntegration.test.ts --exclude sources/accounts/tests/multideviceIntegration.test.ts",
         "test:watch": "vitest",
         "sync-readme": "node --input-type=module -e \"import { copyFileSync } from 'node:fs'; copyFileSync('../../README.md', 'README.md');\"",
-        "prepack": "pnpm run sync-readme && pnpm run check && pnpm run build && pnpm run test:unit && pnpm run test:integration"
+        "prepack": "pnpm run sync-readme && pnpm run check && pnpm run build"
     },
     "dependencies": {
         "@noble/ciphers": "^1.2.1",

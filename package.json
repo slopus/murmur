@@ -8,6 +8,7 @@
         "format:check": "oxfmt --check .",
         "lint": "oxlint .",
         "test": "pnpm --filter @slopus/murmur build && pnpm --filter @slopus/murmur-relay build && pnpm --recursive --filter './packages/**' run test",
+        "test:chaos": "pnpm --filter @slopus/murmur build && pnpm --filter @slopus/murmur-relay build && pnpm --recursive --filter './packages/**' run test:chaos",
         "test:staging": "pnpm --filter @slopus/murmur-relay build && pnpm --filter @slopus/murmur test:e2e:staging",
         "typecheck": "pnpm --filter @slopus/murmur-relay build && pnpm --filter @slopus/murmur build && pnpm --filter @slopus/murmur check && pnpm --filter @slopus/murmur-relay check"
     },

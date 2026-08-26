@@ -1170,7 +1170,8 @@ pnpm install
 pnpm format       # oxfmt --write .
 pnpm lint         # oxlint
 pnpm typecheck
-pnpm test         # vitest across the workspace, real stores and a real relay
+pnpm test         # unit tests across the workspace
+pnpm test:chaos   # opt-in deterministic fault and recovery suites
 pnpm build
 ```
 

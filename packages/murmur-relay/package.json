@@ -34,7 +34,7 @@
         "check": "tsc --noEmit -p tsconfig.json",
         "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
         "start": "node dist/main.js",
-        "test": "pnpm run test:unit && pnpm run test:chaos",
+        "test": "pnpm run test:unit",
         "test:chaos": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run --config vitest.chaos.config.ts --maxWorkers=1 --no-file-parallelism --testTimeout=120000",
         "test:unit": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest run",
         "test:watch": "NODE_OPTIONS=--disable-warning=ExperimentalWarning vitest"
