@@ -1,4 +1,7 @@
-export { createPrivateGroupCredentialAuthority } from "./impl/credentialAuthority.js";
+export {
+    createPrivateGroupCredentialAuthority,
+    createPrivateGroupCredentialAuthorityFromSecret,
+} from "./impl/credentialAuthority.js";
 export type { PrivateGroupCredentialAuthorityAdapter } from "./impl/credentialAuthority.js";
 export { PrivateGroupStateClient } from "./impl/privateGroupStateClient.js";
 export {

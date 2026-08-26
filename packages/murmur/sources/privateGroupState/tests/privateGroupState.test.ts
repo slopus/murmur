@@ -4,11 +4,10 @@ import {
     SqlitePrivateGroupStateStore,
     encodePrivateGroupStateRecord as encodeServiceRecord,
 } from "@slopus/murmur-relay";
-import { deriveCredentialIssuer } from "../../privateGroups/index.js";
 import { encodeBase64Url, equalBytes, utf8Encode } from "../../utils/index.js";
 import {
     PrivateGroupStateClient,
-    createPrivateGroupCredentialAuthority,
+    createPrivateGroupCredentialAuthorityFromSecret,
     privateGroupStateRecordHash,
     type PrivateGroupRecordContent,
     type PrivateGroupStateRecord,
@@ -47,12 +46,11 @@ function fixture(groupSecret = bytes(101)): Fixture {
     const accountA = bytes(11);
     const accountB = bytes(12);
     const accountC = bytes(13);
-    const issuer = deriveCredentialIssuer(bytes(91));
     const store = new SqlitePrivateGroupStateStore(":memory:");
     const clock = { now: START };
     const service = new PrivateGroupStateService({
         store,
-        credentialAuthority: createPrivateGroupCredentialAuthority(issuer),
+        credentialAuthority: createPrivateGroupCredentialAuthorityFromSecret(bytes(91)),
         tokenSecret: bytes(201),
         now: () => clock.now,
         challengeLifetimeMilliseconds: 10 * 60_000,

@@ -4,6 +4,7 @@ import {
     decodeEncryptedUid,
     decodePrivateGroupPublicParameters,
     decodeUidPresentation,
+    deriveCredentialIssuer,
     encodeCredentialIssuanceResponse,
     encodeCredentialIssuerPublicParameters,
     issueCredential,
@@ -86,4 +87,17 @@ export function createPrivateGroupCredentialAuthority(
             }
         },
     };
+}
+
+/**
+ * EXPERIMENTAL: construct a private-group credential authority from a 32-byte secret.
+ *
+ * This is intended for trusted relay hosts. Applications must never receive
+ * this secret; operators should derive it in a private-group-specific domain
+ * from their deployment root secret.
+ */
+export function createPrivateGroupCredentialAuthorityFromSecret(
+    secret: Uint8Array,
+): PrivateGroupCredentialAuthorityAdapter {
+    return createPrivateGroupCredentialAuthority(deriveCredentialIssuer(secret));
 }

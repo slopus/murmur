@@ -71,6 +71,7 @@ if (JSON.stringify(names) !== JSON.stringify([
     "TerminalInboxDeliveryError",
     "WebSocketDeliveryTransport",
     "containsRecipient",
+    "createPrivateGroupCredentialAuthorityFromSecret",
     "createSignedDelivery",
     "createSignedInboxAck",
     "createSignedInboxRead",

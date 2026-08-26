@@ -69,6 +69,15 @@ async function consume(
     return consumed;
 }
 
+async function prefixCount(store: MurmurStore, prefix: string): Promise<number> {
+    const entries = await store.scan(prefix, { limit: 256 });
+    try {
+        return entries.size;
+    } finally {
+        for (const value of entries.values()) zeroBytes(value);
+    }
+}
+
 describe("stateful MLS sessions", () => {
     test("queues initial group messages offline and relays Welcome, Commit, then messages after restart", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
@@ -868,6 +877,92 @@ describe("stateful MLS sessions", () => {
             await relay.close();
         }
     });
+
+    test("terminalizes Add intents whose policy or admin authorization is lost", async () => {
+        const run = async (authority: "admin" | "policy"): Promise<void> => {
+            const relay = new RelayService(
+                new SqliteRelayStore(":memory:"),
+                {},
+                undefined,
+                () => NOW,
+            );
+            const aliceStore = new MemoryMurmurStore();
+            const bobStore = new MemoryMurmurStore();
+            const carolStore = new MemoryMurmurStore();
+            const daveStore = new MemoryMurmurStore();
+            const alice = await client(relay, aliceStore);
+            const bob = await client(relay, bobStore);
+            const carol = await client(relay, carolStore);
+            const dave = await client(relay, daveStore);
+            try {
+                const session = await alice.createSession({
+                    descriptor: utf8Encode(`authorization loss ${authority}`),
+                    members: [await bob.discovery(), await carol.discovery()],
+                    anyoneCanAddMembers: authority === "policy",
+                });
+                await alice.synchronize({ waitMilliseconds: 0 });
+                await bob.synchronize({ waitMilliseconds: 0 });
+                await carol.synchronize({ waitMilliseconds: 0 });
+                await bob.activateSession(session.id);
+                await carol.activateSession(session.id);
+
+                const actor = authority === "admin" ? bob : carol;
+                const actorStore = authority === "admin" ? bobStore : carolStore;
+                if (authority === "admin") {
+                    await alice.grantAdmin(session.id, bob.identity);
+                    await alice.synchronize({ waitMilliseconds: 0 });
+                    await alice.synchronize({ waitMilliseconds: 0 });
+                    await bob.synchronize({ waitMilliseconds: 0 });
+                    await carol.synchronize({ waitMilliseconds: 0 });
+                    expect((await bob.session(session.id))?.admins).toContainEqual(bob.identity);
+                }
+
+                await actor.addMember(session.id, await dave.discovery());
+                expect(await prefixCount(actorStore, "murmur/session-intents/")).toBe(1);
+                if (authority === "admin") {
+                    await alice.revokeAdmin(session.id, bob.identity);
+                } else {
+                    await alice.setPolicies(session.id, {
+                        adminsAssignAdmins: false,
+                        anyoneCanAddMembers: false,
+                    });
+                }
+                await alice.synchronize({ waitMilliseconds: 0 });
+                await alice.synchronize({ waitMilliseconds: 0 });
+                await actor.synchronize({ waitMilliseconds: 0 });
+
+                expect(await prefixCount(actorStore, "murmur/session-intents/")).toBe(0);
+                const issues = (await actor.issues()).filter(
+                    (issue) => issue.code === "intent_authorization_lost",
+                );
+                expect(issues).toEqual([
+                    expect.objectContaining({
+                        code: "intent_authorization_lost",
+                        sessionId: session.id,
+                        kind: "session",
+                        operationId: expect.any(String),
+                    }),
+                ]);
+                await actor.synchronize({ waitMilliseconds: 0 });
+                expect(
+                    (await actor.issues()).filter(
+                        (issue) => issue.code === "intent_authorization_lost",
+                    ),
+                ).toHaveLength(1);
+                expect((await actor.session(session.id))?.members).toHaveLength(3);
+                expect(await dave.session(session.id)).toBeUndefined();
+            } finally {
+                alice.close();
+                bob.close();
+                carol.close();
+                dave.close();
+                await relay.close();
+            }
+        };
+
+        await run("policy");
+        await run("admin");
+    }, 120_000);
 
     test("replaces a pending Welcome after its Add Commit loses", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
