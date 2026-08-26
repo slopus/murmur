@@ -112,6 +112,9 @@ function separated(domain: string, value: Parameters<typeof canonicalJsonBytes>[
     return bytes;
 }
 
+/**
+ * Encode one delivery for relay JSON from a custom transport implementation.
+ */
 export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJson {
     return {
         version: 1,
@@ -130,6 +133,10 @@ function deliverySigningBytes(delivery: SignedDelivery): Uint8Array {
     return separated(DELIVERY_DOMAIN, unsigned);
 }
 
+/**
+ * Validate the canonical shape of a delivery at a custom transport boundary.
+ * This does not verify its sender signature.
+ */
 export function validateSignedDelivery(delivery: SignedDelivery): void {
     validateDeliveryId(delivery.id);
     validateIdentityPublicKey({ publicKey: delivery.sender });
@@ -154,6 +161,7 @@ export function validateSignedDelivery(delivery: SignedDelivery): void {
     }
 }
 
+/** Verify a delivery received by a custom transport implementation. */
 export function verifySignedDelivery(delivery: SignedDelivery): boolean {
     try {
         validateSignedDelivery(delivery);
@@ -167,6 +175,7 @@ export function verifySignedDelivery(delivery: SignedDelivery): boolean {
     }
 }
 
+/** Create an exact sender-signed delivery for a low-level relay integration. */
 export function createSignedDelivery(
     identity: IdentityKeyPair,
     recipients: readonly Uint8Array[],
@@ -253,11 +262,14 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
     return delivery;
 }
 
-/** Parse one strict signed-delivery value and validate its identity point. */
+/**
+ * Parse one strict signed-delivery value for a custom transport implementation.
+ */
 export function parseSignedDelivery(value: unknown): SignedDelivery {
     return parseSignedDeliveryValue(value, true);
 }
 
+/** Encode one signed inbox read for a custom transport's relay request. */
 export function signedInboxReadToJson(read: SignedInboxRead): SignedInboxReadJson {
     return {
         version: 1,
@@ -275,6 +287,7 @@ function readSigningBytes(read: SignedInboxRead): Uint8Array {
     return separated(READ_DOMAIN, unsigned);
 }
 
+/** Create a recipient-signed page or stream read for a custom transport. */
 export function createSignedInboxRead(
     identity: IdentityKeyPair,
     options: CreateInboxReadOptions = {},
@@ -304,6 +317,7 @@ export function createSignedInboxRead(
     return { ...read, signature: signBytes(identity, readSigningBytes(read)) };
 }
 
+/** Encode one signed inbox acknowledgement for a custom transport's relay request. */
 export function signedInboxAckToJson(ack: SignedInboxAck): SignedInboxAckJson {
     return {
         version: 1,
@@ -319,6 +333,7 @@ function ackSigningBytes(ack: SignedInboxAck): Uint8Array {
     return separated(ACK_DOMAIN, unsigned);
 }
 
+/** Create a recipient-signed acknowledgement for a custom transport. */
 export function createSignedInboxAck(
     identity: IdentityKeyPair,
     through: string,
@@ -336,6 +351,7 @@ export function createSignedInboxAck(
     return { ...ack, signature: signBytes(identity, ackSigningBytes(ack)) };
 }
 
+/** Parse one bounded relay page returned by a custom transport implementation. */
 export function parseInboxPage(
     value: unknown,
     maximumDeliveries: number = MAXIMUM_INBOX_READ_ITEMS,
@@ -407,7 +423,7 @@ export function parseInboxDelivery(value: unknown): InboxDelivery {
     };
 }
 
-/** Strictly decode one relay stream continuity control frame. */
+/** Strictly decode one relay stream continuity frame in a custom transport. */
 export function parseInboxContinuity(value: unknown): InboxContinuity {
     const input = object(value, "inbox continuity");
     exact(
@@ -437,6 +453,7 @@ export function parseInboxContinuity(value: unknown): InboxContinuity {
     };
 }
 
+/** Test recipient membership while implementing or inspecting a custom transport. */
 export function containsRecipient(delivery: SignedDelivery, recipient: Uint8Array): boolean {
     return delivery.recipients.some((value) => equalBytes(value, recipient));
 }

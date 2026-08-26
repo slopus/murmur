@@ -225,7 +225,12 @@ function parseRejection(bytes: Uint8Array): InboxRejection {
     return { eventId: value.eventId, code: value.code };
 }
 
-/** Stateful, crash-safe processor for one identity's relay inbox. */
+/**
+ * Stateful, crash-safe processor for custom delivery integrations.
+ *
+ * Ordinary applications should use `MurmurClient.sync()` or
+ * `MurmurClient.synchronize()`, which own this processor internally.
+ */
 export class InboxProcessor {
     readonly #dependencies: InboxProcessorDependencies;
     readonly #handler: InboxDeliveryHandler;

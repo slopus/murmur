@@ -155,7 +155,11 @@ export interface DeliveryStreamHooks {
     readonly onConnected?: () => void | Promise<void>;
 }
 
-/** Relay-neutral queue operations used by the stateful inbox processor. */
+/**
+ * Relay-neutral queue extension point used by `MurmurClient` and
+ * `InboxProcessor`. Implement this only when the built-in HTTP or negotiated
+ * WebSocket transports do not fit the application's relay integration.
+ */
 export interface DeliveryTransport {
     publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
     read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
@@ -183,13 +187,16 @@ export interface CreateInboxReadOptions {
     readonly createdAt?: number;
 }
 
-/** Durable handler invoked inside the cursor transaction. */
+/**
+ * Durable handler invoked inside the cursor transaction by low-level
+ * `InboxProcessor` integrations. Ordinary applications use sync callbacks.
+ */
 export type InboxDeliveryHandler = (
     transaction: StoreTransaction,
     delivery: InboxDelivery,
 ) => Promise<void>;
 
-/** Inbox processor construction policy. */
+/** Construction policy for advanced applications using `InboxProcessor` directly. */
 export interface InboxProcessorOptions {
     /** Maximum diagnostic rejection summaries retained locally. */
     readonly maximumRejections?: number;
@@ -230,7 +237,7 @@ export interface InboxSyncResult {
     readonly exhausted: boolean;
 }
 
-/** Dependencies required by the stateful inbox processor. */
+/** Dependencies required by a custom low-level `InboxProcessor` integration. */
 export interface InboxProcessorDependencies {
     readonly identity: IdentityKeyPair;
     readonly store: MurmurStore;
