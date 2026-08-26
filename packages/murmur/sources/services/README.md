@@ -19,6 +19,12 @@ identity from a JavaScript constructor or class name. A service has exactly two
 protocol entry points: `onNewSession` claims a session and `onUpdate` consumes
 later updates routed to that owner.
 
+Plugin hosts may use the package-root `validateServiceId` and
+`validateMurmurServiceRegistration` helpers before registering dynamic service
+configuration. The defensive descriptor factory itself remains internal;
+applications receive `MurmurServiceSessionDescriptor` values through
+`onNewSession` rather than constructing Murmur's callback boundary.
+
 Claimed updates also appear in the identity-wide global `onUpdates` batch with
 the stable service ID. Murmur drains the batch only after the service handlers
 and global hook resolve.

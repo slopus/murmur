@@ -5,7 +5,13 @@ export {
     generateIdentityKeyPair,
     importIdentityKeyPair,
 } from "./crypto/index.js";
-export type { IdentityKeyPair, IdentityPublicKey, StoredIdentityRoot } from "./crypto/index.js";
+export type { IdentityKeyPair, IdentityPublicKey } from "./crypto/index.js";
+/**
+ * Low-level relay queue primitives for custom `DeliveryTransport`,
+ * `RelaySessionProvider`, and `InboxProcessor` implementations.
+ *
+ * Ordinary applications should use `MurmurClient` instead.
+ */
 export {
     DeliveryAcknowledgementFutureError,
     DeliveryCursorTrimmedError,
@@ -36,6 +42,10 @@ export {
     verifySignedRelaySessionRequest,
     WebSocketDeliveryTransport,
 } from "./delivery/index.js";
+/**
+ * Low-level relay queue contracts for custom transport and inbox integrations.
+ * Ordinary applications should use `MurmurClient` and its synchronization API.
+ */
 export type {
     CreateDeliveryOptions,
     CreateInboxReadOptions,
@@ -73,29 +83,14 @@ export {
     DISCOVERY_INVITATION_TTL_MILLISECONDS,
     DiscoveryTransportError,
     HttpDiscoveryTransport,
-    createAccountDiscoveryBundle,
-    createDiscoveryBundle,
     parseDiscoveryBundle,
     serializeDiscoveryBundle,
     verifyDiscoveryBundle,
 } from "./identity/discovery/index.js";
-export {
-    CONTACT_ADMISSION_LOW_WATERMARK,
-    CONTACT_ADMISSION_MAXIMUM_KEY_PACKAGES,
-    CONTACT_ADMISSION_TARGET_KEY_PACKAGES,
-    contactSessionDescriptor,
-    decodeContactPacket,
-    decodeContactSessionDescriptor,
-    encodeContactPacket,
-    isContactSessionDescriptor,
-    validateContactAdmission,
-    validateContactProfile,
-} from "./contacts/index.js";
+export { validateContactProfile } from "./contacts/index.js";
 export type {
     MurmurContact,
-    MurmurContactAdmission,
     MurmurContactAdded,
-    MurmurContactPacket,
     MurmurContactProfile,
     MurmurContactProfileValue,
     MurmurContactRemoved,
@@ -104,11 +99,7 @@ export type {
     MurmurContactUpdated,
     MurmurOutgoingContactRequest,
 } from "./contacts/index.js";
-export {
-    createMurmurServiceSessionDescriptor,
-    validateMurmurServiceRegistration,
-    validateServiceId,
-} from "./services/index.js";
+export { validateMurmurServiceRegistration, validateServiceId } from "./services/index.js";
 export type {
     MurmurService,
     MurmurServiceRegistration,
@@ -142,7 +133,6 @@ export type {
 export type {
     AccountDiscoveryBundle,
     DiscoveryBundle,
-    DiscoveryBundleOptions,
     DiscoveryBundleValidationOptions,
     DiscoveryFetch,
     DiscoveryTransport,

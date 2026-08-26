@@ -2,6 +2,11 @@
 
 Browser-safe relay transport and the durable identity-inbox processor.
 
+Most applications use `MurmurClient` with a relay URL or negotiated
+`RelaySessionProvider`; they do not call this layer directly. The package root
+keeps the lower-level surface as an explicit extension point for applications
+that need a different relay transport.
+
 ```text
 signed page read --\
                     +-> queued ciphertext -> store transaction -> signed ack
@@ -22,6 +27,29 @@ control of this device's Murmur root. The ticket authenticates routing, while
 publish, read, and acknowledgement frames retain their device signatures. The
 client refreshes expiring tickets and reconnects streams from the same durable
 cursor. Legacy HTTP/SSE construction remains unchanged.
+
+## Custom transport extension point
+
+Implement `DeliveryTransport` when the built-in `HttpDeliveryTransport` and
+`WebSocketDeliveryTransport` do not fit the application's relay boundary, then
+pass that transport to `MurmurClient.open({ transport, discoveryTransport,
+store })`. The interface receives exact signed `SignedDelivery`,
+`SignedInboxRead`, and `SignedInboxAck` values. Its implementation must preserve
+the recipient-authenticated queue semantics described here: exact multicast
+recipient sets, inbox order, continuity metadata, monotonic acknowledgement,
+bounded responses, and abort handling.
+
+The package root exports the corresponding signing, strict parsing, JSON
+encoding, verification, result, and error types for this purpose. A custom
+transport should validate untrusted relay responses with those codecs rather
+than treating decoded JSON as trusted values.
+
+`InboxProcessor` is a still lower-level extension point for an integration
+that owns both the transport and durable inbox handler. It invokes the handler
+inside a `MurmurStore` transaction, persists replay and cursor progress, and
+acknowledges only after that transaction commits. A normal application must not
+stack another `InboxProcessor` beside `MurmurClient`; each identity/store/inbox
+has one owner and one durable cursor.
 
 The processor never acknowledges before the protocol state plus buffered update
 or terminal rejection and cursor commit atomically. A crash after the local

@@ -1755,6 +1755,18 @@ export class SessionEngine {
                         const accounts = activeAccounts(epoch);
                         const accountPresent = (account: Uint8Array): boolean =>
                             accounts.some((member) => equalBytes(member, account));
+                        const terminalizeAuthorizationLoss = async (): Promise<true> => {
+                            await transaction.delete(key);
+                            await this.#quarantine(
+                                transaction,
+                                intentId,
+                                "intent_authorization_lost",
+                                intent.sessionId,
+                                "session",
+                                intentId,
+                            );
+                            return true;
+                        };
                         let additions: readonly PreparedAddition[] = [];
                         let removals: readonly Uint8Array[] = [];
                         let roles = record.roles;
@@ -1762,6 +1774,12 @@ export class SessionEngine {
                             if (accountPresent(intent.account)) {
                                 await transaction.delete(key);
                                 return true;
+                            }
+                            if (
+                                !isSessionAdmin(record.roles, this.#accountKey) &&
+                                !record.roles.anyoneCanAddMembers
+                            ) {
+                                return terminalizeAuthorizationLoss();
                             }
                             if (
                                 removalGeneration(record, intent.account) !==
@@ -1801,6 +1819,12 @@ export class SessionEngine {
                                 await transaction.delete(key);
                                 return true;
                             }
+                            if (
+                                !equalBytes(intent.account, this.#accountKey) &&
+                                !isSessionAdmin(record.roles, this.#accountKey)
+                            ) {
+                                return terminalizeAuthorizationLoss();
+                            }
                             removals = accountLeaves(epoch, intent.account).map((leaf) =>
                                 epoch.memberSignatureKeys[leaf]!.slice(),
                             );
@@ -1824,6 +1848,15 @@ export class SessionEngine {
                                 await transaction.delete(key);
                                 return true;
                             }
+                            if (
+                                !equalBytes(record.roles.owner, this.#accountKey) &&
+                                !(
+                                    isSessionAdmin(record.roles, this.#accountKey) &&
+                                    record.roles.adminsAssignAdmins
+                                )
+                            ) {
+                                return terminalizeAuthorizationLoss();
+                            }
                             roles = normalizeSessionRoles({
                                 ...record.roles,
                                 admins: [...record.roles.admins, intent.account],
@@ -1836,6 +1869,9 @@ export class SessionEngine {
                             ) {
                                 await transaction.delete(key);
                                 return true;
+                            }
+                            if (!equalBytes(record.roles.owner, this.#accountKey)) {
+                                return terminalizeAuthorizationLoss();
                             }
                             roles = normalizeSessionRoles({
                                 ...record.roles,
@@ -1852,6 +1888,9 @@ export class SessionEngine {
                             if (sessionRolesEqual(roles, record.roles)) {
                                 await transaction.delete(key);
                                 return true;
+                            }
+                            if (!equalBytes(record.roles.owner, this.#accountKey)) {
+                                return terminalizeAuthorizationLoss();
                             }
                         } else {
                             throw new Error("Unsupported session intent");

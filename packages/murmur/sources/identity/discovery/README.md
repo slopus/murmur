@@ -4,6 +4,12 @@ A self-contained signed bundle binds one public Murmur identity to current
 one-use MLS KeyPackages. The default five-minute flow stores exact public bytes
 at the relay and shares only their 32-byte SHA-256 digest.
 
+Applications create signed material through `MurmurClient.discovery()` or
+`MurmurClient.createInvitation()`. Raw bundle construction needs engine-owned
+one-use KeyPackages and remains internal. The package root exposes bundle
+parsing, serialization, and verification for applications that carry complete
+public bundles through their own out-of-band channel.
+
 ```text
 identity + current KeyPackages -> signed canonical bundle -> relay cache
 32-byte digest -> download + hash/signature/expiry checks -> MLS bootstrap

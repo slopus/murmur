@@ -4,6 +4,12 @@ This module defines Murmur's built-in mutual contact handshake. Contact state is
 anchored by a two-person technical MLS session; it is not a chat session and is
 not an optional registered service.
 
+Applications use the contact methods and lifecycle callbacks on `MurmurClient`.
+Contact packet codecs, technical-session descriptors, and admission-inventory
+constants are module-internal protocol machinery. The package root exposes only
+the application-facing contact types and `validateContactProfile`, which lets an
+application enforce the same profile bounds before calling the client.
+
 ```text
 discovery digest
       |
