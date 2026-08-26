@@ -107,7 +107,6 @@ jobs:
                   npm install --global npm@^11.5.1
                   npm --version
             - run: pnpm install --frozen-lockfile
-            - run: pnpm --filter @slopus/murmur-relay build
             - run: pnpm --filter @slopus/murmur build
             - name: Check whether npm version already exists
               id: npm-version

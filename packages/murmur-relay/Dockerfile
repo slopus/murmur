@@ -20,7 +20,10 @@ COPY packages/murmur-relay/package.json packages/murmur-relay/package.json
 
 RUN pnpm install --frozen-lockfile --filter @slopus/murmur-relay...
 
+COPY packages/murmur packages/murmur
 COPY packages/murmur-relay packages/murmur-relay
+
+RUN pnpm --filter @slopus/murmur build
 
 RUN case "$TARGETARCH" in \
         amd64) bun_target=bun-linux-x64 ;; \
