@@ -83,6 +83,7 @@ const BOUNDED_PREFIXES = Object.freeze([
     OUTBOX_PREFIX,
     OUTBOX_ORDER_PREFIX,
     "murmur/pending-sessions/",
+    "murmur/pending-membership-controls/",
     APPLICATION_UPDATE_PREFIX,
     "murmur/session-quarantine/",
     "murmur/key-packages/",

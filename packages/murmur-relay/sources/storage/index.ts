@@ -18,11 +18,13 @@ export type {
     AcknowledgeOutcome,
     PageReadConstraints,
     PublishOutcome,
+    RelayStorePublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,
     RelayStore,
 } from "./types.js";
+export type { RelaySessionState } from "./sessionState.js";
 export { RELAY_EXPIRATION_BATCH_ITEMS } from "./types.js";
 export {
     LOSS_GENERATION_BYTES,

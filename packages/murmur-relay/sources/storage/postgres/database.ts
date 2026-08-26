@@ -1,7 +1,7 @@
 import type { Pool, PoolClient } from "pg";
 
 /** Values deliberately supported by relay SQL adapters. Bigints cross as strings. */
-export type PostgresParameter = string | number | Uint8Array | null;
+export type PostgresParameter = string | number | boolean | Uint8Array | null;
 
 /** Small database query seam shared by pg and PGlite. */
 export interface PostgresQuery {

@@ -2,6 +2,10 @@ import { ed25519 } from "@noble/curves/ed25519";
 import { sha256 } from "@noble/hashes/sha2";
 import { RelayError } from "../errors.js";
 import type {
+    DeliverySessionControl,
+    DeliverySessionControlJson,
+    DeliverySessionRoles,
+    DeliverySessionRolesJson,
     SignedDelivery,
     SignedDeliveryJson,
     SignedQueueAck,
@@ -19,6 +23,8 @@ const IDENTITY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder();
+const MAXIMUM_SESSION_IDENTITIES = 1_024;
+const MAXIMUM_UINT64 = 0xffff_ffff_ffff_ffffn;
 
 function objectValue(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -72,6 +78,237 @@ function compareBytes(left: Uint8Array, right: Uint8Array): number {
         if (difference !== 0) return difference;
     }
     return left.length - right.length;
+}
+
+function compareChanges(
+    left: Extract<DeliverySessionControl, { type: "commit" }>["changes"][number],
+    right: Extract<DeliverySessionControl, { type: "commit" }>["changes"][number],
+): number {
+    const type = left.type.localeCompare(right.type);
+    if (type !== 0) return type;
+    const account = compareBytes(left.accountKey, right.accountKey);
+    return account === 0 ? compareBytes(left.deviceKey, right.deviceKey) : account;
+}
+
+function decimalUint64(value: unknown, name: string): bigint {
+    if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) {
+        throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
+    }
+    const decoded = BigInt(value);
+    if (decoded > MAXIMUM_UINT64) {
+        throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
+    }
+    return decoded;
+}
+
+function sessionRolesToJson(roles: DeliverySessionRoles): DeliverySessionRolesJson {
+    return {
+        owner: encodeBase64Url(roles.owner),
+        admins: roles.admins.map(encodeBase64Url),
+        adminsAssignAdmins: roles.adminsAssignAdmins,
+        anyoneCanAddMembers: roles.anyoneCanAddMembers,
+        sendPolicy: roles.sendPolicy,
+    };
+}
+
+function sessionControlToJson(control: DeliverySessionControl): DeliverySessionControlJson {
+    const common = {
+        version: 1 as const,
+        epoch: control.epoch.toString(),
+        coveredDevices: control.coveredDevices.map(encodeBase64Url),
+    };
+    if (control.type === "message") {
+        return { ...common, type: "message", content: control.content };
+    }
+    const state = {
+        members: control.members.map(encodeBase64Url),
+        roles: sessionRolesToJson(control.roles),
+    };
+    return control.type === "create"
+        ? { ...common, ...state, type: "create" }
+        : {
+              ...common,
+              ...state,
+              type: "commit",
+              changes: control.changes.map((change) => ({
+                  type: change.type,
+                  accountKey: encodeBase64Url(change.accountKey),
+                  deviceKey: encodeBase64Url(change.deviceKey),
+              })),
+          };
+}
+
+function parseSessionRoles(value: unknown): DeliverySessionRoles {
+    const input = objectValue(value, "delivery session roles");
+    exactKeys(
+        input,
+        ["owner", "admins", "adminsAssignAdmins", "anyoneCanAddMembers", "sendPolicy"],
+        "delivery session roles",
+    );
+    if (
+        !Array.isArray(input.admins) ||
+        typeof input.adminsAssignAdmins !== "boolean" ||
+        typeof input.anyoneCanAddMembers !== "boolean" ||
+        (input.sendPolicy !== "everyone" && input.sendPolicy !== "admins")
+    ) {
+        throw new RelayError(400, "Invalid delivery session roles", { error: "malformed" });
+    }
+    return {
+        owner: bytesValue(input.owner, "delivery session owner", IDENTITY_BYTES),
+        admins: input.admins.map((admin) =>
+            bytesValue(admin, "delivery session admin", IDENTITY_BYTES),
+        ),
+        adminsAssignAdmins: input.adminsAssignAdmins,
+        anyoneCanAddMembers: input.anyoneCanAddMembers,
+        sendPolicy: input.sendPolicy,
+    };
+}
+
+function parseSessionControl(value: unknown): DeliverySessionControl | null {
+    if (value === null) return null;
+    const input = objectValue(value, "delivery session control");
+    if (input.type === "message") {
+        exactKeys(
+            input,
+            ["version", "type", "epoch", "content", "coveredDevices"],
+            "delivery session control",
+        );
+        if (
+            input.version !== 1 ||
+            (input.content !== "application" && input.content !== "protocol") ||
+            !Array.isArray(input.coveredDevices)
+        ) {
+            throw new RelayError(400, "Invalid delivery session control", {
+                error: "malformed",
+            });
+        }
+        return {
+            version: 1,
+            type: "message",
+            epoch: decimalUint64(input.epoch, "delivery session epoch"),
+            content: input.content,
+            coveredDevices: input.coveredDevices.map((device) =>
+                bytesValue(device, "covered session device", IDENTITY_BYTES),
+            ),
+        };
+    }
+    if (input.type !== "create" && input.type !== "commit") {
+        throw new RelayError(400, "Invalid delivery session control", { error: "malformed" });
+    }
+    exactKeys(
+        input,
+        [
+            "version",
+            "type",
+            "epoch",
+            "members",
+            "roles",
+            ...(input.type === "commit" ? ["changes"] : []),
+            "coveredDevices",
+        ],
+        "delivery session control",
+    );
+    if (
+        input.version !== 1 ||
+        !Array.isArray(input.members) ||
+        !Array.isArray(input.coveredDevices)
+    ) {
+        throw new RelayError(400, "Invalid delivery session control", { error: "malformed" });
+    }
+    const common = {
+        version: 1 as const,
+        epoch: decimalUint64(input.epoch, "delivery session epoch"),
+        members: input.members.map((member) =>
+            bytesValue(member, "delivery session member", IDENTITY_BYTES),
+        ),
+        roles: parseSessionRoles(input.roles),
+        coveredDevices: input.coveredDevices.map((device) =>
+            bytesValue(device, "covered session device", IDENTITY_BYTES),
+        ),
+    };
+    if (input.type === "create") return { ...common, type: "create" };
+    if (!Array.isArray(input.changes)) {
+        throw new RelayError(400, "Invalid delivery session changes", { error: "malformed" });
+    }
+    return {
+        ...common,
+        type: "commit",
+        changes: input.changes.map((value2) => {
+            const change = objectValue(value2, "delivery session change");
+            exactKeys(change, ["type", "accountKey", "deviceKey"], "delivery session change");
+            if (change.type !== "add" && change.type !== "remove") {
+                throw new RelayError(400, "Invalid delivery session change", {
+                    error: "malformed",
+                });
+            }
+            return {
+                type: change.type,
+                accountKey: bytesValue(
+                    change.accountKey,
+                    "delivery session change account",
+                    IDENTITY_BYTES,
+                ),
+                deviceKey: bytesValue(
+                    change.deviceKey,
+                    "delivery session change device",
+                    IDENTITY_BYTES,
+                ),
+            };
+        }),
+    };
+}
+
+function validateCanonicalIdentities(values: readonly Uint8Array[], name: string): void {
+    if (values.length > MAXIMUM_SESSION_IDENTITIES) {
+        throw new RelayError(413, `${name} exceeds relay limit`, { error: "limit" });
+    }
+    let previous: Uint8Array | undefined;
+    for (const value of values) {
+        validateIdentity(value, name);
+        if (previous !== undefined && compareBytes(previous, value) >= 0) {
+            throw new RelayError(400, `${name} must be sorted and unique`, {
+                error: "malformed",
+            });
+        }
+        previous = value;
+    }
+}
+
+function validateSessionControl(control: DeliverySessionControl): void {
+    if (control.version !== 1 || control.epoch < 0n || control.epoch > MAXIMUM_UINT64) {
+        throw new RelayError(400, "Invalid delivery session control", { error: "malformed" });
+    }
+    validateCanonicalIdentities(control.coveredDevices, "covered session devices");
+    if (control.type === "message") return;
+    validateCanonicalIdentities(control.members, "delivery session members");
+    validateIdentity(control.roles.owner, "delivery session owner");
+    validateCanonicalIdentities(control.roles.admins, "delivery session admins");
+    if (
+        control.roles.admins.some((admin) => equalBytes(admin, control.roles.owner)) ||
+        typeof control.roles.adminsAssignAdmins !== "boolean" ||
+        typeof control.roles.anyoneCanAddMembers !== "boolean" ||
+        (control.roles.sendPolicy !== "everyone" && control.roles.sendPolicy !== "admins")
+    ) {
+        throw new RelayError(400, "Invalid delivery session roles", { error: "malformed" });
+    }
+    if (control.type === "commit") {
+        if (control.changes.length > MAXIMUM_SESSION_IDENTITIES * 2) {
+            throw new RelayError(413, "Delivery session changes exceed relay limit", {
+                error: "limit",
+            });
+        }
+        let previous: (typeof control.changes)[number] | undefined;
+        for (const change of control.changes) {
+            validateIdentity(change.accountKey, "delivery session change account");
+            validateIdentity(change.deviceKey, "delivery session change device");
+            if (previous !== undefined && compareChanges(previous, change) >= 0) {
+                throw new RelayError(400, "Delivery session changes must be sorted and unique", {
+                    error: "malformed",
+                });
+            }
+            previous = change;
+        }
+    }
 }
 
 /** Strictly decode one account-signed session-deletion request body. */
@@ -157,6 +394,7 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
             "targetAccounts",
             "ownerAccount",
             "sessionId",
+            "sessionControl",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -181,6 +419,19 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
     if (delivery.ownerAccount !== null) validateIdentity(delivery.ownerAccount, "delivery owner");
     if (delivery.sessionId !== null && delivery.sessionId.length !== IDENTITY_BYTES) {
         throw new RelayError(400, "Invalid delivery session ID", { error: "malformed" });
+    }
+    if (delivery.sessionControl !== null) {
+        if (
+            delivery.ownerAccount === null ||
+            delivery.sessionId === null ||
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0
+        ) {
+            throw new RelayError(400, "Session-addressed delivery names direct recipients", {
+                error: "malformed",
+            });
+        }
+        validateSessionControl(delivery.sessionControl);
     }
     let previous: Uint8Array | undefined;
     for (const recipient of delivery.recipients) {
@@ -236,6 +487,8 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
         ownerAccount:
             delivery.ownerAccount === null ? null : encodeBase64Url(delivery.ownerAccount),
         sessionId: delivery.sessionId === null ? null : encodeBase64Url(delivery.sessionId),
+        sessionControl:
+            delivery.sessionControl === null ? null : sessionControlToJson(delivery.sessionControl),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: encodeBase64Url(delivery.ciphertext),
@@ -257,6 +510,7 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
             "targetAccounts",
             "ownerAccount",
             "sessionId",
+            "sessionControl",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -304,6 +558,7 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
             input.sessionId === null
                 ? null
                 : bytesValue(input.sessionId, "delivery session ID", IDENTITY_BYTES),
+        sessionControl: parseSessionControl(input.sessionControl),
         createdAt: safeInteger(input.createdAt, "delivery timestamp"),
         expiresAt: safeInteger(input.expiresAt, "delivery expiration"),
         ciphertext: bytesValue(input.ciphertext, "delivery ciphertext"),

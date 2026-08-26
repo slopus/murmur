@@ -4,6 +4,7 @@ import {
     queueAckSigningBytes,
     queueReadSigningBytes,
     type SignedDelivery,
+    type DeliverySessionControl,
     type SignedQueueAck,
     type SignedQueueRead,
 } from "../index.js";
@@ -48,6 +49,7 @@ export function signedDelivery(
         }[];
         readonly ownerAccount?: Uint8Array;
         readonly sessionId?: Uint8Array;
+        readonly sessionControl?: DeliverySessionControl;
     } = {},
 ): SignedDelivery {
     const now = options.now ?? 10_000;
@@ -63,6 +65,7 @@ export function signedDelivery(
         })),
         ownerAccount: options.ownerAccount?.slice() ?? null,
         sessionId: options.sessionId?.slice() ?? null,
+        sessionControl: options.sessionControl ?? null,
         createdAt: now,
         expiresAt: options.expiresAt ?? now + 60_000,
         ciphertext: options.ciphertext?.slice() ?? new Uint8Array([1, 2, 3]),

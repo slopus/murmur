@@ -12,9 +12,15 @@ Applications may use `HttpDeliveryTransport`, `WebSocketDeliveryTransport`, or
 provide the exact `DeliveryTransport` seam. Every page and stream record carries
 required sequence and continuity fields.
 
-Every delivery signs the account that owns its outbound relay state. Session
-deliveries additionally carry a nullable owner/session pair. Both built-in
-transports support replay-protected session and terminal account deletion; a
+Every delivery signs the account that owns its outbound relay state. Direct
+deliveries sign an exact recipient set. Ongoing session deliveries instead name
+the owner/session, leave recipients empty, and sign relay-visible epoch,
+coverage, membership, role, and content controls as applicable. Inbox
+processing trusts authenticated queue placement for session fanout and still
+verifies visible controls against decrypted MLS state.
+
+Both built-in transports decode stale epoch-coverage responses carrying current
+rosters and support replay-protected session and terminal account deletion. A
 custom transport must expose `deleteSession` and `deleteAccount` for those
 operations.
 

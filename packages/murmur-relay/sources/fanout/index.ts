@@ -65,7 +65,7 @@ export class DurableFanoutCoordinator {
         const now = this.#now();
         const outcome = await this.#store.reserve(delivery, admissionPrincipal, now);
         await this.#scheduler.schedule(now);
-        return outcome;
+        return { eventId: outcome.eventId, duplicate: outcome.duplicate };
     }
 
     /** Retry oldest-first; later events never overtake an incomplete manifest. */

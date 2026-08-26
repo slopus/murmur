@@ -3,6 +3,7 @@ import { randomBytes } from "../../crypto/index.js";
 import { decodeBase64Url, encodeBase64Url, equalBytes, utf8Encode } from "../../utils/index.js";
 import type {
     DeliveryPublishOutcome,
+    DeliveryDeviceRoster,
     DeliveryStreamHooks,
     DeliveryTransport,
     DeliveryWebSocket,
@@ -28,6 +29,7 @@ import {
 import {
     DeliveryAcknowledgementFutureError,
     DeliveryCursorTrimmedError,
+    DeliveryStaleRosterError,
     DeliveryTransportError,
     OversizedInboxDeliveryError,
 } from "./deliveryHttpTransport.js";
@@ -75,6 +77,57 @@ function uuid(value: unknown): string {
         throw new Error("Invalid relay event ID");
     }
     return value;
+}
+
+function safeInteger(value: unknown): number {
+    if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0) {
+        throw new Error("Invalid relay WebSocket message");
+    }
+    return value;
+}
+
+function roster(value: unknown): DeliveryDeviceRoster {
+    const input = object(value);
+    exact(input, ["version", "accountKey", "revision", "devices", "admissions"]);
+    if (
+        input.version !== 1 ||
+        typeof input.accountKey !== "string" ||
+        !Array.isArray(input.devices) ||
+        !Array.isArray(input.admissions) ||
+        input.devices.length !== input.admissions.length
+    ) {
+        throw new Error("Invalid relay WebSocket message");
+    }
+    const accountKey = decodeBase64Url(input.accountKey);
+    if (accountKey.length !== 32) throw new Error("Invalid relay WebSocket message");
+    return {
+        version: 1,
+        accountKey,
+        revision: safeInteger(input.revision),
+        devices: input.devices.map((candidate) => {
+            const entry = object(candidate);
+            exact(entry, ["deviceKey", "resetGeneration"]);
+            if (typeof entry.deviceKey !== "string") {
+                throw new Error("Invalid relay WebSocket message");
+            }
+            const deviceKey = decodeBase64Url(entry.deviceKey);
+            if (deviceKey.length !== 32) throw new Error("Invalid relay WebSocket message");
+            return { deviceKey, resetGeneration: safeInteger(entry.resetGeneration) };
+        }),
+        admissions: input.admissions.map((candidate) => {
+            const entry = object(candidate);
+            exact(entry, ["deviceKey", "keyPackage"]);
+            if (typeof entry.deviceKey !== "string" || typeof entry.keyPackage !== "string") {
+                throw new Error("Invalid relay WebSocket message");
+            }
+            const deviceKey = decodeBase64Url(entry.deviceKey);
+            const keyPackage = decodeBase64Url(entry.keyPackage);
+            if (deviceKey.length !== 32 || keyPackage.length < 1) {
+                throw new Error("Invalid relay WebSocket message");
+            }
+            return { deviceKey, keyPackage };
+        }),
+    };
 }
 
 function defaultWebSocketFactory(url: string, protocols: readonly string[]): DeliveryWebSocket {
@@ -143,6 +196,14 @@ function throwFailure(status: number, value: unknown): never {
     if (status === 409 && failure.error === "ack_future") {
         exact(failure, ["error", "head"]);
         throw new DeliveryAcknowledgementFutureError(uuid(failure.head));
+    }
+    if (
+        status === 409 &&
+        (failure.error === "stale_roster" || failure.error === "stale_epoch_coverage") &&
+        Array.isArray(failure.rosters)
+    ) {
+        exact(failure, ["error", "rosters"]);
+        throw new DeliveryStaleRosterError(failure.rosters.map(roster), failure.error);
     }
     throw new DeliveryTransportError(
         status,

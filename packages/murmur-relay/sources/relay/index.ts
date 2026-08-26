@@ -218,7 +218,7 @@ export class RelayService {
                 error: "limit",
             });
         }
-        if (delivery.recipients.length < 1) {
+        if (delivery.sessionControl === null && delivery.recipients.length < 1) {
             throw new RelayError(400, "Delivery has no recipients", { error: "malformed" });
         }
         if (delivery.ciphertext.length > this.#options.maximumCiphertextBytes) {
@@ -234,7 +234,8 @@ export class RelayService {
         const authoritativeAccount = await this.#store.readDeviceAccount(delivery.sender);
         if (
             authoritativeAccount === undefined
-                ? !equalBytes(delivery.senderAccount, delivery.sender)
+                ? delivery.sessionControl !== null ||
+                  !equalBytes(delivery.senderAccount, delivery.sender)
                 : !equalBytes(delivery.senderAccount, authoritativeAccount)
         ) {
             throw new RelayError(401, "Delivery sender account is not authoritative", {
@@ -260,6 +261,7 @@ export class RelayService {
             delivery,
             now,
             {
+                maximumRecipients: this.#options.maximumRecipients,
                 maximumItems: this.#options.maximumQueueItems,
                 maximumBytes: this.#options.maximumQueueBytes,
                 maximumSenderItems: this.#options.maximumSenderItems,
@@ -272,12 +274,12 @@ export class RelayService {
             },
             this.#digestAdmissionPrincipal(admissionPrincipal),
         );
-        for (const recipient of delivery.recipients) {
+        for (const recipient of outcome.recipients) {
             const queueId = encodeBase64Url(recipient);
             this.#wake(queueId);
             await this.#wakeSource.notify(queueId).catch(() => undefined);
         }
-        return outcome;
+        return { eventId: outcome.eventId, duplicate: outcome.duplicate };
     }
 
     /** Validate and apply one account-signed, replay-protected session deletion. */
@@ -402,6 +404,7 @@ export class RelayService {
             mutation,
             now,
             {
+                maximumRecipients: this.#options.maximumRecipients,
                 maximumItems: this.#options.maximumQueueItems,
                 maximumBytes: this.#options.maximumQueueBytes,
                 maximumSenderItems: this.#options.maximumSenderItems,
@@ -523,6 +526,7 @@ export class RelayService {
             claims,
             now,
             {
+                maximumRecipients: this.#options.maximumRecipients,
                 maximumItems: this.#options.maximumQueueItems,
                 maximumBytes: this.#options.maximumQueueBytes,
                 maximumSenderItems: this.#options.maximumSenderItems,

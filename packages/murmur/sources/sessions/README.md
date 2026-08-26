@@ -7,7 +7,7 @@ lifecycle, service routing, durable synchronization, and cleanup.
 ```text
 bare KeyPackage -> sealed Welcome -> pending session -> activate or ignore
 ticket + exact account -> per-device claim -> sealed Welcomes
-active epoch -> persisted ratchet + exact outbox -> relay echo -> convergence
+active epoch -> persisted ratchet + session-addressed outbox -> relay echo -> convergence
 ```
 
 Incoming protocol work advances even while a session is pending. Application
@@ -20,9 +20,18 @@ outboxes, replay markers, routing decisions, and queue progress atomically.
 
 Creation selects an `everyone` or `admins` send policy. Policy changes are
 owner-only and Commit-bound; local sends and exact-epoch remote senders are
-checked before application data is accepted. Owner deletion durably separates
-the account-signed relay purge request and final MLS notice from session state,
-so local cleanup is terminal while publication remains retryable.
+checked before application data is accepted. Signed visible controls summarize
+each creation, Commit, and ongoing message. A mismatch with decrypted MLS state
+is durably quarantined. A newly added device keeps the bounded signed membership
+control until its direct Welcome arrives, then compares the epoch, owner, roles,
+member accounts, and covered devices before persisting the joined epoch. The
+relay derives current-device fanout; stale epoch coverage drives a device-add
+Commit and re-encryption without reconstructing a recipient list on ordinary
+sends.
+
+Owner deletion durably separates the account-signed relay purge request and
+final direct MLS notice from session state, so local cleanup is terminal while
+publication remains retryable.
 
 `deleteAccount()` first persists and submits one account-signed terminal relay
 request. After confirmation, or a replay proving earlier acceptance, one store

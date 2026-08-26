@@ -174,6 +174,48 @@ describe("Cloudflare durable fanout", () => {
         });
     });
 
+    test("returns an explicit unsupported response for session-addressed publication", async () => {
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: unusedNamespace,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        const accountSecret = secret(121);
+        const account = identity(accountSecret);
+        const delivery = signedDelivery(accountSecret, [], {
+            ownerAccount: account,
+            sessionId: identity(secret(122)),
+            sessionControl: {
+                version: 1,
+                type: "create",
+                epoch: 0n,
+                members: [account],
+                roles: {
+                    owner: account,
+                    admins: [],
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: false,
+                    sendPolicy: "everyone",
+                },
+                coveredDevices: [account],
+            },
+        });
+        const response = await fanout.fetch(
+            new Request("https://murmur.internal/v2/publish", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    delivery: signedDeliveryToJson(delivery),
+                    admissionPrincipal: "account-121",
+                }),
+            }),
+        );
+        expect(response.status).toBe(501);
+        expect(await response.json()).toEqual({ error: "session_state_unavailable" });
+    });
+
     test("rejects duplicate keys on internal Fetch JSON boundaries", async () => {
         const environment: MurmurCloudflareEnvironment = {
             MURMUR_INBOXES: unusedNamespace,

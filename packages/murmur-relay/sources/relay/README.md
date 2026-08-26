@@ -5,7 +5,8 @@ multicast and queue operations to storage, and coordinates long-poll and stream
 wakeups.
 
 ```text
-signed delivery -> validation -> atomic recipient fanout -> wake
+direct delivery -> validation -> exact recipient fanout -> wake
+session delivery -> member/role/epoch checks -> roster-derived fanout -> wake
 signed read -> authentication -> ordered bounded page
 signed acknowledgement -> authentication -> monotonic prefix trim
 account-signed session deletion -> replay check -> exact owner/session purge
@@ -21,3 +22,8 @@ Directory ticket verification is pluggable. The service validates the upload's
 account signature and every embedded device-signed spent notice before storage.
 For ordinary device publication it also proves the signed sender account owns
 the active device, preventing forged cleanup ownership.
+
+Relay-visible creation and Commit summaries advance persisted session state in
+the same transaction as queue insertion. A stale or concurrent losing epoch is
+rejected, application send policy is enforced, and incomplete current-device
+coverage returns the authoritative rosters needed for MLS leaf convergence.

@@ -7,7 +7,7 @@ import {
     secret,
     signedDelivery,
 } from "../../protocol/tests/helpers.js";
-import type { PublishOutcome } from "../../storage/index.js";
+import type { RelayStorePublishOutcome } from "../../storage/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import {
     DurableFanoutCoordinator,
@@ -34,13 +34,17 @@ class MemoryFanoutStore implements DurableFanoutStore {
         delivery: SignedDelivery,
         admissionPrincipal: string,
         _now: number,
-    ): Promise<PublishOutcome> {
+    ): Promise<RelayStorePublishOutcome> {
         const key = `${encodeBase64Url(delivery.sender)}:${delivery.id}`;
         const fingerprint = encodeBase64Url(deliveryFingerprint(delivery));
         const existing = this.fingerprints.get(key);
         if (existing !== undefined) {
             if (existing.fingerprint !== fingerprint) throw new Error("collision");
-            return { eventId: existing.eventId, duplicate: true };
+            return {
+                eventId: existing.eventId,
+                duplicate: true,
+                recipients: delivery.recipients,
+            };
         }
         const assigned = eventId(this.manifests.length + 1);
         this.fingerprints.set(key, { eventId: assigned, fingerprint });
@@ -50,7 +54,7 @@ class MemoryFanoutStore implements DurableFanoutStore {
             admissionPrincipal,
             pendingRecipients: delivery.recipients.map((value) => value.slice()),
         });
-        return { eventId: assigned, duplicate: false };
+        return { eventId: assigned, duplicate: false, recipients: delivery.recipients };
     }
 
     async oldestPending(now: number): Promise<PendingFanoutManifest | undefined> {

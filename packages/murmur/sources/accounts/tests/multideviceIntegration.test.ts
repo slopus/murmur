@@ -71,7 +71,7 @@ describe("restored-account device registration", () => {
         }
     });
 
-    test("consumes a stale-roster response and retries a session delivery to a new device", async () => {
+    test("consumes stale epoch coverage and retries a session delivery to a new device", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"));
         const handler = createRelayFetchHandler(relay, {
             defaultAdmissionPrincipal: "test",
@@ -128,20 +128,14 @@ describe("restored-account device registration", () => {
             }).readDeviceRoster(targetAccount.publicKey);
             if (staleRoster === undefined) throw new Error("Target roster was not registered");
 
+            const secondStore = new MemoryMurmurStore();
             secondTarget = await MurmurClient.open({
                 identity: targetAccount,
                 transport: new HttpDeliveryTransport("https://relay.test", {
                     fetch: relayFetch,
                 }),
-                store: new MemoryMurmurStore(),
+                store: secondStore,
             });
-            for (let round = 0; round < 12; round += 1) {
-                await firstTarget.synchronize({ waitMilliseconds: 0 });
-                await sender.synchronize({ waitMilliseconds: 0 });
-                await secondTarget.synchronize({ waitMilliseconds: 0 });
-            }
-            expect((await secondTarget.session(session.id))?.status).toBe("pending");
-            await secondTarget.activateSession(session.id);
             await senderStore.set(
                 `${ACCOUNT_PEER_ROSTER_PREFIX}${encodeBase64Url(targetAccount.publicKey)}`,
                 serializeDeviceRoster(staleRoster),
@@ -153,26 +147,36 @@ describe("restored-account device registration", () => {
                 transientPublicationFailures: 1,
                 terminalPublicationFailures: 0,
             });
-            const retried = await sender.synchronize({ waitMilliseconds: 0 });
-            expect(retried.published).toBeGreaterThanOrEqual(1);
-            expect(retried).toMatchObject({
-                transientPublicationFailures: 0,
-                terminalPublicationFailures: 0,
-            });
+            let retriedPublications = 0;
+            for (let round = 0; round < 12; round += 1) {
+                const retried = await sender.synchronize({ waitMilliseconds: 0 });
+                retriedPublications += retried.published;
+                expect(retried).toMatchObject({
+                    transientPublicationFailures: 0,
+                    terminalPublicationFailures: 0,
+                });
+                await firstTarget.synchronize({ waitMilliseconds: 0 });
+                await secondTarget.synchronize({ waitMilliseconds: 0 });
+            }
+            expect(retriedPublications).toBeGreaterThanOrEqual(2);
+            expect(await secondTarget.session(session.id)).toMatchObject({ status: "pending" });
+            expect(await secondTarget.issues()).toEqual([]);
+            await secondTarget.activateSession(session.id);
 
-            expect(staleResponses).toEqual([expect.objectContaining({ error: "stale_roster" })]);
+            expect(staleResponses).toEqual([
+                expect.objectContaining({ error: "stale_epoch_coverage" }),
+            ]);
             expect(successfulPublications).toEqual(
                 expect.arrayContaining([
                     expect.objectContaining({
-                        recipients: expect.arrayContaining([
-                            encodeBase64Url(secondTarget.deviceKey),
-                        ]),
-                        targetAccounts: expect.arrayContaining([
-                            {
-                                accountKey: encodeBase64Url(targetAccount.publicKey),
-                                rosterRevision: 2,
-                            },
-                        ]),
+                        recipients: [],
+                        targetAccounts: [],
+                        sessionControl: expect.objectContaining({
+                            type: "commit",
+                            coveredDevices: expect.arrayContaining([
+                                encodeBase64Url(secondTarget.deviceKey),
+                            ]),
+                        }),
                     }),
                 ]),
             );

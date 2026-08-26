@@ -11,9 +11,10 @@ directory prekey pools.
 - PostgreSQL through `pg`, with database-backed wake notifications.
 - Cloudflare Durable Objects for inboxes and manifest-first fanout.
 
-The Cloudflare adapter is queue-only and does not implement terminal account
-deletion. That operation requires the standalone SQLite or PostgreSQL ownership
-transaction.
+The Cloudflare adapter is queue-only. It returns `501 session_state_unavailable`
+for session-addressed publication and `501 account_deletion_unavailable` for
+terminal account deletion. Both operations require the standalone SQLite or
+PostgreSQL relay.
 
 ## Run locally
 

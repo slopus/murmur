@@ -10,7 +10,8 @@ SQLite and PostgreSQL implement the same queue model:
 delivery row -> exact recipient references -> per-inbox sequence
 sender/principal counters -> transactional quota enforcement
 acknowledgement or expiry -> reference removal -> counter reclamation
-owner/session deletion -> exact reference purge -> continuity advance
+session control -> current members/roles/epoch -> roster-derived references
+owner/session deletion -> state cascade + exact reference purge -> continuity advance
 sender-account deletion -> outbound purge + owned-inbox and account-state cascade
 ```
 
@@ -30,6 +31,9 @@ replay-protected for the maximum delivery retention window. Account deletion
 atomically removes the roster, its dependent directory rows, every owned inbox,
 all outbound deliveries, and raw account-linked nonce rows while preserving
 global and surviving-inbox accounting.
+Session rows hold only relay-visible routing and basic role policy: owner,
+members, admins, epoch, and the three policies. They cascade through exact
+session deletion and owner-account deletion.
 The one clean schema carries version stamp 3.
 
 Initialization accepts only the current exact schema. A mismatched version or

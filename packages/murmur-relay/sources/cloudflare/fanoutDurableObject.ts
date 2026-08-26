@@ -16,7 +16,7 @@ import {
     type SignedDelivery,
     type SignedDeliveryJson,
 } from "../protocol/index.js";
-import type { PublishOutcome } from "../storage/index.js";
+import type { RelayStorePublishOutcome } from "../storage/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 import { nextUuidV7 } from "../utils/uuidV7.js";
@@ -225,6 +225,9 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 });
             }
             const delivery = parseSignedDelivery(input.delivery);
+            if (delivery.sessionControl !== null) {
+                return json({ error: "session_state_unavailable" }, 501);
+            }
             this.#validateDelivery(delivery);
             const outcome = await this.#coordinator.publish(delivery, input.admissionPrincipal);
             return json(outcome, 200);
@@ -246,7 +249,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
         delivery: SignedDelivery,
         admissionPrincipal: string,
         now: number,
-    ): Promise<PublishOutcome> {
+    ): Promise<RelayStorePublishOutcome> {
         await this.pruneExpired(now);
         const fingerprint = encodeBase64Url(deliveryFingerprint(delivery));
         const encodedBytes = textEncoder.encode(
@@ -261,7 +264,11 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                         error: "id_collision",
                     });
                 }
-                return { eventId: existing.eventId, duplicate: true };
+                return {
+                    eventId: existing.eventId,
+                    duplicate: true,
+                    recipients: delivery.recipients,
+                };
             }
             const metadata = (await transaction.get<FanoutMetadata>(META_KEY)) ?? emptyMetadata();
             const eventId = nextUuidV7(now, metadata.lastEventId);
@@ -321,7 +328,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 retainedBytes: metadata.retainedBytes + encodedBytes,
                 retainedReferences: metadata.retainedReferences + delivery.recipients.length,
             });
-            return { eventId, duplicate: false };
+            return { eventId, duplicate: false, recipients: delivery.recipients };
         });
     }
 

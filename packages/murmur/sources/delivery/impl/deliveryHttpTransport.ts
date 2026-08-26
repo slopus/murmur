@@ -117,8 +117,11 @@ export class DeliveryAcknowledgementFutureError extends DeliveryTransportError {
 export class DeliveryStaleRosterError extends DeliveryTransportError {
     readonly rosters: readonly DeliveryDeviceRoster[];
 
-    constructor(rosters: readonly DeliveryDeviceRoster[]) {
-        super(409, "stale_roster");
+    constructor(
+        rosters: readonly DeliveryDeviceRoster[],
+        code: "stale_roster" | "stale_epoch_coverage" = "stale_roster",
+    ) {
+        super(409, code);
         this.name = "DeliveryStaleRosterError";
         this.rosters = rosters;
     }
@@ -613,11 +616,11 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         }
         if (
             response.status === 409 &&
-            failure.error === "stale_roster" &&
+            (failure.error === "stale_roster" || failure.error === "stale_epoch_coverage") &&
             Array.isArray(failure.rosters)
         ) {
             exact(failure, ["error", "rosters"]);
-            throw new DeliveryStaleRosterError(failure.rosters.map(roster));
+            throw new DeliveryStaleRosterError(failure.rosters.map(roster), failure.error);
         }
         throw new DeliveryTransportError(
             response.status,

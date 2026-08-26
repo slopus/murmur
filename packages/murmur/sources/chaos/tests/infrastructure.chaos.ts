@@ -32,6 +32,7 @@ function delivery(id: string, marker: number = 1): SignedDelivery {
         targetAccounts: [],
         ownerAccount: null,
         sessionId: null,
+        sessionControl: null,
         createdAt: 1_700_000_000_000,
         expiresAt: 1_700_000_060_000,
         ciphertext: new Uint8Array([marker, marker + 1, marker + 2]),

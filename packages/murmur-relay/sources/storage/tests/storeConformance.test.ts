@@ -10,6 +10,7 @@ import {
 } from "../../protocol/tests/helpers.js";
 import type { DirectoryPrekeyUpload, SignedDelivery } from "../../protocol/index.js";
 import type { DirectoryTicketClaims } from "../../directory/index.js";
+import { RelayService } from "../../relay/index.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { canonicalJson } from "../../utils/canonicalJson.js";
 import {
@@ -22,6 +23,7 @@ import {
 
 const NOW = 10_000;
 const LIMITS = {
+    maximumRecipients: 1_024,
     maximumItems: 10,
     maximumBytes: 1_000_000,
     maximumSenderItems: 10,
@@ -43,6 +45,328 @@ async function stores(): Promise<readonly RelayStore[]> {
 }
 
 describe("identity queue store conformance", () => {
+    test("persists and arbitrates authenticated session state with relay-derived fanout", async () => {
+        const ownerAccountSecret = secret(101);
+        const ownerAccount = identity(ownerAccountSecret);
+        const ownerDeviceOneSecret = secret(102);
+        const ownerDeviceOne = identity(ownerDeviceOneSecret);
+        const ownerDeviceTwoSecret = secret(103);
+        const ownerDeviceTwo = identity(ownerDeviceTwoSecret);
+        const memberAccountSecret = secret(104);
+        const memberAccount = identity(memberAccountSecret);
+        const memberDeviceOneSecret = secret(105);
+        const memberDeviceOne = identity(memberDeviceOneSecret);
+        const memberDeviceTwoSecret = secret(106);
+        const memberDeviceTwo = identity(memberDeviceTwoSecret);
+        const outsiderAccountSecret = secret(107);
+        const outsiderAccount = identity(outsiderAccountSecret);
+        const outsiderDeviceSecret = secret(108);
+        const outsiderDevice = identity(outsiderDeviceSecret);
+        const sessionId = identity(secret(109));
+        const memberAccounts = recipients(ownerAccount, memberAccount);
+        const initialDevices = recipients(
+            ownerDeviceOne,
+            ownerDeviceTwo,
+            memberDeviceOne,
+            memberDeviceTwo,
+        );
+        const roles = {
+            owner: ownerAccount,
+            admins: [] as readonly Uint8Array[],
+            adminsAssignAdmins: false,
+            anyoneCanAddMembers: false,
+            sendPolicy: "everyone" as const,
+        };
+        const register = async (
+            relay: RelayService,
+            accountSecret: Uint8Array,
+            currentDevices: readonly Uint8Array[],
+            deviceKey: Uint8Array,
+            id: number,
+        ): Promise<void> => {
+            const ciphertext = canonicalJson({
+                version: 1,
+                type: "register",
+                deviceKey: encodeBase64Url(deviceKey),
+                resetGeneration: 0,
+                keyPackage: encodeBase64Url(new Uint8Array([id])),
+            });
+            await relay.mutateDeviceRoster(
+                signedDelivery(accountSecret, recipients(...currentDevices), {
+                    id,
+                    ciphertext,
+                }),
+                "session-conformance",
+            );
+        };
+
+        for (const store of await stores()) {
+            const relay = new RelayService(store, {}, undefined, () => NOW);
+            try {
+                await register(relay, ownerAccountSecret, [ownerDeviceOne], ownerDeviceOne, 101);
+                await register(
+                    relay,
+                    ownerAccountSecret,
+                    [ownerDeviceOne, ownerDeviceTwo],
+                    ownerDeviceTwo,
+                    102,
+                );
+                await register(relay, memberAccountSecret, [memberDeviceOne], memberDeviceOne, 103);
+                await register(
+                    relay,
+                    memberAccountSecret,
+                    [memberDeviceOne, memberDeviceTwo],
+                    memberDeviceTwo,
+                    104,
+                );
+                await register(relay, outsiderAccountSecret, [outsiderDevice], outsiderDevice, 105);
+
+                const creation = signedDelivery(ownerDeviceOneSecret, [], {
+                    id: 106,
+                    senderAccount: ownerAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "create",
+                        epoch: 0n,
+                        members: memberAccounts,
+                        roles,
+                        coveredDevices: initialDevices,
+                    },
+                });
+                expect(creation.recipients).toEqual([]);
+                await expect(relay.publish(creation, "session-conformance")).resolves.toMatchObject(
+                    { duplicate: false },
+                );
+                await expect(store.readSessionState(sessionId)).resolves.toMatchObject({
+                    epoch: 1n,
+                    ownerAccount,
+                    members: memberAccounts,
+                    sendPolicy: "everyone",
+                });
+                for (const device of initialDevices) {
+                    const page = await store.readQueue(device, null, 100, NOW, PAGE);
+                    expect(
+                        page.deliveries.some(({ delivery }) => delivery.id === creation.id),
+                    ).toBe(true);
+                }
+
+                const outsiderSend = signedDelivery(outsiderDeviceSecret, [], {
+                    id: 107,
+                    senderAccount: outsiderAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "message",
+                        epoch: 1n,
+                        content: "application",
+                        coveredDevices: initialDevices,
+                    },
+                });
+                await expect(
+                    relay.publish(outsiderSend, "session-conformance"),
+                ).rejects.toMatchObject({
+                    status: 403,
+                    body: { error: "session_unauthorized" },
+                });
+
+                const adminsOnly = signedDelivery(ownerDeviceOneSecret, [], {
+                    id: 108,
+                    senderAccount: ownerAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "commit",
+                        epoch: 1n,
+                        members: memberAccounts,
+                        roles: { ...roles, sendPolicy: "admins" },
+                        changes: [],
+                        coveredDevices: initialDevices,
+                    },
+                });
+                await relay.publish(adminsOnly, "session-conformance");
+                const rejectedMemberSend = signedDelivery(memberDeviceOneSecret, [], {
+                    id: 109,
+                    senderAccount: memberAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "message",
+                        epoch: 2n,
+                        content: "application",
+                        coveredDevices: initialDevices,
+                    },
+                });
+                await expect(
+                    relay.publish(rejectedMemberSend, "session-conformance"),
+                ).rejects.toMatchObject({
+                    status: 403,
+                    body: { error: "session_unauthorized" },
+                });
+
+                const unauthorizedSummary = signedDelivery(memberDeviceOneSecret, [], {
+                    id: 110,
+                    senderAccount: memberAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "commit",
+                        epoch: 2n,
+                        members: recipients(...memberAccounts, outsiderAccount),
+                        roles: { ...roles, sendPolicy: "admins" },
+                        changes: [
+                            {
+                                type: "add",
+                                accountKey: outsiderAccount,
+                                deviceKey: outsiderDevice,
+                            },
+                        ],
+                        coveredDevices: recipients(...initialDevices, outsiderDevice),
+                    },
+                });
+                await expect(
+                    relay.publish(unauthorizedSummary, "session-conformance"),
+                ).rejects.toMatchObject({
+                    status: 403,
+                    body: { error: "session_unauthorized" },
+                });
+
+                const winner = signedDelivery(ownerDeviceOneSecret, [], {
+                    id: 111,
+                    senderAccount: ownerAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "commit",
+                        epoch: 2n,
+                        members: memberAccounts,
+                        roles: {
+                            ...roles,
+                            sendPolicy: "admins",
+                            anyoneCanAddMembers: true,
+                        },
+                        changes: [],
+                        coveredDevices: initialDevices,
+                    },
+                });
+                const loser = signedDelivery(ownerDeviceTwoSecret, [], {
+                    id: 112,
+                    senderAccount: ownerAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "commit",
+                        epoch: 2n,
+                        members: memberAccounts,
+                        roles: {
+                            ...roles,
+                            sendPolicy: "admins",
+                            adminsAssignAdmins: true,
+                        },
+                        changes: [],
+                        coveredDevices: initialDevices,
+                    },
+                });
+                await relay.publish(winner, "session-conformance");
+                await expect(relay.publish(loser, "session-conformance")).rejects.toMatchObject({
+                    status: 409,
+                    body: { error: "stale_session_epoch", epoch: "3" },
+                });
+                await expect(store.readSessionState(sessionId)).resolves.toMatchObject({
+                    epoch: 3n,
+                    anyoneCanAddMembers: true,
+                    adminsAssignAdmins: false,
+                });
+
+                const ownerDeviceThreeSecret = secret(110);
+                const ownerDeviceThree = identity(ownerDeviceThreeSecret);
+                await register(
+                    relay,
+                    ownerAccountSecret,
+                    [ownerDeviceOne, ownerDeviceTwo, ownerDeviceThree],
+                    ownerDeviceThree,
+                    113,
+                );
+                const staleCoverage = signedDelivery(ownerDeviceOneSecret, [], {
+                    id: 114,
+                    senderAccount: ownerAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "message",
+                        epoch: 3n,
+                        content: "application",
+                        coveredDevices: initialDevices,
+                    },
+                });
+                await expect(
+                    relay.publish(staleCoverage, "session-conformance"),
+                ).rejects.toMatchObject({
+                    status: 409,
+                    body: { error: "stale_epoch_coverage" },
+                });
+
+                const convergedDevices = recipients(...initialDevices, ownerDeviceThree);
+                const deviceCommit = signedDelivery(ownerDeviceOneSecret, [], {
+                    id: 115,
+                    senderAccount: ownerAccount,
+                    ownerAccount,
+                    sessionId,
+                    sessionControl: {
+                        version: 1,
+                        type: "commit",
+                        epoch: 3n,
+                        members: memberAccounts,
+                        roles: {
+                            ...roles,
+                            sendPolicy: "admins",
+                            anyoneCanAddMembers: true,
+                        },
+                        changes: [
+                            {
+                                type: "add",
+                                accountKey: ownerAccount,
+                                deviceKey: ownerDeviceThree,
+                            },
+                        ],
+                        coveredDevices: convergedDevices,
+                    },
+                });
+                await relay.publish(deviceCommit, "session-conformance");
+                await expect(store.readSessionState(sessionId)).resolves.toMatchObject({
+                    epoch: 4n,
+                });
+
+                const direct = signedDelivery(outsiderDeviceSecret, recipients(ownerDeviceOne), {
+                    id: 116,
+                    senderAccount: outsiderAccount,
+                });
+                await expect(relay.publish(direct, "session-conformance")).resolves.toMatchObject({
+                    duplicate: false,
+                });
+                await store.deleteSessionDeliveries(ownerAccount, sessionId, "delete-state", NOW);
+                await expect(store.readSessionState(sessionId)).resolves.toBeUndefined();
+                const ownerQueue = await store.readQueue(ownerDeviceOne, null, 100, NOW, PAGE);
+                expect(
+                    ownerQueue.deliveries.some(({ delivery }) => delivery.id === direct.id),
+                ).toBe(true);
+                expect(
+                    ownerQueue.deliveries.some(({ delivery }) => delivery.sessionControl !== null),
+                ).toBe(false);
+            } finally {
+                await relay.close();
+            }
+        }
+    });
+
     test("rotates, replenishes, and atomically claims one directory prekey per device", async () => {
         const accountSecret = secret(80);
         const account = identity(accountSecret);
@@ -608,10 +932,9 @@ describe("identity queue store conformance", () => {
                 const delivery = signedDelivery(aliceSecret, recipients(alice, bob, carol));
                 const published = await store.publish(delivery, NOW, LIMITS, ADMISSION_PRINCIPAL);
                 expect(published.duplicate).toBe(false);
-                expect(await store.publish(delivery, NOW, LIMITS, ADMISSION_PRINCIPAL)).toEqual({
-                    eventId: published.eventId,
-                    duplicate: true,
-                });
+                expect(
+                    await store.publish(delivery, NOW, LIMITS, ADMISSION_PRINCIPAL),
+                ).toMatchObject({ eventId: published.eventId, duplicate: true });
                 for (const recipient of [alice, bob, carol]) {
                     const page = await store.readQueue(recipient, null, 10, NOW, PAGE);
                     expect(page.deliveries.map(({ eventId: id }) => id)).toEqual([
@@ -904,6 +1227,33 @@ describe("identity queue store conformance", () => {
                 signedDelivery(accountSecret, [], { id: 116 }).id,
                 NOW,
             );
+            const ownedSession = new Uint8Array(32).fill(121);
+            await store.publish(
+                signedDelivery(deviceSecret, [], {
+                    id: 121,
+                    senderAccount: account,
+                    ownerAccount: account,
+                    sessionId: ownedSession,
+                    sessionControl: {
+                        version: 1,
+                        type: "create",
+                        epoch: 0n,
+                        members: [account],
+                        roles: {
+                            owner: account,
+                            admins: [],
+                            adminsAssignAdmins: false,
+                            anyoneCanAddMembers: false,
+                            sendPolicy: "everyone",
+                        },
+                        coveredDevices: [device],
+                    },
+                }),
+                NOW,
+                LIMITS,
+                ADMISSION_PRINCIPAL,
+            );
+            expect(await store.readSessionState(ownedSession)).toBeDefined();
             await store.deleteAccountState(
                 account,
                 signedDelivery(accountSecret, [], { id: 117 }).id,
@@ -918,6 +1268,9 @@ describe("identity queue store conformance", () => {
                 ["murmur_directory_prekey_references", "account_key"],
                 ["murmur_directory_upload_nonces", "account_key"],
                 ["murmur_session_deletion_nonces", "owner_account"],
+                ["murmur_sessions", "owner_account"],
+                ["murmur_session_members", "account_key"],
+                ["murmur_session_admins", "account_key"],
                 ["murmur_queue_deliveries", "sender_account"],
             ] as const;
             for (const [table, column] of accountTables) {

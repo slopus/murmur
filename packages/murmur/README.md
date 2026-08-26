@@ -2,8 +2,9 @@
 
 Murmur is a browser-safe TypeScript library for stateful, forward-secret MLS
 sessions over authenticated encrypted identity queues. The application owns
-storage and effects. The relay stores opaque pending deliveries and can be
-discarded without becoming session state or history.
+storage and effects. The relay stores opaque pending deliveries plus
+MLS-adjacent membership and role state for routing and basic enforcement; it
+never holds cryptographic session state or message history.
 
 `@slopus/murmur` is the only published package. `@slopus/murmur-relay` is
 private deployment infrastructure.

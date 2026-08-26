@@ -25,6 +25,7 @@ import {
     SqliteRelayStore,
     advanceLossGeneration,
     type PublishOutcome,
+    type RelayStorePublishOutcome,
     type QueueLimits,
     type QueuePage,
 } from "../index.js";
@@ -37,6 +38,7 @@ const RETENTION_MILLISECONDS = 180 * DAY_MILLISECONDS;
 const PAGE = { maximumEncodedBytes: 32 * 1024 * 1024 };
 const PRINCIPAL = new Uint8Array(32).fill(240);
 const LIMITS: QueueLimits = {
+    maximumRecipients: 1_024,
     maximumItems: 1_000,
     maximumBytes: 64 * 1024 * 1024,
     maximumSenderItems: 1_000,
@@ -117,13 +119,17 @@ class ManifestStore implements DurableFanoutStore {
         delivery: SignedDelivery,
         admissionPrincipal: string,
         _now: number,
-    ): Promise<PublishOutcome> {
+    ): Promise<RelayStorePublishOutcome> {
         const key = `${encodeBase64Url(delivery.sender)}:${delivery.id}`;
         const fingerprint = deliveryFingerprint(delivery);
         const existing = this.#dedupe.get(key);
         if (existing !== undefined) {
             if (!equalBytes(existing.fingerprint, fingerprint)) throw new Error("fanout collision");
-            return { eventId: existing.eventId, duplicate: true };
+            return {
+                eventId: existing.eventId,
+                duplicate: true,
+                recipients: delivery.recipients,
+            };
         }
         const manifest: MutableManifest = {
             eventId: eventId(this.manifests.length + 1),
@@ -135,7 +141,11 @@ class ManifestStore implements DurableFanoutStore {
         };
         this.manifests.push(manifest);
         this.#dedupe.set(key, manifest);
-        return { eventId: manifest.eventId, duplicate: false };
+        return {
+            eventId: manifest.eventId,
+            duplicate: false,
+            recipients: delivery.recipients,
+        };
     }
 
     async oldestPending(now: number): Promise<PendingFanoutManifest | undefined> {
@@ -390,7 +400,7 @@ describe("SQLite relay and durable fanout chaos", () => {
             await store.close();
 
             store = new SqliteRelayStore(path);
-            await expect(store.publish(delivery, NOW, LIMITS, PRINCIPAL)).resolves.toEqual({
+            await expect(store.publish(delivery, NOW, LIMITS, PRINCIPAL)).resolves.toMatchObject({
                 eventId: concurrent[0]!.eventId,
                 duplicate: true,
             });

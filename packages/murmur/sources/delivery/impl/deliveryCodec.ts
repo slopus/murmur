@@ -15,6 +15,8 @@ import {
 import type {
     CreateDeliveryOptions,
     CreateInboxReadOptions,
+    DeliverySessionControl,
+    DeliverySessionRoles,
     InboxDelivery,
     InboxContinuity,
     SignedDelivery,
@@ -28,6 +30,46 @@ const ACK_DOMAIN = "murmur.relay.queue-ack.v1";
 const MAXIMUM_INBOX_READ_ITEMS = 256;
 const MAXIMUM_INBOX_WAIT_MILLISECONDS = 30_000;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const MAXIMUM_SESSION_IDENTITIES = 1_024;
+const MAXIMUM_UINT64 = 0xffff_ffff_ffff_ffffn;
+
+interface DeliverySessionRolesJson {
+    readonly owner: string;
+    readonly admins: readonly string[];
+    readonly adminsAssignAdmins: boolean;
+    readonly anyoneCanAddMembers: boolean;
+    readonly sendPolicy: "everyone" | "admins";
+}
+
+type DeliverySessionControlJson =
+    | {
+          readonly version: 1;
+          readonly type: "create";
+          readonly epoch: string;
+          readonly members: readonly string[];
+          readonly roles: DeliverySessionRolesJson;
+          readonly coveredDevices: readonly string[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "commit";
+          readonly epoch: string;
+          readonly members: readonly string[];
+          readonly roles: DeliverySessionRolesJson;
+          readonly changes: readonly {
+              readonly type: "add" | "remove";
+              readonly accountKey: string;
+              readonly deviceKey: string;
+          }[];
+          readonly coveredDevices: readonly string[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "message";
+          readonly epoch: string;
+          readonly content: "application" | "protocol";
+          readonly coveredDevices: readonly string[];
+      };
 
 export interface SignedDeliveryJson {
     readonly version: 1;
@@ -41,6 +83,7 @@ export interface SignedDeliveryJson {
     }[];
     readonly ownerAccount: string | null;
     readonly sessionId: string | null;
+    readonly sessionControl: DeliverySessionControlJson | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: string;
@@ -94,6 +137,257 @@ function compareBytes(left: Uint8Array, right: Uint8Array): number {
         if (difference !== 0) return difference;
     }
     return 0;
+}
+
+function compareChanges(
+    left: Extract<DeliverySessionControl, { type: "commit" }>["changes"][number],
+    right: Extract<DeliverySessionControl, { type: "commit" }>["changes"][number],
+): number {
+    const type = left.type.localeCompare(right.type);
+    if (type !== 0) return type;
+    const account = compareBytes(left.accountKey, right.accountKey);
+    return account === 0 ? compareBytes(left.deviceKey, right.deviceKey) : account;
+}
+
+function sessionRolesToJson(roles: DeliverySessionRoles): DeliverySessionRolesJson {
+    return {
+        owner: encodeBase64Url(roles.owner),
+        admins: roles.admins.map(encodeBase64Url),
+        adminsAssignAdmins: roles.adminsAssignAdmins,
+        anyoneCanAddMembers: roles.anyoneCanAddMembers,
+        sendPolicy: roles.sendPolicy,
+    };
+}
+
+function sessionControlToJson(control: DeliverySessionControl): DeliverySessionControlJson {
+    const common = {
+        version: 1 as const,
+        epoch: control.epoch.toString(),
+        coveredDevices: control.coveredDevices.map(encodeBase64Url),
+    };
+    if (control.type === "message") {
+        return { ...common, type: "message", content: control.content };
+    }
+    const state = {
+        members: control.members.map(encodeBase64Url),
+        roles: sessionRolesToJson(control.roles),
+    };
+    return control.type === "create"
+        ? { ...common, ...state, type: "create" }
+        : {
+              ...common,
+              ...state,
+              type: "commit",
+              changes: control.changes.map((change) => ({
+                  type: change.type,
+                  accountKey: encodeBase64Url(change.accountKey),
+                  deviceKey: encodeBase64Url(change.deviceKey),
+              })),
+          };
+}
+
+function decimalUint64(value: unknown, name: string): bigint {
+    if (typeof value !== "string" || !/^(0|[1-9]\d*)$/.test(value)) {
+        throw new Error(`Invalid ${name}`);
+    }
+    const decoded = BigInt(value);
+    if (decoded > MAXIMUM_UINT64) throw new Error(`Invalid ${name}`);
+    return decoded;
+}
+
+function sessionRolesFromJson(value: unknown): DeliverySessionRoles {
+    const input = object(value, "delivery session roles");
+    exact(
+        input,
+        ["owner", "admins", "adminsAssignAdmins", "anyoneCanAddMembers", "sendPolicy"],
+        "delivery session roles",
+    );
+    if (
+        typeof input.owner !== "string" ||
+        !Array.isArray(input.admins) ||
+        input.admins.some((admin) => typeof admin !== "string") ||
+        typeof input.adminsAssignAdmins !== "boolean" ||
+        typeof input.anyoneCanAddMembers !== "boolean" ||
+        (input.sendPolicy !== "everyone" && input.sendPolicy !== "admins")
+    ) {
+        throw new Error("Invalid delivery session roles");
+    }
+    return {
+        owner: decodeBase64Url(input.owner),
+        admins: input.admins.map((admin) => decodeBase64Url(admin as string)),
+        adminsAssignAdmins: input.adminsAssignAdmins,
+        anyoneCanAddMembers: input.anyoneCanAddMembers,
+        sendPolicy: input.sendPolicy,
+    };
+}
+
+function sessionControlFromJson(value: unknown): DeliverySessionControl | null {
+    if (value === null) return null;
+    const input = object(value, "delivery session control");
+    if (input.type === "message") {
+        exact(
+            input,
+            ["version", "type", "epoch", "content", "coveredDevices"],
+            "delivery session control",
+        );
+        if (
+            input.version !== 1 ||
+            (input.content !== "application" && input.content !== "protocol") ||
+            !Array.isArray(input.coveredDevices) ||
+            input.coveredDevices.some((device) => typeof device !== "string")
+        ) {
+            throw new Error("Invalid delivery session control");
+        }
+        return {
+            version: 1,
+            type: "message",
+            epoch: decimalUint64(input.epoch, "delivery session epoch"),
+            content: input.content,
+            coveredDevices: input.coveredDevices.map((device) => decodeBase64Url(device as string)),
+        };
+    }
+    if (input.type !== "create" && input.type !== "commit") {
+        throw new Error("Invalid delivery session control");
+    }
+    exact(
+        input,
+        [
+            "version",
+            "type",
+            "epoch",
+            "members",
+            "roles",
+            ...(input.type === "commit" ? ["changes"] : []),
+            "coveredDevices",
+        ],
+        "delivery session control",
+    );
+    if (
+        input.version !== 1 ||
+        !Array.isArray(input.members) ||
+        input.members.some((member) => typeof member !== "string") ||
+        !Array.isArray(input.coveredDevices) ||
+        input.coveredDevices.some((device) => typeof device !== "string")
+    ) {
+        throw new Error("Invalid delivery session control");
+    }
+    const common = {
+        version: 1 as const,
+        epoch: decimalUint64(input.epoch, "delivery session epoch"),
+        members: input.members.map((member) => decodeBase64Url(member as string)),
+        roles: sessionRolesFromJson(input.roles),
+        coveredDevices: input.coveredDevices.map((device) => decodeBase64Url(device as string)),
+    };
+    if (input.type === "create") return { ...common, type: "create" };
+    if (!Array.isArray(input.changes)) throw new Error("Invalid delivery session changes");
+    return {
+        ...common,
+        type: "commit",
+        changes: input.changes.map((value2) => {
+            const change = object(value2, "delivery session change");
+            exact(change, ["type", "accountKey", "deviceKey"], "delivery session change");
+            if (
+                (change.type !== "add" && change.type !== "remove") ||
+                typeof change.accountKey !== "string" ||
+                typeof change.deviceKey !== "string"
+            ) {
+                throw new Error("Invalid delivery session change");
+            }
+            return {
+                type: change.type,
+                accountKey: decodeBase64Url(change.accountKey),
+                deviceKey: decodeBase64Url(change.deviceKey),
+            };
+        }),
+    };
+}
+
+function normalizeSessionControl(control: DeliverySessionControl): DeliverySessionControl {
+    const common = {
+        version: 1 as const,
+        epoch: control.epoch,
+        coveredDevices: control.coveredDevices.map((device) => device.slice()).sort(compareBytes),
+    };
+    if (control.type === "message") {
+        return { ...common, type: "message", content: control.content };
+    }
+    const state = {
+        members: control.members.map((member) => member.slice()).sort(compareBytes),
+        roles: {
+            owner: control.roles.owner.slice(),
+            admins: control.roles.admins.map((admin) => admin.slice()).sort(compareBytes),
+            adminsAssignAdmins: control.roles.adminsAssignAdmins,
+            anyoneCanAddMembers: control.roles.anyoneCanAddMembers,
+            sendPolicy: control.roles.sendPolicy,
+        },
+    };
+    return control.type === "create"
+        ? { ...common, ...state, type: "create" }
+        : {
+              ...common,
+              ...state,
+              type: "commit",
+              changes: control.changes
+                  .map((change) => ({
+                      type: change.type,
+                      accountKey: change.accountKey.slice(),
+                      deviceKey: change.deviceKey.slice(),
+                  }))
+                  .sort(compareChanges),
+          };
+}
+
+function validateCanonicalIdentities(values: readonly Uint8Array[], name: string): void {
+    if (values.length > MAXIMUM_SESSION_IDENTITIES) throw new Error(`Invalid ${name}`);
+    let previous: Uint8Array | undefined;
+    for (const value of values) {
+        validateIdentityPublicKey({ publicKey: value });
+        if (previous !== undefined && compareBytes(previous, value) >= 0) {
+            throw new Error(`${name} must be sorted and unique`);
+        }
+        previous = value;
+    }
+}
+
+function validateSessionControl(control: DeliverySessionControl): void {
+    if (control.version !== 1 || control.epoch < 0n || control.epoch > MAXIMUM_UINT64) {
+        throw new Error("Invalid delivery session control");
+    }
+    validateCanonicalIdentities(control.coveredDevices, "Covered session devices");
+    if (control.type === "message") {
+        if (control.content !== "application" && control.content !== "protocol") {
+            throw new Error("Invalid delivery session message control");
+        }
+        return;
+    }
+    validateCanonicalIdentities(control.members, "Delivery session members");
+    validateIdentityPublicKey({ publicKey: control.roles.owner });
+    validateCanonicalIdentities(control.roles.admins, "Delivery session admins");
+    if (
+        control.roles.admins.some((admin) => equalBytes(admin, control.roles.owner)) ||
+        typeof control.roles.adminsAssignAdmins !== "boolean" ||
+        typeof control.roles.anyoneCanAddMembers !== "boolean" ||
+        (control.roles.sendPolicy !== "everyone" && control.roles.sendPolicy !== "admins")
+    ) {
+        throw new Error("Invalid delivery session roles");
+    }
+    if (control.type === "commit") {
+        if (control.changes.length > MAXIMUM_SESSION_IDENTITIES * 2) {
+            throw new Error("Invalid delivery session changes");
+        }
+        let previous: (typeof control.changes)[number] | undefined;
+        for (const change of control.changes) {
+            validateIdentityPublicKey({ publicKey: change.accountKey });
+            validateIdentityPublicKey({ publicKey: change.deviceKey });
+            if (
+                (change.type !== "add" && change.type !== "remove") ||
+                (previous !== undefined && compareChanges(previous, change) >= 0)
+            ) {
+                throw new Error("Delivery session changes must be sorted and unique");
+            }
+            previous = change;
+        }
+    }
 }
 
 function validateUuid(value: unknown, name: string): string {
@@ -151,6 +445,8 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
         ownerAccount:
             delivery.ownerAccount === null ? null : encodeBase64Url(delivery.ownerAccount),
         sessionId: delivery.sessionId === null ? null : encodeBase64Url(delivery.sessionId),
+        sessionControl:
+            delivery.sessionControl === null ? null : sessionControlToJson(delivery.sessionControl),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: encodeBase64Url(delivery.ciphertext),
@@ -160,7 +456,10 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
 
 function deliverySigningBytes(delivery: SignedDelivery): Uint8Array {
     const { signature: _signature, ...unsigned } = signedDeliveryToJson(delivery);
-    return separated(DELIVERY_DOMAIN, unsigned);
+    return separated(
+        DELIVERY_DOMAIN,
+        unsigned as unknown as Parameters<typeof canonicalJsonBytes>[0],
+    );
 }
 
 /**
@@ -188,6 +487,17 @@ export function validateSignedDelivery(delivery: SignedDelivery): void {
         validateIdentityPublicKey({ publicKey: delivery.ownerAccount });
     if (delivery.sessionId !== null && delivery.sessionId.length !== 32) {
         throw new Error("Invalid signed delivery session ID");
+    }
+    if (delivery.sessionControl !== null) {
+        if (
+            delivery.ownerAccount === null ||
+            delivery.sessionId === null ||
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0
+        ) {
+            throw new Error("Session-addressed delivery must not name recipients");
+        }
+        validateSessionControl(delivery.sessionControl);
     }
     let previous: Uint8Array | undefined;
     for (const recipient of delivery.recipients) {
@@ -246,6 +556,10 @@ export function createSignedDelivery(
             .sort((left, right) => compareBytes(left.accountKey, right.accountKey)),
         ownerAccount: options.ownerAccount?.slice() ?? null,
         sessionId: options.sessionId?.slice() ?? null,
+        sessionControl:
+            options.sessionControl === undefined
+                ? null
+                : normalizeSessionControl(options.sessionControl),
         createdAt,
         expiresAt: options.expiresAt,
         ciphertext: ciphertext.slice(),
@@ -268,6 +582,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
             "targetAccounts",
             "ownerAccount",
             "sessionId",
+            "sessionControl",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -313,6 +628,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         ownerAccount:
             input.ownerAccount === null ? null : decodeBase64Url(input.ownerAccount as string),
         sessionId: input.sessionId === null ? null : decodeBase64Url(input.sessionId as string),
+        sessionControl: sessionControlFromJson(input.sessionControl),
         createdAt: safeInteger(input.createdAt, "delivery timestamp"),
         expiresAt: safeInteger(input.expiresAt, "delivery expiration"),
         ciphertext: decodeBase64Url(input.ciphertext),
@@ -558,7 +874,7 @@ export function parseInboxContinuity(value: unknown): InboxContinuity {
     };
 }
 
-/** Test recipient membership while implementing or inspecting a custom transport. */
+/** Test explicit recipient membership for a direct, non-session delivery. */
 export function containsRecipient(delivery: SignedDelivery, recipient: Uint8Array): boolean {
     return delivery.recipients.some((value) => equalBytes(value, recipient));
 }

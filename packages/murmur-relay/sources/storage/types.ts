@@ -6,6 +6,7 @@ import type {
     SignedDelivery,
 } from "../protocol/index.js";
 import type { DirectoryTicketClaims } from "../directory/index.js";
+import type { RelaySessionState } from "./sessionState.js";
 
 /** Maximum expired delivery records removed by one writer transaction. */
 export const RELAY_EXPIRATION_BATCH_ITEMS = 100;
@@ -14,6 +15,12 @@ export const RELAY_EXPIRATION_BATCH_ITEMS = 100;
 export interface PublishOutcome {
     readonly eventId: string;
     readonly duplicate: boolean;
+}
+
+/** Store-internal publication result carrying the exact fanout used for wakeups. */
+export interface RelayStorePublishOutcome extends PublishOutcome {
+    /** Exact relay-derived or direct device fanout. */
+    readonly recipients: readonly Uint8Array[];
 }
 
 /** Result of one monotonic queue-prefix acknowledgement. */
@@ -25,6 +32,7 @@ export interface AcknowledgeOutcome {
 
 /** Per-identity queue bounds enforced atomically across a multicast. */
 export interface QueueLimits {
+    readonly maximumRecipients: number;
     readonly maximumItems: number;
     readonly maximumBytes: number;
     readonly maximumSenderItems: number;
@@ -66,7 +74,7 @@ export interface RelayStore {
         now: number,
         limits: QueueLimits,
         admissionPrincipal: Uint8Array,
-    ): Promise<PublishOutcome>;
+    ): Promise<RelayStorePublishOutcome>;
     /** Replay-protected removal of every pending delivery owned by one session. */
     deleteSessionDeliveries(
         ownerAccount: Uint8Array,
@@ -78,6 +86,8 @@ export interface RelayStore {
     deleteAccountState(accountKey: Uint8Array, requestId: string, now: number): Promise<void>;
     /** Resolve the unique current account that owns one active device key. */
     readDeviceAccount(deviceKey: Uint8Array): Promise<Uint8Array | undefined>;
+    /** Read relay-held membership and role state for one exact session. */
+    readSessionState(sessionId: Uint8Array): Promise<RelaySessionState | undefined>;
     /** Read one current roster by exact public account identity key. */
     readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined>;
     /** Atomically apply and notify one replay-protected identity-signed roster mutation. */

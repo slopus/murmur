@@ -708,7 +708,10 @@ export class InboxProcessor {
                 if (queued.delivery.expiresAt > processingNow) {
                     await this.#addTerminal(transaction, digest, processingNow);
                 }
-            } else if (!containsRecipient(queued.delivery, this.#dependencies.identity.publicKey)) {
+            } else if (
+                queued.delivery.sessionControl === null &&
+                !containsRecipient(queued.delivery, this.#dependencies.identity.publicKey)
+            ) {
                 rejection = "invalid_recipient";
                 if (queued.delivery.expiresAt > processingNow) {
                     await this.#addTerminal(transaction, digest, processingNow);

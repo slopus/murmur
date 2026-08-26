@@ -4,6 +4,89 @@ export interface DeliveryAccountTarget {
     readonly rosterRevision: number;
 }
 
+/** Relay-visible role state authenticated beside an encrypted MLS delivery. */
+export interface DeliverySessionRoles {
+    readonly owner: Uint8Array;
+    readonly admins: readonly Uint8Array[];
+    readonly adminsAssignAdmins: boolean;
+    readonly anyoneCanAddMembers: boolean;
+    readonly sendPolicy: "everyone" | "admins";
+}
+
+/** One MLS leaf change summarized for relay-side role enforcement. */
+export interface DeliverySessionMemberChange {
+    readonly type: "add" | "remove";
+    readonly accountKey: Uint8Array;
+    readonly deviceKey: Uint8Array;
+}
+
+/** Signed MLS-adjacent metadata used for relay routing and additive checks. */
+export type DeliverySessionControl =
+    | {
+          readonly version: 1;
+          readonly type: "create";
+          readonly epoch: bigint;
+          readonly members: readonly Uint8Array[];
+          readonly roles: DeliverySessionRoles;
+          readonly coveredDevices: readonly Uint8Array[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "commit";
+          readonly epoch: bigint;
+          readonly members: readonly Uint8Array[];
+          readonly roles: DeliverySessionRoles;
+          readonly changes: readonly DeliverySessionMemberChange[];
+          readonly coveredDevices: readonly Uint8Array[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "message";
+          readonly epoch: bigint;
+          readonly content: "application" | "protocol";
+          readonly coveredDevices: readonly Uint8Array[];
+      };
+
+/** JSON representation of relay-visible session control. */
+export type DeliverySessionControlJson =
+    | {
+          readonly version: 1;
+          readonly type: "create";
+          readonly epoch: string;
+          readonly members: readonly string[];
+          readonly roles: DeliverySessionRolesJson;
+          readonly coveredDevices: readonly string[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "commit";
+          readonly epoch: string;
+          readonly members: readonly string[];
+          readonly roles: DeliverySessionRolesJson;
+          readonly changes: readonly {
+              readonly type: "add" | "remove";
+              readonly accountKey: string;
+              readonly deviceKey: string;
+          }[];
+          readonly coveredDevices: readonly string[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "message";
+          readonly epoch: string;
+          readonly content: "application" | "protocol";
+          readonly coveredDevices: readonly string[];
+      };
+
+/** JSON representation of relay-visible session roles. */
+export interface DeliverySessionRolesJson {
+    readonly owner: string;
+    readonly admins: readonly string[];
+    readonly adminsAssignAdmins: boolean;
+    readonly anyoneCanAddMembers: boolean;
+    readonly sendPolicy: "everyone" | "admins";
+}
+
 /** One signed encrypted multicast delivery accepted by the relay. */
 export interface SignedDelivery {
     readonly version: 1;
@@ -21,6 +104,8 @@ export interface SignedDelivery {
     readonly ownerAccount: Uint8Array | null;
     /** Owning MLS session identifier, or null for account traffic. */
     readonly sessionId: Uint8Array | null;
+    /** Relay-visible signed control for session-addressed publication, otherwise null. */
+    readonly sessionControl: DeliverySessionControl | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: Uint8Array;
@@ -40,6 +125,7 @@ export interface SignedDeliveryJson {
     }[];
     readonly ownerAccount: string | null;
     readonly sessionId: string | null;
+    readonly sessionControl: DeliverySessionControlJson | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: string;

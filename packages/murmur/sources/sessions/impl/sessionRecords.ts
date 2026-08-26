@@ -48,6 +48,8 @@ export interface SessionOutboxRecord {
     readonly bootstrapDeliveryIds?: readonly string[];
     readonly roles?: SessionRoles;
     readonly accountConvergenceKey?: string;
+    /** Application ciphertext awaits an MLS device-coverage Commit. */
+    readonly coverageBlocked?: true;
 }
 
 /** One durable asynchronous membership or role mutation. */
@@ -325,6 +327,7 @@ export function encodeOutboxRecord(record: SessionOutboxRecord): Uint8Array {
         ...(record.accountConvergenceKey === undefined
             ? {}
             : { accountConvergenceKey: record.accountConvergenceKey }),
+        ...(record.coverageBlocked === true ? { coverageBlocked: true } : {}),
     });
 }
 
@@ -346,6 +349,7 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
             "bootstrapDeliveryIds",
             "roles",
             ...(Object.hasOwn(input, "accountConvergenceKey") ? ["accountConvergenceKey"] : []),
+            ...(Object.hasOwn(input, "coverageBlocked") ? ["coverageBlocked"] : []),
         ],
         "session outbox",
     );
@@ -372,7 +376,8 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
         (input.roles !== null && typeof input.roles !== "string") ||
         (input.accountConvergenceKey !== undefined &&
             (typeof input.accountConvergenceKey !== "string" ||
-                !input.accountConvergenceKey.startsWith("murmur/accounts/v1/convergence/")))
+                !input.accountConvergenceKey.startsWith("murmur/accounts/v1/convergence/"))) ||
+        (input.coverageBlocked !== undefined && input.coverageBlocked !== true)
     ) {
         throw new Error("Invalid session outbox");
     }
@@ -382,6 +387,7 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
     const hasRetainPreviousEpoch = input.retainPreviousEpoch !== null;
     const hasBootstrapDeliveryIds = input.bootstrapDeliveryIds !== null;
     const hasRoles = input.roles !== null;
+    const hasCoverageBlocked = input.coverageBlocked === true;
     if (
         (input.kind === "application" &&
             (!hasApplicationData ||
@@ -395,14 +401,16 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
                 !hasRoles ||
                 hasParentCommit ||
                 !hasRetainPreviousEpoch ||
-                !hasBootstrapDeliveryIds)) ||
+                !hasBootstrapDeliveryIds ||
+                hasCoverageBlocked)) ||
         (input.kind === "bootstrap" &&
             (hasApplicationData ||
                 hasStagedEpoch ||
                 hasRoles ||
                 !hasParentCommit ||
                 hasRetainPreviousEpoch ||
-                hasBootstrapDeliveryIds))
+                hasBootstrapDeliveryIds ||
+                hasCoverageBlocked))
     ) {
         throw new Error("Invalid session outbox fields");
     }
@@ -432,6 +440,7 @@ export function decodeOutboxRecord(value: Uint8Array): SessionOutboxRecord {
         ...(input.accountConvergenceKey === undefined
             ? {}
             : { accountConvergenceKey: input.accountConvergenceKey as string }),
+        ...(input.coverageBlocked === true ? { coverageBlocked: true } : {}),
     };
 }
 

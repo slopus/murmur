@@ -20,6 +20,9 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 roster_nonces: unknown;
                 deletion_nonces: unknown;
                 account_deletion_nonces: unknown;
+                sessions: unknown;
+                session_members: unknown;
+                session_admins: unknown;
                 directory_devices: unknown;
                 directory_prekeys: unknown;
                 directory_references: unknown;
@@ -37,6 +40,9 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     to_regclass('murmur_device_roster_nonces') AS roster_nonces,
                     to_regclass('murmur_session_deletion_nonces') AS deletion_nonces,
                     to_regclass('murmur_account_deletion_nonces') AS account_deletion_nonces,
+                    to_regclass('murmur_sessions') AS sessions,
+                    to_regclass('murmur_session_members') AS session_members,
+                    to_regclass('murmur_session_admins') AS session_admins,
                     to_regclass('murmur_directory_devices') AS directory_devices,
                     to_regclass('murmur_directory_prekeys') AS directory_prekeys,
                     to_regclass('murmur_directory_prekey_references') AS directory_references,
@@ -56,6 +62,9 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     row.roster_nonces !== null ||
                     row.deletion_nonces !== null ||
                     row.account_deletion_nonces !== null ||
+                    row.sessions !== null ||
+                    row.session_members !== null ||
+                    row.session_admins !== null ||
                     row.directory_devices !== null ||
                     row.directory_prekeys !== null ||
                     row.directory_references !== null ||
@@ -86,6 +95,9 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     row.roster_nonces === null ||
                     row.deletion_nonces === null ||
                     row.account_deletion_nonces === null ||
+                    row.sessions === null ||
+                    row.session_members === null ||
+                    row.session_admins === null ||
                     row.directory_devices === null ||
                     row.directory_prekeys === null ||
                     row.directory_references === null ||
@@ -164,6 +176,30 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     request_id text NOT NULL,
                     created_at bigint NOT NULL,
                     PRIMARY KEY (account_digest, request_id)
+                )`,
+                `CREATE TABLE murmur_sessions (
+                    session_id bytea PRIMARY KEY CHECK (octet_length(session_id) = 32),
+                    owner_account bytea NOT NULL CHECK (octet_length(owner_account) = 32),
+                    epoch bigint NOT NULL CHECK (epoch >= 1),
+                    admins_assign_admins boolean NOT NULL,
+                    anyone_can_add_members boolean NOT NULL,
+                    send_policy text NOT NULL CHECK (send_policy IN ('everyone', 'admins'))
+                )`,
+                `CREATE INDEX murmur_session_owner ON murmur_sessions(owner_account)`,
+                `CREATE TABLE murmur_session_members (
+                    session_id bytea NOT NULL REFERENCES murmur_sessions(session_id)
+                        ON DELETE CASCADE,
+                    account_key bytea NOT NULL CHECK (octet_length(account_key) = 32),
+                    roster_revision bigint NOT NULL CHECK (roster_revision >= 1),
+                    PRIMARY KEY (session_id, account_key)
+                )`,
+                `CREATE INDEX murmur_session_member_account
+                    ON murmur_session_members(account_key)`,
+                `CREATE TABLE murmur_session_admins (
+                    session_id bytea NOT NULL REFERENCES murmur_sessions(session_id)
+                        ON DELETE CASCADE,
+                    account_key bytea NOT NULL CHECK (octet_length(account_key) = 32),
+                    PRIMARY KEY (session_id, account_key)
                 )`,
                 `CREATE TABLE murmur_queue_references (
                     recipient bytea NOT NULL REFERENCES murmur_queues(recipient)

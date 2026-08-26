@@ -41,12 +41,17 @@ ignore destroys the pending secrets and data.
 ## Relay boundary
 
 The relay authenticates queue reads and acknowledgements, validates signed
-delivery envelopes, atomically fans one event out to exact recipient inboxes,
-and retains only unacknowledged unexpired ciphertext. Every delivery binds its
-sender account so ownership cleanup does not depend on message contents. The
-relay also owns one current device roster and its per-device directory prekey pools per exact account
-identity, without learning MLS, descriptor, membership, role, application, or
-conversation semantics.
+delivery envelopes, and atomically fans one event out to exact recipient
+inboxes. Direct deliveries name those inboxes. Ongoing MLS deliveries name a
+session; the relay joins its current member accounts to current device rosters
+and derives the fanout. Every delivery binds its sender account so ownership
+cleanup does not depend on message contents.
+
+The relay owns one current device roster and its per-device directory prekey
+pools per exact account identity. It also holds MLS-adjacent session routing
+state—epoch, owner, members, admins, and policies—from signed visible controls.
+It never learns MLS secrets, descriptors, or application contents, and members
+independently verify visible controls against encrypted MLS state.
 
 Directory claims are authorized by opaque authentication-server tickets. A
 pluggable verifier supplies issuer, expiry, ticket ID, and claim budget; storage
@@ -62,8 +67,9 @@ restored or rolled-back relay database.
 The standalone relay supports SQLite and PostgreSQL. The Cloudflare deployment
 uses one inbox Durable Object per public identity and a global fanout Durable
 Object for manifest-first atomic multicast. The queue-only Cloudflare adapter
-does not own roster and directory state, so terminal account deletion requires
-the standalone relay.
+does not own roster, directory, or relay-visible session state, so
+session-addressed publication and terminal account deletion require the
+standalone relay.
 
 ## Services and accounts
 

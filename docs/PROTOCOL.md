@@ -50,16 +50,23 @@ the same fallback package are valid.
 One sender-signed delivery contains:
 
 - a random operation ID;
-- sender, owning sender account, and exact recipient public identities;
+- sender and owning sender account;
+- either exact recipient public identities for direct inbox delivery or no
+  recipients for session-addressed delivery;
 - nullable owner-account and session identifiers for relay-side terminal cleanup;
+- nullable relay-visible session control covering epoch, device coverage, and,
+  for creation and Commits, post-Commit membership and roles;
 - creation and expiry times;
 - opaque ciphertext;
 - an Ed25519 signature over a domain-separated canonical encoding.
 
-The relay validates size, time, identity, recipient, and signature policy before
-an atomic multicast. One accepted operation receives one UUIDv7 event ID and
-one monotonically increasing sequence in every recipient inbox. Duplicate
-pending publication returns the original event ID.
+The relay validates size, time, identity, routing, and signature policy before
+an atomic multicast. For ongoing MLS traffic it authenticates a current member
+device, advances relay-visible creation or Commit state in delivery order,
+enforces basic roles and send policy, joins member accounts to current rosters,
+and derives the exact device fanout. One accepted operation receives one UUIDv7
+event ID and one monotonically increasing sequence in every derived or direct
+recipient inbox. Duplicate pending publication returns the original event ID.
 
 Reads and acknowledgements are independently signed by the recipient. An inbox
 page includes its head, head sequence, acknowledged prefix, continuity
@@ -95,9 +102,17 @@ three policies:
 The owner is always an admin. Removal immediately revokes prior-epoch send
 authority for the removed account.
 
+Every ongoing send names only the session and declares the devices covered by
+its MLS epoch. If a current roster contains an uncovered device, the relay
+returns `stale_epoch_coverage` with current rosters; the client adds the leaf
+and re-encrypts. Members independently compare signed visible controls with the
+decrypted MLS message or Commit and durably quarantine any mismatch. A bounded
+prior-epoch message racing a winning Commit remains decryptable by members that
+held that epoch, while the relay rejects removed senders.
+
 The immutable owner may delete an idle active session. Murmur first durably
-creates an account-signed, replay-protected relay purge request and a final MLS
-deletion notice, then destroys local session state. The relay removes every
+creates an account-signed, replay-protected relay purge request and a final
+direct-inbox MLS deletion notice, then destroys local session state. The relay removes every
 unexpired delivery carrying that exact owner/session pair and advances affected
 inbox continuity generations before Murmur publishes the final notice. Members
 authenticate the notice against the owner role in its exact MLS epoch and

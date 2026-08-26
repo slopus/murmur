@@ -8,7 +8,11 @@ import {
     type DeliveryTransport,
     type SignedDelivery,
 } from "../../delivery/index.js";
-import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
+import {
+    decodeIdentityRoot,
+    destroyIdentity,
+    generateIdentityKeyPair,
+} from "../../crypto/index.js";
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
 import { MurmurClient, type MurmurSessionLimits, type MurmurUpdate } from "../index.js";
@@ -142,7 +146,8 @@ describe("stateful MLS sessions", () => {
             store: aliceStore,
             now: () => NOW,
         });
-        const bob = await client(relay);
+        const bobStore = new MemoryMurmurStore();
+        const bob = await client(relay, bobStore);
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("offline group"),
@@ -193,14 +198,18 @@ describe("stateful MLS sessions", () => {
             expect(published.slice(3, 5).map((delivery) => delivery.id)).toEqual([first, second]);
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
-            ).toEqual([
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
-                [encodeBase64Url(bob.deviceKey)],
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
-                [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
-            ]);
+            ).toEqual([[], [encodeBase64Url(bob.deviceKey)], [], [], [], []]);
+            expect(
+                published
+                    .filter((delivery) => delivery.sessionControl !== null)
+                    .map((delivery) =>
+                        delivery.sessionControl!.coveredDevices.map(encodeBase64Url).sort(),
+                    ),
+            ).toEqual(
+                Array.from({ length: 5 }, () =>
+                    [encodeBase64Url(aliceIdentity), encodeBase64Url(bob.deviceKey)].sort(),
+                ),
+            );
 
             await bob.synchronize({ waitMilliseconds: 0 });
             expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
@@ -560,10 +569,18 @@ describe("stateful MLS sessions", () => {
             await carol.synchronize({ waitMilliseconds: 0 });
 
             await bob.grantAdmin(session.id, carol.identity);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            for (
+                let cycle = 0;
+                cycle < 8 &&
+                !(await alice.session(session.id))?.admins.some(
+                    (admin) => encodeBase64Url(admin) === encodeBase64Url(carol.identity),
+                );
+                cycle += 1
+            ) {
+                await bob.synchronize({ waitMilliseconds: 0 });
+                await alice.synchronize({ waitMilliseconds: 0 });
+                await carol.synchronize({ waitMilliseconds: 0 });
+            }
             expect((await alice.session(session.id))?.admins).toContainEqual(carol.identity);
             await expect(bob.revokeAdmin(session.id, carol.identity)).rejects.toThrow(
                 "Only the session owner",
@@ -629,7 +646,9 @@ describe("stateful MLS sessions", () => {
             }
 
             await bob.addMember(session.id, await dave.createKeyPackage());
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
+                transientPublicationFailures: 1,
+            });
             await alice.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
 
@@ -643,18 +662,191 @@ describe("stateful MLS sessions", () => {
             });
             expect((await alice.session(session.id))?.members).toHaveLength(3);
             expect((await carol.session(session.id))?.members).toHaveLength(3);
-            for (const member of [alice, carol]) {
-                expect(await member.issues()).toEqual(
-                    expect.arrayContaining([
-                        expect.objectContaining({ code: "unauthorized_commit" }),
-                    ]),
-                );
-            }
+            expect(await alice.issues()).toEqual([]);
+            expect(await carol.issues()).toEqual([]);
         } finally {
             alice.close();
             bob.close();
             carol.close();
             dave.close();
+            await relay.close();
+        }
+    });
+
+    test("quarantines a Welcome whose encrypted roles disagree with its signed summary", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const aliceIdentity = generateIdentityKeyPair();
+        const aliceStore = new MemoryMurmurStore();
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        let aliceDeviceIdentity: ReturnType<typeof decodeIdentityRoot> | undefined;
+        let tamperCreation = true;
+        const transport: DeliveryTransport = {
+            publish: (delivery, signal) => {
+                if (tamperCreation && delivery.sessionControl?.type === "create") {
+                    tamperCreation = false;
+                    return base.publish(
+                        createSignedDelivery(aliceDeviceIdentity!, [], delivery.ciphertext, {
+                            id: delivery.id,
+                            createdAt: delivery.createdAt,
+                            expiresAt: delivery.expiresAt,
+                            senderAccount: delivery.senderAccount,
+                            ownerAccount: delivery.ownerAccount!,
+                            sessionId: delivery.sessionId!,
+                            sessionControl: {
+                                ...delivery.sessionControl,
+                                roles: {
+                                    ...delivery.sessionControl.roles,
+                                    sendPolicy: "admins",
+                                },
+                            },
+                        }),
+                        signal,
+                    );
+                }
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            uploadDirectoryPrekeys: (delivery, signal) =>
+                base.uploadDirectoryPrekeys(delivery, signal),
+            claimDirectory: (account, ticket, signal) =>
+                base.claimDirectory(account, ticket, signal),
+        };
+        const alice = await MurmurClient.open({
+            identity: aliceIdentity,
+            transport,
+            store: aliceStore,
+            now: () => NOW,
+        });
+        const storedDevice = await aliceStore.get("murmur/identity/root");
+        if (storedDevice === undefined) throw new Error("Missing test device identity");
+        try {
+            aliceDeviceIdentity = decodeIdentityRoot(storedDevice);
+        } finally {
+            zeroBytes(storedDevice);
+        }
+        const bobStore = new MemoryMurmurStore();
+        const bob = await client(relay, bobStore);
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("bootstrap visible mismatch"),
+                members: [await bob.createKeyPackage()],
+            });
+            await alice.synchronize();
+            const outcome = await bob.synchronize();
+
+            expect(outcome.issues).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        code: "visible_session_metadata_mismatch",
+                        kind: "bootstrap",
+                    }),
+                ]),
+            );
+            expect(await bob.session(session.id)).toBeUndefined();
+            expect(await prefixCount(bobStore, "murmur/pending-membership-controls/")).toBe(0);
+        } finally {
+            alice.close();
+            bob.close();
+            if (aliceDeviceIdentity !== undefined) destroyIdentity(aliceDeviceIdentity);
+            destroyIdentity(aliceIdentity);
+            await relay.close();
+        }
+    });
+
+    test("durably quarantines signed visible metadata that disagrees with MLS content", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bobIdentity = generateIdentityKeyPair();
+        const bobStore = new MemoryMurmurStore();
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        let bobDeviceIdentity: ReturnType<typeof decodeIdentityRoot> | undefined;
+        let tamperNextApplication = false;
+        const transport: DeliveryTransport = {
+            publish: (delivery, signal) => {
+                if (
+                    tamperNextApplication &&
+                    delivery.sessionControl?.type === "message" &&
+                    delivery.sessionControl.content === "application"
+                ) {
+                    tamperNextApplication = false;
+                    return base.publish(
+                        createSignedDelivery(bobDeviceIdentity!, [], delivery.ciphertext, {
+                            id: delivery.id,
+                            createdAt: delivery.createdAt,
+                            expiresAt: delivery.expiresAt,
+                            senderAccount: delivery.senderAccount,
+                            ownerAccount: delivery.ownerAccount!,
+                            sessionId: delivery.sessionId!,
+                            sessionControl: {
+                                ...delivery.sessionControl,
+                                content: "protocol",
+                            },
+                        }),
+                        signal,
+                    );
+                }
+                return base.publish(delivery, signal);
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            uploadDirectoryPrekeys: (delivery, signal) =>
+                base.uploadDirectoryPrekeys(delivery, signal),
+            claimDirectory: (account, ticket, signal) =>
+                base.claimDirectory(account, ticket, signal),
+        };
+        const bob = await MurmurClient.open({
+            identity: bobIdentity,
+            transport,
+            store: bobStore,
+            now: () => NOW,
+        });
+        const storedDevice = await bobStore.get("murmur/identity/root");
+        if (storedDevice === undefined) throw new Error("Missing test device identity");
+        try {
+            bobDeviceIdentity = decodeIdentityRoot(storedDevice);
+        } finally {
+            zeroBytes(storedDevice);
+        }
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("visible mismatch"),
+                members: [await bob.createKeyPackage()],
+            });
+            await alice.synchronize();
+            await bob.synchronize();
+            await activate(bob, session.id);
+
+            tamperNextApplication = true;
+            await bob.send(session.id, utf8Encode("must quarantine"));
+            await bob.synchronize();
+            const outcome = await alice.synchronize();
+            expect(outcome.issues).toEqual(
+                expect.arrayContaining([
+                    expect.objectContaining({
+                        code: "visible_session_metadata_mismatch",
+                        kind: "application",
+                    }),
+                ]),
+            );
+            const received: string[] = [];
+            await consume(alice, async (update) => {
+                received.push(utf8Decode(update.bytes));
+            });
+            expect(received).toEqual([]);
+        } finally {
+            alice.close();
+            bob.close();
+            if (bobDeviceIdentity !== undefined) destroyIdentity(bobDeviceIdentity);
+            destroyIdentity(bobIdentity);
             await relay.close();
         }
     });
@@ -1109,6 +1301,11 @@ describe("stateful MLS sessions", () => {
             expect(published[0]?.id).toBe(messageId);
             expect(
                 published.map((delivery) => delivery.recipients.map(encodeBase64Url).sort()),
+            ).toEqual([[], [], []]);
+            expect(
+                published.map((delivery) =>
+                    delivery.sessionControl!.coveredDevices.map(encodeBase64Url).sort(),
+                ),
             ).toEqual([
                 [encodeBase64Url(alice.deviceKey), encodeBase64Url(bob.deviceKey)].sort(),
                 [encodeBase64Url(alice.deviceKey), encodeBase64Url(bob.deviceKey)].sort(),
@@ -1953,9 +2150,11 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize();
             await bob.synchronize();
             await carol.send(session.id, utf8Encode("after removal"));
-            await carol.synchronize();
+            await expect(carol.synchronize()).resolves.toMatchObject({
+                terminalPublicationFailures: 1,
+            });
             const outcome = await alice.synchronize();
-            expect(outcome.inbox.rejected).toBe(1);
+            expect(outcome.inbox.rejected).toBe(0);
             const events: string[] = [];
             await consume(alice, async (event) => {
                 events.push(utf8Decode(event.bytes));

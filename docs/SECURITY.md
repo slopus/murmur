@@ -2,11 +2,13 @@
 
 ## Trust model
 
-The relay is untrusted for confidentiality and session semantics. It sees public
-queue identities, signed envelope metadata, timing, ciphertext sizes, recipient
-fanout, ingress admission principals, and acknowledgement progress. It must not
-receive MLS secrets, identity roots, plaintext descriptors, or application
-updates.
+The relay is honest but not trusted: Murmur relies on it to apply the protocol
+and delivery order correctly, but never for confidentiality or as a replacement
+for member verification. It sees public queue and account identities,
+relay-visible session membership and roles, signed envelope metadata, timing,
+ciphertext sizes, derived fanout, ingress admission principals, and
+acknowledgement progress. It must not receive MLS secrets, identity roots,
+plaintext descriptors, or application updates.
 
 The application controls its `MurmurStore` and every external effect. Compromise
 or loss of that store exposes or destroys the local cryptographic state it
@@ -51,10 +53,13 @@ continuity is a security property rather than an operational convenience.
 
 ## Delivery
 
-Signed envelopes bind the operation ID, sender, owning sender account, exact
-recipient set, account target revisions, timestamps, and ciphertext. The relay
-validates active device ownership, all bounds, and signatures before storage.
-Queue reads and acknowledgements are independently signed by the recipient.
+Signed envelopes bind the operation ID, sender, owning sender account, direct
+recipient set or relay-visible session controls, account target revisions,
+timestamps, and ciphertext. The relay validates active device ownership, all
+bounds, signatures, current session membership, role policy, and epoch coverage
+before storage. Members still validate visible controls against decrypted MLS
+state. Queue reads and acknowledgements are independently signed by the
+recipient.
 
 Use constant-time comparison for authentication values. Never log request
 bodies, signatures, ciphertext, queue tokens, identity roots, or relay-session
@@ -82,7 +87,8 @@ whose signed roster revision is stale while MLS membership converges.
 Account deletion removes relay-owned and local technical state, but it is not
 retroactive erasure from other members. Authenticated MLS events already held
 by remote applications remain under those applications' storage policy. The
-Cloudflare queue-only adapter cannot perform terminal account deletion.
+Cloudflare queue-only adapter cannot perform session-addressed publication or
+terminal account deletion.
 
 ## Identity directory
 

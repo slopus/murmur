@@ -1,5 +1,5 @@
 import type { SignedDelivery } from "../protocol/index.js";
-import type { PublishOutcome } from "../storage/index.js";
+import type { RelayStorePublishOutcome } from "../storage/index.js";
 
 /** Oldest persisted manifest still missing at least one recipient insertion. */
 export interface PendingFanoutManifest {
@@ -15,7 +15,7 @@ export interface DurableFanoutStore {
         delivery: SignedDelivery,
         admissionPrincipal: string,
         now: number,
-    ): Promise<PublishOutcome>;
+    ): Promise<RelayStorePublishOutcome>;
     oldestPending(now: number): Promise<PendingFanoutManifest | undefined>;
     markDelivered(sender: Uint8Array, deliveryId: string, recipient: Uint8Array): Promise<void>;
     pruneExpired(now: number): Promise<number>;

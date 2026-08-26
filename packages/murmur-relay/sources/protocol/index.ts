@@ -34,6 +34,11 @@ export {
 } from "./impl/directoryCodec.js";
 export type {
     DeliveryAccountTarget,
+    DeliverySessionControl,
+    DeliverySessionControlJson,
+    DeliverySessionMemberChange,
+    DeliverySessionRoles,
+    DeliverySessionRolesJson,
     SignedDelivery,
     SignedDeliveryJson,
     SignedQueueAck,

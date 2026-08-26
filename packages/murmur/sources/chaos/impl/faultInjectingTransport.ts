@@ -1,6 +1,5 @@
 import type {
     DeliveryPublishOutcome,
-    DeliveryDeviceRoster,
     DeliveryStreamHooks,
     DeliveryTransport,
     InboxDelivery,
@@ -28,6 +27,42 @@ interface TransportFaultContext {
     readonly counts: Map<string, number>;
 }
 
+function cloneSessionControl(
+    control: SignedDelivery["sessionControl"],
+): SignedDelivery["sessionControl"] {
+    if (control === null) return null;
+    const common = {
+        version: 1 as const,
+        epoch: control.epoch,
+        coveredDevices: control.coveredDevices.map((device) => device.slice()),
+    };
+    if (control.type === "message") {
+        return { ...common, type: "message", content: control.content };
+    }
+    const state = {
+        members: control.members.map((member) => member.slice()),
+        roles: {
+            owner: control.roles.owner.slice(),
+            admins: control.roles.admins.map((admin) => admin.slice()),
+            adminsAssignAdmins: control.roles.adminsAssignAdmins,
+            anyoneCanAddMembers: control.roles.anyoneCanAddMembers,
+            sendPolicy: control.roles.sendPolicy,
+        },
+    };
+    return control.type === "create"
+        ? { ...common, ...state, type: "create" }
+        : {
+              ...common,
+              ...state,
+              type: "commit",
+              changes: control.changes.map((change) => ({
+                  type: change.type,
+                  accountKey: change.accountKey.slice(),
+                  deviceKey: change.deviceKey.slice(),
+              })),
+          };
+}
+
 function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
     return {
         version: 1,
@@ -41,6 +76,7 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
         })),
         ownerAccount: delivery.ownerAccount?.slice() ?? null,
         sessionId: delivery.sessionId?.slice() ?? null,
+        sessionControl: cloneSessionControl(delivery.sessionControl),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),
@@ -219,6 +255,10 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
     readonly #context: TransportFaultContext;
     #lastReadPage: InboxPage | undefined;
     #lastStreamDelivery: InboxDelivery | undefined;
+    readonly deleteAccount?: NonNullable<DeliveryTransport["deleteAccount"]>;
+    readonly deleteSession?: NonNullable<DeliveryTransport["deleteSession"]>;
+    readonly mutateDeviceRoster?: NonNullable<DeliveryTransport["mutateDeviceRoster"]>;
+    readonly readDeviceRoster?: NonNullable<DeliveryTransport["readDeviceRoster"]>;
     readonly stream?: NonNullable<DeliveryTransport["stream"]>;
 
     constructor(options: FaultInjectingTransportOptions) {
@@ -233,6 +273,22 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         };
         if (options.delegate.stream !== undefined) {
             this.stream = (request, signal, hooks) => this.#stream(request, signal, hooks);
+        }
+        if (options.delegate.deleteAccount !== undefined) {
+            this.deleteAccount = (delivery, signal) =>
+                options.delegate.deleteAccount!(cloneDelivery(delivery), signal);
+        }
+        if (options.delegate.deleteSession !== undefined) {
+            this.deleteSession = (delivery, signal) =>
+                options.delegate.deleteSession!(cloneDelivery(delivery), signal);
+        }
+        if (options.delegate.readDeviceRoster !== undefined) {
+            this.readDeviceRoster = (accountKey, signal) =>
+                options.delegate.readDeviceRoster!(accountKey, signal);
+        }
+        if (options.delegate.mutateDeviceRoster !== undefined) {
+            this.mutateDeviceRoster = (delivery, signal) =>
+                options.delegate.mutateDeviceRoster!(delivery, signal);
         }
     }
 
@@ -265,20 +321,6 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             await this.#context.delegate.publish(delivery, signal);
         }
         return { eventId: outcome.eventId, duplicate: outcome.duplicate };
-    }
-
-    async deleteSession(input: SignedDelivery, signal?: AbortSignal): Promise<number> {
-        if (this.#context.delegate.deleteSession === undefined) {
-            throw new Error("Delivery transport does not support session deletion");
-        }
-        return this.#context.delegate.deleteSession(cloneDelivery(input), signal);
-    }
-
-    async deleteAccount(input: SignedDelivery, signal?: AbortSignal): Promise<void> {
-        if (this.#context.delegate.deleteAccount === undefined) {
-            throw new Error("Delivery transport does not support account deletion");
-        }
-        await this.#context.delegate.deleteAccount(cloneDelivery(input), signal);
     }
 
     async read(input: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
@@ -375,23 +417,6 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             await this.#context.delegate.acknowledge(request, signal);
         }
         return { removed: outcome.removed };
-    }
-
-    async readDeviceRoster(
-        accountKey: Uint8Array,
-        signal?: AbortSignal,
-    ): Promise<DeliveryDeviceRoster | undefined> {
-        return this.#context.delegate.readDeviceRoster?.(accountKey, signal);
-    }
-
-    async mutateDeviceRoster(
-        delivery: SignedDelivery,
-        signal?: AbortSignal,
-    ): Promise<DeliveryDeviceRoster> {
-        if (this.#context.delegate.mutateDeviceRoster === undefined) {
-            throw new Error("Delegate does not support device rosters");
-        }
-        return this.#context.delegate.mutateDeviceRoster(delivery, signal);
     }
 
     async *#stream(

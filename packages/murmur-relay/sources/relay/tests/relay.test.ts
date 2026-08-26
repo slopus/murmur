@@ -11,7 +11,7 @@ import { SqliteRelayStore } from "../../storage/index.js";
 import type {
     AcknowledgeOutcome,
     PageReadConstraints,
-    PublishOutcome,
+    RelayStorePublishOutcome,
     QueueLimits,
     QueuePage,
     RelayStore,
@@ -431,6 +431,9 @@ describe("identity queue relay", () => {
             async readDeviceAccount() {
                 return undefined;
             },
+            async readSessionState() {
+                return undefined;
+            },
             async mutateDeviceRoster() {
                 throw new Error("not used");
             },
@@ -444,7 +447,7 @@ describe("identity queue relay", () => {
                 _delivery: SignedDelivery,
                 _now: number,
                 _limits: QueueLimits,
-            ): Promise<PublishOutcome> {
+            ): Promise<RelayStorePublishOutcome> {
                 throw new Error("Unused");
             },
             async deleteSessionDeliveries(): Promise<number> {

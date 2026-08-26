@@ -44,6 +44,7 @@ const BOOTSTRAP_OUTBOX_PREFIX = "murmur/bootstrap-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
 const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
+const PENDING_MEMBERSHIP_CONTROL_PREFIX = "murmur/pending-membership-controls/";
 const CURSOR_KEY = "murmur/delivery/cursor";
 const IDENTITY_KEY = "murmur/identity/root";
 
@@ -513,6 +514,9 @@ async function assertStoreShape(store: MurmurStore): Promise<Record<string, numb
         postCommit: await store.scan(POST_COMMIT_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
         bootstrap: await store.scan(BOOTSTRAP_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
         pending: await store.scan(PENDING_SESSION_PREFIX, { limit: STORE_LIMIT }),
+        pendingControls: await store.scan(PENDING_MEMBERSHIP_CONTROL_PREFIX, {
+            limit: STORE_LIMIT,
+        }),
         states: await store.scan(SESSION_STATE_PREFIX, { limit: STORE_LIMIT }),
         intents: await store.scan(SESSION_INTENT_PREFIX, { limit: STORE_LIMIT }),
         issues: await store.scan(QUARANTINE_PREFIX, { limit: STORE_LIMIT }),
@@ -551,6 +555,7 @@ async function assertStoreShape(store: MurmurStore): Promise<Record<string, numb
         postCommit: families.postCommit.size,
         bootstrap: families.bootstrap.size,
         pending: families.pending.size,
+        pendingControls: families.pendingControls.size,
         states: families.states.size,
         intents: families.intents.size,
         issues: families.issues.size,

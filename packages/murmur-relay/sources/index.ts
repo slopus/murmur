@@ -54,6 +54,7 @@ export type {
     AcknowledgeOutcome,
     PageReadConstraints,
     PublishOutcome,
+    RelayStorePublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,

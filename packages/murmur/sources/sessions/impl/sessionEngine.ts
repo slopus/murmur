@@ -6,9 +6,13 @@ import {
     TerminalInboxDeliveryError,
     createSignedDelivery,
     encodeSessionDeletionRequest,
+    parseSignedDelivery,
+    signedDeliveryToJson,
+    verifySignedDelivery,
     type DeliveryTransport,
     type DeliveryAccountTarget,
     type DeliveryDeviceRoster,
+    type DeliverySessionControl,
     type InboxDelivery,
     type InboxStreamOptions,
     type InboxSyncResult,
@@ -129,6 +133,7 @@ const USED_KEY_PACKAGE_PREFIX = "murmur/used-key-packages/";
 const REJECTED_PREFIX = "murmur/rejected-sessions/";
 const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
+const PENDING_MEMBERSHIP_CONTROL_PREFIX = "murmur/pending-membership-controls/";
 const BOOTSTRAP_INDEX_PREFIX = "murmur/bootstrap-outboxes/";
 const ADMISSION_BARRIER_PREFIX = "murmur/admission-barriers/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
@@ -300,6 +305,10 @@ function pendingKey(id: Uint8Array): string {
     return `${PENDING_SESSION_PREFIX}${sessionId(id)}`;
 }
 
+function pendingMembershipControlKey(id: Uint8Array): string {
+    return `${PENDING_MEMBERSHIP_CONTROL_PREFIX}${sessionId(id)}`;
+}
+
 function usedKeyPackageKey(keyPackage: MlsKeyPackage): string {
     return `${USED_KEY_PACKAGE_PREFIX}${encodeBase64Url(mlsKeyPackageReference(keyPackage))}`;
 }
@@ -387,6 +396,48 @@ function activeAccounts(epoch: MlsEpochState): readonly Uint8Array[] {
     return [...accounts.values()];
 }
 
+function deliverySessionRoles(
+    roles: SessionRoles,
+): Extract<DeliverySessionControl, { type: "create" | "commit" }>["roles"] {
+    return {
+        owner: roles.owner,
+        admins: roles.admins,
+        adminsAssignAdmins: roles.adminsAssignAdmins,
+        anyoneCanAddMembers: roles.anyoneCanAddMembers,
+        sendPolicy: roles.sendPolicy,
+    };
+}
+
+function sameIdentitySet(left: readonly Uint8Array[], right: readonly Uint8Array[]): boolean {
+    const values = new Set(left.map(encodeBase64Url));
+    return (
+        values.size === right.length && right.every((value) => values.has(encodeBase64Url(value)))
+    );
+}
+
+function deliverySessionRolesEqual(
+    left: Extract<DeliverySessionControl, { type: "create" | "commit" }>["roles"],
+    right: SessionRoles,
+): boolean {
+    return (
+        equalBytes(left.owner, right.owner) &&
+        sameIdentitySet(left.admins, right.admins) &&
+        left.adminsAssignAdmins === right.adminsAssignAdmins &&
+        left.anyoneCanAddMembers === right.anyoneCanAddMembers &&
+        left.sendPolicy === right.sendPolicy
+    );
+}
+
+function sessionChangesEqual(
+    left: readonly Extract<DeliverySessionControl, { type: "commit" }>["changes"][number][],
+    right: readonly Extract<DeliverySessionControl, { type: "commit" }>["changes"][number][],
+): boolean {
+    const encoded = (change: (typeof left)[number]): string =>
+        `${change.type}:${encodeBase64Url(change.accountKey)}:${encodeBase64Url(change.deviceKey)}`;
+    const values = new Set(left.map(encoded));
+    return values.size === right.length && right.every((change) => values.has(encoded(change)));
+}
+
 function keyPackageAccount(keyPackage: MlsKeyPackage): Uint8Array {
     const credential = keyPackage.leafNode.credential.identity;
     if (credential.length !== 32) throw new Error("Invalid session account credential");
@@ -447,14 +498,6 @@ function memberLeaf(epoch: MlsEpochState, identity: Uint8Array): number {
     );
     if (matches.length !== 1) throw new Error("Session member is absent or ambiguous");
     return matches[0]!;
-}
-
-function exactRecipients(
-    delivery: InboxDelivery["delivery"],
-    members: readonly Uint8Array[],
-): boolean {
-    const actual = new Set(delivery.recipients.map(encodeBase64Url));
-    return members.every((member) => actual.has(encodeBase64Url(member)));
 }
 
 async function setAndZero(
@@ -2101,7 +2144,8 @@ export class SessionEngine {
             if (record.stagedCommitId !== undefined) return false;
             if (
                 !equalBytes(job.account, this.#accountKey) &&
-                !isSessionAdmin(record.roles, this.#accountKey)
+                !isSessionAdmin(record.roles, this.#accountKey) &&
+                !adding
             ) {
                 return false;
             }
@@ -2289,14 +2333,31 @@ export class SessionEngine {
                     throw new Error("Session delivery exceeds the configured ciphertext limit");
                 }
                 const now = this.#now();
-                const delivery = createSignedDelivery(this.#identity, members, ciphertext, {
-                    createdAt: now,
-                    expiresAt: now + DELIVERY_TTL_MILLISECONDS,
-                    senderAccount: this.#accountKey,
-                    targetAccounts: await this.#targetAccounts(transaction, epoch),
-                    ownerAccount: roles.owner,
-                    sessionId: id,
-                });
+                const direct = frame.type === "delete";
+                const delivery = createSignedDelivery(
+                    this.#identity,
+                    direct ? members : [],
+                    ciphertext,
+                    {
+                        createdAt: now,
+                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        senderAccount: this.#accountKey,
+                        ownerAccount: roles.owner,
+                        sessionId: id,
+                        ...(direct
+                            ? { targetAccounts: await this.#targetAccounts(transaction, epoch) }
+                            : {
+                                  sessionControl: {
+                                      version: 1,
+                                      type: "message",
+                                      epoch: epoch.context.epoch,
+                                      content:
+                                          frame.type === "application" ? "application" : "protocol",
+                                      coveredDevices: members,
+                                  } as const,
+                              }),
+                    },
+                );
                 checkpoint = epoch.serialize();
                 if (parent === undefined) {
                     await setAndZero(
@@ -2429,7 +2490,6 @@ export class SessionEngine {
                         if (!senderAdmin && !currentRoles.anyoneCanAddMembers) return false;
                         counts.set(key, { account, devices: 1 });
                     } else {
-                        if (!senderAdmin && !equalBytes(senderAccount, account)) return false;
                         counts.set(key, { account: current.account, devices: current.devices + 1 });
                     }
                 } else {
@@ -2595,29 +2655,59 @@ export class SessionEngine {
                 if (commitCiphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
                     throw new Error("Session Commit exceeds the configured ciphertext limit");
                 }
-                const delivery = createSignedDelivery(
-                    this.#identity,
-                    [
-                        ...new Map(
-                            [...members, ...additions.map((addition) => addition.identity)].map(
-                                (recipient) => [encodeBase64Url(recipient), recipient],
-                            ),
-                        ).values(),
-                    ],
-                    commitCiphertext,
-                    {
-                        createdAt: now,
-                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
-                        senderAccount: this.#accountKey,
-                        targetAccounts: await this.#targetAccounts(
-                            transaction,
-                            epoch,
-                            additions.map((addition) => keyPackageAccount(addition.keyPackage)),
-                        ),
-                        ownerAccount: nextRoles.owner,
-                        sessionId: id,
-                    },
-                );
+                stagedCheckpoint = transition.transition.serialize();
+                const preview = MlsEpochState.deserialize(stagedCheckpoint, {
+                    localSigningSecretKey: this.#identity.secretKey,
+                    authenticateCredential: authenticateMurmurMlsCredential,
+                    minimumPersistenceGeneration: 0n,
+                });
+                let nextMembers: readonly Uint8Array[];
+                let nextAccounts: readonly Uint8Array[];
+                try {
+                    nextMembers = activeMembers(preview).map((member) => member.slice());
+                    nextAccounts = activeAccounts(preview).map((account) => account.slice());
+                } finally {
+                    preview.destroy();
+                }
+                const changes = [
+                    ...additions.map((addition) => ({
+                        type: "add" as const,
+                        accountKey: keyPackageAccount(addition.keyPackage),
+                        deviceKey: addition.identity,
+                    })),
+                    ...removals.map((device) => ({
+                        type: "remove" as const,
+                        accountKey: memberAccount(epoch, memberLeaf(epoch, device)),
+                        deviceKey: device,
+                    })),
+                ];
+                const sessionControl: DeliverySessionControl =
+                    record.status === "creating"
+                        ? {
+                              version: 1,
+                              type: "create",
+                              epoch: epoch.context.epoch,
+                              members: nextAccounts,
+                              roles: deliverySessionRoles(nextRoles),
+                              coveredDevices: nextMembers,
+                          }
+                        : {
+                              version: 1,
+                              type: "commit",
+                              epoch: epoch.context.epoch,
+                              members: nextAccounts,
+                              roles: deliverySessionRoles(nextRoles),
+                              changes,
+                              coveredDevices: nextMembers,
+                          };
+                const delivery = createSignedDelivery(this.#identity, [], commitCiphertext, {
+                    createdAt: now,
+                    expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                    senderAccount: this.#accountKey,
+                    ownerAccount: nextRoles.owner,
+                    sessionId: id,
+                    sessionControl,
+                });
                 const commitOrder = await this.#nextOutboxOrder(transaction);
                 await setAndZero(
                     transaction,
@@ -2700,7 +2790,6 @@ export class SessionEngine {
                         zeroBytes(bootstrap);
                     }
                 }
-                stagedCheckpoint = transition.transition.serialize();
                 await setAndZero(
                     transaction,
                     outboxKey(delivery.id),
@@ -2719,6 +2808,7 @@ export class SessionEngine {
                     }),
                 );
                 await transaction.set(outboxOrderKey(commitOrder, delivery.id), new Uint8Array());
+                await this.#attachCoverageBlockedOutboxes(transaction, id, delivery.id);
                 if (additions.length > 0) {
                     await this.#queuePrivate(
                         id,
@@ -2813,7 +2903,57 @@ export class SessionEngine {
         }
         if (ownOutboxBytes !== undefined) zeroBytes(ownOutboxBytes);
         const stateBytes = await transaction.get(stateKey(id));
-        if (stateBytes === undefined) throw new TerminalInboxDeliveryError("unknown_session");
+        if (stateBytes === undefined) {
+            const visible = queued.delivery.sessionControl;
+            if (
+                wire.kind !== "commit" ||
+                visible === null ||
+                (visible.type !== "create" && visible.type !== "commit") ||
+                visible.epoch !== wire.epoch ||
+                queued.delivery.sessionId === null ||
+                !equalBytes(queued.delivery.sessionId, wire.groupId) ||
+                queued.delivery.ownerAccount === null ||
+                !equalBytes(queued.delivery.ownerAccount, visible.roles.owner)
+            ) {
+                await this.#quarantine(
+                    transaction,
+                    queued.eventId,
+                    "visible_session_metadata_mismatch",
+                    id,
+                    "commit",
+                );
+                return;
+            }
+            const controlKey = pendingMembershipControlKey(id);
+            const existing = await transaction.get(controlKey);
+            if (existing === undefined) {
+                const controls = await transaction.scan(PENDING_MEMBERSHIP_CONTROL_PREFIX, {
+                    limit: this.#limits.maximumPendingSessions,
+                });
+                try {
+                    if (controls.size >= this.#limits.maximumPendingSessions) {
+                        await this.#quarantine(
+                            transaction,
+                            queued.eventId,
+                            "pending_session_capacity",
+                            id,
+                            "session",
+                        );
+                        return;
+                    }
+                } finally {
+                    for (const value of controls.values()) zeroBytes(value);
+                }
+            } else {
+                zeroBytes(existing);
+            }
+            await setAndZero(
+                transaction,
+                controlKey,
+                canonicalJsonBytes(signedDeliveryToJson(queued.delivery) as never),
+            );
+            return;
+        }
         const record = decodeSessionRecord(stateBytes);
         try {
             if (wire.kind === "commit") {
@@ -2833,6 +2973,7 @@ export class SessionEngine {
         box: Parameters<typeof openBox>[1],
     ): Promise<void> {
         if (
+            queued.delivery.sessionControl !== null ||
             queued.delivery.recipients.length !== 1 ||
             !equalBytes(queued.delivery.recipients[0]!, this.#identity.publicKey)
         ) {
@@ -2952,12 +3093,75 @@ export class SessionEngine {
                     throw new Error("Bootstrap roles name absent accounts");
                 }
                 const senderAccount = memberAccount(epoch, commit.sender);
+                const addedAccounts = new Map<string, number>();
+                for (const proposal of commit.proposals) {
+                    if (proposal.type !== "add") continue;
+                    const account = encodeBase64Url(keyPackageAccount(proposal.keyPackage));
+                    addedAccounts.set(account, (addedAccounts.get(account) ?? 0) + 1);
+                }
+                const postCommitAccounts = new Map<string, number>();
+                for (let leaf = 0; leaf < epoch.memberSignatureKeys.length; leaf += 1) {
+                    if (epoch.memberSignatureKeys[leaf] === undefined) continue;
+                    const account = encodeBase64Url(memberAccount(epoch, leaf));
+                    postCommitAccounts.set(account, (postCommitAccounts.get(account) ?? 0) + 1);
+                }
+                const introducesAccount = [...addedAccounts].some(
+                    ([account, additions]) => (postCommitAccounts.get(account) ?? 0) <= additions,
+                );
                 if (
                     !isSessionAdmin(frame.roles, senderAccount) &&
-                    !frame.roles.anyoneCanAddMembers
+                    !frame.roles.anyoneCanAddMembers &&
+                    introducesAccount
                 ) {
                     throw new Error("Bootstrap sender may not add a member");
                 }
+                const visibleBytes = await transaction.get(
+                    pendingMembershipControlKey(frame.groupId),
+                );
+                let visibleMatches = false;
+                if (visibleBytes !== undefined) {
+                    try {
+                        const membershipDelivery = parseSignedDelivery(
+                            JSON.parse(utf8Decode(visibleBytes)) as unknown,
+                        );
+                        const visible = membershipDelivery.sessionControl;
+                        visibleMatches =
+                            verifySignedDelivery(membershipDelivery) &&
+                            visible !== null &&
+                            (visible.type === "create" || visible.type === "commit") &&
+                            visible.epoch + 1n === epoch.context.epoch &&
+                            membershipDelivery.sessionId !== null &&
+                            equalBytes(membershipDelivery.sessionId, frame.groupId) &&
+                            membershipDelivery.ownerAccount !== null &&
+                            equalBytes(membershipDelivery.ownerAccount, frame.roles.owner) &&
+                            equalBytes(membershipDelivery.sender, frame.inviter) &&
+                            equalBytes(membershipDelivery.senderAccount, senderAccount) &&
+                            queued.delivery.sessionId !== null &&
+                            equalBytes(queued.delivery.sessionId, frame.groupId) &&
+                            queued.delivery.ownerAccount !== null &&
+                            equalBytes(queued.delivery.ownerAccount, frame.roles.owner) &&
+                            equalBytes(queued.delivery.senderAccount, senderAccount) &&
+                            deliverySessionRolesEqual(visible.roles, frame.roles) &&
+                            sameIdentitySet(visible.members, accounts) &&
+                            sameIdentitySet(visible.coveredDevices, activeMembers(epoch));
+                    } catch {
+                        visibleMatches = false;
+                    } finally {
+                        zeroBytes(visibleBytes);
+                    }
+                }
+                if (!visibleMatches) {
+                    await transaction.delete(pendingMembershipControlKey(frame.groupId));
+                    await this.#quarantine(
+                        transaction,
+                        queued.eventId,
+                        "visible_session_metadata_mismatch",
+                        frame.groupId,
+                        "bootstrap",
+                    );
+                    return;
+                }
+                await transaction.delete(pendingMembershipControlKey(frame.groupId));
                 protocolComplete = true;
                 checkpoint = epoch.serialize();
                 const reAdmissionKey = `${RESET_READMISSION_PREFIX}${sessionId(frame.groupId)}`;
@@ -3188,9 +3392,6 @@ export class SessionEngine {
             throw new TerminalInboxDeliveryError("previous_epoch_grace_expired");
         }
         try {
-            if (!exactRecipients(queued.delivery, activeMembers(epoch))) {
-                throw new TerminalInboxDeliveryError("member_recipient_set");
-            }
             let opened: ReturnType<MlsEpochState["openWithCheckpoint"]>;
             try {
                 opened = epoch.openWithCheckpoint(message);
@@ -3236,6 +3437,7 @@ export class SessionEngine {
                     await this.#quarantine(transaction, queued.eventId, "sender_binding");
                     return;
                 }
+                const senderAccount = memberAccount(epoch, opened.message.sender);
                 let frame: ReturnType<typeof decodePrivateFrame>;
                 try {
                     frame = decodePrivateFrame(opened.message.applicationData);
@@ -3247,8 +3449,35 @@ export class SessionEngine {
                     );
                     return;
                 }
+                const visible = queued.delivery.sessionControl;
+                const expectedContent = frame.type === "application" ? "application" : "protocol";
+                if (
+                    frame.type !== "delete" &&
+                    (visible === null ||
+                        visible.type !== "message" ||
+                        visible.epoch !== epoch.context.epoch ||
+                        visible.content !== expectedContent ||
+                        queued.delivery.sessionId === null ||
+                        !equalBytes(queued.delivery.sessionId, epoch.groupId) ||
+                        queued.delivery.ownerAccount === null ||
+                        !equalBytes(
+                            queued.delivery.ownerAccount,
+                            epoch === current ? record.roles.owner : record.previousRoles!.owner,
+                        ) ||
+                        !equalBytes(queued.delivery.senderAccount, senderAccount) ||
+                        !sameIdentitySet(visible.coveredDevices, activeMembers(epoch)))
+                ) {
+                    await this.#quarantine(
+                        transaction,
+                        queued.eventId,
+                        "visible_session_metadata_mismatch",
+                        epoch.groupId,
+                        frame.type === "application" ? "application" : "session",
+                    );
+                    if (frame.type === "application") zeroBytes(frame.bytes);
+                    return;
+                }
                 if (frame.type === "application") {
-                    const senderAccount = memberAccount(epoch, opened.message.sender);
                     const epochRoles = epoch === current ? record.roles : record.previousRoles!;
                     if (
                         (epoch !== current &&
@@ -3280,7 +3509,16 @@ export class SessionEngine {
                         zeroBytes(frame.bytes);
                     }
                 } else if (frame.type === "delete") {
-                    const senderAccount = memberAccount(epoch, opened.message.sender);
+                    if (visible !== null) {
+                        await this.#quarantine(
+                            transaction,
+                            queued.eventId,
+                            "visible_session_metadata_mismatch",
+                            epoch.groupId,
+                            "session",
+                        );
+                        return;
+                    }
                     const epochRoles = epoch === current ? record.roles : record.previousRoles!;
                     if (!equalBytes(senderAccount, epochRoles.owner)) {
                         await this.#quarantine(
@@ -3346,9 +3584,6 @@ export class SessionEngine {
         let key: Uint8Array | undefined;
         let frame: ReturnType<typeof openCommitCiphertext> | undefined;
         try {
-            if (!exactRecipients(queued.delivery, activeMembers(epoch))) {
-                throw new TerminalInboxDeliveryError("commit_recipient_set");
-            }
             if (wire.epoch !== epoch.context.epoch) {
                 await this.#quarantine(
                     transaction,
@@ -3375,6 +3610,9 @@ export class SessionEngine {
                 return;
             }
             const expectedSender = epoch.memberSignatureKeys[commit.sender];
+            const expectedSenderAccount =
+                expectedSender === undefined ? undefined : memberAccount(epoch, commit.sender);
+            const visible = queued.delivery.sessionControl;
             let controlMatches = false;
             try {
                 const control = decodeSessionControl(commit.authenticatedData);
@@ -3384,7 +3622,16 @@ export class SessionEngine {
             }
             if (
                 expectedSender === undefined ||
+                expectedSenderAccount === undefined ||
                 !equalBytes(expectedSender, queued.delivery.sender) ||
+                !equalBytes(expectedSenderAccount, queued.delivery.senderAccount) ||
+                visible === null ||
+                visible.type !== "commit" ||
+                visible.epoch !== wire.epoch ||
+                queued.delivery.sessionId === null ||
+                !equalBytes(queued.delivery.sessionId, wire.groupId) ||
+                queued.delivery.ownerAccount === null ||
+                !equalBytes(queued.delivery.ownerAccount, record.roles.owner) ||
                 !controlMatches ||
                 !(await this.#validRoleCommit(
                     transaction,
@@ -3405,6 +3652,19 @@ export class SessionEngine {
                 return;
             }
             const currentAccounts = activeAccounts(epoch).map((account) => account.slice());
+            const changes = commit.proposals.map((proposal) =>
+                proposal.type === "add"
+                    ? {
+                          type: "add" as const,
+                          accountKey: keyPackageAccount(proposal.keyPackage),
+                          deviceKey: proposal.keyPackage.leafNode.signatureKey,
+                      }
+                    : {
+                          type: "remove" as const,
+                          accountKey: memberAccount(epoch, proposal.removed),
+                          deviceKey: epoch.memberSignatureKeys[proposal.removed]!,
+                      },
+            );
             let transition: ReturnType<MlsEpochState["applyCommit"]>;
             try {
                 try {
@@ -3444,6 +3704,23 @@ export class SessionEngine {
                 const next = transition.commit();
                 committed = true;
                 try {
+                    if (
+                        visible === null ||
+                        visible.type !== "commit" ||
+                        !deliverySessionRolesEqual(visible.roles, frame.roles) ||
+                        !sameIdentitySet(visible.members, activeAccounts(next)) ||
+                        !sameIdentitySet(visible.coveredDevices, activeMembers(next)) ||
+                        !sessionChangesEqual(visible.changes, changes)
+                    ) {
+                        await this.#quarantine(
+                            transaction,
+                            queued.eventId,
+                            "visible_session_metadata_mismatch",
+                            wire.groupId,
+                            "commit",
+                        );
+                        return;
+                    }
                     const nextAccounts = new Set(activeAccounts(next).map(encodeBase64Url));
                     const removedAccounts = currentAccounts.filter(
                         (account) => !nextAccounts.has(encodeBase64Url(account)),
@@ -3561,23 +3838,24 @@ export class SessionEngine {
                     const message = next.seal(dependent.applicationData);
                     const ciphertext = encodePrivateCiphertext(message);
                     const now = this.#now();
-                    const delivery = createSignedDelivery(
-                        this.#identity,
-                        activeMembers(next),
-                        ciphertext,
-                        {
-                            createdAt: now,
-                            expiresAt: now + DELIVERY_TTL_MILLISECONDS,
-                            senderAccount: this.#accountKey,
-                            targetAccounts: await this.#targetAccounts(transaction, next),
-                            ...(dependent.delivery.ownerAccount === null
-                                ? {}
-                                : {
-                                      ownerAccount: dependent.delivery.ownerAccount,
-                                      sessionId: dependent.delivery.sessionId!,
-                                  }),
-                        },
-                    );
+                    const delivery = createSignedDelivery(this.#identity, [], ciphertext, {
+                        createdAt: now,
+                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        senderAccount: this.#accountKey,
+                        ...(dependent.delivery.ownerAccount === null
+                            ? {}
+                            : {
+                                  ownerAccount: dependent.delivery.ownerAccount,
+                                  sessionId: dependent.delivery.sessionId!,
+                                  sessionControl: {
+                                      version: 1,
+                                      type: "message",
+                                      epoch: next.context.epoch,
+                                      content: "application",
+                                      coveredDevices: activeMembers(next),
+                                  } as const,
+                              }),
+                    });
                     await transaction.delete(outboxKey(previousId));
                     await transaction.delete(
                         outboxOrderKey(dependent.order, dependent.delivery.id),
@@ -3635,6 +3913,116 @@ export class SessionEngine {
             await transaction.delete(outboxKey(bootstrapId));
             await transaction.delete(indexKey);
             zeroBytes(indexValue);
+        }
+    }
+
+    async #attachCoverageBlockedOutboxes(
+        transaction: StoreTransaction,
+        id: Uint8Array,
+        commitId: string,
+    ): Promise<void> {
+        const commitBytes = await transaction.get(outboxKey(commitId));
+        if (commitBytes === undefined) throw new Error("Missing staged coverage Commit");
+        const commit = decodeOutboxRecord(commitBytes);
+        if (commit.kind !== "commit" || commit.stagedEpoch === undefined) {
+            zeroBytes(commitBytes);
+            throw new Error("Invalid staged coverage Commit");
+        }
+        const epoch = MlsEpochState.deserialize(commit.stagedEpoch, {
+            localSigningSecretKey: this.#identity.secretKey,
+            authenticateCredential: authenticateMurmurMlsCredential,
+            minimumPersistenceGeneration: 0n,
+        });
+        let changed = false;
+        let checkpoint: Uint8Array | undefined;
+        try {
+            const prefix = `${EPOCH_OUTBOX_INDEX_PREFIX}${sessionId(id)}/`;
+            const entries = await transaction.scan(prefix, {
+                limit: this.#limits.maximumOutboxes,
+            });
+            for (const [indexKey, indexValue] of entries) {
+                const previousId = indexKey.slice(prefix.length);
+                const bytes = await transaction.get(outboxKey(previousId));
+                if (bytes === undefined) {
+                    await transaction.delete(indexKey);
+                    zeroBytes(indexValue);
+                    continue;
+                }
+                const record = decodeOutboxRecord(bytes);
+                try {
+                    if (
+                        record.kind !== "application" ||
+                        record.coverageBlocked !== true ||
+                        record.applicationData === undefined ||
+                        !equalBytes(record.sessionId, id)
+                    ) {
+                        continue;
+                    }
+                    const frame = decodePrivateFrame(record.applicationData);
+                    try {
+                        if (frame.type !== "application") {
+                            throw new Error("Only application outboxes may await epoch coverage");
+                        }
+                    } finally {
+                        if (frame.type === "application") zeroBytes(frame.bytes);
+                    }
+                    const ciphertext = encodePrivateCiphertext(epoch.seal(record.applicationData));
+                    const now = this.#now();
+                    const delivery = createSignedDelivery(this.#identity, [], ciphertext, {
+                        createdAt: now,
+                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        senderAccount: this.#accountKey,
+                        ownerAccount: record.delivery.ownerAccount!,
+                        sessionId: id,
+                        sessionControl: {
+                            version: 1,
+                            type: "message",
+                            epoch: epoch.context.epoch,
+                            content: "application",
+                            coveredDevices: activeMembers(epoch),
+                        },
+                    });
+                    const {
+                        coverageBlocked: _coverageBlocked,
+                        parentCommitId: _parentCommitId,
+                        ...rest
+                    } = record;
+                    await transaction.delete(outboxKey(previousId));
+                    await transaction.delete(outboxOrderKey(record.order, previousId));
+                    await transaction.delete(indexKey);
+                    await setAndZero(
+                        transaction,
+                        outboxKey(delivery.id),
+                        encodeOutboxRecord({ ...rest, delivery, parentCommitId: commitId }),
+                    );
+                    await transaction.set(
+                        outboxOrderKey(record.order, delivery.id),
+                        new Uint8Array(),
+                    );
+                    await transaction.set(
+                        postCommitOutboxIndexKey(commitId, delivery.id),
+                        new Uint8Array(),
+                    );
+                    changed = true;
+                } finally {
+                    if (record.applicationData !== undefined) zeroBytes(record.applicationData);
+                    zeroBytes(bytes);
+                    zeroBytes(indexValue);
+                }
+            }
+            if (changed) {
+                checkpoint = epoch.serialize();
+                await setAndZero(
+                    transaction,
+                    outboxKey(commitId),
+                    encodeOutboxRecord({ ...commit, stagedEpoch: checkpoint }),
+                );
+            }
+        } finally {
+            epoch.destroy();
+            zeroBytes(commit.stagedEpoch);
+            zeroBytes(commitBytes);
+            if (checkpoint !== undefined) zeroBytes(checkpoint);
         }
     }
 
@@ -3843,6 +4231,7 @@ export class SessionEngine {
                             (phase === "current" &&
                                 decodedRecord.kind === "application" &&
                                 decodedRecord.parentCommitId === undefined &&
+                                decodedRecord.coverageBlocked !== true &&
                                 !welcomeComplete) ||
                             (phase === "commit" && decodedRecord.kind === "commit") ||
                             (phase === "completion" &&
@@ -3937,11 +4326,27 @@ export class SessionEngine {
                                         }
                                     }
                                 });
-                                await this.#refreshStaleRosterOutbox(
-                                    key,
-                                    decodedRecord,
-                                    error.rosters,
-                                );
+                                if (
+                                    error.code === "stale_epoch_coverage" &&
+                                    decodedRecord.kind === "application"
+                                ) {
+                                    await this.#store.transaction((transaction) =>
+                                        setAndZero(
+                                            transaction,
+                                            key,
+                                            encodeOutboxRecord({
+                                                ...decodedRecord,
+                                                coverageBlocked: true,
+                                            }),
+                                        ),
+                                    );
+                                } else if (error.code === "stale_roster") {
+                                    await this.#refreshStaleRosterOutbox(
+                                        key,
+                                        decodedRecord,
+                                        error.rosters,
+                                    );
+                                }
                                 transientFailureIds.add(decodedRecord.delivery.id);
                                 blockedSessions.add(encodedSessionId);
                                 continue;
@@ -4547,6 +4952,9 @@ export class SessionEngine {
                     : {
                           ownerAccount: record.delivery.ownerAccount,
                           sessionId: record.delivery.sessionId!,
+                          ...(record.delivery.sessionControl === null
+                              ? {}
+                              : { sessionControl: record.delivery.sessionControl }),
                       }),
             },
         );
@@ -4638,6 +5046,9 @@ export class SessionEngine {
                     : {
                           ownerAccount: record.delivery.ownerAccount,
                           sessionId: record.delivery.sessionId!,
+                          ...(record.delivery.sessionControl === null
+                              ? {}
+                              : { sessionControl: record.delivery.sessionControl }),
                       }),
             },
         );
@@ -4879,6 +5290,7 @@ export class SessionEngine {
         await this.#deletePrefix(transaction, `${SESSION_DATA_PREFIX}${sessionId(id)}/`);
         await transaction.delete(stateKey(id));
         await transaction.delete(pendingKey(id));
+        await transaction.delete(pendingMembershipControlKey(id));
         await transaction.delete(admissionBarrierKey(id));
         await transaction.delete(sessionOwnerKey(id));
         await this.#deleteRoutingMarkers(transaction, id);
@@ -5381,6 +5793,7 @@ export class SessionEngine {
     }
 
     async #rejectSession(transaction: StoreTransaction, id: Uint8Array): Promise<void> {
+        await transaction.delete(pendingMembershipControlKey(id));
         const key = rejectedKey(id);
         await setAndZero(transaction, key, utf8Encode(String(this.#now()).padStart(16, "0")));
         const entries = await transaction.scan(REJECTED_PREFIX, {

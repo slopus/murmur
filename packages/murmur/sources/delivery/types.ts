@@ -7,6 +7,52 @@ export interface DeliveryAccountTarget {
     readonly rosterRevision: number;
 }
 
+/** Relay-visible role state authenticated beside an encrypted MLS delivery. */
+export interface DeliverySessionRoles {
+    readonly owner: Uint8Array;
+    /** Canonically sorted admin accounts, excluding the owner. */
+    readonly admins: readonly Uint8Array[];
+    readonly adminsAssignAdmins: boolean;
+    readonly anyoneCanAddMembers: boolean;
+    readonly sendPolicy: "everyone" | "admins";
+}
+
+/** One MLS leaf change summarized for relay-side role enforcement. */
+export interface DeliverySessionMemberChange {
+    readonly type: "add" | "remove";
+    readonly accountKey: Uint8Array;
+    readonly deviceKey: Uint8Array;
+}
+
+/** Signed MLS-adjacent metadata used for relay routing and additive checks. */
+export type DeliverySessionControl =
+    | {
+          readonly version: 1;
+          readonly type: "create";
+          /** MLS epoch extended by the creation Commit. */
+          readonly epoch: bigint;
+          readonly members: readonly Uint8Array[];
+          readonly roles: DeliverySessionRoles;
+          readonly coveredDevices: readonly Uint8Array[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "commit";
+          /** Current MLS epoch extended by this Commit. */
+          readonly epoch: bigint;
+          readonly members: readonly Uint8Array[];
+          readonly roles: DeliverySessionRoles;
+          readonly changes: readonly DeliverySessionMemberChange[];
+          readonly coveredDevices: readonly Uint8Array[];
+      }
+    | {
+          readonly version: 1;
+          readonly type: "message";
+          readonly epoch: bigint;
+          readonly content: "application" | "protocol";
+          readonly coveredDevices: readonly Uint8Array[];
+      };
+
 /** One sender-signed encrypted multicast accepted by the relay. */
 export interface SignedDelivery {
     readonly version: 1;
@@ -21,6 +67,8 @@ export interface SignedDelivery {
     readonly ownerAccount: Uint8Array | null;
     /** Owning MLS session identifier, or null for account traffic. */
     readonly sessionId: Uint8Array | null;
+    /** Relay-visible signed control for session-addressed publication, otherwise null. */
+    readonly sessionControl: DeliverySessionControl | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: Uint8Array;
@@ -247,6 +295,8 @@ export interface CreateDeliveryOptions {
     /** Session owner and identifier must be supplied together for session traffic. */
     readonly ownerAccount?: Uint8Array;
     readonly sessionId?: Uint8Array;
+    /** Relay-visible control metadata; requires session ownership and no explicit recipients. */
+    readonly sessionControl?: DeliverySessionControl;
 }
 
 /** Inputs for one signed inbox read. */

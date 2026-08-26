@@ -35,12 +35,13 @@ import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
     AcknowledgeOutcome,
     PageReadConstraints,
-    PublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,
     RelayStore,
+    RelayStorePublishOutcome,
 } from "../types.js";
+import { resolveSessionPublication, type RelaySessionState } from "../sessionState.js";
 
 const SQL_VALUE_CHUNK = 5_000;
 const MAXIMUM_DIRECTORY_PREKEYS_PER_DEVICE = 256;
@@ -97,7 +98,7 @@ export class SqliteRelayStore implements RelayStore {
         limits: QueueLimits,
         admissionPrincipal: Uint8Array,
         transactionOpen: boolean = false,
-    ): Promise<PublishOutcome> {
+    ): Promise<RelayStorePublishOutcome> {
         this.#assertOpen();
         if (!(admissionPrincipal instanceof Uint8Array) || admissionPrincipal.length !== 32) {
             throw new Error("Invalid admission principal");
@@ -107,50 +108,6 @@ export class SqliteRelayStore implements RelayStore {
             this.#database.exec("BEGIN IMMEDIATE");
         }
         try {
-            const staleRosters: DeviceRoster[] = [];
-            const currentRosters: DeviceRoster[] = [];
-            for (const target of delivery.targetAccounts) {
-                const roster = this.#readDeviceRoster(target.accountKey);
-                if (roster === undefined) {
-                    throw new RelayError(409, "Target account has no registered devices", {
-                        error: "roster_missing",
-                        accountKey: encodeBase64Url(target.accountKey),
-                    });
-                }
-                currentRosters.push(roster);
-                if (
-                    roster.revision !== target.rosterRevision ||
-                    roster.devices.some(
-                        (entry) =>
-                            !delivery.recipients.some((recipient) =>
-                                equalBytes(recipient, entry.deviceKey),
-                            ),
-                    )
-                ) {
-                    staleRosters.push(roster);
-                }
-            }
-            if (staleRosters.length === 0 && currentRosters.length > 0) {
-                const currentDevices = new Set(
-                    currentRosters.flatMap((roster) =>
-                        roster.devices.map((entry) => encodeBase64Url(entry.deviceKey)),
-                    ),
-                );
-                if (
-                    currentDevices.size !== delivery.recipients.length ||
-                    delivery.recipients.some(
-                        (recipient) => !currentDevices.has(encodeBase64Url(recipient)),
-                    )
-                ) {
-                    staleRosters.push(...currentRosters);
-                }
-            }
-            if (staleRosters.length > 0) {
-                throw new RelayError(409, "Delivery does not match current account devices", {
-                    error: "stale_roster",
-                    rosters: staleRosters.map(deviceRosterToJson),
-                });
-            }
             const fingerprint = deliveryFingerprint(delivery);
             const existing = this.#get(
                 `SELECT event_id, fingerprint
@@ -166,11 +123,69 @@ export class SqliteRelayStore implements RelayStore {
                         error: "id_collision",
                     });
                 }
+                const recipients = this.#all(
+                    `SELECT recipient FROM murmur_queue_references
+                     WHERE sender = ? AND delivery_id = ? ORDER BY recipient`,
+                    delivery.sender,
+                    delivery.id,
+                ).map((row) => copyBytes(row.recipient, "duplicate delivery recipient"));
                 if (!transactionOpen) this.#database.exec("COMMIT");
                 return {
                     eventId: textColumn(existing.event_id, "event ID"),
                     duplicate: true,
+                    recipients,
                 };
+            }
+
+            let recipients: readonly Uint8Array[];
+            if (delivery.sessionControl !== null) {
+                recipients = this.#resolveSessionRecipients(delivery, limits);
+            } else {
+                const staleRosters: DeviceRoster[] = [];
+                const currentRosters: DeviceRoster[] = [];
+                for (const target of delivery.targetAccounts) {
+                    const roster = this.#readDeviceRoster(target.accountKey);
+                    if (roster === undefined) {
+                        throw new RelayError(409, "Target account has no registered devices", {
+                            error: "roster_missing",
+                            accountKey: encodeBase64Url(target.accountKey),
+                        });
+                    }
+                    currentRosters.push(roster);
+                    if (
+                        roster.revision !== target.rosterRevision ||
+                        roster.devices.some(
+                            (entry) =>
+                                !delivery.recipients.some((recipient) =>
+                                    equalBytes(recipient, entry.deviceKey),
+                                ),
+                        )
+                    ) {
+                        staleRosters.push(roster);
+                    }
+                }
+                if (staleRosters.length === 0 && currentRosters.length > 0) {
+                    const currentDevices = new Set(
+                        currentRosters.flatMap((roster) =>
+                            roster.devices.map((entry) => encodeBase64Url(entry.deviceKey)),
+                        ),
+                    );
+                    if (
+                        currentDevices.size !== delivery.recipients.length ||
+                        delivery.recipients.some(
+                            (recipient) => !currentDevices.has(encodeBase64Url(recipient)),
+                        )
+                    ) {
+                        staleRosters.push(...currentRosters);
+                    }
+                }
+                if (staleRosters.length > 0) {
+                    throw new RelayError(409, "Delivery does not match current account devices", {
+                        error: "stale_roster",
+                        rosters: staleRosters.map(deviceRosterToJson),
+                    });
+                }
+                recipients = delivery.recipients;
             }
 
             const encoded = encodeStoredDelivery(delivery);
@@ -183,7 +198,7 @@ export class SqliteRelayStore implements RelayStore {
                 bigintColumn(global.pending_items) + 1n > BigInt(limits.maximumGlobalItems) ||
                 bigintColumn(global.pending_bytes) + BigInt(encoded.encodedBytes) >
                     BigInt(limits.maximumGlobalBytes) ||
-                bigintColumn(global.pending_references) + BigInt(delivery.recipients.length) >
+                bigintColumn(global.pending_references) + BigInt(recipients.length) >
                     BigInt(limits.maximumGlobalReferences)
             ) {
                 throw new RelayError(503, "Relay pending-storage quota exceeded", {
@@ -197,7 +212,7 @@ export class SqliteRelayStore implements RelayStore {
                 admissionPrincipal,
             );
             if (
-                bigintColumn(admissionUsage.reference_count) + BigInt(delivery.recipients.length) >
+                bigintColumn(admissionUsage.reference_count) + BigInt(recipients.length) >
                 BigInt(limits.maximumAdmissionReferences)
             ) {
                 throw new RelayError(429, "Admission-principal fanout quota exceeded", {
@@ -219,14 +234,14 @@ export class SqliteRelayStore implements RelayStore {
                 bigintColumn(senderUsage.item_count) + 1n > BigInt(limits.maximumSenderItems) ||
                 bigintColumn(senderUsage.byte_count) + BigInt(encoded.encodedBytes) >
                     BigInt(limits.maximumSenderBytes) ||
-                bigintColumn(senderUsage.reference_count) + BigInt(delivery.recipients.length) >
+                bigintColumn(senderUsage.reference_count) + BigInt(recipients.length) >
                     BigInt(limits.maximumSenderReferences)
             ) {
                 throw new RelayError(429, "Sender pending-storage quota exceeded", {
                     error: "sender_full",
                 });
             }
-            const targetValues = delivery.recipients.map(() => "(?)").join(", ");
+            const targetValues = recipients.map(() => "(?)").join(", ");
             const recipientUsage = this.#all(
                 `WITH targets(recipient) AS (VALUES ${targetValues})
                  SELECT targets.recipient,
@@ -235,9 +250,9 @@ export class SqliteRelayStore implements RelayStore {
                  FROM targets
                  LEFT JOIN murmur_queues AS queue
                    ON queue.recipient = targets.recipient`,
-                ...delivery.recipients,
+                ...recipients,
             );
-            if (recipientUsage.length !== delivery.recipients.length) {
+            if (recipientUsage.length !== recipients.length) {
                 throw new Error("SQLite recipient usage did not cover every target");
             }
             for (const usage of recipientUsage) {
@@ -266,7 +281,7 @@ export class SqliteRelayStore implements RelayStore {
                  WHERE singleton = 1`,
                 eventId,
                 BigInt(encoded.encodedBytes),
-                BigInt(delivery.recipients.length),
+                BigInt(recipients.length),
             );
             this.#run(
                 `INSERT INTO murmur_queue_deliveries
@@ -285,10 +300,8 @@ export class SqliteRelayStore implements RelayStore {
                 delivery.sessionId,
             );
             const generationSeed = copyBytes(global.generation_seed, "generation seed");
-            const queueValues = delivery.recipients
-                .map(() => "(?, ?, 1, 2, NULL, 0, ?, 1, ?)")
-                .join(", ");
-            const queueParameters = delivery.recipients.flatMap((recipient) => [
+            const queueValues = recipients.map(() => "(?, ?, 1, 2, NULL, 0, ?, 1, ?)").join(", ");
+            const queueParameters = recipients.flatMap((recipient) => [
                 recipient,
                 eventId,
                 initialLossGeneration(generationSeed, recipient),
@@ -310,8 +323,8 @@ export class SqliteRelayStore implements RelayStore {
             );
             const assigned = this.#all(
                 `SELECT recipient, head_sequence FROM murmur_queues
-                 WHERE recipient IN (${delivery.recipients.map(() => "?").join(", ")})`,
-                ...delivery.recipients,
+                 WHERE recipient IN (${recipients.map(() => "?").join(", ")})`,
+                ...recipients,
             );
             const sequenceByRecipient = new Map(
                 assigned.map((row) => [
@@ -319,10 +332,8 @@ export class SqliteRelayStore implements RelayStore {
                     safeNumberColumn(row.head_sequence),
                 ]),
             );
-            const referenceValues = delivery.recipients
-                .map(() => "(?, ?, ?, ?, ?, ?, ?)")
-                .join(", ");
-            const referenceParameters = delivery.recipients.flatMap((recipient) => {
+            const referenceValues = recipients.map(() => "(?, ?, ?, ?, ?, ?, ?)").join(", ");
+            const referenceParameters = recipients.flatMap((recipient) => {
                 const sequence = sequenceByRecipient.get(encodeBase64Url(recipient));
                 if (sequence === undefined) throw new Error("Missing assigned inbox sequence");
                 return [
@@ -343,7 +354,7 @@ export class SqliteRelayStore implements RelayStore {
                 ...referenceParameters,
             );
             if (!transactionOpen) this.#database.exec("COMMIT");
-            return { eventId, duplicate: false };
+            return { eventId, duplicate: false, recipients };
         } catch (error: unknown) {
             if (!transactionOpen) this.#rollback();
             throw error;
@@ -502,6 +513,214 @@ export class SqliteRelayStore implements RelayStore {
             deviceKey,
         );
         return row === undefined ? undefined : copyBytes(row.account_key, "device account key");
+    }
+
+    async readSessionState(sessionId: Uint8Array): Promise<RelaySessionState | undefined> {
+        this.#assertOpen();
+        if (sessionId.length !== 32) throw new Error("Invalid relay session ID");
+        return this.#readSessionState(sessionId);
+    }
+
+    #readSessionState(sessionId: Uint8Array): RelaySessionState | undefined {
+        const row = this.#get(
+            `SELECT owner_account, epoch, admins_assign_admins, anyone_can_add_members, send_policy
+             FROM murmur_sessions WHERE session_id = ?`,
+            sessionId,
+        );
+        if (row === undefined) return undefined;
+        const members = this.#all(
+            `SELECT account_key, roster_revision FROM murmur_session_members
+             WHERE session_id = ? ORDER BY account_key`,
+            sessionId,
+        );
+        const admins = this.#all(
+            `SELECT account_key FROM murmur_session_admins
+             WHERE session_id = ? ORDER BY account_key`,
+            sessionId,
+        ).map((entry) => copyBytes(entry.account_key, "session admin account"));
+        const sendPolicy = textColumn(row.send_policy, "session send policy");
+        if (sendPolicy !== "everyone" && sendPolicy !== "admins") {
+            throw new Error("Invalid SQLite session send policy");
+        }
+        return {
+            sessionId: sessionId.slice(),
+            epoch: bigintColumn(row.epoch),
+            ownerAccount: copyBytes(row.owner_account, "session owner account"),
+            members: members.map((entry) => copyBytes(entry.account_key, "session member account")),
+            rosterRevisions: members.map((entry) => ({
+                accountKey: copyBytes(entry.account_key, "session member account"),
+                revision: safeNumberColumn(entry.roster_revision),
+            })),
+            admins,
+            adminsAssignAdmins: safeNumberColumn(row.admins_assign_admins) === 1,
+            anyoneCanAddMembers: safeNumberColumn(row.anyone_can_add_members) === 1,
+            sendPolicy,
+        };
+    }
+
+    #writeSessionState(state: RelaySessionState): void {
+        this.#run(
+            `INSERT INTO murmur_sessions
+                (session_id, owner_account, epoch, admins_assign_admins,
+                 anyone_can_add_members, send_policy)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (session_id) DO UPDATE SET
+                owner_account = excluded.owner_account,
+                epoch = excluded.epoch,
+                admins_assign_admins = excluded.admins_assign_admins,
+                anyone_can_add_members = excluded.anyone_can_add_members,
+                send_policy = excluded.send_policy`,
+            state.sessionId,
+            state.ownerAccount,
+            state.epoch,
+            state.adminsAssignAdmins ? 1 : 0,
+            state.anyoneCanAddMembers ? 1 : 0,
+            state.sendPolicy,
+        );
+        this.#run(`DELETE FROM murmur_session_members WHERE session_id = ?`, state.sessionId);
+        this.#run(`DELETE FROM murmur_session_admins WHERE session_id = ?`, state.sessionId);
+        if (state.members.length > 0) {
+            const revisions = new Map(
+                state.rosterRevisions.map((entry) => [
+                    encodeBase64Url(entry.accountKey),
+                    entry.revision,
+                ]),
+            );
+            this.#run(
+                `INSERT INTO murmur_session_members
+                    (session_id, account_key, roster_revision) VALUES ${state.members
+                        .map(() => "(?, ?, ?)")
+                        .join(", ")}`,
+                ...state.members.flatMap((account) => [
+                    state.sessionId,
+                    account,
+                    revisions.get(encodeBase64Url(account))!,
+                ]),
+            );
+        }
+        if (state.admins.length > 0) {
+            this.#run(
+                `INSERT INTO murmur_session_admins (session_id, account_key) VALUES ${state.admins
+                    .map(() => "(?, ?)")
+                    .join(", ")}`,
+                ...state.admins.flatMap((account) => [state.sessionId, account]),
+            );
+        }
+    }
+
+    #resolveSessionRecipients(
+        delivery: SignedDelivery,
+        limits: QueueLimits,
+    ): readonly Uint8Array[] {
+        const control = delivery.sessionControl;
+        if (control === null || delivery.sessionId === null || delivery.ownerAccount === null) {
+            throw new Error("Missing session-addressed delivery control");
+        }
+        const resolved = resolveSessionPublication(
+            delivery.sessionId,
+            delivery.ownerAccount,
+            delivery.senderAccount,
+            control,
+            this.#readSessionState(delivery.sessionId),
+        );
+        for (const change of control.type === "commit" ? control.changes : []) {
+            if (change.type !== "add") continue;
+            const row = this.#get(
+                `SELECT account_key FROM murmur_device_roster_devices WHERE device_key = ?`,
+                change.deviceKey,
+            );
+            if (
+                row === undefined ||
+                !equalBytes(
+                    copyBytes(row.account_key, "session change device account"),
+                    change.accountKey,
+                )
+            ) {
+                throw new RelayError(403, "Session Add does not name a current account device", {
+                    error: "session_unauthorized",
+                });
+            }
+        }
+        const coverage = new Set(control.coveredDevices.map(encodeBase64Url));
+        const coverageAccounts = new Set(resolved.coverageAccounts.map(encodeBase64Url));
+        const acceptedRevisions = new Map(
+            resolved.nextState.rosterRevisions.map((entry) => [
+                encodeBase64Url(entry.accountKey),
+                entry.revision,
+            ]),
+        );
+        const currentRosters = new Map<string, DeviceRoster>();
+        const fanout = new Map<string, Uint8Array>();
+        const stale: DeviceRoster[] = [];
+        const expectedCoverage = new Set<string>();
+        const coverageRosters: DeviceRoster[] = [];
+        for (const account of resolved.fanoutAccounts) {
+            const roster = this.#readDeviceRoster(account);
+            if (roster === undefined) {
+                if (coverageAccounts.has(encodeBase64Url(account))) {
+                    throw new RelayError(409, "Session member account has no registered devices", {
+                        error: "roster_missing",
+                        accountKey: encodeBase64Url(account),
+                    });
+                }
+                continue;
+            }
+            for (const device of roster.devices) {
+                fanout.set(encodeBase64Url(device.deviceKey), device.deviceKey);
+            }
+            const encodedAccount = encodeBase64Url(account);
+            currentRosters.set(encodedAccount, roster);
+            if (coverageAccounts.has(encodedAccount)) {
+                coverageRosters.push(roster);
+                for (const device of roster.devices) {
+                    expectedCoverage.add(encodeBase64Url(device.deviceKey));
+                }
+            }
+            if (
+                coverageAccounts.has(encodedAccount) &&
+                (roster.devices.some(
+                    (device) => !coverage.has(encodeBase64Url(device.deviceKey)),
+                ) ||
+                    (!resolved.stateChanged &&
+                        acceptedRevisions.get(encodedAccount) !== roster.revision))
+            ) {
+                stale.push(roster);
+            }
+        }
+        if (
+            coverageAccounts.size > 0 &&
+            (coverage.size !== expectedCoverage.size ||
+                [...coverage].some((device) => !expectedCoverage.has(device)))
+        ) {
+            const staleAccounts = new Set(
+                stale.map((roster) => encodeBase64Url(roster.accountKey)),
+            );
+            for (const roster of coverageRosters) {
+                if (!staleAccounts.has(encodeBase64Url(roster.accountKey))) stale.push(roster);
+            }
+        }
+        if (stale.length > 0) {
+            throw new RelayError(409, "MLS epoch does not cover every current member device", {
+                error: "stale_epoch_coverage",
+                rosters: stale.map(deviceRosterToJson),
+            });
+        }
+        const recipients = [...fanout.entries()]
+            .sort(([left], [right]) => left.localeCompare(right))
+            .map(([, device]) => device);
+        if (recipients.length < 1 || recipients.length > limits.maximumRecipients) {
+            throw new RelayError(413, "Session fanout exceeds relay limit", { error: "limit" });
+        }
+        if (resolved.stateChanged) {
+            this.#writeSessionState({
+                ...resolved.nextState,
+                rosterRevisions: resolved.coverageAccounts.map((accountKey) => ({
+                    accountKey,
+                    revision: currentRosters.get(encodeBase64Url(accountKey))!.revision,
+                })),
+            });
+        }
+        return recipients;
     }
 
     async mutateDeviceRoster(
@@ -1173,6 +1392,11 @@ export class SqliteRelayStore implements RelayStore {
                 BigInt(now),
             );
             const removed = this.#deleteOwnedSessionDeliveries(ownerAccount, sessionId);
+            this.#run(
+                `DELETE FROM murmur_sessions WHERE session_id = ? AND owner_account = ?`,
+                sessionId,
+                ownerAccount,
+            );
             this.#database.exec("COMMIT");
             return removed;
         } catch (error: unknown) {
@@ -1217,6 +1441,7 @@ export class SqliteRelayStore implements RelayStore {
                 BigInt(now),
             );
             this.#deleteOwnedAccountDeliveries(accountKey);
+            this.#run(`DELETE FROM murmur_sessions WHERE owner_account = ?`, accountKey);
             const devices = this.#all(
                 `SELECT device_key FROM murmur_device_roster_devices WHERE account_key = ?`,
                 accountKey,
@@ -1373,6 +1598,9 @@ export class SqliteRelayStore implements RelayStore {
                     ,'murmur_device_roster_nonces'
                     ,'murmur_session_deletion_nonces'
                     ,'murmur_account_deletion_nonces'
+                    ,'murmur_sessions'
+                    ,'murmur_session_members'
+                    ,'murmur_session_admins'
                     ,'murmur_directory_devices'
                     ,'murmur_directory_prekeys'
                     ,'murmur_directory_prekey_references'
@@ -1380,7 +1608,7 @@ export class SqliteRelayStore implements RelayStore {
                     ,'murmur_directory_ticket_uses'
                  )`,
             );
-            if (safeNumberColumn(tables.table_count) !== 15) {
+            if (safeNumberColumn(tables.table_count) !== 18) {
                 throw new Error("Incomplete SQLite queue schema");
             }
             return;
@@ -1458,6 +1686,30 @@ export class SqliteRelayStore implements RelayStore {
                 request_id TEXT NOT NULL,
                 created_at INTEGER NOT NULL,
                 PRIMARY KEY (account_digest, request_id)
+            ) STRICT;
+            CREATE TABLE murmur_sessions (
+                session_id BLOB PRIMARY KEY CHECK (length(session_id) = 32),
+                owner_account BLOB NOT NULL CHECK (length(owner_account) = 32),
+                epoch INTEGER NOT NULL CHECK (epoch >= 1),
+                admins_assign_admins INTEGER NOT NULL CHECK (admins_assign_admins IN (0, 1)),
+                anyone_can_add_members INTEGER NOT NULL CHECK (anyone_can_add_members IN (0, 1)),
+                send_policy TEXT NOT NULL CHECK (send_policy IN ('everyone', 'admins'))
+            ) STRICT;
+            CREATE INDEX murmur_session_owner ON murmur_sessions(owner_account);
+            CREATE TABLE murmur_session_members (
+                session_id BLOB NOT NULL REFERENCES murmur_sessions(session_id)
+                    ON DELETE CASCADE,
+                account_key BLOB NOT NULL CHECK (length(account_key) = 32),
+                roster_revision INTEGER NOT NULL CHECK (roster_revision >= 1),
+                PRIMARY KEY (session_id, account_key)
+            ) STRICT;
+            CREATE INDEX murmur_session_member_account
+                ON murmur_session_members(account_key);
+            CREATE TABLE murmur_session_admins (
+                session_id BLOB NOT NULL REFERENCES murmur_sessions(session_id)
+                    ON DELETE CASCADE,
+                account_key BLOB NOT NULL CHECK (length(account_key) = 32),
+                PRIMARY KEY (session_id, account_key)
             ) STRICT;
             CREATE TABLE murmur_queue_references (
                 recipient BLOB NOT NULL REFERENCES murmur_queues(recipient)
@@ -1761,7 +2013,9 @@ export class SqliteRelayStore implements RelayStore {
     #deleteOwnedAccountDeliveries(accountKey: Uint8Array): number {
         const usage = this.#requiredGet(
             `SELECT COUNT(*) AS item_count, COALESCE(SUM(encoded_bytes), 0) AS byte_count
-             FROM murmur_queue_deliveries WHERE sender_account = ?`,
+             FROM murmur_queue_deliveries
+             WHERE sender_account = ? OR owner_account = ?`,
+            accountKey,
             accountKey,
         );
         const references = this.#requiredGet(
@@ -1770,7 +2024,8 @@ export class SqliteRelayStore implements RelayStore {
              JOIN murmur_queue_deliveries AS delivery
                ON delivery.sender = reference.sender
               AND delivery.delivery_id = reference.delivery_id
-             WHERE delivery.sender_account = ?`,
+             WHERE delivery.sender_account = ? OR delivery.owner_account = ?`,
+            accountKey,
             accountKey,
         );
         const affected = this.#all(
@@ -1783,13 +2038,18 @@ export class SqliteRelayStore implements RelayStore {
              JOIN murmur_queue_deliveries AS delivery
                ON delivery.sender = reference.sender
               AND delivery.delivery_id = reference.delivery_id
-             WHERE delivery.sender_account = ?
+             WHERE delivery.sender_account = ? OR delivery.owner_account = ?
              GROUP BY reference.recipient, queue.loss_generation`,
+            accountKey,
             accountKey,
         );
         const removed = safeNumberColumn(
-            this.#run(`DELETE FROM murmur_queue_deliveries WHERE sender_account = ?`, accountKey)
-                .changes,
+            this.#run(
+                `DELETE FROM murmur_queue_deliveries
+                 WHERE sender_account = ? OR owner_account = ?`,
+                accountKey,
+                accountKey,
+            ).changes,
         );
         for (let offset = 0; offset < affected.length; offset += SQL_VALUE_CHUNK) {
             const chunk = affected.slice(offset, offset + SQL_VALUE_CHUNK);
