@@ -7,17 +7,19 @@ create a contact. It defines and validates a self-contained signed discovery
 bundle containing a public account identity, an authorized device, and current
 signed MLS KeyPackage material sufficient to attempt a bootstrap. It does not
 itself create a relationship, exchange profiles, or establish a separate
-channel. The built-in contact protocol may use the verified result to begin its
-two-device contact handshake.
+channel. Alongside this bundle flow, the relay is an identity directory:
+published per-device KeyPackage pools are resolvable by the exact public
+identity key and claimed with a contact ticket, as dictated by the
+identity-directory plan.
 
 The authorized device identifies the recipient's authenticated relay inbox,
-while the stable account identity is what a contact verifies. There are no
-anonymous request topics or capability addresses. Discovery
-material is not retained as a relay directory or list. The application may
+while the stable account identity is what a peer verifies. There are no
+anonymous request topics or capability addresses. The application may
 share the complete bundle out of band, or upload its exact bytes to the relay's
 five-minute content-addressed cache and share the returned SHA-256 digest. The
-relay neither enumerates bundles nor resolves identities; the digest is the
-only lookup capability.
+relay never enumerates bundles, directory entries, or identities; an exact
+digest or an exact public identity key is the only lookup capability, and an
+identity key is unguessable.
 
 ## Identity and KeyPackages
 
@@ -45,11 +47,10 @@ control of acceptance and implementations must bound unsolicited attempts.
 - The application may share the bundle itself, or share a 32-byte SHA-256
   digest that resolves only through the relay's non-enumerable five-minute
   cache.
-- Discovery itself creates no contact record or profile exchange. Those begin
-  only when the built-in contact protocol accepts the verified material and
-  bootstraps its technical session.
-- The relay is not used as a retained identity directory, list, or anonymous
-  request topic; cached bundles are opaque, content-addressed, and expire within
-  five minutes.
+- Discovery itself creates no relationship record or profile exchange; there
+  is no built-in contact protocol.
+- The relay resolves only exact identity keys or exact digests and never
+  enumerates or lists; cached bundles are opaque, content-addressed, and
+  expire within five minutes.
 - Unsolicited discovery and bootstrap attempts have explicit acceptance and
   spam bounds.

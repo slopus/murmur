@@ -3,10 +3,12 @@
 ## Vision
 
 Murmur is a stateful library for discovering a public account identity,
-bootstrapping an MLS session, establishing a built-in contact relationship,
-and exchanging data through typed synchronization services. A two-person
-interaction and a many-person interaction use the same MLS group primitive.
-Contacts are foundational Murmur state. Chat remains an optional independent
+bootstrapping an MLS session, and exchanging data through typed
+synchronization services. A two-person interaction and a many-person
+interaction use the same MLS group primitive. There is no built-in contact
+protocol: sharing a public identity key is enough to claim published
+KeyPackages through the identity directory and instantly start a session or
+group. Chat remains an optional independent
 service, and the old friend-channel and generic relay-topic machinery are not
 part of Murmur.
 
@@ -42,12 +44,15 @@ authenticated inbox; devices never share sender or epoch state. Active devices
 synchronize Murmur-owned account state and automatically drive their MLS
 membership across known account sessions. The server may retain the bounded
 account-to-device routing needed to issue tokens and deliver traffic, but it
-cannot forge the roster, does not become a public discovery directory, and
-receives no device secrets.
+cannot forge the roster and receives no device secrets.
 
 The relay stores encrypted deliveries that remain unacknowledged and unexpired.
-It may also hold a signed discovery bundle for at most five minutes under the
-SHA-256 digest of its exact bytes. It stores no snapshots, retained chat
+It is an identity directory: it holds each published account's per-device pool
+of one-use KeyPackages and its multi-use last-resort KeyPackage, resolvable
+only by the exact public identity key and gated by contact tickets from the
+authentication server, as dictated by the identity-directory plan. It may also
+hold a signed discovery bundle for at most five minutes under the SHA-256
+digest of its exact bytes. It stores no snapshots, retained chat
 history, event-sourced application state, anonymous capability topics, or MLS
 state.
 
@@ -79,10 +84,9 @@ A relay item is acknowledged only after its queue-processing outcome is
 durable. Successful session processing atomically persists Murmur state, replay
 and queue progress, and a bounded opaque application update before
 acknowledgement. One identity-wide synchronization loop routes an inbox-ordered
-batch to built-in contact handling, registered session owners, and the relevant
-main sync callbacks. The main sync options include `onUpdates` and typed contact
-lifecycle callbacks, but `onUpdates` is never a fallback for an unclaimed
-session. Only after all relevant asynchronous handling resolves does Murmur
+batch to registered session owners and the relevant main sync callbacks. The
+main sync options include `onUpdates`, but `onUpdates` is never a fallback for
+an unclaimed session. Only after all relevant asynchronous handling resolves does Murmur
 atomically drain the whole local batch. A thrown handler or crash before that
 internal commit exposes the same stable event IDs again; applications needing
 durable exactly-once effects deduplicate those IDs in their own persistence.
@@ -95,9 +99,7 @@ so later queue items can also be acknowledged without waiting. Pending state
 and buffered data are strictly bounded. Activation makes its buffered events
 visible to the appropriate owner in the same identity-wide loop; ignore or
 overflow terminally rejects the session and destroys pending secrets and data
-while retaining replay and rejection state. Built-in contact bootstraps instead
-expose their validated profile hello while pending and follow the contact
-accept-or-reject flow.
+while retaining replay and rejection state.
 
 Malformed, unauthenticatable, undecryptable, unsupported, ignored during queue
 processing, or otherwise terminal deliveries are durably rejected or
@@ -117,29 +119,24 @@ fresh device followed by new MLS Welcomes.
 2. **Admission and routing.** Continue supporting a directly configured legacy
    relay, or ask the application authentication server for a short-lived token
    that binds one authorized account device to an endpoint and transport.
-3. **Discovery.** Define and validate a self-contained signed bundle containing
-   a public account identity, authorized device, and current KeyPackage
-   material without creating a friend relationship. An application may share
-   it directly, or upload it to
-   the relay's five-minute content-addressed cache and share only its SHA-256
-   digest. The recipient fetches by that digest and rejects an expired or
-   invalid bundle.
+3. **Discovery.** Publish each account's per-device one-use KeyPackage pool
+   and multi-use last-resort KeyPackage to the relay's identity directory,
+   resolvable only by the exact public identity key and claimed with a contact
+   ticket. An application may also share a self-contained signed bundle
+   directly, or upload it to the relay's five-minute content-addressed cache
+   and share only its SHA-256 digest.
 4. **Bootstrap.** Create an MLS session and deliver its Welcome and initial
    material to the recipient's authenticated queue. The recipient persists it
-   as pending and trims the queue before generic application acceptance or
-   built-in contact handling.
+   as pending and trims the queue before application acceptance.
 5. **MLS sessions.** Send opaque descriptors, application events, and
    membership changes through the same MLS primitive for two or more members.
-6. **Contacts.** Use an initially two-device technical MLS session and a mutual
-   typed profile hello to establish durable proof between account identities,
-   then track their verified active-device rosters.
-7. **Synchronization services.** Register optional independent typed services
+6. **Synchronization services.** Register optional independent typed services
    on the client. Each service may claim a new session from its descriptor and
    then owns later updates routed through that durable association.
-8. **Private group state.** Store canonical encrypted group records behind
+7. **Private group state.** Store canonical encrypted group records behind
    anonymous, zero-knowledge membership authorization without exposing a
    readable social graph or replacing MLS membership.
-9. **Applications.** Register typed synchronization services for domains such
+8. **Applications.** Register typed synchronization services for domains such
    as chat, documents, or files.
 
 ## How we know it is done
@@ -162,9 +159,6 @@ fresh device followed by new MLS Welcomes.
 - A pending session stays cryptographically current under a strict storage
   bound; activation durably hands off buffered events or effects, while ignore
   or overflow terminally rejects and destroys pending secrets and data.
-- A two-device contact session becomes durable contact proof only after both
-  identities exchange and process their typed profile hellos; rejection
-  destroys the pending contact session.
 - Optional strictly typed synchronization services persist their state and
   participate in the identity-wide sync loop through exactly `onNewSession`
   and `onUpdate`. A successful new-session claim durably routes later updates
@@ -185,9 +179,8 @@ fresh device followed by new MLS Welcomes.
   recording queue progress and its successful protocol state plus buffered
   update, pending bootstrap, or terminal rejection.
 - One `sync` loop delivers bounded identity-wide batches with stable event IDs
-  to built-in contact handling, registered service callbacks, and the relevant
-  optional sync callbacks. Contact lifecycle callbacks include
-  `onContactRequested`, `onContactAdded`, and `onContactRemoved`. Murmur commits
+  to registered service callbacks and the relevant optional sync callbacks.
+  Murmur commits
   and drains a whole batch only after its asynchronous handling resolves; an
   uncommitted batch is returned again after restart.
 - A session that no registered service claims has its unknown updates durably

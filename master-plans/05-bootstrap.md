@@ -2,8 +2,8 @@
 
 ## Destination
 
-There is no friend channel. Given a verified discovery bundle, Murmur creates
-an MLS session and publishes the Welcome and initial material to the
+There is no friend channel. Given a verified discovery bundle or KeyPackage
+material claimed from the identity directory, Murmur creates an MLS session and publishes the Welcome and initial material to the
 recipient's authenticated device inbox. The legacy relay keeps its atomic
 publication contract. A negotiated endpoint first durably records publication
 and then completes every idempotent target insertion through ordered retry.
@@ -27,14 +27,6 @@ rejection state to make retries harmless. It does not claim to reverse
 membership created by the sender. An activated session uses MLS for everything
 afterward.
 
-A bootstrap routed to the built-in contact protocol is handled differently.
-Murmur internally decrypts and validates its typed profile hello while the
-two-device contact session is still pending, then exposes the claimed contact
-profile for an accept-or-reject decision. The application does not activate the
-session or receive a raw update first. Rejection destroys the pending contact
-session. Acceptance sends the local typed profile hello; only the mutual hello
-exchange confirms and persists the contact relationship.
-
 Pending session state and buffered data are strictly bounded. Exceeding that
 bound terminally ignores or rejects the pending session using the same cleanup
 as an application ignore.
@@ -47,12 +39,10 @@ later queue entries.
 ## Safety and abuse
 
 Knowing an identity is enough to attempt bootstrap, not enough to force a
-relationship or session into the recipient's application. For a generic
-bootstrap, Murmur must expose the claimed initiator and opaque session
-descriptor needed for an informed accept-or-ignore decision while keeping
-application semantics above the library. For a contact bootstrap, Murmur owns
-the typed profile handshake and exposes the validated profile and contact
-decision instead.
+relationship or session into the recipient's application. Murmur must expose
+the claimed initiator and opaque session descriptor needed for an informed
+accept-or-ignore decision while keeping application semantics above the
+library.
 
 Bootstrap processing, pending Welcomes, KeyPackage lifecycle, retry, replay
 protection, pending-session buffers, and queue progress belong to Murmur's
@@ -62,8 +52,8 @@ details.
 
 ## How we know it is done
 
-- A verified discovery bundle is sufficient to create and deliver an MLS
-  bootstrap.
+- A verified discovery bundle or claimed directory KeyPackage material is
+  sufficient to create and deliver an MLS bootstrap.
 - Initial delivery uses the selected relay protocol's ordinary bounded
   publication: atomic multicast for the legacy relay, or durable ordered fanout
   retry and per-target idempotency for a negotiated endpoint.
@@ -80,10 +70,6 @@ details.
 - Activation hands buffered events or effects through the ordinary durable
   application boundary. Ignore destroys pending secrets and data, retains
   replay and rejection state, and does not reverse sender-created membership.
-- A contact bootstrap exposes its validated typed profile while pending,
-  requires no raw application update or generic activation first, and either
-  destroys the pending session on rejection or confirms it through a mutual
-  typed hello.
 - After local activation, descriptors, membership control, and application
   data travel through MLS rather than a separate pairwise channel.
 - There is no legacy friendship lifecycle or friend-channel state.

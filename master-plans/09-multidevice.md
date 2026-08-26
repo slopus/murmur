@@ -19,7 +19,7 @@ or forked roster mutations converge under an explicit authenticated ordering
 rule rather than server discretion.
 
 Active devices maintain a built-in account synchronization session. Murmur uses
-it for roster control, contacts, session routing, and the protocol material
+it for roster control, session routing, and the protocol material
 needed to introduce fresh device state. Applications receive a typed,
 authenticated channel over the same device relationship and may use it to
 transfer history, snapshots, backups, domain keys, or other state. Application
@@ -27,15 +27,14 @@ history is never implicit Murmur state and is not reconstructed from an
 identity key, MLS Welcome, or relay queue. Large application synchronization is
 bounded, chunked, resumable, and controlled by the application.
 
-Contacts and service groups treat the account as the logical member while MLS
+Service groups treat the account as the logical member while MLS
 treats every active device as a separate leaf. Once a new device is accepted in
-the account roster, Murmur automatically finds every locally known built-in
-contact and service-owned session containing that account, creates or obtains
+the account roster, Murmur automatically finds every locally known
+service-owned session containing that account, creates or obtains
 fresh KeyPackages, and durably submits the required MLS Add proposals. The
 authenticated epoch committer serializes the resulting Commits, and the new
 device receives a separate Welcome for each session. Offline, pending, or
 temporarily blocked sessions converge later without blocking application sends.
-No remote contact acceptance is repeated for a roster-authorized device.
 
 Device revocation immediately stops new account authorization, token issuance,
 publication, and inbox access for that device. Murmur automatically submits
@@ -46,7 +45,7 @@ plaintext or secrets the device already possessed.
 
 An authorized device can issue a verifiable account tombstone that revokes the
 entire roster and authorizes deletion of account admission, routing, endpoint,
-pending-queue, and other account-owned server state. Former contacts retain the
+pending-queue, and other account-owned server state. Former peers retain the
 tombstone against silent reappearance. Every known MLS session still processes
 its own Remove Commit. A recovery and complete-revocation authority that works
 after every device store is lost is separate from MLS and application history;
@@ -72,13 +71,13 @@ is never used as recovery.
 - Active devices synchronize Murmur-owned account state automatically and give
   applications a typed, bounded, resumable channel for their own state.
 - Adding a device automatically and durably drives MLS Adds and Welcomes for
-  every known contact and service session containing the account, including
+  every known service session containing the account, including
   sessions that must finish later after reconnecting.
 - Revoking a device stops future server access immediately and automatically
   drives MLS Removes in every known session without claiming retroactive or
   instantaneous cryptographic erasure.
 - A verifiable account tombstone revokes all devices, removes account-owned
-  server state, remains recognizable to former contacts, and triggers ordinary
+  server state, remains recognizable to former peers, and triggers ordinary
   MLS removal convergence.
 - A lost device returns only with fresh authorized device and MLS state.
   Identity continuity alone never restores protocol state or application

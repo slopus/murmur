@@ -18,8 +18,8 @@ Code is organized into modules by domain. The boundary is practical rather than
 rigid: everything concerned with keys and encryption belongs in `crypto`; MLS
 epochs and ratchets belong in `mls`; inbound queues and publication belong in
 `delivery`; the relay's own behavior belongs in `relay`; public identity and
-discovery belong in `identity`; foundational contact behavior belongs in
-`contacts`; optional typed synchronization capabilities belong in `services`.
+discovery belong in `identity`; optional typed synchronization capabilities
+belong in `services`.
 Each service is its own domain within `sources/services` and keeps its typed
 packets, persistence, and callbacks together. Services are independent; Murmur
 does not model or validate dependencies between services or sessions. The goal

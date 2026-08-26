@@ -26,23 +26,20 @@ one final reset event to the application containing the full snapshot of every
 affected session — identifiers, descriptors, membership, and roles — and then
 destroys all session state: epochs, ratchets, buffered events, outboxes, and
 intents. It keeps its device identity key, device credential, account signing
-material where this device holds it, the account roster, and durable contact
-relationships and their profile metadata — the social graph is account state,
-not session state, and a reset must not cost it. Everything transport- and
-session-shaped is destroyed. There is no partial reset and no per-session
+material where this device holds it, and the account roster. Everything
+transport- and session-shaped is destroyed. There is no partial reset and no per-session
 survival.
 
 Re-admission reuses the existing roster convergence machinery. The reset
 device announces a signed reset generation through its account roster, the
-same authenticated channel as device addition and revocation. Every contact
-and group member that holds the account observes the announcement and
+same authenticated channel as device addition and revocation. Every session
+member that holds the account observes the announcement and
 automatically Removes the dead leaf and re-adds the device with a fresh
 Welcome in every session containing that account, exactly as device linking
 and revocation converge today. The account never loses membership: membership
 is logical and account-level, and a reset costs the device its continuity and
-history, never the account its seat. A single-device account re-enters
-contact sessions through ordinary contact re-bootstrap and group sessions
-through member convergence on its reset announcement.
+history, never the account its seat. A single-device account re-enters its
+sessions through member convergence on its reset announcement.
 
 Dormancy follows the same constant. Sibling devices may revoke a device that
 has been silent past six months, since it can never rejoin continuously.
@@ -80,7 +77,7 @@ silent unacknowledged removal the relay performs today.
   complete affected-session snapshot at least once until it resolves, and the
   purge commits exactly once, destroying all session and transport state while
   device identity, account signing material held by this device, device
-  credential, roster, and durable contact relationships are retained.
+  credential, and roster are retained.
 - A reset adopts the relay's observed head as its new continuity baseline, so
   a reset device cannot loop on the same loss.
 - A reset device's signed reset announcement converges automatically: every

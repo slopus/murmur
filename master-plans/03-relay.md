@@ -24,10 +24,14 @@ It stores no snapshots, retained chat history, event-sourced application state,
 anonymous topics, capability topics, or MLS state. The one exception is the
 canonical private-group state record dictated by the private-groups plan: an
 opaque encrypted record the relay backend keeps for as long as its group
-exists, versioned by UUIDv7 and never expired or evicted. The invitation cache is not
-enumerable and is not an identity directory. The negotiated authentication
-server retains only the account, device, endpoint, and protocol routing needed
-for admission and delivery. The relay does not interpret encrypted delivery
+exists, versioned by UUIDv7 and never expired or evicted. The relay is also an
+identity directory as dictated by the identity-directory plan: it holds each
+published account's per-device one-use KeyPackage pool and multi-use
+last-resort KeyPackage, resolvable only by the exact public identity key and
+claimed with a contact ticket. Neither the invitation cache nor the directory
+is enumerable. The negotiated authentication server retains only the account,
+device, endpoint, and protocol routing needed for admission, delivery, and
+contact-ticket issuance. The relay does not interpret encrypted delivery
 contents or trust cached discovery contents. It does learn authenticated user
 admission, device, sender, recipient, exact fanout, timing, and queue progress;
 this metadata exposure is accepted.
@@ -168,7 +172,7 @@ by TTL or quota, advances the inbox's loss generation so the loss is explicit
 rather than silent. Fanout manifests and their retry work are bounded
 by the same delivery expiry plus separate item and byte quotas. These bounds
 prevent abandoned state from consuming storage forever. They do not turn the
-relay into durable history, an identity directory, or a recovery system.
+relay into durable history or a recovery system.
 
 ## How we know it is done
 
@@ -222,7 +226,8 @@ relay into durable history, an identity directory, or a recovery system.
 - The relay has no retained event history, snapshots, public identity or
   application lists, generic topics, or anonymous addressing, apart from the
   opaque canonical private-group state records that persist while their group
-  exists.
+  exists and the identity-directory KeyPackage records resolvable only by
+  exact public identity key.
 - Signed device revocation and account tombstones remove corresponding future
   routing authority and account-owned relay state without pretending to replace
   MLS Remove Commits.
