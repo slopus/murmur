@@ -35,7 +35,7 @@ export function randomBytes(length: number): Uint8Array {
  *
  * Murmur intentionally converts this same root to X25519 for key agreement.
  * This avoids publishing two linkable identity keys, but it accepts the
- * composition risk documented in the friends master plan. It does not treat
+ * documented Ed25519/X25519 key-composition risk. It does not treat
  * Ed25519 and X25519 encodings as interchangeable raw bytes.
  */
 export function generateIdentityKeyPair(): IdentityKeyPair {
