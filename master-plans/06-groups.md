@@ -21,12 +21,15 @@ inbox.
 
 ## Ordering and delivery
 
-Each outbound MLS delivery has one verifiably bound recipient set containing
-every current epoch device member, including the publisher. The relay
-publishes one ciphertext atomically to every recipient queue with one UUIDv7
-event ID, or durably accepts one fanout manifest and completes
+A session send names only the session. The relay derives the recipient set
+itself from its relay-held session membership and the current device rosters,
+so every delivery reaches every current member device, including the
+publisher, without the client knowing or enumerating recipients. The relay
+publishes one ciphertext atomically to every derived recipient queue with one
+UUIDv7 event ID, or durably accepts one fanout manifest and completes
 idempotent per-device insertion in event order, retrying failures without a
-cross-endpoint transaction. Event IDs are monotonic within each inbox, and the
+cross-endpoint transaction. Direct inbox-addressed publication remains for
+Welcomes, bootstrap material, and relay notifications. Event IDs are monotonic within each inbox, and the
 session never assumes simultaneous fanout completion. Because one multicast
 carries one event ID everywhere, the relative event-ID order of two multicasts
 is identical in every inbox that holds both; that is the only cross-inbox
@@ -136,9 +139,9 @@ new Welcomes as fresh device state.
   channel or shared relay topic.
 - Every current epoch device member, including the publisher, receives each
   ongoing MLS delivery with the same UUIDv7 event ID, through atomic
-  multicast or durable ordered idempotent fanout. Ordering is guaranteed
-  within an individual inbox, plus the consistent relative order of two
-  shared event IDs across inboxes.
+  multicast or durable ordered idempotent fanout of the relay-derived
+  recipient set. Ordering is guaranteed within an individual inbox, plus the
+  consistent relative order of two shared event IDs across inboxes.
 - Any member may publish a Commit, membership-changing Commits are validated
   against the session's roles by every member, and shared per-multicast UUIDv7
   event IDs make relay delivery order resolve concurrent Commits for one epoch
