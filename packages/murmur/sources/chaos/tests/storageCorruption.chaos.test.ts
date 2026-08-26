@@ -33,6 +33,7 @@ const SESSION_STATE_PREFIX = "murmur/session-states/";
 const OUTBOX_PREFIX = "murmur/session-outbox/";
 const OUTBOX_ORDER_PREFIX = "murmur/session-outbox-order/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
+const DELIVERY_CURSOR_KEY = "murmur/delivery/cursor";
 const DELIVERY_STATE_KEYS = ["murmur/delivery/cursor", "murmur/delivery/continuity"] as const;
 const DRAIN_PREFIX = "murmur/chaos/drained/";
 const ACK_KEY = "murmur/chaos/ack";
@@ -355,6 +356,12 @@ class CapacityMurmurStore implements MurmurStore {
         return this.#writeOrdinal;
     }
 
+    constrain(policy: CapacityPolicy): void {
+        this.#policy = policy;
+        this.#writeOrdinal = 0;
+        this.#enabled = true;
+    }
+
     restoreCapacity(): void {
         this.#enabled = false;
     }
@@ -544,6 +551,422 @@ async function copyDeliveryProgress(source: MurmurStore, target: MurmurStore): P
         } finally {
             if (value !== undefined) zeroBytes(value);
         }
+    }
+}
+
+async function storeFingerprint(store: MurmurStore): Promise<string> {
+    const values = await store.scan("", { limit: MAXIMUM_STORE_SCAN_ITEMS });
+    try {
+        return JSON.stringify(
+            [...values].map(([key, value]) => ({
+                key,
+                digest: digest(value),
+                length: value.length,
+            })),
+        );
+    } finally {
+        for (const value of values.values()) zeroBytes(value);
+    }
+}
+
+async function requiredText(store: MurmurStore, key: string): Promise<string> {
+    const bytes = await store.get(key);
+    if (bytes === undefined) throw new Error(`Required store key is missing: ${key}`);
+    try {
+        return utf8Decode(bytes);
+    } finally {
+        zeroBytes(bytes);
+    }
+}
+
+async function prefixCount(store: MurmurStore, prefix: string): Promise<number> {
+    const values = await store.scan(prefix, { limit: MAXIMUM_STORE_SCAN_ITEMS });
+    try {
+        return values.size;
+    } finally {
+        for (const value of values.values()) zeroBytes(value);
+    }
+}
+
+interface LiveIntentCapacityResult {
+    readonly seed: number;
+    readonly failedWriteOrdinal: number;
+    readonly observedWrites: number;
+    readonly atomicRollback: boolean;
+    readonly partialIntents: number;
+    readonly partialOutboxes: number;
+    readonly recoveredMembers: number;
+}
+
+async function runLiveIntentCapacity(
+    seed: number,
+    failedWriteOrdinal: number = 0,
+): Promise<LiveIntentCapacityResult> {
+    const label = seed.toString(16).padStart(8, "0");
+    const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+    const aliceDelegate = new MemoryMurmurStore();
+    const constrained = new CapacityMurmurStore(aliceDelegate, {});
+    const bobStore = new MemoryMurmurStore();
+    const carolStore = new MemoryMurmurStore();
+    const alice = await relayClient(relay, constrained);
+    const bob = await relayClient(relay, bobStore);
+    const carol = await relayClient(relay, carolStore);
+    try {
+        const session = await alice.createSession({
+            descriptor: utf8Encode(`ST-02L ${label}`),
+            members: [await bob.discovery()],
+        });
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        await bob.activateSession(session.id);
+        const carolDiscovery = await carol.discovery();
+
+        const before = await storeFingerprint(aliceDelegate);
+        constrained.constrain(
+            failedWriteOrdinal === 0 ? {} : { failWriteOrdinals: [failedWriteOrdinal] },
+        );
+        if (failedWriteOrdinal === 0) {
+            await alice.addMember(session.id, carolDiscovery);
+            return Object.freeze({
+                seed,
+                failedWriteOrdinal,
+                observedWrites: constrained.writeOrdinal,
+                atomicRollback: true,
+                partialIntents: 0,
+                partialOutboxes: 0,
+                recoveredMembers: 0,
+            });
+        }
+
+        await expect(alice.addMember(session.id, carolDiscovery)).rejects.toThrow(
+            `write ${failedWriteOrdinal}`,
+        );
+        const observedWrites = constrained.writeOrdinal;
+        const after = await storeFingerprint(aliceDelegate);
+        const partialIntents = await prefixCount(aliceDelegate, "murmur/session-intents/");
+        const partialOutboxes = await prefixCount(aliceDelegate, OUTBOX_PREFIX);
+        expect(await alice.session(session.id)).toMatchObject({ status: "active" });
+
+        constrained.restoreCapacity();
+        await alice.addMember(session.id, carolDiscovery);
+        let recoveredMembers = 0;
+        for (let round = 0; round < 6; round += 1) {
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize({ waitMilliseconds: 0 });
+            recoveredMembers = (await alice.session(session.id))?.members.length ?? 0;
+            if (recoveredMembers === 3 && (await carol.session(session.id)) !== undefined) break;
+        }
+        expect(await carol.session(session.id)).toMatchObject({ status: "pending" });
+
+        return Object.freeze({
+            seed,
+            failedWriteOrdinal,
+            observedWrites,
+            atomicRollback: before === after,
+            partialIntents,
+            partialOutboxes,
+            recoveredMembers,
+        });
+    } finally {
+        alice.close();
+        bob.close();
+        carol.close();
+        await relay.close();
+    }
+}
+
+interface LiveCapacityResult {
+    readonly seed: number;
+    readonly atomicRollback: boolean;
+    readonly retainedEvent: boolean;
+    readonly stableUpdateId: boolean;
+    readonly recovered: readonly string[];
+    readonly followUp: readonly string[];
+}
+
+async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult> {
+    const label = seed.toString(16).padStart(8, "0");
+    const relayStore = new SqliteRelayStore(":memory:");
+    const relay = new RelayService(relayStore, {}, undefined, () => NOW);
+    const aliceStore = new MemoryMurmurStore();
+    const bobDelegate = new MemoryMurmurStore();
+    const constrained = new CapacityMurmurStore(bobDelegate, {});
+    const alice = await relayClient(relay, aliceStore);
+    const bob = await relayClient(relay, constrained);
+    try {
+        const session = await alice.createSession({
+            descriptor: utf8Encode(`ST-03L ${label}`),
+            members: [await bob.discovery()],
+        });
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        await bob.activateSession(session.id);
+
+        const previousCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
+        const message = `capacity-replay-${label}`;
+        await alice.send(session.id, utf8Encode(message));
+        await alice.synchronize({ waitMilliseconds: 0 });
+        const beforePage = await relayStore.readQueue(bob.identity, previousCursor, 2, NOW, {
+            maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
+        });
+        expect(beforePage.deliveries).toHaveLength(1);
+        const queuedEventId = beforePage.deliveries[0]!.eventId;
+        zeroBytes(beforePage.generation);
+
+        const before = await storeFingerprint(bobDelegate);
+        let callbacks = 0;
+        constrained.constrain({ failPrefix: APPLICATION_UPDATE_PREFIX });
+        await expect(
+            bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onUpdates: () => {
+                        callbacks += 1;
+                    },
+                },
+            ),
+        ).rejects.toThrow(`prefix ${APPLICATION_UPDATE_PREFIX}`);
+        const after = await storeFingerprint(bobDelegate);
+        const failedCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
+        const retainedPage = await relayStore.readQueue(bob.identity, previousCursor, 2, NOW, {
+            maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
+        });
+        expect(callbacks).toBe(0);
+        expect(retainedPage.deliveries).toHaveLength(1);
+        const retainedEventId = retainedPage.deliveries[0]!.eventId;
+        zeroBytes(retainedPage.generation);
+
+        constrained.restoreCapacity();
+        const recovered: string[] = [];
+        let recoveredId: string | undefined;
+        await bob.synchronize(
+            { waitMilliseconds: 0 },
+            {
+                onUpdates: (updates) => {
+                    callbacks += 1;
+                    for (const update of updates) {
+                        recoveredId = update.id;
+                        recovered.push(utf8Decode(update.bytes));
+                    }
+                },
+            },
+        );
+        expect(callbacks).toBe(1);
+        const recoveredCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
+        const acknowledgedPage = await relayStore.readQueue(bob.identity, recoveredCursor, 2, NOW, {
+            maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
+        });
+        expect(acknowledgedPage.deliveries).toHaveLength(0);
+        expect(acknowledgedPage.acknowledgedThrough).toBe(recoveredCursor);
+        zeroBytes(acknowledgedPage.generation);
+
+        const followUpMessage = `capacity-follow-up-${label}`;
+        await alice.send(session.id, utf8Encode(followUpMessage));
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        const followUp: string[] = [];
+        await consume(bob, followUp);
+
+        return Object.freeze({
+            seed,
+            atomicRollback: before === after && failedCursor === previousCursor,
+            retainedEvent: retainedEventId === queuedEventId,
+            stableUpdateId: recoveredId === queuedEventId && recoveredCursor === queuedEventId,
+            recovered: Object.freeze(recovered.slice()),
+            followUp: Object.freeze(followUp.slice()),
+        });
+    } finally {
+        alice.close();
+        bob.close();
+        await relay.close();
+    }
+}
+
+interface LiveDrainResult {
+    readonly seed: number;
+    readonly callbackIdsStable: boolean;
+    readonly durableEffectCount: number;
+    readonly callbackCount: number;
+    readonly bufferedAfterFailure: number | undefined;
+    readonly bufferedAfterRecovery: number | undefined;
+    readonly relayAcknowledgedBeforeDrain: boolean;
+}
+
+async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
+    const label = seed.toString(16).padStart(8, "0");
+    const relayStore = new SqliteRelayStore(":memory:");
+    const relay = new RelayService(relayStore, {}, undefined, () => NOW);
+    const aliceStore = new MemoryMurmurStore();
+    const bobDelegate = new MemoryMurmurStore();
+    const constrained = new CapacityMurmurStore(bobDelegate, {});
+    const alice = await relayClient(relay, aliceStore);
+    let bob = await relayClient(relay, constrained);
+    try {
+        const session = await alice.createSession({
+            descriptor: utf8Encode(`ST-04L ${label}`),
+            members: [await bob.discovery()],
+        });
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        await bob.activateSession(session.id);
+        const previousCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
+
+        await alice.send(session.id, utf8Encode(`owned-effect-${label}`));
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        const queuedCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
+        expect(queuedCursor).not.toBe(previousCursor);
+        const staged = await bob.session(session.id);
+        expect(staged).toMatchObject({ status: "active", bufferedEvents: 1 });
+
+        const callbackIds: string[] = [];
+        const commitApplicationEffect = async (id: string): Promise<void> => {
+            const key = `application/ST-04L/${id}`;
+            const existing = await bobDelegate.get(key);
+            if (existing === undefined) {
+                await bobDelegate.set(key, utf8Encode(`committed-${label}`));
+            } else {
+                zeroBytes(existing);
+            }
+        };
+        await expect(
+            bob.synchronize(
+                { waitMilliseconds: 0 },
+                {
+                    onUpdates: async (updates) => {
+                        expect(updates).toHaveLength(1);
+                        const id = updates[0]!.id;
+                        callbackIds.push(id);
+                        await commitApplicationEffect(id);
+                        constrained.constrain({ failWriteOrdinals: [1] });
+                    },
+                },
+            ),
+        ).rejects.toThrow("write 1");
+        const bufferedAfterFailure = (await bob.session(session.id))?.bufferedEvents;
+        const acknowledgedPage = await relayStore.readQueue(bob.identity, queuedCursor, 2, NOW, {
+            maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
+        });
+        const relayAcknowledgedBeforeDrain =
+            acknowledgedPage.deliveries.length === 0 &&
+            acknowledgedPage.acknowledgedThrough === queuedCursor;
+        zeroBytes(acknowledgedPage.generation);
+
+        bob.close();
+        constrained.restoreCapacity();
+        bob = await relayClient(relay, constrained);
+        await bob.synchronize(
+            { waitMilliseconds: 0 },
+            {
+                onUpdates: async (updates) => {
+                    expect(updates).toHaveLength(1);
+                    const id = updates[0]!.id;
+                    callbackIds.push(id);
+                    await commitApplicationEffect(id);
+                },
+            },
+        );
+        const bufferedAfterRecovery = (await bob.session(session.id))?.bufferedEvents;
+        const durableEffectCount = await prefixCount(bobDelegate, "application/ST-04L/");
+
+        return Object.freeze({
+            seed,
+            callbackIdsStable: callbackIds.length === 2 && callbackIds[0] === callbackIds[1],
+            durableEffectCount,
+            callbackCount: callbackIds.length,
+            bufferedAfterFailure,
+            bufferedAfterRecovery,
+            relayAcknowledgedBeforeDrain,
+        });
+    } finally {
+        alice.close();
+        bob.close();
+        await relay.close();
+    }
+}
+
+interface LiveOutboxCorruptionResult {
+    readonly seed: number;
+    readonly operator: "flip" | "truncate";
+    readonly offset: number;
+    readonly recordLength: number;
+    readonly issueCode: string | undefined;
+    readonly corruptedDeliveries: readonly string[];
+    readonly recoveredDeliveries: readonly string[];
+}
+
+async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorruptionResult> {
+    const random = new SeededRandom(seed);
+    const label = seed.toString(16).padStart(8, "0");
+    const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+    const aliceStore = new InspectableStoreFixture();
+    const bobStore = new MemoryMurmurStore();
+    let alice = await relayClient(relay, aliceStore);
+    let aliceOpen = true;
+    aliceStore.clientOpened();
+    let bob = await relayClient(relay, bobStore);
+    try {
+        const session = await alice.createSession({
+            descriptor: utf8Encode(`ST-07L ${label}`),
+            members: [await bob.discovery()],
+        });
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        await bob.activateSession(session.id);
+
+        const corruptedId = await alice.send(session.id, utf8Encode(`corrupt-${label}`));
+        const outboxKey = `${OUTBOX_PREFIX}${corruptedId}`;
+        alice.close();
+        aliceStore.clientClosed();
+        aliceOpen = false;
+        bob.close();
+        const original = await aliceStore.snapshotExact(outboxKey);
+        const operator = random.oneIn(2) ? "flip" : "truncate";
+        let offset: number;
+        if (operator === "flip") {
+            offset = 0;
+            await aliceStore.flipExact(outboxKey, offset, random.integer(1, 256));
+        } else {
+            offset = random.integer(0, Math.min(4, original.length));
+            await aliceStore.truncateExact(outboxKey, offset);
+        }
+
+        alice = await relayClient(relay, aliceStore);
+        aliceStore.clientOpened();
+        aliceOpen = true;
+        bob = await relayClient(relay, bobStore);
+        const corruptionOutcome = await alice.synchronize({ waitMilliseconds: 0 });
+        expect(corruptionOutcome).toMatchObject({
+            pendingOutboxes: 0,
+            terminalPublicationFailures: 1,
+        });
+        expect(await alice.session(session.id)).toMatchObject({ status: "active" });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        const corruptedDeliveries: string[] = [];
+        await consume(bob, corruptedDeliveries);
+
+        await alice.send(session.id, utf8Encode(`recovered-${label}`));
+        await alice.synchronize({ waitMilliseconds: 0 });
+        await bob.synchronize({ waitMilliseconds: 0 });
+        const recoveredDeliveries: string[] = [];
+        await consume(bob, recoveredDeliveries);
+
+        return Object.freeze({
+            seed,
+            operator,
+            offset,
+            recordLength: original.length,
+            issueCode: corruptionOutcome.issues.find((issue) => issue.code === "corrupt_outbox")
+                ?.code,
+            corruptedDeliveries: Object.freeze(corruptedDeliveries.slice()),
+            recoveredDeliveries: Object.freeze(recoveredDeliveries.slice()),
+        });
+    } finally {
+        alice.close();
+        if (aliceOpen) aliceStore.clientClosed();
+        bob.close();
+        await relay.close();
     }
 }
 
@@ -787,6 +1210,27 @@ describe("storage corruption and capacity chaos", () => {
         expect(await prefixDelegate.scan("murmur/", { limit: 4 })).toEqual(new Map());
     });
 
+    test("ST-02L real Add intent write ladder rolls back discovery claims and intent state", async () => {
+        const seed = 0x5354_3032;
+        const calibration = await runLiveIntentCapacity(seed);
+        expect(calibration.observedWrites).toBeGreaterThan(1);
+        expect(calibration.observedWrites).toBeLessThanOrEqual(20);
+        for (let nth = 1; nth <= calibration.observedWrites; nth += 1) {
+            const first = await runLiveIntentCapacity(seed, nth);
+            const replay = await runLiveIntentCapacity(seed, nth);
+            expect(replay).toEqual(first);
+            expect(first).toMatchObject({
+                seed,
+                failedWriteOrdinal: nth,
+                observedWrites: nth,
+                atomicRollback: true,
+                partialIntents: 0,
+                partialOutboxes: 0,
+                recoveredMembers: 3,
+            });
+        }
+    }, 120_000);
+
     test("ST-03/ST-04 buffer, callback drain, ack, and lost-response ordering stay durable", async () => {
         const delegate = new MemoryMurmurStore();
         const eventKey = `${APPLICATION_UPDATE_PREFIX}event-1`;
@@ -853,6 +1297,37 @@ describe("storage corruption and capacity chaos", () => {
         expect(utf8Decode((await delegate.get(ACK_KEY))!)).toBe("event-1");
         expect(callbacks).toBe(2);
         schedule.assertConsumed();
+    });
+
+    test("ST-03L real inbound disk-full rollback retains the exact relay event", async () => {
+        const seed = 0x5354_3033;
+        const first = await runLiveInboundCapacity(seed);
+        const replay = await runLiveInboundCapacity(seed);
+        expect(replay).toEqual(first);
+        expect(first).toEqual({
+            seed,
+            atomicRollback: true,
+            retainedEvent: true,
+            stableUpdateId: true,
+            recovered: [`capacity-replay-${seed.toString(16)}`],
+            followUp: [`capacity-follow-up-${seed.toString(16)}`],
+        });
+    });
+
+    test("ST-04L real post-callback disk-full drain replays one stable update ID", async () => {
+        const seed = 0x5354_3034;
+        const first = await runLiveDrainCapacity(seed);
+        const replay = await runLiveDrainCapacity(seed);
+        expect(replay).toEqual(first);
+        expect(first).toEqual({
+            seed,
+            callbackIdsStable: true,
+            durableEffectCount: 1,
+            callbackCount: 2,
+            bufferedAfterFailure: 1,
+            bufferedAfterRecovery: 0,
+            relayAcknowledgedBeforeDrain: true,
+        });
     });
 
     test("ST-05 bounded scans cover zero, page edges, after cursors, and maximum limits", async () => {
@@ -989,6 +1464,22 @@ describe("storage corruption and capacity chaos", () => {
             await relay.close();
         }
     }, 120_000);
+
+    test("ST-07L a real outbox corrupted between syncs is quarantined and replayable", async () => {
+        const seed = 0x5354_3037;
+        const first = await runLiveOutboxCorruption(seed);
+        const replay = await runLiveOutboxCorruption(seed);
+        expect(replay).toEqual(first);
+        expect(first).toMatchObject({
+            seed,
+            issueCode: "corrupt_outbox",
+            corruptedDeliveries: [],
+            recoveredDeliveries: [`recovered-${seed.toString(16)}`],
+        });
+        expect(["flip", "truncate"]).toContain(first.operator);
+        expect(first.offset).toBeGreaterThanOrEqual(0);
+        expect(first.offset).toBeLessThan(first.recordLength);
+    });
 
     test("ST-08 identity corruption fails closed and traces contain metadata only", async () => {
         const fixture = new InspectableStoreFixture();
