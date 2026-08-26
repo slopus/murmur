@@ -21,7 +21,10 @@ available only by the SHA-256 digest of its exact bytes and expires within five
 minutes.
 
 It stores no snapshots, retained chat history, event-sourced application state,
-anonymous topics, capability topics, or MLS state. The invitation cache is not
+anonymous topics, capability topics, or MLS state. The one exception is the
+canonical private-group state record dictated by the private-groups plan: an
+opaque encrypted record the relay backend keeps for as long as its group
+exists, versioned by UUIDv7 and never expired or evicted. The invitation cache is not
 enumerable and is not an identity directory. The negotiated authentication
 server retains only the account, device, endpoint, and protocol routing needed
 for admission and delivery. The relay does not interpret encrypted delivery
@@ -211,7 +214,9 @@ relay into durable history, an identity directory, or a recovery system.
 - Every schema upgrade after version 3 migrates in place and preserves pending
   relay data; operators are not required to start from a clean database.
 - The relay has no retained event history, snapshots, public identity or
-  application lists, generic topics, or anonymous addressing.
+  application lists, generic topics, or anonymous addressing, apart from the
+  opaque canonical private-group state records that persist while their group
+  exists.
 - Signed device revocation and account tombstones remove corresponding future
   routing authority and account-owned relay state without pretending to replace
   MLS Remove Commits.

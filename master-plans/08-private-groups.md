@@ -21,16 +21,22 @@ its group use.
 After a valid presentation, the service may issue a short-lived token scoped to
 that opaque group, entry, role, and expiry so ordinary record operations do not
 repeat the full proof. The token contains no account identifier and cannot be
-used in another group or after the underlying credential expires.
+used in another group or after the underlying credential expires. The token is
+cryptographically bound to the encrypted member entry it was issued for, so it
+is not a bare bearer secret; a use that does not match that binding fails.
 
 One random group master secret known only to members derives the opaque group
 identifier, group-specific identifier-encryption parameters, metadata keys,
 and public proof parameters. Identifier encryption is deterministic only
 within one group, allowing a client to reconstruct its own entry and the
 service to reject duplicates, while remaining unlinkable across groups. Group
-attributes are protected with authenticated encryption. Revisions are ordered
-and rollback-protected so the service provides one canonical encrypted state
-without becoming a trusted source of plaintext membership.
+attributes are protected with authenticated encryption. Every revision is named
+by a UUIDv7 version, and each write names the version it replaces, so a retried
+write is idempotent and a conflicting write is rejected deterministically.
+Clients reject any downgrade to an older version. The canonical record persists
+on the server for as long as its group exists; it is not expired or evicted.
+The service provides one canonical encrypted state without becoming a trusted
+source of plaintext membership.
 
 The cryptographic boundary includes prime-order Ristretto255 algebra,
 group-specific ElGamal-like verifiable identifier encryption, an algebraic-MAC
@@ -49,7 +55,11 @@ account membership and authorization; each active account device is still a
 separate MLS leaf. Every membership mutation binds one authorized canonical
 revision to the corresponding MLS proposal or Commit, and clients reject
 server forks, rollbacks, or roster changes that are not reflected in valid MLS
-state. The private-group service cannot silently add a decrypting member.
+state. The service runs on the backend beside the relay and trusts the relay's
+arbitration order to identify the winning Commit among concurrent candidates,
+so it refuses a canonical revision from a losing fork and canonical state
+follows the same winner every member adopts. The private-group service cannot
+silently add a decrypting member.
 
 Account deletion stops credential renewal, so private-group access ends within
 the deliberately short credential lifetime; it does not pretend to remove an
@@ -74,11 +84,14 @@ padding, proxy, PIR, ORAM, or mix-network work is added later.
   credential matching an encrypted member entry without revealing or globally
   linking that account.
 - A presentation-derived access token is short-lived, group- and role-scoped,
-  unlinkable to the account identifier, and useless after credential expiry.
+  bound to its encrypted member entry, unlinkable to the account identifier,
+  and useless after credential expiry.
 - Fixed roles on opaque entries let the service enforce group access control
   without learning which account holds a role.
-- Group record revisions have authenticated ordering, fork detection, rollback
-  protection, strict validation, replay protection, and bounded storage.
+- Group record versions are UUIDv7, every write names the version it replaces
+  and is idempotent under retry, clients reject downgrades and forks, the
+  record persists while its group exists, and validation, replay protection,
+  and record size stay strict and bounded.
 - The algebraic MAC, verifiable encryption, Schnorr proof system, Fiat-Shamir
   transcript, serialization, and key derivation pass independent positive,
   negative, malleability, forgery, and cross-domain test vectors before an
