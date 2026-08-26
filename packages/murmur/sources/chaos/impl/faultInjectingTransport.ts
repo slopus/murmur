@@ -41,14 +41,23 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
 }
 
 function cloneInboxDelivery(item: InboxDelivery): InboxDelivery {
-    return { eventId: item.eventId, delivery: cloneDelivery(item.delivery) };
+    return {
+        eventId: item.eventId,
+        ...(item.sequence === undefined ? {} : { sequence: item.sequence }),
+        delivery: cloneDelivery(item.delivery),
+    };
 }
 
 function clonePage(page: InboxPage): InboxPage {
     return {
         deliveries: page.deliveries.map(cloneInboxDelivery),
         head: page.head,
+        ...(page.headSequence === undefined ? {} : { headSequence: page.headSequence }),
         acknowledgedThrough: page.acknowledgedThrough,
+        ...(page.acknowledgedSequence === undefined
+            ? {}
+            : { acknowledgedSequence: page.acknowledgedSequence }),
+        ...(page.generation === undefined ? {} : { generation: page.generation.slice() }),
         exhausted: page.exhausted,
     };
 }
