@@ -107,5 +107,7 @@ describe("session outbox ordering", () => {
             bob.close();
             await relay.close();
         }
-    }, 20_000);
+        // Relay-derived fanout adds a round trip per publication, so this
+        // paging-plus-restart scenario needs more headroom on slow runners.
+    }, 60_000);
 });
