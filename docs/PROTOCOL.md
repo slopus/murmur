@@ -3,8 +3,8 @@
 Relay, discovery, delivery, and MLS session formats are version `1`. The
 built-in contact protocol and its persisted records are version `2`.
 
-The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
-baseline. Pre-beta client state, wire formats, and relay schemas are not read or
+The Murmur 0.5.0 release line and its fresh relay schema are the compatibility
+baseline. Pre-0.5.0 client state, wire formats, and relay schemas are not read or
 migrated. From this baseline onward, public wire formats remain compatible and
 relay schema upgrades migrate in place while preserving pending data.
 

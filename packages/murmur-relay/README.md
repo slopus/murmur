@@ -113,8 +113,8 @@ invitation cache. Applications using it must configure a compatible external
 `DiscoveryTransport`; deploying the Worker alone does not provide invitation
 revocation.
 
-The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
-baseline. Pre-beta SQLite databases, Postgres schemas, client state, and wire
+The Murmur 0.5.0 release line and its fresh relay schema are the compatibility
+baseline. Pre-0.5.0 SQLite databases, Postgres schemas, client state, and wire
 formats are unsupported and are not migrated; deploy the baseline with an empty
 relay. Every later schema upgrade must migrate in place while preserving
 pending relay data and must not require a clean database.

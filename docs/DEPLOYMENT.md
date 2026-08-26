@@ -35,7 +35,7 @@ operations. Proof, token, and canonical-record requests carry the opaque group
 header and are routed to that group's Durable Object. Each fresh object stores
 only its pinned opaque ID, current encrypted record, opaque member index, and
 bounded one-use presentation challenges. There is no legacy private-group
-record decoder or Durable Object storage migration path during beta.
+record decoder or Durable Object storage migration path at 0.5.0.
 
 The application server mounts `createRelaySessionFetchHandler`. Its
 `authorize` callback authenticates the user, verifies that the signed device
@@ -81,12 +81,12 @@ quota/UUID row.
 
 ## Upgrades
 
-The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
-baseline. The beta deployments start empty: pre-beta client state, wire
+The Murmur 0.5.0 release line and its fresh relay schema are the compatibility
+baseline. The 0.5.0 deployments start empty: pre-0.5.0 client state, wire
 formats, SQLite databases, and Postgres schemas are unsupported and have no
 migration path. Provision a fresh database when deploying this baseline.
 
-Every schema upgrade after the beta baseline must migrate an existing SQLite
+Every schema upgrade after the 0.5.0 baseline must migrate an existing SQLite
 database or Postgres schema in place while preserving pending relay data. Do
 not introduce a later upgrade that requires operators to delete relay data or
 provision a clean database.

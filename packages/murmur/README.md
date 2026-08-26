@@ -1182,11 +1182,11 @@ Deeper reference material lives in the repository docs:
 
 ## Protocol versions
 
-The Murmur 0.5.0 beta line and its fresh relay schema are the compatibility
-baseline. Pre-beta client state, wire formats, and relay schemas are not read or
+The Murmur 0.5.0 release line and its fresh relay schema are the compatibility
+baseline. Pre-0.5.0 client state, wire formats, and relay schemas are not read or
 migrated. Relay, discovery, delivery, and MLS session formats are version `1`;
 the built-in contact protocol and contact records are version `2`.
 
-From the beta baseline onward, releases preserve the public API and wire
+From the 0.5.0 baseline onward, releases preserve the public API and wire
 formats, read or migrate persisted client state, and migrate relay schemas in
 place without deleting pending data or requiring a clean database.
