@@ -932,107 +932,23 @@ export class SqliteRelayStore implements RelayStore {
                 "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
             );
             const version = bigintColumn(schema.version);
-            if (version === 3n) {
-                this.#database.exec("BEGIN IMMEDIATE");
-                try {
-                    this.#database.exec(`
-                    ALTER TABLE murmur_invitations ADD COLUMN revocation_key BLOB
-                        CHECK (revocation_key IS NULL OR length(revocation_key) = 32);
-                    CREATE INDEX murmur_invitation_revocation_key
-                        ON murmur_invitations(revocation_key);
-                    CREATE TABLE murmur_invitation_revocations (
-                        digest BLOB PRIMARY KEY CHECK (length(digest) = 32),
-                        revocation_key BLOB NOT NULL CHECK (length(revocation_key) = 32),
-                        expires_at INTEGER NOT NULL,
-                        admission_principal BLOB NOT NULL CHECK (
-                            length(admission_principal) = 32
-                        )
-                    ) STRICT;
-                    CREATE INDEX murmur_invitation_revocation_expiration
-                        ON murmur_invitation_revocations(expires_at);
-                    CREATE INDEX murmur_invitation_revocation_authority
-                        ON murmur_invitation_revocations(revocation_key);
-                    CREATE INDEX murmur_invitation_revocation_admission
-                        ON murmur_invitation_revocations(admission_principal);
-                    UPDATE murmur_queue_schema SET version = 4 WHERE singleton = 1;
-                    `);
-                    this.#database.exec("COMMIT");
-                } catch (error: unknown) {
-                    this.#rollback();
-                    throw error;
-                }
-                const queueGlobal = this.#get(
-                    `SELECT name FROM sqlite_master
-                     WHERE type = 'table' AND name = 'murmur_queue_global'`,
-                );
-                if (queueGlobal !== undefined) this.#initializeSchema();
-                return;
-            }
-            if (version === 4n) {
-                this.#database.exec("BEGIN IMMEDIATE");
-                try {
-                    this.#database.exec(`
-                    ALTER TABLE murmur_queue_global ADD COLUMN generation_seed BLOB
-                        NOT NULL
-                        DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
-                        CHECK (length(generation_seed) = 32);
-                    ALTER TABLE murmur_queues ADD COLUMN head_sequence INTEGER
-                        NOT NULL DEFAULT 0 CHECK (head_sequence >= 0);
-                    ALTER TABLE murmur_queues ADD COLUMN next_sequence INTEGER
-                        NOT NULL DEFAULT 1 CHECK (next_sequence > head_sequence);
-                    ALTER TABLE murmur_queues ADD COLUMN acknowledged_sequence INTEGER
-                        NOT NULL DEFAULT 0 CHECK (
-                            acknowledged_sequence >= 0 AND acknowledged_sequence <= head_sequence
-                        );
-                    ALTER TABLE murmur_queues ADD COLUMN loss_generation BLOB
-                        NOT NULL
-                        DEFAULT X'0000000000000000000000000000000000000000000000000000000000000000'
-                        CHECK (length(loss_generation) = 32);
-                    ALTER TABLE murmur_queue_references ADD COLUMN sequence INTEGER
-                        NOT NULL DEFAULT 0 CHECK (sequence >= 0);
-                    UPDATE murmur_queue_references AS reference
-                    SET sequence = (
-                        SELECT COUNT(*) FROM murmur_queue_references AS prior
-                        WHERE prior.recipient = reference.recipient
-                          AND prior.event_id <= reference.event_id
-                    );
-                    CREATE UNIQUE INDEX murmur_queue_reference_sequence
-                        ON murmur_queue_references(recipient, sequence);
-                    UPDATE murmur_queues
-                    SET head_sequence = COALESCE((
-                            SELECT MAX(sequence) FROM murmur_queue_references AS reference
-                            WHERE reference.recipient = murmur_queues.recipient
-                        ), 0),
-                        next_sequence = COALESCE((
-                            SELECT MAX(sequence) + 1
-                            FROM murmur_queue_references AS reference
-                            WHERE reference.recipient = murmur_queues.recipient
-                        ), 1);
-                    UPDATE murmur_queue_schema SET version = 5 WHERE singleton = 1;
-                    `);
-                    const seed = createGenerationSeed();
-                    this.#run(
-                        `UPDATE murmur_queue_global SET generation_seed = ? WHERE singleton = 1`,
-                        seed,
-                    );
-                    const queues = this.#all(`SELECT recipient FROM murmur_queues`);
-                    for (const queue of queues) {
-                        const recipient = copyBytes(queue.recipient, "queue recipient");
-                        this.#run(
-                            `UPDATE murmur_queues SET loss_generation = ? WHERE recipient = ?`,
-                            initialLossGeneration(seed, recipient),
-                            recipient,
-                        );
-                    }
-                    this.#database.exec("COMMIT");
-                } catch (error: unknown) {
-                    this.#rollback();
-                    throw error;
-                }
-                return;
-            }
             if (version !== 5n) {
                 throw new Error("Unsupported SQLite queue schema version");
+            }
+            const tables = this.#requiredGet(
+                `SELECT COUNT(*) AS table_count FROM sqlite_master
+                 WHERE type = 'table' AND name IN (
+                    'murmur_queue_schema',
+                    'murmur_queue_global',
+                    'murmur_queues',
+                    'murmur_queue_deliveries',
+                    'murmur_queue_references',
+                    'murmur_invitations',
+                    'murmur_invitation_revocations'
+                 )`,
+            );
+            if (safeNumberColumn(tables.table_count) !== 7) {
+                throw new Error("Incomplete SQLite queue schema");
             }
             return;
         }

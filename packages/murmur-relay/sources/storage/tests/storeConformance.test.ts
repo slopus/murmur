@@ -74,93 +74,41 @@ describe("identity queue store conformance", () => {
         await postgres.close();
     });
 
-    test("migrates schema v3 invitation rows in place on both backends", async () => {
-        const bundle = new TextEncoder().encode("pending v3 invitation");
-        const digest = sha256(bundle);
-
-        const sqlite = new DatabaseSync(":memory:");
-        sqlite.exec(`
+    test.each([3, 4] as const)(
+        "rejects pre-beta queue schema v%i on both backends",
+        async (version) => {
+            const sqlite = new DatabaseSync(":memory:");
+            sqlite.exec(`
             CREATE TABLE murmur_queue_schema (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3);
-            CREATE TABLE murmur_invitations (
-                digest BLOB PRIMARY KEY CHECK (length(digest) = 32),
-                bundle BLOB NOT NULL,
-                encoded_bytes INTEGER NOT NULL,
-                expires_at INTEGER NOT NULL,
-                admission_principal BLOB NOT NULL CHECK (length(admission_principal) = 32)
-            ) STRICT;
         `);
-        sqlite
-            .prepare(
-                `INSERT INTO murmur_invitations
-                    (digest, bundle, encoded_bytes, expires_at, admission_principal)
-                 VALUES (?, ?, ?, ?, ?)`,
-            )
-            .run(digest, bundle, BigInt(bundle.length), BigInt(NOW + 10), ADMISSION_PRINCIPAL);
-        const sqliteStore = new SqliteRelayStore(":memory:", { database: sqlite });
-        expect(await sqliteStore.readInvitation(digest, NOW)).toEqual({
-            bundle,
-            expiresAt: NOW + 10,
-        });
-        expect(sqlite.prepare("SELECT version FROM murmur_queue_schema").get()).toMatchObject({
-            version: 4,
-        });
-        expect(
             sqlite
-                .prepare(
-                    `SELECT name FROM sqlite_master
-                     WHERE type = 'table' AND name = 'murmur_invitation_revocations'`,
-                )
-                .get(),
-        ).toMatchObject({ name: "murmur_invitation_revocations" });
-        await sqliteStore.close();
+                .prepare("INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, ?)")
+                .run(BigInt(version));
+            expect(() => new SqliteRelayStore(":memory:", { database: sqlite })).toThrow(
+                "Unsupported SQLite queue schema version",
+            );
+            sqlite.close();
 
-        const postgres = new PGlite();
-        await postgres.exec(`
+            const postgres = new PGlite();
+            await postgres.exec(`
             CREATE TABLE murmur_queue_schema (
                 singleton bigint PRIMARY KEY CHECK (singleton = 1),
                 version bigint NOT NULL
             );
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3);
-            CREATE TABLE murmur_queue_global (
-                singleton bigint PRIMARY KEY,
-                last_event_id uuid
-            );
-            CREATE TABLE murmur_invitations (
-                digest bytea PRIMARY KEY CHECK (octet_length(digest) = 32),
-                bundle bytea NOT NULL,
-                encoded_bytes bigint NOT NULL,
-                expires_at bigint NOT NULL,
-                admission_principal bytea NOT NULL
-            );
         `);
-        await postgres.query(
-            `INSERT INTO murmur_invitations
-                (digest, bundle, encoded_bytes, expires_at, admission_principal)
-             VALUES ($1, $2, $3, $4, $5)`,
-            [digest, bundle, bundle.length, NOW + 10, ADMISSION_PRINCIPAL],
-        );
-        const postgresStore = await PostgresRelayStore.create(new PGliteDatabase(postgres));
-        expect(await postgresStore.readInvitation(digest, NOW)).toEqual({
-            bundle,
-            expiresAt: NOW + 10,
-        });
-        expect(
-            (await postgres.query<{ version: unknown }>("SELECT version FROM murmur_queue_schema"))
-                .rows[0],
-        ).toMatchObject({ version: 4 });
-        expect(
-            (
-                await postgres.query<{ name: unknown }>(
-                    `SELECT to_regclass('murmur_invitation_revocations') AS name`,
-                )
-            ).rows[0],
-        ).toMatchObject({ name: "murmur_invitation_revocations" });
-        await postgresStore.close();
-    });
+            await postgres.query(
+                "INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, $1)",
+                [version],
+            );
+            await expect(PostgresRelayStore.create(new PGliteDatabase(postgres))).rejects.toThrow(
+                "Unsupported Postgres queue schema version",
+            );
+            await postgres.close();
+        },
+    );
 
     test("stores invitations by digest without extending expiry and releases cache quota", async () => {
         const firstBundle = new TextEncoder().encode("first public invitation");

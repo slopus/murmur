@@ -32,7 +32,7 @@ import type {
     StoreInvitationOutcome,
 } from "../types.js";
 import type { PostgresDatabase, PostgresQuery } from "./database.js";
-import { createPostgresRelaySchema } from "./migrations.js";
+import { createPostgresRelaySchema } from "./schema.js";
 
 export {
     PgPoolDatabase,
