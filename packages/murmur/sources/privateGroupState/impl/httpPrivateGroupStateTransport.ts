@@ -10,20 +10,17 @@ import type {
     PrivateGroupAccessToken,
     PrivateGroupPresentationChallenge,
     PrivateGroupRole,
+    PrivateGroupStateFetch,
     PrivateGroupStateRecord,
     PrivateGroupStateTransport,
     StoredPrivateGroupStateRecord,
 } from "../types.js";
 
+export type { PrivateGroupStateFetch } from "../types.js";
+
 const DEFAULT_MAXIMUM_RESPONSE_BYTES = 2 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MILLISECONDS = 45_000;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-
-/** Fetch seam used by the experimental private-group HTTP transport. */
-export type PrivateGroupStateFetch = (
-    input: RequestInfo | URL,
-    init?: RequestInit,
-) => Promise<Response>;
 
 /** Construction inputs for the experimental private-group HTTP transport. */
 export interface HttpPrivateGroupStateTransportOptions {

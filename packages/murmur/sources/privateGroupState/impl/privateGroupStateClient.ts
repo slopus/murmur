@@ -270,11 +270,15 @@ export class PrivateGroupStateClient {
         const ownRole = this.#roleForOwnAccount(content);
         if (ownRole !== "owner") throw new Error("Private-group creator must have owner role");
         const token = await this.authorize(credential, ownRole, "create");
-        const stored = await this.#transport.createRecord({
-            record: this.buildInitialRecord(content),
-            token: token.bytes,
-        });
-        return this.acceptRecord(stored, content);
+        try {
+            const stored = await this.#transport.createRecord({
+                record: this.buildInitialRecord(content),
+                token: token.bytes,
+            });
+            return this.acceptRecord(stored, content);
+        } finally {
+            zeroBytes(token.bytes);
+        }
     }
 
     /** Read, authenticate, decrypt, and MLS-bind the current canonical record. */

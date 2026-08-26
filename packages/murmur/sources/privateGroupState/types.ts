@@ -99,6 +99,38 @@ export interface PrivateGroupStateTransport {
     }): Promise<StoredPrivateGroupStateRecord>;
 }
 
+/** Fetch seam used by the experimental private-group HTTP transport. */
+export type PrivateGroupStateFetch = (
+    input: RequestInfo | URL,
+    init?: RequestInit,
+) => Promise<Response>;
+
+/** App-safe connection configuration for one private-group state service. */
+export type PrivateGroupStateConnection =
+    | {
+          /** State-service base URL, commonly the same URL as the relay. */
+          readonly relay: string | URL;
+          readonly transport?: never;
+          readonly fetch?: PrivateGroupStateFetch;
+          readonly maximumResponseBytes?: number;
+          readonly requestTimeoutMilliseconds?: number;
+      }
+    | {
+          /** Custom state-service transport for embedding or testing. */
+          readonly transport: PrivateGroupStateTransport;
+          readonly relay?: never;
+          readonly fetch?: never;
+          readonly maximumResponseBytes?: never;
+          readonly requestTimeoutMilliseconds?: never;
+      };
+
+/** Durable rollback-protection tip retained with one session's private state. */
+export interface PrivateGroupTrustedTip {
+    readonly canonicalVersion: string;
+    readonly revision: number;
+    readonly revisionHash: Uint8Array;
+}
+
 /** Accepted and decrypted state returned to private-group feature code. */
 export interface PrivateGroupAcceptedState {
     readonly record: StoredPrivateGroupStateRecord;
@@ -111,11 +143,14 @@ export interface PrivateGroupStateClientOptions {
     readonly groupMasterSecret: Uint8Array;
     readonly transport: PrivateGroupStateTransport;
     readonly now?: () => number;
-    readonly trustedTip?: {
-        readonly canonicalVersion: string;
-        readonly revision: number;
-        readonly revisionHash: Uint8Array;
-    };
+    readonly trustedTip?: PrivateGroupTrustedTip;
+}
+
+/** Plaintext attributes and public canonical metadata returned by a ready handle. */
+export interface PrivateGroupStateSnapshot {
+    readonly attributes: Uint8Array;
+    readonly revision: number;
+    readonly canonicalVersion: string;
 }
 
 /** Inputs shared by initial and successor canonical record construction. */
