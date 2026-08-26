@@ -1,6 +1,6 @@
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
-import { generateIdentityKeyPair } from "../../crypto/index.js";
+import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
 import type {
     DeliveryFetch,
     DeliveryPublishOutcome,
@@ -16,22 +16,31 @@ import {
     HttpDeliveryTransport,
     createSignedDelivery,
 } from "../../delivery/index.js";
-import { MurmurClient } from "../../sessions/index.js";
-import type { MurmurSession, MurmurUpdate } from "../../sessions/index.js";
+import { MurmurClient, MurmurResetRequiredError } from "../../sessions/index.js";
+import type { MurmurResetEvent, MurmurSession, MurmurUpdate } from "../../sessions/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import type { MurmurStore } from "../../storage/index.js";
-import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
-import { ManualVirtualClock, SeededRandom, settleChaos } from "../index.js";
+import { encodeBase64Url, equalBytes, utf8Decode, utf8Encode } from "../../utils/index.js";
+import {
+    ChaosCrashError,
+    FaultInjectingMurmurStore,
+    ManualVirtualClock,
+    SeededChaosSchedule,
+    SeededRandom,
+    settleChaos,
+} from "../index.js";
+import type { ChaosRule } from "../index.js";
 
 const NOW = 1_700_000_000_000;
 const RACE_SEED = 0x5241_4345;
 const STORE_LIMIT = 2_001;
 const COMMIT_KIND = 3;
+const POST_COMMIT_OUTBOX_PREFIX = "murmur/post-commit-outboxes/";
 const OUTBOX_PREFIXES = [
     "murmur/session-outbox/",
     "murmur/session-outbox-order/",
     "murmur/epoch-outboxes/",
-    "murmur/post-commit-outboxes/",
+    POST_COMMIT_OUTBOX_PREFIX,
     "murmur/bootstrap-outboxes/",
 ] as const;
 const INTENT_PREFIX = "murmur/session-intents/";
@@ -302,6 +311,27 @@ async function reopen(actor: RaceActor, fixture: RaceFixture): Promise<void> {
     });
 }
 
+async function reopenWithStore(
+    actor: RaceActor,
+    fixture: RaceFixture,
+    store: MurmurStore,
+): Promise<void> {
+    actor.client.close();
+    actor.client = await MurmurClient.open({
+        store,
+        transport: actor.transport,
+        now: fixture.clock.now,
+    });
+}
+
+async function abandonAndReopen(actor: RaceActor, fixture: RaceFixture): Promise<void> {
+    actor.client = await MurmurClient.open({
+        store: actor.store,
+        transport: actor.transport,
+        now: fixture.clock.now,
+    });
+}
+
 function updateHook(actor: RaceActor): (updates: readonly MurmurUpdate[]) => void {
     return (updates) => {
         for (const update of updates) {
@@ -460,6 +490,35 @@ async function releaseTwo(
     return [firstAccepted, secondAccepted];
 }
 
+async function stageMany(
+    fixture: RaceFixture,
+    actors: readonly RaceActor[],
+): Promise<readonly Promise<unknown>[]> {
+    fixture.gate.arm();
+    const pending = actors.map((actor) => synchronize(actor));
+    for (const operation of pending) void operation.catch(() => undefined);
+    await fixture.gate.waitFor(actors.length);
+    expect(new Set(fixture.gate.pendingActors())).toEqual(
+        new Set(actors.map((actor) => actor.name)),
+    );
+    return pending;
+}
+
+async function releaseMany(
+    fixture: RaceFixture,
+    order: readonly RaceActor[],
+    pending: readonly Promise<unknown>[],
+): Promise<readonly AcceptedCommit[]> {
+    const accepted: AcceptedCommit[] = [];
+    for (const actor of order) accepted.push(await fixture.gate.accept(actor.name));
+    await Promise.all(pending);
+    fixture.gate.disarm();
+    for (let index = 1; index < accepted.length; index += 1) {
+        expectComparable(accepted[index - 1]!, accepted[index]!);
+    }
+    return accepted;
+}
+
 async function activateIfPending(actor: RaceActor, sessionId: Uint8Array): Promise<void> {
     const session = await actor.client.session(sessionId);
     if (session?.status === "pending") await actor.client.activateSession(sessionId);
@@ -485,15 +544,64 @@ async function assertNoOrphans(actors: readonly RaceActor[]): Promise<void> {
     }
 }
 
+async function assertNoOutboxes(actors: readonly RaceActor[]): Promise<void> {
+    for (const actor of actors) {
+        const counts = await storeCounts(actor.store);
+        for (const prefix of OUTBOX_PREFIXES) {
+            expect(counts[prefix], `${actor.name}:${prefix}`).toBe(0);
+        }
+    }
+}
+
 function memberCount(session: MurmurSession | undefined, actor: RaceActor): number {
     const key = encodeBase64Url(actor.client.accountKey);
     return session?.members.map(encodeBase64Url).filter((member) => member === key).length ?? 0;
 }
 
+type ReencryptStoreCut = "S0" | "S1" | "S2" | "S3";
+
+const REENCRYPT_STORE_CUTS: readonly ReencryptStoreCut[] = ["S0", "S1", "S2", "S3"];
+
+function reencryptStoreRule(cut: ReencryptStoreCut, oldDeliveryId: string): ChaosRule {
+    const selector =
+        cut === "S0"
+            ? {
+                  boundary: "store" as const,
+                  operation: "transaction",
+                  phase: "before" as const,
+                  ordinal: 4,
+              }
+            : cut === "S1"
+              ? {
+                    boundary: "store" as const,
+                    operation: "transaction.delete",
+                    phase: "after" as const,
+                    key: `murmur/session-outbox/${oldDeliveryId}`,
+                }
+              : cut === "S2"
+                ? {
+                      boundary: "store" as const,
+                      operation: "transaction.commit",
+                      phase: "before" as const,
+                      ordinal: 4,
+                  }
+                : {
+                      boundary: "store" as const,
+                      operation: "transaction",
+                      phase: "after" as const,
+                      ordinal: 4,
+                  };
+    return {
+        id: `loser-reencrypt-${cut}`,
+        selector,
+        effect: { type: "crash", message: `injected loser re-encryption ${cut}` },
+    };
+}
+
 describe("Commit race and intent convergence chaos", () => {
     interface RaceScenario {
         readonly name: string;
-        readonly expectedFailure: boolean;
+        readonly expectedFailure: string | undefined;
         readonly run: () => Promise<void>;
     }
 
@@ -503,14 +611,15 @@ describe("Commit race and intent convergence chaos", () => {
         _options: { readonly timeout: number },
         run: () => Promise<void>,
     ): void => {
-        scenarios.push({ name, expectedFailure: false, run });
+        scenarios.push({ name, expectedFailure: undefined, run });
     };
     const scenarioFails = (
         name: string,
+        productFinding: string,
         _options: { readonly timeout: number },
         run: () => Promise<void>,
     ): void => {
-        scenarios.push({ name, expectedFailure: true, run });
+        scenarios.push({ name, expectedFailure: productFinding, run });
     };
 
     scenario(
@@ -709,6 +818,7 @@ describe("Commit race and intent convergence chaos", () => {
 
     scenarioFails(
         "RACE-06 plain-member Add is terminally re-authorized after a policy winner",
+        "PRODUCT FINDING RACE-06/I08",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture();
@@ -725,15 +835,22 @@ describe("Commit race and intent convergence chaos", () => {
                 await releaseTwo(fixture, fixture.alice, fixture.carol, [pending[1], pending[0]]);
                 await settle(fixture, fixture.session.id, ["alice", "carol", "bob", "dave"], 20);
                 expect(
-                    (await fixture.carol.client.issues()).filter(({ operationId }) => operationId),
-                ).toHaveLength(1);
-                expect(
                     memberCount(
                         await fixture.alice.client.session(fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(0);
-                await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
+                await assertNoOutboxes([fixture.alice, fixture.bob, fixture.carol]);
+                const terminalIssues = (await fixture.carol.client.issues()).filter(
+                    ({ operationId }) => operationId !== undefined,
+                );
+                expect(
+                    {
+                        intents: (await storeCounts(fixture.carol.store))[INTENT_PREFIX],
+                        issues: terminalIssues.length,
+                    },
+                    "PRODUCT FINDING RACE-06/I08: the safely rejected losing Add remains a zombie intent and has no durable operation issue",
+                ).toEqual({ intents: 0, issues: 1 });
             } finally {
                 await closeFixture(fixture);
             }
@@ -840,6 +957,7 @@ describe("Commit race and intent convergence chaos", () => {
 
     scenarioFails(
         "RACE-08 revoke-first terminalizes the rebased unauthorized admin action",
+        "PRODUCT FINDING RACE-08/I08",
         { timeout: 120_000 },
         async () => {
             const fixture = await activeFixture({ anyoneCanAddMembers: false });
@@ -856,15 +974,22 @@ describe("Commit race and intent convergence chaos", () => {
                 await releaseTwo(fixture, fixture.alice, fixture.bob, [pending[1], pending[0]]);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 20);
                 expect(
-                    (await fixture.bob.client.issues()).filter(({ operationId }) => operationId),
-                ).toHaveLength(1);
-                expect(
                     memberCount(
                         await fixture.alice.client.session(fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(0);
-                await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
+                await assertNoOutboxes([fixture.alice, fixture.bob, fixture.carol]);
+                const terminalIssues = (await fixture.bob.client.issues()).filter(
+                    ({ operationId }) => operationId !== undefined,
+                );
+                expect(
+                    {
+                        intents: (await storeCounts(fixture.bob.store))[INTENT_PREFIX],
+                        issues: terminalIssues.length,
+                    },
+                    "PRODUCT FINDING RACE-08/I08: the safely rejected losing admin Add remains a zombie intent and has no durable operation issue",
+                ).toEqual({ intents: 0, issues: 1 });
             } finally {
                 await closeFixture(fixture);
             }
@@ -1273,6 +1398,511 @@ describe("Commit race and intent convergence chaos", () => {
         },
     );
 
+    scenario(
+        "RACE-17 three full-client candidates serialize from one parent epoch",
+        { timeout: 120_000 },
+        async () => {
+            const fixture = await activeFixture();
+            const frank = await addActor(fixture, "frank");
+            try {
+                const parent = publicSession(
+                    await fixture.alice.client.session(fixture.session.id),
+                );
+                expect(publicSession(await fixture.bob.client.session(fixture.session.id))).toEqual(
+                    parent,
+                );
+                expect(
+                    publicSession(await fixture.carol.client.session(fixture.session.id)),
+                ).toEqual(parent);
+                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                expect(await fixture.erin.client.session(fixture.session.id)).toBeUndefined();
+                expect(await frank.client.session(fixture.session.id)).toBeUndefined();
+
+                await fixture.alice.client.addMember(
+                    fixture.session.id,
+                    await fixture.dave.client.discovery(),
+                );
+                await fixture.bob.client.addMember(
+                    fixture.session.id,
+                    await fixture.erin.client.discovery(),
+                );
+                await fixture.carol.client.addMember(
+                    fixture.session.id,
+                    await frank.client.discovery(),
+                );
+                const candidates = [fixture.alice, fixture.bob, fixture.carol] as const;
+                const pending = await stageMany(fixture, candidates);
+                const accepted = await releaseMany(
+                    fixture,
+                    [fixture.carol, fixture.alice, fixture.bob],
+                    pending,
+                );
+                expect(accepted.map(({ actor }) => actor)).toEqual(["carol", "alice", "bob"]);
+
+                const participants = [
+                    fixture.alice,
+                    fixture.bob,
+                    fixture.carol,
+                    fixture.dave,
+                    fixture.erin,
+                    frank,
+                ] as const;
+                await settle(
+                    fixture,
+                    fixture.session.id,
+                    participants.map(({ name }) => name),
+                    80,
+                );
+                for (const joiner of [fixture.dave, fixture.erin, frank]) {
+                    await activateIfPending(joiner, fixture.session.id);
+                }
+                await settle(
+                    fixture,
+                    fixture.session.id,
+                    participants.map(({ name }) => name),
+                    80,
+                );
+                const terminal = publicSession(
+                    await fixture.alice.client.session(fixture.session.id),
+                );
+                for (const actor of participants) {
+                    const session = await actor.client.session(fixture.session.id);
+                    expect(publicSession(session)).toEqual(terminal);
+                    for (const joiner of [fixture.dave, fixture.erin, frank]) {
+                        expect(memberCount(session, joiner)).toBe(1);
+                    }
+                }
+                expect(
+                    (
+                        await Promise.all(candidates.map(async (actor) => actor.client.issues()))
+                    ).flatMap((issues) => issues.filter(({ operationId }) => operationId)),
+                ).toEqual([]);
+                await assertNoOrphans(participants);
+            } finally {
+                await closeFixture(fixture);
+            }
+        },
+    );
+
+    scenarioFails(
+        "RACE-18 four full-client candidates converge through duplicate Adds",
+        "PRODUCT FINDING RACE-18/I06/I10",
+        { timeout: 120_000 },
+        async () => {
+            const fixture = await activeFixture();
+            const frank = await addActor(fixture, "frank");
+            try {
+                await addAndActivate(fixture, fixture.alice, fixture.dave);
+                const current = [fixture.alice, fixture.bob, fixture.carol, fixture.dave] as const;
+                const parent = publicSession(
+                    await fixture.alice.client.session(fixture.session.id),
+                );
+                for (const actor of current) {
+                    expect(publicSession(await actor.client.session(fixture.session.id))).toEqual(
+                        parent,
+                    );
+                }
+
+                await fixture.alice.client.setPolicies(fixture.session.id, {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                });
+                await fixture.bob.client.addMember(
+                    fixture.session.id,
+                    await frank.client.discovery(),
+                );
+                await fixture.carol.client.addMember(
+                    fixture.session.id,
+                    await fixture.erin.client.discovery(),
+                );
+                await fixture.dave.client.addMember(
+                    fixture.session.id,
+                    await frank.client.discovery(),
+                );
+                const pending = await stageMany(fixture, current);
+                const accepted = await releaseMany(
+                    fixture,
+                    [fixture.dave, fixture.carol, fixture.bob, fixture.alice],
+                    pending,
+                );
+                expect(accepted.map(({ actor }) => actor)).toEqual([
+                    "dave",
+                    "carol",
+                    "bob",
+                    "alice",
+                ]);
+
+                const participants = [...current, fixture.erin, frank] as const;
+                await settle(
+                    fixture,
+                    fixture.session.id,
+                    participants.map(({ name }) => name),
+                    100,
+                );
+                await activateIfPending(fixture.erin, fixture.session.id);
+                await activateIfPending(frank, fixture.session.id);
+                await settle(
+                    fixture,
+                    fixture.session.id,
+                    participants.map(({ name }) => name),
+                    100,
+                );
+                const terminal = await fixture.alice.client.session(fixture.session.id);
+                expect(terminal?.policies).toEqual({
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                });
+                expect(terminal?.members).toHaveLength(6);
+                for (const actor of participants.filter(({ name }) => name !== "frank")) {
+                    const session = await actor.client.session(fixture.session.id);
+                    expect(publicSession(session), `${actor.name} terminal snapshot`).toEqual(
+                        publicSession(terminal),
+                    );
+                    expect(memberCount(session, fixture.erin)).toBe(1);
+                    expect(memberCount(session, frank)).toBe(1);
+                }
+                await assertNoOrphans(participants);
+                const frankTerminal = await frank.client.session(fixture.session.id);
+                expect(frankTerminal?.status).toBe("active");
+                expect(memberCount(frankTerminal, frank)).toBe(1);
+                expect(memberCount(frankTerminal, fixture.erin)).toBe(0);
+                expect(frankTerminal?.policies.adminsAssignAdmins).toBe(true);
+                expect(
+                    publicSession(frankTerminal),
+                    "PRODUCT FINDING RACE-18/I06/I10: the first winning Add joiner stays on its activation epoch and misses later rebased Commits",
+                ).toEqual(publicSession(terminal));
+            } finally {
+                await closeFixture(fixture);
+            }
+        },
+    );
+
+    scenarioFails(
+        "RACE-19 relay-first winner survives loser continuity reset and re-admission",
+        "PRODUCT FINDING RACE-19/I06/I15/I24",
+        { timeout: 120_000 },
+        async () => {
+            const fixture = await activeFixture();
+            const expiringSender = generateIdentityKeyPair();
+            const resets: MurmurResetEvent[] = [];
+            const bobIdentity = fixture.bob.client.identity;
+            try {
+                const parent = await fixture.bob.client.session(fixture.session.id);
+                expect(parent?.status).toBe("active");
+                expect(memberCount(parent, fixture.carol)).toBe(1);
+
+                await fixture.bob.client.removeMember(
+                    fixture.session.id,
+                    fixture.carol.client.accountKey,
+                );
+                await fixture.alice.client.setPolicies(fixture.session.id, {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                });
+                const pending = await stageTwo(fixture, fixture.bob, fixture.alice);
+                const winner = await fixture.gate.accept("alice");
+                const loser = await fixture.gate.accept("bob", true);
+                expectComparable(winner, loser);
+                await pending[1];
+
+                const transport = new HttpDeliveryTransport("https://relay.test", {
+                    fetch: fixture.fetch,
+                });
+                await transport.publish(
+                    createSignedDelivery(
+                        expiringSender,
+                        [fixture.bob.client.identity],
+                        utf8Encode("race-continuity-loss"),
+                        {
+                            createdAt: fixture.clock.now(),
+                            expiresAt: fixture.clock.now() + 1,
+                        },
+                    ),
+                );
+                fixture.clock.advance(2);
+                await expect(fixture.relay.pruneExpired()).resolves.toBe(1);
+                fixture.gate.releaseResponse("bob");
+                await expect(pending[0]).resolves.toMatchObject({
+                    inbox: { processed: 0 },
+                });
+                fixture.gate.disarm();
+                await expect(
+                    fixture.bob.client.synchronize({ waitMilliseconds: 0 }),
+                ).rejects.toMatchObject({
+                    name: "MurmurResetRequiredError",
+                    committed: false,
+                } satisfies Partial<MurmurResetRequiredError>);
+                expect(await fixture.bob.store.get("murmur/reset/v1/pending")).toBeDefined();
+                expect(await fixture.bob.client.session(fixture.session.id)).toBeDefined();
+
+                await expect(
+                    fixture.bob.client.synchronize(
+                        { waitMilliseconds: 0 },
+                        {
+                            onReset: (reset) => {
+                                resets.push(reset);
+                            },
+                        },
+                    ),
+                ).rejects.toMatchObject({
+                    name: "MurmurResetRequiredError",
+                    committed: true,
+                } satisfies Partial<MurmurResetRequiredError>);
+                expect(resets).toHaveLength(1);
+                expect(resets[0]!.sessions).toHaveLength(1);
+                expect(equalBytes(resets[0]!.sessions[0]!.id, fixture.session.id)).toBe(true);
+                expect(equalBytes(fixture.bob.client.identity, bobIdentity)).toBe(true);
+                expect(await fixture.bob.client.session(fixture.session.id)).toBeUndefined();
+                await assertNoOrphans([fixture.bob]);
+
+                for (let cycle = 0; cycle < 12; cycle += 1) {
+                    for (const actor of [fixture.alice, fixture.carol, fixture.bob]) {
+                        try {
+                            await synchronize(actor);
+                        } catch (error: unknown) {
+                            throw new Error(
+                                `reset convergence cycle=${cycle} actor=${actor.name}: ${
+                                    error instanceof Error ? error.message : String(error)
+                                }`,
+                            );
+                        }
+                    }
+                }
+                await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
+                    {
+                        status: "pending",
+                        reAdmission: true,
+                    },
+                );
+                await fixture.bob.client.activateSession(fixture.session.id);
+                await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
+                    {
+                        status: "active",
+                        reAdmission: true,
+                    },
+                );
+                let convergenceFailure: unknown;
+                try {
+                    await settle(fixture, fixture.session.id, ["alice", "carol", "bob"], 80);
+                } catch (error: unknown) {
+                    convergenceFailure = error;
+                }
+                if (
+                    convergenceFailure !== undefined &&
+                    (!(convergenceFailure instanceof Error) ||
+                        convergenceFailure.message !== "Invalid device credential")
+                ) {
+                    throw new Error("Unexpected post-readmission race failure", {
+                        cause: convergenceFailure,
+                    });
+                }
+                expect(
+                    convergenceFailure,
+                    "PRODUCT FINDING RACE-19/I06/I15/I24: the freshly re-admitted race loser rejects the first post-activation Commit credential",
+                ).toBeUndefined();
+                const terminal = await fixture.alice.client.session(fixture.session.id);
+                expect(terminal?.policies).toEqual({
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                });
+                expect(memberCount(terminal, fixture.bob)).toBe(1);
+                expect(memberCount(terminal, fixture.carol)).toBe(1);
+                for (const actor of [fixture.alice, fixture.bob, fixture.carol]) {
+                    expect(publicSession(await actor.client.session(fixture.session.id))).toEqual(
+                        publicSession(terminal),
+                    );
+                }
+                expect((await fixture.bob.client.session(fixture.session.id))?.reAdmission).toBe(
+                    true,
+                );
+                await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
+            } finally {
+                destroyIdentity(expiringSender);
+                await closeFixture(fixture);
+            }
+        },
+    );
+
+    scenario(
+        "RACE-20 two losing bootstraps are replaced before one activation",
+        { timeout: 120_000 },
+        async () => {
+            const fixture = await activeFixture();
+            try {
+                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                await fixture.bob.client.addMember(
+                    fixture.session.id,
+                    await fixture.dave.client.discovery(),
+                );
+                fixture.gate.arm();
+                const firstCandidate = synchronize(fixture.bob);
+                void firstCandidate.catch(() => undefined);
+                await fixture.gate.waitFor(1);
+                fixture.gate.reject(
+                    "bob",
+                    new DeliveryTransportError(429, "first losing Add candidate"),
+                );
+                await firstCandidate;
+                fixture.gate.disarm();
+                await synchronize(fixture.dave);
+                await expect(
+                    fixture.dave.client.session(fixture.session.id),
+                ).resolves.toMatchObject({
+                    status: "pending",
+                });
+
+                await fixture.alice.client.setPolicies(fixture.session.id, {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: true,
+                });
+                await synchronize(fixture.alice);
+                await synchronize(fixture.alice);
+
+                fixture.gate.arm();
+                const staleCandidate = synchronize(fixture.bob);
+                void staleCandidate.catch(() => undefined);
+                await fixture.gate.waitFor(1);
+                fixture.gate.reject(
+                    "bob",
+                    new DeliveryTransportError(429, "observe first replacement parent"),
+                );
+                await fixture.gate.waitFor(1);
+                expect(fixture.gate.pendingActors()).toEqual(["bob"]);
+                await fixture.alice.client.setPolicies(fixture.session.id, {
+                    adminsAssignAdmins: true,
+                    anyoneCanAddMembers: true,
+                });
+                const policySync = synchronize(fixture.alice);
+                void policySync.catch(() => undefined);
+                await fixture.gate.waitFor(2);
+                expect(new Set(fixture.gate.pendingActors())).toEqual(new Set(["bob", "alice"]));
+                const winner = await fixture.gate.accept("alice");
+                const loser = await fixture.gate.accept("bob");
+                await Promise.all([policySync, staleCandidate]);
+                fixture.gate.disarm();
+                expectComparable(winner, loser);
+                expect(winner.actor).toBe("alice");
+                await synchronize(fixture.dave);
+                await expect(
+                    fixture.dave.client.session(fixture.session.id),
+                ).resolves.toMatchObject({
+                    status: "pending",
+                });
+
+                await settle(fixture, fixture.session.id, ["carol", "alice", "bob", "dave"], 80);
+                await activateIfPending(fixture.dave, fixture.session.id);
+                await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 80);
+                const terminal = await fixture.alice.client.session(fixture.session.id);
+                expect(terminal?.policies).toEqual({
+                    adminsAssignAdmins: true,
+                    anyoneCanAddMembers: true,
+                });
+                for (const actor of [fixture.alice, fixture.bob, fixture.carol, fixture.dave]) {
+                    const session = await actor.client.session(fixture.session.id);
+                    expect(publicSession(session)).toEqual(publicSession(terminal));
+                    expect(memberCount(session, fixture.dave)).toBe(1);
+                }
+                expect(
+                    fixture.bob.transport.publications.filter(
+                        ({ ciphertext }) => ciphertext[0] !== COMMIT_KIND,
+                    ).length,
+                ).toBeGreaterThanOrEqual(3);
+                await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol, fixture.dave]);
+            } finally {
+                await closeFixture(fixture);
+            }
+        },
+    );
+
+    scenario(
+        "RACE-21 losing-send re-encryption survives S0-S3 transaction cuts",
+        { timeout: 120_000 },
+        async () => {
+            const labels = ["cut-a", "cut-b"] as const;
+            for (const cut of REENCRYPT_STORE_CUTS) {
+                const fixture = await activeFixture();
+                try {
+                    const parent = publicSession(
+                        await fixture.bob.client.session(fixture.session.id),
+                    );
+                    expect(parent).toEqual(
+                        publicSession(await fixture.alice.client.session(fixture.session.id)),
+                    );
+                    const bobIdentity = fixture.bob.client.identity;
+                    await fixture.bob.client.removeMember(
+                        fixture.session.id,
+                        fixture.carol.client.accountKey,
+                    );
+                    fixture.gate.arm();
+                    const staged = synchronize(fixture.bob);
+                    void staged.catch(() => undefined);
+                    await fixture.gate.waitFor(1);
+                    fixture.gate.reject(
+                        "bob",
+                        new DeliveryTransportError(429, `stage losing Commit before ${cut}`),
+                    );
+                    await staged;
+                    fixture.gate.disarm();
+                    for (const label of labels) {
+                        await fixture.bob.client.send(fixture.session.id, utf8Encode(label));
+                    }
+
+                    await fixture.alice.client.setPolicies(fixture.session.id, {
+                        adminsAssignAdmins: false,
+                        anyoneCanAddMembers: true,
+                    });
+                    await synchronize(fixture.alice);
+                    await synchronize(fixture.alice);
+
+                    const indexes = await fixture.bob.store.scan(POST_COMMIT_OUTBOX_PREFIX, {
+                        limit: STORE_LIMIT,
+                    });
+                    const oldIds = [...indexes.keys()]
+                        .map((key) => key.slice(key.lastIndexOf("/") + 1))
+                        .sort();
+                    expect(oldIds, `${cut} staged-send indexes`).toHaveLength(labels.length);
+                    const schedule = new SeededChaosSchedule(
+                        (0x5241_4321 ^ REENCRYPT_STORE_CUTS.indexOf(cut)) >>> 0,
+                        [reencryptStoreRule(cut, oldIds[0]!)],
+                    );
+                    const store = new FaultInjectingMurmurStore({
+                        actor: "bob",
+                        delegate: fixture.bob.store,
+                        schedule,
+                    });
+                    await reopenWithStore(fixture.bob, fixture, store);
+                    await expect(synchronize(fixture.bob)).rejects.toBeInstanceOf(ChaosCrashError);
+                    schedule.assertConsumed();
+                    expect(
+                        schedule.trace.filter(({ ruleId }) => ruleId === `loser-reencrypt-${cut}`),
+                    ).toHaveLength(1);
+
+                    await abandonAndReopen(fixture.bob, fixture);
+                    expect(equalBytes(fixture.bob.client.identity, bobIdentity)).toBe(true);
+                    await settle(fixture, fixture.session.id, ["carol", "alice", "bob"], 80);
+                    expect(fixture.alice.updates.map(({ text }) => text)).toEqual(labels);
+                    expect(fixture.bob.updates.map(({ text }) => text)).toEqual(labels);
+                    expect(fixture.carol.updates.map(({ text }) => text)).toEqual([]);
+                    for (const actor of [fixture.alice, fixture.bob]) {
+                        expect(new Set(actor.updates.map(({ id }) => id)).size).toBe(labels.length);
+                    }
+                    const terminal = await fixture.alice.client.session(fixture.session.id);
+                    expect(terminal?.policies).toEqual({
+                        adminsAssignAdmins: false,
+                        anyoneCanAddMembers: true,
+                    });
+                    expect(memberCount(terminal, fixture.carol)).toBe(0);
+                    expect(
+                        publicSession(await fixture.bob.client.session(fixture.session.id)),
+                    ).toEqual(publicSession(terminal));
+                    await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
+                } finally {
+                    await closeFixture(fixture);
+                }
+            }
+        },
+    );
+
     const batches: readonly (readonly [number, number])[] = [
         [0, 5],
         [5, 10],
@@ -1280,6 +1910,11 @@ describe("Commit race and intent convergence chaos", () => {
         [15, 16],
         [16, 17],
         [17, 18],
+        [18, 19],
+        [19, 20],
+        [20, 21],
+        [21, 22],
+        [22, 23],
     ];
     for (const [start, end] of batches) {
         const first = scenarios[start];
@@ -1290,7 +1925,7 @@ describe("Commit race and intent convergence chaos", () => {
             { timeout: 120_000 },
             async () => {
                 for (const value of scenarios.slice(start, end)) {
-                    if (value.expectedFailure) {
+                    if (value.expectedFailure !== undefined) {
                         let failure: unknown;
                         try {
                             await value.run();
@@ -1301,6 +1936,8 @@ describe("Commit race and intent convergence chaos", () => {
                             failure,
                             `${value.name} unexpectedly satisfied its contract`,
                         ).toBeDefined();
+                        expect(failure).toBeInstanceOf(Error);
+                        expect((failure as Error).message).toContain(value.expectedFailure);
                     } else {
                         try {
                             await value.run();
