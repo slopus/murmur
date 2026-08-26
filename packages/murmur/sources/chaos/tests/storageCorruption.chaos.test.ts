@@ -76,7 +76,6 @@ const RECORD_FIXTURES: readonly RecordFixture[] = Object.freeze([
     record("account-roster", "murmur/accounts/v1/own-roster"),
     record("account-job", "murmur/accounts/v1/convergence/session/device"),
     record("provisioning", "murmur/accounts/v1/pending-envelope"),
-    record("private-canonical", "murmur/private-groups/canonical/group"),
 ]);
 
 const BOUNDED_PREFIXES = Object.freeze([
@@ -89,7 +88,6 @@ const BOUNDED_PREFIXES = Object.freeze([
     "murmur/session-quarantine/",
     "murmur/key-packages/",
     "murmur/accounts/v1/convergence/",
-    "murmur/private-groups/canonical/",
 ]);
 
 function record(family: string, key: string): RecordFixture {
@@ -614,7 +612,7 @@ async function runLiveIntentCapacity(
     try {
         const session = await alice.createSession({
             descriptor: utf8Encode(`ST-02L ${label}`),
-            members: [await bob.discovery()],
+            members: [await bob.createKeyPackage()],
         });
         await alice.synchronize({ waitMilliseconds: 0 });
         await bob.synchronize({ waitMilliseconds: 0 });
@@ -625,14 +623,14 @@ async function runLiveIntentCapacity(
             await bob.synchronize({ waitMilliseconds: 0 });
         }
         expect(await prefixCount(aliceDelegate, OUTBOX_PREFIX)).toBe(0);
-        const carolDiscovery = await carol.discovery();
+        const carolKeyPackage = await carol.createKeyPackage();
 
         const before = await storeFingerprint(aliceDelegate);
         constrained.constrain(
             failedWriteOrdinal === 0 ? {} : { failWriteOrdinals: [failedWriteOrdinal] },
         );
         if (failedWriteOrdinal === 0) {
-            await alice.addMember(session.id, carolDiscovery);
+            await alice.addMember(session.id, carolKeyPackage);
             return Object.freeze({
                 seed,
                 failedWriteOrdinal,
@@ -644,7 +642,7 @@ async function runLiveIntentCapacity(
             });
         }
 
-        await expect(alice.addMember(session.id, carolDiscovery)).rejects.toThrow(
+        await expect(alice.addMember(session.id, carolKeyPackage)).rejects.toThrow(
             `write ${failedWriteOrdinal}`,
         );
         const observedWrites = constrained.writeOrdinal;
@@ -654,7 +652,7 @@ async function runLiveIntentCapacity(
         expect(await alice.session(session.id)).toMatchObject({ status: "active" });
 
         constrained.restoreCapacity();
-        await alice.addMember(session.id, carolDiscovery);
+        await alice.addMember(session.id, carolKeyPackage);
         let recoveredMembers = 0;
         for (let round = 0; round < 6; round += 1) {
             await alice.synchronize({ waitMilliseconds: 0 });
@@ -703,7 +701,7 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
     try {
         const session = await alice.createSession({
             descriptor: utf8Encode(`ST-03L ${label}`),
-            members: [await bob.discovery()],
+            members: [await bob.createKeyPackage()],
         });
         await alice.synchronize({ waitMilliseconds: 0 });
         await bob.synchronize({ waitMilliseconds: 0 });
@@ -811,7 +809,7 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
     try {
         const session = await alice.createSession({
             descriptor: utf8Encode(`ST-04L ${label}`),
-            members: [await bob.discovery()],
+            members: [await bob.createKeyPackage()],
         });
         await alice.synchronize({ waitMilliseconds: 0 });
         await bob.synchronize({ waitMilliseconds: 0 });
@@ -915,7 +913,7 @@ async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorrupti
     try {
         const session = await alice.createSession({
             descriptor: utf8Encode(`ST-07L ${label}`),
-            members: [await bob.discovery()],
+            members: [await bob.createKeyPackage()],
         });
         await alice.synchronize({ waitMilliseconds: 0 });
         await bob.synchronize({ waitMilliseconds: 0 });
@@ -1118,7 +1116,7 @@ describe("storage corruption and capacity chaos", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("capacity send ladder"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1222,7 +1220,7 @@ describe("storage corruption and capacity chaos", () => {
         expect(await prefixDelegate.scan("murmur/", { limit: 4 })).toEqual(new Map());
     });
 
-    test("ST-02L real Add intent write ladder rolls back discovery claims and intent state", async () => {
+    test("ST-02L real Add intent write ladder rolls back KeyPackage claims and intent state", async () => {
         const seed = 0x5354_3032;
         const calibration = await runLiveIntentCapacity(seed);
         expect(calibration.observedWrites).toBeGreaterThan(1);
@@ -1406,7 +1404,7 @@ describe("storage corruption and capacity chaos", () => {
         try {
             const damaged = await alice.createSession({
                 descriptor: utf8Encode("damaged chaos session"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1414,7 +1412,7 @@ describe("storage corruption and capacity chaos", () => {
 
             const healthy = await alice.createSession({
                 descriptor: utf8Encode("healthy chaos session"),
-                members: [await carol.discovery()],
+                members: [await carol.createKeyPackage()],
             });
             await alice.synchronize();
             await carol.synchronize();

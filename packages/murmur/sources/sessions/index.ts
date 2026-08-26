@@ -1,4 +1,3 @@
-import { sha256 } from "@noble/hashes/sha2";
 import {
     DeliveryTransportError,
     HttpDeliveryTransport,
@@ -17,20 +16,6 @@ import {
     type IdentityKeyPair,
 } from "../crypto/index.js";
 import {
-    DISCOVERY_INVITATION_TTL_MILLISECONDS,
-    HttpDiscoveryTransport,
-    createAccountDiscoveryBundle,
-    createInvitationUploadAuthorization,
-    createSignedInvitationRevocation,
-    createDiscoveryBundle,
-    parseDiscoveryBundle,
-    serializeDiscoveryBundle,
-    type DiscoveryBundle,
-    type DiscoveryTransport,
-    type DiscoveryUploadOutcome,
-} from "../identity/discovery/index.js";
-import { InvitationState } from "../identity/discovery/impl/invitationState.js";
-import {
     createMlsKeyPackage,
     decodeMlsKeyPackage,
     destroyMlsKeyPackageBundle,
@@ -41,12 +26,6 @@ import {
 } from "../mls/index.js";
 import type { MurmurStore } from "../storage/index.js";
 import {
-    createReadyPrivateGroupState,
-    type MurmurPrivateGroupState,
-} from "../privateGroupState/impl/readyPrivateGroupState.js";
-import { destroyPrivateGroupSessionState } from "../privateGroupState/impl/sessionState.js";
-import type { PrivateGroupStateConnection } from "../privateGroupState/types.js";
-import {
     canonicalJsonBytes,
     decodeBase64Url,
     encodeBase64Url,
@@ -55,22 +34,6 @@ import {
     utf8Encode,
     zeroBytes,
 } from "../utils/index.js";
-import {
-    ContactEngine,
-    type ContactAdmissionSelection,
-    type PreparedContactEvents,
-} from "../contacts/impl/contactEngine.js";
-import {
-    CONTACT_ADMISSION_TARGET_KEY_PACKAGES,
-    contactSessionDescriptor,
-    encodeContactPacket,
-    isContactSessionDescriptor,
-    type MurmurContact,
-    type MurmurContactAdmission,
-    type MurmurContactProfile,
-    type MurmurContactRequested,
-    type MurmurOutgoingContactRequest,
-} from "../contacts/index.js";
 import {
     createMurmurServiceSessionDescriptor,
     validateMurmurServiceRegistration,
@@ -108,14 +71,6 @@ import {
     type MurmurDormantDevice,
     type PreparedAccountEvents,
 } from "../accounts/index.js";
-import {
-    CONTACT_IDENTITY_PREFIX,
-    CONTACT_LOCAL_PROFILE_KEY,
-    CONTACT_SOCIAL_PREFIX,
-    contactSocialKey,
-    decodeContactRecord,
-    encodeContactSocialRecord,
-} from "../contacts/impl/contactRecords.js";
 import { randomBytes } from "../crypto/index.js";
 import type { StoreTransaction } from "../storage/index.js";
 import {
@@ -130,6 +85,7 @@ import type {
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
+    MurmurSessionMember,
     MurmurSessionPolicies,
     MurmurResetEvent,
     MurmurResetSession,
@@ -147,6 +103,7 @@ export type {
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
+    MurmurSessionMember,
     MurmurSessionPolicies,
     MurmurResetEvent,
     MurmurResetSession,
@@ -158,7 +115,6 @@ export type {
 export { MurmurResetRequiredError } from "./types.js";
 
 const IDENTITY_KEY = "murmur/identity/root";
-const INVITATION_REVOCATION_KEY = "murmur/invitations/revocation-root";
 const ACCOUNT_ROOT_KEY = "murmur/accounts/v1/root";
 const DEVICE_CREDENTIAL_KEY = "murmur/accounts/v1/device-credential";
 const LINK_MATERIAL_KEY = "murmur/accounts/v1/link-material";
@@ -171,17 +127,9 @@ const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
 const MURMUR_KEY_PREFIX = "murmur/";
 const RESET_PURGE_SCAN_LIMIT = 10_000;
 const DEVICE_DORMANCY_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
-const DEFAULT_KEY_PACKAGES = 1;
-const CONTACT_ADMISSION_GENERATION = 1;
-const LAST_RESORT_KEY_PACKAGE_LIFETIME_SECONDS = 10 * 365 * 24 * 60 * 60;
 // KeyPackages outlive the six-month delivery window by thirty days.
 const KEY_PACKAGE_LIFETIME_SECONDS = 210 * 24 * 60 * 60;
 const SYNC_RECONNECT_DELAY_MILLISECONDS = 1_000;
-
-interface CreatedContactAdmission {
-    readonly admission: MurmurContactAdmission;
-    readonly references: readonly Uint8Array[];
-}
 
 function encodeResetEvent(reset: MurmurResetEvent): Uint8Array {
     return canonicalJsonBytes({
@@ -324,7 +272,7 @@ function decodeResetEvent(bytes: Uint8Array): MurmurResetEvent {
 
 /** Construction inputs for the stateful Murmur MLS client. */
 export interface MurmurClientOptions {
-    /** Relay base URL used to construct the built-in HTTP delivery and discovery transports. */
+    /** Relay base URL used to construct the built-in HTTP delivery transport. */
     readonly relay?: string | URL;
     /** Custom delivery transport, mutually exclusive with `relay` and `sessionProvider`. */
     readonly transport?: DeliveryTransport;
@@ -332,23 +280,8 @@ export interface MurmurClientOptions {
     readonly sessionProvider?: RelaySessionProvider;
     /** Connection and retry policy for the negotiated WebSocket delivery transport. */
     readonly webSocket?: WebSocketDeliveryTransportOptions;
-    /**
-     * Custom transport for publishing and resolving invitation bundles.
-     *
-     * Supply this when using a custom delivery transport or relay-session provider
-     * and the application needs Murmur's invitation or contact-request methods.
-     */
-    readonly discoveryTransport?: DiscoveryTransport;
-    /** Fetch implementation used by the built-in HTTP delivery and discovery transports. */
+    /** Fetch implementation used by the built-in HTTP delivery transport. */
     readonly fetch?: DeliveryFetch;
-    /**
-     * EXPERIMENTAL private-group state connection.
-     *
-     * A relay URL automatically supplies the matching HTTP connection when this is omitted.
-     * Custom delivery transports must provide this explicitly before using
-     * `privateGroupState`.
-     */
-    readonly privateGroupState?: PrivateGroupStateConnection;
     /** Exclusive durable state store for this client identity. */
     readonly store: MurmurStore;
     /**
@@ -365,17 +298,11 @@ export interface MurmurClientOptions {
     readonly services?: readonly MurmurServiceRegistration[];
 }
 
-/** Stateful identity, discovery, bootstrap, and opaque MLS-session facade. */
+/** Stateful identity, bootstrap, and opaque MLS-session facade. */
 export class MurmurClient {
     readonly #identity: IdentityKeyPair;
-    readonly #invitationRevocation: IdentityKeyPair;
-    readonly #invitations: InvitationState;
     readonly #engine: SessionEngine;
-    #contacts: ContactEngine;
     readonly #services = new Map<string, MurmurService>();
-    readonly #discoveryTransport: DiscoveryTransport | undefined;
-    readonly #privateGroupStateConnection: PrivateGroupStateConnection | undefined;
-    readonly #privateGroupStates = new Map<string, MurmurPrivateGroupState>();
     readonly #store: MurmurStore;
     readonly #now: () => number;
     #account: IdentityKeyPair | undefined;
@@ -391,11 +318,8 @@ export class MurmurClient {
 
     private constructor(
         identity: IdentityKeyPair,
-        invitationRevocation: IdentityKeyPair,
         store: MurmurStore,
         transport: DeliveryTransport,
-        discoveryTransport: DiscoveryTransport | undefined,
-        privateGroupStateConnection: PrivateGroupStateConnection | undefined,
         limits: MurmurSessionLimits,
         now: () => number,
         services: readonly MurmurServiceRegistration[],
@@ -403,11 +327,8 @@ export class MurmurClient {
         deviceCredential: Uint8Array | undefined,
     ) {
         this.#identity = identity;
-        this.#invitationRevocation = invitationRevocation;
         this.#store = store;
         this.#now = now;
-        this.#discoveryTransport = discoveryTransport;
-        this.#privateGroupStateConnection = privateGroupStateConnection;
         this.#account = account;
         this.#deviceCredential = deviceCredential;
         this.#engine = new SessionEngine(
@@ -418,8 +339,6 @@ export class MurmurClient {
             now,
             deviceCredential ?? identity.publicKey,
         );
-        this.#invitations = new InvitationState(store, now);
-        this.#contacts = new ContactEngine(store, account?.publicKey ?? identity.publicKey, now);
         for (const registration of services) {
             this.#services.set(registration.id, registration.service);
         }
@@ -447,7 +366,6 @@ export class MurmurClient {
             serviceIds.add(registration.id);
         }
         let identity: IdentityKeyPair | undefined;
-        let invitationRevocation: IdentityKeyPair | undefined;
         let account: IdentityKeyPair | undefined;
         let deviceCredential: Uint8Array | undefined;
         try {
@@ -488,23 +406,6 @@ export class MurmurClient {
                     }
                 }
 
-                const storedRevocation = await transaction.get(INVITATION_REVOCATION_KEY);
-                if (storedRevocation === undefined) {
-                    invitationRevocation = generateIdentityKeyPair();
-                    const encoded = encodeIdentityRoot(invitationRevocation);
-                    try {
-                        await transaction.set(INVITATION_REVOCATION_KEY, encoded);
-                    } finally {
-                        zeroBytes(encoded);
-                    }
-                } else {
-                    try {
-                        invitationRevocation = decodeIdentityRoot(storedRevocation);
-                    } finally {
-                        zeroBytes(storedRevocation);
-                    }
-                }
-
                 const storedAccount = await transaction.get(ACCOUNT_ROOT_KEY);
                 if (storedAccount !== undefined) {
                     try {
@@ -516,9 +417,6 @@ export class MurmurClient {
                 deviceCredential = await transaction.get(DEVICE_CREDENTIAL_KEY);
             });
             if (identity === undefined) throw new Error("Murmur identity did not open");
-            if (invitationRevocation === undefined) {
-                throw new Error("Murmur invitation revocation authority did not open");
-            }
             const transport =
                 options.transport ??
                 (options.sessionProvider === undefined
@@ -531,47 +429,19 @@ export class MurmurClient {
                           options.sessionProvider,
                           options.webSocket,
                       ));
-            const discoveryTransport =
-                options.discoveryTransport ??
-                (options.relay === undefined
-                    ? undefined
-                    : new HttpDiscoveryTransport(
-                          options.relay,
-                          options.fetch === undefined ? {} : { fetch: options.fetch },
-                      ));
-            const privateGroupStateConnection =
-                options.privateGroupState ??
-                (options.relay === undefined
-                    ? undefined
-                    : {
-                          relay: options.relay,
-                          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
-                      });
             const client = new MurmurClient(
                 identity,
-                invitationRevocation,
                 options.store,
                 transport,
-                discoveryTransport,
-                privateGroupStateConnection,
                 options.limits ?? {},
                 options.now ?? Date.now,
                 services,
                 account,
                 deviceCredential,
             );
-            const pendingReferences = await client.#invitations.pendingReferences();
-            try {
-                if (pendingReferences.length > 0) {
-                    await client.#engine.deleteKeyPackages(pendingReferences);
-                }
-            } finally {
-                for (const reference of pendingReferences) zeroBytes(reference);
-            }
             return client;
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
-            if (invitationRevocation !== undefined) destroyIdentity(invitationRevocation);
             if (account !== undefined) destroyIdentity(account);
             if (deviceCredential !== undefined) zeroBytes(deviceCredential);
             throw error;
@@ -714,8 +584,8 @@ export class MurmurClient {
      *
      * Signs the next roster revision, adds the new device to the built-in
      * account synchronization session, and returns encrypted envelope bytes the
-     * application transports back to the new device. Session membership across
-     * contacts and services then converges automatically.
+     * application transports back to the new device. Session membership then
+     * converges automatically.
      */
     async authorizeDevice(requestBytes: Uint8Array): Promise<Uint8Array> {
         const envelope = await this.#exclusive(async () => {
@@ -783,7 +653,7 @@ export class MurmurClient {
      *
      * Adopts the account root, roster, and account-authorized device credential.
      * The device then automatically joins the account synchronization session
-     * and receives Welcomes for every converged contact and service session.
+     * and receives Welcomes for every converged session.
      */
     async completeDeviceLink(envelopeBytes: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#completeDeviceLinkBytes(envelopeBytes));
@@ -824,15 +694,9 @@ export class MurmurClient {
                 zeroBytes(accountRoot);
                 zeroBytes(rosterBytes);
             }
-            this.#closePrivateGroupStates();
             this.#account = provisioned.account;
             this.#deviceCredential = credential.slice();
             this.#engine.adoptDeviceCredential(credential);
-            this.#contacts = new ContactEngine(
-                this.#store,
-                provisioned.account.publicKey,
-                this.#now,
-            );
         } finally {
             zeroBytes(material.ephemeralSecretKey);
         }
@@ -842,7 +706,7 @@ export class MurmurClient {
      * Revoke another account device from any active device.
      *
      * Signs the next roster revision, then automatically drives MLS Removes in
-     * every known session and publishes the authenticated roster to contacts.
+     * every known session and publishes the authenticated roster to peers.
      */
     async revokeDevice(deviceKey: Uint8Array): Promise<void> {
         await this.#exclusive(async () => {
@@ -904,314 +768,41 @@ export class MurmurClient {
         this.#services.delete(id);
     }
 
-    /** Create and durably retain fresh one-use KeyPackages in a signed bundle. */
-    async discovery(): Promise<DiscoveryBundle> {
-        return this.#exclusive(() => this.#createDiscovery());
-    }
-
-    /** Upload a five-minute bundle and return its 32-byte SHA-256 lookup capability. */
-    async createInvitation(signal?: AbortSignal): Promise<Uint8Array> {
+    /** Create and durably retain one bare MLS KeyPackage for direct session admission. */
+    async createKeyPackage(): Promise<MurmurSessionMember> {
         return this.#exclusive(async () => {
-            if (this.#discoveryTransport === undefined) {
-                throw new Error("No discovery transport is configured");
-            }
-            const transport = this.#discoveryTransport;
-            const bundle = await this.#createDiscovery();
-            const references = bundle.keyPackages.map(mlsKeyPackageReference);
-            const bytes = serializeDiscoveryBundle(bundle);
-            const digest = sha256(bytes);
-            const revocable = transport.uploadOwned !== undefined && transport.revoke !== undefined;
-            let authorization: ReturnType<typeof createInvitationUploadAuthorization> | undefined;
+            const bundle = createMlsKeyPackage(
+                this.#identity,
+                Math.floor(this.#now() / 1_000),
+                KEY_PACKAGE_LIFETIME_SECONDS,
+                this.#deviceCredential ?? this.#identity.publicKey,
+            );
             try {
-                if (revocable) {
-                    await this.#invitations.record(digest, references, bundle.expiresAt);
-                    authorization = createInvitationUploadAuthorization(
-                        this.#identity,
-                        this.#invitationRevocation,
-                        digest,
-                        bundle.expiresAt,
-                        this.#now(),
-                    );
-                }
-                let outcome: DiscoveryUploadOutcome;
-                if (authorization === undefined) {
-                    outcome = await transport.upload(bytes, signal);
-                } else {
-                    if (transport.uploadOwned === undefined) {
-                        throw new Error(
-                            "Discovery transport does not support revocable invitations",
-                        );
-                    }
-                    outcome = await transport.uploadOwned(bytes, authorization, signal);
-                }
-                if (outcome.expiresAt !== bundle.expiresAt || !equalBytes(outcome.digest, digest)) {
-                    throw new Error("Discovery relay returned invalid invitation metadata");
-                }
-                return outcome.digest.slice();
-            } catch (error: unknown) {
-                const cleanupErrors: unknown[] = [];
-                let pendingMarked = false;
-                if (revocable) {
-                    try {
-                        const pendingReferences = await this.#invitations.begin(digest);
-                        try {
-                            pendingMarked = true;
-                        } finally {
-                            for (const reference of pendingReferences) zeroBytes(reference);
-                        }
-                    } catch (cleanupError: unknown) {
-                        cleanupErrors.push(cleanupError);
-                    }
-                }
-                let keysDeleted = false;
+                const reference = mlsKeyPackageReference(bundle.keyPackage);
+                const bytes = serializeMlsKeyPackageBundle(bundle);
                 try {
-                    await this.#engine.deleteKeyPackages(references);
-                    keysDeleted = true;
-                } catch (cleanupError: unknown) {
-                    cleanupErrors.push(cleanupError);
-                }
-                if (revocable && pendingMarked && keysDeleted) {
-                    try {
-                        await this.#invitations.complete(digest);
-                    } catch (cleanupError: unknown) {
-                        cleanupErrors.push(cleanupError);
-                    }
-                }
-                if (cleanupErrors.length > 0) {
-                    throw new AggregateError(
-                        [error, ...cleanupErrors],
-                        "Invitation creation failed and local cleanup did not complete",
-                    );
-                }
-                throw error;
-            } finally {
-                zeroBytes(bytes);
-                zeroBytes(digest);
-                for (const reference of references) zeroBytes(reference);
-                if (authorization !== undefined) {
-                    zeroBytes(authorization.owner);
-                    zeroBytes(authorization.revocationKey);
-                    zeroBytes(authorization.digest);
-                    zeroBytes(authorization.signature);
-                }
-            }
-        });
-    }
-
-    /** Revoke one owner-created relay invitation idempotently. */
-    async revokeInvitation(invitation: Uint8Array, signal?: AbortSignal): Promise<void> {
-        await this.#revokeInvitations(invitation, signal);
-    }
-
-    /** Revoke every outstanding relay invitation under this durable authority. */
-    async revokeInvitations(signal?: AbortSignal): Promise<void> {
-        await this.#revokeInvitations(null, signal);
-    }
-
-    /** Download, hash-check, and authenticate a five-minute invitation capability. */
-    async resolveInvitation(digest: Uint8Array, signal?: AbortSignal): Promise<DiscoveryBundle> {
-        return this.#tracked(async () => {
-            if (this.#discoveryTransport === undefined) {
-                throw new Error("No discovery transport is configured");
-            }
-            if (!(digest instanceof Uint8Array) || digest.length !== 32) {
-                throw new Error("Invalid invitation digest");
-            }
-            const bytes = await this.#discoveryTransport.download(digest, signal);
-            try {
-                if (!equalBytes(sha256(bytes), digest)) {
-                    throw new Error("Downloaded invitation digest does not match");
-                }
-                return parseDiscoveryBundle(bytes, { now: this.#now() });
-            } finally {
-                zeroBytes(bytes);
-            }
-        });
-    }
-
-    /** Resolve an invitation and durably begin the built-in mutual contact hello. */
-    async requestContact(
-        invitation: Uint8Array,
-        profile: MurmurContactProfile,
-        signal?: AbortSignal,
-    ): Promise<MurmurSession> {
-        const bundle = await this.resolveInvitation(invitation, signal);
-        const session = await this.#exclusive(async () => {
-            const existing = await this.#contacts.outgoingRequest(bundle.identityKey);
-            if (existing !== undefined) {
-                try {
-                    const existingSession = await this.#engine.get(existing.sessionId);
-                    if (existingSession !== undefined) {
-                        await this.#queueContactHellos();
-                        return existingSession;
-                    }
-                    await this.#contacts.reject(existing.sessionId);
+                    await this.#engine.storeKeyPackages([
+                        {
+                            reference,
+                            bytes,
+                            expiresAt: Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n),
+                        },
+                    ]);
                 } finally {
-                    zeroBytes(existing.identity);
-                    zeroBytes(existing.sessionId);
+                    zeroBytes(reference);
+                    zeroBytes(bytes);
                 }
-            }
-            const created = await this.#createContactAdmission(CONTACT_ADMISSION_GENERATION);
-            let createdSession: MurmurSession;
-            try {
-                createdSession = await this.#engine.create(
-                    {
-                        descriptor: contactSessionDescriptor(),
-                        members: [bundle],
-                    },
-                    { version: 1, owner: "contact" },
-                    (transaction, id) =>
-                        this.#contacts.recordOutgoingInTransaction(
-                            transaction,
-                            id,
-                            bundle.identityKey,
-                            profile,
-                            created.admission,
-                        ),
-                );
-            } catch (error: unknown) {
-                await this.#engine.deleteKeyPackages(created.references);
-                throw error;
-            } finally {
-                for (const reference of created.references) zeroBytes(reference);
-            }
-            await this.#queueContactHellos();
-            return createdSession;
-        });
-        this.#signalSync();
-        return session;
-    }
-
-    /** Persist the local profile decision, activate the pending contact, and queue hello. */
-    async acceptContact(sessionId: Uint8Array, profile: MurmurContactProfile): Promise<void> {
-        await this.#exclusive(async () => {
-            const created = await this.#createContactAdmission(CONTACT_ADMISSION_GENERATION);
-            let packet: Uint8Array | undefined;
-            try {
-                packet = encodeContactPacket({
-                    version: 2,
-                    type: "hello",
-                    profile,
-                    admission: created.admission,
+                return Object.freeze({
+                    identity: (this.#account ?? this.#identity).publicKey.slice(),
+                    keyPackage: encodeMlsKeyPackage(bundle.keyPackage),
                 });
-                await this.#engine.acceptOwnedContact(
-                    sessionId,
-                    packet,
-                    (transaction, deliveryId) =>
-                        this.#contacts.acceptInTransaction(
-                            transaction,
-                            sessionId,
-                            profile,
-                            created.admission,
-                            deliveryId,
-                        ),
-                );
-            } catch (error: unknown) {
-                await this.#engine.deleteKeyPackages(created.references);
-                throw error;
             } finally {
-                if (packet !== undefined) zeroBytes(packet);
-                for (const reference of created.references) zeroBytes(reference);
+                destroyMlsKeyPackageBundle(bundle);
             }
         });
-        this.#signalSync();
     }
 
-    /** Reject and destroy one pending contact session. */
-    async rejectContact(sessionId: Uint8Array): Promise<void> {
-        await this.#exclusive(() =>
-            this.#engine.destroyOwned(sessionId, "contact", (transaction) =>
-                this.#contacts.rejectInTransaction(transaction, sessionId),
-            ),
-        );
-        this.#closePrivateGroupState(sessionId);
-    }
-
-    /** Queue a typed removal and retain the contact until its authenticated echo. */
-    async removeContact(identity: Uint8Array): Promise<void> {
-        await this.#exclusive(async () => {
-            const contact = await this.#contacts.contact(identity);
-            if (contact === undefined) throw new Error("Unknown contact");
-            if (contact.sessionId.length === 0) {
-                await this.#store.delete(contactSocialKey(identity));
-                return;
-            }
-            const packet = encodeContactPacket({ version: 2, type: "remove" });
-            try {
-                await this.#engine.sendOwnedContact(
-                    contact.sessionId,
-                    packet,
-                    async (transaction, deliveryId) => {
-                        await this.#contacts.markRemovingInTransaction(
-                            transaction,
-                            identity,
-                            deliveryId,
-                        );
-                    },
-                );
-            } finally {
-                zeroBytes(packet);
-            }
-        });
-        this.#signalSync();
-    }
-
-    /** Atomically replace and publish the local profile to every active contact. */
-    async updateContactProfile(profile: MurmurContactProfile): Promise<void> {
-        await this.#exclusive(async () => {
-            const prepared = await this.#contacts.prepareProfileUpdate(profile);
-            const packet = encodeContactPacket({
-                version: 2,
-                type: "profile_update",
-                revision: prepared.revision,
-                profile: prepared.profile,
-            });
-            try {
-                await this.#engine.sendOwnedContacts(
-                    prepared.targets.map((target) => ({
-                        id: target.sessionId,
-                        bytes: packet,
-                    })),
-                    (transaction) =>
-                        this.#contacts.commitProfileUpdateInTransaction(transaction, prepared),
-                );
-            } finally {
-                zeroBytes(packet);
-                for (const target of prepared.targets) {
-                    zeroBytes(target.identity);
-                    zeroBytes(target.sessionId);
-                }
-            }
-        });
-        this.#signalSync();
-    }
-
-    /** Read one confirmed contact from durable local state. */
-    async contact(identity: Uint8Array): Promise<MurmurContact | undefined> {
-        return this.#tracked(() => this.#contacts.contact(identity));
-    }
-
-    /** Read the bounded durable contact list without relay connectivity. */
-    async contacts(): Promise<readonly MurmurContact[]> {
-        return this.#tracked(() => this.#contacts.contacts());
-    }
-
-    /** Read validated incoming contact requests awaiting a decision. */
-    async contactRequests(): Promise<readonly MurmurContactRequested[]> {
-        return this.#tracked(() => this.#contacts.requests());
-    }
-
-    /** Read durable outgoing contact requests awaiting the remote decision. */
-    async outgoingContactRequests(): Promise<readonly MurmurOutgoingContactRequest[]> {
-        return this.#tracked(() => this.#contacts.outgoingRequests());
-    }
-
-    /**
-     * Create a two-or-more-member MLS session from confirmed contact identities.
-     *
-     * Contact admission material is cached and refillable, so peers need not be
-     * online. Direct discovery members remain available for low-level bootstrap.
-     */
+    /** Create a two-or-more-member MLS session from bare MLS admission material. */
     async createSession(options: CreateMurmurSessionOptions): Promise<MurmurSession> {
         const owner =
             options.service === undefined
@@ -1220,47 +811,8 @@ export class MurmurClient {
         if (options.service !== undefined && !this.#services.has(options.service)) {
             throw new Error("Session service is not registered");
         }
-        const session = await this.#exclusive(async () => {
-            if ("contacts" in options && options.contacts !== undefined) {
-                const selections: ContactAdmissionSelection[] = [];
-                try {
-                    for (const identity of options.contacts) {
-                        selections.push(await this.#contacts.selectAdmission(identity));
-                    }
-                    return await this.#engine.create(
-                        {
-                            descriptor: options.descriptor,
-                            ...(options.adminsAssignAdmins === undefined
-                                ? {}
-                                : { adminsAssignAdmins: options.adminsAssignAdmins }),
-                            ...(options.anyoneCanAddMembers === undefined
-                                ? {}
-                                : { anyoneCanAddMembers: options.anyoneCanAddMembers }),
-                            members: selections.map((selection) => ({
-                                identity: selection.identity,
-                                keyPackage: decodeMlsKeyPackage(selection.keyPackage),
-                            })),
-                        },
-                        owner,
-                        async (transaction) => {
-                            for (const selection of selections) {
-                                await this.#contacts.consumeAdmissionInTransaction(
-                                    transaction,
-                                    selection,
-                                );
-                            }
-                        },
-                    );
-                } finally {
-                    for (const selection of selections) {
-                        zeroBytes(selection.identity);
-                        zeroBytes(selection.sessionId);
-                        zeroBytes(selection.keyPackage);
-                        zeroBytes(selection.reference);
-                    }
-                }
-            }
-            return this.#engine.create(
+        const session = await this.#exclusive(() =>
+            this.#engine.create(
                 {
                     descriptor: options.descriptor,
                     ...(options.adminsAssignAdmins === undefined
@@ -1269,11 +821,14 @@ export class MurmurClient {
                     ...(options.anyoneCanAddMembers === undefined
                         ? {}
                         : { anyoneCanAddMembers: options.anyoneCanAddMembers }),
-                    members: options.members,
+                    members: options.members.map((member) => ({
+                        identity: member.identity,
+                        keyPackage: decodeMlsKeyPackage(member.keyPackage),
+                    })),
                 },
                 owner,
-            );
-        });
+            ),
+        );
         this.#signalSync();
         return session;
     }
@@ -1281,57 +836,6 @@ export class MurmurClient {
     /** Return a defensive snapshot of one local session, or `undefined` when it is unknown. */
     async session(id: Uint8Array): Promise<MurmurSession | undefined> {
         return this.#tracked(() => this.#engine.get(id));
-    }
-
-    /**
-     * EXPERIMENTAL open the private canonical state bound to one active MLS session.
-     *
-     * The member-only group secret remains inside Murmur. The returned handle derives
-     * authorization from the live authenticated session roster and durably retains its
-     * rollback-protection tip before resolving any accepted operation.
-     */
-    async privateGroupState(id: Uint8Array): Promise<MurmurPrivateGroupState> {
-        return this.#exclusive(async () => {
-            if (!(id instanceof Uint8Array) || id.length !== 32) {
-                throw new Error("Private-group session ID must be 32 bytes");
-            }
-            if (this.#privateGroupStateConnection === undefined) {
-                throw new Error("No private-group state connection is configured");
-            }
-            const key = encodeBase64Url(id);
-            const existing = this.#privateGroupStates.get(key);
-            if (existing !== undefined) return existing;
-            const state = await this.#engine.privateGroupSessionState(id);
-            if (state === undefined) throw new Error("Unknown session");
-            const sessionId = id.slice();
-            let handle: MurmurPrivateGroupState | undefined;
-            try {
-                handle = await createReadyPrivateGroupState({
-                    identity: this.#account ?? this.#identity,
-                    state,
-                    connection: this.#privateGroupStateConnection,
-                    session: () => this.#tracked(() => this.#engine.get(sessionId)),
-                    persistTrustedTip: (tip) =>
-                        this.#exclusive(() =>
-                            this.#engine.persistPrivateGroupTrustedTip(sessionId, tip),
-                        ),
-                    onClose: () => {
-                        if (handle !== undefined && this.#privateGroupStates.get(key) === handle) {
-                            this.#privateGroupStates.delete(key);
-                        }
-                        zeroBytes(sessionId);
-                    },
-                    now: this.#now,
-                });
-                this.#privateGroupStates.set(key, handle);
-                return handle;
-            } catch (error: unknown) {
-                zeroBytes(sessionId);
-                throw error;
-            } finally {
-                destroyPrivateGroupSessionState(state);
-            }
-        });
     }
 
     /** List one bounded page of local sessions in durable key order. */
@@ -1348,13 +852,11 @@ export class MurmurClient {
     /** Terminally reject and destroy an application-owned pending session. */
     async ignoreSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.ignore(id));
-        this.#closePrivateGroupState(id);
     }
 
     /** Abandon a blocked local membership operation and destroy the whole session. */
     async abandonSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.abandon(id));
-        this.#closePrivateGroupState(id);
     }
 
     /**
@@ -1369,31 +871,14 @@ export class MurmurClient {
         return deliveryId;
     }
 
-    /** Add one confirmed contact while offline, or use direct discovery material. */
-    async addMember(id: Uint8Array, contact: Uint8Array | DiscoveryBundle): Promise<void> {
-        await this.#exclusive(async () => {
-            if (contact instanceof Uint8Array) {
-                const selection = await this.#contacts.selectAdmission(contact);
-                try {
-                    await this.#engine.add(
-                        id,
-                        {
-                            identity: selection.identity,
-                            keyPackage: decodeMlsKeyPackage(selection.keyPackage),
-                        },
-                        (transaction) =>
-                            this.#contacts.consumeAdmissionInTransaction(transaction, selection),
-                    );
-                } finally {
-                    zeroBytes(selection.identity);
-                    zeroBytes(selection.sessionId);
-                    zeroBytes(selection.keyPackage);
-                    zeroBytes(selection.reference);
-                }
-                return;
-            }
-            await this.#engine.add(id, contact);
-        });
+    /** Durably request one MLS member addition from bare admission material. */
+    async addMember(id: Uint8Array, member: MurmurSessionMember): Promise<void> {
+        await this.#exclusive(() =>
+            this.#engine.add(id, {
+                identity: member.identity,
+                keyPackage: decodeMlsKeyPackage(member.keyPackage),
+            }),
+        );
         this.#signalSync();
     }
 
@@ -1491,14 +976,11 @@ export class MurmurClient {
     #preserveAcrossReset(key: string): boolean {
         return (
             key === IDENTITY_KEY ||
-            key === INVITATION_REVOCATION_KEY ||
             key === ACCOUNT_ROOT_KEY ||
             key === DEVICE_CREDENTIAL_KEY ||
             key === ACCOUNT_ROSTER_KEY ||
             key.startsWith(ACCOUNT_PEER_ROSTER_PREFIX) ||
             key.startsWith(ACCOUNT_DEVICE_ACTIVITY_PREFIX) ||
-            key.startsWith(CONTACT_SOCIAL_PREFIX) ||
-            key === CONTACT_LOCAL_PROFILE_KEY ||
             key === RESET_PENDING_KEY
         );
     }
@@ -1597,26 +1079,6 @@ export class MurmurClient {
                     for (const [key, value] of page) {
                         after = key;
                         try {
-                            if (key.startsWith(CONTACT_IDENTITY_PREFIX)) {
-                                const contact = decodeContactRecord(value);
-                                try {
-                                    await transaction.set(
-                                        contactSocialKey(contact.identity),
-                                        encodeContactSocialRecord({
-                                            version: 1,
-                                            identity: contact.identity,
-                                            localProfile: contact.localProfile,
-                                            profile: contact.profile,
-                                            confirmedAt: contact.confirmedAt,
-                                        }),
-                                    );
-                                } finally {
-                                    zeroBytes(contact.identity);
-                                    zeroBytes(contact.sessionId);
-                                }
-                                await transaction.delete(key);
-                                continue;
-                            }
                             if (!this.#preserveAcrossReset(key)) await transaction.delete(key);
                         } finally {
                             zeroBytes(value);
@@ -1677,7 +1139,6 @@ export class MurmurClient {
         await onReset(reset);
         await this.#exclusive(async () => {
             await this.#purgeReset(reset);
-            this.#closePrivateGroupStates();
         });
         throw new MurmurResetRequiredError(reset, true);
     }
@@ -1692,16 +1153,7 @@ export class MurmurClient {
         options: MurmurSynchronizeOptions = {},
         lifecycle: Pick<
             MurmurSyncOptions,
-            | "onUpdates"
-            | "onContactRequested"
-            | "onContactAdded"
-            | "onContactUpdated"
-            | "onContactRemoved"
-            | "onDeviceAdded"
-            | "onDeviceRevoked"
-            | "onContactRosterChanged"
-            | "onReset"
-            | "onDeviceDormant"
+            "onUpdates" | "onDeviceAdded" | "onDeviceRevoked" | "onReset" | "onDeviceDormant"
         > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
@@ -1711,7 +1163,6 @@ export class MurmurClient {
         if (pendingReset !== undefined) {
             return this.#completeReset(pendingReset, lifecycle.onReset);
         }
-        await this.#exclusive(() => this.#queueContactMaintenance());
         await this.#exclusive(() => this.#queueAccountWork());
         let result: MurmurSynchronizeResult;
         try {
@@ -1826,154 +1277,9 @@ export class MurmurClient {
             throw new Error("Cannot close Murmur while an operation is pending");
         }
         this.#closed = true;
-        this.#closePrivateGroupStates();
         destroyIdentity(this.#identity);
-        destroyIdentity(this.#invitationRevocation);
         if (this.#account !== undefined) destroyIdentity(this.#account);
         if (this.#deviceCredential !== undefined) zeroBytes(this.#deviceCredential);
-    }
-
-    async #revokeInvitations(digest: Uint8Array | null, signal?: AbortSignal): Promise<void> {
-        await this.#exclusive(async () => {
-            if (this.#discoveryTransport?.revoke === undefined) {
-                throw new Error(
-                    "Invitation revocation is not supported by the discovery transport",
-                );
-            }
-            if (digest !== null && (!(digest instanceof Uint8Array) || digest.length !== 32)) {
-                throw new Error("Invalid invitation digest");
-            }
-            const references = await this.#invitations.begin(digest);
-            try {
-                if (references.length > 0) await this.#engine.deleteKeyPackages(references);
-            } finally {
-                for (const reference of references) zeroBytes(reference);
-            }
-            const request = createSignedInvitationRevocation(
-                this.#invitationRevocation,
-                digest,
-                this.#now(),
-            );
-            try {
-                await this.#discoveryTransport.revoke(request, signal);
-            } finally {
-                zeroBytes(request.revocationKey);
-                if (request.digest !== null) zeroBytes(request.digest);
-                zeroBytes(request.signature);
-            }
-            await this.#invitations.complete(digest);
-        });
-    }
-
-    async #createContactAdmission(generation: number): Promise<CreatedContactAdmission> {
-        const nowSeconds = Math.floor(this.#now() / 1_000);
-        const bundles: ReturnType<typeof createMlsKeyPackage>[] = [];
-        const stored: {
-            reference: Uint8Array;
-            bytes: Uint8Array;
-            expiresAt: number;
-            reusable?: boolean;
-        }[] = [];
-        try {
-            for (let index = 0; index < CONTACT_ADMISSION_TARGET_KEY_PACKAGES; index += 1) {
-                bundles.push(
-                    createMlsKeyPackage(
-                        this.#identity,
-                        nowSeconds,
-                        KEY_PACKAGE_LIFETIME_SECONDS,
-                        this.#deviceCredential ?? this.#identity.publicKey,
-                    ),
-                );
-            }
-            bundles.push(
-                createMlsKeyPackage(
-                    this.#identity,
-                    nowSeconds,
-                    LAST_RESORT_KEY_PACKAGE_LIFETIME_SECONDS,
-                    this.#deviceCredential ?? this.#identity.publicKey,
-                ),
-            );
-            for (let index = 0; index < bundles.length; index += 1) {
-                const bundle = bundles[index]!;
-                const reference = mlsKeyPackageReference(bundle.keyPackage);
-                stored.push({
-                    reference,
-                    bytes: serializeMlsKeyPackageBundle(bundle),
-                    expiresAt: Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n),
-                    ...(index === bundles.length - 1 ? { reusable: true } : {}),
-                });
-            }
-            await this.#engine.storeKeyPackages(stored);
-            return {
-                admission: Object.freeze({
-                    generation,
-                    oneTimeKeyPackages: Object.freeze(
-                        bundles
-                            .slice(0, -1)
-                            .map((bundle) => encodeMlsKeyPackage(bundle.keyPackage)),
-                    ),
-                    lastResortKeyPackage: encodeMlsKeyPackage(
-                        bundles[bundles.length - 1]!.keyPackage,
-                    ),
-                }),
-                references: Object.freeze(stored.map((value) => value.reference.slice())),
-            };
-        } finally {
-            for (const value of stored) {
-                zeroBytes(value.reference);
-                zeroBytes(value.bytes);
-            }
-            for (const bundle of bundles) destroyMlsKeyPackageBundle(bundle);
-        }
-    }
-
-    async #createDiscovery(): Promise<DiscoveryBundle> {
-        const now = this.#now();
-        const expiresAt = now + DISCOVERY_INVITATION_TTL_MILLISECONDS;
-        const bundles: ReturnType<typeof createMlsKeyPackage>[] = [];
-        const stored: {
-            reference: Uint8Array;
-            bytes: Uint8Array;
-            expiresAt: number;
-        }[] = [];
-        try {
-            for (let index = 0; index < DEFAULT_KEY_PACKAGES; index += 1) {
-                const bundle = createMlsKeyPackage(
-                    this.#identity,
-                    Math.floor(now / 1_000),
-                    KEY_PACKAGE_LIFETIME_SECONDS,
-                    this.#deviceCredential ?? this.#identity.publicKey,
-                );
-                bundles.push(bundle);
-                stored.push({
-                    reference: mlsKeyPackageReference(bundle.keyPackage),
-                    bytes: serializeMlsKeyPackageBundle(bundle),
-                    expiresAt,
-                });
-            }
-            await this.#engine.storeKeyPackages(stored);
-            if (this.#account !== undefined) {
-                const roster = await this.#ownRoster();
-                if (roster === undefined) {
-                    throw new Error("Account device is missing its roster");
-                }
-                return createAccountDiscoveryBundle(
-                    this.#account,
-                    this.#identity,
-                    roster,
-                    bundles.map((bundle) => bundle.keyPackage),
-                    { createdAt: now, expiresAt },
-                );
-            }
-            return createDiscoveryBundle(
-                this.#identity,
-                bundles.map((bundle) => bundle.keyPackage),
-                { createdAt: now, expiresAt },
-            );
-        } finally {
-            for (const value of stored) zeroBytes(value.bytes);
-            for (const bundle of bundles) destroyMlsKeyPackageBundle(bundle);
-        }
     }
 
     #signalSync(): void {
@@ -1986,15 +1292,7 @@ export class MurmurClient {
     async #deliverUpdates(
         lifecycle: Pick<
             MurmurSyncOptions,
-            | "onUpdates"
-            | "onContactRequested"
-            | "onContactAdded"
-            | "onContactUpdated"
-            | "onContactRemoved"
-            | "onDeviceAdded"
-            | "onDeviceRevoked"
-            | "onContactRosterChanged"
-            | "onDeviceDormant"
+            "onUpdates" | "onDeviceAdded" | "onDeviceRevoked" | "onDeviceDormant"
         >,
     ): Promise<number> {
         if (this.#updatesActive) return 0;
@@ -2007,15 +1305,12 @@ export class MurmurClient {
                 if (dormant.length > 0) await lifecycle.onDeviceDormant(dormant);
             }
             for (;;) {
-                await this.#exclusive(() => this.#queueContactMaintenance());
                 await this.#exclusive(() => this.#queueAccountWork());
                 const prepared = await this.#exclusive(() => this.#engine.prepareUpdates());
                 const decisions: SessionRouteDecision[] = [];
                 const consumedKeys = new Set<string>();
                 const globalUpdates: MurmurUpdate[] = [];
-                const removedSessions: Uint8Array[] = [];
                 const claimedAccountSessions: Uint8Array[] = [];
-                let contactEvents: PreparedContactEvents | undefined;
                 let accountEvents: PreparedAccountEvents | undefined;
                 let deferredRoutes = false;
                 let deferredUpdates = false;
@@ -2036,11 +1331,6 @@ export class MurmurClient {
                             if (claimed) {
                                 claimedAccountSessions.push(route.session.id.slice());
                             }
-                        } else if (
-                            isContactSessionDescriptor(route.session.descriptor) &&
-                            route.session.members.length === 2
-                        ) {
-                            owner = { version: 1, owner: "contact" };
                         } else {
                             for (const [serviceId, service] of [...this.#services].sort(
                                 ([left], [right]) => left.localeCompare(right),
@@ -2070,13 +1360,6 @@ export class MurmurClient {
                         }
                     }
                     for (const update of prepared.updates) {
-                        if (update.owner?.owner === "contact") {
-                            if ((await this.#contacts.process(update)) === "remove") {
-                                removedSessions.push(update.sessionId.slice());
-                            }
-                            consumedKeys.add(update.key);
-                            continue;
-                        }
                         if (update.owner?.owner === "account") {
                             await this.#processAccountPacket(update);
                             consumedKeys.add(update.key);
@@ -2110,12 +1393,10 @@ export class MurmurClient {
                         globalUpdates.push(publicUpdate);
                         consumedKeys.add(update.key);
                     }
-                    contactEvents = await this.#contacts.prepareEvents();
                     accountEvents = await prepareAccountEvents(this.#store);
                     if (
                         decisions.length === 0 &&
                         consumedKeys.size === 0 &&
-                        contactEvents.keys.length === 0 &&
                         accountEvents.keys.length === 0
                     ) {
                         break;
@@ -2123,34 +1404,12 @@ export class MurmurClient {
                     if (globalUpdates.length > 0) {
                         await lifecycle.onUpdates?.(Object.freeze(globalUpdates));
                     }
-                    if (contactEvents.requested.length > 0) {
-                        await lifecycle.onContactRequested?.(contactEvents.requested);
-                    }
-                    if (contactEvents.added.length > 0) {
-                        await lifecycle.onContactAdded?.(contactEvents.added);
-                    }
-                    if (contactEvents.updated.length > 0) {
-                        await lifecycle.onContactUpdated?.(contactEvents.updated);
-                    }
-                    if (contactEvents.removed.length > 0) {
-                        await lifecycle.onContactRemoved?.(contactEvents.removed);
-                    }
                     if (accountEvents.added.length > 0) {
                         await lifecycle.onDeviceAdded?.(accountEvents.added);
                     }
                     if (accountEvents.revoked.length > 0) {
                         await lifecycle.onDeviceRevoked?.(accountEvents.revoked);
                     }
-                    if (accountEvents.contacts.length > 0) {
-                        await lifecycle.onContactRosterChanged?.(accountEvents.contacts);
-                    }
-                    for (const sessionId of removedSessions) {
-                        await this.#exclusive(() =>
-                            this.#engine.destroyOwned(sessionId, "contact"),
-                        );
-                        this.#closePrivateGroupState(sessionId);
-                    }
-                    const committedContactEvents = contactEvents;
                     const committedAccountEvents = accountEvents;
                     await this.#exclusive(() =>
                         this.#engine.commitUpdates(
@@ -2158,10 +1417,6 @@ export class MurmurClient {
                             decisions,
                             consumedKeys,
                             async (transaction) => {
-                                await this.#contacts.deletePreparedEvents(
-                                    transaction,
-                                    committedContactEvents,
-                                );
                                 await deletePreparedAccountEvents(
                                     transaction,
                                     committedAccountEvents,
@@ -2184,7 +1439,6 @@ export class MurmurClient {
                     if (deferredRoutes || deferredUpdates) break;
                 } finally {
                     for (const decision of decisions) zeroBytes(decision.sessionId);
-                    for (const sessionId of removedSessions) zeroBytes(sessionId);
                     for (const sessionId of claimedAccountSessions) zeroBytes(sessionId);
                     this.#zeroPreparedUpdates(prepared);
                 }
@@ -2377,102 +1631,6 @@ export class MurmurClient {
         return targets > 0;
     }
 
-    async #queueContactHellos(): Promise<boolean> {
-        let queued = false;
-        const handshakes = await this.#contacts.outgoingWithoutHello();
-        for (const handshake of handshakes) {
-            try {
-                if (
-                    handshake.localProfile === undefined ||
-                    handshake.localAdmission === undefined
-                ) {
-                    continue;
-                }
-                const packet = encodeContactPacket({
-                    version: 2,
-                    type: "hello",
-                    profile: handshake.localProfile,
-                    admission: handshake.localAdmission,
-                });
-                try {
-                    await this.#engine.sendOwnedContact(
-                        handshake.sessionId,
-                        packet,
-                        (transaction, deliveryId) =>
-                            this.#contacts.recordLocalHelloInTransaction(
-                                transaction,
-                                handshake.sessionId,
-                                deliveryId,
-                            ),
-                    );
-                    queued = true;
-                } finally {
-                    zeroBytes(packet);
-                }
-            } finally {
-                zeroBytes(handshake.identity);
-                zeroBytes(handshake.sessionId);
-            }
-        }
-        return queued;
-    }
-
-    async #queueContactMaintenance(): Promise<void> {
-        let queued = await this.#queueContactHellos();
-        for (const request of await this.#contacts.refillRequests()) {
-            const packet = encodeContactPacket({
-                version: 2,
-                type: "admission_request",
-                generation: request.generation,
-            });
-            try {
-                await this.#engine.sendOwnedContact(
-                    request.sessionId,
-                    packet,
-                    (transaction, deliveryId) =>
-                        this.#contacts.markRefillRequestedInTransaction(
-                            transaction,
-                            request.identity,
-                            deliveryId,
-                        ),
-                );
-                queued = true;
-            } finally {
-                zeroBytes(request.identity);
-                zeroBytes(request.sessionId);
-                zeroBytes(packet);
-            }
-        }
-        for (const request of await this.#contacts.supplyRequests()) {
-            const created = await this.#createContactAdmission(request.generation);
-            let packet: Uint8Array | undefined;
-            try {
-                packet = encodeContactPacket({
-                    version: 2,
-                    type: "admission_response",
-                    admission: created.admission,
-                });
-                await this.#engine.sendOwnedContact(request.sessionId, packet, (transaction) =>
-                    this.#contacts.markAdmissionSuppliedInTransaction(
-                        transaction,
-                        request.identity,
-                        created.admission,
-                    ),
-                );
-                queued = true;
-            } catch (error: unknown) {
-                await this.#engine.deleteKeyPackages(created.references);
-                throw error;
-            } finally {
-                zeroBytes(request.identity);
-                zeroBytes(request.sessionId);
-                if (packet !== undefined) zeroBytes(packet);
-                for (const reference of created.references) zeroBytes(reference);
-            }
-        }
-        if (queued) this.#signalSync();
-    }
-
     #waitSyncWake(): Promise<void> {
         if (this.#syncWakePending) {
             this.#syncWakePending = false;
@@ -2488,7 +1646,6 @@ export class MurmurClient {
 
     async #flushSync(milliseconds: number, signal: AbortSignal): Promise<void> {
         const retry = await this.#exclusive(async () => {
-            await this.#queueContactMaintenance();
             await this.#queueAccountWork();
             return this.#engine.flush(signal);
         });
@@ -2518,15 +1675,6 @@ export class MurmurClient {
             const timeout = setTimeout(finish, milliseconds);
             signal.addEventListener("abort", finish, { once: true });
         });
-    }
-
-    #closePrivateGroupState(id: Uint8Array): void {
-        this.#privateGroupStates.get(encodeBase64Url(id))?.close();
-    }
-
-    #closePrivateGroupStates(): void {
-        for (const handle of this.#privateGroupStates.values()) handle.close();
-        this.#privateGroupStates.clear();
     }
 
     #assertOpen(): void {

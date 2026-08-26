@@ -1867,7 +1867,7 @@ describe("seeded soak and refinement", () => {
         try {
             const created = await alice.createSession({
                 descriptor: utf8Encode("seeded-soak-reset"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });

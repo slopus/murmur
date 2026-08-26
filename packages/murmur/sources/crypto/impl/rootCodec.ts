@@ -18,11 +18,7 @@ export function encodeIdentityRoot(identity: IdentityKeyPair): Uint8Array {
     return utf8Encode(JSON.stringify(stored));
 }
 
-/**
- * Decode the strict one-root storage representation.
- *
- * Legacy independent signing/encryption secrets are intentionally rejected.
- */
+/** Decode the strict one-root storage representation. */
 export function decodeIdentityRoot(bytes: Uint8Array): IdentityKeyPair {
     if (bytes.length > 256) {
         throw new Error("Invalid stored identity root");

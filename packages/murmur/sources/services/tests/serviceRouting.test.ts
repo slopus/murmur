@@ -53,7 +53,7 @@ describe("typed session services", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("notes-v1"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
                 service: "notes",
             });
             await alice.synchronize();
@@ -129,7 +129,7 @@ describe("typed session services", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("unknown-v1"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -177,7 +177,7 @@ describe("typed session services", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("retry"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
                 service: "retry",
             });
             await alice.synchronize();

@@ -26,16 +26,12 @@ import {
 import { RELAY_EXPIRATION_BATCH_ITEMS } from "../types.js";
 import type {
     AcknowledgeOutcome,
-    InvitationLimits,
     PageReadConstraints,
     PublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,
     RelayStore,
-    RevokeInvitationsOutcome,
-    StoredInvitation,
-    StoreInvitationOutcome,
 } from "../types.js";
 
 const SQL_VALUE_CHUNK = 5_000;
@@ -74,274 +70,6 @@ export class SqliteRelayStore implements RelayStore {
         this.#database.exec("PRAGMA foreign_keys = ON");
         this.#database.exec("PRAGMA busy_timeout = 5000");
         this.#initializeSchema();
-    }
-
-    async storeInvitation(
-        digest: Uint8Array,
-        bundle: Uint8Array,
-        expiresAt: number,
-        now: number,
-        limits: InvitationLimits,
-        admissionPrincipal: Uint8Array,
-        revocationKey?: Uint8Array,
-    ): Promise<StoreInvitationOutcome> {
-        this.#assertOpen();
-        if (
-            digest.length !== 32 ||
-            bundle.length < 1 ||
-            admissionPrincipal.length !== 32 ||
-            (revocationKey !== undefined && revocationKey.length !== 32) ||
-            !Number.isSafeInteger(expiresAt) ||
-            expiresAt <= now
-        ) {
-            throw new Error("Invalid invitation persistence input");
-        }
-        await this.pruneExpired(now);
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            const revoked = this.#get(
-                `SELECT digest FROM murmur_invitation_revocations
-                 WHERE digest = ? AND expires_at > ?`,
-                digest,
-                BigInt(now),
-            );
-            if (revoked !== undefined) {
-                throw new RelayError(410, "Invitation has been revoked", {
-                    error: "invitation_revoked",
-                });
-            }
-            const existing = this.#get(
-                `SELECT bundle, expires_at, revocation_key
-                 FROM murmur_invitations WHERE digest = ?`,
-                digest,
-            );
-            if (existing !== undefined) {
-                if (!equalBytes(copyBytes(existing.bundle, "invitation bundle"), bundle)) {
-                    throw new Error("Invitation digest collision");
-                }
-                const storedExpiry = safeNumberColumn(existing.expires_at);
-                if (revocationKey !== undefined) {
-                    if (existing.revocation_key === null) {
-                        this.#assertRevocationKeyCapacity(revocationKey, now, limits, 1);
-                        this.#run(
-                            `UPDATE murmur_invitations SET revocation_key = ? WHERE digest = ?`,
-                            revocationKey,
-                            digest,
-                        );
-                    } else if (
-                        !equalBytes(
-                            copyBytes(existing.revocation_key, "invitation revocation key"),
-                            revocationKey,
-                        )
-                    ) {
-                        throw new RelayError(409, "Invitation revocation authority conflicts", {
-                            error: "invitation_revocation_authority_conflict",
-                        });
-                    }
-                }
-                this.#database.exec("COMMIT");
-                return { expiresAt: storedExpiry, duplicate: true };
-            }
-            const global = this.#requiredGet(
-                `SELECT
-                    (SELECT COUNT(*) FROM murmur_invitations WHERE expires_at > ?) +
-                    (SELECT COUNT(*) FROM murmur_invitation_revocations
-                     WHERE expires_at > ?) AS item_count,
-                    (SELECT COALESCE(SUM(encoded_bytes), 0)
-                     FROM murmur_invitations WHERE expires_at > ?) AS byte_count`,
-                BigInt(now),
-                BigInt(now),
-                BigInt(now),
-            );
-            if (
-                bigintColumn(global.item_count) + 1n > BigInt(limits.maximumGlobalItems) ||
-                bigintColumn(global.byte_count) + BigInt(bundle.length) >
-                    BigInt(limits.maximumGlobalBytes)
-            ) {
-                throw new RelayError(503, "Relay invitation-cache quota exceeded", {
-                    error: "invitation_relay_full",
-                });
-            }
-            const principal = this.#requiredGet(
-                `SELECT
-                    (SELECT COUNT(*) FROM murmur_invitations
-                     WHERE admission_principal = ? AND expires_at > ?) +
-                    (SELECT COUNT(*) FROM murmur_invitation_revocations
-                     WHERE admission_principal = ? AND expires_at > ?) AS item_count,
-                    (SELECT COALESCE(SUM(encoded_bytes), 0)
-                     FROM murmur_invitations
-                     WHERE admission_principal = ? AND expires_at > ?) AS byte_count`,
-                admissionPrincipal,
-                BigInt(now),
-                admissionPrincipal,
-                BigInt(now),
-                admissionPrincipal,
-                BigInt(now),
-            );
-            if (
-                bigintColumn(principal.item_count) + 1n > BigInt(limits.maximumPrincipalItems) ||
-                bigintColumn(principal.byte_count) + BigInt(bundle.length) >
-                    BigInt(limits.maximumPrincipalBytes)
-            ) {
-                throw new RelayError(429, "Admission-principal invitation quota exceeded", {
-                    error: "invitation_admission_full",
-                });
-            }
-            if (revocationKey !== undefined) {
-                this.#assertRevocationKeyCapacity(revocationKey, now, limits, 1);
-            }
-            this.#run(
-                `INSERT INTO murmur_invitations
-                    (digest, bundle, encoded_bytes, expires_at, admission_principal,
-                     revocation_key)
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                digest,
-                bundle,
-                BigInt(bundle.length),
-                BigInt(expiresAt),
-                admissionPrincipal,
-                revocationKey ?? null,
-            );
-            this.#database.exec("COMMIT");
-            return { expiresAt, duplicate: false };
-        } catch (error: unknown) {
-            this.#rollback();
-            throw error;
-        }
-    }
-
-    async readInvitation(digest: Uint8Array, now: number): Promise<StoredInvitation | undefined> {
-        this.#assertOpen();
-        if (digest.length !== 32) throw new Error("Invalid invitation digest");
-        const row = this.#get(
-            `SELECT bundle, expires_at
-             FROM murmur_invitations
-             WHERE digest = ? AND expires_at > ?`,
-            digest,
-            BigInt(now),
-        );
-        return row === undefined
-            ? undefined
-            : {
-                  bundle: copyBytes(row.bundle, "invitation bundle"),
-                  expiresAt: safeNumberColumn(row.expires_at),
-              };
-    }
-
-    async revokeInvitations(
-        revocationKey: Uint8Array,
-        digest: Uint8Array | null,
-        now: number,
-        maximumItems: number,
-    ): Promise<RevokeInvitationsOutcome> {
-        this.#assertOpen();
-        if (
-            revocationKey.length !== 32 ||
-            (digest !== null && digest.length !== 32) ||
-            !Number.isSafeInteger(now) ||
-            !Number.isSafeInteger(maximumItems) ||
-            maximumItems < 1
-        ) {
-            throw new Error("Invalid invitation revocation input");
-        }
-        await this.pruneExpired(now);
-        this.#database.exec("BEGIN IMMEDIATE");
-        try {
-            let revoked = 0;
-            if (digest !== null) {
-                const invitation = this.#get(
-                    `SELECT revocation_key, expires_at, admission_principal
-                     FROM murmur_invitations
-                     WHERE digest = ? AND expires_at > ?`,
-                    digest,
-                    BigInt(now),
-                );
-                if (invitation !== undefined) {
-                    if (
-                        invitation.revocation_key === null ||
-                        !equalBytes(
-                            copyBytes(invitation.revocation_key, "invitation revocation key"),
-                            revocationKey,
-                        )
-                    ) {
-                        throw new RelayError(401, "Invitation revocation is unauthorized", {
-                            error: "invitation_revocation_unauthorized",
-                        });
-                    }
-                    this.#run(
-                        `INSERT OR IGNORE INTO murmur_invitation_revocations
-                            (digest, revocation_key, expires_at, admission_principal)
-                         VALUES (?, ?, ?, ?)`,
-                        digest,
-                        revocationKey,
-                        BigInt(safeNumberColumn(invitation.expires_at)),
-                        copyBytes(invitation.admission_principal, "admission principal"),
-                    );
-                    revoked = safeNumberColumn(
-                        this.#run(`DELETE FROM murmur_invitations WHERE digest = ?`, digest)
-                            .changes,
-                    );
-                } else {
-                    const tombstone = this.#get(
-                        `SELECT revocation_key
-                         FROM murmur_invitation_revocations
-                         WHERE digest = ? AND expires_at > ?`,
-                        digest,
-                        BigInt(now),
-                    );
-                    if (
-                        tombstone !== undefined &&
-                        !equalBytes(
-                            copyBytes(tombstone.revocation_key, "invitation revocation key"),
-                            revocationKey,
-                        )
-                    ) {
-                        throw new RelayError(401, "Invitation revocation is unauthorized", {
-                            error: "invitation_revocation_unauthorized",
-                        });
-                    }
-                }
-            } else {
-                while (true) {
-                    const invitations = this.#all(
-                        `SELECT digest, expires_at, admission_principal
-                         FROM murmur_invitations
-                         WHERE revocation_key = ? AND expires_at > ?
-                         ORDER BY expires_at, digest
-                         LIMIT ?`,
-                        revocationKey,
-                        BigInt(now),
-                        BigInt(maximumItems),
-                    );
-                    if (invitations.length === 0) break;
-                    for (const invitation of invitations) {
-                        const invitationDigest = copyBytes(invitation.digest, "invitation digest");
-                        this.#run(
-                            `INSERT OR IGNORE INTO murmur_invitation_revocations
-                                (digest, revocation_key, expires_at, admission_principal)
-                             VALUES (?, ?, ?, ?)`,
-                            invitationDigest,
-                            revocationKey,
-                            BigInt(safeNumberColumn(invitation.expires_at)),
-                            copyBytes(invitation.admission_principal, "admission principal"),
-                        );
-                        revoked += safeNumberColumn(
-                            this.#run(
-                                `DELETE FROM murmur_invitations
-                                 WHERE digest = ? AND revocation_key = ?`,
-                                invitationDigest,
-                                revocationKey,
-                            ).changes,
-                        );
-                    }
-                }
-            }
-            this.#database.exec("COMMIT");
-            return { revoked };
-        } catch (error: unknown) {
-            this.#rollback();
-            throw error;
-        }
     }
 
     async publish(
@@ -832,32 +560,8 @@ export class SqliteRelayStore implements RelayStore {
         this.#database.exec("BEGIN IMMEDIATE");
         try {
             const removedDeliveries = this.#pruneExpired(now);
-            const removedInvitations = safeNumberColumn(
-                this.#run(
-                    `DELETE FROM murmur_invitations
-                     WHERE digest IN (
-                         SELECT digest FROM murmur_invitations
-                         WHERE expires_at <= ?
-                         ORDER BY expires_at, digest
-                         LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
-                     )`,
-                    BigInt(now),
-                ).changes,
-            );
-            const removedRevocations = safeNumberColumn(
-                this.#run(
-                    `DELETE FROM murmur_invitation_revocations
-                     WHERE digest IN (
-                         SELECT digest FROM murmur_invitation_revocations
-                         WHERE expires_at <= ?
-                         ORDER BY expires_at, digest
-                         LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
-                     )`,
-                    BigInt(now),
-                ).changes,
-            );
             this.#database.exec("COMMIT");
-            return removedDeliveries + removedInvitations + removedRevocations;
+            return removedDeliveries;
         } catch (error: unknown) {
             this.#rollback();
             throw error;
@@ -901,14 +605,6 @@ export class SqliteRelayStore implements RelayStore {
     }
 
     #initializeSchema(): void {
-        const legacy = this.#get(
-            `SELECT name FROM sqlite_master
-             WHERE type = 'table' AND name LIKE 'murmur_relay_%'
-             LIMIT 1`,
-        );
-        if (legacy !== undefined) {
-            throw new Error("Legacy SQLite relay schema is not supported; use a clean database");
-        }
         const marker = this.#get(
             `SELECT name FROM sqlite_master
              WHERE type = 'table' AND name = 'murmur_queue_schema'`,
@@ -917,11 +613,7 @@ export class SqliteRelayStore implements RelayStore {
             const incomplete = this.#get(
                 `SELECT name FROM sqlite_master
                  WHERE type = 'table'
-                   AND (
-                       name LIKE 'murmur_queue_%'
-                       OR name = 'murmur_invitations'
-                       OR name = 'murmur_invitation_revocations'
-                   )
+                   AND name LIKE 'murmur_queue_%'
                  LIMIT 1`,
             );
             if (incomplete !== undefined) {
@@ -932,7 +624,7 @@ export class SqliteRelayStore implements RelayStore {
                 "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
             );
             const version = bigintColumn(schema.version);
-            if (version !== 5n) {
+            if (version !== 1n) {
                 throw new Error("Unsupported SQLite queue schema version");
             }
             const tables = this.#requiredGet(
@@ -942,12 +634,10 @@ export class SqliteRelayStore implements RelayStore {
                     'murmur_queue_global',
                     'murmur_queues',
                     'murmur_queue_deliveries',
-                    'murmur_queue_references',
-                    'murmur_invitations',
-                    'murmur_invitation_revocations'
+                    'murmur_queue_references'
                  )`,
             );
-            if (safeNumberColumn(tables.table_count) !== 7) {
+            if (safeNumberColumn(tables.table_count) !== 5) {
                 throw new Error("Incomplete SQLite queue schema");
             }
             return;
@@ -959,7 +649,7 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 5);
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 1);
             CREATE TABLE murmur_queue_global (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 last_event_id TEXT CHECK (
@@ -1023,40 +713,6 @@ export class SqliteRelayStore implements RelayStore {
                 ON murmur_queue_references(sender, delivery_id);
             CREATE INDEX murmur_queue_reference_admission
                 ON murmur_queue_references(admission_principal);
-            CREATE TABLE murmur_invitations (
-                digest BLOB PRIMARY KEY CHECK (length(digest) = 32),
-                bundle BLOB NOT NULL,
-                encoded_bytes INTEGER NOT NULL CHECK (
-                    encoded_bytes > 0 AND length(bundle) = encoded_bytes
-                ),
-                expires_at INTEGER NOT NULL,
-                admission_principal BLOB NOT NULL CHECK (
-                    length(admission_principal) = 32
-                ),
-                revocation_key BLOB CHECK (
-                    revocation_key IS NULL OR length(revocation_key) = 32
-                )
-            ) STRICT;
-            CREATE INDEX murmur_invitation_expiration
-                ON murmur_invitations(expires_at);
-            CREATE INDEX murmur_invitation_admission
-                ON murmur_invitations(admission_principal);
-            CREATE INDEX murmur_invitation_revocation_key
-                ON murmur_invitations(revocation_key);
-            CREATE TABLE murmur_invitation_revocations (
-                digest BLOB PRIMARY KEY CHECK (length(digest) = 32),
-                revocation_key BLOB NOT NULL CHECK (length(revocation_key) = 32),
-                expires_at INTEGER NOT NULL,
-                admission_principal BLOB NOT NULL CHECK (
-                    length(admission_principal) = 32
-                )
-            ) STRICT;
-            CREATE INDEX murmur_invitation_revocation_expiration
-                ON murmur_invitation_revocations(expires_at);
-            CREATE INDEX murmur_invitation_revocation_authority
-                ON murmur_invitation_revocations(revocation_key);
-            CREATE INDEX murmur_invitation_revocation_admission
-                ON murmur_invitation_revocations(admission_principal);
             `);
             this.#run(
                 `UPDATE murmur_queue_global SET generation_seed = ? WHERE singleton = 1`,
@@ -1066,33 +722,6 @@ export class SqliteRelayStore implements RelayStore {
         } catch (error: unknown) {
             this.#rollback();
             throw error;
-        }
-    }
-
-    #assertRevocationKeyCapacity(
-        revocationKey: Uint8Array,
-        now: number,
-        limits: InvitationLimits,
-        addedItems: number,
-    ): void {
-        const usage = this.#requiredGet(
-            `SELECT
-                (SELECT COUNT(*) FROM murmur_invitations
-                 WHERE revocation_key = ? AND expires_at > ?) +
-                (SELECT COUNT(*) FROM murmur_invitation_revocations
-                 WHERE revocation_key = ? AND expires_at > ?) AS item_count`,
-            revocationKey,
-            BigInt(now),
-            revocationKey,
-            BigInt(now),
-        );
-        if (
-            bigintColumn(usage.item_count) + BigInt(addedItems) >
-            BigInt(limits.maximumRevocationKeyItems)
-        ) {
-            throw new RelayError(429, "Invitation revocation-authority quota exceeded", {
-                error: "invitation_revocation_authority_full",
-            });
         }
     }
 

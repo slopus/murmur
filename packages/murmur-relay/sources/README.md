@@ -1,18 +1,16 @@
 # Relay sources
 
 ```text
-invitation bytes -> digest/TTL policy -> bounded opaque cache
-queue protocol --> relay policy ------> atomic queue storage
-                          \-----------> page JSON / ordered SSE
-                                        Fetch and Node hosts
+cloudflare/  Worker and Durable Object implementation
+fanout/      durable manifest-first multicast coordinator
+http/        standalone Fetch request boundary
+protocol/    signed delivery and queue request codecs
+relay/       queue service and wake coordination
+server/      Node HTTP adapter
+session/     short-lived relay-session tickets
+storage/     SQLite and PostgreSQL queue stores
+utils/       strict JSON, logging, bytes, and UUID helpers
+websocket/   authenticated WebSocket protocol
 ```
 
-The relay stores one encrypted delivery record plus one queue reference per
-recipient until acknowledgement or expiration. It also stores public signed
-invitation bytes for at most five minutes under their SHA-256 digest. It has no
-topic, directory, or application semantics.
-
-The additive `session` boundary issues device-bound temporary routing
-capabilities after application authorization. The `websocket` boundary maps
-those capabilities onto the same signed queue operations; HTTP/SSE stays
-available unchanged.
+The relay stores opaque pending ciphertext and continuity metadata only.

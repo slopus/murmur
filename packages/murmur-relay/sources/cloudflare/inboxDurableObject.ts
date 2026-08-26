@@ -715,62 +715,45 @@ export class MurmurInboxDurableObject {
     async #metadataInTransaction(
         transaction: DurableObjectTransactionLike,
     ): Promise<InboxMetadata> {
-        const existing = await transaction.get<Partial<InboxMetadata>>(META_KEY);
+        const existing = await transaction.get<unknown>(META_KEY);
         if (existing === undefined) {
             const created = emptyMetadata();
             await transaction.put(META_KEY, created);
             return created;
         }
+        const metadata = object(existing);
+        exact(metadata, [
+            "head",
+            "headSequence",
+            "nextSequence",
+            "acknowledgedThrough",
+            "acknowledgedSequence",
+            "generation",
+            "pendingItems",
+            "pendingBytes",
+        ]);
         if (
-            (existing.head === null || typeof existing.head === "string") &&
-            Number.isSafeInteger(existing.headSequence) &&
-            (existing.headSequence ?? -1) >= 0 &&
-            Number.isSafeInteger(existing.nextSequence) &&
-            (existing.nextSequence ?? 0) > (existing.headSequence ?? -1) &&
-            (existing.acknowledgedThrough === null ||
-                typeof existing.acknowledgedThrough === "string") &&
-            Number.isSafeInteger(existing.acknowledgedSequence) &&
-            (existing.acknowledgedSequence ?? -1) >= 0 &&
-            typeof existing.generation === "string"
+            (metadata.head === null || typeof metadata.head === "string") &&
+            Number.isSafeInteger(metadata.headSequence) &&
+            (metadata.headSequence as number) >= 0 &&
+            Number.isSafeInteger(metadata.nextSequence) &&
+            (metadata.nextSequence as number) > (metadata.headSequence as number) &&
+            (metadata.acknowledgedThrough === null ||
+                typeof metadata.acknowledgedThrough === "string") &&
+            Number.isSafeInteger(metadata.acknowledgedSequence) &&
+            (metadata.acknowledgedSequence as number) >= 0 &&
+            typeof metadata.generation === "string" &&
+            Number.isSafeInteger(metadata.pendingItems) &&
+            (metadata.pendingItems as number) >= 0 &&
+            (metadata.pendingItems as number) <= MAXIMUM_QUEUE_ITEMS &&
+            Number.isSafeInteger(metadata.pendingBytes) &&
+            (metadata.pendingBytes as number) >= 0 &&
+            (metadata.pendingBytes as number) <= MAXIMUM_QUEUE_BYTES
         ) {
-            try {
-                decodeBase64Url(existing.generation, 32);
-                return existing as InboxMetadata;
-            } catch {
-                // Fall through to a loss-signaling lazy migration.
-            }
+            decodeBase64Url(metadata.generation, 32);
+            return metadata as unknown as InboxMetadata;
         }
-
-        const records = await transaction.list<StoredDeliveryRecord>({
-            prefix: EVENT_PREFIX,
-            limit: MAXIMUM_QUEUE_ITEMS + 1,
-        });
-        if (records.size > MAXIMUM_QUEUE_ITEMS) {
-            throw new Error("Inbox migration exceeds queue capacity");
-        }
-        let sequence = 0;
-        let pendingBytes = 0;
-        for (const [key, record] of records) {
-            sequence += 1;
-            pendingBytes += record.encodedBytes;
-            await transaction.put<StoredDeliveryRecord>(key, { ...record, sequence });
-        }
-        const last = [...records.values()].at(-1);
-        const migrated: InboxMetadata = {
-            head: typeof existing.head === "string" ? existing.head : (last?.eventId ?? null),
-            headSequence: sequence,
-            nextSequence: sequence + 1,
-            acknowledgedThrough:
-                typeof existing.acknowledgedThrough === "string"
-                    ? existing.acknowledgedThrough
-                    : null,
-            acknowledgedSequence: 0,
-            generation: encodeBase64Url(createGenerationSeed()),
-            pendingItems: records.size,
-            pendingBytes,
-        };
-        await transaction.put(META_KEY, migrated);
-        return migrated;
+        throw new Error("Invalid inbox metadata");
     }
 
     async #scheduleAt(scheduled: number): Promise<void> {

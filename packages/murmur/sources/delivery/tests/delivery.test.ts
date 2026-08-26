@@ -178,7 +178,15 @@ describe("delivery client", () => {
                 throw new Error("unexpected publish");
             },
             read: async (_read: SignedInboxRead) => {
-                throw new OversizedInboxDeliveryError(eventId, eventId, null);
+                throw new OversizedInboxDeliveryError(
+                    eventId,
+                    1,
+                    eventId,
+                    1,
+                    null,
+                    0,
+                    new Uint8Array(32),
+                );
             },
             acknowledge: async (acknowledgement) => {
                 acknowledgements.push(acknowledgement);

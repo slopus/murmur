@@ -1,125 +1,68 @@
 # Security
 
-Murmur protects application content from the relay, not communication metadata.
-
-## Relay visibility
-
-The relay sees:
-
-- sender and recipient public identities;
-- exact multicast fanout;
-- delivery sizes, timing, TTL, and per-inbox progress;
-- IP or trusted-ingress admission metadata;
-- the lifetime and timing of recipient SSE connections;
-- public signed discovery-bundle bytes uploaded to its five-minute cache.
-
-The relay does not receive identity roots, KeyPackage private keys, Welcome
-plaintext, MLS epochs, application plaintext, or application history.
-
-For revocable invitations it also sees the invitation owner's public identity,
-a separate public revocation key, and signatures authorizing registration and
-revocation. The private revocation root remains in the creator's store. Relay
-logs must never include invitation digests, bundle bytes, authorization bodies,
-or revocation signatures.
-
-Invitation digests are short-lived bearer capabilities. Signed bundles contain
-unpredictable cryptographic material, making their 32-byte digests infeasible to
-guess; SHA-256 also detects relay substitution. Anyone who obtains a digest may
-download its public bundle until expiry. The client always verifies the digest,
-signed expiry, identity signature, and KeyPackage signatures; cache presence is
-not authentication.
-
-Possessing a digest grants download but not revocation. The owner signature
-binds an exact digest and expiry to a separate revocation public key, and the
-relay accepts revocation only under that key. A live revocation creates an
-expiring tombstone so replaying the public invitation bytes cannot resurrect
-the cache entry. Revocation is not retroactive session termination.
-
-If the relay is unavailable, the creator immediately destroys matching unused
-private KeyPackages and retains a durable pending revocation. That prevents a
-new Welcome from completing at the creator, but no client-side action can make
-an unreachable relay stop serving already-cached public bytes. Global cache
-invalidation therefore occurs only after authenticated retry or five-minute
-expiry.
-
-Confirmed contacts exchange fifteen one-use KeyPackages and one reusable
-last-resort KeyPackage inside their authenticated technical session. Normal
-group admission deletes private KeyPackage material after one Welcome. The
-fallback deliberately remains available across multiple Welcomes so an offline
-contact can always be added after the one-use pool is exhausted. Compromise of
-that retained fallback can therefore expose captured Welcomes addressed to it;
-the tradeoff is explicit availability rather than deletion-based Welcome
-forward secrecy. Refill rotates the fallback when the contact reconnects.
-
 ## Trust model
 
-The relay is untrusted for confidentiality and correctness. It can delay, drop,
-reorder across inboxes, replay retained ciphertext, equivocate, or become
-unavailable. It cannot forge a valid sender delivery or decrypt MLS content.
+The relay is untrusted for confidentiality and session semantics. It sees public
+queue identities, signed envelope metadata, timing, ciphertext sizes, recipient
+fanout, ingress admission principals, and acknowledgement progress. It must not
+receive MLS secrets, identity roots, plaintext descriptors, or application
+updates.
 
-UUIDv7 order is a relay consistency service, not a cryptographic proof. Murmur
-uses the shared event ID from each atomic multicast to arbitrate concurrent
-Commits, but accepts only a cryptographically valid, role-authorized Commit for
-the current epoch. Clients validate exact recipients, epoch, sender, complete
-owner/admin/policy control, KeyPackage lifetime, and every cryptographic
-transition. A malicious relay can deny progress, but cannot make honest members
-accept different valid winners without violating the shared-order contract.
+The application controls its `MurmurStore` and every external effect. Compromise
+or loss of that store exposes or destroys the local cryptographic state it
+contains. Protect it with application-grade encryption, access control, atomic
+backup, and rollback detection.
 
-SSE transports the same untrusted signed deliveries as bounded queue reads. A
-stream is authenticated once when opened and must use TLS. It can replay,
-truncate, delay, or reorder records; the client validates strict inbox order and
-reconnects from durable progress. SSE receipt never authorizes deletion.
+## Identity and MLS
 
-## Durable client invariants
+- Generate identity roots with a cryptographically secure random source.
+- Keep all secret keys as byte arrays; never log or stringify them.
+- Validate identity lengths, KeyPackage signatures, lifetimes, credentials, and
+  key bindings before cryptographic operations.
+- Destroy one-use private KeyPackage material after successful Welcome
+  processing.
+- Zero temporary secret arrays at the end of their lifetime.
+- Reject replayed KeyPackages and protocol frames durably.
 
-- Persist protocol effects, buffered updates, replay state, and cursor before
-  acknowledging.
-- Commit one identity-wide update batch only after `onUpdates` resolves; use
-  stable update IDs when application persistence needs idempotency.
-- Persist post-ratchet epochs and exact outboxes before publishing.
-- Commit a local contact profile revision, all active-contact mirrors, and all
-  corresponding outboxes in one transaction.
-- Persist invitation revocation authority and pending local key destruction
-  across restart; never serialize the private authority into an invitation.
-- Adopt Commits only from authenticated queue echoes.
-- Keep active and staged epochs separate until the echo wins; cancel and rebase
-  dependent sends when an earlier valid Commit arrives.
-- Treat malformed authenticated input as terminal queue progress.
-- Never expose the `murmur/` storage namespace or transaction to application
-  callbacks.
-- Zero temporary secret and plaintext byte arrays in success and error paths.
+Forward secrecy depends on durable epoch replacement and deletion of retired
+secrets. Rollback of client storage can restore old send authority, so storage
+continuity is a security property rather than an operational convenience.
 
-Losing or rolling back the single-device store can lose identity and MLS state.
-The relay cannot reconstruct it. A stale store behind the acknowledged queue
-prefix fails explicitly rather than skipping missing MLS state.
+## Delivery
 
-## Limits
+Signed envelopes bind the operation ID, sender, exact recipient set, timestamps,
+and ciphertext. The relay validates all bounds and signatures before storage.
+Queue reads and acknowledgements are independently signed by the recipient.
 
-Pending sessions, buffered events, replay entries, membership intents, members,
-outboxes, ciphertext, fanout, queue bytes, sender bytes, and global relay
-storage are all bounded. Per-sender reference quotas charge multicast fanout,
-but identities are free to create: relay quotas bound resource usage, not fair
-availability under a Sybil attack. Probabilistic replay overflow can reject
-legitimate new traffic but never exposes a probable replay to the application.
+Use constant-time comparison for authentication values. Never log request
+bodies, signatures, ciphertext, queue tokens, identity roots, or relay-session
+tokens. Production ingress must authenticate callers and apply non-Sybil policy
+before assigning quota principals.
 
-Relay UUIDv7 time is an untrusted ordering input. The inbox processor accepts
-its magnitude only inside a bounded local plausibility window before using it
-for expiry and replay garbage collection. A malicious relay can still delay
-traffic within that window; MLS generation and epoch validation remain the
-cryptographic backstop.
+## Durable effects
 
-## Deployment requirements
+Murmur persists protocol progress and application batches before relay
+acknowledgement. The application should apply an update batch atomically and
+deduplicate by stable event ID. Throwing a callback is safe only when retrying
+that same effect is safe.
 
-- Terminate TLS before the Node relay.
-- Apply non-Sybil authenticated admission before forwarding and enforce an
-  outstanding-fanout budget per admitted principal. A socket-address rate
-  limit alone is not sufficient for a public relay.
-- Protect the client store as identity and epoch secret material.
-- Back up client state atomically; restoring a stale backup may be
-  unrecoverable.
-- Monitor queue, sender, and global backpressure.
-- Monitor separate invitation-cache item, byte, revocation-authority, and
-  tombstone backpressure.
+Pending sessions are unsolicited cryptographic state. Keep member, byte, event,
+outbox, and pending-session limits conservative. Ignore unknown descriptors and
+surface only the initiator and opaque metadata needed for an informed decision.
 
-Murmur has not received an independent security audit. Its MLS implementation
-is a tested RFC 9420 profile, not a claim of complete RFC feature coverage.
+## Multiple devices
+
+Verify device-link material over an authenticated user-visible channel. Roster
+revisions are signed by active account devices. Review dormant-device reports
+and revoke lost devices promptly. A revoked device must be removed from every
+known MLS session before it stops receiving new traffic.
+
+## Operations
+
+- Terminate TLS at a trusted boundary.
+- Bound JSON, SSE, WebSocket, recipient, ciphertext, and response sizes.
+- Monitor quota pressure, signature failures, sequence gaps, continuity changes,
+  and repeated reset events.
+- Exercise restore procedures and declare restored relay state before serving.
+- Keep signing, token, database, and application-storage secrets in separate
+  secret-management domains.

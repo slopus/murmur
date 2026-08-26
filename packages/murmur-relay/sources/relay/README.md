@@ -1,33 +1,14 @@
 # Relay service
 
-Validates signed deliveries and signed queue operations, enforces TTL and quota
-policy, delegates atomic multicast and trimming to storage, and orchestrates
-bounded long polling plus pull-driven ordered SSE. It also hashes and stores
-opaque signed discovery bytes under a hard five-minute policy without treating
-cache contents as trusted. Owner-authorized registration binds exact bytes to a
-separate revocation public key; signed revocation delegates bounded tombstone
-replacement to storage.
-
-Every publication call must supply an explicit admission principal. The service
-hashes it before storage and never falls back to the free protocol sender
-identity. The HTTP boundary supplies the trusted socket/header principal or an
-explicit shared embedding principal.
+`RelayService` validates signed opaque delivery envelopes, delegates atomic
+multicast and queue operations to storage, and coordinates long-poll and stream
+wakeups.
 
 ```text
-signed request -> shape/time/signature policy -> atomic store operation
-                                                  |
-empty read/stream -> bounded waiter -> wake hint -+-> authoritative reread
-bundle + owner auth -> time/signature/SHA-256 -> invitation cache
-revocation signature -------------------------> one/all tombstones
+signed delivery -> validation -> atomic recipient fanout -> wake
+signed read -> authentication -> ordered bounded page
+signed acknowledgement -> authentication -> monotonic prefix trim
 ```
 
-Long polls and persistent streams share global and per-recipient concurrency
-bounds. Disconnects, relay shutdown, and timeouts settle each waiter exactly
-once. A wake is only a latency hint: duplicate publication also wakes
-receivers, and every wake is followed by a fresh store read. SSE emits exact
-queued deliveries rather than wake hints and uses comments only for heartbeat.
-
-UUIDv7 order is guaranteed only within one inbox and is not a cryptographic
-guarantee. A malicious relay can suppress or equivocate about delivery order.
-Clients must treat this as part of the untrusted-transport threat model rather
-than assuming event IDs prove consensus.
+Quota policy covers recipient inboxes, senders, ingress principals, and global
+pending storage. Expiry pruning is bounded and destructive.

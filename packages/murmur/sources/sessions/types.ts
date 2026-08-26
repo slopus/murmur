@@ -1,13 +1,5 @@
 import type { InboxSyncResult } from "../delivery/index.js";
-import type { DiscoveryBundle } from "../identity/discovery/index.js";
 import type {
-    MurmurContactAdded,
-    MurmurContactRemoved,
-    MurmurContactRequested,
-    MurmurContactUpdated,
-} from "../contacts/types.js";
-import type {
-    MurmurContactRosterChanged,
     MurmurDeviceAdded,
     MurmurDeviceRevoked,
     MurmurDormantDevice,
@@ -108,26 +100,12 @@ export interface MurmurSyncOptions {
      * omitting the hook leaves updates pending.
      */
     readonly onUpdates?: (updates: readonly MurmurUpdate[]) => void | Promise<void>;
-    /** Runs for validated incoming contact requests in the same durable batch. */
-    readonly onContactRequested?: (
-        requests: readonly MurmurContactRequested[],
-    ) => void | Promise<void>;
-    /** Runs when mutual profile hellos establish confirmed contacts. */
-    readonly onContactAdded?: (contacts: readonly MurmurContactAdded[]) => void | Promise<void>;
-    /** Runs when an established contact publishes a newer authenticated profile. */
-    readonly onContactUpdated?: (contacts: readonly MurmurContactUpdated[]) => void | Promise<void>;
-    /** Runs when technical contact sessions are removed. */
-    readonly onContactRemoved?: (contacts: readonly MurmurContactRemoved[]) => void | Promise<void>;
     /** Runs when a device of this account is durably authorized. */
     readonly onDeviceAdded?: (devices: readonly MurmurDeviceAdded[]) => void | Promise<void>;
     /** Runs when a device of this account is durably revoked. */
     readonly onDeviceRevoked?: (devices: readonly MurmurDeviceRevoked[]) => void | Promise<void>;
     /** Reports sibling devices silent for six months; revocation remains application-directed. */
     readonly onDeviceDormant?: (devices: readonly MurmurDormantDevice[]) => void | Promise<void>;
-    /** Runs when an authenticated contact roster adds or revokes a device. */
-    readonly onContactRosterChanged?: (
-        changes: readonly MurmurContactRosterChanged[],
-    ) => void | Promise<void>;
 }
 
 /** Bounded session-list query. */
@@ -152,18 +130,16 @@ interface CreateMurmurSessionCommonOptions {
     readonly anyoneCanAddMembers?: boolean;
 }
 
+/** Bare MLS admission material used until relay-directory claims are introduced. */
+export interface MurmurSessionMember {
+    readonly identity: Uint8Array;
+    readonly keyPackage: Uint8Array;
+}
+
 /** Construction inputs for one new local session. */
-export type CreateMurmurSessionOptions =
-    | (CreateMurmurSessionCommonOptions & {
-          /** Confirmed contact identities admitted from their cached KeyPackages. */
-          readonly contacts: readonly Uint8Array[];
-          readonly members?: never;
-      })
-    | (CreateMurmurSessionCommonOptions & {
-          /** Direct discovery material used by low-level bootstrap workflows. */
-          readonly members: readonly DiscoveryBundle[];
-          readonly contacts?: never;
-      });
+export interface CreateMurmurSessionOptions extends CreateMurmurSessionCommonOptions {
+    readonly members: readonly MurmurSessionMember[];
+}
 
 /** Stateful-session resource limits. */
 export interface MurmurSessionLimits {

@@ -9,11 +9,6 @@ import {
     type SignedDelivery,
 } from "../../delivery/index.js";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
-import {
-    DISCOVERY_INVITATION_TTL_MILLISECONDS,
-    createDiscoveryBundle,
-    type DiscoveryTransport,
-} from "../../identity/discovery/index.js";
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
 import { MurmurClient, type MurmurSessionLimits, type MurmurUpdate } from "../index.js";
@@ -103,7 +98,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("offline group"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             const first = await alice.send(session.id, utf8Encode("first offline"));
             const second = await alice.send(session.id, utf8Encode("second offline"));
@@ -175,33 +170,6 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("creates a session from a 32-byte relay-cached invitation digest", async () => {
-        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
-        const alice = await client(relay);
-        const bob = await client(relay);
-        try {
-            const digest = await bob.createInvitation();
-            expect(digest).toHaveLength(32);
-            const resolved = await alice.resolveInvitation(digest);
-            expect(resolved.identityKey).toEqual(bob.identity);
-            expect(resolved.expiresAt - resolved.createdAt).toBe(
-                DISCOVERY_INVITATION_TTL_MILLISECONDS,
-            );
-
-            const session = await alice.createSession({
-                descriptor: utf8Encode("digest invitation"),
-                members: [resolved],
-            });
-            await alice.synchronize();
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
-        } finally {
-            alice.close();
-            bob.close();
-            await relay.close();
-        }
-    });
-
     test("streams realtime events in order and publishes local outboxes without polling", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
@@ -215,7 +183,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("realtime SSE"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -315,82 +283,6 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("rejects an expired digest and drops its matching private KeyPackage", async () => {
-        let now = NOW;
-        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
-        const fetch = relayFetch(relay);
-        const bobStore = new MemoryMurmurStore();
-        const alice = await MurmurClient.open({
-            relay: "https://relay.test",
-            fetch,
-            store: new MemoryMurmurStore(),
-            now: () => now,
-        });
-        const bob = await MurmurClient.open({
-            relay: "https://relay.test",
-            fetch,
-            store: bobStore,
-            now: () => now,
-        });
-        try {
-            const digest = await bob.createInvitation();
-            const resolved = await alice.resolveInvitation(digest);
-            const session = await alice.createSession({
-                descriptor: utf8Encode("expires"),
-                members: [resolved],
-            });
-
-            now += DISCOVERY_INVITATION_TTL_MILLISECONDS;
-            await expect(alice.resolveInvitation(digest)).rejects.toMatchObject({
-                status: 404,
-                code: "invitation_not_found",
-            });
-            await alice.synchronize();
-            const synchronized = await bob.synchronize();
-            expect(synchronized.inbox.rejected).toBe(2);
-            expect(await bob.session(session.id)).toBeUndefined();
-            expect(await bobStore.scan("murmur/key-packages/", { limit: 10 })).toHaveLength(0);
-            expect(await bobStore.scan("murmur/key-package-expiries/", { limit: 10 })).toHaveLength(
-                0,
-            );
-        } finally {
-            alice.close();
-            bob.close();
-            await relay.close();
-        }
-    });
-
-    test("drops private KeyPackages when invitation upload fails", async () => {
-        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
-        const store = new MemoryMurmurStore();
-        const discoveryTransport: DiscoveryTransport = {
-            upload: async () => {
-                throw new Error("injected invitation upload failure");
-            },
-            download: async () => {
-                throw new Error("unused");
-            },
-        };
-        const bob = await MurmurClient.open({
-            transport: new HttpDeliveryTransport("https://relay.test", {
-                fetch: relayFetch(relay),
-            }),
-            discoveryTransport,
-            store,
-            now: () => NOW,
-        });
-        try {
-            await expect(bob.createInvitation()).rejects.toThrow(
-                "injected invitation upload failure",
-            );
-            expect(await store.scan("murmur/key-packages/", { limit: 10 })).toHaveLength(0);
-            expect(await store.scan("murmur/key-package-expiries/", { limit: 10 })).toHaveLength(0);
-        } finally {
-            bob.close();
-            await relay.close();
-        }
-    });
-
     test("delivers one identity-wide ordered batch across sessions", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
@@ -398,7 +290,7 @@ describe("stateful MLS sessions", () => {
         try {
             const first = await alice.createSession({
                 descriptor: utf8Encode("first session"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -406,7 +298,7 @@ describe("stateful MLS sessions", () => {
 
             const second = await alice.createSession({
                 descriptor: utf8Encode("second session"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -450,10 +342,10 @@ describe("stateful MLS sessions", () => {
         const bobStore = new MemoryMurmurStore();
         const bob = await client(relay, bobStore);
         try {
-            const bobDiscovery = await bob.discovery();
+            const bobKeyPackage = await bob.createKeyPackage();
             const created = await alice.createSession({
                 descriptor: utf8Encode("opaque descriptor"),
-                members: [bobDiscovery],
+                members: [bobKeyPackage],
             });
 
             await alice.synchronize();
@@ -573,13 +465,13 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("group"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
             await activate(bob, session.id);
 
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             await alice.synchronize();
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize();
@@ -662,7 +554,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("unauthorized add"),
-                members: [await bob.discovery(), await carol.discovery()],
+                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -688,7 +580,7 @@ describe("stateful MLS sessions", () => {
                 zeroBytes(state);
             }
 
-            await bob.addMember(session.id, await dave.discovery());
+            await bob.addMember(session.id, await dave.createKeyPackage());
             await bob.synchronize({ waitMilliseconds: 0 });
             await alice.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
@@ -725,7 +617,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("leave"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -772,7 +664,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("concurrent commits"),
-                members: [await bob.discovery(), await carol.discovery()],
+                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -837,7 +729,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("removal generation"),
-                members: [await bob.discovery(), await carol.discovery()],
+                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -854,7 +746,7 @@ describe("stateful MLS sessions", () => {
             await bob.synchronize({ waitMilliseconds: 0 });
 
             // Alice has not observed Bob's removal yet, so this snapshots the old generation.
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             await alice.synchronize({ waitMilliseconds: 0 });
             expect((await alice.session(session.id))?.members).toHaveLength(2);
             expect(await alice.issues()).toEqual(
@@ -869,7 +761,7 @@ describe("stateful MLS sessions", () => {
             await carol.synchronize({ waitMilliseconds: 0 });
             expect(await carol.session(session.id)).toBeUndefined();
 
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             await alice.synchronize({ waitMilliseconds: 0 });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -906,7 +798,7 @@ describe("stateful MLS sessions", () => {
             try {
                 const session = await alice.createSession({
                     descriptor: utf8Encode(`authorization loss ${authority}`),
-                    members: [await bob.discovery(), await carol.discovery()],
+                    members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
                     anyoneCanAddMembers: authority === "policy",
                 });
                 await alice.synchronize({ waitMilliseconds: 0 });
@@ -926,7 +818,7 @@ describe("stateful MLS sessions", () => {
                     expect((await bob.session(session.id))?.admins).toContainEqual(bob.identity);
                 }
 
-                await actor.addMember(session.id, await dave.discovery());
+                await actor.addMember(session.id, await dave.createKeyPackage());
                 expect(await prefixCount(actorStore, "murmur/session-intents/")).toBe(1);
                 if (authority === "admin") {
                     await alice.revokeAdmin(session.id, bob.identity);
@@ -1001,7 +893,7 @@ describe("stateful MLS sessions", () => {
             const session = await alice.createSession({
                 descriptor: utf8Encode("retried welcome"),
                 anyoneCanAddMembers: true,
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -1009,7 +901,7 @@ describe("stateful MLS sessions", () => {
             await activate(bob, session.id);
 
             blockBobCommit = true;
-            await bob.addMember(session.id, await carol.discovery());
+            await bob.addMember(session.id, await carol.createKeyPackage());
             expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 transientPublicationFailures: 1,
             });
@@ -1079,19 +971,19 @@ describe("stateful MLS sessions", () => {
             const session = await alice.createSession({
                 descriptor: utf8Encode("same account add"),
                 anyoneCanAddMembers: true,
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
             await activate(bob, session.id);
 
             blockBobAdd = true;
-            await bob.addMember(session.id, await carol.discovery());
+            await bob.addMember(session.id, await carol.createKeyPackage());
             expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 transientPublicationFailures: 1,
             });
 
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             await alice.synchronize({ waitMilliseconds: 0 });
             await alice.synchronize({ waitMilliseconds: 0 });
             await carol.synchronize({ waitMilliseconds: 0 });
@@ -1139,14 +1031,14 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("offline add"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
             await activate(bob, session.id);
             published.length = 0;
 
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             const messageId = await alice.send(session.id, utf8Encode("welcome carol"));
             expect(published).toEqual([]);
 
@@ -1214,7 +1106,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("restart"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1280,7 +1172,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("activation"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1344,7 +1236,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("bounded"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1379,7 +1271,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("pending overflow"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1404,13 +1296,13 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("old epoch"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
             await activate(bob, session.id);
 
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             await alice.synchronize();
             await bob.send(session.id, utf8Encode("from prior epoch"));
             await bob.synchronize();
@@ -1456,7 +1348,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("isolated outbox"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1500,7 +1392,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("corrupt outbox"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1537,7 +1429,7 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual(["healthy"]);
 
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             await alice.synchronize();
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize();
@@ -1562,7 +1454,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("corrupt multi-Welcome"),
-                members: [await bob.discovery(), await carol.discovery()],
+                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
             });
             const outboxes = await aliceStore.scan("murmur/session-outbox/", {
                 limit: 10,
@@ -1617,7 +1509,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("missing Welcome index"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             const indexes = await aliceStore.scan("murmur/bootstrap-outboxes/", {
                 limit: 10,
@@ -1653,7 +1545,7 @@ describe("stateful MLS sessions", () => {
         try {
             const damaged = await alice.createSession({
                 descriptor: utf8Encode("damaged state"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1661,7 +1553,7 @@ describe("stateful MLS sessions", () => {
 
             const healthy = await alice.createSession({
                 descriptor: utf8Encode("healthy state"),
-                members: [await carol.discovery()],
+                members: [await carol.createKeyPackage()],
             });
             await alice.synchronize();
             await carol.synchronize();
@@ -1707,14 +1599,14 @@ describe("stateful MLS sessions", () => {
             await expect(
                 outboxConstrained.createSession({
                     descriptor: utf8Encode("too many outboxes"),
-                    members: [await bob.discovery()],
+                    members: [await bob.createKeyPackage()],
                 }),
             ).rejects.toThrow("outbox capacity");
             expect((await outboxConstrained.sessions()).sessions).toEqual([]);
 
             const session = await ciphertextConstrained.createSession({
                 descriptor: utf8Encode("bounded send"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await ciphertextConstrained.synchronize();
             await bob.synchronize();
@@ -1749,7 +1641,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("clock skew"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             expect((await alice.synchronize()).transientPublicationFailures).toBe(0);
             await bob.synchronize();
@@ -1795,7 +1687,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("failed add"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             const outcome = await alice.synchronize();
             expect(outcome).toMatchObject({
@@ -1875,7 +1767,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("ordered outboxes"),
-                members: [await bob.discovery(), await carol.discovery()],
+                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -1934,7 +1826,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("recover commit"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             const blocked = await alice.synchronize();
             expect(blocked).toMatchObject({
@@ -1976,7 +1868,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("remove"),
-                members: [await bob.discovery(), await carol.discovery()],
+                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();
@@ -2012,11 +1904,11 @@ describe("stateful MLS sessions", () => {
         try {
             await alice.createSession({
                 descriptor: utf8Encode("first page"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.createSession({
                 descriptor: utf8Encode("second page"),
-                members: [await carol.discovery()],
+                members: [await carol.createKeyPackage()],
             });
             const first = await alice.sessions({ limit: 1 });
             expect(first.sessions).toHaveLength(1);
@@ -2032,69 +1924,25 @@ describe("stateful MLS sessions", () => {
         }
     });
 
-    test("refuses local reuse of a one-use discovery bundle", async () => {
+    test("refuses local reuse of a one-use KeyPackage", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const alice = await client(relay);
         const bob = await client(relay);
         try {
-            const discovery = await bob.discovery();
+            const keyPackage = await bob.createKeyPackage();
             await alice.createSession({
                 descriptor: utf8Encode("first use"),
-                members: [discovery],
+                members: [keyPackage],
             });
             await expect(
                 alice.createSession({
                     descriptor: utf8Encode("second use"),
-                    members: [discovery],
+                    members: [keyPackage],
                 }),
             ).rejects.toThrow("already used");
         } finally {
             alice.close();
             bob.close();
-            await relay.close();
-        }
-    });
-
-    test("retains a discovery claim through the KeyPackage lifetime", async () => {
-        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
-        const base = new HttpDeliveryTransport("https://relay.test", {
-            fetch: relayFetch(relay),
-        });
-        const bobIdentity = generateIdentityKeyPair();
-        let aliceNow = NOW;
-        const alice = await MurmurClient.open({
-            transport: base,
-            store: new MemoryMurmurStore(),
-            now: () => aliceNow,
-        });
-        const bob = await MurmurClient.open({
-            identity: bobIdentity,
-            transport: base,
-            store: new MemoryMurmurStore(),
-            now: () => NOW,
-        });
-        try {
-            const original = await bob.discovery();
-            await alice.createSession({
-                descriptor: utf8Encode("first wrapper"),
-                members: [original],
-            });
-
-            aliceNow = original.expiresAt + 1;
-            const replacement = createDiscoveryBundle(bobIdentity, original.keyPackages, {
-                createdAt: aliceNow,
-                expiresAt: aliceNow + 24 * 60 * 60 * 1_000,
-            });
-            await expect(
-                alice.createSession({
-                    descriptor: utf8Encode("replacement wrapper"),
-                    members: [replacement],
-                }),
-            ).rejects.toThrow("already used");
-        } finally {
-            alice.close();
-            bob.close();
-            destroyIdentity(bobIdentity);
             await relay.close();
         }
     });
@@ -2123,7 +1971,7 @@ describe("stateful MLS sessions", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("abandon"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             expect(await alice.synchronize()).toMatchObject({
                 pendingOutboxes: 2,
@@ -2167,12 +2015,12 @@ describe("stateful MLS sessions", () => {
         try {
             const first = await alice.createSession({
                 descriptor: utf8Encode("first pending"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             const second = await carol.createSession({
                 descriptor: utf8Encode("capacity retry"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await carol.synchronize();
             await bob.synchronize();
@@ -2236,7 +2084,7 @@ describe("stateful MLS sessions", () => {
         });
         const synchronizing = murmur.synchronize();
         await started;
-        const discovering = murmur.discovery();
+        const discovering = murmur.createKeyPackage();
         expect(() => murmur.close()).toThrow("operation is pending");
         releaseRead();
         await synchronizing;

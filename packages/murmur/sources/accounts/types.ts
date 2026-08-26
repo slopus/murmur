@@ -89,15 +89,6 @@ export interface MurmurDormantDevice {
     readonly dormantSince: number;
 }
 
-/** Authenticated device-membership change observed for a contact account. */
-export interface MurmurContactRosterChanged {
-    readonly id: string;
-    readonly account: Uint8Array;
-    readonly device: Uint8Array;
-    readonly change: "added" | "revoked" | "reset";
-    readonly rosterRevision?: number;
-}
-
 /** Inputs for authorizing one verified device-link request. */
 export interface MurmurDeviceProvisioningAuthorization {
     readonly request: MurmurDeviceLinkRequest;

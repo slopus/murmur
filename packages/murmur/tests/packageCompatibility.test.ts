@@ -52,13 +52,10 @@ describe("published package compatibility", () => {
 const loaded = await import("@slopus/murmur");
 const names = Object.keys(loaded).sort();
 if (JSON.stringify(names) !== JSON.stringify([
-    "DISCOVERY_INVITATION_TTL_MILLISECONDS",
     "DeliveryAcknowledgementFutureError",
     "DeliveryCursorTrimmedError",
     "DeliveryTransportError",
-    "DiscoveryTransportError",
     "HttpDeliveryTransport",
-    "HttpDiscoveryTransport",
     "HttpRelaySessionProvider",
     "InboxContinuityLossError",
     "InboxProcessor",
@@ -71,7 +68,6 @@ if (JSON.stringify(names) !== JSON.stringify([
     "TerminalInboxDeliveryError",
     "WebSocketDeliveryTransport",
     "containsRecipient",
-    "createPrivateGroupCredentialAuthorityFromSecret",
     "createSignedDelivery",
     "createSignedInboxAck",
     "createSignedInboxRead",
@@ -81,22 +77,18 @@ if (JSON.stringify(names) !== JSON.stringify([
     "encodeIdentityRoot",
     "generateIdentityKeyPair",
     "importIdentityKeyPair",
-    "parseDiscoveryBundle",
     "parseInboxContinuity",
     "parseInboxPage",
     "parseRelaySessionTicket",
     "parseSignedDelivery",
     "parseSignedRelaySessionRequest",
-    "serializeDiscoveryBundle",
     "signedDeliveryToJson",
     "signedInboxAckToJson",
     "signedInboxReadToJson",
     "signedRelaySessionRequestToJson",
-    "validateContactProfile",
     "validateMurmurServiceRegistration",
     "validateServiceId",
     "validateSignedDelivery",
-    "verifyDiscoveryBundle",
     "verifySignedDelivery",
     "verifySignedRelaySessionRequest",
 ])) {
@@ -108,7 +100,7 @@ if (JSON.stringify(names) !== JSON.stringify([
         });
     });
 
-    it("blocks every legacy package subpath", async () => {
+    it("blocks every removed package subpath", async () => {
         const script = `
 const blocked = [
     "@slopus/murmur/client",
@@ -128,7 +120,7 @@ for (const specifier of blocked) {
         rejected = true;
     }
     if (!rejected) {
-        throw new Error(\`Legacy package subpath resolved: \${specifier}\`);
+        throw new Error(\`Removed package subpath resolved: \${specifier}\`);
     }
 }
 `;
@@ -137,7 +129,7 @@ for (const specifier of blocked) {
         });
     });
 
-    it("contains no packed legacy CLI, document, session, or package-root MLS artifact", async () => {
+    it("contains no packed removed CLI, document, session, or package-root MLS artifact", async () => {
         const manifestPath = await publishedManifestPath();
         const root = join(manifestPath, "..");
         const entries = (await readdir(root, { recursive: true })).map((entry) =>
@@ -169,7 +161,6 @@ for (const specifier of blocked) {
                 `
 import {
     HttpDeliveryTransport,
-    HttpDiscoveryTransport,
     HttpRelaySessionProvider,
     MemoryMurmurStore,
     MurmurClient,
@@ -177,32 +168,21 @@ import {
     destroyIdentity,
     generateIdentityKeyPair,
     type DeliveryFetch,
-    type DiscoveryBundle,
-    type DiscoveryTransport,
     type IdentityKeyPair,
     type MurmurClientOptions,
-    type MurmurContactProfile,
-    type MurmurContactUpdated,
-    type MurmurPrivateGroupState,
     type MurmurService,
+    type MurmurSessionMember,
     type MurmurSyncOptions,
     type MurmurSessionPage,
     type MurmurStore,
-    type PrivateGroupStateConnection,
-    type PrivateGroupStateSnapshot,
     type RelaySessionProvider,
     type RelaySessionTicket,
-    type SignedInvitationRevocation,
     type SignedRelaySessionRequest,
 } from "@slopus/murmur";
 
 const store: MurmurStore = new MemoryMurmurStore();
 const deliveryFetch: DeliveryFetch = globalThis.fetch;
 const transport = new HttpDeliveryTransport("https://relay.example", { fetch: deliveryFetch });
-const discoveryTransport: DiscoveryTransport = new HttpDiscoveryTransport(
-    "https://relay.example",
-    { fetch: deliveryFetch },
-);
 const identity: IdentityKeyPair = generateIdentityKeyPair();
 const sessionProvider: RelaySessionProvider = new HttpRelaySessionProvider(
     "https://app.example/murmur/session",
@@ -211,13 +191,8 @@ const sessionProvider: RelaySessionProvider = new HttpRelaySessionProvider(
 const negotiatedOptions: MurmurClientOptions = { sessionProvider, store };
 const ticket: RelaySessionTicket | undefined = undefined;
 const proof: SignedRelaySessionRequest | undefined = undefined;
-const revocation: SignedInvitationRevocation | undefined = undefined;
 const options: MurmurClientOptions = {
     relay: new URL("https://relay.example"),
-    privateGroupState: {
-        relay: new URL("https://relay.example"),
-        fetch: deliveryFetch,
-    },
     store,
     fetch: deliveryFetch,
     identity,
@@ -230,43 +205,25 @@ const options: MurmurClientOptions = {
     }],
 };
 const service: MurmurService = options.services![0]!.service;
-const profile: MurmurContactProfile = { displayName: "Alice" };
 const opening: Promise<MurmurClient> = MurmurClient.open(options);
 const syncOptions: MurmurSyncOptions = {
     abort: new AbortController().signal,
     onUpdates: async (updates) => void updates,
-    onContactUpdated: async (updates: readonly MurmurContactUpdated[]) => void updates,
 };
-const exerciseSharing = async (client: MurmurClient): Promise<void> => {
-    await client.updateContactProfile(profile);
-    await client.revokeInvitation(new Uint8Array(32));
-    await client.revokeInvitations();
-};
-const privateStateConnection: PrivateGroupStateConnection = {
-    relay: "https://relay.example",
-    fetch: deliveryFetch,
-};
-const exercisePrivateState = async (client: MurmurClient): Promise<PrivateGroupStateSnapshot> => {
-    const state: MurmurPrivateGroupState = await client.privateGroupState(new Uint8Array(32));
-    return await state.read();
+const createSession = async (client: MurmurClient): Promise<void> => {
+    const member: MurmurSessionMember = await client.createKeyPackage();
+    await client.createSession({ descriptor: new Uint8Array([1]), members: [member] });
 };
 const page: MurmurSessionPage | undefined = undefined;
-const discovery: DiscoveryBundle | undefined = undefined;
 void transport;
-void discoveryTransport;
 void opening;
 void syncOptions;
 void page;
-void discovery;
 void service;
-void profile;
 void negotiatedOptions;
 void ticket;
 void proof;
-void revocation;
-void exerciseSharing;
-void privateStateConnection;
-void exercisePrivateState;
+void createSession;
 void WebSocketDeliveryTransport;
 destroyIdentity(identity);
 `,

@@ -1,12 +1,7 @@
 # Documentation
 
-- [ARCHITECTURE.md](ARCHITECTURE.md) — ownership, components, and durable
-  boundaries.
-- [PROTOCOL.md](PROTOCOL.md) — identity, discovery, delivery, and MLS session
-  behavior.
-- [RELAY_API.md](RELAY_API.md) — HTTP wire contract.
-- [SECURITY.md](SECURITY.md) — threat model, guarantees, and limitations.
-- [DEPLOYMENT.md](DEPLOYMENT.md) — relay deployment and operational boundaries.
-- [RELEASING.md](RELEASING.md) — checks and npm release procedure.
-
-Product intent and completion criteria live in `master-plans/`.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — component boundaries and durable state.
+- [PROTOCOL.md](PROTOCOL.md) — identity queues, MLS sessions, and synchronization.
+- [RELAY_API.md](RELAY_API.md) — standalone relay HTTP routes.
+- [DEPLOYMENT.md](DEPLOYMENT.md) — standalone and Cloudflare deployment.
+- [SECURITY.md](SECURITY.md) — trust model, secret handling, and operational risks.

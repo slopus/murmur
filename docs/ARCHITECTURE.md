@@ -1,147 +1,67 @@
 # Architecture
 
-Murmur has two stateful components with a strict ownership boundary.
+Murmur separates durable cryptographic state from disposable transport.
 
 ```text
 application
-    |
-    | transactional MurmurStore
-    v
+  | owns effects and MurmurStore
+  v
 @slopus/murmur
-    | identity root
-    | MLS epochs and ratchets
-    | replay records and exact outboxes
-    | pending-session buffers
-    |
-    | HTTPS: invitation digests + signed delivery + ordered SSE
-    v
-@slopus/murmur-relay
-    | non-enumerable five-minute discovery cache
-    | one queue per recipient identity
-    | unacknowledged and unexpired delivery references only
-    v
-SQLite or Postgres
+  | signed opaque deliveries
+  v
+relay
+  | one bounded queue per exact public identity
+  v
+recipient Murmur client
 ```
 
-## Client ownership
+## Library boundary
 
-`MurmurClient` owns one single-device Ed25519 identity derived from a 32-byte
-root. The same identity authenticates discovery bundles, relay operations, and
-MLS credentials. The supplied `MurmurStore` is authoritative for:
+The library owns identity roots, MLS KeyPackages, epochs, pending bootstraps,
+membership intents, replay protection, exact outboxes, account synchronization,
+and inbox progress. Application updates cross one identity-wide durable
+callback boundary. The application owns their meaning and downstream effects.
 
-- the identity root;
-- the separate invitation-revocation root and bounded digest-to-KeyPackage
-  records;
-- unused private KeyPackages;
-- active, creating, and pending MLS checkpoints;
-- sender ratchets and exact publication outboxes;
-- inbox cursor, replay protection, and terminal rejections;
-- asynchronous role and membership intents, pending-session state, bounded opaque event buffers, and
-  the identity-wide application-update order;
-- built-in contacts and session-to-service ownership.
+An application send clones and ratchets the active epoch, then persists both
+the new epoch and exact unpublished ciphertext before returning. A membership
+Commit persists active and staged epochs separately. The sender adopts its own
+Commit only from its authenticated queue echo.
 
-An identity-wide contact profile revision is mirrored into every active
-contact record. Updating it and queuing one MLS outbox for every active
-technical contact session is one transaction, so local reads can never observe
-a published revision without its durable outbound work.
+Incoming Welcomes become bounded pending sessions. Murmur continues processing
+MLS traffic while pending and buffers application bytes without exposing them.
+Activation releases the buffer through the ordinary application boundary;
+ignore destroys the pending secrets and data.
 
-Each confirmed contact also owns an offline admission inventory: fifteen
-one-use public KeyPackages from the peer plus one reusable last-resort package.
-The matching private bundles live only in the peer's store. Group creation
-consumes cached material locally, queues refill before depletion, and can reuse
-the fallback while that peer is offline.
+## Relay boundary
 
-Application history is not reconstructed from the relay. Murmur never exposes
-its storage transaction to event handlers. All durable client state is compound
-keys over one ordered byte key/value store with bounded lexicographic prefix
-scans. Active-session events enter one identity-wide UUIDv7-ordered local
-index. Contact handling, registered service callbacks, and global `onUpdates`
-participate in one batch; Murmur removes it only after every relevant callback
-resolves. Custom services own any application persistence separately from
-`MurmurStore`.
+The relay authenticates queue reads and acknowledgements, validates signed
+delivery envelopes, atomically fans one event out to exact recipient inboxes,
+and retains only unacknowledged unexpired ciphertext. It has no MLS, descriptor,
+membership, role, application, or conversation semantics.
 
-## Relay ownership
+UUIDv7 event IDs order deliveries only within one inbox. Signed acknowledgement
+is monotonic and separate from delivery. A continuity generation detects a
+restored or rolled-back relay database.
 
-The relay authenticates identities but does not interpret ciphertext. An
-accepted multicast receives one UUIDv7 event ID and one queue reference per
-recipient. UUID order is guaranteed only inside an individual inbox.
+The standalone relay supports SQLite and PostgreSQL. The Cloudflare deployment
+uses one inbox Durable Object per public identity and a global fanout Durable
+Object for manifest-first atomic multicast.
 
-The relay stores a public signed discovery bundle for at most five minutes
-under the SHA-256 digest of its exact bytes. It cannot enumerate invitations or
-resolve an identity; recipients already holding the digest fetch the bytes and
-independently verify the hash, signed expiry, identity signature, and
-KeyPackages.
+## Services and accounts
 
-For owner-authorized uploads it additionally stores the public revocation key.
-Revocation replaces a live invitation with a bounded tombstone carrying only
-digest, public authority, original expiry, and admission principal. Tombstones
-block public re-upload resurrection, count toward item quotas, and are pruned
-at expiry; they contain no private capability.
+Applications may register typed services under stable IDs. A service can claim
+new pending sessions and receives its own updates before the global application
+batch is prepared.
 
-The relay stores a delivery while at least one queue reference is
-unacknowledged and unexpired. A signed monotonic acknowledgement removes one
-recipient's processed prefix. The last reference removal deletes the delivery.
-TTL, recipient, sender, and global quotas bound pending storage.
+Device linking creates an authenticated account roster. Account synchronization
+uses an internal MLS session, while ordinary sessions continue to expose
+account identities instead of individual device leaves.
 
-Realtime receiving uses one recipient-signed SSE connection. The stream carries
-each exact queued delivery with its UUIDv7 ID, applies transport backpressure,
-and advances its in-memory emission cursor in inbox order. The durable client
-cursor remains authoritative: reconnect starts there, and acknowledgement still
-occurs only after local processing commits.
+## Failure boundaries
 
-The relay has no account registry, discovery directory or listing, application
-history, MLS state, or application-level acknowledgement protocol.
-
-## Session ordering
-
-Every Commit carries the complete owner, admin, and policy state in MLS
-authenticated data. Any current member may create a Commit, but each recipient
-deterministically validates the change against the role state of the epoch it
-extends. One relay multicast receives one shared UUIDv7 event ID in every
-recipient inbox, so the first valid Commit for an epoch wins identically for
-all retained members. There is no session-level committer role.
-
-Membership publication is an operation:
-
-```text
-validate full operation manifest
-          |
-publish Commit
-          |
-adopt only from the sender's own queue echo
-          |
-publish every required Welcome
-          |
-publish authenticated admission completion
-          |
-release dependent application work and later Commits
-```
-
-Membership and role APIs persist bounded intents before network I/O. A losing
-concurrent Commit is cancelled when the earlier relay event arrives; dependent
-application outboxes are re-encrypted against the winning epoch and the intent
-is retried with a fresh Commit. An Add's Welcome publishes only after that exact
-Commit is adopted, and an authenticated completion control prevents another
-member from publishing a later Commit before the admission finishes. Application
-and control outboxes are durably ordered per client. A transient head failure
-blocks later records for the same session while unrelated sessions continue.
-
-## Processing boundary
-
-Inbox processing and application handoff follow two related invariants:
-
-```text
-page or SSE event -> authenticate/decrypt
-                  -> persist protocol state + buffered update or rejection + cursor
-                  -> commit -> acknowledge through cursor
-
-ordered buffered batch -> contact + service handlers
-                       -> await lifecycle hooks + onUpdates(batch)
-                       -> local commit of the whole batch
-```
-
-A crash before the local commit leaves the relay item pending. A crash after
-that commit causes only acknowledgement retry. Separately, a thrown
-`onUpdates` callback or crash before its batch commit leaves the same stable
-update IDs pending locally. Terminal malformed data is durably rejected so it
-cannot block the identity queue.
+- Relay publication failure leaves exact durable outboxes for retry.
+- Callback failure leaves the exact update batch for retry.
+- Terminal malformed queue items are durably rejected so later items proceed.
+- Pending sessions and application buffers are strictly bounded.
+- Inbox continuity loss records a final application-visible reset snapshot
+  before technical state is purged.

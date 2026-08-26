@@ -1,4 +1,3 @@
-import { sha256 } from "@noble/hashes/sha2";
 import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -25,7 +24,6 @@ import { RelayService } from "../../relay/index.js";
 import {
     SqliteRelayStore,
     advanceLossGeneration,
-    type InvitationLimits,
     type PublishOutcome,
     type QueueLimits,
     type QueuePage,
@@ -36,7 +34,6 @@ import { equalBytes } from "../../utils/bytes.js";
 const NOW = 1_700_000_000_000;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const RETENTION_MILLISECONDS = 180 * DAY_MILLISECONDS;
-const INVITATION_TTL_MILLISECONDS = 5 * 60 * 1_000;
 const PAGE = { maximumEncodedBytes: 32 * 1024 * 1024 };
 const PRINCIPAL = new Uint8Array(32).fill(240);
 const LIMITS: QueueLimits = {
@@ -50,14 +47,6 @@ const LIMITS: QueueLimits = {
     maximumGlobalBytes: 256 * 1024 * 1024,
     maximumGlobalReferences: 100_000,
 };
-const INVITATION_LIMITS: InvitationLimits = {
-    maximumPrincipalItems: 100,
-    maximumPrincipalBytes: 10 * 1024 * 1024,
-    maximumGlobalItems: 1_000,
-    maximumGlobalBytes: 64 * 1024 * 1024,
-    maximumRevocationKeyItems: 100,
-};
-
 function chaosDelivery(
     secretKey: Uint8Array,
     targets: readonly Uint8Array[],
@@ -500,26 +489,16 @@ describe("SQLite relay and durable fanout chaos", () => {
         }
     });
 
-    test("SQL-05 file-backed reopen preserves invitations, references, and continuity metadata", async () => {
+    test("SQL-05 file-backed reopen preserves references and continuity metadata", async () => {
         await withDatabasePath(async (path) => {
             const sender = secret(7);
             const bob = identity(secret(8));
             const carol = identity(secret(9));
-            const bundle = new TextEncoder().encode("reopen invitation");
-            const digest = sha256(bundle);
             let store = new SqliteRelayStore(path);
             const published = await store.publish(
                 chaosDelivery(sender, recipients(bob, carol), { id: 7 }),
                 NOW,
                 LIMITS,
-                PRINCIPAL,
-            );
-            await store.storeInvitation(
-                digest,
-                bundle,
-                NOW + INVITATION_TTL_MILLISECONDS,
-                NOW,
-                INVITATION_LIMITS,
                 PRINCIPAL,
             );
             const bobBefore = normalizePage(await queue(store, bob));
@@ -529,10 +508,6 @@ describe("SQLite relay and durable fanout chaos", () => {
             store = new SqliteRelayStore(path);
             expect(normalizePage(await queue(store, bob))).toEqual(bobBefore);
             expect(normalizePage(await queue(store, carol))).toEqual(carolBefore);
-            expect(await store.readInvitation(digest, NOW)).toEqual({
-                bundle,
-                expiresAt: NOW + INVITATION_TTL_MILLISECONDS,
-            });
             const bobGeneration = (await queue(store, bob)).generation;
             await store.acknowledge(bob, published.eventId, NOW);
             expect((await queue(store, bob, published.eventId)).generation).toEqual(bobGeneration);
@@ -562,8 +537,6 @@ describe("SQLite relay and durable fanout chaos", () => {
         const sender = secret(10);
         const bob = identity(secret(11));
         const carol = identity(secret(12));
-        const bundle = new TextEncoder().encode("expiring invitation");
-        const digest = sha256(bundle);
         try {
             const published = await store.publish(
                 chaosDelivery(sender, recipients(bob, carol), {
@@ -574,15 +547,12 @@ describe("SQLite relay and durable fanout chaos", () => {
                 LIMITS,
                 PRINCIPAL,
             );
-            await store.storeInvitation(digest, bundle, NOW + 1, NOW, INVITATION_LIMITS, PRINCIPAL);
             const bobBefore = await queue(store, bob);
             const carolBefore = await queue(store, carol);
             await store.acknowledge(bob, published.eventId, NOW);
-            expect(await store.readInvitation(digest, NOW)).toBeDefined();
             expect((await queue(store, carol, null, 10, NOW)).deliveries).toHaveLength(1);
             await expect(store.pruneExpired(NOW)).resolves.toBe(0);
             await expect(store.pruneExpired(NOW + 1)).resolves.toBeGreaterThanOrEqual(1);
-            expect(await store.readInvitation(digest, NOW + 1)).toBeUndefined();
             expect((await queue(store, carol, null, 10, NOW + 1)).deliveries).toHaveLength(0);
             expect((await queue(store, bob, published.eventId, 10, NOW + 1)).generation).toEqual(
                 bobBefore.generation,
@@ -835,74 +805,6 @@ describe("SQLite relay and durable fanout chaos", () => {
             ).resolves.toMatchObject({ removed: 1, sequence: 1 });
         } finally {
             await relay.close();
-        }
-    });
-
-    test("SQL-12 invitation cache stays digest-only, idempotent, exact, and quota-bounded", async () => {
-        const store = new SqliteRelayStore(":memory:");
-        const first = new TextEncoder().encode("anonymous invitation one");
-        const second = new TextEncoder().encode("anonymous invitation two");
-        const firstDigest = sha256(first);
-        const secondDigest = sha256(second);
-        const wrong = firstDigest.slice();
-        wrong[0] = wrong[0]! ^ 1;
-        try {
-            await expect(
-                store.storeInvitation(
-                    firstDigest,
-                    first,
-                    NOW + INVITATION_TTL_MILLISECONDS,
-                    NOW,
-                    { ...INVITATION_LIMITS, maximumPrincipalItems: 1 },
-                    PRINCIPAL,
-                ),
-            ).resolves.toEqual({
-                expiresAt: NOW + INVITATION_TTL_MILLISECONDS,
-                duplicate: false,
-            });
-            await expect(
-                store.storeInvitation(
-                    firstDigest,
-                    first,
-                    NOW + INVITATION_TTL_MILLISECONDS + 1,
-                    NOW,
-                    INVITATION_LIMITS,
-                    PRINCIPAL,
-                ),
-            ).resolves.toEqual({
-                expiresAt: NOW + INVITATION_TTL_MILLISECONDS,
-                duplicate: true,
-            });
-            expect(await store.readInvitation(wrong, NOW)).toBeUndefined();
-            await expect(
-                store.storeInvitation(
-                    secondDigest,
-                    second,
-                    NOW + INVITATION_TTL_MILLISECONDS,
-                    NOW,
-                    { ...INVITATION_LIMITS, maximumPrincipalItems: 1 },
-                    PRINCIPAL,
-                ),
-            ).rejects.toMatchObject({ status: 429 });
-            expect(
-                await store.readInvitation(firstDigest, NOW + INVITATION_TTL_MILLISECONDS - 1),
-            ).toBeDefined();
-            expect(
-                await store.readInvitation(firstDigest, NOW + INVITATION_TTL_MILLISECONDS),
-            ).toBeUndefined();
-            await store.pruneExpired(NOW + INVITATION_TTL_MILLISECONDS);
-            await expect(
-                store.storeInvitation(
-                    secondDigest,
-                    second,
-                    NOW + INVITATION_TTL_MILLISECONDS + 1,
-                    NOW + INVITATION_TTL_MILLISECONDS,
-                    { ...INVITATION_LIMITS, maximumPrincipalItems: 1 },
-                    PRINCIPAL,
-                ),
-            ).resolves.toMatchObject({ duplicate: false });
-        } finally {
-            await store.close();
         }
     });
 

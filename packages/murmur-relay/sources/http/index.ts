@@ -1,14 +1,12 @@
 import {
     RelayError,
-    parseOwnedInvitationUpload,
-    parseSignedInvitationRevocation,
     parseSignedDelivery,
     parseSignedQueueAck,
     parseSignedQueueRead,
     signedDeliveryToJson,
 } from "../protocol/index.js";
 import type { QueueEventSubscription, RelayService } from "../relay/index.js";
-import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
+import { encodeBase64Url } from "../utils/base64Url.js";
 import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 
 /** Metadata supplied by a concrete HTTP host. */
@@ -344,82 +342,6 @@ export function createRelayFetchHandler(
             if (request.method === "GET" && url.pathname === "/health") {
                 await relay.health();
                 return json({ ok: true }, 200, corsHeaders);
-            }
-            if (request.method === "POST" && url.pathname === "/v1/invitations") {
-                if (admissionPrincipal === undefined) {
-                    throw new RelayError(503, "Admission principal is required", {
-                        error: "admission_context_required",
-                    });
-                }
-                const outcome = await relay.storeInvitation(
-                    await readBytes(request, relay.options.maximumInvitationBytes),
-                    admissionPrincipal,
-                );
-                return boundedJson(
-                    {
-                        digest: encodeBase64Url(outcome.digest),
-                        expiresAt: outcome.expiresAt,
-                        duplicate: outcome.duplicate,
-                    },
-                    relay.options.maximumJsonBodyBytes,
-                    corsHeaders,
-                );
-            }
-            if (request.method === "POST" && url.pathname === "/v1/invitations/owned") {
-                if (admissionPrincipal === undefined) {
-                    throw new RelayError(503, "Admission principal is required", {
-                        error: "admission_context_required",
-                    });
-                }
-                const upload = parseOwnedInvitationUpload(
-                    await readJson(request, relay.options.maximumJsonBodyBytes),
-                );
-                const outcome = await relay.storeOwnedInvitation(
-                    upload.bundle,
-                    upload.authorization,
-                    admissionPrincipal,
-                );
-                return boundedJson(
-                    {
-                        digest: encodeBase64Url(outcome.digest),
-                        expiresAt: outcome.expiresAt,
-                        duplicate: outcome.duplicate,
-                    },
-                    relay.options.maximumJsonBodyBytes,
-                    corsHeaders,
-                );
-            }
-            if (request.method === "POST" && url.pathname === "/v1/invitations/revoke") {
-                const revocation = parseSignedInvitationRevocation(
-                    await readJson(request, relay.options.maximumJsonBodyBytes),
-                );
-                const outcome = await relay.revokeInvitations(revocation);
-                return boundedJson(
-                    { revoked: outcome.revoked },
-                    relay.options.maximumJsonBodyBytes,
-                    corsHeaders,
-                );
-            }
-            if (request.method === "GET" && url.pathname.startsWith("/v1/invitations/")) {
-                const encodedDigest = url.pathname.slice("/v1/invitations/".length);
-                let digest: Uint8Array;
-                try {
-                    digest = decodeBase64Url(encodedDigest, 32);
-                } catch {
-                    throw new RelayError(400, "Invalid invitation digest", {
-                        error: "malformed",
-                    });
-                }
-                const invitation = await relay.readInvitation(digest);
-                return new Response(invitation.bundle, {
-                    status: 200,
-                    headers: {
-                        "content-type": "application/vnd.slopus.murmur-discovery+json",
-                        "cache-control": "no-store",
-                        "x-murmur-invitation-expires-at": String(invitation.expiresAt),
-                        ...corsHeaders,
-                    },
-                });
             }
             if (request.method === "POST" && url.pathname === "/v1/deliveries") {
                 const delivery = parseSignedDelivery(

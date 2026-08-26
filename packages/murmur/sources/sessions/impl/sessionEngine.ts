@@ -13,8 +13,6 @@ import {
     type SignedDelivery,
 } from "../../delivery/index.js";
 import { openBox, randomBytes, sealBox, type IdentityKeyPair } from "../../crypto/index.js";
-import type { DiscoveryBundle } from "../../identity/discovery/index.js";
-import { verifyDiscoveryBundle } from "../../identity/discovery/index.js";
 import {
     accountConvergenceJobs,
     ACCOUNT_PEER_ROSTER_PREFIX,
@@ -46,13 +44,6 @@ import {
     type MlsKeyPackage,
 } from "../../mls/index.js";
 import type { MurmurStore, StoreTransaction } from "../../storage/index.js";
-import {
-    createPrivateGroupSessionState,
-    destroyPrivateGroupSessionState,
-    updatePrivateGroupSessionTrustedTip,
-    type PrivateGroupSessionState,
-} from "../../privateGroupState/impl/sessionState.js";
-import type { PrivateGroupTrustedTip } from "../../privateGroupState/types.js";
 import {
     ROUTING_MARKER_PREFIX,
     decodeSessionRouting,
@@ -126,10 +117,10 @@ const OUTBOX_SEQUENCE_KEY = "murmur/session-outbox-sequence";
 const KEY_PACKAGE_PREFIX = "murmur/key-packages/";
 const KEY_PACKAGE_EXPIRY_PREFIX = "murmur/key-package-expiries/";
 const KEY_PACKAGE_REUSABLE_PREFIX = "murmur/key-package-reusable/";
+const USED_KEY_PACKAGE_PREFIX = "murmur/used-key-packages/";
 const REJECTED_PREFIX = "murmur/rejected-sessions/";
 const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
-const USED_DISCOVERY_PREFIX = "murmur/used-discovery/";
 const BOOTSTRAP_INDEX_PREFIX = "murmur/bootstrap-outboxes/";
 const ADMISSION_BARRIER_PREFIX = "murmur/admission-barriers/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
@@ -145,9 +136,9 @@ const DEFAULT_MAXIMUM_BUFFERED_BYTES = 16 * 1024 * 1024;
 const DEFAULT_MAXIMUM_MEMBERS = 256;
 const DEFAULT_MAXIMUM_CIPHERTEXT_BYTES = 1024 * 1024;
 const MAXIMUM_KEY_PACKAGES = 8_192;
+const MAXIMUM_USED_KEY_PACKAGES = 1_024;
 const DEFAULT_MAXIMUM_OUTBOXES = 1_000;
 const MAXIMUM_REJECTED_SESSIONS = 256;
-const MAXIMUM_USED_DISCOVERY = 1_024;
 const MAXIMUM_SESSION_INTENTS = 256;
 const SESSION_LIST_LIMIT = 256;
 const MAXIMUM_UPDATE_BATCH_EVENTS = 256;
@@ -189,12 +180,10 @@ export interface SessionRouteDecision {
     readonly owner: SessionOwnerRecord;
 }
 
-/** Authenticated public admission material supplied by the built-in contact layer. */
+/** Authenticated public admission material supplied to the session engine. */
 export interface SessionMemberMaterial {
     readonly identity: Uint8Array;
     readonly keyPackage: MlsKeyPackage;
-    /** Present only for public discovery, whose one-use claim is tracked separately. */
-    readonly discovery?: DiscoveryBundle;
 }
 
 function sessionId(value: Uint8Array): string {
@@ -307,14 +296,14 @@ function pendingKey(id: Uint8Array): string {
     return `${PENDING_SESSION_PREFIX}${sessionId(id)}`;
 }
 
-function usedDiscoveryKey(keyPackage: MlsKeyPackage): string {
-    return `${USED_DISCOVERY_PREFIX}${encodeBase64Url(mlsKeyPackageReference(keyPackage))}`;
+function usedKeyPackageKey(keyPackage: MlsKeyPackage): string {
+    return `${USED_KEY_PACKAGE_PREFIX}${encodeBase64Url(mlsKeyPackageReference(keyPackage))}`;
 }
 
-function usedDiscoveryExpiresAt(keyPackage: MlsKeyPackage): number {
+function usedKeyPackageExpiresAt(keyPackage: MlsKeyPackage): number {
     const expiresAt = (keyPackage.leafNode.notAfter + 1n) * 1_000n;
     if (expiresAt > BigInt(Number.MAX_SAFE_INTEGER)) {
-        throw new Error("Discovery KeyPackage lifetime is too large");
+        throw new Error("KeyPackage lifetime is too large");
     }
     return Number(expiresAt);
 }
@@ -490,21 +479,11 @@ async function setAndZero(
 }
 
 function restoreEpoch(identity: IdentityKeyPair, record: SessionRecord): MlsEpochState {
-    try {
-        const epoch = MlsEpochState.deserialize(record.epoch, {
-            localSigningSecretKey: identity.secretKey,
-            authenticateCredential: authenticateMurmurMlsCredential,
-            minimumPersistenceGeneration: record.generation,
-        });
-        if (!equalBytes(epoch.groupId, record.privateGroupState.sessionId)) {
-            epoch.destroy();
-            throw new Error("Private-group state does not match its MLS session");
-        }
-        return epoch;
-    } catch (error: unknown) {
-        destroyPrivateGroupSessionState(record.privateGroupState);
-        throw error;
-    }
+    return MlsEpochState.deserialize(record.epoch, {
+        localSigningSecretKey: identity.secretKey,
+        authenticateCredential: authenticateMurmurMlsCredential,
+        minimumPersistenceGeneration: record.generation,
+    });
 }
 
 function restorePreviousEpoch(
@@ -909,19 +888,19 @@ export class SessionEngine {
         }
     }
 
-    async #claimDiscovery(
+    async #claimKeyPackages(
         transaction: StoreTransaction,
-        bundles: readonly DiscoveryBundle[],
-    ): Promise<void> {
-        const entries = await transaction.scan(USED_DISCOVERY_PREFIX, {
-            limit: MAXIMUM_USED_DISCOVERY + 1,
+        members: readonly SessionMemberMaterial[],
+    ): Promise<readonly string[]> {
+        const entries = await transaction.scan(USED_KEY_PACKAGE_PREFIX, {
+            limit: MAXIMUM_USED_KEY_PACKAGES + 1,
         });
         const active = new Set<string>();
         try {
             for (const [key, value] of entries) {
                 const encodedExpiry = utf8Decode(value);
                 if (!/^\d{16}$/.test(encodedExpiry)) {
-                    throw new Error("Invalid discovery claim");
+                    throw new Error("Invalid used KeyPackage record");
                 }
                 if (Number(encodedExpiry) <= this.#now()) {
                     await transaction.delete(key);
@@ -932,18 +911,18 @@ export class SessionEngine {
         } finally {
             for (const value of entries.values()) zeroBytes(value);
         }
-        const claims = bundles.map((bundle) => ({
-            key: usedDiscoveryKey(bundle.keyPackages[0]!),
-            expiresAt: usedDiscoveryExpiresAt(bundle.keyPackages[0]!),
+        const claims = members.map((member) => ({
+            key: usedKeyPackageKey(member.keyPackage),
+            expiresAt: usedKeyPackageExpiresAt(member.keyPackage),
         }));
         if (
             new Set(claims.map(({ key }) => key)).size !== claims.length ||
             claims.some(({ key }) => active.has(key))
         ) {
-            throw new Error("Discovery KeyPackage was already used");
+            throw new Error("KeyPackage was already used");
         }
-        if (active.size + claims.length > MAXIMUM_USED_DISCOVERY) {
-            throw new Error("Used discovery capacity exceeded");
+        if (active.size + claims.length > MAXIMUM_USED_KEY_PACKAGES) {
+            throw new Error("Used KeyPackage capacity exceeded");
         }
         for (const claim of claims) {
             await setAndZero(
@@ -952,6 +931,7 @@ export class SessionEngine {
                 utf8Encode(String(claim.expiresAt).padStart(16, "0")),
             );
         }
+        return claims.map(({ key }) => key);
     }
 
     async create(
@@ -959,7 +939,7 @@ export class SessionEngine {
             CreateMurmurSessionOptions,
             "descriptor" | "adminsAssignAdmins" | "anyoneCanAddMembers"
         > & {
-            readonly members: readonly (DiscoveryBundle | SessionMemberMaterial)[];
+            readonly members: readonly SessionMemberMaterial[];
         },
         owner?: SessionOwnerRecord,
         operation?: (transaction: StoreTransaction, id: Uint8Array) => Promise<void>,
@@ -967,22 +947,7 @@ export class SessionEngine {
         if (options.descriptor.length > 1024 * 1024) {
             throw new Error("Session descriptor is too large");
         }
-        const members: SessionMemberMaterial[] = options.members.map((member) => {
-            if ("keyPackage" in member) {
-                return member;
-            }
-            if (
-                member.keyPackages.length !== 1 ||
-                !verifyDiscoveryBundle(member, { now: this.#now() })
-            ) {
-                throw new Error("Invalid session member discovery bundle");
-            }
-            return {
-                identity: member.version === 1 ? member.identityKey : member.deviceKey,
-                keyPackage: member.keyPackages[0]!,
-                discovery: member,
-            };
-        });
+        const members = options.members;
         if (members.length < 1) {
             throw new Error("A session requires at least two members");
         }
@@ -1007,17 +972,11 @@ export class SessionEngine {
             }
             memberIdentities.add(identity);
         }
-        const discoveryMembers = members
-            .map((member) => member.discovery)
-            .filter((member): member is DiscoveryBundle => member !== undefined);
-        const discoveryClaims = discoveryMembers.map((member) =>
-            usedDiscoveryKey(member.keyPackages[0]!),
-        );
         const epoch = createMlsGroup(this.#identity, {
             credentialIdentity: this.#credentialIdentity,
         });
         const id = epoch.groupId;
-        const privateGroupState = createPrivateGroupSessionState(id);
+        const claimKeys = members.map((member) => usedKeyPackageKey(member.keyPackage));
         const roles = normalizeSessionRoles({
             owner: this.#accountKey,
             admins: [],
@@ -1036,7 +995,6 @@ export class SessionEngine {
                 bufferedEvents: 0,
                 bufferedBytes: 0,
                 roles,
-                privateGroupState,
                 removalGenerations: [],
             };
             await this.#store.transaction(async (transaction) => {
@@ -1045,7 +1003,7 @@ export class SessionEngine {
                     zeroBytes(existingState);
                     throw new Error("Session already exists");
                 }
-                await this.#claimDiscovery(transaction, discoveryMembers);
+                await this.#claimKeyPackages(transaction, members);
                 await setAndZero(transaction, stateKey(id), encodeSessionRecord(record));
                 if (owner !== undefined) {
                     await setAndZero(transaction, sessionOwnerKey(id), encodeSessionOwner(owner));
@@ -1054,7 +1012,6 @@ export class SessionEngine {
             });
         } finally {
             epoch.destroy();
-            destroyPrivateGroupSessionState(privateGroupState);
             if (checkpoint !== undefined) zeroBytes(checkpoint);
         }
         if (members.length > 0) {
@@ -1071,9 +1028,7 @@ export class SessionEngine {
             } catch (error: unknown) {
                 await this.#store.transaction(async (transaction) => {
                     await this.#deleteSession(transaction, id);
-                    for (const claim of discoveryClaims) {
-                        await transaction.delete(claim);
-                    }
+                    for (const claimKey of claimKeys) await transaction.delete(claimKey);
                 });
                 throw error;
             }
@@ -1093,70 +1048,6 @@ export class SessionEngine {
             this.#zeroSessionRecord(record);
             zeroBytes(bytes);
         }
-    }
-
-    /** Return a defensive member-only state snapshot for one active MLS session. */
-    async privateGroupSessionState(id: Uint8Array): Promise<PrivateGroupSessionState | undefined> {
-        const bytes = await this.#store.get(stateKey(id));
-        if (bytes === undefined) return undefined;
-        const record = decodeSessionRecord(bytes);
-        const epoch = restoreEpoch(this.#identity, record);
-        try {
-            if (record.status !== "active") {
-                throw new Error("Private-group state requires an active MLS session");
-            }
-            return {
-                version: 1,
-                sessionId: record.privateGroupState.sessionId.slice(),
-                masterSecret: record.privateGroupState.masterSecret.slice(),
-                ...(record.privateGroupState.trustedTip === undefined
-                    ? {}
-                    : {
-                          trustedTip: {
-                              canonicalVersion:
-                                  record.privateGroupState.trustedTip.canonicalVersion,
-                              revision: record.privateGroupState.trustedTip.revision,
-                              revisionHash:
-                                  record.privateGroupState.trustedTip.revisionHash.slice(),
-                          },
-                      }),
-            };
-        } finally {
-            epoch.destroy();
-            this.#zeroSessionRecord(record);
-            zeroBytes(bytes);
-        }
-    }
-
-    /** Atomically retain one accepted private-group canonical tip with its active session. */
-    async persistPrivateGroupTrustedTip(
-        id: Uint8Array,
-        tip: PrivateGroupTrustedTip,
-    ): Promise<void> {
-        await this.#store.transaction(async (transaction) => {
-            const bytes = await transaction.get(stateKey(id));
-            if (bytes === undefined) throw new Error("Unknown session");
-            const record = decodeSessionRecord(bytes);
-            let updated: PrivateGroupSessionState | undefined;
-            try {
-                if (
-                    record.status !== "active" ||
-                    !equalBytes(record.privateGroupState.sessionId, id)
-                ) {
-                    throw new Error("Private-group state requires an active MLS session");
-                }
-                updated = updatePrivateGroupSessionTrustedTip(record.privateGroupState, tip);
-                await setAndZero(
-                    transaction,
-                    stateKey(id),
-                    encodeSessionRecord({ ...record, privateGroupState: updated }),
-                );
-            } finally {
-                if (updated !== undefined) destroyPrivateGroupSessionState(updated);
-                this.#zeroSessionRecord(record);
-                zeroBytes(bytes);
-            }
-        });
     }
 
     async list(options: MurmurSessionListOptions = {}): Promise<MurmurSessionPage> {
@@ -1205,10 +1096,7 @@ export class SessionEngine {
     }
 
     /** Activate one internally owned pending session after an explicit decision. */
-    async activateOwned(
-        id: Uint8Array,
-        expectedOwner: "contact" | "service" | "account",
-    ): Promise<void> {
+    async activateOwned(id: Uint8Array, expectedOwner: "service" | "account"): Promise<void> {
         await this.#store.transaction(async (transaction) => {
             const owner = await this.#sessionOwner(transaction, id);
             if (owner === undefined || owner.owner !== expectedOwner) {
@@ -1221,7 +1109,7 @@ export class SessionEngine {
     /** Destroy one internally owned session and retain its rejection marker. */
     async destroyOwned(
         id: Uint8Array,
-        expectedOwner: "contact" | "service",
+        expectedOwner: "service",
         operation?: (transaction: StoreTransaction) => Promise<void>,
     ): Promise<void> {
         await this.#store.transaction(async (transaction) => {
@@ -1431,11 +1319,7 @@ export class SessionEngine {
                                 sessionOwnerKey(decision.sessionId),
                                 encodeSessionOwner(decision.owner),
                             );
-                            if (decision.owner.owner === "contact") {
-                                await this.#indexBuffered(transaction, decision.sessionId);
-                            } else {
-                                await this.#activatePending(transaction, decision.sessionId);
-                            }
+                            await this.#activatePending(transaction, decision.sessionId);
                         }
                         await transaction.delete(decision.key);
                     } finally {
@@ -1487,12 +1371,7 @@ export class SessionEngine {
                     const record = decodeSessionRecord(stateBytes);
                     try {
                         if (
-                            (record.status !== "active" &&
-                                !(
-                                    record.status === "pending" &&
-                                    (await this.#sessionOwner(transaction, change.id))?.owner ===
-                                        "contact"
-                                )) ||
+                            record.status !== "active" ||
                             record.bufferedEvents < change.events ||
                             record.bufferedBytes < change.bytes
                         ) {
@@ -1543,107 +1422,11 @@ export class SessionEngine {
         );
     }
 
-    /** Atomically queue one contact packet with its contact-state mutation. */
-    async sendOwnedContact(
-        id: Uint8Array,
-        bytes: Uint8Array,
-        operation: (transaction: StoreTransaction, deliveryId: string) => Promise<void>,
-    ): Promise<string> {
-        return this.#store.transaction(async (transaction) => {
-            const owner = await this.#sessionOwner(transaction, id);
-            if (owner?.owner !== "contact") throw new Error("Session owner does not match");
-            const deliveryId = await this.#queuePrivate(
-                id,
-                { version: 1, type: "application", bytes },
-                "application",
-                transaction,
-            );
-            await operation(transaction, deliveryId);
-            return deliveryId;
-        });
-    }
-
-    /** Atomically queue one packet to each bounded active contact and mutate contact state. */
-    async sendOwnedContacts(
-        packets: readonly { readonly id: Uint8Array; readonly bytes: Uint8Array }[],
-        operation: (transaction: StoreTransaction, deliveryIds: readonly string[]) => Promise<void>,
-    ): Promise<readonly string[]> {
-        if (packets.length > 256) throw new Error("Contact packet batch exceeds the contact bound");
-        const sessionIds = packets.map(({ id }) => encodeBase64Url(id));
-        if (new Set(sessionIds).size !== sessionIds.length) {
-            throw new Error("Contact packet batch contains duplicate sessions");
-        }
-        return this.#store.transaction(async (transaction) => {
-            const outboxCount = (
-                await transaction.scan(OUTBOX_PREFIX, {
-                    limit: this.#limits.maximumOutboxes,
-                })
-            ).size;
-            if (outboxCount > this.#limits.maximumOutboxes - packets.length) {
-                throw new Error("Local session outbox capacity exceeded");
-            }
-            for (const packet of packets) {
-                const owner = await this.#sessionOwner(transaction, packet.id);
-                if (owner?.owner !== "contact") throw new Error("Session owner does not match");
-            }
-            const deliveryIds: string[] = [];
-            for (const packet of packets) {
-                deliveryIds.push(
-                    await this.#queuePrivate(
-                        packet.id,
-                        { version: 1, type: "application", bytes: packet.bytes },
-                        "application",
-                        transaction,
-                    ),
-                );
-            }
-            await operation(transaction, deliveryIds);
-            return Object.freeze(deliveryIds);
-        });
-    }
-
-    /** Atomically activate one contact request, queue hello, and persist its mutation. */
-    async acceptOwnedContact(
-        id: Uint8Array,
-        bytes: Uint8Array,
-        operation: (transaction: StoreTransaction, deliveryId: string) => Promise<void>,
-    ): Promise<string> {
-        return this.#store.transaction(async (transaction) => {
-            const owner = await this.#sessionOwner(transaction, id);
-            if (owner?.owner !== "contact") throw new Error("Session owner does not match");
-            await this.#activatePending(transaction, id);
-            const deliveryId = await this.#queuePrivate(
-                id,
-                { version: 1, type: "application", bytes },
-                "application",
-                transaction,
-            );
-            await operation(transaction, deliveryId);
-            return deliveryId;
-        });
-    }
-
     async add(
         id: Uint8Array,
-        input: DiscoveryBundle | SessionMemberMaterial,
+        member: SessionMemberMaterial,
         operation?: (transaction: StoreTransaction) => Promise<void>,
     ): Promise<void> {
-        let member: SessionMemberMaterial;
-        if ("keyPackage" in input) {
-            member = input;
-        } else {
-            if (
-                input.keyPackages.length !== 1 ||
-                !verifyDiscoveryBundle(input, { now: this.#now() })
-            ) {
-                throw new Error("Invalid Add discovery bundle");
-            }
-            member = {
-                identity: input.version === 1 ? input.identityKey : input.deviceKey,
-                keyPackage: input.keyPackages[0]!,
-                discovery: input,
-            };
-        }
         if (
             member.identity.length !== 32 ||
             !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
@@ -1666,9 +1449,7 @@ export class SessionEngine {
                 ) {
                     throw new Error("The local account may not add session members");
                 }
-                if (member.discovery !== undefined) {
-                    await this.#claimDiscovery(transaction, [member.discovery]);
-                }
+                await this.#claimKeyPackages(transaction, [member]);
                 await operation?.(transaction);
                 await this.#queueSessionIntent(transaction, {
                     version: 1,
@@ -2446,18 +2227,15 @@ export class SessionEngine {
         epoch: MlsEpochState,
         currentRoles: SessionRoles,
         nextRoles: SessionRoles,
-        privateGroupMasterSecret: Uint8Array,
         commit: ReturnType<typeof decodeMlsTreeCommit>,
         createdAt: number = this.#now(),
     ): Promise<boolean> {
-        let control: ReturnType<typeof decodeSessionControl> | undefined;
         try {
-            control = decodeSessionControl(commit.authenticatedData);
+            const control = decodeSessionControl(commit.authenticatedData);
             if (
                 commit.sender < 0 ||
                 commit.sender >= epoch.memberSignatureKeys.length ||
                 epoch.memberSignatureKeys[commit.sender] === undefined ||
-                !equalBytes(control.privateGroupMasterSecret, privateGroupMasterSecret) ||
                 !equalBytes(control.roles.owner, nextRoles.owner) ||
                 !sessionRolesEqual(control.roles, nextRoles) ||
                 !equalBytes(currentRoles.owner, nextRoles.owner)
@@ -2558,8 +2336,6 @@ export class SessionEngine {
             return true;
         } catch {
             return false;
-        } finally {
-            if (control !== undefined) zeroBytes(control.privateGroupMasterSecret);
         }
     }
 
@@ -2638,7 +2414,6 @@ export class SessionEngine {
                     proposals,
                     encodeSessionControl({
                         roles: nextRoles,
-                        privateGroupMasterSecret: record.privateGroupState.masterSecret,
                     }),
                 );
                 const commitMessage = decodeMlsTreeCommit(transition.commit);
@@ -2648,7 +2423,6 @@ export class SessionEngine {
                         epoch,
                         record.roles,
                         nextRoles,
-                        record.privateGroupState.masterSecret,
                         commitMessage,
                         now,
                     ))
@@ -2661,7 +2435,6 @@ export class SessionEngine {
                     epoch: epoch.context.epoch,
                     commit: transition.commit,
                     roles: nextRoles,
-                    privateGroupMasterSecret: record.privateGroupState.masterSecret,
                 });
                 if (commitCiphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
                     throw new Error("Session Commit exceeds the configured ciphertext limit");
@@ -2692,7 +2465,6 @@ export class SessionEngine {
                         commit: transition.commit,
                         keyPackageReference: mlsKeyPackageReference(addition.keyPackage),
                         roles: nextRoles,
-                        privateGroupMasterSecret: record.privateGroupState.masterSecret,
                     });
                     try {
                         const box = sealBox(
@@ -2983,21 +2755,12 @@ export class SessionEngine {
                 ) {
                     throw new Error("Bootstrap KeyPackage is stale or mismatched");
                 }
-                let control: ReturnType<typeof decodeSessionControl> | undefined;
-                try {
-                    control = decodeSessionControl(commit.authenticatedData);
-                    if (
-                        !equalBytes(commit.confirmationTag, frame.confirmationTag) ||
-                        !sessionRolesEqual(control.roles, frame.roles) ||
-                        !equalBytes(
-                            control.privateGroupMasterSecret,
-                            frame.privateGroupMasterSecret,
-                        )
-                    ) {
-                        throw new Error("Bootstrap Commit control mismatch");
-                    }
-                } finally {
-                    if (control !== undefined) zeroBytes(control.privateGroupMasterSecret);
+                const control = decodeSessionControl(commit.authenticatedData);
+                if (
+                    !equalBytes(commit.confirmationTag, frame.confirmationTag) ||
+                    !sessionRolesEqual(control.roles, frame.roles)
+                ) {
+                    throw new Error("Bootstrap Commit control mismatch");
                 }
                 const tree = decodeMlsRatchetTree(frame.tree, {
                     groupId: frame.groupId,
@@ -3064,11 +2827,6 @@ export class SessionEngine {
                         bufferedEvents: 0,
                         bufferedBytes: 0,
                         roles: frame.roles,
-                        privateGroupState: {
-                            version: 1,
-                            sessionId: frame.groupId.slice(),
-                            masterSecret: frame.privateGroupMasterSecret.slice(),
-                        },
                         removalGenerations: [],
                         bootstrapKeyPackageReference: frame.keyPackageReference,
                         ...(reAdmission ? { reAdmission: true } : {}),
@@ -3095,7 +2853,6 @@ export class SessionEngine {
                 zeroBytes(bundleBytes);
             }
         } finally {
-            if (frame !== undefined) zeroBytes(frame.privateGroupMasterSecret);
             zeroBytes(plaintext);
         }
     }
@@ -3449,20 +3206,11 @@ export class SessionEngine {
             }
             const expectedSender = epoch.memberSignatureKeys[commit.sender];
             let controlMatches = false;
-            let control: ReturnType<typeof decodeSessionControl> | undefined;
             try {
-                control = decodeSessionControl(commit.authenticatedData);
-                controlMatches =
-                    sessionRolesEqual(control.roles, frame.roles) &&
-                    equalBytes(control.privateGroupMasterSecret, frame.privateGroupMasterSecret) &&
-                    equalBytes(
-                        frame.privateGroupMasterSecret,
-                        record.privateGroupState.masterSecret,
-                    );
+                const control = decodeSessionControl(commit.authenticatedData);
+                controlMatches = sessionRolesEqual(control.roles, frame.roles);
             } catch {
                 controlMatches = false;
-            } finally {
-                if (control !== undefined) zeroBytes(control.privateGroupMasterSecret);
             }
             if (
                 expectedSender === undefined ||
@@ -3473,7 +3221,6 @@ export class SessionEngine {
                     epoch,
                     record.roles,
                     frame.roles,
-                    record.privateGroupState.masterSecret,
                     commit,
                     queued.delivery.createdAt,
                 ))
@@ -3589,7 +3336,6 @@ export class SessionEngine {
             }
         } finally {
             if (key !== undefined) zeroBytes(key);
-            if (frame !== undefined) zeroBytes(frame.privateGroupMasterSecret);
             this.#zeroSessionRecord(record);
         }
     }
@@ -3829,9 +3575,7 @@ export class SessionEngine {
             `${bufferPrefix(id)}${eventId}`,
             encodeBufferedEvent({ version: 1, sender, bytes }),
         );
-        const owner =
-            record.status === "active" ? undefined : await this.#sessionOwner(transaction, id);
-        if (record.status === "active" || owner?.owner === "contact") {
+        if (record.status === "active") {
             await transaction.set(applicationUpdateKey(eventId), id);
         }
         const latestBytes = await transaction.get(stateKey(id));
@@ -5341,7 +5085,6 @@ export class SessionEngine {
     #zeroSessionRecord(record: SessionRecord): void {
         zeroBytes(record.epoch);
         if (record.previousEpoch !== undefined) zeroBytes(record.previousEpoch);
-        destroyPrivateGroupSessionState(record.privateGroupState);
     }
 
     async #rejectSession(transaction: StoreTransaction, id: Uint8Array): Promise<void> {

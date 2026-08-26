@@ -11,3 +11,5 @@ mutation, bounded expiration, and targeted orphan cleanup. Fanout writes are
 set-based, and expiration removes a fixed delivery batch plus chunked affected
 inbox rows. Reads do not prune or take the writer lock; they filter expired rows
 in their stable snapshot.
+
+Initialization requires the exact current queue schema.

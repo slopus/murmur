@@ -15,7 +15,7 @@ describe("Murmur services", () => {
     it("strictly validates stable registrations", () => {
         expect(() => validateServiceId("chat.v1")).not.toThrow();
         expect(() =>
-            validateMurmurServiceRegistration({ id: "contacts.v1", service }),
+            validateMurmurServiceRegistration({ id: "messaging.v1", service }),
         ).not.toThrow();
 
         for (const id of ["", "Chat", "chat/v1", "chat..v1", ".chat", "chat_", "a".repeat(65)]) {

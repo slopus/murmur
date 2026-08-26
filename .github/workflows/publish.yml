@@ -66,9 +66,9 @@ jobs:
                       printf 'Unexpected npm package entries:\n%s\n' "$unexpected" >&2
                       exit 1
                   fi
-                  legacy="$(printf '%s\n' "$package_contents" | grep -E '^package/(mls|sharedSession)(/|$)|^package/dist/(cli|client|document|sharedSession|groupChannel|ephemeral)(/|\\.)' || true)"
-                  if [ -n "$legacy" ]; then
-                      printf 'Legacy artifacts found in npm package:\n%s\n' "$legacy" >&2
+                  removed="$(printf '%s\n' "$package_contents" | grep -E '^package/(mls|sharedSession)(/|$)|^package/dist/(cli|client|document|sharedSession|groupChannel|ephemeral)(/|\\.)' || true)"
+                  if [ -n "$removed" ]; then
+                      printf 'Removed artifacts found in npm package:\n%s\n' "$removed" >&2
                       exit 1
                   fi
                   for required in package/package.json package/dist/index.js package/dist/index.d.ts; do
@@ -199,7 +199,7 @@ jobs:
                           "- npm: \`pnpm add @slopus/murmur@$release_version\`" \
                           "- container: \`ghcr.io/slopus/murmur-relay:$release_version\`" \
                           "- container platforms: Linux amd64 and arm64" \
-                          "The browser-safe npm package includes signed discovery, durable queue processing, and unified two-person or many-person MLS sessions. The container includes the authenticated identity-queue relay with SQLite/Postgres storage, an SBOM, and provenance."
+                          "The browser-safe npm package includes durable queue processing and unified two-person or many-person MLS sessions. The container includes the authenticated identity-queue relay with SQLite/Postgres storage, an SBOM, and provenance."
                       gh release create "$GITHUB_REF_NAME" \
                           --verify-tag \
                           --title "Murmur $GITHUB_REF_NAME" \

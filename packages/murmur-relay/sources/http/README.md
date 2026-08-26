@@ -1,53 +1,9 @@
-# HTTP
+# Relay HTTP boundary
 
-Fetch-compatible invitation-cache, delivery, queue-read, ordered SSE, and
-queue-ack endpoints with bounded bodies and explicit CORS policy. Queue
-authentication is inside each signed protocol body.
+The Fetch-compatible handler exposes health, signed publication, bounded queue
+read, ordered SSE, and signed acknowledgement routes. JSON parsing rejects
+duplicate keys and unknown fields before protocol validation.
 
-```text
-invitation bytes + owner authorization -> SHA-256 address -> five-minute cache
-signed revocation ---------------------> expiring anti-resurrection tombstone
-queue JSON ------> exact codec -----> relay service -> bounded JSON / SSE
-remote address -----------------------> fixed-window admission bound
-```
-
-A remote socket address is mandatory for every non-OPTIONS request by default,
-including health checks. The supplied Node host provides it from the
-connection; an embedder may disable this requirement only explicitly with
-`requireRemoteAddress: false` and must then provide one explicit
-`defaultAdmissionPrincipal`; all embedded traffic shares that exact pending
-fanout budget. Configure `remoteAddressHeader` only behind a trusted proxy that
-overwrites the named header. It may carry a stable authenticated principal
-instead of an address. Never trust a client-controlled forwarded header.
-
-The in-process fixed-window limiter bounds request concurrency and accidental
-abuse; it does not make self-created protocol identities non-Sybil. Public
-deployments must enforce their own principal-level outstanding-fanout budget at
-the trusted ingress. The handler hashes the supplied address/principal and the
-relay also enforces its configured exact outstanding-reference quota for that
-principal.
-
-The Fetch handler speaks HTTP semantics but does not terminate TLS. Production
-deployments require TLS at a trusted reverse proxy or load balancer because
-signed reads and acknowledgements can be replayed within their timestamp
-window.
-
-A queue page uses nullable UUIDv7 `head` and `acknowledgedThrough` cursors plus
-`headSequence`, `acknowledgedSequence`, and a 32-byte loss generation. If a
-previously accepted delivery is larger than the current response budget, the
-relay returns `413 delivery_too_large` with its `eventId` and inbox progress so
-the client can durably quarantine that terminal item and advance without
-head-of-line blocking.
-
-`POST /v1/queue/events` requires a signed zero-wait queue read, emits a
-`continuity` control record, and returns one pull-driven `delivery` SSE record
-with its sequence per exact queue event. Comment heartbeats do
-not advance progress. Disconnect and response cancellation close the relay
-subscription.
-
-New clients use `POST /v1/invitations/owned` and
-`POST /v1/invitations/revoke`. Their JSON parsers enforce exact fields,
-canonical base64url keys, bounded bodies, signature clocks, and owner binding.
-The legacy raw-byte upload remains additive compatibility and produces an
-unrevocable row. Request bodies, invitation digests, and revocation signatures
-must not be logged by hosts or proxies.
+CORS origins are exact, request sizes are bounded, and POST rate limiting uses
+a trusted remote address. A trusted ingress principal separately bounds
+outstanding multicast references.

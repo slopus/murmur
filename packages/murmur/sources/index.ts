@@ -79,26 +79,6 @@ export type {
     SignedRelaySessionRequestJson,
     WebSocketDeliveryTransportOptions,
 } from "./delivery/index.js";
-export {
-    DISCOVERY_INVITATION_TTL_MILLISECONDS,
-    DiscoveryTransportError,
-    HttpDiscoveryTransport,
-    parseDiscoveryBundle,
-    serializeDiscoveryBundle,
-    verifyDiscoveryBundle,
-} from "./identity/discovery/index.js";
-export { validateContactProfile } from "./contacts/index.js";
-export type {
-    MurmurContact,
-    MurmurContactAdded,
-    MurmurContactProfile,
-    MurmurContactProfileValue,
-    MurmurContactRemoved,
-    MurmurContactRequest,
-    MurmurContactRequested,
-    MurmurContactUpdated,
-    MurmurOutgoingContactRequest,
-} from "./contacts/index.js";
 export { validateMurmurServiceRegistration, validateServiceId } from "./services/index.js";
 export type {
     MurmurService,
@@ -113,6 +93,7 @@ export type {
     MurmurSessionIssue,
     MurmurSessionLimits,
     MurmurSessionListOptions,
+    MurmurSessionMember,
     MurmurSessionPage,
     MurmurSessionPolicies,
     MurmurResetEvent,
@@ -123,35 +104,11 @@ export type {
     MurmurUpdate,
 } from "./sessions/index.js";
 export type {
-    MurmurContactRosterChanged,
     MurmurDeviceAdded,
     MurmurDeviceRevoked,
     MurmurDeviceRoster,
     MurmurDeviceRosterEntry,
     MurmurDormantDevice,
 } from "./accounts/index.js";
-/** EXPERIMENTAL credential-authority construction for trusted relay hosts. */
-export { createPrivateGroupCredentialAuthorityFromSecret } from "./privateGroupState/index.js";
-export type {
-    MurmurPrivateGroupState,
-    PrivateGroupCredentialAuthorityAdapter,
-    PrivateGroupStateConnection,
-    PrivateGroupStateFetch,
-    PrivateGroupStateSnapshot,
-    PrivateGroupStateTransport,
-} from "./privateGroupState/index.js";
-export type {
-    AccountDiscoveryBundle,
-    DiscoveryBundle,
-    DiscoveryBundleValidationOptions,
-    DiscoveryFetch,
-    DiscoveryTransport,
-    DiscoveryUploadOutcome,
-    HttpDiscoveryTransportOptions,
-    InvitationRevocationOutcome,
-    InvitationUploadAuthorization,
-    LegacyDiscoveryBundle,
-    SignedInvitationRevocation,
-} from "./identity/discovery/index.js";
 export { MAXIMUM_STORE_SCAN_ITEMS, MemoryMurmurStore } from "./storage/index.js";
 export type { MurmurStore, StoreScanOptions, StoreTransaction } from "./storage/index.js";

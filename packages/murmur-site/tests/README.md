@@ -34,7 +34,7 @@ visual system         no gradients, no colour literal outside a token block,
                       black primary action, 4px spacing grid, no keyframes, no
                       transition over 200ms, reduced-motion block, focus-visible
 content               the protocol explanation, the four steps, the mutual
-                      contact handshake, RFC and Noble reference links, the
+                      direct session flow, RFC and Noble reference links, the
                       exact primitives in use, the relay trust boundary, the
                       metadata caveat, offline durability, the service contract,
                       escaped code samples, install and repository links

@@ -2,13 +2,6 @@ import type { QueuedDelivery } from "../storage/index.js";
 
 /** Relay limits with conservative defaults. */
 export interface RelayOptions {
-    readonly maximumInvitationBytes?: number;
-    readonly maximumInvitationTtlMilliseconds?: number;
-    readonly maximumInvitationItemsPerAdmissionPrincipal?: number;
-    readonly maximumInvitationBytesPerAdmissionPrincipal?: number;
-    readonly maximumGlobalInvitationItems?: number;
-    readonly maximumGlobalInvitationBytes?: number;
-    readonly maximumInvitationItemsPerRevocationKey?: number;
     readonly maximumCiphertextBytes?: number;
     readonly maximumRecipients?: number;
     readonly maximumJsonBodyBytes?: number;
@@ -31,13 +24,6 @@ export interface RelayOptions {
 
 /** Fully resolved relay limits. */
 export interface ResolvedRelayOptions {
-    readonly maximumInvitationBytes: number;
-    readonly maximumInvitationTtlMilliseconds: number;
-    readonly maximumInvitationItemsPerAdmissionPrincipal: number;
-    readonly maximumInvitationBytesPerAdmissionPrincipal: number;
-    readonly maximumGlobalInvitationItems: number;
-    readonly maximumGlobalInvitationBytes: number;
-    readonly maximumInvitationItemsPerRevocationKey: number;
     readonly maximumCiphertextBytes: number;
     readonly maximumRecipients: number;
     readonly maximumJsonBodyBytes: number;
@@ -56,24 +42,6 @@ export interface ResolvedRelayOptions {
     readonly maximumLongPollMilliseconds: number;
     readonly maximumConcurrentLongPolls: number;
     readonly maximumConcurrentLongPollsPerIdentity: number;
-}
-
-/** Result of caching one opaque signed discovery bundle. */
-export interface InvitationUploadOutcome {
-    readonly digest: Uint8Array;
-    readonly expiresAt: number;
-    readonly duplicate: boolean;
-}
-
-/** One unexpired invitation fetched by its exact SHA-256 digest. */
-export interface InvitationDownload {
-    readonly bundle: Uint8Array;
-    readonly expiresAt: number;
-}
-
-/** Result of one owner-authorized invitation revocation transaction. */
-export interface InvitationRevocationOutcome {
-    readonly revoked: number;
 }
 
 /** One stream control frame proving the current inbox continuity baseline. */

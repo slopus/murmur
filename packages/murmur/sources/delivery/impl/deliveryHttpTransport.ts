@@ -47,7 +47,6 @@ export class OversizedInboxDeliveryError extends DeliveryTransportError {
     readonly acknowledgedSequence: number;
     readonly generation: Uint8Array;
 
-    constructor(eventId: string, head: string, acknowledgedThrough: string | null);
     constructor(
         eventId: string,
         sequence: number,
@@ -59,30 +58,23 @@ export class OversizedInboxDeliveryError extends DeliveryTransportError {
     );
     constructor(
         eventId: string,
-        sequenceOrHead: number | string,
-        headOrAcknowledged: string | null,
-        headSequence?: number,
-        acknowledgedThrough?: string | null,
-        acknowledgedSequence?: number,
-        generation?: Uint8Array,
+        sequence: number,
+        head: string,
+        headSequence: number,
+        acknowledgedThrough: string | null,
+        acknowledgedSequence: number,
+        generation: Uint8Array,
     ) {
         super(413, "delivery_too_large");
-        const legacy = typeof sequenceOrHead === "string";
-        const sequence = legacy ? 1 : sequenceOrHead;
-        const head = legacy ? sequenceOrHead : (headOrAcknowledged as string);
-        const resolvedHeadSequence = legacy ? 1 : headSequence!;
-        const resolvedAcknowledgedThrough = legacy ? headOrAcknowledged : acknowledgedThrough!;
-        const resolvedAcknowledgedSequence = legacy ? 0 : acknowledgedSequence!;
-        const resolvedGeneration = legacy ? new Uint8Array(32) : generation!;
         if (
             !Number.isSafeInteger(sequence) ||
             sequence < 1 ||
-            !Number.isSafeInteger(resolvedHeadSequence) ||
-            resolvedHeadSequence < sequence ||
-            !Number.isSafeInteger(resolvedAcknowledgedSequence) ||
-            resolvedAcknowledgedSequence < 0 ||
-            resolvedAcknowledgedSequence >= sequence ||
-            resolvedGeneration.length !== 32
+            !Number.isSafeInteger(headSequence) ||
+            headSequence < sequence ||
+            !Number.isSafeInteger(acknowledgedSequence) ||
+            acknowledgedSequence < 0 ||
+            acknowledgedSequence >= sequence ||
+            generation.length !== 32
         ) {
             throw new Error("Invalid oversized inbox delivery metadata");
         }
@@ -90,10 +82,10 @@ export class OversizedInboxDeliveryError extends DeliveryTransportError {
         this.eventId = eventId;
         this.sequence = sequence;
         this.head = head;
-        this.headSequence = resolvedHeadSequence;
-        this.acknowledgedThrough = resolvedAcknowledgedThrough;
-        this.acknowledgedSequence = resolvedAcknowledgedSequence;
-        this.generation = resolvedGeneration.slice();
+        this.headSequence = headSequence;
+        this.acknowledgedThrough = acknowledgedThrough;
+        this.acknowledgedSequence = acknowledgedSequence;
+        this.generation = generation.slice();
     }
 }
 

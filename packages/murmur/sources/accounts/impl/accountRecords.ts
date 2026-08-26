@@ -13,12 +13,7 @@ import {
     parseDeviceRoster,
     serializeDeviceRoster,
 } from "./deviceRosterCodec.js";
-import type {
-    MurmurContactRosterChanged,
-    MurmurDeviceAdded,
-    MurmurDeviceRevoked,
-    MurmurDeviceRoster,
-} from "../types.js";
+import type { MurmurDeviceAdded, MurmurDeviceRevoked, MurmurDeviceRoster } from "../types.js";
 
 export const ACCOUNT_EVENT_PREFIX = "murmur/accounts/v1/events/";
 export const ACCOUNT_ROSTER_KEY = "murmur/accounts/v1/own-roster";
@@ -38,32 +33,21 @@ export interface AccountConvergenceJob {
     readonly dependsOn?: string;
 }
 
-type AccountEventRecord =
-    | {
-          readonly version: 1;
-          readonly scope: "own";
-          readonly type: "added" | "revoked" | "reset";
-          readonly id: string;
-          readonly account: Uint8Array;
-          readonly device: Uint8Array;
-          readonly rosterRevision: number;
-      }
-    | {
-          readonly version: 1;
-          readonly scope: "contact";
-          readonly type: "added" | "revoked" | "reset";
-          readonly id: string;
-          readonly account: Uint8Array;
-          readonly device: Uint8Array;
-          readonly rosterRevision?: number;
-      };
+type AccountEventRecord = {
+    readonly version: 1;
+    readonly scope: "own";
+    readonly type: "added" | "revoked" | "reset";
+    readonly id: string;
+    readonly account: Uint8Array;
+    readonly device: Uint8Array;
+    readonly rosterRevision: number;
+};
 
 /** One prepared account-event batch sharing the identity-wide drain boundary. */
 export interface PreparedAccountEvents {
     readonly keys: readonly string[];
     readonly added: readonly MurmurDeviceAdded[];
     readonly revoked: readonly MurmurDeviceRevoked[];
-    readonly contacts: readonly MurmurContactRosterChanged[];
 }
 
 function eventKey(id: string, account: Uint8Array, device: Uint8Array): string {
@@ -92,7 +76,7 @@ function decodeEvent(value: Uint8Array): AccountEventRecord {
     const fields = ["version", "scope", "type", "id", "account", "device", "rosterRevision"];
     if (
         input.version !== 1 ||
-        (input.scope !== "own" && input.scope !== "contact") ||
+        input.scope !== "own" ||
         (input.type !== "added" && input.type !== "revoked" && input.type !== "reset") ||
         typeof input.id !== "string" ||
         typeof input.account !== "string" ||
@@ -124,7 +108,7 @@ function decodeEvent(value: Uint8Array): AccountEventRecord {
     } as AccountEventRecord;
 }
 
-/** Durably record an own-account or contact roster lifecycle event idempotently. */
+/** Durably record an own-account roster lifecycle event idempotently. */
 export async function recordAccountEvent(
     transaction: StoreTransaction,
     record: AccountEventRecord,
@@ -140,33 +124,18 @@ export async function prepareAccountEvents(store: MurmurStore): Promise<Prepared
     const keys: string[] = [];
     const added: MurmurDeviceAdded[] = [];
     const revoked: MurmurDeviceRevoked[] = [];
-    const contacts: MurmurContactRosterChanged[] = [];
     for (const [key, bytes] of page) {
         const event = decodeEvent(bytes);
         try {
             keys.push(key);
-            if (event.scope === "contact") {
-                contacts.push(
-                    Object.freeze({
-                        id: event.id,
-                        account: event.account.slice(),
-                        device: event.device.slice(),
-                        change: event.type,
-                        ...(event.rosterRevision === undefined
-                            ? {}
-                            : { rosterRevision: event.rosterRevision }),
-                    }),
-                );
-            } else {
-                const publicEvent = Object.freeze({
-                    id: event.id,
-                    account: event.account.slice(),
-                    device: event.device.slice(),
-                    rosterRevision: event.rosterRevision,
-                });
-                if (event.type !== "reset") {
-                    (event.type === "added" ? added : revoked).push(publicEvent);
-                }
+            const publicEvent = Object.freeze({
+                id: event.id,
+                account: event.account.slice(),
+                device: event.device.slice(),
+                rosterRevision: event.rosterRevision,
+            });
+            if (event.type !== "reset") {
+                (event.type === "added" ? added : revoked).push(publicEvent);
             }
         } finally {
             zeroBytes(event.account);
@@ -174,7 +143,7 @@ export async function prepareAccountEvents(store: MurmurStore): Promise<Prepared
             zeroBytes(bytes);
         }
     }
-    return { keys, added, revoked, contacts };
+    return { keys, added, revoked };
 }
 
 /** Delete account events only after every lifecycle callback resolves. */
@@ -351,15 +320,17 @@ export async function observeDeviceRoster(
                     keyPackage,
                 );
             }
-            await recordAccountEvent(transaction, {
-                version: 1,
-                scope: equalBytes(candidate.accountKey, ownAccount) ? "own" : "contact",
-                type: "reset",
-                id: eventId,
-                account: candidate.accountKey,
-                device,
-                rosterRevision: candidate.revision,
-            });
+            if (equalBytes(candidate.accountKey, ownAccount)) {
+                await recordAccountEvent(transaction, {
+                    version: 1,
+                    scope: "own",
+                    type: "reset",
+                    id: eventId,
+                    account: candidate.accountKey,
+                    device,
+                    rosterRevision: candidate.revision,
+                });
+            }
         }
         for (const change of changes) {
             if (resets.some((device) => equalBytes(device, change.device))) continue;
@@ -379,15 +350,17 @@ export async function observeDeviceRoster(
                     keyPackage,
                 );
             }
-            await recordAccountEvent(transaction, {
-                version: 1,
-                scope: equalBytes(candidate.accountKey, ownAccount) ? "own" : "contact",
-                type: change.change,
-                id: eventId,
-                account: candidate.accountKey,
-                device: change.device,
-                rosterRevision: candidate.revision,
-            });
+            if (equalBytes(candidate.accountKey, ownAccount)) {
+                await recordAccountEvent(transaction, {
+                    version: 1,
+                    scope: "own",
+                    type: change.change,
+                    id: eventId,
+                    account: candidate.accountKey,
+                    device: change.device,
+                    rosterRevision: candidate.revision,
+                });
+            }
         }
         if (
             admission !== undefined &&

@@ -5,3 +5,5 @@ Strict codec and key tests for durable service routing.
 ```text
 owner / routing record -> canonical bytes -> strict decoder
 ```
+
+Owner vectors cover account, ignored, and registered-service records.

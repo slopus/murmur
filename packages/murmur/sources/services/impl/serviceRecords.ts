@@ -21,7 +21,6 @@ export const ROUTING_MARKER_PREFIX = SESSION_ROUTING_PREFIX;
 /** Durable owner assigned to one MLS session. */
 export type SessionOwnerRecord =
     | { readonly version: 1; readonly owner: "ignored" }
-    | { readonly version: 1; readonly owner: "contact" }
     | { readonly version: 1; readonly owner: "account" }
     | {
           readonly version: 1;
@@ -108,7 +107,7 @@ export function encodeSessionOwner(record: SessionOwnerRecord): Uint8Array {
             serviceId: record.serviceId,
         });
     }
-    if (record.owner !== "ignored" && record.owner !== "contact" && record.owner !== "account") {
+    if (record.owner !== "ignored" && record.owner !== "account") {
         throw new Error("Invalid session owner");
     }
     return canonicalJsonBytes({ version: 1, owner: record.owner });
@@ -119,10 +118,7 @@ export function decodeSessionOwner(value: Uint8Array): SessionOwnerRecord {
     const input = parseCanonical(value, "session owner");
     if (
         input.version !== 1 ||
-        (input.owner !== "ignored" &&
-            input.owner !== "contact" &&
-            input.owner !== "account" &&
-            input.owner !== "service")
+        (input.owner !== "ignored" && input.owner !== "account" && input.owner !== "service")
     ) {
         throw new Error("Invalid session owner");
     }

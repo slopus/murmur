@@ -322,15 +322,6 @@ describe("identity queue relay", () => {
             exhausted: true,
         };
         const store: RelayStore = {
-            async storeInvitation() {
-                throw new Error("Unused");
-            },
-            async readInvitation() {
-                throw new Error("Unused");
-            },
-            async revokeInvitations() {
-                throw new Error("Unused");
-            },
             async publish(
                 _delivery: SignedDelivery,
                 _now: number,

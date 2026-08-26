@@ -29,7 +29,6 @@ class Messenger {
     readonly messages: { sender: string; text: string }[] = [];
     readonly deviceAdded: string[] = [];
     readonly deviceRevoked: string[] = [];
-    readonly contactRosterChanges: { account: string; change: string }[] = [];
 
     constructor(client: MurmurClient) {
         this.client = client;
@@ -53,14 +52,6 @@ class Messenger {
             onDeviceRevoked: async (devices) => {
                 for (const device of devices) {
                     this.deviceRevoked.push(encodeBase64Url(device.device));
-                }
-            },
-            onContactRosterChanged: async (changes) => {
-                for (const change of changes) {
-                    this.contactRosterChanges.push({
-                        account: encodeBase64Url(change.account),
-                        change: change.change,
-                    });
                 }
             },
         };
@@ -92,34 +83,6 @@ async function pumpAll(messengers: readonly Messenger[], rounds: number): Promis
     }
 }
 
-async function establishContact(invited: Messenger, requester: Messenger): Promise<Uint8Array> {
-    const session = await requester.client.requestContact(await invited.client.createInvitation(), {
-        name: "Requester",
-    });
-    let accepted = false;
-    for (let index = 0; index < 8; index += 1) {
-        await requester.client.synchronize({ waitMilliseconds: 0 });
-        await invited.client.synchronize(
-            { waitMilliseconds: 0 },
-            {
-                onContactRequested: async (events) => {
-                    if (!accepted && events.length > 0) {
-                        await invited.client.acceptContact(session.id, { name: "Invited" });
-                        accepted = true;
-                    }
-                },
-            },
-        );
-        if (
-            (await invited.client.contact(requester.client.accountKey)) !== undefined &&
-            (await requester.client.contact(invited.client.accountKey)) !== undefined
-        ) {
-            return session.id;
-        }
-    }
-    throw new Error("Contact did not converge");
-}
-
 describe("multidevice messenger", () => {
     test(
         "links, converges, messages, and revokes transparently",
@@ -143,11 +106,9 @@ describe("multidevice messenger", () => {
             const alice2 = new Messenger(await open());
             const bob = new Messenger(await open());
             try {
-                await establishContact(bob, alice1);
-
                 const chat = await alice1.client.createSession({
                     descriptor: CHAT_DESCRIPTOR,
-                    contacts: [bob.client.accountKey],
+                    members: [await bob.client.createKeyPackage()],
                 });
                 await pumpAll([alice1, bob], 4);
                 await alice1.client.send(chat.id, utf8Encode("hello bob"));
@@ -166,9 +127,6 @@ describe("multidevice messenger", () => {
                 const aliceDevices = await alice1.client.devices();
                 expect(aliceDevices.map(({ status }) => status)).toEqual(["active", "active"]);
                 expect(alice1.deviceAdded.length).toBeGreaterThan(0);
-                expect(bob.contactRosterChanges.some(({ change }) => change === "added")).toBe(
-                    true,
-                );
 
                 // Chat membership stays two accounts even with three device leaves.
                 const bobChat = await bob.client.session(chat.id);
@@ -190,9 +148,6 @@ describe("multidevice messenger", () => {
                 await alice1.client.revokeDevice(alice2.client.identity);
                 await pumpAll([alice1, bob], 8);
                 expect(alice1.deviceRevoked.length).toBeGreaterThan(0);
-                expect(bob.contactRosterChanges.some(({ change }) => change === "revoked")).toBe(
-                    true,
-                );
 
                 const revokedCount = alice2.messages.length;
                 await bob.client.send(chat.id, utf8Encode("after revocation"));

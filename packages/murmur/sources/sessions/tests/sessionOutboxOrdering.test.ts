@@ -59,7 +59,7 @@ describe("session outbox ordering", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("ordered sends"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize();
             await bob.synchronize();

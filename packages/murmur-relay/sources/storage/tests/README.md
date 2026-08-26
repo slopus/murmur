@@ -12,7 +12,5 @@ same vectors -> SQLite
              -> equal queue outcomes
 ```
 
-Page selection tests pin bounded hydration and UUID cursor behavior.
-Pre-beta SQLite and Postgres schema markers are rejected without migration.
-Long-running SQLite and durable-fanout chaos coverage runs separately from the
-unit suite.
+Page selection tests pin bounded hydration and UUID cursor behavior. Long-running
+SQLite and durable-fanout chaos coverage runs separately from the unit suite.

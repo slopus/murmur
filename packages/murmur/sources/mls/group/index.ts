@@ -44,14 +44,14 @@ export interface JoinMlsGroupFromWelcomeOptions {
     readonly welcome: Uint8Array;
     readonly tree: MlsRatchetTree;
     readonly keyPackageBundle: MlsKeyPackageBundle;
-    /** Confirmation tag carried by the exact retained Commit named by the invitation. */
+    /** Confirmation tag carried by the exact retained bootstrap Commit. */
     readonly expectedCommitConfirmationTag: Uint8Array;
 }
 
 /**
  * Authenticate and adopt a recipient-bound Welcome with an external tree.
  *
- * Invitation codecs remain in the stateful facade; this function owns the
+ * Stateful bootstrap codecs remain in the facade; this function owns the
  * cryptographic KeyPackage/tree/identity binding.
  */
 export function joinMlsGroupFromWelcome(options: JoinMlsGroupFromWelcomeOptions): MlsEpochState {

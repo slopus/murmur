@@ -1,17 +1,17 @@
-# Core source layout
+# Library sources
 
 ```text
-crypto/              one-root Ed25519/X25519 identity primitives
-contacts/            built-in mutual-profile contact protocol and state
-delivery/            signed pages/SSE, HTTP transport, durable inbox processor
-identity/discovery/  signed KeyPackage bundles and digest-cache transport
-mls/                 browser-safe RFC 9420 profile
-sessions/            public stateful MLS coordinator
-services/            optional typed session ownership and scoped persistence
-storage/             transactional durable-store contract and memory store
-utils/               bounded serialization and byte utilities
-index.ts             root package exports
+accounts/   authenticated account-device rosters and provisioning
+chaos/      deterministic fault-injection support
+crypto/     identity roots, signatures, key agreement, and hashing
+delivery/   signed queue transport, processing, SSE, and WebSocket clients
+identity/   identity-domain boundary
+mls/        MLS cryptographic state and protocol operations
+services/   typed application routing
+sessions/   stateful public client facade and durable session engine
+storage/    application-owned transactional store seam
+utils/      self-contained encoding and byte helpers
 ```
 
-The public façade is `MurmurClient` in `sessions/`. Delivery queues and ordered
-SSE are transport buffers; durable protocol state always crosses `storage/`.
+`index.ts` is the only package entry point. The published surface remains
+browser-safe and side-effect free.

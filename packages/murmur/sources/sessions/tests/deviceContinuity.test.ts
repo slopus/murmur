@@ -47,7 +47,7 @@ describe("device inbox continuity", () => {
         try {
             const created = await alice.createSession({
                 descriptor: utf8Encode("continuity reset"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -112,19 +112,10 @@ describe("device inbox continuity", () => {
                 inbox: { processed: 0 },
             });
 
-            const rosterChanges: string[] = [];
             for (let cycle = 0; cycle < 8; cycle += 1) {
-                await alice.synchronize(
-                    { waitMilliseconds: 0 },
-                    {
-                        onContactRosterChanged: (changes) => {
-                            rosterChanges.push(...changes.map((change) => change.change));
-                        },
-                    },
-                );
+                await alice.synchronize({ waitMilliseconds: 0 });
                 await bob.synchronize({ waitMilliseconds: 0 });
             }
-            expect(rosterChanges).toContain("reset");
             await expect(bob.session(created.id)).resolves.toMatchObject({
                 descriptor: created.descriptor,
                 status: "pending",

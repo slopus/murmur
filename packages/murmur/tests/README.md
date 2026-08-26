@@ -13,6 +13,9 @@ The package test proves that the root contains only the facade runtime exports
 and bundles for browsers without Node imports. MLS is compiled internally and
 has no package subpath.
 
+The strict consumer fixture covers direct KeyPackage session creation and the
+current lifecycle callback surface.
+
 `vitestReporterProxy.ts` is not a test. Both vitest configurations load it as a
 worker setup file so a test that holds the event loop in synchronous
 cryptography does not expire Vitest's reporter acknowledgement.

@@ -1,42 +1,12 @@
 # Storage
 
-Murmur state is built on one ordered byte key/value primitive:
+`MurmurStore` is the application-owned durable boundary. It provides atomic
+transactions, exact key/value access, and bounded prefix scans. Murmur persists
+identity roots, account state, KeyPackage bundles, epochs, pending sessions,
+outboxes, replay markers, application updates, and queue continuity here.
 
-```text
-get(key)
-set(key, bytes)
-delete(key)
-scan(prefix, { after?, limit })
-transaction(async store => ...)
-```
+Values are defensive byte copies. Prefix scans return lexicographically ordered
+keys and enforce a hard maximum result count. Cryptographic code must zero
+temporary secret values after use.
 
-`scan` is lexicographic, prefix-filtered, and page-bounded. Compound durable
-keys use `/` separators inside Murmur's opaque persisted namespace. Contacts,
-services, routing, MLS checkpoints, inbox state, and outboxes are all records
-layered on this same application-supplied `MurmurStore`; none introduces another
-database abstraction. The 0.5.0 beta format is the first compatibility baseline;
-pre-beta records are not decoded or migrated.
-
-The core depends on a minimal asynchronous byte key-value store. Browser
-applications can back it with IndexedDB; Node applications can use SQLite. The
-included memory implementation is for tests and ephemeral processes.
-
-All library-owned keys live under the `murmur/` namespace. Stores must
-return defensive byte copies and must roll a transaction back when its callback
-throws. Murmur does not require or attempt nested transactions.
-
-```text
-Murmur engine
-    |
-    +-- get/set/delete
-    +-- scan(prefix, after, limit) -> bounded ordered page
-    `-- transaction(callback) ----> atomic commit or full rollback
-                                      |
-                                  application store
-```
-
-The bounded scan is used for session indexes, outboxes, buffered events, replay
-state, invitation KeyPackage expiries, and diagnostics without materializing an
-entire namespace. Private KeyPackages are deleted when the matching Welcome
-consumes them, or on the next client operation after their five-minute
-invitation expires and before another Welcome is processed.
+`MemoryMurmurStore` is deterministic test support, not production persistence.

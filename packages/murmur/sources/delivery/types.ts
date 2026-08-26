@@ -42,7 +42,6 @@ export interface DeliveryPublishOutcome {
 /** One retained delivery reference in an inbox. */
 export interface InboxDelivery {
     readonly eventId: string;
-    /** Relay v2 continuity sequence; omitted only by legacy custom transports. */
     readonly sequence?: number;
     readonly delivery: SignedDelivery;
 }

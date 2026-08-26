@@ -13,3 +13,5 @@ enforcing quota through set-based target operations. Expiration deletes one
 fixed delivery batch and chunks affected-inbox cleanup. Reads only filter
 expired rows, avoiding serialization failures and write amplification.
 LISTEN/NOTIFY wakes readers only after publication commits.
+
+Initialization requires the exact current queue schema.

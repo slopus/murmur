@@ -4,6 +4,8 @@ Policy and orchestration coverage for signed identity access, TTL and size
 limits, pending idempotency, monotonic trimming, race-free long polling, and
 destructive expiration.
 
+Test stores implement only the current queue seam.
+
 ```text
 initial read -> register waiter -> recheck store -> wake / abort / timeout
 ```

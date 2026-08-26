@@ -67,11 +67,8 @@ export interface DurableObjectStateLike {
 export interface MurmurCloudflareEnvironment {
     readonly MURMUR_INBOXES: DurableObjectNamespaceLike;
     readonly MURMUR_FANOUT: DurableObjectNamespaceLike;
-    readonly MURMUR_PRIVATE_GROUPS: DurableObjectNamespaceLike;
     /** Canonical unpadded base64url HMAC secret containing at least 32 bytes. */
     readonly MURMUR_RELAY_TOKEN_SECRET: string;
-    /** Canonical unpadded base64url private-group deployment secret of exactly 32 bytes. */
-    readonly MURMUR_PRIVATE_GROUP_SECRET: string;
     /** Exact public `wss:` URL returned by the application's ticket issuer. */
     readonly MURMUR_RELAY_ENDPOINT: string;
 }

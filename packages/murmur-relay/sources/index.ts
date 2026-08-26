@@ -29,8 +29,6 @@ export {
     RelayService,
 } from "./relay/index.js";
 export type {
-    InvitationDownload,
-    InvitationUploadOutcome,
     QueueEventSubscription,
     QueueContinuityEvent,
     RelayOptions,
@@ -47,7 +45,6 @@ export {
 } from "./storage/index.js";
 export type {
     AcknowledgeOutcome,
-    InvitationLimits,
     PageReadConstraints,
     PublishOutcome,
     QueuedDelivery,
@@ -56,8 +53,6 @@ export type {
     RelayStore,
     RelayStoreBackend,
     SqliteRelayStoreOptions,
-    StoredInvitation,
-    StoreInvitationOutcome,
 } from "./storage/index.js";
 export { createRelayFetchHandler, parseRelayAllowedOrigins } from "./http/index.js";
 export type { RelayFetchHandler, RelayHttpOptions, RelayRequestContext } from "./http/index.js";
@@ -103,31 +98,3 @@ export type {
     RelayWebSocketPeer,
     RelayWebSocketSessionOptions,
 } from "./websocket/index.js";
-export {
-    PrivateGroupStateService,
-    createPrivateGroupCredentialAuthorityFromSecret,
-    createPrivateGroupStateFetchHandler,
-    createPrivateGroupStateServiceFromSecret,
-    encodePrivateGroupStateRecord,
-    encodeUnsignedPrivateGroupStateRecord,
-    privateGroupStateRecordHash,
-} from "./privateGroupState/index.js";
-export { PostgresPrivateGroupStateStore } from "./privateGroupState/impl/privateGroupStateStorePostgres.js";
-export { SqlitePrivateGroupStateStore } from "./privateGroupState/impl/privateGroupStateStoreSqlite.js";
-export type { SqlitePrivateGroupStateStoreOptions } from "./privateGroupState/impl/privateGroupStateStoreSqlite.js";
-export type {
-    PrivateGroupAccessToken,
-    PrivateGroupChallengeOperation,
-    PrivateGroupCredentialAuthority,
-    PrivateGroupCredentialIssuanceChallenge,
-    PrivateGroupMemberEntry,
-    PrivateGroupPresentationChallenge,
-    PrivateGroupRole,
-    PrivateGroupStateLimits,
-    PrivateGroupStateRecord,
-    PrivateGroupStateServiceOptions,
-    PrivateGroupStateSecretServiceOptions,
-    PrivateGroupStateStore,
-    PrivateGroupCredentialAuthorityAdapter,
-    StoredPrivateGroupStateRecord,
-} from "./privateGroupState/index.js";

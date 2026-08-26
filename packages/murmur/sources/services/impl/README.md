@@ -10,5 +10,5 @@ event UUID -> routed-session marker
 ```
 
 `serviceId.ts` validates stable IDs. `serviceRecords.ts` owns strict versioned
-codecs for Murmur's durable routing. Decoders reject unknown fields and
+codecs for account, ignored, and registered-service ownership. Decoders reject unknown fields and
 non-canonical JSON. Custom-service application state is outside this module.

@@ -1,7 +1,7 @@
 # Services
 
 Optional typed synchronization capabilities registered on one Murmur client.
-Contacts remain built in and are not a service.
+Account synchronization remains internal and is not a service.
 
 ```text
 new MLS session descriptor

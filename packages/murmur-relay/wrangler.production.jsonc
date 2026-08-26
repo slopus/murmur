@@ -12,20 +12,12 @@
                 "name": "MURMUR_FANOUT",
                 "class_name": "MurmurFanoutDurableObject",
             },
-            {
-                "name": "MURMUR_PRIVATE_GROUPS",
-                "class_name": "MurmurPrivateGroupDurableObject",
-            },
         ],
     },
     "migrations": [
         {
             "tag": "v1",
             "new_sqlite_classes": ["MurmurInboxDurableObject", "MurmurFanoutDurableObject"],
-        },
-        {
-            "tag": "v2",
-            "new_sqlite_classes": ["MurmurPrivateGroupDurableObject"],
         },
     ],
     "vars": {

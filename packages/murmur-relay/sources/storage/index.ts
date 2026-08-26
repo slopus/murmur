@@ -16,16 +16,12 @@ export type {
 } from "./postgres/index.js";
 export type {
     AcknowledgeOutcome,
-    InvitationLimits,
     PageReadConstraints,
     PublishOutcome,
     QueuedDelivery,
     QueueLimits,
     QueuePage,
-    RevokeInvitationsOutcome,
     RelayStore,
-    StoredInvitation,
-    StoreInvitationOutcome,
 } from "./types.js";
 export { RELAY_EXPIRATION_BATCH_ITEMS } from "./types.js";
 export {

@@ -1,8 +1,6 @@
 import {
     DELIVERY_RETENTION_MILLISECONDS,
-    PrivateGroupStateService,
     RelayService,
-    SqlitePrivateGroupStateStore,
     SqliteRelayStore,
     createRelayFetchHandler,
     type RelayOptions,
@@ -52,17 +50,6 @@ import {
     type RelaySessionProvider,
     type SignedDelivery,
 } from "../../delivery/index.js";
-import {
-    createDiscoveryBundle,
-    parseDiscoveryBundle,
-    serializeDiscoveryBundle,
-    verifyDiscoveryBundle,
-} from "../../identity/discovery/index.js";
-import {
-    createMlsKeyPackage,
-    destroyMlsKeyPackageBundle,
-    type MlsKeyPackageBundle,
-} from "../../mls/index.js";
 import { type MlsGroupContext } from "../../mls/groupContext/index.js";
 import {
     decodeMlsPrivateMessage,
@@ -71,26 +58,6 @@ import {
     sealMlsApplicationMessage,
 } from "../../mls/privateMessage/index.js";
 import { MlsSecretTree, destroyMlsGenerationKey } from "../../mls/secretTree/index.js";
-import {
-    PrivateGroupStateClient,
-    createPrivateGroupCredentialAuthority,
-    type PrivateGroupRecordContent,
-} from "../../privateGroupState/index.js";
-import {
-    createCredentialIssuanceRequest,
-    createEncryptedUid,
-    createUidPresentation,
-    decodeCredentialIssuanceResponse,
-    decodeUidPresentation,
-    deriveCredentialIssuer,
-    derivePrivateGroupParameters,
-    encodeCredentialIssuanceResponse,
-    encodeUidPresentation,
-    finalizeCredentialIssuance,
-    issueCredential,
-    privateGroupPublicParameters,
-    verifyUidPresentation,
-} from "../../privateGroups/index.js";
 import { MurmurClient, type MurmurUpdate } from "../../sessions/index.js";
 import {
     decodeSessionRoles,
@@ -241,11 +208,11 @@ describe("adversarial inputs and resource limits", () => {
             "application",
             "commit",
             "welcome",
-            "discovery",
+            "directory-prekey",
             "provisioning",
             "role-control",
             "account-roster",
-            "private-group",
+            "account-sync",
         ] as const;
         const processor = new InboxProcessor(
             { identity: recipient, transport: fixture.transport, store },
@@ -393,7 +360,7 @@ describe("adversarial inputs and resource limits", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("adversarial-commit-order"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -457,7 +424,6 @@ describe("adversarial inputs and resource limits", () => {
                     epoch: 7n,
                     commit: utf8Encode("valid-commit"),
                     roles,
-                    privateGroupMasterSecret: new Uint8Array(32).fill(7),
                 }),
             );
             expect(wire.kind).toBe("commit");
@@ -509,112 +475,6 @@ describe("adversarial inputs and resource limits", () => {
             );
         }
     });
-
-    test("ADV-06 discovery count, identity, time, encoding, cache, and size boundaries fail closed", async () => {
-        let now = NOW;
-        const fixture = relayFixture(
-            {
-                maximumInvitationItemsPerAdmissionPrincipal: 1,
-                maximumGlobalInvitationItems: 2,
-                maximumInvitationItemsPerRevocationKey: 2,
-            },
-            () => now,
-        );
-        const identity = generateIdentityKeyPair();
-        const other = generateIdentityKeyPair();
-        const packages: MlsKeyPackageBundle[] = [];
-        try {
-            while (packages.length < 33) {
-                packages.push(createMlsKeyPackage(identity, Math.floor(NOW / 1_000), 3_600));
-            }
-            expect(() => createDiscoveryBundle(identity, [], { createdAt: NOW })).toThrow();
-            expect(() =>
-                createDiscoveryBundle(
-                    identity,
-                    packages.map((value) => value.keyPackage),
-                    { createdAt: NOW, expiresAt: NOW + MINUTE_MILLISECONDS },
-                ),
-            ).toThrow();
-            expect(
-                createDiscoveryBundle(
-                    identity,
-                    packages.slice(0, 32).map((value) => value.keyPackage),
-                    { createdAt: NOW, expiresAt: NOW + MINUTE_MILLISECONDS },
-                ).keyPackages,
-            ).toHaveLength(32);
-            expect(() =>
-                createDiscoveryBundle(
-                    identity,
-                    [packages[0]!.keyPackage, packages[0]!.keyPackage],
-                    { createdAt: NOW, expiresAt: NOW + MINUTE_MILLISECONDS },
-                ),
-            ).toThrow("Duplicate");
-
-            const valid = createDiscoveryBundle(identity, [packages[0]!.keyPackage], {
-                createdAt: NOW,
-                expiresAt: NOW + MINUTE_MILLISECONDS,
-            });
-            const encoded = serializeDiscoveryBundle(valid);
-            expect(
-                verifyDiscoveryBundle(parseDiscoveryBundle(encoded, { now: NOW }), { now: NOW }),
-            ).toBe(true);
-            const json = objectJson(encoded);
-            for (const mutation of [
-                { ...json, extra: true },
-                { ...json, identityKey: encodeBase64Url(other.publicKey) },
-                { ...json, signature: `${String(json.signature)}=` },
-                { ...json, keyPackages: [] },
-                { ...json, keyPackages: Array.from({ length: 33 }, () => "AA") },
-            ]) {
-                expect(() =>
-                    parseDiscoveryBundle(utf8Encode(JSON.stringify(mutation)), { now: NOW }),
-                ).toThrow();
-            }
-            expect(() =>
-                parseDiscoveryBundle(encoded, { now: NOW + MINUTE_MILLISECONDS }),
-            ).toThrow();
-            expect(() =>
-                parseDiscoveryBundle(encoded, {
-                    now: NOW - 30_001,
-                    maximumFutureSkewMilliseconds: 30_000,
-                }),
-            ).toThrow();
-
-            const stored = await fixture.relay.storeInvitation(encoded, "principal-a");
-            expect((await fixture.relay.storeInvitation(encoded, "principal-a")).duplicate).toBe(
-                true,
-            );
-            await expect(fixture.relay.readInvitation(flip(stored.digest))).rejects.toMatchObject({
-                status: 404,
-            });
-            const second = createDiscoveryBundle(identity, [packages[1]!.keyPackage], {
-                createdAt: NOW,
-                expiresAt: NOW + MINUTE_MILLISECONDS,
-            });
-            await expect(
-                fixture.relay.storeInvitation(serializeDiscoveryBundle(second), "principal-a"),
-            ).rejects.toMatchObject({ status: 429 });
-            now = NOW + MINUTE_MILLISECONDS;
-            await expect(fixture.relay.readInvitation(stored.digest)).rejects.toMatchObject({
-                status: 404,
-            });
-
-            const exact = relayFixture({ maximumInvitationBytes: encoded.length });
-            const short = relayFixture({ maximumInvitationBytes: encoded.length - 1 });
-            try {
-                await expect(exact.relay.storeInvitation(encoded, "exact")).resolves.toBeDefined();
-                await expect(short.relay.storeInvitation(encoded, "short")).rejects.toMatchObject({
-                    status: 413,
-                });
-            } finally {
-                await exact.relay.close();
-                await short.relay.close();
-            }
-        } finally {
-            for (const value of packages) destroyMlsKeyPackageBundle(value);
-            await closeFixture(fixture, [identity, other]);
-        }
-    }, 120_000);
 
     test("ADV-07/08 signed delivery, authentication, fanout, quota, and retention boundaries", async () => {
         expect(DELIVERY_RETENTION_MILLISECONDS).toBe(SIX_MONTHS_MILLISECONDS);
@@ -849,7 +709,7 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
-    test("ADV-09 concurrent and sequential discovery claims admit one KeyPackage exactly once", async () => {
+    test("ADV-09 concurrent and sequential KeyPackage claims admit exactly once", async () => {
         const fixture = relayFixture();
         const alice = await MurmurClient.open({
             transport: fixture.transport,
@@ -862,7 +722,7 @@ describe("adversarial inputs and resource limits", () => {
             now: () => NOW,
         });
         try {
-            const replayed = await bob.discovery();
+            const replayed = await bob.createKeyPackage();
             const concurrent = await Promise.allSettled([
                 alice.createSession({
                     descriptor: utf8Encode("concurrent KeyPackage claim A"),
@@ -910,7 +770,7 @@ describe("adversarial inputs and resource limits", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("prior-epoch-adversarial"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -1133,7 +993,7 @@ describe("adversarial inputs and resource limits", () => {
 
             const session = await alice.createSession({
                 descriptor: utf8Encode("reset-announcement-adversarial"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -1174,164 +1034,6 @@ describe("adversarial inputs and resource limits", () => {
             alice.close();
             bob.close();
             await closeFixture(fixture, [aliceIdentity, bobIdentity, attacker, attackerAccount]);
-        }
-    });
-
-    test("ADV-12 private-group proof, group, replay, context, expiry, and encoding swaps fail closed", () => {
-        const accountIdentifier = hashBytes(utf8Encode("private-account"));
-        const otherIdentifier = hashBytes(utf8Encode("other-private-account"));
-        const issuer = deriveCredentialIssuer(hashBytes(utf8Encode("issuer")));
-        const groupA = derivePrivateGroupParameters(hashBytes(utf8Encode("group-a-parameters")));
-        const groupB = derivePrivateGroupParameters(hashBytes(utf8Encode("group-b-parameters")));
-        const issueContext = utf8Encode("credential issue revision 9");
-        const presentationContext = utf8Encode("PATCH private roster revision 9");
-        const expiresAt = NOW + 5 * MINUTE_MILLISECONDS;
-        const state = createCredentialIssuanceRequest(
-            accountIdentifier,
-            issuer.publicParameters,
-            issueContext,
-        );
-        const response = issueCredential({
-            issuer,
-            accountIdentifier,
-            request: state.request,
-            expiresAt,
-            now: NOW,
-            context: issueContext,
-        });
-        const credential = finalizeCredentialIssuance({
-            state,
-            response: decodeCredentialIssuanceResponse(encodeCredentialIssuanceResponse(response)),
-            accountIdentifier,
-            parameters: issuer.publicParameters,
-            context: issueContext,
-        });
-        const encryptedUid = createEncryptedUid(accountIdentifier, groupA);
-        const replayNonce = hashBytes(utf8Encode("private-replay"));
-        const presentation = createUidPresentation({
-            credential,
-            accountIdentifier,
-            encryptedUid,
-            group: groupA,
-            issuer: issuer.publicParameters,
-            replayNonce,
-            context: presentationContext,
-            now: NOW,
-        });
-        const verify = (overrides: {
-            readonly group?: ReturnType<typeof privateGroupPublicParameters>;
-            readonly expectedReplayNonce?: Uint8Array;
-            readonly context?: Uint8Array;
-            readonly now?: number;
-        }): boolean =>
-            verifyUidPresentation({
-                presentation,
-                encryptedUid,
-                group: overrides.group ?? privateGroupPublicParameters(groupA),
-                issuer,
-                expectedReplayNonce: overrides.expectedReplayNonce ?? replayNonce,
-                context: overrides.context ?? presentationContext,
-                now: overrides.now ?? NOW,
-            });
-
-        expect(verify({})).toBe(true);
-        expect(verify({ group: privateGroupPublicParameters(groupB) })).toBe(false);
-        expect(verify({ expectedReplayNonce: otherIdentifier })).toBe(false);
-        expect(verify({ context: utf8Encode("GET private roster revision 9") })).toBe(false);
-        expect(verify({ now: expiresAt })).toBe(false);
-        expect(
-            verifyUidPresentation({
-                presentation: { ...presentation, proof: flip(presentation.proof) },
-                encryptedUid,
-                group: privateGroupPublicParameters(groupA),
-                issuer,
-                expectedReplayNonce: replayNonce,
-                context: presentationContext,
-                now: NOW,
-            }),
-        ).toBe(false);
-        const encoded = encodeUidPresentation(presentation);
-        expect(decodeUidPresentation(encoded)).toEqual(presentation);
-        const decodedTampered = decodeUidPresentation(flip(encoded));
-        expect(
-            verifyUidPresentation({
-                presentation: decodedTampered,
-                encryptedUid,
-                group: privateGroupPublicParameters(groupA),
-                issuer,
-                expectedReplayNonce: replayNonce,
-                context: presentationContext,
-                now: NOW,
-            }),
-        ).toBe(false);
-        for (const malformed of [encoded.slice(0, -1), new Uint8Array()]) {
-            expect(() => decodeUidPresentation(malformed)).toThrow();
-        }
-    });
-
-    // PRODUCT FINDING: presentation challenges are one-use, but the resulting bearer token
-    // currently authorizes unlimited reads until expiry. This sentinel turns red if replay is
-    // bound or if the product explicitly adopts reusable bearer semantics and removes the test.
-    test.fails("ADV-12 PRODUCT FINDING private-group access tokens reject replay before expiry", async () => {
-        let now = NOW;
-        const account = hashBytes(utf8Encode("token-replay-account"));
-        const issuer = deriveCredentialIssuer(hashBytes(utf8Encode("token-replay-issuer")));
-        const service = new PrivateGroupStateService({
-            store: new SqlitePrivateGroupStateStore(":memory:"),
-            credentialAuthority: createPrivateGroupCredentialAuthority(issuer),
-            tokenSecret: hashBytes(utf8Encode("token-replay-service-secret")),
-            now: () => now,
-            tokenLifetimeMilliseconds: MINUTE_MILLISECONDS,
-        });
-        const client = new PrivateGroupStateClient({
-            accountIdentifier: account,
-            groupMasterSecret: hashBytes(utf8Encode("token-replay-group-secret")),
-            transport: service,
-            now: () => now,
-        });
-        const content: PrivateGroupRecordContent = {
-            attributes: utf8Encode("token replay sentinel"),
-            session: {
-                id: hashBytes(utf8Encode("token-replay-session")),
-                status: "active",
-                descriptor: utf8Encode("token-replay-descriptor"),
-                members: [account],
-                owner: account,
-                admins: [account],
-                policies: { adminsAssignAdmins: false, anyoneCanAddMembers: false },
-            },
-            roles: [{ accountIdentifier: account, role: "owner" }],
-        };
-        try {
-            const credential = await client.obtainCredential(utf8Encode("token replay auth"));
-            await client.createGroup(credential, content);
-            const token = await client.authorize(credential, "owner", "access");
-            const outcomes: string[] = [];
-            for (let attempt = 0; attempt < 2; attempt += 1) {
-                try {
-                    await service.readRecord({
-                        opaqueGroupId: client.opaqueGroupId,
-                        token: token.bytes,
-                    });
-                    outcomes.push("accepted");
-                } catch {
-                    outcomes.push("rejected");
-                }
-            }
-            now = token.expiresAt;
-            try {
-                await service.readRecord({
-                    opaqueGroupId: client.opaqueGroupId,
-                    token: token.bytes,
-                });
-                outcomes.push("accepted");
-            } catch {
-                outcomes.push("rejected");
-            }
-            expect(outcomes).toEqual(["accepted", "rejected", "rejected"]);
-        } finally {
-            client.close();
-            service.close();
         }
     });
 
@@ -1675,13 +1377,6 @@ describe("adversarial inputs and resource limits", () => {
     test("ADV-16 256 seeded structural mutations are deterministic and controls stay live", () => {
         const identity = generateIdentityKeyPair();
         const peer = generateIdentityKeyPair();
-        const keyPackage = createMlsKeyPackage(identity, Math.floor(NOW / 1_000), 3_600);
-        const discovery = serializeDiscoveryBundle(
-            createDiscoveryBundle(identity, [keyPackage.keyPackage], {
-                createdAt: NOW,
-                expiresAt: NOW + MINUTE_MILLISECONDS,
-            }),
-        );
         const signed = delivery(identity, [peer.publicKey], utf8Encode("mutation-control"));
         const signedBytes = utf8Encode(JSON.stringify(signedDeliveryToJson(signed)));
         const link = createDeviceLinkMaterial(peer, utf8Encode("mutation-key-package"), NOW);
@@ -1693,13 +1388,6 @@ describe("adversarial inputs and resource limits", () => {
             anyoneCanAddMembers: false,
         });
         const corpus = [
-            {
-                name: "discovery",
-                bytes: discovery,
-                parse: (value: Uint8Array): void => {
-                    parseDiscoveryBundle(value, { now: NOW });
-                },
-            },
             {
                 name: "delivery",
                 bytes: signedBytes,
@@ -1765,7 +1453,6 @@ describe("adversarial inputs and resource limits", () => {
             }
         } finally {
             zeroBytes(link.ephemeralSecretKey);
-            destroyMlsKeyPackageBundle(keyPackage);
             destroyIdentity(identity);
             destroyIdentity(peer);
         }

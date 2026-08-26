@@ -17,13 +17,6 @@ export {
     verifyQueueAckSignature,
     verifyQueueReadSignature,
 } from "./impl/deliveryCodec.js";
-export {
-    invitationUploadSigningBytes,
-    parseOwnedInvitationUpload,
-    parseSignedInvitationRevocation,
-    verifyInvitationUploadAuthorization,
-    verifyInvitationRevocationSignature,
-} from "./impl/invitationCodec.js";
 export type {
     SignedDelivery,
     SignedDeliveryJson,
@@ -31,7 +24,4 @@ export type {
     SignedQueueAckJson,
     SignedQueueRead,
     SignedQueueReadJson,
-    InvitationUploadAuthorization,
-    OwnedInvitationUpload,
-    SignedInvitationRevocation,
 } from "./types.js";

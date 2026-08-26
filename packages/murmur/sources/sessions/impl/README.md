@@ -1,8 +1,8 @@
 # Session implementation
 
-`sessionEngine.ts` coordinates durable state, relay delivery, and local
-KeyPackage retention. Ordinary admission packages are deleted after one
-Welcome; contact last-resort packages carry an explicit reusable marker and
-remain available for later offline group Welcomes until rotation or expiry.
-`sessionFrames.ts` owns strict bootstrap, PrivateMessage, and Commit envelopes.
-`sessionRecords.ts` owns current checkpoints, outboxes, and bounded buffers.
+The engine encodes authenticated bootstrap, Commit, proposal, role-control, and
+application frames. Session records contain MLS and application-routing state;
+active and staged epochs are stored separately.
+
+KeyPackage bundles are one-use by default. Explicit internal reusable bundles
+are reserved for account convergence across known sessions.

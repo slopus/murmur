@@ -1,13 +1,9 @@
-# Workspace packages
+# Packages
 
-```text
-packages/
-    murmur/         @slopus/murmur         published browser-safe library
-    murmur-relay/   @slopus/murmur-relay   private Node queue relay
-    murmur-site/    @slopus/murmur-site    private static landing page
-```
+- `murmur` — `@slopus/murmur`, the browser-safe published library for durable
+  MLS sessions, account synchronization, and authenticated delivery queues.
+- `murmur-relay` — private standalone and Cloudflare relay infrastructure.
+- `murmur-site` — private static product site.
 
-The core package owns identity, signed discovery, durable delivery processing,
-MLS, and the `MurmurClient` session façade. The relay owns authenticated
-pending identity queues plus a non-enumerable five-minute invitation cache. The
-site is an assets-only Cloudflare Worker with no runtime bindings or secrets.
+The library owns cryptographic and durable client state. The relay owns only
+bounded opaque pending delivery and acknowledgement state.

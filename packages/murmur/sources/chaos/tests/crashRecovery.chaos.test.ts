@@ -46,7 +46,6 @@ const QUARANTINE_PREFIX = "murmur/session-quarantine/";
 const PENDING_SESSION_PREFIX = "murmur/pending-sessions/";
 const CURSOR_KEY = "murmur/delivery/cursor";
 const IDENTITY_KEY = "murmur/identity/root";
-const INVITATION_ROOT_KEY = "murmur/invitations/revocation-root";
 
 type StoreCut = "S0" | "S1" | "S2" | "S3";
 type SyncOrder = readonly ["alice", "bob"] | readonly ["bob", "alice"];
@@ -360,7 +359,7 @@ async function createActivePair(fixture: ChaosFixture): Promise<{
     const bob = await createActor(fixture, "bob");
     const session = await alice.client.createSession({
         descriptor: utf8Encode("crash recovery"),
-        members: [await bob.client.discovery()],
+        members: [await bob.client.createKeyPackage()],
     });
     await synchronize(alice);
     await synchronize(bob);
@@ -383,7 +382,7 @@ async function createActiveTriple(fixture: ChaosFixture): Promise<{
     const carol = await createActor(fixture, "carol");
     const session = await alice.client.createSession({
         descriptor: utf8Encode("crash recovery triple"),
-        members: [await bob.client.discovery(), await carol.client.discovery()],
+        members: [await bob.client.createKeyPackage(), await carol.client.createKeyPackage()],
     });
     await synchronize(alice);
     await synchronize(bob);
@@ -609,8 +608,6 @@ describe("crash and transaction recovery chaos", () => {
                     schedule.consume();
 
                     const root = await delegate.get(IDENTITY_KEY);
-                    const revocation = await delegate.get(INVITATION_ROOT_KEY);
-                    expect(root === undefined).toBe(revocation === undefined);
                     expect(root !== undefined).toBe(cut === "S3");
 
                     let reopened = await MurmurClient.open({
@@ -954,7 +951,7 @@ describe("crash and transaction recovery chaos", () => {
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
                         const carol = await createActor(fixture, "carol");
-                        const discovery = await carol.client.discovery();
+                        const keyPackage = await carol.client.createKeyPackage();
                         const target = immediateStoreTarget(
                             alice,
                             "transaction.set",
@@ -962,7 +959,7 @@ describe("crash and transaction recovery chaos", () => {
                             SESSION_INTENT_PREFIX,
                         );
                         await executeStoreCut(alice, cut, target, () =>
-                            alice.client.addMember(session.id, discovery),
+                            alice.client.addMember(session.id, keyPackage),
                         );
                         await reopen(alice, fixture.clock);
                         const actors = new Map<ChaosActor["name"], ChaosActor>([
@@ -982,7 +979,7 @@ describe("crash and transaction recovery chaos", () => {
                         if (cut !== "S3") {
                             await alice.client.addMember(
                                 session.id,
-                                await carol.client.discovery(),
+                                await carol.client.createKeyPackage(),
                             );
                             await reopen(alice, fixture.clock);
                             await settleSession(actors, session.id, order);
@@ -1012,7 +1009,10 @@ describe("crash and transaction recovery chaos", () => {
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
                         const carol = await createActor(fixture, "carol");
-                        await alice.client.addMember(session.id, await carol.client.discovery());
+                        await alice.client.addMember(
+                            session.id,
+                            await carol.client.createKeyPackage(),
+                        );
                         const target = offsetStoreTarget(
                             alice,
                             3,
@@ -1062,7 +1062,10 @@ describe("crash and transaction recovery chaos", () => {
                         const { alice, bob, session } = await createActivePair(fixture);
                         const carol = await createActor(fixture, "carol");
                         const publicationOffset = alice.observer.publishAttempts.length;
-                        await alice.client.addMember(session.id, await carol.client.discovery());
+                        await alice.client.addMember(
+                            session.id,
+                            await carol.client.createKeyPackage(),
+                        );
                         const reached = alice.delay.block();
                         alice.transportSchedule.arm([
                             {
@@ -1124,7 +1127,7 @@ describe("crash and transaction recovery chaos", () => {
                 try {
                     const { alice, bob, session } = await createActivePair(fixture);
                     const carol = await createActor(fixture, "carol");
-                    await alice.client.addMember(session.id, await carol.client.discovery());
+                    await alice.client.addMember(session.id, await carol.client.createKeyPackage());
                     const reached = alice.delay.block();
                     alice.transportSchedule.arm([
                         {
@@ -1258,7 +1261,10 @@ describe("crash and transaction recovery chaos", () => {
 
                         await bob.client.removeMember(session.id, carol.client.identity);
                         await synchronize(bob);
-                        await alice.client.addMember(session.id, await carol.client.discovery());
+                        await alice.client.addMember(
+                            session.id,
+                            await carol.client.createKeyPackage(),
+                        );
                         const target = offsetStoreTarget(
                             alice,
                             5,
@@ -1288,7 +1294,10 @@ describe("crash and transaction recovery chaos", () => {
                         expect(await prefixSize(alice.delegate, SESSION_INTENT_PREFIX)).toBe(0);
                         expect(await carol.client.session(session.id)).toBeUndefined();
 
-                        await alice.client.addMember(session.id, await carol.client.discovery());
+                        await alice.client.addMember(
+                            session.id,
+                            await carol.client.createKeyPackage(),
+                        );
                         await settleSession(actors, session.id, ["alice", "bob", "carol"]);
                         expect((await alice.client.session(session.id))?.members).toHaveLength(3);
                         expect((await assertStoreShape(alice.delegate)).issues).toBe(1);

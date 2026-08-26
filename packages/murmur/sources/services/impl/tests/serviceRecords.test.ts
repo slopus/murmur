@@ -18,7 +18,7 @@ describe("service records", () => {
     it("round-trips every session owner variant canonically", () => {
         const records: readonly SessionOwnerRecord[] = [
             { version: 1, owner: "ignored" },
-            { version: 1, owner: "contact" },
+            { version: 1, owner: "account" },
             { version: 1, owner: "service", serviceId: "chat.v1" },
         ];
         for (const record of records) {
@@ -47,11 +47,11 @@ describe("service records", () => {
         expect(() => sessionOwnerKey(new Uint8Array(31))).toThrow("Invalid Murmur session ID");
         expect(() => sessionRoutingKey("not-a-uuid")).toThrow("Invalid Murmur routing event ID");
         expect(() =>
-            decodeSessionOwner(new TextEncoder().encode('{ "version":1,"owner":"contact"}')),
+            decodeSessionOwner(new TextEncoder().encode('{ "version":1,"owner":"account"}')),
         ).toThrow("must use canonical JSON");
         expect(() =>
             decodeSessionOwner(
-                new TextEncoder().encode('{"extra":true,"owner":"contact","version":1}'),
+                new TextEncoder().encode('{"extra":true,"owner":"account","version":1}'),
             ),
         ).toThrow("Invalid session owner");
         expect(() =>

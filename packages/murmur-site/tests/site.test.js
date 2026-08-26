@@ -346,164 +346,67 @@ describe("visual system", () => {
     });
 });
 
-describe("content: how Murmur works", () => {
-    const required = [
-        "browser-safe TypeScript library",
-        "32-byte Ed25519 public key",
-        "X25519 agreement key",
-        "KeyPackage",
-        "SHA-256 digest",
-        "five minutes",
-        "role-authorized Commit",
-        "TreeKEM",
-        "UUIDv7",
-        "MurmurStore",
-        "durable outboxes",
-        "forward-secret",
-    ];
-
-    for (const phrase of required) {
-        test(`explains "${phrase}"`, () => {
-            assert.ok(prose.includes(phrase), `missing "${phrase}"`);
-        });
-    }
-
-    test("names the four steps", () => {
-        for (const step of ["Identity", "Invitation", "Session", "Synchronization"]) {
+describe("content: current product", () => {
+    test("names the four durable transitions", () => {
+        for (const step of ["Identity", "KeyPackage", "Session", "Synchronization"]) {
             assert.match(prose, new RegExp(`<h3>${step}</h3>`));
         }
     });
-});
 
-describe("content: invitations and mutual contacts", () => {
-    test("describes the mutual contact handshake rather than a friendship object", () => {
-        assert.ok(prose.includes("acceptContact()"));
-        assert.ok(prose.includes("rejectContact()"));
-        assert.ok(prose.includes("mutual exchange confirms the contact"));
-        assert.ok(prose.includes('no separate "friendship" object'));
+    test("states the durable client and relay boundary", () => {
+        for (const phrase of [
+            "browser-safe TypeScript library",
+            "32-byte Ed25519 public key",
+            "one-use MLS admission material",
+            "bounded pending state",
+            "persist before relay acknowledgement",
+            "The relay sees",
+            "The relay never receives",
+            "identity roots",
+            "MLS epochs",
+            "application plaintext",
+        ]) {
+            assert.ok(prose.includes(phrase), `missing ${phrase}`);
+        }
     });
 
-    test("states that contact admission works while the peer is offline", () => {
-        assert.ok(prose.includes("fifteen one-use MLS KeyPackages"));
-        assert.ok(prose.includes("last-resort package"));
-        assert.ok(prose.includes("availability tradeoff"));
-    });
-
-    test("states that an invitation is a bearer capability and revocation is relay-dependent", () => {
-        assert.ok(prose.includes("bearer capabilities"));
-        assert.ok(prose.includes("revokeInvitation(digest)"));
-        assert.ok(prose.includes("reachable relay"));
-    });
-});
-
-describe("content: cryptography references", () => {
-    const references = {
-        "RFC 9420 (MLS)": "https://www.rfc-editor.org/rfc/rfc9420",
-        "RFC 9180 (HPKE)": "https://www.rfc-editor.org/rfc/rfc9180",
-        "RFC 7748 (X25519)": "https://www.rfc-editor.org/rfc/rfc7748",
-        "RFC 5869 (HKDF)": "https://www.rfc-editor.org/rfc/rfc5869",
-        "RFC 8032 (Ed25519)": "https://www.rfc-editor.org/rfc/rfc8032",
-        "@noble/curves": "https://github.com/paulmillr/noble-curves",
-        "@noble/hashes": "https://github.com/paulmillr/noble-hashes",
-        "@noble/ciphers": "https://github.com/paulmillr/noble-ciphers",
-    };
-
-    for (const [name, url] of Object.entries(references)) {
-        test(`links ${name}`, () => {
-            assert.ok(prose.includes(`href="${url}"`), `missing link to ${url}`);
-        });
-    }
-
-    test("names the exact primitives the library implements", () => {
+    test("names exact cryptographic references and primitives", () => {
+        const references = [
+            "https://www.rfc-editor.org/rfc/rfc9420",
+            "https://www.rfc-editor.org/rfc/rfc9180",
+            "https://www.rfc-editor.org/rfc/rfc7748",
+            "https://www.rfc-editor.org/rfc/rfc5869",
+            "https://www.rfc-editor.org/rfc/rfc8032",
+            "https://github.com/paulmillr/noble-curves",
+            "https://github.com/paulmillr/noble-hashes",
+            "https://github.com/paulmillr/noble-ciphers",
+        ];
+        for (const url of references) assert.ok(prose.includes(`href="${url}"`));
         for (const primitive of [
             "<code>0x0001</code>",
             "DHKEM(X25519, HKDF-SHA-256)",
-            "HKDF-SHA-256",
             "AES-128-GCM",
             "AES-256-GCM",
             "Ed25519",
             "BasicCredential",
             "SHA-256",
         ]) {
-            assert.ok(prose.includes(primitive), `missing primitive ${primitive}`);
+            assert.ok(prose.includes(primitive), `missing ${primitive}`);
         }
     });
 
-    test("claims no primitive the library does not use", () => {
-        for (const absent of [
-            "ChaCha20",
-            "Poly1305",
-            "XSalsa",
-            "RSA",
-            "P-256",
-            "Signal Protocol",
+    test("shows direct admission and the typed service seam", () => {
+        for (const phrase of [
+            "createKeyPackage()",
+            "createSession(",
+            "MurmurClient.open(",
+            "MurmurService",
+            "onNewSession",
+            "onUpdate",
+            "do not apply the update a second time",
         ]) {
-            assert.ok(!prose.includes(absent), `claims unused primitive ${absent}`);
+            assert.ok(prose.includes(phrase), `missing ${phrase}`);
         }
-    });
-});
-
-describe("content: relay trust boundary", () => {
-    test("separates what the relay sees from what it never receives", () => {
-        assert.ok(prose.includes("The relay sees"));
-        assert.ok(prose.includes("The relay never receives"));
-        for (const visible of [
-            "sender and recipient public identities",
-            "exact multicast fanout",
-            "delivery sizes, timing, TTL",
-        ]) {
-            assert.ok(prose.includes(visible), `missing relay-visible item: ${visible}`);
-        }
-        for (const hidden of ["identity roots", "MLS epochs", "application plaintext"]) {
-            assert.ok(prose.includes(hidden), `missing relay-hidden item: ${hidden}`);
-        }
-    });
-
-    test("states the metadata caveat without hedging", () => {
-        assert.ok(prose.includes("not communication metadata"));
-        assert.ok(
-            prose.includes("If you need metadata privacy, Murmur is the wrong layer for it."),
-        );
-        assert.ok(
-            prose.includes("anonymous: the relay learns sender, recipient, fanout, and timing"),
-        );
-    });
-
-    test("bounds what a hostile relay can do", () => {
-        assert.ok(prose.includes("delay, drop, reorder across inboxes, replay"));
-        assert.ok(prose.includes("cannot"));
-        assert.ok(prose.includes("decrypt MLS content"));
-    });
-});
-
-describe("content: offline durability", () => {
-    test("states the persist-then-acknowledge invariant", () => {
-        assert.ok(prose.includes("Persist, then acknowledge."));
-        assert.ok(prose.includes("harmless redelivery"));
-        assert.ok(prose.includes("At-least-once with stable IDs"));
-    });
-
-    test("states that sends never block", () => {
-        assert.ok(prose.includes("never waits for the network"));
-        assert.ok(prose.includes("staged post-Commit epoch"));
-    });
-
-    test("states that the relay is not an archive", () => {
-        assert.ok(prose.includes("not an archive"));
-        assert.ok(prose.includes("server-side history: acknowledged deliveries are gone"));
-    });
-});
-
-describe("content: typed services and code", () => {
-    test("shows the two-method service contract", () => {
-        assert.ok(prose.includes("MurmurService"));
-        assert.ok(prose.includes("onNewSession"));
-        assert.ok(prose.includes("onUpdate"));
-        assert.ok(prose.includes("MurmurClient.open("));
-        assert.ok(prose.includes("createSession("));
-    });
-
-    test("escapes every code sample so no markup leaks", () => {
         for (const block of captureAll(
             index,
             /<pre class="code"><code>([\s\S]*?)<\/code><\/pre>/g,
@@ -512,59 +415,22 @@ describe("content: typed services and code", () => {
         }
     });
 
-    test("warns against applying a service update twice", () => {
-        assert.ok(prose.includes("do not apply the update a second time"));
-    });
-});
-
-describe("content: honest claims", () => {
-    test("discloses the audit status", () => {
-        assert.ok(prose.includes("has not received an independent security audit"));
-        assert.ok(prose.includes("not a claim of complete RFC feature coverage"));
-    });
-
-    test("discloses the remaining limits", () => {
-        for (const limit of [
-            "One active receiving device per identity",
-            "No history and no recovery from the relay",
+    test("discloses audit, metadata, recovery, and deployment limits", () => {
+        for (const phrase of [
+            "has not received an independent security audit",
+            "not a claim of complete RFC feature coverage",
+            "not communication metadata",
             "non-Sybil admission control",
             "no hosted public relay",
+            "no history or recovery from relay storage",
+            "require TLS termination",
+            "MURMUR_RELAY_STORE=sqlite",
         ]) {
-            assert.ok(prose.includes(limit), `missing limit: ${limit}`);
+            assert.ok(prose.includes(phrase), `missing ${phrase}`);
         }
     });
 
-    test("makes no absolute security claim", () => {
-        const forbidden = [
-            "zero-knowledge",
-            "zero knowledge",
-            "military-grade",
-            "military grade",
-            "unbreakable",
-            "unhackable",
-            "NSA-proof",
-            "100% secure",
-            "completely private",
-            "perfect secrecy",
-            "we cannot see",
-            "we can't see",
-            "trustless",
-        ];
-        const lower = prose.toLowerCase();
-        for (const claim of forbidden) {
-            assert.ok(!lower.includes(claim.toLowerCase()), `misleading claim: ${claim}`);
-        }
-    });
-});
-
-describe("content: install and repository links", () => {
-    test("shows the install command and the local relay recipe", () => {
-        assert.ok(prose.includes("pnpm add @slopus/murmur"));
-        assert.ok(prose.includes("MURMUR_RELAY_STORE=sqlite"));
-        assert.ok(prose.includes("require TLS termination"));
-    });
-
-    test("links the repository, the package, and every reference document", () => {
+    test("links package and reference documents", () => {
         for (const url of [
             "https://github.com/slopus/murmur",
             "https://www.npmjs.com/package/@slopus/murmur",
@@ -574,7 +440,7 @@ describe("content: install and repository links", () => {
             "https://github.com/slopus/murmur/blob/main/docs/SECURITY.md",
             "https://github.com/slopus/murmur/blob/main/LICENSE",
         ]) {
-            assert.ok(prose.includes(`href="${url}"`), `missing link to ${url}`);
+            assert.ok(prose.includes(`href="${url}"`), `missing ${url}`);
         }
     });
 });

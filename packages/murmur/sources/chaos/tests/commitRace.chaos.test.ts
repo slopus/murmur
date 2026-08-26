@@ -392,7 +392,7 @@ async function activeFixture(
     const erin = await addActor(fixture, "erin");
     const session = await alice.client.createSession({
         descriptor: utf8Encode("commit race chaos"),
-        members: [await bob.client.discovery(), await carol.client.discovery()],
+        members: [await bob.client.createKeyPackage(), await carol.client.createKeyPackage()],
         adminsAssignAdmins: true,
         anyoneCanAddMembers: options.anyoneCanAddMembers ?? true,
     });
@@ -498,7 +498,7 @@ async function addAndActivate(
     inviter: RaceActor,
     invited: RaceActor,
 ): Promise<void> {
-    await inviter.client.addMember(fixture.session.id, await invited.client.discovery());
+    await inviter.client.addMember(fixture.session.id, await invited.client.createKeyPackage());
     await settle(fixture, fixture.session.id, ["alice", "bob", "carol", invited.name]);
     await activateIfPending(invited, fixture.session.id);
     await settle(fixture, fixture.session.id, ["alice", "bob", "carol", invited.name]);
@@ -632,11 +632,11 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.alice.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.erin.client.discovery(),
+                    await fixture.erin.client.createKeyPackage(),
                 );
                 const pending = await stageTwo(fixture, fixture.alice, fixture.bob);
                 const [winner] = await releaseTwo(fixture, fixture.bob, fixture.alice, [
@@ -680,11 +680,11 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.alice.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 const pending = await stageTwo(fixture, fixture.alice, fixture.bob);
                 await releaseTwo(fixture, fixture.alice, fixture.bob, pending);
@@ -717,7 +717,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await synchronize(fixture.alice);
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await settle(fixture, fixture.session.id, ["bob", "alice", "carol", "dave"]);
                 expect(
@@ -731,7 +731,7 @@ describe("Commit race and intent convergence chaos", () => {
 
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 await activateIfPending(fixture.dave, fixture.session.id);
@@ -793,7 +793,7 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.carol.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.alice.client.setPolicies(fixture.session.id, {
                     adminsAssignAdmins: true,
@@ -830,7 +830,7 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.alice.client.setPolicies(fixture.session.id, {
                     adminsAssignAdmins: true,
@@ -898,7 +898,7 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.alice.client.revokeAdmin(
                     fixture.session.id,
@@ -928,7 +928,7 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.alice.client.revokeAdmin(
                     fixture.session.id,
@@ -1126,7 +1126,7 @@ describe("Commit race and intent convergence chaos", () => {
                 });
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 const pending = await stageTwo(fixture, fixture.alice, fixture.bob);
                 const [winner, second] = await releaseTwo(
@@ -1161,7 +1161,7 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 fixture.gate.arm();
                 const losing = synchronize(fixture.bob);
@@ -1221,7 +1221,7 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.alice.client.setPolicies(fixture.session.id, {
                     adminsAssignAdmins: false,
@@ -1384,15 +1384,15 @@ describe("Commit race and intent convergence chaos", () => {
 
                 await fixture.alice.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.erin.client.discovery(),
+                    await fixture.erin.client.createKeyPackage(),
                 );
                 await fixture.carol.client.addMember(
                     fixture.session.id,
-                    await frank.client.discovery(),
+                    await frank.client.createKeyPackage(),
                 );
                 const candidates = [fixture.alice, fixture.bob, fixture.carol] as const;
                 const pending = await stageMany(fixture, candidates);
@@ -1472,15 +1472,15 @@ describe("Commit race and intent convergence chaos", () => {
                 });
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await frank.client.discovery(),
+                    await frank.client.createKeyPackage(),
                 );
                 await fixture.carol.client.addMember(
                     fixture.session.id,
-                    await fixture.erin.client.discovery(),
+                    await fixture.erin.client.createKeyPackage(),
                 );
                 await fixture.dave.client.addMember(
                     fixture.session.id,
-                    await frank.client.discovery(),
+                    await frank.client.createKeyPackage(),
                 );
                 const pending = await stageMany(fixture, current);
                 const accepted = await releaseMany(
@@ -1692,7 +1692,7 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
                 await fixture.bob.client.addMember(
                     fixture.session.id,
-                    await fixture.dave.client.discovery(),
+                    await fixture.dave.client.createKeyPackage(),
                 );
                 await fixture.alice.client.setPolicies(fixture.session.id, {
                     adminsAssignAdmins: false,

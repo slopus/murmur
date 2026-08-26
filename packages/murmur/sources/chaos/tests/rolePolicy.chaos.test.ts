@@ -160,9 +160,9 @@ async function createRoleFixture(policies: MurmurSessionPolicies): Promise<RoleF
             adminsAssignAdmins: policies.adminsAssignAdmins,
             anyoneCanAddMembers: policies.anyoneCanAddMembers,
             members: [
-                await bob.client.discovery(),
-                await carol.client.discovery(),
-                await dave.client.discovery(),
+                await bob.client.createKeyPackage(),
+                await carol.client.createKeyPackage(),
+                await dave.client.createKeyPackage(),
             ],
         });
         await synchronize([alice, bob, carol, dave], 2);
@@ -410,21 +410,21 @@ describe("role, policy, and private-roster session races", () => {
                             actor: fixture.alice,
                             allowed: true,
                             operation: async () =>
-                                a.addMember(id, await fixture.erin.client.discovery()),
+                                a.addMember(id, await fixture.erin.client.createKeyPackage()),
                         },
                         {
                             name: "admin adds",
                             actor: fixture.bob,
                             allowed: true,
                             operation: async () =>
-                                b.addMember(id, await fixture.erin.client.discovery()),
+                                b.addMember(id, await fixture.erin.client.createKeyPackage()),
                         },
                         {
                             name: "member add follows anyoneCanAddMembers",
                             actor: fixture.carol,
                             allowed: anyoneCanAddMembers,
                             operation: async () =>
-                                c.addMember(id, await fixture.erin.client.discovery()),
+                                c.addMember(id, await fixture.erin.client.createKeyPackage()),
                         },
                         {
                             name: "admin removes another member",
@@ -555,7 +555,7 @@ describe("role, policy, and private-roster session races", () => {
                     }));
                     await attacker.client.addMember(
                         fixture.sessionId,
-                        await fixture.erin.client.discovery(),
+                        await fixture.erin.client.createKeyPackage(),
                     );
                 } else if (attack === "admin-grant") {
                     await rewriteRoles(attacker, fixture.sessionId, (roles) => ({
@@ -740,7 +740,7 @@ describe("role, policy, and private-roster session races", () => {
                 fixture.carol.gate.blocked = winner === "policy";
                 await fixture.carol.client.addMember(
                     fixture.sessionId,
-                    await fixture.erin.client.discovery(),
+                    await fixture.erin.client.createKeyPackage(),
                 );
                 if (winner === "add") {
                     await synchronize([fixture.carol, fixture.alice, fixture.bob, fixture.dave], 3);
@@ -774,7 +774,7 @@ describe("role, policy, and private-roster session races", () => {
             crashed.carol.gate.blocked = true;
             await crashed.carol.client.addMember(
                 crashed.sessionId,
-                await crashed.erin.client.discovery(),
+                await crashed.erin.client.createKeyPackage(),
             );
             await crashed.carol.client.synchronize({ waitMilliseconds: 0 });
             await crashed.alice.client.setPolicies(crashed.sessionId, {

@@ -1,8 +1,6 @@
 import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
-    verifyInvitationRevocationSignature,
-    verifyInvitationUploadAuthorization,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
     verifyQueueAckSignature,
@@ -10,8 +8,6 @@ import {
     type SignedDelivery,
     type SignedQueueAck,
     type SignedQueueRead,
-    type InvitationUploadAuthorization,
-    type SignedInvitationRevocation,
 } from "../protocol/index.js";
 import type {
     AcknowledgeOutcome,
@@ -22,12 +18,8 @@ import type {
 } from "../storage/index.js";
 import { encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
-import { invitationOwner, validateInvitationTimes } from "./impl/invitationValidate.js";
 import { InProcessWakeSource } from "./impl/wakeInProcess.js";
 import type {
-    InvitationDownload,
-    InvitationRevocationOutcome,
-    InvitationUploadOutcome,
     QueueEventSubscription,
     QueueContinuityEvent,
     RelayOptions,
@@ -38,9 +30,6 @@ import type {
 export { InProcessWakeSource } from "./impl/wakeInProcess.js";
 export { PostgresWakeSource } from "./impl/wakePostgres.js";
 export type {
-    InvitationDownload,
-    InvitationRevocationOutcome,
-    InvitationUploadOutcome,
     QueueEventSubscription,
     QueueContinuityEvent,
     RelayOptions,
@@ -53,8 +42,6 @@ const HARD_MAXIMUM_LONG_POLL_MILLISECONDS = 30_000;
 /** Six-month relay delivery continuity window, defined as exactly 180 days. */
 export const DELIVERY_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 const HARD_MAXIMUM_DELIVERY_TTL_MILLISECONDS = DELIVERY_RETENTION_MILLISECONDS;
-const HARD_MAXIMUM_INVITATION_TTL_MILLISECONDS = 5 * 60 * 1_000;
-const HARD_MAXIMUM_INVITATION_BYTES = 64 * 1024;
 const HARD_MAXIMUM_RECIPIENTS = 1_024;
 const HARD_MAXIMUM_QUEUE_ITEMS = 25_000;
 const QUEUE_STREAM_HEARTBEAT_MILLISECONDS = 15_000;
@@ -74,34 +61,6 @@ function positiveInteger(value: number, name: string): number {
 
 function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
     const resolved: ResolvedRelayOptions = {
-        maximumInvitationBytes: positiveInteger(
-            options.maximumInvitationBytes ?? 16 * 1024,
-            "Maximum invitation bytes",
-        ),
-        maximumInvitationTtlMilliseconds: positiveInteger(
-            options.maximumInvitationTtlMilliseconds ?? HARD_MAXIMUM_INVITATION_TTL_MILLISECONDS,
-            "Maximum invitation TTL",
-        ),
-        maximumInvitationItemsPerAdmissionPrincipal: positiveInteger(
-            options.maximumInvitationItemsPerAdmissionPrincipal ?? 32,
-            "Maximum invitation items per admission principal",
-        ),
-        maximumInvitationBytesPerAdmissionPrincipal: positiveInteger(
-            options.maximumInvitationBytesPerAdmissionPrincipal ?? 512 * 1024,
-            "Maximum invitation bytes per admission principal",
-        ),
-        maximumGlobalInvitationItems: positiveInteger(
-            options.maximumGlobalInvitationItems ?? 10_000,
-            "Maximum global invitation items",
-        ),
-        maximumGlobalInvitationBytes: positiveInteger(
-            options.maximumGlobalInvitationBytes ?? 64 * MEBIBYTE,
-            "Maximum global invitation bytes",
-        ),
-        maximumInvitationItemsPerRevocationKey: positiveInteger(
-            options.maximumInvitationItemsPerRevocationKey ?? 32,
-            "Maximum invitation items per revocation key",
-        ),
         maximumCiphertextBytes: positiveInteger(
             options.maximumCiphertextBytes ?? MEBIBYTE,
             "Maximum ciphertext bytes",
@@ -175,22 +134,6 @@ function resolveOptions(options: RelayOptions): ResolvedRelayOptions {
     if (resolved.maximumLongPollMilliseconds > HARD_MAXIMUM_LONG_POLL_MILLISECONDS) {
         throw new Error("Maximum long poll cannot exceed 30 seconds");
     }
-    if (resolved.maximumInvitationTtlMilliseconds > HARD_MAXIMUM_INVITATION_TTL_MILLISECONDS) {
-        throw new Error("Maximum invitation TTL cannot exceed five minutes");
-    }
-    if (resolved.maximumInvitationBytes > HARD_MAXIMUM_INVITATION_BYTES) {
-        throw new Error("Maximum invitation size cannot exceed 64 KiB");
-    }
-    if (
-        resolved.maximumInvitationBytes > resolved.maximumInvitationBytesPerAdmissionPrincipal ||
-        resolved.maximumInvitationBytes > resolved.maximumGlobalInvitationBytes ||
-        resolved.maximumInvitationItemsPerAdmissionPrincipal >
-            resolved.maximumGlobalInvitationItems ||
-        resolved.maximumInvitationItemsPerRevocationKey > resolved.maximumGlobalInvitationItems ||
-        resolved.maximumInvitationBytesPerAdmissionPrincipal > resolved.maximumGlobalInvitationBytes
-    ) {
-        throw new Error("Invitation cache limits are inconsistent");
-    }
     if (resolved.maximumDeliveryTtlMilliseconds > HARD_MAXIMUM_DELIVERY_TTL_MILLISECONDS) {
         throw new Error("Maximum delivery TTL cannot exceed 180 days");
     }
@@ -244,136 +187,6 @@ export class RelayService {
     /** Resolved immutable limits used by the HTTP boundary. */
     get options(): ResolvedRelayOptions {
         return this.#options;
-    }
-
-    /** Cache one opaque signed bundle under the SHA-256 digest of its exact bytes. */
-    async storeInvitation(
-        bundle: Uint8Array,
-        admissionPrincipal: string,
-    ): Promise<InvitationUploadOutcome> {
-        return this.#storeInvitation(bundle, admissionPrincipal);
-    }
-
-    /** Cache one invitation after verifying its owner's separate revocation authority. */
-    async storeOwnedInvitation(
-        bundle: Uint8Array,
-        authorization: InvitationUploadAuthorization,
-        admissionPrincipal: string,
-    ): Promise<InvitationUploadOutcome> {
-        return this.#storeInvitation(bundle, admissionPrincipal, authorization);
-    }
-
-    async #storeInvitation(
-        bundle: Uint8Array,
-        admissionPrincipal: string,
-        authorization?: InvitationUploadAuthorization,
-    ): Promise<InvitationUploadOutcome> {
-        this.#assertOpen();
-        if (!(bundle instanceof Uint8Array) || bundle.length < 1) {
-            throw new RelayError(400, "Invalid invitation bundle", { error: "malformed" });
-        }
-        if (bundle.length > this.#options.maximumInvitationBytes) {
-            throw new RelayError(413, "Invitation bundle exceeds relay limit", {
-                error: "limit",
-            });
-        }
-        const now = this.#now();
-        let expiresAt: number;
-        try {
-            expiresAt = validateInvitationTimes(
-                bundle,
-                now,
-                this.#options.maximumInvitationTtlMilliseconds,
-                this.#options.maximumAuthenticationSkewMilliseconds,
-            ).expiresAt;
-        } catch {
-            throw new RelayError(400, "Invalid invitation bundle time policy", {
-                error: "malformed",
-            });
-        }
-        const digest = sha256(bundle);
-        let revocationKey: Uint8Array | undefined;
-        if (authorization !== undefined) {
-            let owner: Uint8Array;
-            try {
-                owner = invitationOwner(bundle);
-            } catch {
-                throw new RelayError(400, "Invalid invitation owner", { error: "malformed" });
-            }
-            try {
-                if (
-                    !equalBytes(owner, authorization.owner) ||
-                    !equalBytes(digest, authorization.digest) ||
-                    authorization.expiresAt !== expiresAt ||
-                    authorization.createdAt >
-                        now + this.#options.maximumAuthenticationSkewMilliseconds ||
-                    authorization.createdAt <
-                        now - this.#options.maximumAuthenticationSkewMilliseconds ||
-                    !verifyInvitationUploadAuthorization(authorization)
-                ) {
-                    throw new RelayError(401, "Invalid invitation owner authorization", {
-                        error: "unauthorized",
-                    });
-                }
-                revocationKey = authorization.revocationKey;
-            } finally {
-                owner.fill(0);
-            }
-        }
-        const outcome = await this.#store.storeInvitation(
-            digest,
-            bundle,
-            expiresAt,
-            now,
-            {
-                maximumPrincipalItems: this.#options.maximumInvitationItemsPerAdmissionPrincipal,
-                maximumPrincipalBytes: this.#options.maximumInvitationBytesPerAdmissionPrincipal,
-                maximumGlobalItems: this.#options.maximumGlobalInvitationItems,
-                maximumGlobalBytes: this.#options.maximumGlobalInvitationBytes,
-                maximumRevocationKeyItems: this.#options.maximumInvitationItemsPerRevocationKey,
-            },
-            this.#digestAdmissionPrincipal(admissionPrincipal),
-            revocationKey,
-        );
-        return { digest, expiresAt: outcome.expiresAt, duplicate: outcome.duplicate };
-    }
-
-    /** Authenticate and atomically revoke one or all live invitations for one authority. */
-    async revokeInvitations(
-        request: SignedInvitationRevocation,
-    ): Promise<InvitationRevocationOutcome> {
-        this.#assertOpen();
-        const now = this.#now();
-        if (
-            request.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
-            request.createdAt < now - this.#options.maximumAuthenticationSkewMilliseconds ||
-            !verifyInvitationRevocationSignature(request)
-        ) {
-            throw new RelayError(401, "Invalid invitation revocation authorization", {
-                error: "unauthorized",
-            });
-        }
-        return this.#store.revokeInvitations(
-            request.revocationKey,
-            request.digest,
-            now,
-            this.#options.maximumInvitationItemsPerRevocationKey,
-        );
-    }
-
-    /** Fetch one unexpired opaque bundle by its exact SHA-256 digest. */
-    async readInvitation(digest: Uint8Array): Promise<InvitationDownload> {
-        this.#assertOpen();
-        if (!(digest instanceof Uint8Array) || digest.length !== 32) {
-            throw new RelayError(400, "Invalid invitation digest", { error: "malformed" });
-        }
-        const invitation = await this.#store.readInvitation(digest, this.#now());
-        if (invitation === undefined) {
-            throw new RelayError(404, "Invitation was not found or has expired", {
-                error: "invitation_not_found",
-            });
-        }
-        return invitation;
     }
 
     /** Validate and atomically multicast one signed encrypted delivery. */

@@ -17,7 +17,6 @@ import {
     parseDeviceRoster,
     revokeDeviceFromRoster,
     resetDeviceInRoster,
-    prepareAccountEvents,
     selectDeviceRosterChild,
     serializeDeviceRoster,
     verifyDeviceRoster,
@@ -140,10 +139,6 @@ describe("account device rosters", () => {
             });
             const jobs = await accountConvergenceJobs(store);
             expect(jobs.map((job) => job.change)).toEqual(["reset_add"]);
-            expect((await prepareAccountEvents(store)).contacts).toMatchObject([
-                { change: "added" },
-                { change: "reset" },
-            ]);
         } finally {
             destroyIdentity(account);
             destroyIdentity(device);

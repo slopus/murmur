@@ -27,6 +27,7 @@ import {
 } from "../../crypto/index.js";
 import {
     HttpDeliveryTransport,
+    type DeliveryFetch,
     type DeliveryPublishOutcome,
     type DeliveryStreamHooks,
     type DeliveryTransport,
@@ -35,7 +36,6 @@ import {
     type SignedInboxAck,
     type SignedInboxRead,
 } from "../../delivery/index.js";
-import { HttpDiscoveryTransport, type DiscoveryFetch } from "../../identity/discovery/index.js";
 import { MurmurClient, type MurmurSession, type MurmurUpdate } from "../../sessions/index.js";
 import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
 import {
@@ -60,7 +60,7 @@ const PROVISIONING_TTL = 5 * 60 * 1_000;
 const MAXIMUM_KEY_PACKAGE_BYTES = 1024 * 1024;
 const CHAT_DESCRIPTOR = utf8Encode('{"protocol":"chaos.multidevice","version":1}');
 
-function relayFetch(relay: RelayService): DiscoveryFetch {
+function relayFetch(relay: RelayService): DeliveryFetch {
     const handler = createRelayFetchHandler(relay, {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "multidevice-chaos",
@@ -117,7 +117,7 @@ class RecordingTransport implements DeliveryTransport {
 
 interface RealNetwork {
     readonly relay: RelayService;
-    readonly fetch: DiscoveryFetch;
+    readonly fetch: DeliveryFetch;
     readonly clock: ManualVirtualClock;
 }
 
@@ -202,9 +202,6 @@ async function openNode(
     });
     const client = await MurmurClient.open({
         transport,
-        discoveryTransport: new HttpDiscoveryTransport("https://relay.test", {
-            fetch: network.fetch,
-        }),
         store,
         now: () => network.clock.now(),
     });
@@ -781,17 +778,17 @@ describe("multi-device and provisioning chaos", () => {
             try {
                 const chat = await a1.client.createSession({
                     descriptor: CHAT_DESCRIPTOR,
-                    members: [await b1.client.discovery()],
+                    members: [await b1.client.createKeyPackage()],
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: true,
                 });
                 await settleNodes([a1, b1], 12);
 
                 const a2Request = await a2.client.linkDevice();
-                const carolDiscovery = await c1.client.discovery();
+                const carolKeyPackage = await c1.client.createKeyPackage();
                 const [a2Envelope] = await Promise.all([
                     a1.client.authorizeDevice(a2Request),
-                    b1.client.addMember(chat.id, carolDiscovery),
+                    b1.client.addMember(chat.id, carolKeyPackage),
                 ]);
                 await a2.client.completeDeviceLink(a2Envelope);
                 await pumpAll([a1, a2, b1, c1], 12);

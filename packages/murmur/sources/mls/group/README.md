@@ -22,3 +22,5 @@ creator KeyPackage + random group ID + epoch secret
 
 There is no separate two-person construction path; every larger group grows
 from the same one-member primitive.
+
+Bootstrap confirmation metadata is carried by the retained initial Commit.

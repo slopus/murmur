@@ -35,12 +35,6 @@ import {
     type SignedInboxRead,
 } from "../../delivery/index.js";
 import {
-    DISCOVERY_INVITATION_TTL_MILLISECONDS,
-    createDiscoveryBundle,
-    serializeDiscoveryBundle,
-} from "../../identity/discovery/index.js";
-import { createMlsKeyPackage, destroyMlsKeyPackageBundle } from "../../mls/index.js";
-import {
     MurmurClient,
     MurmurResetRequiredError,
     type MurmurResetEvent,
@@ -1131,7 +1125,7 @@ describe("network and delivery contract chaos", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("negotiated commit reconnect"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await expect(alice.synchronize({ waitMilliseconds: 0 })).rejects.toThrow(
                 "negotiated reconnect",
@@ -1211,7 +1205,7 @@ describe("network and delivery contract chaos", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("Welcome reconnect"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
@@ -1278,7 +1272,7 @@ describe("network and delivery contract chaos", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("admission completion reconnect"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
                 anyoneCanAddMembers: true,
             });
             await alice.synchronize({ waitMilliseconds: 0 });
@@ -1306,7 +1300,7 @@ describe("network and delivery contract chaos", () => {
                 classifyDelivery: (delivery) => delivery.ciphertext[0],
             });
             alice = await murmurClient(aliceIdentity, fault, aliceStore, fixture.clock.now);
-            await alice.addMember(session.id, await carol.discovery());
+            await alice.addMember(session.id, await carol.createKeyPackage());
             expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
                 transientPublicationFailures: 0,
@@ -1323,7 +1317,7 @@ describe("network and delivery contract chaos", () => {
             await bob.synchronize({ waitMilliseconds: 0 });
             expect((await bob.session(session.id))?.members).toHaveLength(3);
 
-            await bob.addMember(session.id, await dave.discovery());
+            await bob.addMember(session.id, await dave.createKeyPackage());
             expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
                 published: 0,
                 pendingOutboxes: 3,
@@ -1466,7 +1460,7 @@ describe("network and delivery contract chaos", () => {
         try {
             const session = await alice.createSession({
                 descriptor: utf8Encode("six-month continuity"),
-                members: [await bob.discovery()],
+                members: [await bob.createKeyPackage()],
             });
             await alice.synchronize({ waitMilliseconds: 0 });
             await bob.synchronize({ waitMilliseconds: 0 });
@@ -1539,40 +1533,7 @@ describe("network and delivery contract chaos", () => {
         }
     }, 60_000);
 
-    test("NET-19 five-minute invitation and 180-day hard delivery bounds are exact", async () => {
-        const invitationFixture = networkFixture({
-            maximumInvitationTtlMilliseconds: DISCOVERY_INVITATION_TTL_MILLISECONDS,
-        });
-        const owner = generateIdentityKeyPair();
-        const keyPackage = createMlsKeyPackage(owner, Math.floor(NOW / 1_000), 24 * 60 * 60);
-        try {
-            const exactBundle = serializeDiscoveryBundle(
-                createDiscoveryBundle(owner, [keyPackage.keyPackage], {
-                    createdAt: NOW,
-                    expiresAt: NOW + DISCOVERY_INVITATION_TTL_MILLISECONDS,
-                }),
-            );
-            const upload = await invitationFixture.relay.storeInvitation(
-                exactBundle,
-                "network-delivery-chaos",
-            );
-            invitationFixture.clock.set(upload.expiresAt - 1);
-            await expect(
-                invitationFixture.relay.readInvitation(upload.digest),
-            ).resolves.toMatchObject({
-                expiresAt: upload.expiresAt,
-            });
-            invitationFixture.clock.set(upload.expiresAt);
-            await expect(
-                invitationFixture.relay.readInvitation(upload.digest),
-            ).rejects.toMatchObject({
-                status: 404,
-            });
-        } finally {
-            destroyMlsKeyPackageBundle(keyPackage);
-            await invitationFixture.relay.close();
-        }
-
+    test("NET-19 the 180-day hard delivery bound is exact", async () => {
         const hardFixture = networkFixture({ maximumDeliveryTtlMilliseconds: SIX_MONTHS });
         const alice = generateIdentityKeyPair();
         const bob = generateIdentityKeyPair();

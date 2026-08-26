@@ -45,7 +45,6 @@ export {
     type AccountSyncPacket,
 } from "./impl/accountSyncCodec.js";
 export type {
-    MurmurContactRosterChanged,
     MurmurDeviceCredential,
     MurmurDeviceLinkMaterial,
     MurmurDeviceLinkRequest,

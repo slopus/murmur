@@ -1,17 +1,9 @@
-# MLS internals
+# MLS
 
-This directory contains Murmur's browser-safe RFC 9420 subset. It is compiled
-as part of `@slopus/murmur` and is not a package export.
+Browser-safe MLS protocol machinery using Noble primitives. Modules cover the
+cipher suite, KeyPackages, ratchet trees, group context, key schedule, Welcome,
+Commit, UpdatePath, secret tree, private messages, and epoch state.
 
-```text
-Murmur facade
-    |
-    +-- epoch + Secret Tree
-    +-- Commit + UpdatePath
-    +-- KeyPackage + Welcome
-    `-- cipher-suite and wire codecs
-```
-
-The facade owns persistence, relay ordering, outboxes, invitations, replay,
-and crash recovery. These modules only implement cryptographic state
-transitions and strict bounded codecs.
+The MLS layer operates on explicit byte arrays and typed state. The session
+facade owns persistence, queue ordering, outboxes, replay, pending activation,
+roles, and application effects.
