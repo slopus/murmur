@@ -37,12 +37,15 @@ are resolved by relay arbitration: each atomic multicast carries one UUIDv7
 event ID shared by every recipient inbox, every inbox delivers in event-ID
 order, and therefore the first valid Commit for an epoch wins identically at
 every member. Publish success only stages a Commit; every member, including its
-sender, adopts a Commit from its own relay echo. A member whose staged Commit
-loses discards the staged epoch, re-encrypts any dependent staged-epoch
-application sends against the winning epoch, and retries the underlying durable
-membership intent, including a fresh Welcome for an affected joiner. A joiner
-whose pending session came from a losing Commit accepts a replacement bootstrap
-for the same session while it is still pending. Members retain a bounded
+sender, adopts a Commit from its own relay echo. A Welcome is published only
+after its Commit has been adopted from that echo, so a joiner is only ever
+bootstrapped into the one adopted epoch: there is no stale, winning, or losing
+Welcome, no replacement bootstrap, and a Commit that does not get adopted never
+produces a Welcome at all. A member whose staged Commit loses discards the
+staged epoch, re-encrypts any dependent staged-epoch application sends against
+the winning epoch, and retries the underlying durable membership intent; the
+retried Commit publishes its Welcome only once it is adopted in turn. Members
+retain a bounded
 prior-epoch window so application messages racing a Commit remain decryptable.
 Commit authorization is role-based and validated by every member; roles and the
 asynchronous membership-intent flow are dictated by
@@ -56,10 +59,12 @@ pending local activation, or a staged membership Commit as permission to send.
 Every send encrypts and persists immediately against durable local state. If a
 Commit is staged, the send uses and advances the staged post-Commit epoch
 without adopting it, and its outbox records the Commit dependency. Murmur
-publishes older current-epoch work first, then every required Welcome and the
-Commit, then the staged-epoch application work. A restart preserves both
-ratchets and this dependency order. The other members may remain offline
-through the entire operation.
+publishes older current-epoch work first, then the Commit; after adopting that
+Commit from its own relay echo it publishes every required Welcome, then the
+staged-epoch application work. A restart preserves both ratchets and this
+dependency order. The other members may remain offline through the entire
+operation; only the relay echo of the sender's own Commit gates the Welcome,
+never peer presence.
 
 Murmur owns synchronization, outbox retry, replay protection, Commit
 resolution, current epochs and ratchets, Welcome processing, and session
@@ -146,12 +151,14 @@ new Welcomes as fresh device state.
   against the session's roles by every member, and shared per-multicast UUIDv7
   event IDs make relay delivery order resolve concurrent Commits for one epoch
   identically everywhere. A losing staged Commit is cancelled and retried from
-  its durable membership intent without losing staged application sends.
+  its durable membership intent without losing staged application sends, and a
+  Welcome publishes only for a Commit its sender has adopted from the relay
+  echo, so no joiner is ever bootstrapped from a Commit that was not adopted.
 - No session lifecycle or synchronization state blocks an application send.
   Sends during creation, pending local activation, or a staged membership
-  change encrypt and persist immediately; staged-epoch sends publish after
-  their Welcome and Commit prerequisites without waiting for peer presence or
-  the sender's own Commit echo.
+  change encrypt and persist immediately; staged-epoch work publishes after
+  the Commit is adopted from the sender's own relay echo and every required
+  Welcome is published, without waiting for peer presence.
 - Successful protocol state and any buffered application update are durable
   before queue acknowledgement.
 - A valid bootstrap becomes durable pending local state before acknowledgement,
