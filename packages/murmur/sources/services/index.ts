@@ -28,7 +28,9 @@ export function validateMurmurServiceRegistration(registration: MurmurServiceReg
         registration.service === null ||
         typeof registration.service !== "object" ||
         typeof registration.service.onNewSession !== "function" ||
-        typeof registration.service.onUpdate !== "function"
+        typeof registration.service.onUpdate !== "function" ||
+        (registration.service.onSessionDeleted !== undefined &&
+            typeof registration.service.onSessionDeleted !== "function")
     ) {
         throw new Error("Invalid Murmur service registration");
     }
@@ -52,6 +54,7 @@ export function createMurmurServiceSessionDescriptor(
         session.admins.some((admin) => !(admin instanceof Uint8Array) || admin.length !== 32) ||
         typeof session.policies?.adminsAssignAdmins !== "boolean" ||
         typeof session.policies.anyoneCanAddMembers !== "boolean" ||
+        (session.policies.sendPolicy !== "everyone" && session.policies.sendPolicy !== "admins") ||
         !Array.isArray(session.members) ||
         session.members.length < 1 ||
         session.members.length > 256 ||

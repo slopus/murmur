@@ -5,6 +5,7 @@ import {
     MURMUR_INTERNAL_INBOX_HANDLER,
     TerminalInboxDeliveryError,
     createSignedDelivery,
+    encodeSessionDeletionRequest,
     type DeliveryTransport,
     type DeliveryAccountTarget,
     type DeliveryDeviceRoster,
@@ -75,6 +76,7 @@ import type {
     MurmurSessionLimits,
     MurmurSessionListOptions,
     MurmurSessionPage,
+    MurmurSessionDeletedEvent,
     MurmurSynchronizeOptions,
     MurmurSynchronizeResult,
     MurmurUpdate,
@@ -100,10 +102,14 @@ import {
     decodeBufferedEvent,
     decodeOutboxRecord,
     decodeSessionIntent,
+    decodeSessionDeletedEvent,
+    decodeSessionDeletionOutbox,
     decodeSessionRecord,
     encodeBufferedEvent,
     encodeOutboxRecord,
     encodeSessionIntent,
+    encodeSessionDeletedEvent,
+    encodeSessionDeletionOutbox,
     encodeSessionRecord,
     type SessionOutboxRecord,
     type SessionIntentRecord,
@@ -128,6 +134,8 @@ const ADMISSION_BARRIER_PREFIX = "murmur/admission-barriers/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
 const POST_COMMIT_OUTBOX_INDEX_PREFIX = "murmur/post-commit-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
+const SESSION_DELETION_OUTBOX_PREFIX = "murmur/session-deletion-outboxes/";
+const SESSION_DELETED_EVENT_PREFIX = "murmur/session-deleted-events/";
 const RESET_READMISSION_PREFIX = "murmur/reset/v1/re-admissions/";
 const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
 const ACCOUNT_CONVERGENCE_COMPLETION_PREFIX = "murmur/accounts/v1/convergence-complete/";
@@ -156,7 +164,12 @@ export interface PreparedUpdates {
     readonly keys: readonly string[];
     readonly routes: readonly PreparedSessionRoute[];
     readonly updates: readonly PreparedRoutedUpdate[];
+    readonly deletions: readonly PreparedSessionDeletion[];
     readonly exhausted: boolean;
+}
+
+export interface PreparedSessionDeletion extends MurmurSessionDeletedEvent {
+    readonly key: string;
 }
 
 /** One incoming session whose descriptor still needs an owner decision. */
@@ -207,6 +220,14 @@ function bufferPrefix(id: Uint8Array): string {
 
 function applicationUpdateKey(eventId: string): string {
     return `${APPLICATION_UPDATE_PREFIX}${eventId}`;
+}
+
+function sessionDeletionOutboxKey(deliveryId: string): string {
+    return `${SESSION_DELETION_OUTBOX_PREFIX}${deliveryId}`;
+}
+
+function sessionDeletedEventKey(deliveryId: string): string {
+    return `${SESSION_DELETED_EVENT_PREFIX}${deliveryId}`;
 }
 
 function intentKey(intentId: string): string {
@@ -487,6 +508,7 @@ function publicSession(record: SessionRecord, epoch: MlsEpochState): MurmurSessi
         policies: {
             adminsAssignAdmins: roles.adminsAssignAdmins,
             anyoneCanAddMembers: roles.anyoneCanAddMembers,
+            sendPolicy: roles.sendPolicy,
         },
         bufferedEvents: record.bufferedEvents,
         ...(record.reAdmission === true ? { reAdmission: true } : {}),
@@ -522,6 +544,7 @@ interface CorruptOutboxRecovery {
 /** Internal stateful MLS/session coordinator. */
 export class SessionEngine {
     readonly #identity: IdentityKeyPair;
+    readonly #accountIdentity: IdentityKeyPair;
     readonly #store: MurmurStore;
     readonly #transport: DeliveryTransport;
     readonly #inbox: InboxProcessor;
@@ -537,13 +560,20 @@ export class SessionEngine {
         limits: MurmurSessionLimits = {},
         now: () => number = Date.now,
         credentialIdentity: Uint8Array = identity.publicKey,
+        accountIdentity: IdentityKeyPair = identity,
     ) {
         this.#identity = identity;
+        this.#accountIdentity = accountIdentity;
         this.#store = store;
         this.#transport = transport;
         this.#now = now;
         this.#credentialIdentity = credentialIdentity.slice();
-        if (credentialIdentity.length !== 32) throw new Error("Invalid account credential");
+        if (
+            credentialIdentity.length !== 32 ||
+            !equalBytes(credentialIdentity, accountIdentity.publicKey)
+        ) {
+            throw new Error("Invalid account credential");
+        }
         this.#accountKey = credentialIdentity.slice();
         this.#limits = {
             maximumPendingSessions: limits.maximumPendingSessions ?? DEFAULT_MAXIMUM_PENDING,
@@ -872,7 +902,7 @@ export class SessionEngine {
     async create(
         options: Pick<
             CreateMurmurSessionOptions,
-            "descriptor" | "adminsAssignAdmins" | "anyoneCanAddMembers"
+            "descriptor" | "adminsAssignAdmins" | "anyoneCanAddMembers" | "sendPolicy"
         > & {
             readonly members: readonly SessionMemberMaterial[];
         },
@@ -917,6 +947,7 @@ export class SessionEngine {
             admins: [],
             adminsAssignAdmins: options.adminsAssignAdmins ?? false,
             anyoneCanAddMembers: options.anyoneCanAddMembers ?? false,
+            sendPolicy: options.sendPolicy ?? "everyone",
         });
         let checkpoint: Uint8Array | undefined;
         try {
@@ -1099,6 +1130,93 @@ export class SessionEngine {
         });
     }
 
+    /** Durably emit a final MLS notice and terminally destroy an owner-held session. */
+    async delete(id: Uint8Array): Promise<string> {
+        return this.#store.transaction(async (transaction) => {
+            const stateBytes = await transaction.get(stateKey(id));
+            if (stateBytes === undefined) throw new Error("Unknown active session");
+            const record = decodeSessionRecord(stateBytes);
+            let outboxBytes: Uint8Array | undefined;
+            let requestBody: Uint8Array | undefined;
+            try {
+                if (!equalBytes(record.roles.owner, this.#accountKey)) {
+                    throw new Error("Only the session owner may delete the session");
+                }
+                if (this.#transport.deleteSession === undefined) {
+                    throw new Error("Delivery transport does not support session deletion");
+                }
+                if (
+                    record.status !== "active" ||
+                    record.stagedCommitId !== undefined ||
+                    (await this.#readyBootstrapParentForSession(transaction, id)) !== undefined
+                ) {
+                    throw new Error("Session deletion requires an idle active session");
+                }
+                const owner = await this.#sessionOwner(transaction, id);
+                const noticeId = await this.#queuePrivate(
+                    id,
+                    { version: 1, type: "delete" },
+                    "application",
+                    transaction,
+                );
+                outboxBytes = await transaction.get(outboxKey(noticeId));
+                if (outboxBytes === undefined) throw new Error("Missing session deletion notice");
+                const outbox = decodeOutboxRecord(outboxBytes);
+                try {
+                    if (
+                        outbox.kind !== "application" ||
+                        outbox.parentCommitId !== undefined ||
+                        !equalBytes(outbox.sessionId, id)
+                    ) {
+                        throw new Error("Invalid session deletion notice");
+                    }
+                    requestBody = encodeSessionDeletionRequest(id);
+                    const now = this.#now();
+                    const request = createSignedDelivery(this.#accountIdentity, [], requestBody, {
+                        createdAt: now,
+                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                    });
+                    await setAndZero(
+                        transaction,
+                        sessionDeletionOutboxKey(noticeId),
+                        encodeSessionDeletionOutbox({
+                            version: 1,
+                            sessionId: id,
+                            request,
+                            notice: outbox.delivery,
+                        }),
+                    );
+                    if (owner?.owner === "service") {
+                        await setAndZero(
+                            transaction,
+                            sessionDeletedEventKey(noticeId),
+                            encodeSessionDeletedEvent({
+                                version: 1,
+                                id: noticeId,
+                                sessionId: id,
+                                owner: record.roles.owner,
+                                serviceId: owner.serviceId,
+                            }),
+                        );
+                    }
+                    await transaction.delete(outboxKey(noticeId));
+                    await transaction.delete(outboxOrderKey(outbox.order, noticeId));
+                    await transaction.delete(epochOutboxIndexKey(id, noticeId));
+                    await this.#deleteSession(transaction, id);
+                    return noticeId;
+                } finally {
+                    if (outbox.applicationData !== undefined) zeroBytes(outbox.applicationData);
+                    if (outbox.stagedEpoch !== undefined) zeroBytes(outbox.stagedEpoch);
+                }
+            } finally {
+                this.#zeroSessionRecord(record);
+                zeroBytes(stateBytes);
+                if (outboxBytes !== undefined) zeroBytes(outboxBytes);
+                if (requestBody !== undefined) zeroBytes(requestBody);
+            }
+        });
+    }
+
     async prepareUpdates(): Promise<PreparedUpdates> {
         return this.#store.transaction(async (transaction) => {
             type Candidate =
@@ -1154,11 +1272,15 @@ export class SessionEngine {
             } finally {
                 for (const bytes of updatePage.values()) zeroBytes(bytes);
             }
+            const deletionPage = await transaction.scan(SESSION_DELETED_EVENT_PREFIX, {
+                limit: MAXIMUM_UPDATE_BATCH_EVENTS + 1,
+            });
             candidates.sort((left, right) => left.eventId.localeCompare(right.eventId));
             const selected = candidates.slice(0, MAXIMUM_UPDATE_BATCH_EVENTS);
             const keys: string[] = [];
             const routes: PreparedSessionRoute[] = [];
             const updates: PreparedRoutedUpdate[] = [];
+            const deletions: PreparedSessionDeletion[] = [];
             try {
                 for (const candidate of selected) {
                     if (candidate.type === "route") {
@@ -1211,19 +1333,39 @@ export class SessionEngine {
                         owner: await this.#sessionOwner(transaction, candidate.sessionId),
                     });
                 }
+                for (const [key, bytes] of [...deletionPage].slice(
+                    0,
+                    MAXIMUM_UPDATE_BATCH_EVENTS,
+                )) {
+                    const event = decodeSessionDeletedEvent(bytes);
+                    if (event.serviceId === undefined) {
+                        await transaction.delete(key);
+                        continue;
+                    }
+                    deletions.push({
+                        key,
+                        id: event.id,
+                        sessionId: event.sessionId,
+                        owner: event.owner,
+                        service: event.serviceId,
+                    });
+                }
                 return {
                     keys,
                     routes,
                     updates,
+                    deletions,
                     exhausted:
                         candidates.length <= MAXIMUM_UPDATE_BATCH_EVENTS &&
                         routePage.size <= MAXIMUM_UPDATE_BATCH_EVENTS &&
-                        updatePage.size <= MAXIMUM_UPDATE_BATCH_EVENTS,
+                        updatePage.size <= MAXIMUM_UPDATE_BATCH_EVENTS &&
+                        deletionPage.size <= MAXIMUM_UPDATE_BATCH_EVENTS,
                 };
             } finally {
                 for (const candidate of candidates) {
                     if (candidate.type === "update") zeroBytes(candidate.sessionId);
                 }
+                for (const bytes of deletionPage.values()) zeroBytes(bytes);
             }
         });
     }
@@ -1232,6 +1374,9 @@ export class SessionEngine {
         prepared: PreparedUpdates,
         decisions: readonly SessionRouteDecision[] = [],
         consumedKeys: ReadonlySet<string> = new Set(prepared.keys),
+        consumedDeletionKeys: ReadonlySet<string> = new Set(
+            prepared.deletions.map((deletion) => deletion.key),
+        ),
         operation?: (transaction: StoreTransaction) => Promise<void>,
     ): Promise<void> {
         await this.#store.transaction(async (transaction) => {
@@ -1326,6 +1471,7 @@ export class SessionEngine {
                         zeroBytes(stateBytes);
                     }
                 }
+                for (const key of consumedDeletionKeys) await transaction.delete(key);
                 await operation?.(transaction);
             } finally {
                 for (const change of changes.values()) {
@@ -1408,11 +1554,15 @@ export class SessionEngine {
         policies: {
             readonly adminsAssignAdmins: boolean;
             readonly anyoneCanAddMembers: boolean;
+            readonly sendPolicy?: "everyone" | "admins";
         },
     ): Promise<void> {
         if (
             typeof policies.adminsAssignAdmins !== "boolean" ||
-            typeof policies.anyoneCanAddMembers !== "boolean"
+            typeof policies.anyoneCanAddMembers !== "boolean" ||
+            (policies.sendPolicy !== undefined &&
+                policies.sendPolicy !== "everyone" &&
+                policies.sendPolicy !== "admins")
         ) {
             throw new Error("Invalid session policies");
         }
@@ -1432,6 +1582,7 @@ export class SessionEngine {
                     sessionId: id.slice(),
                     adminsAssignAdmins: policies.adminsAssignAdmins,
                     anyoneCanAddMembers: policies.anyoneCanAddMembers,
+                    sendPolicy: policies.sendPolicy ?? record.roles.sendPolicy,
                 });
             } finally {
                 epoch.destroy();
@@ -1688,6 +1839,7 @@ export class SessionEngine {
                                 ...record.roles,
                                 adminsAssignAdmins: intent.adminsAssignAdmins,
                                 anyoneCanAddMembers: intent.anyoneCanAddMembers,
+                                sendPolicy: intent.sendPolicy,
                             });
                             if (sessionRolesEqual(roles, record.roles)) {
                                 await transaction.delete(key);
@@ -1732,10 +1884,12 @@ export class SessionEngine {
             this.#pruneKeyPackages(transaction, this.#now()),
         );
         await this.convergeAccounts();
+        await this.#flushDeletionOutboxes(options.signal);
         const before = await this.#flushOutboxes(options.signal);
         const inbox = await this.#inbox.synchronize(options);
         await this.convergeAccounts();
         await this.convergeIntents();
+        await this.#flushDeletionOutboxes(options.signal);
         const after = await this.#flushOutboxes(options.signal);
         return this.#synchronizationResult(inbox, [before, after]);
     }
@@ -1750,11 +1904,86 @@ export class SessionEngine {
         );
         const accountRetry = await this.convergeAccounts();
         const intentRetry = await this.convergeIntents();
-        return (
-            (await this.#flushOutboxes(signal)).transientFailureIds.size > 0 ||
-            accountRetry ||
-            intentRetry
-        );
+        const deletionRetry = await this.#flushDeletionOutboxes(signal);
+        const outboxRetry = (await this.#flushOutboxes(signal)).transientFailureIds.size > 0;
+        return deletionRetry || outboxRetry || accountRetry || intentRetry;
+    }
+
+    async #flushDeletionOutboxes(signal?: AbortSignal): Promise<boolean> {
+        const entries = await this.#store.scan(SESSION_DELETION_OUTBOX_PREFIX, {
+            limit: OUTBOX_SCAN_ITEMS,
+        });
+        let retry = entries.size >= OUTBOX_SCAN_ITEMS;
+        for (const [key, bytes] of entries) {
+            let record: ReturnType<typeof decodeSessionDeletionOutbox> | undefined;
+            try {
+                record = decodeSessionDeletionOutbox(bytes);
+                if (this.#transport.deleteSession === undefined) {
+                    retry = true;
+                    continue;
+                }
+                const now = this.#now();
+                const request = createSignedDelivery(
+                    this.#accountIdentity,
+                    [],
+                    record.request.ciphertext,
+                    {
+                        id: record.request.id,
+                        createdAt: now,
+                        expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                    },
+                );
+                let notice = record.notice;
+                if (notice.expiresAt <= now) {
+                    notice = createSignedDelivery(
+                        this.#identity,
+                        record.notice.recipients,
+                        record.notice.ciphertext,
+                        {
+                            id: record.notice.id,
+                            createdAt: now,
+                            expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                            targetAccounts: record.notice.targetAccounts,
+                            ...(record.notice.ownerAccount === null
+                                ? {}
+                                : {
+                                      ownerAccount: record.notice.ownerAccount,
+                                      sessionId: record.notice.sessionId!,
+                                  }),
+                        },
+                    );
+                }
+                await setAndZero(
+                    this.#store,
+                    key,
+                    encodeSessionDeletionOutbox({ ...record, request, notice }),
+                );
+                try {
+                    await this.#transport.deleteSession(request, signal);
+                } catch (error: unknown) {
+                    if (!(error instanceof DeliveryTransportError && error.code === "replay")) {
+                        retry = true;
+                        continue;
+                    }
+                }
+                try {
+                    await this.#transport.publish(notice, signal);
+                    await this.#store.delete(key);
+                } catch {
+                    retry = true;
+                }
+            } catch {
+                retry = true;
+            } finally {
+                if (record !== undefined) {
+                    zeroBytes(record.sessionId);
+                    zeroBytes(record.request.ciphertext);
+                    zeroBytes(record.notice.ciphertext);
+                }
+                zeroBytes(bytes);
+            }
+        }
+        return retry;
     }
 
     /**
@@ -2026,6 +2255,14 @@ export class SessionEngine {
                         epoch.rebasePersistenceGeneration(minimumGeneration);
                     }
                 }
+                const roles = parent?.roles ?? record.roles;
+                if (
+                    frame.type === "application" &&
+                    roles.sendPolicy === "admins" &&
+                    !isSessionAdmin(roles, this.#accountKey)
+                ) {
+                    throw new Error("The local account may not send session events");
+                }
                 const members = activeMembers(epoch);
                 if (members.length > this.#limits.maximumMembersPerSession) {
                     throw new Error("Session exceeds the configured member limit");
@@ -2053,6 +2290,8 @@ export class SessionEngine {
                     createdAt: now,
                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
                     targetAccounts: await this.#targetAccounts(transaction, epoch),
+                    ownerAccount: roles.owner,
+                    sessionId: id,
                 });
                 checkpoint = epoch.serialize();
                 if (parent === undefined) {
@@ -2240,7 +2479,8 @@ export class SessionEngine {
             }
             if (
                 (currentRoles.adminsAssignAdmins !== nextRoles.adminsAssignAdmins ||
-                    currentRoles.anyoneCanAddMembers !== nextRoles.anyoneCanAddMembers) &&
+                    currentRoles.anyoneCanAddMembers !== nextRoles.anyoneCanAddMembers ||
+                    currentRoles.sendPolicy !== nextRoles.sendPolicy) &&
                 !equalBytes(senderAccount, currentRoles.owner)
             ) {
                 return false;
@@ -2369,6 +2609,8 @@ export class SessionEngine {
                             epoch,
                             additions.map((addition) => keyPackageAccount(addition.keyPackage)),
                         ),
+                        ownerAccount: nextRoles.owner,
+                        sessionId: id,
                     },
                 );
                 const commitOrder = await this.#nextOutboxOrder(transaction);
@@ -2417,6 +2659,8 @@ export class SessionEngine {
                                 {
                                     createdAt: now,
                                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                                    ownerAccount: nextRoles.owner,
+                                    sessionId: id,
                                 },
                             );
                             const bootstrapOrder = await this.#nextOutboxOrder(transaction);
@@ -2803,6 +3047,7 @@ export class SessionEngine {
                         previousGeneration: _previousGeneration,
                         previousEpochExpiresAt: _previousEpochExpiresAt,
                         previousMessagesRemaining: _previousMessagesRemaining,
+                        previousRoles: _previousRoles,
                         ...settled
                     } = record;
                     checkpoint = next.serialize();
@@ -2827,6 +3072,7 @@ export class SessionEngine {
                                           sessionEventTime(queued.eventId) +
                                           PREVIOUS_EPOCH_GRACE_MILLISECONDS,
                                       previousMessagesRemaining: PREVIOUS_EPOCH_MESSAGES,
+                                      previousRoles: record.roles,
                                   }
                                 : {}),
                         }),
@@ -2959,6 +3205,7 @@ export class SessionEngine {
                         previousGeneration: _previousGeneration,
                         previousEpochExpiresAt: _previousEpochExpiresAt,
                         previousMessagesRemaining: _previousMessagesRemaining,
+                        previousRoles: _previousRoles,
                         ...withoutPrevious
                     } = record;
                     updated = withoutPrevious;
@@ -2995,18 +3242,65 @@ export class SessionEngine {
                     return;
                 }
                 if (frame.type === "application") {
+                    const senderAccount = memberAccount(epoch, opened.message.sender);
+                    const epochRoles = epoch === current ? record.roles : record.previousRoles!;
+                    if (
+                        (epoch !== current &&
+                            !activeAccounts(current).some((account) =>
+                                equalBytes(account, senderAccount),
+                            )) ||
+                        (epochRoles.sendPolicy === "admins" &&
+                            !isSessionAdmin(epochRoles, senderAccount))
+                    ) {
+                        await this.#quarantine(
+                            transaction,
+                            queued.eventId,
+                            "unauthorized_application_sender",
+                            epoch.groupId,
+                            "application",
+                        );
+                        return;
+                    }
                     try {
                         await this.#buffer(
                             transaction,
                             epoch.groupId,
                             record,
                             queued.eventId,
-                            memberAccount(epoch, opened.message.sender),
+                            senderAccount,
                             frame.bytes,
                         );
                     } finally {
                         zeroBytes(frame.bytes);
                     }
+                } else if (frame.type === "delete") {
+                    const senderAccount = memberAccount(epoch, opened.message.sender);
+                    const epochRoles = epoch === current ? record.roles : record.previousRoles!;
+                    if (!equalBytes(senderAccount, epochRoles.owner)) {
+                        await this.#quarantine(
+                            transaction,
+                            queued.eventId,
+                            "unauthorized_session_deletion",
+                            epoch.groupId,
+                            "session",
+                        );
+                        return;
+                    }
+                    const owner = await this.#sessionOwner(transaction, epoch.groupId);
+                    if (owner?.owner === "service") {
+                        await setAndZero(
+                            transaction,
+                            sessionDeletedEventKey(queued.delivery.id),
+                            encodeSessionDeletedEvent({
+                                version: 1,
+                                id: queued.delivery.id,
+                                sessionId: epoch.groupId,
+                                owner: epochRoles.owner,
+                                serviceId: owner.serviceId,
+                            }),
+                        );
+                    }
+                    await this.#deleteSession(transaction, epoch.groupId);
                 } else if (frame.type === "leave") {
                     const account = memberAccount(epoch, opened.message.sender);
                     if (
@@ -3162,6 +3456,7 @@ export class SessionEngine {
                         previousGeneration: _previousGeneration,
                         previousEpochExpiresAt: _previousEpochExpiresAt,
                         previousMessagesRemaining: _previousMessagesRemaining,
+                        previousRoles: _previousRoles,
                         ...settled
                     } = record;
                     checkpoint = next.serialize();
@@ -3186,6 +3481,7 @@ export class SessionEngine {
                                           sessionEventTime(queued.eventId) +
                                           PREVIOUS_EPOCH_GRACE_MILLISECONDS,
                                       previousMessagesRemaining: PREVIOUS_EPOCH_MESSAGES,
+                                      previousRoles: record.roles,
                                   }),
                         }),
                     );
@@ -3267,6 +3563,12 @@ export class SessionEngine {
                             createdAt: now,
                             expiresAt: now + DELIVERY_TTL_MILLISECONDS,
                             targetAccounts: await this.#targetAccounts(transaction, next),
+                            ...(dependent.delivery.ownerAccount === null
+                                ? {}
+                                : {
+                                      ownerAccount: dependent.delivery.ownerAccount,
+                                      sessionId: dependent.delivery.sessionId!,
+                                  }),
                         },
                     );
                     await transaction.delete(outboxKey(previousId));
@@ -4232,6 +4534,12 @@ export class SessionEngine {
                 createdAt: now,
                 expiresAt: now + DELIVERY_TTL_MILLISECONDS,
                 targetAccounts: [...targets.values()],
+                ...(record.delivery.ownerAccount === null
+                    ? {}
+                    : {
+                          ownerAccount: record.delivery.ownerAccount,
+                          sessionId: record.delivery.sessionId!,
+                      }),
             },
         );
         await this.#store.transaction(async (transaction) => {
@@ -4316,6 +4624,12 @@ export class SessionEngine {
                 createdAt: now,
                 expiresAt: now + DELIVERY_TTL_MILLISECONDS,
                 targetAccounts: record.delivery.targetAccounts,
+                ...(record.delivery.ownerAccount === null
+                    ? {}
+                    : {
+                          ownerAccount: record.delivery.ownerAccount,
+                          sessionId: record.delivery.sessionId!,
+                      }),
             },
         );
         await this.#store.transaction(async (transaction) => {

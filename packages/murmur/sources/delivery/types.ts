@@ -15,6 +15,10 @@ export interface SignedDelivery {
     readonly recipients: readonly Uint8Array[];
     /** Exact logical account-roster revisions used to select recipient inboxes. */
     readonly targetAccounts: readonly DeliveryAccountTarget[];
+    /** Owning account for session-linked relay cleanup, or null for account traffic. */
+    readonly ownerAccount: Uint8Array | null;
+    /** Owning MLS session identifier, or null for account traffic. */
+    readonly sessionId: Uint8Array | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: Uint8Array;
@@ -197,6 +201,8 @@ export interface DeliveryStreamHooks {
  */
 export interface DeliveryTransport {
     publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
+    /** Apply one account-signed, replay-protected session relay-state deletion. */
+    deleteSession?(delivery: SignedDelivery, signal?: AbortSignal): Promise<number>;
     read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
     acknowledge(request: SignedInboxAck, signal?: AbortSignal): Promise<InboxAcknowledgement>;
     /** Read the relay's one current roster for an exact account identity key. */
@@ -232,6 +238,9 @@ export interface CreateDeliveryOptions {
     readonly expiresAt: number;
     /** Exact account-roster revisions checked against relay-owned current state. */
     readonly targetAccounts?: readonly DeliveryAccountTarget[];
+    /** Session owner and identifier must be supplied together for session traffic. */
+    readonly ownerAccount?: Uint8Array;
+    readonly sessionId?: Uint8Array;
 }
 
 /** Inputs for one signed inbox read. */

@@ -216,4 +216,199 @@ describe("Cloudflare durable fanout", () => {
         expect(firstOutcome.eventId < secondOutcome.eventId).toBe(true);
         expect((await fanoutState.storage.list({ prefix: "fanout:pending:" })).size).toBe(0);
     });
+
+    test("purges exact owner-linked session deliveries and rejects replay", async () => {
+        const now = Date.now();
+        const ownerSecret = secret(11);
+        const owner = identity(ownerSecret);
+        const otherOwnerSecret = secret(12);
+        const otherOwner = identity(otherOwnerSecret);
+        const bob = identity(secret(13));
+        const carol = identity(secret(14));
+        const sessionId = new Uint8Array(32).fill(21);
+        const otherSessionId = new Uint8Array(32).fill(22);
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        const linked = signedDelivery(ownerSecret, recipients(bob, carol), {
+            id: 31,
+            now,
+            expiresAt: now + 60_000,
+            ownerAccount: owner,
+            sessionId,
+        });
+        const otherSession = signedDelivery(ownerSecret, recipients(bob), {
+            id: 32,
+            now,
+            expiresAt: now + 60_000,
+            ownerAccount: owner,
+            sessionId: otherSessionId,
+        });
+        const otherOwnerDelivery = signedDelivery(otherOwnerSecret, recipients(carol), {
+            id: 33,
+            now,
+            expiresAt: now + 60_000,
+            ownerAccount: otherOwner,
+            sessionId,
+        });
+        for (const delivery of [linked, otherSession, otherOwnerDelivery]) {
+            const response = await fanout.fetch(
+                new Request("https://murmur.internal/v2/publish", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                        delivery: signedDeliveryToJson(delivery),
+                        admissionPrincipal: "account-1",
+                    }),
+                }),
+            );
+            expect(response.status).toBe(200);
+        }
+        await fanout.alarm();
+        const bobStorage = inboxes.states.get(encodeBase64Url(bob))!.storage;
+        const carolStorage = inboxes.states.get(encodeBase64Url(carol))!.storage;
+        expect((await bobStorage.list({ prefix: "inbox:event:" })).size).toBe(2);
+        expect((await carolStorage.list({ prefix: "inbox:event:" })).size).toBe(2);
+        const bobGeneration = (
+            (await bobStorage.get("inbox:meta")) as { readonly generation: string }
+        ).generation;
+        const carolGeneration = (
+            (await carolStorage.get("inbox:meta")) as { readonly generation: string }
+        ).generation;
+
+        const deletion = signedDelivery(ownerSecret, [], {
+            id: 34,
+            now,
+            expiresAt: now + 60_000,
+            ciphertext: new TextEncoder().encode(
+                JSON.stringify({
+                    version: 1,
+                    type: "delete_session",
+                    sessionId: encodeBase64Url(sessionId),
+                }),
+            ),
+        });
+        const deleteRequest = (requestDelivery = deletion): Promise<Response> =>
+            fanout.fetch(
+                new Request("https://murmur.internal/v2/delete", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ delivery: signedDeliveryToJson(requestDelivery) }),
+                }),
+            );
+        const deleted = await deleteRequest();
+        expect(deleted.status).toBe(200);
+        expect(await deleted.json()).toEqual({ removed: 2 });
+        expect((await bobStorage.list({ prefix: "inbox:event:" })).size).toBe(1);
+        expect((await carolStorage.list({ prefix: "inbox:event:" })).size).toBe(1);
+        expect(
+            ((await bobStorage.get("inbox:meta")) as { readonly generation: string }).generation,
+        ).not.toBe(bobGeneration);
+        expect(
+            ((await carolStorage.get("inbox:meta")) as { readonly generation: string }).generation,
+        ).not.toBe(carolGeneration);
+
+        const replay = await deleteRequest(
+            signedDelivery(ownerSecret, [], {
+                id: 34,
+                now: now + 1,
+                expiresAt: now + 60_001,
+                ciphertext: deletion.ciphertext,
+            }),
+        );
+        expect(replay.status).toBe(409);
+        expect(await replay.json()).toEqual({ error: "replay" });
+        const republish = await fanout.fetch(
+            new Request("https://murmur.internal/v2/publish", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({
+                    delivery: signedDeliveryToJson(
+                        signedDelivery(ownerSecret, recipients(bob), {
+                            id: 35,
+                            now,
+                            expiresAt: now + 60_000,
+                            ownerAccount: owner,
+                            sessionId,
+                        }),
+                    ),
+                    admissionPrincipal: "account-1",
+                }),
+            }),
+        );
+        expect(republish.status).toBe(409);
+        expect(await republish.json()).toEqual({ error: "session_deleted" });
+    });
+
+    test("absorbs a pre-deletion fanout manifest that reaches its inbox late", async () => {
+        const now = Date.now();
+        const ownerSecret = secret(41);
+        const owner = identity(ownerSecret);
+        const recipient = identity(secret(42));
+        const sessionId = new Uint8Array(32).fill(43);
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanoutState = new MemoryState();
+        const fanout = new MurmurFanoutDurableObject(fanoutState, environment);
+        const pending = signedDelivery(ownerSecret, recipients(recipient), {
+            id: 44,
+            now,
+            expiresAt: now + 60_000,
+            ownerAccount: owner,
+            sessionId,
+        });
+        expect(
+            (
+                await fanout.fetch(
+                    new Request("https://murmur.internal/v2/publish", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({
+                            delivery: signedDeliveryToJson(pending),
+                            admissionPrincipal: "account-1",
+                        }),
+                    }),
+                )
+            ).status,
+        ).toBe(200);
+
+        const deletion = signedDelivery(ownerSecret, [], {
+            id: 45,
+            now,
+            expiresAt: now + 60_000,
+            ciphertext: new TextEncoder().encode(
+                JSON.stringify({
+                    version: 1,
+                    type: "delete_session",
+                    sessionId: encodeBase64Url(sessionId),
+                }),
+            ),
+        });
+        const deleted = await fanout.fetch(
+            new Request("https://murmur.internal/v2/delete", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: JSON.stringify({ delivery: signedDeliveryToJson(deletion) }),
+            }),
+        );
+        expect(deleted.status).toBe(200);
+        expect(await deleted.json()).toEqual({ removed: 0 });
+
+        await fanout.alarm();
+        const inbox = inboxes.states.get(encodeBase64Url(recipient))!.storage;
+        expect((await inbox.list({ prefix: "inbox:event:" })).size).toBe(0);
+        expect((await fanoutState.storage.list({ prefix: "fanout:pending:" })).size).toBe(0);
+    });
 });

@@ -18,6 +18,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                 rosters: unknown;
                 roster_devices: unknown;
                 roster_nonces: unknown;
+                deletion_nonces: unknown;
                 directory_devices: unknown;
                 directory_prekeys: unknown;
                 directory_references: unknown;
@@ -33,6 +34,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     to_regclass('murmur_device_rosters') AS rosters,
                     to_regclass('murmur_device_roster_devices') AS roster_devices,
                     to_regclass('murmur_device_roster_nonces') AS roster_nonces,
+                    to_regclass('murmur_session_deletion_nonces') AS deletion_nonces,
                     to_regclass('murmur_directory_devices') AS directory_devices,
                     to_regclass('murmur_directory_prekeys') AS directory_prekeys,
                     to_regclass('murmur_directory_prekey_references') AS directory_references,
@@ -50,6 +52,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     row.rosters !== null ||
                     row.roster_devices !== null ||
                     row.roster_nonces !== null ||
+                    row.deletion_nonces !== null ||
                     row.directory_devices !== null ||
                     row.directory_prekeys !== null ||
                     row.directory_references !== null ||
@@ -78,6 +81,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     row.rosters === null ||
                     row.roster_devices === null ||
                     row.roster_nonces === null ||
+                    row.deletion_nonces === null ||
                     row.directory_devices === null ||
                     row.directory_prekeys === null ||
                     row.directory_references === null ||
@@ -129,10 +133,25 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     delivery_json jsonb NOT NULL,
                     encoded_bytes bigint NOT NULL CHECK (encoded_bytes > 0),
                     expires_at bigint NOT NULL,
+                    owner_account bytea CHECK (
+                        owner_account IS NULL OR octet_length(owner_account) = 32
+                    ),
+                    session_id bytea CHECK (
+                        session_id IS NULL OR octet_length(session_id) = 32
+                    ),
+                    CHECK ((owner_account IS NULL) = (session_id IS NULL)),
                     PRIMARY KEY (sender, delivery_id)
                 )`,
                 `CREATE INDEX murmur_queue_delivery_expiration
                     ON murmur_queue_deliveries(expires_at)`,
+                `CREATE INDEX murmur_queue_delivery_session
+                    ON murmur_queue_deliveries(owner_account, session_id)`,
+                `CREATE TABLE murmur_session_deletion_nonces (
+                    owner_account bytea NOT NULL CHECK (octet_length(owner_account) = 32),
+                    request_id text NOT NULL,
+                    created_at bigint NOT NULL,
+                    PRIMARY KEY (owner_account, request_id)
+                )`,
                 `CREATE TABLE murmur_queue_references (
                     recipient bytea NOT NULL REFERENCES murmur_queues(recipient)
                         ON DELETE CASCADE,

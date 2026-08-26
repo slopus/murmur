@@ -17,6 +17,8 @@ import type {
     RelayStore,
 } from "../../storage/index.js";
 import type { SignedDelivery } from "../../protocol/index.js";
+import { encodeBase64Url } from "../../utils/base64Url.js";
+import { canonicalJson } from "../../utils/canonicalJson.js";
 import { RelayService, type WakeSource } from "../index.js";
 
 const NOW = 10_000;
@@ -97,6 +99,33 @@ describe("identity queue relay", () => {
             ).rejects.toMatchObject({ status: 409, body: { error: "cursor_trimmed" } });
 
             now += 1;
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("authenticates session deletion under the account key and rejects request replay", async () => {
+        const ownerSecret = secret(51);
+        const sessionId = new Uint8Array(32).fill(52);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        try {
+            const request = signedDelivery(ownerSecret, [], {
+                id: 53,
+                now: NOW,
+                ciphertext: canonicalJson({
+                    version: 1,
+                    type: "delete_session",
+                    sessionId: encodeBase64Url(sessionId),
+                }),
+            });
+            await expect(relay.deleteSession(request)).resolves.toBe(0);
+            await expect(relay.deleteSession(request)).rejects.toMatchObject({
+                status: 409,
+                body: { error: "replay" },
+            });
+            await expect(
+                relay.deleteSession({ ...request, signature: new Uint8Array(64) }),
+            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
         } finally {
             await relay.close();
         }
@@ -339,6 +368,9 @@ describe("identity queue relay", () => {
                 _now: number,
                 _limits: QueueLimits,
             ): Promise<PublishOutcome> {
+                throw new Error("Unused");
+            },
+            async deleteSessionDeliveries(): Promise<number> {
                 throw new Error("Unused");
             },
             async readQueue(

@@ -15,6 +15,10 @@ export interface SignedDelivery {
     readonly recipients: readonly Uint8Array[];
     /** Exact logical account-roster revisions used to select recipient inboxes. */
     readonly targetAccounts: readonly DeliveryAccountTarget[];
+    /** Owning account for session-linked cleanup, or null for account traffic. */
+    readonly ownerAccount: Uint8Array | null;
+    /** Owning MLS session identifier, or null for account traffic. */
+    readonly sessionId: Uint8Array | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: Uint8Array;
@@ -31,6 +35,8 @@ export interface SignedDeliveryJson {
         readonly accountKey: string;
         readonly rosterRevision: number;
     }[];
+    readonly ownerAccount: string | null;
+    readonly sessionId: string | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: string;

@@ -10,6 +10,7 @@ SQLite and PostgreSQL implement the same queue model:
 delivery row -> exact recipient references -> per-inbox sequence
 sender/principal counters -> transactional quota enforcement
 acknowledgement or expiry -> reference removal -> counter reclamation
+owner/session deletion -> exact reference purge -> continuity advance
 ```
 
 The same transaction seam stores per-account/per-device directory state:
@@ -21,6 +22,8 @@ ticketed exact claim -> spend budget -> consume one-time or read fallback
 ```
 
 One-use reference history, upload nonces, and ticket-use counters are durable.
+Session deletion request IDs remain replay-protected for the maximum delivery
+retention window.
 The one clean schema carries version stamp 3.
 
 Initialization accepts only the current exact schema. A mismatched version or

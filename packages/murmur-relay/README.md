@@ -30,6 +30,7 @@ fanout limits before exposing the process publicly.
 | ------ | --------------------------- | ---------------------------------- |
 | `GET`  | `/health`                   | Storage and wake-source readiness  |
 | `POST` | `/v1/deliveries`            | Atomic signed ciphertext multicast |
+| `POST` | `/v1/sessions/delete`       | Signed terminal session purge      |
 | `POST` | `/v1/queue/read`            | Signed bounded inbox read          |
 | `POST` | `/v1/queue/events`          | Authenticated ordered SSE stream   |
 | `POST` | `/v1/queue/ack`             | Signed monotonic prefix trim       |

@@ -51,6 +51,7 @@ One sender-signed delivery contains:
 
 - a random operation ID;
 - sender and exact recipient public identities;
+- nullable owner-account and session identifiers for relay-side terminal cleanup;
 - creation and expiry times;
 - opaque ciphertext;
 - an Ed25519 signature over a domain-separated canonical encoding.
@@ -84,14 +85,24 @@ change is an MLS Commit. One authenticated epoch committer serializes Commits;
 other members submit proposals. A staged send waits for its owning Commit and
 all required Welcomes before publication.
 
-Authenticated session control carries the immutable owner, admin set, and two
-policies:
+Authenticated session control carries the immutable owner, admin set, and
+three policies:
 
 - whether admins may grant admin to another member;
-- whether every member may add another member.
+- whether every member may add another member;
+- whether everyone or only admins may send application events.
 
 The owner is always an admin. Removal immediately revokes prior-epoch send
 authority for the removed account.
+
+The immutable owner may delete an idle active session. Murmur first durably
+creates an account-signed, replay-protected relay purge request and a final MLS
+deletion notice, then destroys local session state. The relay removes every
+unexpired delivery carrying that exact owner/session pair and advances affected
+inbox continuity generations before Murmur publishes the final notice. Members
+authenticate the notice against the owner role in its exact MLS epoch and
+terminally destroy their local state. A service-owned session receives one
+durable typed deletion event; a thrown callback retries that same event ID.
 
 ## Durable application boundary
 

@@ -390,6 +390,7 @@ describe("adversarial inputs and resource limits", () => {
             admins: [admin],
             adminsAssignAdmins: false,
             anyoneCanAddMembers: false,
+            sendPolicy: "everyone",
         };
         const key = hashBytes(utf8Encode("commit-key"));
         const groupId = utf8Encode("group-a");
@@ -1174,6 +1175,7 @@ describe("adversarial inputs and resource limits", () => {
             admins: [peer.publicKey],
             adminsAssignAdmins: false,
             anyoneCanAddMembers: false,
+            sendPolicy: "everyone",
         });
         const corpus = [
             {

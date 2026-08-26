@@ -2,10 +2,13 @@ import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
     deliveryFingerprint,
+    parseSessionDeletionRequest,
     parseSignedDelivery,
     parseSignedQueueAck,
     parseSignedQueueRead,
     signedDeliveryToJson,
+    validateSignedDeliveryShape,
+    verifyDeliverySignature,
     verifyQueueAckSignature,
     verifyQueueReadSignature,
     type SignedDelivery,
@@ -22,6 +25,7 @@ import { relaySessionTokenFromWebSocketProtocols } from "../websocket/index.js";
 import { advanceLossGeneration, createGenerationSeed } from "../storage/continuity.js";
 import {
     MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS,
+    MAXIMUM_DELIVERY_TTL_MILLISECONDS,
     MAXIMUM_MESSAGE_BYTES,
     MAXIMUM_QUEUE_BYTES,
     MAXIMUM_QUEUE_ITEMS,
@@ -56,6 +60,8 @@ const EVENT_PREFIX = "inbox:event:";
 const EXPIRY_PREFIX = "inbox:expiry:";
 const SENDER_PREFIX = "inbox:sender:";
 const PRINCIPAL_PREFIX = "inbox:principal:";
+const DELETED_SESSION_PREFIX = "inbox:deleted-session:";
+const DELETED_SESSION_EXPIRY_PREFIX = "inbox:deleted-session-expiry:";
 const FANOUT_OBJECT_NAME = "global-v1";
 const MAXIMUM_SENDER_ITEMS = 1_000;
 const MAXIMUM_SENDER_BYTES = 256 * 1024 * 1024;
@@ -69,6 +75,14 @@ interface UsageCounter {
 
 interface InboxExpiryRecord {
     readonly eventKey: string;
+}
+
+interface DeletedSessionRecord {
+    readonly expiresAt: number;
+}
+
+interface DeletedSessionExpiryRecord {
+    readonly tombstoneKey: string;
 }
 
 interface QueuePageBody {
@@ -91,6 +105,18 @@ function eventKey(eventId: string): string {
 
 function expiryKey(expiresAt: number, eventId: string): string {
     return `${EXPIRY_PREFIX}${expiresAt.toString().padStart(16, "0")}:${eventId}`;
+}
+
+function deletedSessionKey(ownerAccount: Uint8Array, sessionId: Uint8Array): string {
+    return `${DELETED_SESSION_PREFIX}${encodeBase64Url(ownerAccount)}:${encodeBase64Url(sessionId)}`;
+}
+
+function deletedSessionExpiryKey(
+    expiresAt: number,
+    ownerAccount: Uint8Array,
+    sessionId: Uint8Array,
+): string {
+    return `${DELETED_SESSION_EXPIRY_PREFIX}${expiresAt.toString().padStart(16, "0")}:${encodeBase64Url(ownerAccount)}:${encodeBase64Url(sessionId)}`;
 }
 
 function emptyMetadata(): InboxMetadata {
@@ -171,6 +197,25 @@ export class MurmurInboxDurableObject {
     /** Accept authenticated sockets or idempotent internal fanout insertions. */
     async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v2/delete") {
+            try {
+                const input = object(await requestJson(request));
+                exact(input, ["recipient", "delivery"]);
+                if (typeof input.recipient !== "string") {
+                    throw new RelayError(400, "Invalid inbox deletion", {
+                        error: "malformed",
+                    });
+                }
+                const recipient = decodeBase64Url(input.recipient, 32);
+                const delivery = parseSignedDelivery(input.delivery);
+                const sessionId = this.#authorizeDeletion(delivery);
+                const removed = await this.#deleteSessionDeliveries(delivery.sender, sessionId);
+                return json({ removed, recipient: encodeBase64Url(recipient) }, 200);
+            } catch (error: unknown) {
+                if (error instanceof RelayError) return json(error.body, error.status);
+                return json({ error: "internal" }, 500);
+            }
+        }
         if (request.method === "POST" && url.pathname === "/v2/insert") {
             try {
                 const input = object(await requestJson(request));
@@ -275,6 +320,19 @@ export class MurmurInboxDurableObject {
                 send(socket, responseFrame(frame.id, response.status, await response.json()));
                 return;
             }
+            if (frame.operation === "delete_session") {
+                const delivery = parseSignedDelivery(frame.body);
+                const fanoutId = this.#environment.MURMUR_FANOUT.idFromName(FANOUT_OBJECT_NAME);
+                const response = await this.#environment.MURMUR_FANOUT.get(fanoutId).fetch(
+                    new Request("https://murmur.internal/v2/delete", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({ delivery: signedDeliveryToJson(delivery) }),
+                    }),
+                );
+                send(socket, responseFrame(frame.id, response.status, await response.json()));
+                return;
+            }
             if (frame.operation === "read") {
                 const read = parseSignedQueueRead(frame.body);
                 this.#authorizeRead(authorization.device, read, false);
@@ -365,6 +423,7 @@ export class MurmurInboxDurableObject {
     /** Send stream heartbeats and enforce the ticket's maximum socket lifetime. */
     async alarm(): Promise<void> {
         const now = Date.now();
+        await this.#pruneDeletedSessions(now);
         await this.#pruneExpired(now);
         let active = false;
         for (const socket of this.#state.getWebSockets()) {
@@ -393,6 +452,20 @@ export class MurmurInboxDurableObject {
             const expiresAt = Number(key.slice(EXPIRY_PREFIX.length, EXPIRY_PREFIX.length + 16));
             if (Number.isSafeInteger(expiresAt)) await this.#scheduleAt(expiresAt);
         }
+        const tombstones = await this.#state.storage.list<DeletedSessionExpiryRecord>({
+            prefix: DELETED_SESSION_EXPIRY_PREFIX,
+            limit: 1,
+        });
+        const tombstoneKey = tombstones.keys().next().value as string | undefined;
+        if (tombstoneKey !== undefined) {
+            const expiresAt = Number(
+                tombstoneKey.slice(
+                    DELETED_SESSION_EXPIRY_PREFIX.length,
+                    DELETED_SESSION_EXPIRY_PREFIX.length + 16,
+                ),
+            );
+            if (Number.isSafeInteger(expiresAt)) await this.#scheduleAt(expiresAt);
+        }
     }
 
     async #insert(
@@ -410,6 +483,16 @@ export class MurmurInboxDurableObject {
         const expires = expiryKey(delivery.expiresAt, eventId);
         const duplicate = await this.#state.storage.transaction(async (transaction) => {
             const key = eventKey(eventId);
+            if (delivery.ownerAccount !== null && delivery.sessionId !== null) {
+                const tombstoneKey = deletedSessionKey(delivery.ownerAccount, delivery.sessionId);
+                const tombstone = await transaction.get<DeletedSessionRecord>(tombstoneKey);
+                if (tombstone !== undefined && tombstone.expiresAt > Date.now()) {
+                    throw new RelayError(409, "Session was deleted", {
+                        error: "session_deleted",
+                    });
+                }
+                if (tombstone !== undefined) await transaction.delete(tombstoneKey);
+            }
             const existing = await transaction.get<StoredDeliveryRecord>(key);
             if (existing !== undefined) {
                 const stored = decodeStoredDelivery(existing.delivery);
@@ -591,6 +674,102 @@ export class MurmurInboxDurableObject {
         });
     }
 
+    async #deleteSessionDeliveries(
+        ownerAccount: Uint8Array,
+        sessionId: Uint8Array,
+    ): Promise<number> {
+        const now = Date.now();
+        const expiresAt = now + MAXIMUM_DELIVERY_TTL_MILLISECONDS;
+        const tombstoneKey = deletedSessionKey(ownerAccount, sessionId);
+        await this.#state.storage.transaction(async (transaction) => {
+            await transaction.put<DeletedSessionRecord>(tombstoneKey, { expiresAt });
+            await transaction.put<DeletedSessionExpiryRecord>(
+                deletedSessionExpiryKey(expiresAt, ownerAccount, sessionId),
+                { tombstoneKey },
+            );
+        });
+        await this.#scheduleAt(expiresAt);
+        let after: string | undefined;
+        let removed = 0;
+        for (;;) {
+            const page = await this.#state.storage.list<StoredDeliveryRecord>({
+                prefix: EVENT_PREFIX,
+                ...(after === undefined ? {} : { startAfter: after }),
+                limit: PRUNE_BATCH,
+            });
+            if (page.size === 0) break;
+            after = [...page.keys()].at(-1);
+            const candidates = [...page.entries()].filter(([, value]) => {
+                const delivery = decodeStoredDelivery(value.delivery);
+                return (
+                    delivery.ownerAccount !== null &&
+                    delivery.sessionId !== null &&
+                    equalBytes(delivery.ownerAccount, ownerAccount) &&
+                    equalBytes(delivery.sessionId, sessionId)
+                );
+            });
+            if (candidates.length > 0) {
+                const result = await this.#state.storage.transaction(async (transaction) => {
+                    const records: [string, StoredDeliveryRecord][] = [];
+                    for (const [key] of candidates) {
+                        const current = await transaction.get<StoredDeliveryRecord>(key);
+                        if (current === undefined) continue;
+                        const delivery = decodeStoredDelivery(current.delivery);
+                        if (
+                            delivery.ownerAccount !== null &&
+                            delivery.sessionId !== null &&
+                            equalBytes(delivery.ownerAccount, ownerAccount) &&
+                            equalBytes(delivery.sessionId, sessionId)
+                        ) {
+                            records.push([key, current]);
+                        }
+                    }
+                    if (records.length === 0) return undefined;
+                    await this.#deleteRecords(transaction, records);
+                    const metadata = await this.#metadataInTransaction(transaction);
+                    const removedBytes = records.reduce(
+                        (total, [, value]) => total + value.encodedBytes,
+                        0,
+                    );
+                    const updated: InboxMetadata = {
+                        ...metadata,
+                        generation: encodeBase64Url(
+                            advanceLossGeneration(
+                                decodeBase64Url(metadata.generation, 32),
+                                records.length,
+                            ),
+                        ),
+                        pendingItems: Math.max(0, metadata.pendingItems - records.length),
+                        pendingBytes: Math.max(0, metadata.pendingBytes - removedBytes),
+                    };
+                    await transaction.put<InboxMetadata>(META_KEY, updated);
+                    return { count: records.length, metadata: updated };
+                });
+                if (result !== undefined) {
+                    removed += result.count;
+                    this.#broadcastContinuity(result.metadata);
+                }
+            }
+            if (page.size < PRUNE_BATCH) break;
+        }
+        return removed;
+    }
+
+    async #pruneDeletedSessions(now: number): Promise<number> {
+        const entries = await this.#state.storage.list<DeletedSessionExpiryRecord>({
+            prefix: DELETED_SESSION_EXPIRY_PREFIX,
+            end: `${DELETED_SESSION_EXPIRY_PREFIX}${(now + 1).toString().padStart(16, "0")}`,
+            limit: PRUNE_BATCH,
+        });
+        if (entries.size === 0) return 0;
+        await this.#state.storage.transaction(async (transaction) => {
+            for (const [key, value] of entries) {
+                await transaction.delete([key, value.tombstoneKey]);
+            }
+        });
+        return entries.size;
+    }
+
     async #pruneExpired(now: number): Promise<number> {
         const expirations = await this.#state.storage.list<InboxExpiryRecord>({
             prefix: EXPIRY_PREFIX,
@@ -677,6 +856,35 @@ export class MurmurInboxDurableObject {
         }
     }
 
+    #authorizeDeletion(delivery: SignedDelivery): Uint8Array {
+        validateSignedDeliveryShape(delivery);
+        if (
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0 ||
+            delivery.ownerAccount !== null ||
+            delivery.sessionId !== null ||
+            delivery.ciphertext.length > 1_024 ||
+            !verifyDeliverySignature(delivery)
+        ) {
+            throw new RelayError(401, "Invalid session deletion authorization", {
+                error: "unauthorized",
+            });
+        }
+        const now = Date.now();
+        if (
+            delivery.createdAt > now + MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt < now - MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > MAXIMUM_DELIVERY_TTL_MILLISECONDS
+        ) {
+            throw new RelayError(401, "Session deletion violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        return parseSessionDeletionRequest(delivery.ciphertext);
+    }
+
     #validateRequestTime(createdAt: number): void {
         if (Math.abs(createdAt - Date.now()) > MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS) {
             throw new RelayError(401, "Signed request violates relay time policy", {
@@ -698,6 +906,19 @@ export class MurmurInboxDurableObject {
                 }
             } catch {
                 socket.close(1011, "stream delivery failed");
+            }
+        }
+    }
+
+    #broadcastContinuity(metadata: InboxMetadata): void {
+        for (const socket of this.#state.getWebSockets()) {
+            try {
+                const value = attachment(socket);
+                if (value.streamId !== undefined) {
+                    send(socket, continuityFrame(value.streamId, metadata));
+                }
+            } catch {
+                socket.close(1011, "stream continuity failed");
             }
         }
     }

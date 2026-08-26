@@ -38,6 +38,8 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
             accountKey: target.accountKey.slice(),
             rosterRevision: target.rosterRevision,
         })),
+        ownerAccount: delivery.ownerAccount?.slice() ?? null,
+        sessionId: delivery.sessionId?.slice() ?? null,
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),
@@ -262,6 +264,13 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             await this.#context.delegate.publish(delivery, signal);
         }
         return { eventId: outcome.eventId, duplicate: outcome.duplicate };
+    }
+
+    async deleteSession(input: SignedDelivery, signal?: AbortSignal): Promise<number> {
+        if (this.#context.delegate.deleteSession === undefined) {
+            throw new Error("Delivery transport does not support session deletion");
+        }
+        return this.#context.delegate.deleteSession(cloneDelivery(input), signal);
     }
 
     async read(input: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {

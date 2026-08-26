@@ -45,6 +45,8 @@ export function signedDelivery(
             readonly accountKey: Uint8Array;
             readonly rosterRevision: number;
         }[];
+        readonly ownerAccount?: Uint8Array;
+        readonly sessionId?: Uint8Array;
     } = {},
 ): SignedDelivery {
     const now = options.now ?? 10_000;
@@ -57,6 +59,8 @@ export function signedDelivery(
             accountKey: target.accountKey.slice(),
             rosterRevision: target.rosterRevision,
         })),
+        ownerAccount: options.ownerAccount?.slice() ?? null,
+        sessionId: options.sessionId?.slice() ?? null,
         createdAt: now,
         expiresAt: options.expiresAt ?? now + 60_000,
         ciphertext: options.ciphertext?.slice() ?? new Uint8Array([1, 2, 3]),

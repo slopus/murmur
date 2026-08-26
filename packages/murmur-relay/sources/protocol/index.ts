@@ -5,6 +5,7 @@ export {
     deliverySigningBytes,
     isDeliveryId,
     parseSignedDelivery,
+    parseSessionDeletionRequest,
     parseSignedQueueAck,
     parseSignedQueueRead,
     queueAckSigningBytes,

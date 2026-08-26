@@ -28,6 +28,8 @@ export interface SessionRoles {
     readonly adminsAssignAdmins: boolean;
     /** Whether any member may add a new member account. */
     readonly anyoneCanAddMembers: boolean;
+    /** Accounts permitted to send application events in this epoch. */
+    readonly sendPolicy: "everyone" | "admins";
 }
 
 /** MLS-authenticated session metadata shared by every current logical member. */
@@ -55,6 +57,7 @@ export function normalizeSessionRoles(roles: SessionRoles): SessionRoles {
             .map(([, value]) => value),
         adminsAssignAdmins: roles.adminsAssignAdmins,
         anyoneCanAddMembers: roles.anyoneCanAddMembers,
+        sendPolicy: roles.sendPolicy,
     };
 }
 
@@ -65,17 +68,23 @@ function rolesToJson(roles: SessionRoles): Record<string, unknown> {
         admins: normalized.admins.map((admin) => encodeBase64Url(admin)),
         adminsAssignAdmins: normalized.adminsAssignAdmins,
         anyoneCanAddMembers: normalized.anyoneCanAddMembers,
+        sendPolicy: normalized.sendPolicy,
     };
 }
 
 function rolesFromJson(value: unknown, name: string): SessionRoles {
     const input = object(value, name);
-    exact(input, ["owner", "admins", "adminsAssignAdmins", "anyoneCanAddMembers"], name);
+    exact(
+        input,
+        ["owner", "admins", "adminsAssignAdmins", "anyoneCanAddMembers", "sendPolicy"],
+        name,
+    );
     if (
         !Array.isArray(input.admins) ||
         input.admins.length > MAXIMUM_ROLE_ADMINS ||
         typeof input.adminsAssignAdmins !== "boolean" ||
-        typeof input.anyoneCanAddMembers !== "boolean"
+        typeof input.anyoneCanAddMembers !== "boolean" ||
+        (input.sendPolicy !== "everyone" && input.sendPolicy !== "admins")
     ) {
         throw new Error(`Invalid ${name}`);
     }
@@ -98,6 +107,7 @@ function rolesFromJson(value: unknown, name: string): SessionRoles {
         admins,
         adminsAssignAdmins: input.adminsAssignAdmins,
         anyoneCanAddMembers: input.anyoneCanAddMembers,
+        sendPolicy: input.sendPolicy,
     };
 }
 
@@ -118,7 +128,8 @@ export function sessionRolesEqual(left: SessionRoles, right: SessionRoles): bool
         left.admins.length === right.admins.length &&
         left.admins.every((admin, index) => equalBytes(admin, right.admins[index]!)) &&
         left.adminsAssignAdmins === right.adminsAssignAdmins &&
-        left.anyoneCanAddMembers === right.anyoneCanAddMembers
+        left.anyoneCanAddMembers === right.anyoneCanAddMembers &&
+        left.sendPolicy === right.sendPolicy
     );
 }
 
@@ -137,6 +148,7 @@ export interface BootstrapFrame {
 
 export type PrivateSessionFrame =
     | { readonly version: 1; readonly type: "application"; readonly bytes: Uint8Array }
+    | { readonly version: 1; readonly type: "delete" }
     | { readonly version: 1; readonly type: "leave" }
     | { readonly version: 1; readonly type: "welcome_complete" };
 
@@ -416,6 +428,9 @@ export function encodePrivateFrame(frame: PrivateSessionFrame): Uint8Array {
     if (frame.type === "leave") {
         return canonicalJsonBytes({ version: 1, type: frame.type });
     }
+    if (frame.type === "delete") {
+        return canonicalJsonBytes({ version: 1, type: frame.type });
+    }
     if (frame.type === "welcome_complete") {
         return canonicalJsonBytes({ version: 1, type: frame.type });
     }
@@ -438,6 +453,10 @@ export function decodePrivateFrame(value: Uint8Array): PrivateSessionFrame {
     if (input.type === "leave") {
         exact(input, ["version", "type"], "leave control");
         return { version: 1, type: "leave" };
+    }
+    if (input.type === "delete") {
+        exact(input, ["version", "type"], "session deletion control");
+        return { version: 1, type: "delete" };
     }
     if (input.type === "welcome_complete") {
         exact(input, ["version", "type"], "Welcome-complete control");

@@ -202,6 +202,8 @@ describe("negotiated relay sessions", () => {
                             accountKey: encodeBase64Url(target.accountKey),
                             rosterRevision: target.rosterRevision,
                         })),
+                        ownerAccount: null,
+                        sessionId: null,
                         createdAt: delivery.createdAt,
                         expiresAt: delivery.expiresAt,
                         ciphertext: encodeBase64Url(delivery.ciphertext),

@@ -52,6 +52,7 @@ export {
 export const POSTGRES_WAKE_CHANNEL = "murmur_queue_wake_v1";
 const SQL_VALUE_CHUNK = 10_000;
 const MAXIMUM_DIRECTORY_PREKEYS_PER_DEVICE = 256;
+const SESSION_DELETION_NONCE_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 
 function jsonValue(value: unknown): unknown {
     return typeof value === "string" ? (JSON.parse(value) as unknown) : value;
@@ -316,8 +317,8 @@ export class PostgresRelayStore implements RelayStore {
         await transaction.query(
             `INSERT INTO murmur_queue_deliveries
                     (sender, delivery_id, event_id, fingerprint, delivery_json,
-                     encoded_bytes, expires_at)
-                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7)`,
+                     encoded_bytes, expires_at, owner_account, session_id)
+                 VALUES ($1, $2, $3, $4, $5::jsonb, $6, $7, $8, $9)`,
             [
                 delivery.sender,
                 delivery.id,
@@ -326,6 +327,8 @@ export class PostgresRelayStore implements RelayStore {
                 encoded.json,
                 encoded.encodedBytes,
                 delivery.expiresAt.toString(),
+                delivery.ownerAccount,
+                delivery.sessionId,
             ],
         );
         await transaction.query(
@@ -1165,6 +1168,43 @@ export class PostgresRelayStore implements RelayStore {
         });
     }
 
+    async deleteSessionDeliveries(
+        ownerAccount: Uint8Array,
+        sessionId: Uint8Array,
+        requestId: string,
+        now: number,
+    ): Promise<number> {
+        this.#assertOpen();
+        if (ownerAccount.length !== 32 || sessionId.length !== 32 || requestId.length < 1) {
+            throw new Error("Invalid session deletion");
+        }
+        return this.#database.transaction(async (transaction) => {
+            await transaction.query(
+                "SELECT last_event_id FROM murmur_queue_global WHERE singleton = 1 FOR UPDATE",
+            );
+            await transaction.query(
+                `DELETE FROM murmur_session_deletion_nonces WHERE created_at < $1`,
+                [(now - SESSION_DELETION_NONCE_RETENTION_MILLISECONDS).toString()],
+            );
+            const replay = await transaction.query<{ request_id: unknown }>(
+                `SELECT request_id FROM murmur_session_deletion_nonces
+                 WHERE owner_account = $1 AND request_id = $2`,
+                [ownerAccount, requestId],
+            );
+            if (replay.rows.length > 0) {
+                throw new RelayError(409, "Session deletion was already applied", {
+                    error: "replay",
+                });
+            }
+            await transaction.query(
+                `INSERT INTO murmur_session_deletion_nonces
+                    (owner_account, request_id, created_at) VALUES ($1, $2, $3)`,
+                [ownerAccount, requestId, now.toString()],
+            );
+            return this.#deleteOwnedSessionDeliveries(transaction, ownerAccount, sessionId);
+        });
+    }
+
     async declareRestored(): Promise<number> {
         this.#assertOpen();
         return this.#database.transaction(async (transaction) => {
@@ -1340,6 +1380,100 @@ export class PostgresRelayStore implements RelayStore {
                       AS change(recipient, item_count, byte_count, loss_generation)
                  WHERE queue.recipient = change.recipient`,
                 changeParameters,
+            );
+        }
+        await transaction.query(
+            `UPDATE murmur_queue_global
+             SET pending_items = pending_items - $1,
+                 pending_bytes = pending_bytes - $2,
+                 pending_references = pending_references - $3
+             WHERE singleton = 1`,
+            [
+                bigintColumn(usageRow.item_count).toString(),
+                bigintColumn(usageRow.byte_count).toString(),
+                bigintColumn(usageRow.reference_count).toString(),
+            ],
+        );
+        return removed.rows.length;
+    }
+
+    async #deleteOwnedSessionDeliveries(
+        transaction: PostgresQuery,
+        ownerAccount: Uint8Array,
+        sessionId: Uint8Array,
+    ): Promise<number> {
+        const usage = await transaction.query<{
+            item_count: unknown;
+            byte_count: unknown;
+            reference_count: unknown;
+        }>(
+            `SELECT
+                COUNT(*) AS item_count,
+                COALESCE(SUM(encoded_bytes), 0) AS byte_count,
+                (SELECT COUNT(*)
+                 FROM murmur_queue_references AS reference
+                 JOIN murmur_queue_deliveries AS linked
+                   ON linked.sender = reference.sender
+                  AND linked.delivery_id = reference.delivery_id
+                 WHERE linked.owner_account = $1 AND linked.session_id = $2
+                ) AS reference_count
+             FROM murmur_queue_deliveries
+             WHERE owner_account = $1 AND session_id = $2`,
+            [ownerAccount, sessionId],
+        );
+        const usageRow = usage.rows[0];
+        if (usageRow === undefined) throw new Error("Missing session deletion usage result");
+        const affected = await transaction.query<{
+            recipient: unknown;
+            item_count: unknown;
+            byte_count: unknown;
+            loss_generation: unknown;
+        }>(
+            `SELECT reference.recipient,
+                    COUNT(reference.event_id) AS item_count,
+                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count,
+                    queue.loss_generation
+             FROM murmur_queue_references AS reference
+             JOIN murmur_queues AS queue ON queue.recipient = reference.recipient
+             JOIN murmur_queue_deliveries AS delivery
+               ON delivery.sender = reference.sender
+              AND delivery.delivery_id = reference.delivery_id
+             WHERE delivery.owner_account = $1 AND delivery.session_id = $2
+             GROUP BY reference.recipient, queue.loss_generation`,
+            [ownerAccount, sessionId],
+        );
+        const removed = await transaction.query<{ event_id: unknown }>(
+            `DELETE FROM murmur_queue_deliveries
+             WHERE owner_account = $1 AND session_id = $2
+             RETURNING event_id`,
+            [ownerAccount, sessionId],
+        );
+        for (let offset = 0; offset < affected.rows.length; offset += SQL_VALUE_CHUNK) {
+            const chunk = affected.rows.slice(offset, offset + SQL_VALUE_CHUNK);
+            const parameters: (Uint8Array | string)[] = [];
+            const values = chunk
+                .map((row, index) => {
+                    parameters.push(
+                        copyBytes(row.recipient, "queue recipient"),
+                        bigintColumn(row.item_count).toString(),
+                        bigintColumn(row.byte_count).toString(),
+                        advanceLossGeneration(
+                            copyBytes(row.loss_generation, "loss generation"),
+                            safeNumberColumn(row.item_count),
+                        ),
+                    );
+                    return `($${index * 4 + 1}::bytea, $${index * 4 + 2}::bigint, $${index * 4 + 3}::bigint, $${index * 4 + 4}::bytea)`;
+                })
+                .join(", ");
+            await transaction.query(
+                `UPDATE murmur_queues AS queue
+                 SET pending_items = queue.pending_items - change.item_count,
+                     pending_bytes = queue.pending_bytes - change.byte_count,
+                     loss_generation = change.loss_generation
+                 FROM (VALUES ${values})
+                      AS change(recipient, item_count, byte_count, loss_generation)
+                 WHERE queue.recipient = change.recipient`,
+                parameters,
             );
         }
         await transaction.query(

@@ -61,10 +61,21 @@ export class MurmurResetRequiredError extends Error {
     }
 }
 
+/** Accounts permitted to send application events in one session epoch. */
+export type MurmurSessionSendPolicy = "everyone" | "admins";
+
 /** Owner-controlled policies for one role-managed session. */
 export interface MurmurSessionPolicies {
     readonly adminsAssignAdmins: boolean;
     readonly anyoneCanAddMembers: boolean;
+    readonly sendPolicy: MurmurSessionSendPolicy;
+}
+
+/** Owner-controlled policy update. Omitted send policy keeps its current value. */
+export interface MurmurSessionPolicyChanges {
+    readonly adminsAssignAdmins: boolean;
+    readonly anyoneCanAddMembers: boolean;
+    readonly sendPolicy?: MurmurSessionSendPolicy;
 }
 
 /** One opaque application update from the identity's ordered inbox. */
@@ -76,6 +87,15 @@ export interface MurmurUpdate {
     readonly bytes: Uint8Array;
     /** Stable registered service owner, omitted for unowned sessions. */
     readonly service?: string;
+}
+
+/** Durable final lifecycle event for an owner-deleted session. */
+export interface MurmurSessionDeletedEvent {
+    /** Stable deletion delivery ID reused when a callback retries. */
+    readonly id: string;
+    readonly sessionId: Uint8Array;
+    readonly owner: Uint8Array;
+    readonly service: string;
 }
 
 /** Optional lifecycle configuration for the single identity-wide synchronization loop. */
@@ -128,6 +148,8 @@ interface CreateMurmurSessionCommonOptions {
     readonly adminsAssignAdmins?: boolean;
     /** Whether any member may add a new member account. Defaults to false. */
     readonly anyoneCanAddMembers?: boolean;
+    /** Who may send application events. Defaults to everyone. */
+    readonly sendPolicy?: MurmurSessionSendPolicy;
 }
 
 /** Bare MLS admission material used until relay-directory claims are introduced. */

@@ -8,6 +8,7 @@ import type {
 import {
     RelayError,
     deliveryFingerprint,
+    parseSessionDeletionRequest,
     parseSignedDelivery,
     signedDeliveryToJson,
     validateSignedDeliveryShape,
@@ -33,6 +34,10 @@ const META_KEY = "fanout:meta";
 const PENDING_PREFIX = "fanout:pending:";
 const INDEX_PREFIX = "fanout:index:";
 const EXPIRY_PREFIX = "fanout:expiry:";
+const SESSION_INDEX_PREFIX = "fanout:session:";
+const SESSION_TOMBSTONE_PREFIX = "fanout:deleted-session:";
+const DELETION_PREFIX = "fanout:deletion:";
+const DELETION_EXPIRY_PREFIX = "fanout:deletion-expiry:";
 const MAXIMUM_GLOBAL_ITEMS = 100_000;
 const MAXIMUM_GLOBAL_BYTES = 8 * 1024 * 1024 * 1024;
 const MAXIMUM_GLOBAL_REFERENCES = 1_000_000;
@@ -51,6 +56,7 @@ interface FanoutIndexRecord {
     readonly expiresAt: number;
     readonly encodedBytes: number;
     readonly references: number;
+    readonly sessionIndexKey: string | null;
 }
 
 interface FanoutExpiryRecord extends FanoutIndexRecord {
@@ -64,6 +70,28 @@ interface StoredFanoutManifest {
     readonly pendingRecipients: readonly string[];
 }
 
+interface SessionIndexRecord {
+    readonly recipients: readonly string[];
+}
+
+interface SessionTombstoneRecord {
+    readonly expiresAt: number;
+}
+
+interface SessionDeletionRecord {
+    readonly expiresAt: number;
+    readonly tombstoneKey: string;
+    readonly sessionPrefix: string;
+    readonly status: "collecting" | "pending" | "complete";
+    readonly pendingRecipients: readonly string[];
+    readonly removed: number;
+}
+
+interface SessionDeletionExpiryRecord {
+    readonly deletionKey: string;
+    readonly tombstoneKey: string;
+}
+
 function indexKey(delivery: SignedDelivery): string {
     return `${INDEX_PREFIX}${encodeBase64Url(delivery.sender)}:${delivery.id}`;
 }
@@ -74,6 +102,26 @@ function pendingKey(eventId: string): string {
 
 function expiryKey(expiresAt: number, eventId: string): string {
     return `${EXPIRY_PREFIX}${expiresAt.toString().padStart(16, "0")}:${eventId}`;
+}
+
+function sessionPrefix(ownerAccount: Uint8Array, sessionId: Uint8Array): string {
+    return `${SESSION_INDEX_PREFIX}${encodeBase64Url(ownerAccount)}:${encodeBase64Url(sessionId)}:`;
+}
+
+function sessionIndexKey(ownerAccount: Uint8Array, sessionId: Uint8Array, eventId: string): string {
+    return `${sessionPrefix(ownerAccount, sessionId)}${eventId}`;
+}
+
+function sessionTombstoneKey(ownerAccount: Uint8Array, sessionId: Uint8Array): string {
+    return `${SESSION_TOMBSTONE_PREFIX}${encodeBase64Url(ownerAccount)}:${encodeBase64Url(sessionId)}`;
+}
+
+function deletionKey(delivery: SignedDelivery): string {
+    return `${DELETION_PREFIX}${encodeBase64Url(delivery.sender)}:${delivery.id}`;
+}
+
+function deletionExpiryKey(expiresAt: number, delivery: SignedDelivery): string {
+    return `${DELETION_EXPIRY_PREFIX}${expiresAt.toString().padStart(16, "0")}:${encodeBase64Url(delivery.sender)}:${delivery.id}`;
 }
 
 function emptyMetadata(): FanoutMetadata {
@@ -119,6 +167,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
     readonly #state: DurableObjectStateLike;
     readonly #environment: MurmurCloudflareEnvironment;
     readonly #coordinator: DurableFanoutCoordinator;
+    readonly #deletionsInFlight = new Set<string>();
 
     constructor(state: DurableObjectStateLike, environment: MurmurCloudflareEnvironment) {
         this.#state = state;
@@ -139,6 +188,10 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                     }),
                 );
                 if (!response.ok) {
+                    if (response.status === 409) {
+                        const body = (await response.json()) as { readonly error?: unknown };
+                        if (body.error === "session_deleted") return;
+                    }
                     throw new Error(`Inbox insertion failed (${response.status})`);
                 }
             },
@@ -150,10 +203,18 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
     async fetch(request: Request): Promise<Response> {
         try {
             const url = new URL(request.url);
-            if (request.method !== "POST" || url.pathname !== "/v2/publish") {
+            if (request.method !== "POST") {
                 return json({ error: "not_found" }, 404);
             }
             const input = object(await requestJson(request));
+            if (url.pathname === "/v2/delete") {
+                const delivery = parseSignedDelivery(input.delivery);
+                const removed = await this.#deleteSession(delivery);
+                return json({ removed }, 200);
+            }
+            if (url.pathname !== "/v2/publish") {
+                return json({ error: "not_found" }, 404);
+            }
             if (
                 typeof input.admissionPrincipal !== "string" ||
                 input.admissionPrincipal.length < 1 ||
@@ -175,6 +236,7 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
 
     /** Resume the oldest incomplete manifest after a durable alarm. */
     async alarm(): Promise<void> {
+        await this.#pruneDeletionState(Date.now());
         await this.#coordinator.retry();
         await this.#scheduleNextExpiration();
     }
@@ -202,6 +264,23 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 return { eventId: existing.eventId, duplicate: true };
             }
             const metadata = (await transaction.get<FanoutMetadata>(META_KEY)) ?? emptyMetadata();
+            const eventId = nextUuidV7(now, metadata.lastEventId);
+            let linkedSessionIndexKey: string | null = null;
+            if (delivery.ownerAccount !== null && delivery.sessionId !== null) {
+                const tombstoneKey = sessionTombstoneKey(delivery.ownerAccount, delivery.sessionId);
+                const tombstone = await transaction.get<SessionTombstoneRecord>(tombstoneKey);
+                if (tombstone !== undefined && tombstone.expiresAt > now) {
+                    throw new RelayError(409, "Session was deleted", {
+                        error: "session_deleted",
+                    });
+                }
+                if (tombstone !== undefined) await transaction.delete(tombstoneKey);
+                linkedSessionIndexKey = sessionIndexKey(
+                    delivery.ownerAccount,
+                    delivery.sessionId,
+                    eventId,
+                );
+            }
             if (
                 metadata.retainedItems + 1 > MAXIMUM_GLOBAL_ITEMS ||
                 metadata.retainedBytes + encodedBytes > MAXIMUM_GLOBAL_BYTES ||
@@ -211,13 +290,13 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                     error: "relay_full",
                 });
             }
-            const eventId = nextUuidV7(now, metadata.lastEventId);
             const record: FanoutIndexRecord = {
                 eventId,
                 fingerprint,
                 expiresAt: delivery.expiresAt,
                 encodedBytes,
                 references: delivery.recipients.length,
+                sessionIndexKey: linkedSessionIndexKey,
             };
             const manifest: StoredFanoutManifest = {
                 eventId,
@@ -230,6 +309,11 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 ...record,
                 indexKey: key,
             });
+            if (linkedSessionIndexKey !== null) {
+                await transaction.put<SessionIndexRecord>(linkedSessionIndexKey, {
+                    recipients: delivery.recipients.map(encodeBase64Url),
+                });
+            }
             await transaction.put(pendingKey(eventId), manifest);
             await transaction.put<FanoutMetadata>(META_KEY, {
                 lastEventId: eventId,
@@ -305,7 +389,12 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
             let retainedBytes = metadata.retainedBytes;
             let retainedReferences = metadata.retainedReferences;
             for (const [key, value] of expired) {
-                await transaction.delete([key, value.indexKey, pendingKey(value.eventId)]);
+                await transaction.delete([
+                    key,
+                    value.indexKey,
+                    pendingKey(value.eventId),
+                    ...(value.sessionIndexKey === null ? [] : [value.sessionIndexKey]),
+                ]);
                 retainedItems -= 1;
                 retainedBytes -= value.encodedBytes;
                 retainedReferences -= value.references;
@@ -327,12 +416,194 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
     }
 
     async #scheduleNextExpiration(): Promise<void> {
-        const entries = await this.#state.storage.list<FanoutExpiryRecord>({
-            prefix: EXPIRY_PREFIX,
-            limit: 1,
+        const [deliveryEntries, deletionEntries] = await Promise.all([
+            this.#state.storage.list<FanoutExpiryRecord>({
+                prefix: EXPIRY_PREFIX,
+                limit: 1,
+            }),
+            this.#state.storage.list<SessionDeletionExpiryRecord>({
+                prefix: DELETION_EXPIRY_PREFIX,
+                limit: 1,
+            }),
+        ]);
+        const delivery = deliveryEntries.values().next().value as FanoutExpiryRecord | undefined;
+        const deletionKey = deletionEntries.keys().next().value as string | undefined;
+        if (delivery !== undefined) await this.schedule(delivery.expiresAt);
+        if (deletionKey !== undefined) {
+            const expiresAt = Number(
+                deletionKey.slice(
+                    DELETION_EXPIRY_PREFIX.length,
+                    DELETION_EXPIRY_PREFIX.length + 16,
+                ),
+            );
+            if (Number.isSafeInteger(expiresAt)) await this.schedule(expiresAt);
+        }
+    }
+
+    async #deleteSession(delivery: SignedDelivery): Promise<number> {
+        const now = Date.now();
+        const sessionId = this.#validateDeletion(delivery, now);
+        await this.#pruneDeletionState(now);
+        const key = deletionKey(delivery);
+        if (this.#deletionsInFlight.has(key)) {
+            throw new RelayError(409, "Session deletion is already in progress", {
+                error: "replay",
+            });
+        }
+        this.#deletionsInFlight.add(key);
+        try {
+            const tombstoneKey = sessionTombstoneKey(delivery.sender, sessionId);
+            const linkedSessionPrefix = sessionPrefix(delivery.sender, sessionId);
+            let record = await this.#state.storage.transaction(async (transaction) => {
+                const existing = await transaction.get<SessionDeletionRecord>(key);
+                if (existing !== undefined) {
+                    if (existing.sessionPrefix !== linkedSessionPrefix) {
+                        throw new RelayError(409, "Deletion identifier collision", {
+                            error: "id_collision",
+                        });
+                    }
+                    if (existing.status === "complete") {
+                        throw new RelayError(409, "Session deletion was already applied", {
+                            error: "replay",
+                        });
+                    }
+                    return existing;
+                }
+                const tombstone = await transaction.get<SessionTombstoneRecord>(tombstoneKey);
+                if (tombstone !== undefined && tombstone.expiresAt > now) {
+                    throw new RelayError(409, "Session was already deleted", {
+                        error: "session_deleted",
+                    });
+                }
+                const expiresAt = now + MAXIMUM_DELIVERY_TTL_MILLISECONDS;
+                const created: SessionDeletionRecord = {
+                    expiresAt,
+                    tombstoneKey,
+                    sessionPrefix: linkedSessionPrefix,
+                    status: "collecting",
+                    pendingRecipients: [],
+                    removed: 0,
+                };
+                await transaction.put<SessionTombstoneRecord>(tombstoneKey, { expiresAt });
+                await transaction.put<SessionDeletionRecord>(key, created);
+                await transaction.put<SessionDeletionExpiryRecord>(
+                    deletionExpiryKey(expiresAt, delivery),
+                    { deletionKey: key, tombstoneKey },
+                );
+                return created;
+            });
+            if (record.status === "collecting") {
+                const recipients = new Set<string>();
+                let after: string | undefined;
+                for (;;) {
+                    const page = await this.#state.storage.list<SessionIndexRecord>({
+                        prefix: record.sessionPrefix,
+                        ...(after === undefined ? {} : { startAfter: after }),
+                        limit: 1_000,
+                    });
+                    if (page.size === 0) break;
+                    after = [...page.keys()].at(-1);
+                    for (const value of page.values()) {
+                        for (const recipient of value.recipients) recipients.add(recipient);
+                    }
+                    if (page.size < 1_000) break;
+                }
+                record = {
+                    ...record,
+                    status: "pending",
+                    pendingRecipients: [...recipients].sort(),
+                };
+                await this.#state.storage.put<SessionDeletionRecord>(key, record);
+            }
+            for (const recipient of record.pendingRecipients) {
+                const id = this.#environment.MURMUR_INBOXES.idFromName(recipient);
+                const response = await this.#environment.MURMUR_INBOXES.get(id).fetch(
+                    new Request("https://murmur.internal/v2/delete", {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: JSON.stringify({
+                            recipient,
+                            delivery: signedDeliveryToJson(delivery),
+                        }),
+                    }),
+                );
+                if (!response.ok) {
+                    throw new Error(`Inbox session deletion failed (${response.status})`);
+                }
+                const body = (await response.json()) as { readonly removed?: unknown };
+                const removed =
+                    typeof body.removed === "number" && Number.isSafeInteger(body.removed)
+                        ? body.removed
+                        : 0;
+                record = {
+                    ...record,
+                    pendingRecipients: record.pendingRecipients.filter(
+                        (value) => value !== recipient,
+                    ),
+                    removed: record.removed + removed,
+                };
+                await this.#state.storage.put<SessionDeletionRecord>(key, record);
+            }
+            await this.#deletePrefix(record.sessionPrefix);
+            record = { ...record, status: "complete", pendingRecipients: [] };
+            await this.#state.storage.put<SessionDeletionRecord>(key, record);
+            await this.schedule(record.expiresAt);
+            return record.removed;
+        } finally {
+            this.#deletionsInFlight.delete(key);
+        }
+    }
+
+    async #deletePrefix(prefix: string): Promise<void> {
+        for (;;) {
+            const page = await this.#state.storage.list({ prefix, limit: 1_000 });
+            if (page.size === 0) return;
+            await this.#state.storage.delete([...page.keys()]);
+            if (page.size < 1_000) return;
+        }
+    }
+
+    async #pruneDeletionState(now: number): Promise<number> {
+        const entries = await this.#state.storage.list<SessionDeletionExpiryRecord>({
+            prefix: DELETION_EXPIRY_PREFIX,
+            end: `${DELETION_EXPIRY_PREFIX}${(now + 1).toString().padStart(16, "0")}`,
+            limit: PRUNE_BATCH,
         });
-        const record = entries.values().next().value as FanoutExpiryRecord | undefined;
-        if (record !== undefined) await this.schedule(record.expiresAt);
+        if (entries.size === 0) return 0;
+        await this.#state.storage.transaction(async (transaction) => {
+            for (const [key, value] of entries) {
+                await transaction.delete([key, value.deletionKey, value.tombstoneKey]);
+            }
+        });
+        return entries.size;
+    }
+
+    #validateDeletion(delivery: SignedDelivery, now: number): Uint8Array {
+        validateSignedDeliveryShape(delivery);
+        if (
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0 ||
+            delivery.ownerAccount !== null ||
+            delivery.sessionId !== null ||
+            delivery.ciphertext.length > 1_024 ||
+            !verifyDeliverySignature(delivery)
+        ) {
+            throw new RelayError(401, "Invalid session deletion authorization", {
+                error: "unauthorized",
+            });
+        }
+        if (
+            delivery.createdAt > now + MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt < now - MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > MAXIMUM_DELIVERY_TTL_MILLISECONDS
+        ) {
+            throw new RelayError(401, "Session deletion violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        return parseSessionDeletionRequest(delivery.ciphertext);
     }
 
     #validateDelivery(delivery: SignedDelivery): void {

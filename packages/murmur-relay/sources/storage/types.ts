@@ -67,6 +67,13 @@ export interface RelayStore {
         limits: QueueLimits,
         admissionPrincipal: Uint8Array,
     ): Promise<PublishOutcome>;
+    /** Replay-protected removal of every pending delivery owned by one session. */
+    deleteSessionDeliveries(
+        ownerAccount: Uint8Array,
+        sessionId: Uint8Array,
+        requestId: string,
+        now: number,
+    ): Promise<number>;
     /** Read one current roster by exact public account identity key. */
     readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined>;
     /** Atomically apply and notify one replay-protected identity-signed roster mutation. */

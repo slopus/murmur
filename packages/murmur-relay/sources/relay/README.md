@@ -8,6 +8,7 @@ wakeups.
 signed delivery -> validation -> atomic recipient fanout -> wake
 signed read -> authentication -> ordered bounded page
 signed acknowledgement -> authentication -> monotonic prefix trim
+account-signed deletion -> replay check -> exact owner/session purge
 account-signed upload -> current roster device -> durable prekey state
 ticket + exact account -> atomic per-device claim -> spent-notice wake
 ```

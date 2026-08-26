@@ -592,6 +592,7 @@ describe("stateful MLS sessions", () => {
                 policies: {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: false,
+                    sendPolicy: "everyone",
                 },
             });
             expect((await alice.session(session.id))?.members).toHaveLength(3);
@@ -712,6 +713,7 @@ describe("stateful MLS sessions", () => {
                 policies: {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
+                    sendPolicy: "everyone",
                 },
             });
             expect((await alice.session(session.id))?.members).toHaveLength(2);
@@ -933,6 +935,7 @@ describe("stateful MLS sessions", () => {
                 policies: {
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: true,
+                    sendPolicy: "everyone",
                 },
             });
 

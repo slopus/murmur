@@ -27,6 +27,15 @@ describe("Murmur services", () => {
                 service: { ...service, onUpdate: undefined } as unknown as MurmurService,
             }),
         ).toThrow("Invalid Murmur service registration");
+        expect(() =>
+            validateMurmurServiceRegistration({
+                id: "chat.v1",
+                service: {
+                    ...service,
+                    onSessionDeleted: true,
+                } as unknown as MurmurService,
+            }),
+        ).toThrow("Invalid Murmur service registration");
     });
 
     it("passes defensive session byte copies across the callback boundary", () => {
@@ -36,7 +45,11 @@ describe("Murmur services", () => {
             members: [new Uint8Array(32).fill(4), new Uint8Array(32).fill(5)],
             owner: new Uint8Array(32).fill(4),
             admins: [new Uint8Array(32).fill(4)],
-            policies: { adminsAssignAdmins: false, anyoneCanAddMembers: false },
+            policies: {
+                adminsAssignAdmins: false,
+                anyoneCanAddMembers: false,
+                sendPolicy: "everyone" as const,
+            },
         };
         const descriptor = createMurmurServiceSessionDescriptor(original);
         descriptor.id[0] = 99;

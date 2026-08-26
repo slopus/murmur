@@ -3,6 +3,7 @@ import {
     RelayError,
     parseDirectoryPrekeyUpload,
     parseDirectorySpentNotification,
+    parseSessionDeletionRequest,
     parseDeviceRosterMutation,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
@@ -266,6 +267,37 @@ export class RelayService {
             await this.#wakeSource.notify(queueId).catch(() => undefined);
         }
         return outcome;
+    }
+
+    /** Validate and apply one account-signed, replay-protected session deletion. */
+    async deleteSession(delivery: SignedDelivery): Promise<number> {
+        this.#assertOpen();
+        validateSignedDeliveryShape(delivery);
+        if (
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0 ||
+            delivery.ownerAccount !== null ||
+            delivery.sessionId !== null ||
+            !verifyDeliverySignature(delivery)
+        ) {
+            throw new RelayError(401, "Invalid session deletion authorization", {
+                error: "unauthorized",
+            });
+        }
+        const now = this.#now();
+        if (
+            delivery.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt < now - this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > this.#options.maximumDeliveryTtlMilliseconds
+        ) {
+            throw new RelayError(401, "Session deletion violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        const sessionId = parseSessionDeletionRequest(delivery.ciphertext);
+        return this.#store.deleteSessionDeliveries(delivery.sender, sessionId, delivery.id, now);
     }
 
     /** Read one current roster by exact public account identity key. */

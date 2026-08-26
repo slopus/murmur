@@ -332,6 +332,21 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         return { eventId: uuid(value.eventId), duplicate: value.duplicate };
     }
 
+    async deleteSession(delivery: SignedDelivery, signal?: AbortSignal): Promise<number> {
+        const value = object(
+            await this.#post("/v1/sessions/delete", signedDeliveryToJson(delivery), signal),
+        );
+        exact(value, ["removed"]);
+        if (
+            typeof value.removed !== "number" ||
+            !Number.isSafeInteger(value.removed) ||
+            value.removed < 0
+        ) {
+            throw new Error("Invalid relay response");
+        }
+        return value.removed;
+    }
+
     async readDeviceRoster(
         accountKey: Uint8Array,
         signal?: AbortSignal,

@@ -22,6 +22,7 @@ export interface SessionRecord {
     readonly previousGeneration?: bigint;
     readonly previousEpochExpiresAt?: number;
     readonly previousMessagesRemaining?: number;
+    readonly previousRoles?: SessionRoles;
     readonly roles: SessionRoles;
     readonly removalGenerations: readonly SessionRemovalGeneration[];
     readonly bootstrapKeyPackageReference?: Uint8Array;
@@ -72,12 +73,30 @@ export type SessionIntentRecord =
           readonly sessionId: Uint8Array;
           readonly adminsAssignAdmins: boolean;
           readonly anyoneCanAddMembers: boolean;
+          readonly sendPolicy: "everyone" | "admins";
       };
 
 export interface BufferedEventRecord {
     readonly version: 1;
     readonly sender: Uint8Array;
     readonly bytes: Uint8Array;
+}
+
+/** Durable relay purge and final MLS notice retained after local session destruction. */
+export interface SessionDeletionOutboxRecord {
+    readonly version: 1;
+    readonly sessionId: Uint8Array;
+    readonly request: SignedDelivery;
+    readonly notice: SignedDelivery;
+}
+
+/** Durable service lifecycle event retained until its callback commits. */
+export interface SessionDeletedEventRecord {
+    readonly version: 1;
+    readonly id: string;
+    readonly sessionId: Uint8Array;
+    readonly owner: Uint8Array;
+    readonly serviceId?: string;
 }
 
 const DELIVERY_ID = /^[A-Za-z0-9_-]{32}$/;
@@ -142,6 +161,10 @@ export function encodeSessionRecord(record: SessionRecord): Uint8Array {
         previousGeneration: record.previousGeneration?.toString() ?? null,
         previousEpochExpiresAt: record.previousEpochExpiresAt ?? null,
         previousMessagesRemaining: record.previousMessagesRemaining ?? null,
+        previousRoles:
+            record.previousRoles === undefined
+                ? null
+                : encodeBase64Url(encodeSessionRoles(record.previousRoles)),
         ...(record.reAdmission === true ? { reAdmission: true } : {}),
     };
     const removalGenerations = [...record.removalGenerations]
@@ -183,6 +206,7 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         "previousGeneration",
         "previousEpochExpiresAt",
         "previousMessagesRemaining",
+        "previousRoles",
         "roles",
         "removalGenerations",
         "bootstrapKeyPackageReference",
@@ -201,11 +225,13 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         (input.previousEpoch === null) !== (input.previousGeneration === null) ||
         (input.previousEpoch === null) !== (input.previousEpochExpiresAt === null) ||
         (input.previousEpoch === null) !== (input.previousMessagesRemaining === null) ||
+        (input.previousEpoch === null) !== (input.previousRoles === null) ||
         (input.previousEpoch !== null && typeof input.previousEpoch !== "string") ||
         (input.previousGeneration !== null &&
             (typeof input.previousGeneration !== "string" ||
                 !/^(0|[1-9]\d*)$/.test(input.previousGeneration))) ||
         typeof input.roles !== "string" ||
+        (input.previousRoles !== null && typeof input.previousRoles !== "string") ||
         !Array.isArray(input.removalGenerations) ||
         input.removalGenerations.length > 256 ||
         (input.bootstrapKeyPackageReference !== null &&
@@ -260,6 +286,9 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
                       input.previousMessagesRemaining,
                       1_000,
                       "previous epoch message count",
+                  ),
+                  previousRoles: decodeSessionRoles(
+                      bytes(input.previousRoles, 64 * 1024, "previous session roles"),
                   ),
               }),
         roles: decodeSessionRoles(bytes(input.roles, 64 * 1024, "session roles")),
@@ -416,6 +445,7 @@ export function encodeSessionIntent(record: SessionIntentRecord): Uint8Array {
             ? {
                   adminsAssignAdmins: record.adminsAssignAdmins,
                   anyoneCanAddMembers: record.anyoneCanAddMembers,
+                  sendPolicy: record.sendPolicy,
               }
             : { account: encodeBase64Url(record.account) }),
         ...(record.kind === "add"
@@ -445,12 +475,20 @@ export function decodeSessionIntent(value: Uint8Array): SessionIntentRecord {
     if (input.kind === "set_policies") {
         exact(
             input,
-            ["version", "kind", "sessionId", "adminsAssignAdmins", "anyoneCanAddMembers"],
+            [
+                "version",
+                "kind",
+                "sessionId",
+                "adminsAssignAdmins",
+                "anyoneCanAddMembers",
+                "sendPolicy",
+            ],
             "session intent",
         );
         if (
             typeof input.adminsAssignAdmins !== "boolean" ||
-            typeof input.anyoneCanAddMembers !== "boolean"
+            typeof input.anyoneCanAddMembers !== "boolean" ||
+            (input.sendPolicy !== "everyone" && input.sendPolicy !== "admins")
         ) {
             throw new Error("Invalid session intent");
         }
@@ -460,6 +498,7 @@ export function decodeSessionIntent(value: Uint8Array): SessionIntentRecord {
             sessionId: bytes(input.sessionId, 255, "intent session ID"),
             adminsAssignAdmins: input.adminsAssignAdmins,
             anyoneCanAddMembers: input.anyoneCanAddMembers,
+            sendPolicy: input.sendPolicy,
         };
     }
     const add = input.kind === "add";
@@ -514,5 +553,56 @@ export function decodeBufferedEvent(value: Uint8Array): BufferedEventRecord {
         version: 1,
         sender: bytes(input.sender, 32, "buffered event sender"),
         bytes: bytes(input.bytes, 1024 * 1024, "buffered event bytes"),
+    };
+}
+
+export function encodeSessionDeletionOutbox(record: SessionDeletionOutboxRecord): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        sessionId: encodeBase64Url(record.sessionId),
+        request: signedDeliveryToJson(record.request),
+        notice: signedDeliveryToJson(record.notice),
+    } as unknown as JsonValue);
+}
+
+export function decodeSessionDeletionOutbox(value: Uint8Array): SessionDeletionOutboxRecord {
+    const input = json(value, 4 * 1024 * 1024, "session deletion outbox");
+    exact(input, ["version", "sessionId", "request", "notice"], "session deletion outbox");
+    if (input.version !== 1) throw new Error("Invalid session deletion outbox");
+    return {
+        version: 1,
+        sessionId: bytes(input.sessionId, 32, "deleted session ID"),
+        request: parseSignedDelivery(input.request),
+        notice: parseSignedDelivery(input.notice),
+    };
+}
+
+export function encodeSessionDeletedEvent(record: SessionDeletedEventRecord): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        id: record.id,
+        sessionId: encodeBase64Url(record.sessionId),
+        owner: encodeBase64Url(record.owner),
+        serviceId: record.serviceId ?? null,
+    });
+}
+
+export function decodeSessionDeletedEvent(value: Uint8Array): SessionDeletedEventRecord {
+    const input = json(value, 4 * 1024, "session deletion event");
+    exact(input, ["version", "id", "sessionId", "owner", "serviceId"], "session deletion event");
+    if (
+        input.version !== 1 ||
+        typeof input.id !== "string" ||
+        !DELIVERY_ID.test(input.id) ||
+        (input.serviceId !== null && typeof input.serviceId !== "string")
+    ) {
+        throw new Error("Invalid session deletion event");
+    }
+    return {
+        version: 1,
+        id: input.id,
+        sessionId: bytes(input.sessionId, 32, "deleted session ID"),
+        owner: bytes(input.owner, 32, "deleted session owner"),
+        ...(input.serviceId === null ? {} : { serviceId: input.serviceId }),
     };
 }

@@ -2,8 +2,9 @@
 
 The Fetch-compatible handler exposes health, signed publication, bounded queue
 read, ordered SSE, signed acknowledgement, current device rosters, directory
-uploads, and exact ticketed directory claims. JSON parsing rejects duplicate
-keys and unknown fields before protocol validation.
+uploads, exact ticketed directory claims, and account-signed terminal session
+deletion. JSON parsing rejects duplicate keys and unknown fields before protocol
+validation.
 
 CORS origins are exact, request sizes are bounded, and POST rate limiting uses
 a trusted remote address. A trusted ingress principal separately bounds

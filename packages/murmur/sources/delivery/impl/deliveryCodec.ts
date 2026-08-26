@@ -38,6 +38,8 @@ export interface SignedDeliveryJson {
         readonly accountKey: string;
         readonly rosterRevision: number;
     }[];
+    readonly ownerAccount: string | null;
+    readonly sessionId: string | null;
     readonly createdAt: number;
     readonly expiresAt: number;
     readonly ciphertext: string;
@@ -116,6 +118,16 @@ function separated(domain: string, value: Parameters<typeof canonicalJsonBytes>[
     return bytes;
 }
 
+/** Encode one account-signed session-deletion request body. */
+export function encodeSessionDeletionRequest(sessionId: Uint8Array): Uint8Array {
+    if (sessionId.length !== 32) throw new Error("Invalid session deletion request");
+    return canonicalJsonBytes({
+        version: 1,
+        type: "delete_session",
+        sessionId: encodeBase64Url(sessionId),
+    });
+}
+
 /**
  * Encode one delivery for relay JSON from a custom transport implementation.
  */
@@ -129,6 +141,9 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
             accountKey: encodeBase64Url(target.accountKey),
             rosterRevision: target.rosterRevision,
         })),
+        ownerAccount:
+            delivery.ownerAccount === null ? null : encodeBase64Url(delivery.ownerAccount),
+        sessionId: delivery.sessionId === null ? null : encodeBase64Url(delivery.sessionId),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: encodeBase64Url(delivery.ciphertext),
@@ -157,6 +172,14 @@ export function validateSignedDelivery(delivery: SignedDelivery): void {
         delivery.signature.length !== 64
     ) {
         throw new Error("Invalid signed delivery");
+    }
+    if ((delivery.ownerAccount === null) !== (delivery.sessionId === null)) {
+        throw new Error("Invalid signed delivery session ownership");
+    }
+    if (delivery.ownerAccount !== null)
+        validateIdentityPublicKey({ publicKey: delivery.ownerAccount });
+    if (delivery.sessionId !== null && delivery.sessionId.length !== 32) {
+        throw new Error("Invalid signed delivery session ID");
     }
     let previous: Uint8Array | undefined;
     for (const recipient of delivery.recipients) {
@@ -212,6 +235,8 @@ export function createSignedDelivery(
                 rosterRevision: target.rosterRevision,
             }))
             .sort((left, right) => compareBytes(left.accountKey, right.accountKey)),
+        ownerAccount: options.ownerAccount?.slice() ?? null,
+        sessionId: options.sessionId?.slice() ?? null,
         createdAt,
         expiresAt: options.expiresAt,
         ciphertext: ciphertext.slice(),
@@ -231,6 +256,8 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
             "sender",
             "recipients",
             "targetAccounts",
+            "ownerAccount",
+            "sessionId",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -245,6 +272,8 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         !Array.isArray(input.recipients) ||
         input.recipients.some((entry) => typeof entry !== "string") ||
         !Array.isArray(input.targetAccounts) ||
+        (input.ownerAccount !== null && typeof input.ownerAccount !== "string") ||
+        (input.sessionId !== null && typeof input.sessionId !== "string") ||
         typeof input.ciphertext !== "string" ||
         typeof input.signature !== "string"
     ) {
@@ -269,6 +298,9 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
                 ),
             };
         }),
+        ownerAccount:
+            input.ownerAccount === null ? null : decodeBase64Url(input.ownerAccount as string),
+        sessionId: input.sessionId === null ? null : decodeBase64Url(input.sessionId as string),
         createdAt: safeInteger(input.createdAt, "delivery timestamp"),
         expiresAt: safeInteger(input.expiresAt, "delivery expiration"),
         ciphertext: decodeBase64Url(input.ciphertext),
@@ -288,6 +320,13 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
             delivery.signature.length !== 64
         ) {
             throw new Error("Invalid signed delivery");
+        }
+        if (
+            (delivery.ownerAccount === null) !== (delivery.sessionId === null) ||
+            (delivery.ownerAccount !== null && delivery.ownerAccount.length !== 32) ||
+            (delivery.sessionId !== null && delivery.sessionId.length !== 32)
+        ) {
+            throw new Error("Invalid signed delivery session ownership");
         }
         let previous: Uint8Array | undefined;
         for (const recipient of delivery.recipients) {

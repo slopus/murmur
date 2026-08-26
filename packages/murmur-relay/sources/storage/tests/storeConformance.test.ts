@@ -646,6 +646,72 @@ describe("identity queue store conformance", () => {
         }
     });
 
+    test("deletes only exact owner-session deliveries, advances continuity, and rejects replay", async () => {
+        const owner = identity(secret(40));
+        const otherOwner = identity(secret(41));
+        const senderSecret = secret(42);
+        const bob = identity(secret(43));
+        const carol = identity(secret(44));
+        const firstSession = new Uint8Array(32).fill(45);
+        const secondSession = new Uint8Array(32).fill(46);
+        const requestId = signedDelivery(secret(40), [], { id: 47 }).id;
+        for (const store of await stores()) {
+            try {
+                await store.publish(
+                    signedDelivery(senderSecret, recipients(bob, carol), {
+                        id: 48,
+                        ownerAccount: owner,
+                        sessionId: firstSession,
+                    }),
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await store.publish(
+                    signedDelivery(senderSecret, recipients(bob), {
+                        id: 49,
+                        ownerAccount: owner,
+                        sessionId: secondSession,
+                    }),
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await store.publish(
+                    signedDelivery(senderSecret, recipients(bob), {
+                        id: 50,
+                        ownerAccount: otherOwner,
+                        sessionId: firstSession,
+                    }),
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                const bobBefore = await store.readQueue(bob, null, 10, NOW, PAGE);
+                const carolBefore = await store.readQueue(carol, null, 10, NOW, PAGE);
+
+                await expect(
+                    store.deleteSessionDeliveries(owner, firstSession, requestId, NOW),
+                ).resolves.toBe(1);
+                const bobAfter = await store.readQueue(bob, null, 10, NOW, PAGE);
+                const carolAfter = await store.readQueue(carol, null, 10, NOW, PAGE);
+                expect(bobAfter.deliveries).toHaveLength(2);
+                expect(carolAfter.deliveries).toHaveLength(0);
+                expect(encodeBase64Url(bobAfter.generation)).not.toBe(
+                    encodeBase64Url(bobBefore.generation),
+                );
+                expect(encodeBase64Url(carolAfter.generation)).not.toBe(
+                    encodeBase64Url(carolBefore.generation),
+                );
+                await expect(
+                    store.deleteSessionDeliveries(owner, firstSession, requestId, NOW),
+                ).rejects.toMatchObject({ status: 409, body: { error: "replay" } });
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
     test("rejects pending ID collisions and all-or-nothing queue overflow", async () => {
         const aliceSecret = secret(4);
         const bob = identity(secret(5));

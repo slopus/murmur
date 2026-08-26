@@ -374,6 +374,13 @@ export function createRelayFetchHandler(
                     corsHeaders,
                 );
             }
+            if (request.method === "POST" && url.pathname === "/v1/sessions/delete") {
+                const delivery = parseSignedDelivery(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                const removed = await relay.deleteSession(delivery);
+                return boundedJson({ removed }, relay.options.maximumJsonBodyBytes, corsHeaders);
+            }
             if (request.method === "POST" && url.pathname === "/v1/device-rosters/read") {
                 const accountKey = parseDeviceRosterLookup(
                     await readJson(request, relay.options.maximumJsonBodyBytes),

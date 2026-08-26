@@ -25,6 +25,18 @@ revisions. A `409 stale_roster` response includes the relay's current roster so
 the sender can durably retarget and retry. Deliveries with no account targets
 retain pure exact-inbox semantics.
 
+Session deliveries additionally carry nullable `ownerAccount` and `sessionId`
+fields. They must either both be null or both identify the immutable session
+owner and exact 32-byte MLS group ID.
+
+## `POST /v1/sessions/delete`
+
+Accepts an account-identity-signed, recipientless delivery whose ciphertext is
+`{ version: 1, type: "delete_session", sessionId }`. The relay replay-protects
+the delivery operation ID and durably removes all pending deliveries tagged
+with that exact sender account and session ID. Affected inbox continuity
+generations advance. Success returns `{ removed }`; replay returns `409`.
+
 ## `POST /v1/device-rosters/read`
 
 Accepts `{ accountKey }` for one exact public account identity. Returns the

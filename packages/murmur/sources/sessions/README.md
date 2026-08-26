@@ -18,6 +18,12 @@ resolves.
 The implementation persists session records, active and staged epochs, intents,
 outboxes, replay markers, routing decisions, and queue progress atomically.
 
+Creation selects an `everyone` or `admins` send policy. Policy changes are
+owner-only and Commit-bound; local sends and exact-epoch remote senders are
+checked before application data is accepted. Owner deletion durably separates
+the account-signed relay purge request and final MLS notice from session state,
+so local cleanup is terminal while publication remains retryable.
+
 `claimAccount()` validates every returned MLS signature, lifetime, device key,
 and account credential before exposing an immutable claim. `createSession()`
 and `addMember()` flatten that claim into device-level MLS additions. Client

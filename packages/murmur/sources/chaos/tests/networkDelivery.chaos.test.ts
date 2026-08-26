@@ -74,6 +74,8 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
             accountKey: target.accountKey.slice(),
             rosterRevision: target.rosterRevision,
         })),
+        ownerAccount: delivery.ownerAccount?.slice() ?? null,
+        sessionId: delivery.sessionId?.slice() ?? null,
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),

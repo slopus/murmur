@@ -19,7 +19,7 @@ import {
     MurmurClient,
     type MurmurResetEvent,
     type MurmurSession,
-    type MurmurSessionPolicies,
+    type MurmurSessionPolicyChanges,
     type MurmurUpdate,
 } from "../../sessions/index.js";
 import {
@@ -100,6 +100,13 @@ class CommitGateTransport implements DeliveryTransport {
         return this.#delegate.publish(delivery, signal);
     }
 
+    async deleteSession(delivery: SignedDelivery, signal?: AbortSignal): Promise<number> {
+        if (this.#delegate.deleteSession === undefined) {
+            throw new Error("Delivery transport does not support session deletion");
+        }
+        return this.#delegate.deleteSession(delivery, signal);
+    }
+
     async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
         return this.#delegate.read(request, signal);
     }
@@ -139,6 +146,8 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
             accountKey: target.accountKey.slice(),
             rosterRevision: target.rosterRevision,
         })),
+        ownerAccount: delivery.ownerAccount?.slice() ?? null,
+        sessionId: delivery.sessionId?.slice() ?? null,
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: delivery.ciphertext.slice(),
@@ -161,7 +170,7 @@ async function openActor(
     };
 }
 
-async function createRoleFixture(policies: MurmurSessionPolicies): Promise<RoleFixture> {
+async function createRoleFixture(policies: MurmurSessionPolicyChanges): Promise<RoleFixture> {
     const now = { value: NOW };
     const relay = new RelayService(
         new SqliteRelayStore(":memory:"),
@@ -181,6 +190,7 @@ async function createRoleFixture(policies: MurmurSessionPolicies): Promise<RoleF
             descriptor: utf8Encode("role-policy chaos"),
             adminsAssignAdmins: policies.adminsAssignAdmins,
             anyoneCanAddMembers: policies.anyoneCanAddMembers,
+            sendPolicy: policies.sendPolicy ?? "everyone",
             members: [
                 await bob.client.createKeyPackage(),
                 await carol.client.createKeyPackage(),
@@ -197,7 +207,7 @@ async function createRoleFixture(policies: MurmurSessionPolicies): Promise<RoleF
         expect(await alice.client.session(session.id)).toMatchObject({
             owner: alice.client.accountKey,
             admins: expect.arrayContaining([alice.client.accountKey, bob.client.accountKey]),
-            policies,
+            policies: { ...policies, sendPolicy: policies.sendPolicy ?? "everyone" },
         });
         return {
             relay,
@@ -519,6 +529,101 @@ describe("role, policy, and private-roster session races", () => {
         }
     }, 120_000);
 
+    test("admins-only send policy rejects local members and forged remote application events", async () => {
+        const fixture = await createRoleFixture({
+            adminsAssignAdmins: false,
+            anyoneCanAddMembers: false,
+            sendPolicy: "admins",
+        });
+        try {
+            await expect(
+                fixture.carol.client.send(fixture.sessionId, utf8Encode("local-forbidden")),
+            ).rejects.toThrow("may not send");
+
+            const forgedStore = await cloneMemoryStore(fixture.carol.store);
+            const forged = await openActor(
+                "carol",
+                fixture.base,
+                () => fixture.now.value,
+                forgedStore,
+            );
+            try {
+                await rewriteRoles(forged, fixture.sessionId, (roles) => ({
+                    ...roles,
+                    sendPolicy: "everyone",
+                }));
+                await forged.client.send(fixture.sessionId, utf8Encode("forged-remote"));
+                await forged.client.synchronize({ waitMilliseconds: 0 });
+                await synchronize([fixture.alice, fixture.bob, fixture.dave], 2);
+
+                expect(
+                    (await consume(fixture.dave)).map((update) => utf8Decode(update.bytes)),
+                ).not.toContain("forged-remote");
+                expect(await fixture.alice.client.issues()).toEqual(
+                    expect.arrayContaining([
+                        expect.objectContaining({ code: "unauthorized_application_sender" }),
+                    ]),
+                );
+            } finally {
+                forged.client.close();
+            }
+        } finally {
+            await fixture.close();
+        }
+    }, 120_000);
+
+    test("owner deletion is local-terminal and its final MLS notice destroys every member session", async () => {
+        const fixture = await createRoleFixture({
+            adminsAssignAdmins: false,
+            anyoneCanAddMembers: false,
+        });
+        try {
+            await expect(fixture.carol.client.deleteSession(fixture.sessionId)).rejects.toThrow(
+                "Only the session owner",
+            );
+
+            const forgedStore = await cloneMemoryStore(fixture.carol.store);
+            const forged = await openActor(
+                "carol",
+                fixture.base,
+                () => fixture.now.value,
+                forgedStore,
+            );
+            try {
+                await rewriteRoles(forged, fixture.sessionId, (roles) => ({
+                    ...roles,
+                    owner: fixture.carol.client.accountKey,
+                }));
+                await forged.client.deleteSession(fixture.sessionId);
+                await forged.client.synchronize({ waitMilliseconds: 0 });
+                await copyDeliveryProgress(forged.store, fixture.carol.store);
+                await synchronize([fixture.alice, fixture.bob, fixture.dave], 2);
+                for (const actor of [fixture.alice, fixture.bob, fixture.dave]) {
+                    await expect(actor.client.session(fixture.sessionId)).resolves.toBeDefined();
+                }
+                expect(await fixture.alice.client.issues()).toEqual(
+                    expect.arrayContaining([
+                        expect.objectContaining({ code: "unauthorized_session_deletion" }),
+                    ]),
+                );
+            } finally {
+                forged.client.close();
+            }
+
+            const deletionId = await fixture.alice.client.deleteSession(fixture.sessionId);
+            expect(deletionId).toMatch(/^[A-Za-z0-9_-]{32}$/);
+            await expect(fixture.alice.client.session(fixture.sessionId)).resolves.toBeUndefined();
+
+            await fixture.alice.client.synchronize({ waitMilliseconds: 0 });
+            await synchronize([fixture.bob, fixture.carol, fixture.dave], 2);
+            for (const actor of [fixture.bob, fixture.carol, fixture.dave]) {
+                await expect(actor.client.session(fixture.sessionId)).resolves.toBeUndefined();
+            }
+        } finally {
+            await fixture.close();
+        }
+    }, 120_000);
+
     test("ROLE-01/08 forged remote controls and malformed role encodings fail closed", async () => {
         const owner = new Uint8Array(32).fill(1);
         const first = new Uint8Array(32).fill(2);
@@ -555,6 +660,7 @@ describe("role, policy, and private-roster session races", () => {
                     admins: [],
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: false,
+                    sendPolicy: "everyone",
                 }),
                 0,
             ]),
@@ -1051,6 +1157,7 @@ describe("role, policy, and private-roster session races", () => {
                 expect(final.policies).toEqual({
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: false,
+                    sendPolicy: "everyone",
                 });
                 expect(
                     final.admins.some((admin) => equalBytes(admin, fixture.bob.client.accountKey)),

@@ -18,6 +18,7 @@ const DELIVERY_ID_BYTES = 24;
 const IDENTITY_BYTES = 32;
 const SIGNATURE_BYTES = 64;
 const textEncoder = new TextEncoder();
+const textDecoder = new TextDecoder();
 
 function objectValue(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -73,6 +74,25 @@ function compareBytes(left: Uint8Array, right: Uint8Array): number {
     return left.length - right.length;
 }
 
+/** Strictly decode one account-signed session-deletion request body. */
+export function parseSessionDeletionRequest(value: Uint8Array): Uint8Array {
+    if (!(value instanceof Uint8Array) || value.length < 1 || value.length > 1_024) {
+        throw new RelayError(400, "Invalid session deletion request", { error: "malformed" });
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(textDecoder.decode(value)) as unknown;
+    } catch {
+        throw new RelayError(400, "Invalid session deletion request", { error: "malformed" });
+    }
+    const input = objectValue(parsed, "session deletion request");
+    exactKeys(input, ["version", "type", "sessionId"], "session deletion request");
+    if (input.version !== 1 || input.type !== "delete_session") {
+        throw new RelayError(400, "Invalid session deletion request", { error: "malformed" });
+    }
+    return bytesValue(input.sessionId, "session deletion ID", IDENTITY_BYTES);
+}
+
 function validateIdentity(value: unknown, name: string): asserts value is Uint8Array {
     if (!(value instanceof Uint8Array) || value.length !== IDENTITY_BYTES) {
         throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
@@ -116,6 +136,8 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
             "sender",
             "recipients",
             "targetAccounts",
+            "ownerAccount",
+            "sessionId",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -132,6 +154,13 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
     }
     if (!Array.isArray(delivery.targetAccounts)) {
         throw new RelayError(400, "Invalid delivery target accounts", { error: "malformed" });
+    }
+    if ((delivery.ownerAccount === null) !== (delivery.sessionId === null)) {
+        throw new RelayError(400, "Invalid delivery session ownership", { error: "malformed" });
+    }
+    if (delivery.ownerAccount !== null) validateIdentity(delivery.ownerAccount, "delivery owner");
+    if (delivery.sessionId !== null && delivery.sessionId.length !== IDENTITY_BYTES) {
+        throw new RelayError(400, "Invalid delivery session ID", { error: "malformed" });
     }
     let previous: Uint8Array | undefined;
     for (const recipient of delivery.recipients) {
@@ -183,6 +212,9 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
             accountKey: encodeBase64Url(target.accountKey),
             rosterRevision: target.rosterRevision,
         })),
+        ownerAccount:
+            delivery.ownerAccount === null ? null : encodeBase64Url(delivery.ownerAccount),
+        sessionId: delivery.sessionId === null ? null : encodeBase64Url(delivery.sessionId),
         createdAt: delivery.createdAt,
         expiresAt: delivery.expiresAt,
         ciphertext: encodeBase64Url(delivery.ciphertext),
@@ -201,6 +233,8 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
             "sender",
             "recipients",
             "targetAccounts",
+            "ownerAccount",
+            "sessionId",
             "createdAt",
             "expiresAt",
             "ciphertext",
@@ -239,6 +273,14 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
                 ),
             };
         }),
+        ownerAccount:
+            input.ownerAccount === null
+                ? null
+                : bytesValue(input.ownerAccount, "delivery owner", IDENTITY_BYTES),
+        sessionId:
+            input.sessionId === null
+                ? null
+                : bytesValue(input.sessionId, "delivery session ID", IDENTITY_BYTES),
         createdAt: safeInteger(input.createdAt, "delivery timestamp"),
         expiresAt: safeInteger(input.expiresAt, "delivery expiration"),
         ciphertext: bytesValue(input.ciphertext, "delivery ciphertext"),

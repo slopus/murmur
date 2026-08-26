@@ -197,4 +197,64 @@ describe("typed session services", () => {
             await relay.close();
         }
     });
+
+    test("retries one final typed service event after owner deletion destroys local state", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const fetch = relayFetch(relay);
+        const ownerEvents: string[] = [];
+        const memberEvents: string[] = [];
+        let memberAttempts = 0;
+        const ownerService: MurmurService = {
+            onNewSession: async () => true,
+            onUpdate: async () => {},
+            onSessionDeleted: async (event) => {
+                ownerEvents.push(event.id);
+            },
+        };
+        const memberService: MurmurService = {
+            onNewSession: async () => true,
+            onUpdate: async () => {},
+            onSessionDeleted: async (event) => {
+                memberAttempts += 1;
+                memberEvents.push(event.id);
+                if (memberAttempts === 1) throw new Error("retry deletion event");
+            },
+        };
+        const alice = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+            services: [{ id: "notes", service: ownerService }],
+        });
+        const bob = await MurmurClient.open({
+            relay: "https://relay.test",
+            fetch,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+            services: [{ id: "notes", service: memberService }],
+        });
+        try {
+            const session = await alice.createSession({
+                descriptor: utf8Encode("delete-service"),
+                members: [await bob.createKeyPackage()],
+                service: "notes",
+            });
+            await alice.synchronize();
+            await bob.synchronize();
+            await alice.synchronize();
+
+            const deletionId = await alice.deleteSession(session.id);
+            await alice.synchronize();
+            expect(ownerEvents).toEqual([deletionId]);
+            await expect(bob.synchronize()).rejects.toThrow("retry deletion event");
+            await expect(bob.session(session.id)).resolves.toBeUndefined();
+            await bob.synchronize();
+            expect(memberEvents).toEqual([deletionId, deletionId]);
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
 });

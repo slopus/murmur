@@ -57,6 +57,7 @@ describe("session frame codecs", () => {
             admins: [],
             adminsAssignAdmins: false,
             anyoneCanAddMembers: false,
+            sendPolicy: "everyone" as const,
         };
         for (const epoch of [-1n, 2n ** 64n]) {
             expect(() =>
@@ -77,6 +78,7 @@ describe("session frame codecs", () => {
             admins: [new Uint8Array(32).fill(2)],
             adminsAssignAdmins: true,
             anyoneCanAddMembers: false,
+            sendPolicy: "admins" as const,
         };
         const control = decodeSessionControl(encodeSessionControl({ roles }));
         expect(control).toEqual({ roles });

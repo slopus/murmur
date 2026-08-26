@@ -1261,6 +1261,7 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(final?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
+                    sendPolicy: "everyone",
                 });
                 await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol, fixture.dave]);
             } finally {
@@ -1532,6 +1533,7 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
+                    sendPolicy: "everyone",
                 });
                 expect(terminal?.members).toHaveLength(6);
                 for (const actor of participants.filter(({ name }) => name !== "frank")) {
@@ -1666,6 +1668,7 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
+                    sendPolicy: "everyone",
                 });
                 expect(memberCount(terminal, fixture.bob)).toBe(1);
                 expect(
@@ -1724,6 +1727,7 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
+                    sendPolicy: "everyone",
                 });
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol, fixture.dave]) {
                     const session = await actor.client.session(fixture.session.id);
@@ -1818,6 +1822,7 @@ describe("Commit race and intent convergence chaos", () => {
                     expect(terminal?.policies).toEqual({
                         adminsAssignAdmins: false,
                         anyoneCanAddMembers: true,
+                        sendPolicy: "everyone",
                     });
                     expect(memberCount(terminal, fixture.carol)).toBe(0);
                     expect(

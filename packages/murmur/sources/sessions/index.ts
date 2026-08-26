@@ -85,7 +85,7 @@ import type {
     MurmurSessionAdmission,
     MurmurAccountClaim,
     MurmurClaimedSessionMember,
-    MurmurSessionPolicies,
+    MurmurSessionPolicyChanges,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,
@@ -107,6 +107,9 @@ export type {
     MurmurAccountClaim,
     MurmurClaimedSessionMember,
     MurmurSessionPolicies,
+    MurmurSessionPolicyChanges,
+    MurmurSessionSendPolicy,
+    MurmurSessionDeletedEvent,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,
@@ -227,8 +230,11 @@ function decodeResetEvent(bytes: Uint8Array): MurmurResetEvent {
             Array.isArray(policies) ||
             typeof (policies as Record<string, unknown>).adminsAssignAdmins !== "boolean" ||
             typeof (policies as Record<string, unknown>).anyoneCanAddMembers !== "boolean" ||
+            ((policies as Record<string, unknown>).sendPolicy !== "everyone" &&
+                (policies as Record<string, unknown>).sendPolicy !== "admins") ||
             Object.keys(policies).some(
-                (field) => !["adminsAssignAdmins", "anyoneCanAddMembers"].includes(field),
+                (field) =>
+                    !["adminsAssignAdmins", "anyoneCanAddMembers", "sendPolicy"].includes(field),
             ) ||
             Object.keys(session).some(
                 (field) =>
@@ -259,6 +265,9 @@ function decodeResetEvent(bytes: Uint8Array): MurmurResetEvent {
                     (policies as Record<string, unknown>).adminsAssignAdmins === true,
                 anyoneCanAddMembers:
                     (policies as Record<string, unknown>).anyoneCanAddMembers === true,
+                sendPolicy: (policies as Record<string, unknown>).sendPolicy as
+                    | "everyone"
+                    | "admins",
             }),
         });
     });
@@ -343,6 +352,7 @@ export class MurmurClient {
             limits,
             now,
             account.publicKey,
+            account,
         );
         for (const registration of services) {
             this.#services.set(registration.id, registration.service);
@@ -1113,6 +1123,7 @@ export class MurmurClient {
                     ...(options.anyoneCanAddMembers === undefined
                         ? {}
                         : { anyoneCanAddMembers: options.anyoneCanAddMembers }),
+                    ...(options.sendPolicy === undefined ? {} : { sendPolicy: options.sendPolicy }),
                     members: this.#flattenAdmissions(options.members).map((member) => {
                         const keyPackage = decodeMlsKeyPackage(member.keyPackage);
                         if (!equalBytes(keyPackage.leafNode.credential.identity, member.identity)) {
@@ -1152,6 +1163,13 @@ export class MurmurClient {
     /** Abandon a blocked local membership operation and destroy the whole session. */
     async abandonSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.abandon(id));
+    }
+
+    /** Owner-only durable deletion of one session and its relay-linked pending state. */
+    async deleteSession(id: Uint8Array): Promise<string> {
+        const deletionId = await this.#exclusive(() => this.#engine.delete(id));
+        this.#signalSync();
+        return deletionId;
     }
 
     /**
@@ -1202,7 +1220,7 @@ export class MurmurClient {
     }
 
     /** Durably request owner-controlled policy changes. */
-    async setPolicies(id: Uint8Array, policies: MurmurSessionPolicies): Promise<void> {
+    async setPolicies(id: Uint8Array, policies: MurmurSessionPolicyChanges): Promise<void> {
         await this.#exclusive(() => this.#engine.setPolicies(id, policies));
         this.#signalSync();
     }
@@ -1497,6 +1515,7 @@ export class MurmurClient {
                 const prepared = await this.#exclusive(() => this.#engine.prepareUpdates());
                 const decisions: SessionRouteDecision[] = [];
                 const consumedKeys = new Set<string>();
+                const consumedDeletionKeys = new Set<string>();
                 const globalUpdates: MurmurUpdate[] = [];
                 let accountEvents: PreparedAccountEvents | undefined;
                 let deferredRoutes = false;
@@ -1559,10 +1578,25 @@ export class MurmurClient {
                         globalUpdates.push(publicUpdate);
                         consumedKeys.add(update.key);
                     }
+                    for (const deletion of prepared.deletions) {
+                        const service = this.#services.get(deletion.service);
+                        if (service !== undefined) {
+                            await service.onSessionDeleted?.(
+                                Object.freeze({
+                                    id: deletion.id,
+                                    sessionId: deletion.sessionId.slice(),
+                                    owner: deletion.owner.slice(),
+                                    service: deletion.service,
+                                }),
+                            );
+                        }
+                        consumedDeletionKeys.add(deletion.key);
+                    }
                     accountEvents = await prepareAccountEvents(this.#store);
                     if (
                         decisions.length === 0 &&
                         consumedKeys.size === 0 &&
+                        consumedDeletionKeys.size === 0 &&
                         accountEvents.keys.length === 0
                     ) {
                         break;
@@ -1582,6 +1616,7 @@ export class MurmurClient {
                             prepared,
                             decisions,
                             consumedKeys,
+                            consumedDeletionKeys,
                             async (transaction) => {
                                 await deletePreparedAccountEvents(
                                     transaction,
@@ -1590,7 +1625,7 @@ export class MurmurClient {
                             },
                         ),
                     );
-                    delivered += consumedKeys.size;
+                    delivered += consumedKeys.size + consumedDeletionKeys.size;
                     if (deferredRoutes || deferredUpdates) break;
                 } finally {
                     for (const decision of decisions) zeroBytes(decision.sessionId);
@@ -1616,6 +1651,10 @@ export class MurmurClient {
             zeroBytes(update.sessionId);
             zeroBytes(update.sender);
             zeroBytes(update.bytes);
+        }
+        for (const deletion of prepared.deletions) {
+            zeroBytes(deletion.sessionId);
+            zeroBytes(deletion.owner);
         }
     }
 

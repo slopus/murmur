@@ -43,6 +43,7 @@ import type {
 
 const SQL_VALUE_CHUNK = 5_000;
 const MAXIMUM_DIRECTORY_PREKEYS_PER_DEVICE = 256;
+const SESSION_DELETION_NONCE_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000;
 
 /** SQLite store construction options for embedding. */
 export interface SqliteRelayStoreOptions {
@@ -268,8 +269,8 @@ export class SqliteRelayStore implements RelayStore {
             this.#run(
                 `INSERT INTO murmur_queue_deliveries
                     (sender, delivery_id, event_id, fingerprint, delivery_json,
-                     encoded_bytes, expires_at)
-                 VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                     encoded_bytes, expires_at, owner_account, session_id)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
                 delivery.sender,
                 delivery.id,
                 eventId,
@@ -277,6 +278,8 @@ export class SqliteRelayStore implements RelayStore {
                 encoded.json,
                 BigInt(encoded.encodedBytes),
                 BigInt(delivery.expiresAt),
+                delivery.ownerAccount,
+                delivery.sessionId,
             );
             const generationSeed = copyBytes(global.generation_seed, "generation seed");
             const queueValues = delivery.recipients
@@ -1121,6 +1124,50 @@ export class SqliteRelayStore implements RelayStore {
         }
     }
 
+    async deleteSessionDeliveries(
+        ownerAccount: Uint8Array,
+        sessionId: Uint8Array,
+        requestId: string,
+        now: number,
+    ): Promise<number> {
+        this.#assertOpen();
+        if (ownerAccount.length !== 32 || sessionId.length !== 32 || requestId.length < 1) {
+            throw new Error("Invalid session deletion");
+        }
+        this.#database.exec("BEGIN IMMEDIATE");
+        try {
+            this.#run(
+                `DELETE FROM murmur_session_deletion_nonces WHERE created_at < ?`,
+                BigInt(now - SESSION_DELETION_NONCE_RETENTION_MILLISECONDS),
+            );
+            if (
+                this.#get(
+                    `SELECT request_id FROM murmur_session_deletion_nonces
+                     WHERE owner_account = ? AND request_id = ?`,
+                    ownerAccount,
+                    requestId,
+                ) !== undefined
+            ) {
+                throw new RelayError(409, "Session deletion was already applied", {
+                    error: "replay",
+                });
+            }
+            this.#run(
+                `INSERT INTO murmur_session_deletion_nonces
+                    (owner_account, request_id, created_at) VALUES (?, ?, ?)`,
+                ownerAccount,
+                requestId,
+                BigInt(now),
+            );
+            const removed = this.#deleteOwnedSessionDeliveries(ownerAccount, sessionId);
+            this.#database.exec("COMMIT");
+            return removed;
+        } catch (error: unknown) {
+            this.#rollback();
+            throw error;
+        }
+    }
+
     async declareRestored(): Promise<number> {
         this.#assertOpen();
         this.#database.exec("BEGIN IMMEDIATE");
@@ -1217,6 +1264,7 @@ export class SqliteRelayStore implements RelayStore {
                     ,'murmur_device_rosters'
                     ,'murmur_device_roster_devices'
                     ,'murmur_device_roster_nonces'
+                    ,'murmur_session_deletion_nonces'
                     ,'murmur_directory_devices'
                     ,'murmur_directory_prekeys'
                     ,'murmur_directory_prekey_references'
@@ -1224,7 +1272,7 @@ export class SqliteRelayStore implements RelayStore {
                     ,'murmur_directory_ticket_uses'
                  )`,
             );
-            if (safeNumberColumn(tables.table_count) !== 13) {
+            if (safeNumberColumn(tables.table_count) !== 14) {
                 throw new Error("Incomplete SQLite queue schema");
             }
             return;
@@ -1277,10 +1325,23 @@ export class SqliteRelayStore implements RelayStore {
                 delivery_json TEXT NOT NULL,
                 encoded_bytes INTEGER NOT NULL CHECK (encoded_bytes > 0),
                 expires_at INTEGER NOT NULL,
+                owner_account BLOB CHECK (
+                    owner_account IS NULL OR length(owner_account) = 32
+                ),
+                session_id BLOB CHECK (session_id IS NULL OR length(session_id) = 32),
+                CHECK ((owner_account IS NULL) = (session_id IS NULL)),
                 PRIMARY KEY (sender, delivery_id)
             ) STRICT;
             CREATE INDEX murmur_queue_delivery_expiration
                 ON murmur_queue_deliveries(expires_at);
+            CREATE INDEX murmur_queue_delivery_session
+                ON murmur_queue_deliveries(owner_account, session_id);
+            CREATE TABLE murmur_session_deletion_nonces (
+                owner_account BLOB NOT NULL CHECK (length(owner_account) = 32),
+                request_id TEXT NOT NULL,
+                created_at INTEGER NOT NULL,
+                PRIMARY KEY (owner_account, request_id)
+            ) STRICT;
             CREATE TABLE murmur_queue_references (
                 recipient BLOB NOT NULL REFERENCES murmur_queues(recipient)
                     ON DELETE CASCADE,
@@ -1443,6 +1504,93 @@ export class SqliteRelayStore implements RelayStore {
                      LIMIT ${RELAY_EXPIRATION_BATCH_ITEMS}
                  )`,
                 BigInt(now),
+            ).changes,
+        );
+        for (let offset = 0; offset < affected.length; offset += SQL_VALUE_CHUNK) {
+            const chunk = affected.slice(offset, offset + SQL_VALUE_CHUNK);
+            const changeValues = chunk.map(() => "(?, ?, ?, ?)").join(", ");
+            const changeParameters = chunk.flatMap((row) => [
+                copyBytes(row.recipient, "queue recipient"),
+                bigintColumn(row.item_count),
+                bigintColumn(row.byte_count),
+                advanceLossGeneration(
+                    copyBytes(row.loss_generation, "loss generation"),
+                    safeNumberColumn(row.item_count),
+                ),
+            ]);
+            this.#run(
+                `WITH changes(recipient, item_count, byte_count, loss_generation) AS (
+                     VALUES ${changeValues}
+                 )
+                 UPDATE murmur_queues
+                 SET pending_items = pending_items - (
+                         SELECT item_count FROM changes
+                         WHERE changes.recipient = murmur_queues.recipient
+                     ),
+                     pending_bytes = pending_bytes - (
+                         SELECT byte_count FROM changes
+                         WHERE changes.recipient = murmur_queues.recipient
+                     ),
+                     loss_generation = (
+                         SELECT loss_generation FROM changes
+                         WHERE changes.recipient = murmur_queues.recipient
+                     )
+                 WHERE recipient IN (SELECT recipient FROM changes)`,
+                ...changeParameters,
+            );
+        }
+        this.#run(
+            `UPDATE murmur_queue_global
+             SET pending_items = pending_items - ?,
+                 pending_bytes = pending_bytes - ?,
+                 pending_references = pending_references - ?
+             WHERE singleton = 1`,
+            bigintColumn(usage.item_count),
+            bigintColumn(usage.byte_count),
+            bigintColumn(references.reference_count),
+        );
+        return removed;
+    }
+
+    #deleteOwnedSessionDeliveries(ownerAccount: Uint8Array, sessionId: Uint8Array): number {
+        const usage = this.#requiredGet(
+            `SELECT COUNT(*) AS item_count, COALESCE(SUM(encoded_bytes), 0) AS byte_count
+             FROM murmur_queue_deliveries
+             WHERE owner_account = ? AND session_id = ?`,
+            ownerAccount,
+            sessionId,
+        );
+        const references = this.#requiredGet(
+            `SELECT COUNT(*) AS reference_count
+             FROM murmur_queue_references AS reference
+             JOIN murmur_queue_deliveries AS delivery
+               ON delivery.sender = reference.sender
+              AND delivery.delivery_id = reference.delivery_id
+             WHERE delivery.owner_account = ? AND delivery.session_id = ?`,
+            ownerAccount,
+            sessionId,
+        );
+        const affected = this.#all(
+            `SELECT reference.recipient,
+                    COUNT(reference.event_id) AS item_count,
+                    COALESCE(SUM(reference.encoded_bytes), 0) AS byte_count,
+                    queue.loss_generation
+             FROM murmur_queue_references AS reference
+             JOIN murmur_queues AS queue ON queue.recipient = reference.recipient
+             JOIN murmur_queue_deliveries AS delivery
+               ON delivery.sender = reference.sender
+              AND delivery.delivery_id = reference.delivery_id
+             WHERE delivery.owner_account = ? AND delivery.session_id = ?
+             GROUP BY reference.recipient, queue.loss_generation`,
+            ownerAccount,
+            sessionId,
+        );
+        const removed = safeNumberColumn(
+            this.#run(
+                `DELETE FROM murmur_queue_deliveries
+                 WHERE owner_account = ? AND session_id = ?`,
+                ownerAccount,
+                sessionId,
             ).changes,
         );
         for (let offset = 0; offset < affected.length; offset += SQL_VALUE_CHUNK) {
