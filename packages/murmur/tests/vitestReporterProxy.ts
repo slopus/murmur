@@ -1,14 +1,15 @@
 /**
- * Vitest worker setup for the chaos suite.
+ * Vitest worker setup shared by every suite in this package.
  *
- * Vitest 3.2.7 waits for a reporter acknowledgement of every task update and
- * times out after sixty seconds. A chaos scenario legitimately runs longer than
- * that, so the acknowledgement expires and the run reports an unhandled error
- * even though every test passed. The event form delivers the same ordered task
- * update without retaining the acknowledgement promise.
+ * Vitest 3.2.7 waits for a reporter acknowledgement of each task update and
+ * times out after sixty seconds. Our heavier tests hold the worker's event loop
+ * in synchronous MLS cryptography for longer than that, so the acknowledgement
+ * expires and the run reports an unhandled error even though every test passed.
+ * The event form delivers the same ordered task update without retaining the
+ * acknowledgement promise.
  *
- * The chaos configuration loads this file as a setup file so the whole suite
- * shares one correction instead of repeating it in each long-running file.
+ * Both vitest configurations load this file so the correction lives in one
+ * place rather than being repeated in each long-running test file.
  */
 
 interface VitestRuntimeRpcMethod {
