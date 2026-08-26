@@ -10,20 +10,21 @@ registered typed synchronization service.
 
 The public API creates a session from an opaque descriptor, sends opaque events,
 and adds or removes device members. All ongoing membership control and
-application data travel inside MLS. One stable account may authorize several
-devices, but every device is a distinct MLS member with its own roster-certified
-credential, ratchets, durable store, and authenticated inbox. Murmur
-automatically translates an account roster addition or removal into ordinary
-MLS membership changes in every known session containing that account. A newly
-added device receives a separate MLS Welcome and fresh state through its
-authenticated inbox.
+application data travel inside MLS. One stable account may run several
+devices, but every device is a distinct MLS member with its own ratchets,
+durable store, and authenticated inbox. Murmur automatically translates a
+device-roster addition or removal into ordinary MLS membership changes in
+every known session containing that account, and the relay's device-roster
+consistency check forces stale senders to converge. A newly added device
+receives a separate MLS Welcome and fresh state through its authenticated
+inbox.
 
 ## Ordering and delivery
 
 Each outbound MLS delivery has one verifiably bound recipient set containing
-every current epoch device member, including the publisher. The legacy relay
+every current epoch device member, including the publisher. The relay
 publishes one ciphertext atomically to every recipient queue with one UUIDv7
-event ID. A negotiated relay durably accepts one fanout manifest and completes
+event ID, or durably accepts one fanout manifest and completes
 idempotent per-device insertion in event order, retrying failures without a
 cross-endpoint transaction. Event IDs are monotonic within each inbox, and the
 session never assumes simultaneous fanout completion. Because one multicast
@@ -49,9 +50,8 @@ retain a bounded
 prior-epoch window so application messages racing a Commit remain decryptable.
 Commit authorization is role-based and validated by every member; roles and the
 asynchronous membership-intent flow are dictated by
-[`10-group-roles.md`](10-group-roles.md). This change ships without backward
-compatibility: every session is role-managed, the single-committer flow and its
-serialized-proposal machinery are removed rather than retained, and old session
+[`10-group-roles.md`](10-group-roles.md). There is no backward
+compatibility: every session is role-managed, and old session
 records and Commit wire frames are not decoded or migrated.
 
 The public API never uses relay connectivity, peer presence, session creation,
@@ -135,10 +135,10 @@ new Welcomes as fresh device state.
 - Ongoing application and control traffic is MLS-protected; there is no friend
   channel or shared relay topic.
 - Every current epoch device member, including the publisher, receives each
-  ongoing MLS delivery with the same UUIDv7 event ID. Legacy publication is
-  atomic; negotiated publication durably retries ordered idempotent target
-  insertion. Ordering is guaranteed within an individual inbox, plus the
-  consistent relative order of two shared event IDs across inboxes.
+  ongoing MLS delivery with the same UUIDv7 event ID, through atomic
+  multicast or durable ordered idempotent fanout. Ordering is guaranteed
+  within an individual inbox, plus the consistent relative order of two
+  shared event IDs across inboxes.
 - Any member may publish a Commit, membership-changing Commits are validated
   against the session's roles by every member, and shared per-multicast UUIDv7
   event IDs make relay delivery order resolve concurrent Commits for one epoch
@@ -169,6 +169,6 @@ new Welcomes as fresh device state.
   and staged epoch state, dependency-ordered outboxes, replay, and queue
   progress through application-supplied persistence.
 - The relay is never treated as session history or recovery storage.
-- Account roster additions and revocations automatically converge through
+- Device roster additions and removals automatically converge through
   durable MLS Adds, Welcomes, and Removes across every locally known session
   without sharing sender state or blocking application sends.

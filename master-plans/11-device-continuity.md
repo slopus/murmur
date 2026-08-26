@@ -25,26 +25,25 @@ On detected loss the device resets completely. It stops processing, surfaces
 one final reset event to the application containing the full snapshot of every
 affected session — identifiers, descriptors, membership, and roles — and then
 destroys all session state: epochs, ratchets, buffered events, outboxes, and
-intents. It keeps its device identity key, device credential, account signing
-material where this device holds it, and the account roster. Everything
-transport- and session-shaped is destroyed. There is no partial reset and no per-session
+intents. It keeps the account identity material this device holds and its
+place in the account's device roster. Everything transport- and
+session-shaped is destroyed. There is no partial reset and no per-session
 survival.
 
-Re-admission reuses the existing roster convergence machinery. The reset
-device announces a signed reset generation through its account roster, the
-same authenticated channel as device addition and revocation. Every session
-member that holds the account observes the announcement and
-automatically Removes the dead leaf and re-adds the device with a fresh
-Welcome in every session containing that account, exactly as device linking
-and revocation converge today. The account never loses membership: membership
-is logical and account-level, and a reset costs the device its continuity and
-history, never the account its seat. A single-device account re-enters its
-sessions through member convergence on its reset announcement.
+Re-admission converges through the relay-held device roster. The reset device
+updates its roster entry with a new reset generation, authorized by
+possession of the identity key. Every session member that holds the account
+observes the roster change and automatically Removes the dead leaf and
+re-adds the device with a fresh Welcome in every session containing that
+account. The account never loses membership: membership is logical and
+account-level, and a reset costs the device its continuity and history,
+never the account its seat. A single-device account re-enters its sessions
+through member convergence on its reset announcement.
 
-Dormancy follows the same constant. Sibling devices may revoke a device that
-has been silent past six months, since it can never rejoin continuously.
-A dormant device that reconnects self-detects its loss generation change and
-resets; it does not need to be told.
+Dormancy follows the same constant. Any device of the account may remove a
+device that has been silent past six months, since it can never rejoin
+continuously. A dormant device that reconnects self-detects its loss
+generation change and resets; it does not need to be told.
 
 The application owns backfill. Murmur's contract is: inline delivery is
 exactly-once and gapless, or the application receives one reset event before
@@ -57,9 +56,8 @@ Murmur itself never stores or replays application history, and deliveries
 multicast between the loss and the re-Welcome are gone for that device;
 backfill is the application's answer for them.
 
-Relay schema and wire changes migrate in place from the current baseline
-without deleting pending data, and the loss-generation bump replaces every
-silent unacknowledged removal the relay performs today.
+The loss-generation bump replaces every silent unacknowledged removal the
+relay performs.
 
 ## How we know it is done
 
@@ -76,17 +74,16 @@ silent unacknowledged removal the relay performs today.
   the reset is durably recorded first, the application callback delivers the
   complete affected-session snapshot at least once until it resolves, and the
   purge commits exactly once, destroying all session and transport state while
-  device identity, account signing material held by this device, device
-  credential, and roster are retained.
+  the account identity material this device holds and its roster entry are
+  retained.
 - A reset adopts the relay's observed head as its new continuity baseline, so
   a reset device cannot loop on the same loss.
-- A reset device's signed reset announcement converges automatically: every
+- A reset device's roster update converges automatically: every
   member holding the account Removes the dead leaf and issues a fresh Welcome
   in every shared session, without manual action, while the account remains a
   logical member throughout.
 - Re-admitted sessions reappear under their original descriptors flagged as
   re-admissions, and peers observe the reset through existing roster-change
   callbacks.
-- A sibling device may revoke a device silent past six months, and a dormant
-  device that reconnects resets itself without external instruction.
-- Relay schema migration preserves pending deliveries in place.
+- Any device of the account may remove a device silent past six months, and a
+  dormant device that reconnects resets itself without external instruction.

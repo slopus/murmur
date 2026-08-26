@@ -17,11 +17,7 @@ Role state travels inside every Commit's authenticated control and inside the
 joiner bootstrap, so each member holds the identical role state for each epoch
 and validates every Commit against the role state of the epoch it extends. An
 unauthorized Commit is deterministically rejected by every member, so a rogue
-member cannot fork the session. Device-scoped changes that follow a signed
-account roster — adding a newly authorized device of an existing member account
-or removing a revoked one — are authorized for the devices of that same account
-and for admins, because the account-signed device credential is itself the
-proof of admission.
+member cannot fork the session.
 
 Membership and role changes are asynchronous intents. The public API records a
 durable intent and returns; Murmur converges it into a Commit during
@@ -50,6 +46,11 @@ new model. Sessions persisted by earlier releases are not decoded or migrated.
   locally and an unauthorized membership Commit is rejected by every member.
 - The owner cannot be demoted or removed; any other member can leave; removing
   someone else's account requires an admin.
+- The send policy is enforced on both sides: an unauthorized member's send
+  fails locally, and every member rejects application events from a sender
+  the epoch's role state does not authorize.
+- The owner can delete the session; deletion removes its relay state and
+  terminates every member's local session through the durable boundary.
 - `addMember` and `removeMember` return once the intent is durable, and the
   change converges through synchronization even when every other member is
   offline.

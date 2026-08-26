@@ -2,11 +2,10 @@
 
 ## Destination
 
-There is no built-in contact protocol, contact relationship, profile exchange,
-or contact acceptance step. Sharing a public identity key is enough: a peer
-claims KeyPackage material through the identity directory and instantly
-creates sessions and groups with that account, as dictated by the
-identity-directory plan.
+There is no contact protocol, invitation, profile exchange, or acceptance
+step. Sharing a public identity key is enough: a peer claims prekey material
+through the identity directory and instantly creates sessions and groups
+with that account, as dictated by the identity-directory plan.
 
 Capabilities are optional, strictly typed synchronization services registered
 on a Murmur client. A service is a class or object with exactly two protocol
@@ -58,17 +57,14 @@ Service routing, offline mutation, restart recovery, and membership changes
 are tested with real application stores and a real local relay rather than
 mocked services. An explicit end-to-end suite also exercises the deployed
 production relay with ephemeral identities. It must acknowledge and clean up
-every delivery it creates and allow cached invitation entries to expire.
+every delivery it creates.
 
-The v0.3.3 compatibility baseline remains intact: existing public APIs, direct
-relay configuration, HTTP/SSE wire formats, and persisted client state stay
-backward-compatible. Negotiated tokens, endpoints, and WebSocket delivery are
-additive. Relay schemas migrate in place, and the published library remains
+There is no backward compatibility. The published library remains
 browser-safe with its Noble-only runtime dependency boundary.
 
 ## How we know it is done
 
-- Knowing a public identity key and holding a contact ticket is sufficient to
+- Knowing a public identity key and holding a ticket is sufficient to
   begin sessions and groups with an account; no contact record, profile
   handshake, or acceptance step exists.
 - Optional strictly typed services are registered on `MurmurClient`, expose
@@ -88,6 +84,5 @@ browser-safe with its Noble-only runtime dependency boundary.
   Creating, pending, committing, and disconnected states never block service
   sends; their durable outboxes converge in dependency order when the relay is
   reachable.
-- Local integration and production-relay end-to-end tests cover invitation
-  expiry, exact acknowledgement and cleanup, restart recovery, and offline
-  convergence.
+- Local integration and production-relay end-to-end tests cover exact
+  acknowledgement and cleanup, restart recovery, and offline convergence.
