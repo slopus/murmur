@@ -17,7 +17,9 @@ Role state travels inside every Commit's authenticated control and inside the
 joiner bootstrap, so each member holds the identical role state for each epoch
 and validates every Commit against the role state of the epoch it extends. An
 unauthorized Commit is deterministically rejected by every member, so a rogue
-member cannot fork the session.
+member cannot fork the session. The honest-but-not-trusted relay may also
+enforce basic roles and reject visibly unauthorized traffic before queueing
+it, as an addition to this local verification — never as a replacement.
 
 Membership and role changes are asynchronous intents. The public API records a
 durable intent and returns; Murmur converges it into a Commit during

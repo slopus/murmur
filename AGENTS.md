@@ -1,8 +1,9 @@
 # Murmur Development Guide
 
-Stateful MLS sessions over authenticated encrypted identity queues. Discovery
-is self-contained and application-routed; the relay is a disposable delivery
-buffer, never session state or history.
+Stateful MLS sessions over authenticated encrypted identity queues. Accounts
+are found through the relay's identity directory by exact public identity key;
+the relay is a delivery buffer plus that directory — honest but not trusted:
+it is relied on to do its job correctly, but it can never decrypt anything.
 
 ## Master plans
 
@@ -83,14 +84,17 @@ every directory. Read that plan before adding files.
 4. **The application owns effects** - Murmur durably buffers updates before
    acknowledgement, calls the identity-wide `onUpdates` hook, and drains a
    whole batch only after the hook resolves
-5. **The relay is untrusted and dumb** - never add message semantics to it
-6. **One queue per public identity** - queue addresses are canonical Ed25519
-   identity keys, not anonymous topics or arbitrary routing labels
-7. **Compatibility starts at v0.3.3** - pre-v0.3 topic, friendship, and
-   retained-event formats remain unsupported. From v0.3.3 and relay schema v3
-   onward, preserve public APIs and wire formats, read or migrate persisted
-   client state, and migrate relay schemas in place without deleting pending
-   data or requiring a clean database
+5. **The relay is honest but not trusted** - assume the server performs the
+   protocol honestly, so it may hold authoritative MLS-adjacent state and
+   enforce delivery and role rules (reject a publication that omits a current
+   recipient device, enforce basic roles) as an addition to local member
+   verification — never as a replacement, because it can never decrypt
+   anything. The server can stop servicing something; that denial of service
+   is accepted as unavoidable, since the server could shut down anyway
+6. **One inbox per device, addressed by identity** - queue addresses are
+   canonical Ed25519 keys, not anonymous topics or arbitrary routing labels
+7. **No backward compatibility** - old APIs, wire formats, and schemas are
+   deleted, not migrated or decoded; both deployed relays start clean
 
 ## Testing
 
@@ -120,38 +124,43 @@ later.
 See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the full description. The parts
 that most often trip up a change:
 
-### Identity and discovery
+### Identity, account secret, and directory
 
-An identity exposes one Ed25519 public key. Signing and X25519 key agreement are
-derived from one 32-byte root. A signed discovery bundle carries one current
-one-use MLS KeyPackage. Its exact bytes may be exchanged directly or cached at
-the relay for at most five minutes under their SHA-256 digest. Applications
-share the 32-byte digest out of band; the relay cannot enumerate bundles or
-resolve identities and is not a directory.
+An identity exposes one Ed25519 public key; signing and X25519 key agreement
+derive from one 32-byte root. A 1Password-like account secret — a strong
+generated string plus the user password — wraps that root into an encrypted
+blob the application persists; restoring the secret on a device is the entire
+multidevice story, and losing it is final. Devices self-register in a
+relay-held roster by proving key possession. The relay's identity directory
+stores per-device pools of one-use prekeys plus one multi-use last-resort
+prekey, resolvable only by the exact (unguessable) identity key and claimed
+with a ticket from the authentication server. Everything the relay stores is
+account-linked and removed by account or session deletion.
 
 ### Delivery queues
 
-The relay stores unacknowledged and unexpired encrypted deliveries plus
-five-minute public invitation bundles addressed only by SHA-256. One atomic
-multicast receives one UUIDv7 event ID and one reference in every exact
-recipient inbox. Recipient-authenticated SSE carries each exact queued delivery
-in that inbox's UUIDv7 order; it is not a wake-only channel, and durable signed
-acknowledgement remains separate. Event IDs are ordered only within an inbox.
-Recipient, sender-fanout, invitation-cache, and global quotas bound storage;
-production ingress must also apply non-Sybil admission because public
-identities are free to create.
+The relay stores unacknowledged and unexpired encrypted deliveries, directory
+prekeys, and device rosters — nothing else. One atomic multicast receives one
+UUIDv7 event ID and one reference in every exact recipient inbox, and a
+publication that omits a current device of a targeted account is rejected with
+the current roster so the sender re-encrypts. Streams carry each exact queued
+delivery in inbox UUIDv7 order; durable signed acknowledgement remains
+separate. Every inbox exposes a sequence number and loss generation so missed
+deliveries are provable, never silent.
 
 ### MLS sessions
 
 Two-person and many-person conversations use the same forward-secret TreeKEM
-session. Every membership change is a Commit. One authenticated epoch committer
-serializes Commits; other members submit proposals. The sender adopts its own
-Commit only from the authenticated queue echo, never from publish success.
-
-Application sends persist the cloned post-ratchet epoch and exact outbox before
-publication. Commits persist active and staged epochs separately. Pending
-Welcome sessions continue MLS processing while application events remain
-bounded and hidden until activation.
+session. Every membership change is a Commit; any member may publish one, role
+state validates it at every member, and relay delivery order resolves
+concurrent Commits identically everywhere. The sender adopts its own Commit
+only from the authenticated queue echo, never from publish success. Sessions
+carry roles — owner, admins, membership policies, and a send policy — enforced
+locally at send time and by every receiving member; the owner can delete the
+session. Application sends persist the cloned post-ratchet epoch and exact
+outbox before publication, and pending Welcome sessions continue MLS
+processing while application events remain bounded and hidden until
+activation.
 
 ## Security Principles
 

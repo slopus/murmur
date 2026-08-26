@@ -50,6 +50,12 @@ deleting an account or deleting a session can remove everything that belongs
 to it. It stores no history, snapshots, retained events, invitation caches,
 anonymous topics, or MLS state, and it never interprets encrypted contents.
 
+The server is honest but not trusted: we rely on it to perform the protocol
+correctly — it may hold authoritative MLS-adjacent state and additively
+enforce delivery completeness and basic roles — but it can never decrypt
+anything, and every member still verifies everything locally. A server that
+stops servicing something is an accepted, unavoidable failure mode.
+
 Admission, device, sender, recipient, timing, queue, and fanout metadata are
 an accepted tradeoff. Murmur promises encrypted contents, not anonymous
 routing.

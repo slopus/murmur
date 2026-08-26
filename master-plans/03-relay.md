@@ -2,7 +2,16 @@
 
 ## Destination
 
-The relay is a disposable delivery buffer plus the identity directory. It has
+The relay is honest but not trusted. We assume the server does its job
+honestly and rely on that for a smooth experience, but it can never decrypt
+anything. Because it is honest, it may be authoritative for MLS-adjacent
+state: it rejects a publication whose recipient set omits a current device of
+a targeted account, and it may enforce basic roles as an addition to the local
+verification every member still performs — never as a replacement. The server
+can stop servicing something; that denial of service is accepted as
+unavoidable, since the server could equally shut down.
+
+The relay is a delivery buffer plus the identity directory. It has
 one authenticated inbound queue per running client inbox, bounded HTTP reads,
 and one authenticated streaming receiver per inbox. It stores exactly two
 kinds of data: encrypted deliveries that remain unacknowledged and unexpired,
@@ -17,8 +26,9 @@ an owner-only action dictated by the roles plan — removes that session's
 relay state. Cleanup is by ownership, not by anonymity-preserving timeout.
 
 It stores no snapshots, retained chat history, event-sourced application
-state, invitation caches, anonymous topics, capability topics, or MLS state.
-It does not interpret encrypted delivery contents. It does learn
+state, invitation caches, or anonymous topics. It may hold the unencrypted
+MLS-adjacent state needed for its additive enforcement, but it cannot
+interpret encrypted delivery contents. It does learn
 authenticated admission, sender, recipient, exact fanout, timing, and queue
 progress; this metadata exposure is accepted. The authentication server
 retains only the account, endpoint, and protocol routing needed for
@@ -48,7 +58,10 @@ while the delivery record or any queue reference remains.
 
 For every ongoing MLS delivery, the exact recipient set contains every
 current epoch member, including the publisher, and is bound in a way
-recipients can verify. The relay applies no Commit semantics.
+recipients can verify. The relay applies no Commit resolution of its own —
+concurrent Commits are resolved by delivery order at the members — but as an
+honest server it may additively reject traffic that visibly violates delivery
+completeness or basic roles before it ever reaches a queue.
 
 The relay holds each account's current device roster as account-linked state
 and enforces delivery consistency against it: a publication whose recipient
