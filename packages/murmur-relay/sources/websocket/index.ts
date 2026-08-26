@@ -190,7 +190,13 @@ export class RelayWebSocketSession {
                 const acknowledgement = parseSignedQueueAck(request.body);
                 this.#assertDevice(acknowledgement.recipient);
                 const outcome = await this.#relay.acknowledge(acknowledgement);
-                this.#send(response(request.id, 200, outcome));
+                this.#send(
+                    response(request.id, 200, {
+                        removed: outcome.removed,
+                        sequence: outcome.sequence,
+                        generation: encodeBase64Url(outcome.generation),
+                    }),
+                );
                 return;
             }
             const read = parseSignedQueueRead(request.body);

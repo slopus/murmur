@@ -1,4 +1,16 @@
 import { ed25519 } from "@noble/curves/ed25519";
+import {
+    WebSocketDeliveryTransport,
+    createSignedDelivery,
+    createSignedInboxAck,
+    createSignedInboxRead,
+    destroyIdentity,
+    generateIdentityKeyPair,
+    type DeliveryWebSocket,
+    type DeliveryWebSocketCloseEvent,
+    type DeliveryWebSocketMessageEvent,
+    type RelaySessionProvider,
+} from "@slopus/murmur";
 import { describe, expect, test } from "vitest";
 import { RelayService } from "../../relay/index.js";
 import { SqliteRelayStore } from "../../storage/index.js";
@@ -51,6 +63,42 @@ class CapturingPeer implements RelayWebSocketPeer {
 
     close(): void {
         this.closed = true;
+    }
+}
+
+class RelaySessionWebSocket implements DeliveryWebSocket {
+    readyState = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: DeliveryWebSocketMessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    onclose: ((event: DeliveryWebSocketCloseEvent) => void) | null = null;
+    readonly #session: RelayWebSocketSession;
+
+    constructor(relay: RelayService, claims: ReturnType<typeof verifyRelaySessionToken>) {
+        const peer: RelayWebSocketPeer = {
+            send: (message) => {
+                queueMicrotask(() => this.onmessage?.({ data: message }));
+            },
+            close: (code = 1000, reason = "") => {
+                if (this.readyState === 3) return;
+                this.readyState = 3;
+                queueMicrotask(() => this.onclose?.({ code, reason, wasClean: code === 1000 }));
+            },
+        };
+        this.#session = new RelayWebSocketSession({ relay, claims, peer });
+        queueMicrotask(() => {
+            if (this.readyState !== 0) return;
+            this.readyState = 1;
+            this.onopen?.();
+        });
+    }
+
+    send(data: string): void {
+        void this.#session.receive(data).catch(() => this.onerror?.());
+    }
+
+    close(code: number = 1000, reason: string = ""): void {
+        this.#session.close(code, reason);
     }
 }
 
@@ -190,6 +238,65 @@ describe("negotiated relay sessions", () => {
                 body: { error: "forbidden" },
             });
         } finally {
+            await relay.close();
+        }
+    });
+
+    test("roundtrips continuity acknowledgement through the production WebSocket client", async () => {
+        const identityKeyPair = generateIdentityKeyPair();
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const token = createRelaySessionToken(TOKEN_SECRET, {
+            device: identityKeyPair.publicKey,
+            endpoint: ENDPOINT,
+            admissionPrincipal: "account-42",
+            issuedAt: NOW,
+            expiresAt: NOW + 60_000,
+            nonce: new Uint8Array(24).fill(9),
+        });
+        const claims = verifyRelaySessionToken(TOKEN_SECRET, token, { now: NOW });
+        const provider: RelaySessionProvider = {
+            issue: async () => ({
+                version: 1,
+                protocol: "murmur-websocket-v1",
+                endpoint: ENDPOINT,
+                token,
+                expiresAt: NOW + 60_000,
+            }),
+        };
+        const transport = new WebSocketDeliveryTransport(identityKeyPair, provider, {
+            now: () => NOW,
+            webSocketFactory: () => new RelaySessionWebSocket(relay, claims),
+        });
+        try {
+            const delivery = createSignedDelivery(
+                identityKeyPair,
+                [identityKeyPair.publicKey],
+                new Uint8Array([2]),
+                { createdAt: NOW, expiresAt: NOW + 60_000 },
+            );
+            const published = await transport.publish(delivery);
+            const page = await transport.read(
+                createSignedInboxRead(identityKeyPair, { createdAt: NOW }),
+            );
+            expect(page.deliveries).toHaveLength(1);
+            const acknowledgement = await transport.acknowledge(
+                createSignedInboxAck(identityKeyPair, published.eventId, NOW),
+            );
+            expect(acknowledgement).toEqual({
+                removed: 1,
+                sequence: 1,
+                generation: page.generation,
+            });
+            await expect(
+                transport.read(
+                    createSignedInboxRead(identityKeyPair, {
+                        after: published.eventId,
+                        createdAt: NOW,
+                    }),
+                ),
+            ).resolves.toMatchObject({ deliveries: [] });
+        } finally {
+            destroyIdentity(identityKeyPair);
             await relay.close();
         }
     });

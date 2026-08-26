@@ -1,23 +1,35 @@
 import {
     RelayService,
+    RelayWebSocketSession,
     SqliteRelayStore,
     createRelayFetchHandler,
     type RelayOptions,
+    type RelaySessionClaims,
+    type RelayWebSocketPeer,
 } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
-import { generateIdentityKeyPair, type IdentityKeyPair } from "../../crypto/index.js";
+import {
+    destroyIdentity,
+    generateIdentityKeyPair,
+    type IdentityKeyPair,
+} from "../../crypto/index.js";
 import {
     DeliveryCursorTrimmedError,
     DeliveryTransportError,
     HttpDeliveryTransport,
     InboxProcessor,
+    WebSocketDeliveryTransport,
     createSignedDelivery,
     createSignedInboxAck,
     createSignedInboxRead,
     type DeliveryFetch,
     type DeliveryPublishOutcome,
     type DeliveryTransport,
+    type DeliveryWebSocket,
+    type DeliveryWebSocketCloseEvent,
+    type DeliveryWebSocketMessageEvent,
     type InboxPage,
+    type RelaySessionProvider,
     type SignedDelivery,
     type SignedInboxAck,
     type SignedInboxRead,
@@ -137,6 +149,72 @@ function networkFixture(options: RelayOptions = {}, now: number = NOW): NetworkF
     );
     const http = new HttpDeliveryTransport("https://relay.test", { fetch: relayFetch(relay) });
     return { clock, relay, http, recording: new RecordingDeliveryTransport(http) };
+}
+
+class RelayBackedWebSocket implements DeliveryWebSocket {
+    readyState = 0;
+    onopen: (() => void) | null = null;
+    onmessage: ((event: DeliveryWebSocketMessageEvent) => void) | null = null;
+    onerror: (() => void) | null = null;
+    onclose: ((event: DeliveryWebSocketCloseEvent) => void) | null = null;
+    readonly #session: RelayWebSocketSession;
+
+    constructor(relay: RelayService, claims: RelaySessionClaims) {
+        const peer: RelayWebSocketPeer = {
+            send: (message) => {
+                queueMicrotask(() => this.onmessage?.({ data: message }));
+            },
+            close: (code = 1000, reason = "") => {
+                if (this.readyState === 3) return;
+                this.readyState = 3;
+                queueMicrotask(() => this.onclose?.({ code, reason, wasClean: code === 1000 }));
+            },
+        };
+        this.#session = new RelayWebSocketSession({ relay, claims, peer });
+        queueMicrotask(() => {
+            if (this.readyState !== 0) return;
+            this.readyState = 1;
+            this.onopen?.();
+        });
+    }
+
+    send(data: string): void {
+        void this.#session.receive(data).catch(() => this.onerror?.());
+    }
+
+    close(code: number = 1000, reason: string = ""): void {
+        this.#session.close(code, reason);
+    }
+}
+
+function negotiatedTransport(
+    fixture: NetworkFixture,
+    identity: IdentityKeyPair,
+): WebSocketDeliveryTransport {
+    const endpoint = "wss://relay.test/v2/connect";
+    const provider: RelaySessionProvider = {
+        issue: async () => ({
+            version: 1,
+            protocol: "murmur-websocket-v1",
+            endpoint,
+            token: "network.delivery.ticket",
+            expiresAt: fixture.clock.now() + 60_000,
+        }),
+    };
+    return new WebSocketDeliveryTransport(identity, provider, {
+        now: fixture.clock.now,
+        webSocketFactory: () =>
+            new RelayBackedWebSocket(fixture.relay, {
+                version: 1,
+                protocol: "murmur-websocket-v1",
+                device: identity.publicKey.slice(),
+                endpoint,
+                admissionPrincipal: "network-delivery-chaos",
+                issuedAt: fixture.clock.now(),
+                expiresAt: fixture.clock.now() + 60_000,
+                nonce: new Uint8Array(24).fill(4),
+            }),
+    });
 }
 
 function labeledDelivery(
@@ -768,6 +846,36 @@ describe("network and delivery contract chaos", () => {
             await expect(clean.synchronize()).resolves.toMatchObject({ processed: 1 });
             expect(effects).toEqual(["poll-after-invalid-stream"]);
         } finally {
+            await fixture.relay.close();
+        }
+    });
+
+    test("NET-12B negotiated WebSocket acknowledgement preserves continuity generation", async () => {
+        const fixture = networkFixture();
+        const identity = generateIdentityKeyPair();
+        const transport = negotiatedTransport(fixture, identity);
+        try {
+            const delivery = labeledDelivery(identity, [identity], "WebSocket continuity ack");
+            const published = await transport.publish(delivery);
+            const page = await transport.read(
+                createSignedInboxRead(identity, {
+                    createdAt: fixture.clock.now(),
+                    waitMilliseconds: 0,
+                }),
+            );
+            expect(page.deliveries).toHaveLength(1);
+            expect(page.generation).toBeInstanceOf(Uint8Array);
+            await expect(
+                transport.acknowledge(
+                    createSignedInboxAck(identity, published.eventId, fixture.clock.now()),
+                ),
+            ).resolves.toMatchObject({
+                removed: 1,
+                sequence: 1,
+                generation: page.generation,
+            });
+        } finally {
+            destroyIdentity(identity);
             await fixture.relay.close();
         }
     });
