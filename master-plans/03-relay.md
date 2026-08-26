@@ -38,10 +38,12 @@ A valid account tombstone does the same for every account device. This
 transport revocation does not replace the MLS Remove Commits required by each
 session.
 
-Version 0.3.3 and relay schema version 3 are the compatibility baseline. Every
-later relay schema upgrade migrates in place without deleting pending data or
-requiring a clean database. Pre-v0.3 topic, friendship, and retained-event
-schemas remain unsupported.
+The 0.5.0 beta release and its relay schema are the compatibility baseline.
+Both deployed relays are empty, so nothing earlier is supported: pre-beta
+client state, wire formats, and relay schemas are not decoded, migrated, or
+carried, and their migration machinery is removed rather than retained. From
+this baseline onward, every later relay schema upgrade migrates in place
+without deleting pending data or requiring a clean database.
 
 ## Ephemeral invitations
 
@@ -211,7 +213,7 @@ relay into durable history, an identity directory, or a recovery system.
   exposes a loss generation that advances exactly when an unacknowledged
   delivery is removed for any reason, and fresh relay state issues a new
   unpredictable generation.
-- Every schema upgrade after version 3 migrates in place and preserves pending
+- Every schema upgrade after the 0.5.0 beta baseline migrates in place and preserves pending
   relay data; operators are not required to start from a clean database.
 - The relay has no retained event history, snapshots, public identity or
   application lists, generic topics, or anonymous addressing, apart from the
