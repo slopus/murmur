@@ -127,6 +127,31 @@ const unusedNamespace: DurableObjectNamespaceLike = {
 };
 
 describe("Cloudflare durable fanout", () => {
+    test("rejects duplicate keys on internal Fetch JSON boundaries", async () => {
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: unusedNamespace,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        const boundaries = [
+            new MurmurFanoutDurableObject(new MemoryState(), environment),
+            new MurmurInboxDurableObject(new MemoryState(), environment),
+        ];
+        const paths = ["/v2/publish", "/v2/insert"];
+        for (let index = 0; index < boundaries.length; index += 1) {
+            const response = await boundaries[index]!.fetch(
+                new Request(`https://murmur.internal${paths[index]!}`, {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: '{"value":1,"\\u0076alue":2}',
+                }),
+            );
+            expect(response.status).toBe(400);
+            expect(await response.json()).toEqual({ error: "duplicate_json_key" });
+        }
+    });
+
     test("retries a partial manifest before inserting a later event", async () => {
         const now = Date.now();
         const alice = secret(1);

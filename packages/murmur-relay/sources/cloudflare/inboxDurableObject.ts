@@ -16,6 +16,7 @@ import {
 import { verifyRelaySessionToken } from "../session/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
+import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 import { isUuidV7 } from "../utils/uuidV7.js";
 import { relaySessionTokenFromWebSocketProtocols } from "../websocket/index.js";
 import { advanceLossGeneration, createGenerationSeed } from "../storage/continuity.js";
@@ -128,8 +129,11 @@ async function requestJson(request: Request): Promise<unknown> {
         throw new RelayError(413, "Inbox request exceeds limit", { error: "limit" });
     }
     try {
-        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
-    } catch {
+        return parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch (error: unknown) {
+        if (error instanceof DuplicateJsonKeyError) {
+            throw new RelayError(400, error.message, { error: "duplicate_json_key" });
+        }
         throw new RelayError(400, "Invalid inbox JSON", { error: "malformed" });
     }
 }

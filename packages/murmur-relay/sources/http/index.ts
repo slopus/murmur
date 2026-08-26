@@ -9,6 +9,7 @@ import {
 } from "../protocol/index.js";
 import type { QueueEventSubscription, RelayService } from "../relay/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
+import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 
 /** Metadata supplied by a concrete HTTP host. */
 export interface RelayRequestContext {
@@ -208,13 +209,16 @@ async function readBytes(request: Request, maximumBytes: number): Promise<Uint8A
 
 async function readJson(request: Request, maximumBytes: number): Promise<unknown> {
     try {
-        return JSON.parse(
+        return parseStrictJson(
             new TextDecoder("utf-8", { fatal: true }).decode(
                 await readBytes(request, maximumBytes),
             ),
-        ) as unknown;
+        );
     } catch (error: unknown) {
         if (error instanceof RelayError) throw error;
+        if (error instanceof DuplicateJsonKeyError) {
+            throw new RelayError(400, error.message, { error: "duplicate_json_key" });
+        }
         throw new RelayError(400, "Invalid JSON request", { error: "malformed" });
     }
 }

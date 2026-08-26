@@ -55,6 +55,30 @@ class CapturingPeer implements RelayWebSocketPeer {
 }
 
 describe("negotiated relay sessions", () => {
+    test("rejects duplicate JSON keys before authorization", async () => {
+        const aliceSecret = secret(1);
+        let authorizations = 0;
+        const handler = createRelaySessionFetchHandler({
+            tokenSecret: TOKEN_SECRET,
+            now: () => NOW,
+            authorize: async () => {
+                authorizations += 1;
+                return { endpoint: ENDPOINT, admissionPrincipal: "account-42" };
+            },
+        });
+        const canonical = JSON.stringify(sessionProof(aliceSecret));
+        const response = await handler(
+            new Request("https://app.test/v2/murmur-session", {
+                method: "POST",
+                headers: { "content-type": "application/json" },
+                body: canonical.replace("{", '{"version":2,'),
+            }),
+        );
+        expect(response.status).toBe(400);
+        expect(await response.json()).toEqual({ error: "duplicate_json_key" });
+        expect(authorizations).toBe(0);
+    });
+
     test("lets the application authorize a device and issues an endpoint-bound token", async () => {
         const aliceSecret = secret(1);
         const handler = createRelaySessionFetchHandler({

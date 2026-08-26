@@ -17,6 +17,7 @@ import {
 } from "../protocol/index.js";
 import type { PublishOutcome } from "../storage/index.js";
 import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
+import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 import { nextUuidV7 } from "../utils/uuidV7.js";
 import {
     MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS,
@@ -104,8 +105,11 @@ async function requestJson(request: Request): Promise<unknown> {
         throw new RelayError(413, "Fanout request exceeds limit", { error: "limit" });
     }
     try {
-        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
-    } catch {
+        return parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch (error: unknown) {
+        if (error instanceof DuplicateJsonKeyError) {
+            throw new RelayError(400, error.message, { error: "duplicate_json_key" });
+        }
         throw new RelayError(400, "Invalid fanout JSON", { error: "malformed" });
     }
 }

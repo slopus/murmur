@@ -1,4 +1,5 @@
 import { RelayError } from "../protocol/index.js";
+import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 import type { RelaySessionIssuerOptions } from "./types.js";
 import {
     createRelaySessionToken,
@@ -60,8 +61,11 @@ async function readJson(request: Request, maximumBytes: number): Promise<unknown
         offset += chunk.length;
     }
     try {
-        return JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes)) as unknown;
-    } catch {
+        return parseStrictJson(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    } catch (error: unknown) {
+        if (error instanceof DuplicateJsonKeyError) {
+            throw new RelayError(400, error.message, { error: "duplicate_json_key" });
+        }
         throw new RelayError(400, "Invalid relay-session JSON", { error: "malformed" });
     }
 }

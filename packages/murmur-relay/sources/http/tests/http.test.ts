@@ -36,6 +36,36 @@ function invitation(createdAt: number, expiresAt: number, value = "public"): Uin
 }
 
 describe("identity queue HTTP API", () => {
+    test("rejects duplicate object keys on every JSON request route", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const handler = createRelayFetchHandler(relay, {
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "duplicate-json-tests",
+        });
+        try {
+            for (const path of [
+                "/v1/invitations/owned",
+                "/v1/invitations/revoke",
+                "/v1/deliveries",
+                "/v1/queue/read",
+                "/v1/queue/events",
+                "/v1/queue/ack",
+            ]) {
+                const response = await handler(
+                    new Request(`https://relay.example${path}`, {
+                        method: "POST",
+                        headers: { "content-type": "application/json" },
+                        body: '{"outer":{"value":1,"\\u0076alue":2}}',
+                    }),
+                );
+                expect(response.status, path).toBe(400);
+                expect(await response.json(), path).toEqual({ error: "duplicate_json_key" });
+            }
+        } finally {
+            await relay.close();
+        }
+    });
+
     test("uploads and downloads a five-minute invitation by its exact digest", async () => {
         let now = NOW;
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => now);
