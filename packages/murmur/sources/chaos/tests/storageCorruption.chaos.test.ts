@@ -619,6 +619,12 @@ async function runLiveIntentCapacity(
         await alice.synchronize({ waitMilliseconds: 0 });
         await bob.synchronize({ waitMilliseconds: 0 });
         await bob.activateSession(session.id);
+        for (let round = 0; round < 4; round += 1) {
+            if ((await prefixCount(aliceDelegate, OUTBOX_PREFIX)) === 0) break;
+            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize({ waitMilliseconds: 0 });
+        }
+        expect(await prefixCount(aliceDelegate, OUTBOX_PREFIX)).toBe(0);
         const carolDiscovery = await carol.discovery();
 
         const before = await storeFingerprint(aliceDelegate);
@@ -1117,6 +1123,12 @@ describe("storage corruption and capacity chaos", () => {
             await alice.synchronize();
             await bob.synchronize();
             await activate(bob, session.id);
+            for (let round = 0; round < 4; round += 1) {
+                if ((await prefixCount(aliceBaseline, OUTBOX_PREFIX)) === 0) break;
+                await alice.synchronize({ waitMilliseconds: 0 });
+                await bob.synchronize({ waitMilliseconds: 0 });
+            }
+            expect(await prefixCount(aliceBaseline, OUTBOX_PREFIX)).toBe(0);
             alice.close();
             bob.close();
 
