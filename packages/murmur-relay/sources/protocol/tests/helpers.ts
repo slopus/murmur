@@ -41,6 +41,7 @@ export function signedDelivery(
         readonly now?: number;
         readonly expiresAt?: number;
         readonly ciphertext?: Uint8Array;
+        readonly senderAccount?: Uint8Array;
         readonly targetAccounts?: readonly {
             readonly accountKey: Uint8Array;
             readonly rosterRevision: number;
@@ -54,6 +55,7 @@ export function signedDelivery(
         version: 1,
         id: encodeBase64Url(new Uint8Array(24).fill(options.id ?? 1)),
         sender: identity(secretKey),
+        senderAccount: options.senderAccount?.slice() ?? identity(secretKey),
         recipients: targets.map((target) => target.slice()),
         targetAccounts: (options.targetAccounts ?? []).map((target) => ({
             accountKey: target.accountKey.slice(),

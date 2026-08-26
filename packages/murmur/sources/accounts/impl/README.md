@@ -14,5 +14,5 @@ current last-resort package, one-use pool, pending replenishment, and spent
 markers. Matching private KeyPackage bundles remain in the session engine's
 durable KeyPackage storage.
 
-There is no provisioning transcript, roster chain, device credential, or
-approval ceremony.
+Device authority is exactly the relay's current account-signed roster. Murmur
+does not add secondary device credentials or an approval ceremony.

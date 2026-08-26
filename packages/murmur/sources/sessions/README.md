@@ -24,6 +24,12 @@ checked before application data is accepted. Owner deletion durably separates
 the account-signed relay purge request and final MLS notice from session state,
 so local cleanup is terminal while publication remains retryable.
 
+`deleteAccount()` first persists and submits one account-signed terminal relay
+request. After confirmation, or a replay proving earlier acceptance, one store
+transaction removes every local key and the client destroys both identity roots
+in memory. It does not erase authenticated MLS events already held by remote
+members; those sessions converge later through silence or explicit removal.
+
 `claimAccount()` validates every returned MLS signature, lifetime, device key,
 and account credential before exposing an immutable claim. `createSession()`
 and `addMember()` flatten that claim into device-level MLS additions. Client

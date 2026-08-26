@@ -141,6 +141,7 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
         version: 1,
         id: delivery.id,
         sender: delivery.sender.slice(),
+        senderAccount: delivery.senderAccount.slice(),
         recipients: delivery.recipients.map((recipient) => recipient.slice()),
         targetAccounts: delivery.targetAccounts.map((target) => ({
             accountKey: target.accountKey.slice(),

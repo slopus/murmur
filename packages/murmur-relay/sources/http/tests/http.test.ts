@@ -42,6 +42,8 @@ describe("identity queue HTTP API", () => {
         try {
             for (const path of [
                 "/v1/deliveries",
+                "/v1/sessions/delete",
+                "/v1/accounts/delete",
                 "/v1/queue/read",
                 "/v1/queue/events",
                 "/v1/queue/ack",
@@ -135,6 +137,51 @@ describe("identity queue HTTP API", () => {
             const exhausted = await handler(claim(account, budgeted));
             expect(exhausted.status).toBe(429);
             expect(await exhausted.json()).toEqual({ error: "ticket_exhausted" });
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("terminally deletes an account without exposing whether it had state", async () => {
+        const accountSecret = secret(24);
+        const account = identity(accountSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const handler = createRelayFetchHandler(relay, {
+            requireRemoteAddress: false,
+            defaultAdmissionPrincipal: "account-deletion-http-tests",
+        });
+        try {
+            await relay.publish(
+                signedDelivery(accountSecret, recipients(account), { id: 24, now: NOW }),
+                "account-deletion-http-tests",
+            );
+            const deletion = signedDelivery(accountSecret, [], {
+                id: 25,
+                now: NOW,
+                ciphertext: canonicalJson({ version: 1, type: "delete_account" }),
+            });
+            const deleted = await handler(
+                post("/v1/accounts/delete", signedDeliveryToJson(deletion)),
+            );
+            expect(deleted.status).toBe(200);
+            expect(await deleted.json()).toEqual({ deleted: true });
+
+            const missing = signedDelivery(secret(26), [], {
+                id: 26,
+                now: NOW,
+                ciphertext: canonicalJson({ version: 1, type: "delete_account" }),
+            });
+            const missingResponse = await handler(
+                post("/v1/accounts/delete", signedDeliveryToJson(missing)),
+            );
+            expect(missingResponse.status).toBe(200);
+            expect(await missingResponse.json()).toEqual({ deleted: true });
+
+            const replay = await handler(
+                post("/v1/accounts/delete", signedDeliveryToJson(deletion)),
+            );
+            expect(replay.status).toBe(409);
+            expect(await replay.json()).toEqual({ error: "replay" });
         } finally {
             await relay.close();
         }

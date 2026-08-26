@@ -4,6 +4,7 @@ export {
     deliveryFingerprint,
     deliverySigningBytes,
     isDeliveryId,
+    parseAccountDeletionRequest,
     parseSignedDelivery,
     parseSessionDeletionRequest,
     parseSignedQueueAck,

@@ -12,12 +12,13 @@ Applications may use `HttpDeliveryTransport`, `WebSocketDeliveryTransport`, or
 provide the exact `DeliveryTransport` seam. Every page and stream record carries
 required sequence and continuity fields.
 
-Session deliveries carry a signed nullable owner/session pair used only for
-terminal relay cleanup. Both built-in transports support account-signed,
-replay-protected session deletion; a custom transport must expose
-`deleteSession` before owner deletion is available.
+Every delivery signs the account that owns its outbound relay state. Session
+deliveries additionally carry a nullable owner/session pair. Both built-in
+transports support replay-protected session and terminal account deletion; a
+custom transport must expose `deleteSession` and `deleteAccount` for those
+operations.
 
 The transport seam optionally exposes current-roster mutation plus directory
 upload and exact ticketed claim operations. The built-in HTTP transport
-implements all four. A custom transport must implement the directory methods to
-support automatic publication, `claimAccount()`, and `rotate()`.
+implements all four. A custom transport must implement the directory methods
+to support automatic publication, `claimAccount()`, and `rotate()`.

@@ -11,6 +11,7 @@ delivery row -> exact recipient references -> per-inbox sequence
 sender/principal counters -> transactional quota enforcement
 acknowledgement or expiry -> reference removal -> counter reclamation
 owner/session deletion -> exact reference purge -> continuity advance
+sender-account deletion -> outbound purge + owned-inbox and account-state cascade
 ```
 
 The same transaction seam stores per-account/per-device directory state:
@@ -22,10 +23,15 @@ ticketed exact claim -> spend budget -> consume one-time or read fallback
 ```
 
 One-use reference history, upload nonces, and ticket-use counters are durable.
-Session deletion request IDs remain replay-protected for the maximum delivery
-retention window.
+Active device identities are globally unique and resolve to one authoritative
+sender account for outbound ownership validation.
+Session deletion request IDs and hashed account-deletion tombstones remain
+replay-protected for the maximum delivery retention window. Account deletion
+atomically removes the roster, its dependent directory rows, every owned inbox,
+all outbound deliveries, and raw account-linked nonce rows while preserving
+global and surviving-inbox accounting.
 The one clean schema carries version stamp 3.
 
 Initialization accepts only the current exact schema. A mismatched version or
-unexpected or incomplete tables and metadata fail closed; there is no migration
-path.
+unexpected or incomplete tables and metadata fail closed; older schemas require
+a fresh relay database.

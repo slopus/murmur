@@ -41,7 +41,13 @@ const DEFAULT_MAXIMUM_MESSAGE_BYTES = 16 * 1024 * 1024;
 const DEFAULT_TICKET_REFRESH_SKEW_MILLISECONDS = 5_000;
 const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
-type WebSocketOperation = "publish" | "delete_session" | "read" | "acknowledge" | "stream";
+type WebSocketOperation =
+    | "publish"
+    | "delete_session"
+    | "delete_account"
+    | "read"
+    | "acknowledge"
+    | "stream";
 
 interface WebSocketResponse {
     readonly status: number;
@@ -242,6 +248,20 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
             throw new Error("Invalid relay WebSocket response");
         }
         return body.removed;
+    }
+
+    async deleteAccount(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+        const response = await this.#request(
+            "delete_account",
+            signedDeliveryToJson(delivery),
+            signal,
+        );
+        if (response.status < 200 || response.status >= 300) {
+            throwFailure(response.status, response.body);
+        }
+        const body = object(response.body);
+        exact(body, ["deleted"]);
+        if (body.deleted !== true) throw new Error("Invalid relay WebSocket response");
     }
 
     /** Read one bounded page from the negotiated device inbox. */

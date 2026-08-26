@@ -1,6 +1,7 @@
 import { sha256 } from "@noble/hashes/sha2";
 import {
     RelayError,
+    parseAccountDeletionRequest,
     parseDirectoryPrekeyUpload,
     parseDirectorySpentNotification,
     parseSessionDeletionRequest,
@@ -230,6 +231,16 @@ export class RelayService {
                 error: "unauthorized",
             });
         }
+        const authoritativeAccount = await this.#store.readDeviceAccount(delivery.sender);
+        if (
+            authoritativeAccount === undefined
+                ? !equalBytes(delivery.senderAccount, delivery.sender)
+                : !equalBytes(delivery.senderAccount, authoritativeAccount)
+        ) {
+            throw new RelayError(401, "Delivery sender account is not authoritative", {
+                error: "unauthorized",
+            });
+        }
         const now = this.#now();
         if (
             delivery.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
@@ -278,6 +289,7 @@ export class RelayService {
             delivery.targetAccounts.length !== 0 ||
             delivery.ownerAccount !== null ||
             delivery.sessionId !== null ||
+            !equalBytes(delivery.senderAccount, delivery.sender) ||
             !verifyDeliverySignature(delivery)
         ) {
             throw new RelayError(401, "Invalid session deletion authorization", {
@@ -298,6 +310,38 @@ export class RelayService {
         }
         const sessionId = parseSessionDeletionRequest(delivery.ciphertext);
         return this.#store.deleteSessionDeliveries(delivery.sender, sessionId, delivery.id, now);
+    }
+
+    /** Validate and terminally delete all relay state owned by one account. */
+    async deleteAccount(delivery: SignedDelivery): Promise<void> {
+        this.#assertOpen();
+        validateSignedDeliveryShape(delivery);
+        if (
+            delivery.recipients.length !== 0 ||
+            delivery.targetAccounts.length !== 0 ||
+            delivery.ownerAccount !== null ||
+            delivery.sessionId !== null ||
+            !equalBytes(delivery.senderAccount, delivery.sender) ||
+            !verifyDeliverySignature(delivery)
+        ) {
+            throw new RelayError(401, "Invalid account deletion authorization", {
+                error: "unauthorized",
+            });
+        }
+        const now = this.#now();
+        if (
+            delivery.createdAt > now + this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt < now - this.#options.maximumAuthenticationSkewMilliseconds ||
+            delivery.createdAt >= delivery.expiresAt ||
+            delivery.expiresAt <= now ||
+            delivery.expiresAt - now > this.#options.maximumDeliveryTtlMilliseconds
+        ) {
+            throw new RelayError(401, "Account deletion violates relay time policy", {
+                error: "unauthorized",
+            });
+        }
+        parseAccountDeletionRequest(delivery.ciphertext);
+        await this.#store.deleteAccountState(delivery.sender, delivery.id, now);
     }
 
     /** Read one current roster by exact public account identity key. */
@@ -324,6 +368,11 @@ export class RelayService {
         }
         if (!verifyDeliverySignature(delivery)) {
             throw new RelayError(401, "Invalid device roster mutation signature", {
+                error: "unauthorized",
+            });
+        }
+        if (!equalBytes(delivery.senderAccount, delivery.sender)) {
+            throw new RelayError(401, "Invalid device roster mutation owner", {
                 error: "unauthorized",
             });
         }
@@ -382,6 +431,11 @@ export class RelayService {
                 error: "unauthorized",
             });
         }
+        if (!equalBytes(delivery.senderAccount, delivery.sender)) {
+            throw new RelayError(401, "Invalid directory upload owner", {
+                error: "unauthorized",
+            });
+        }
         if (delivery.recipients.length !== 0 || delivery.targetAccounts.length !== 0) {
             throw new RelayError(400, "Directory uploads may not target inboxes", {
                 error: "malformed",
@@ -409,6 +463,7 @@ export class RelayService {
             const notification = entry.spentNotification;
             if (
                 !equalBytes(notification.sender, upload.deviceKey) ||
+                !equalBytes(notification.senderAccount, delivery.sender) ||
                 notification.recipients.length !== 1 ||
                 !equalBytes(notification.recipients[0]!, upload.deviceKey) ||
                 notification.targetAccounts.length !== 0 ||

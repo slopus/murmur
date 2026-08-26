@@ -59,6 +59,11 @@ The application's authenticated server issues short-lived relay session
 tickets. The Worker verifies each ticket before upgrading to WebSocket. Durable
 Objects retain bounded pending deliveries and alarms prune expiry.
 
+The Cloudflare adapter is queue-only and cannot perform the cross-roster,
+directory, inbox, and outbound-state transaction required by terminal account
+deletion. `delete_account` returns `501 account_deletion_unavailable`; use the
+standalone SQLite or PostgreSQL relay when that API is required.
+
 ## Health and shutdown
 
 Do not route traffic until `/health` succeeds. On shutdown, stop accepting new

@@ -6,6 +6,12 @@ empty-queue acknowledgement, metadata reclamation, and UUIDv7 monotonicity.
 SQLite also pins the fixed expiration batch boundary.
 Another regression proves a later quota rejection cannot roll that batch back.
 
+Terminal account-deletion vectors run against SQLite and PGlite. They cover
+owned outbound fanout, device inboxes, surviving shared deliveries, continuity,
+replay, missing-account no-op behavior, and exact global counters. A direct
+SQLite assertion checks every raw account column is empty after the cascade;
+only a SHA-256 replay tombstone remains.
+
 The shared vectors also rotate and replenish two-device directory pools, prove
 one one-use package is consumed per device, exercise reusable fallback, reject
 reference and upload replay, and roll the entire claim back when publishing a

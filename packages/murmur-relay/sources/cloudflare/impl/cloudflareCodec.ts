@@ -19,7 +19,13 @@ export const textEncoder = new TextEncoder();
 
 export interface CloudflareRequestFrame {
     readonly id: string;
-    readonly operation: "publish" | "delete_session" | "read" | "acknowledge" | "stream";
+    readonly operation:
+        | "publish"
+        | "delete_session"
+        | "delete_account"
+        | "read"
+        | "acknowledge"
+        | "stream";
     readonly body: unknown;
 }
 
@@ -72,6 +78,7 @@ export function requestFrame(message: string): CloudflareRequestFrame {
         !/^[A-Za-z0-9_-]{24}$/.test(input.id) ||
         (input.operation !== "publish" &&
             input.operation !== "delete_session" &&
+            input.operation !== "delete_account" &&
             input.operation !== "read" &&
             input.operation !== "acknowledge" &&
             input.operation !== "stream")

@@ -3,7 +3,7 @@
 Fast self-tests prove deterministic seeds, isolated forks, virtual time,
 transaction rollback versus lost responses, defensive copying, transport
 idempotence, page mutation, acknowledgement retry, rule consumption, redaction,
-bounded settling, and abort behavior.
+bounded settling, terminal-operation forwarding, and abort behavior.
 
 Session fault campaigns use bare one-use KeyPackage material.
 

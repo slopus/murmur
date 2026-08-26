@@ -30,6 +30,7 @@ export {
     createSignedDelivery,
     createSignedInboxAck,
     createSignedInboxRead,
+    encodeAccountDeletionRequest,
     encodeSessionDeletionRequest,
     parseInboxDelivery,
     parseInboxContinuity,

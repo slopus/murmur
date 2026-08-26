@@ -11,6 +11,8 @@ export interface SignedDelivery {
     readonly id: string;
     /** Public Murmur identity that signed and published this delivery. */
     readonly sender: Uint8Array;
+    /** Account that owns this outbound relay state. */
+    readonly senderAccount: Uint8Array;
     /** Strictly sorted unique public identities receiving the same ciphertext. */
     readonly recipients: readonly Uint8Array[];
     /** Exact logical account-roster revisions used to select recipient inboxes. */
@@ -30,6 +32,7 @@ export interface SignedDeliveryJson {
     readonly version: 1;
     readonly id: string;
     readonly sender: string;
+    readonly senderAccount: string;
     readonly recipients: readonly string[];
     readonly targetAccounts: readonly {
         readonly accountKey: string;

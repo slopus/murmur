@@ -7,3 +7,6 @@ install command. It performs no network access or analytics.
 The product page explains identity, bare KeyPackage admission, MLS sessions,
 durable synchronization, the relay trust boundary, cryptographic references,
 typed services, and deployment limits.
+
+Cryptography copy names account-secret wrapping directly and avoids retired
+account-lifecycle terminology.

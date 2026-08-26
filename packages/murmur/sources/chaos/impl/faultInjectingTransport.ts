@@ -33,6 +33,7 @@ function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
         version: 1,
         id: delivery.id,
         sender: delivery.sender.slice(),
+        senderAccount: delivery.senderAccount.slice(),
         recipients: delivery.recipients.map((recipient) => recipient.slice()),
         targetAccounts: delivery.targetAccounts.map((target) => ({
             accountKey: target.accountKey.slice(),
@@ -271,6 +272,13 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             throw new Error("Delivery transport does not support session deletion");
         }
         return this.#context.delegate.deleteSession(cloneDelivery(input), signal);
+    }
+
+    async deleteAccount(input: SignedDelivery, signal?: AbortSignal): Promise<void> {
+        if (this.#context.delegate.deleteAccount === undefined) {
+            throw new Error("Delivery transport does not support account deletion");
+        }
+        await this.#context.delegate.deleteAccount(cloneDelivery(input), signal);
     }
 
     async read(input: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {

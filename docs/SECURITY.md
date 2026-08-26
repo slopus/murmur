@@ -51,10 +51,10 @@ continuity is a security property rather than an operational convenience.
 
 ## Delivery
 
-Signed envelopes bind the operation ID, sender, exact recipient set, account
-target revisions, timestamps, and ciphertext. The relay validates all bounds
-and signatures before storage. Queue reads and acknowledgements are
-independently signed by the recipient.
+Signed envelopes bind the operation ID, sender, owning sender account, exact
+recipient set, account target revisions, timestamps, and ciphertext. The relay
+validates active device ownership, all bounds, and signatures before storage.
+Queue reads and acknowledgements are independently signed by the recipient.
 
 Use constant-time comparison for authentication values. Never log request
 bodies, signatures, ciphertext, queue tokens, identity roots, or relay-session
@@ -78,6 +78,11 @@ Protect account-restoration material: possession authorizes registering and
 removing devices without a sibling approval step. Review dormant-device reports
 and remove lost devices promptly. The relay rejects account-targeted traffic
 whose signed roster revision is stale while MLS membership converges.
+
+Account deletion removes relay-owned and local technical state, but it is not
+retroactive erasure from other members. Authenticated MLS events already held
+by remote applications remain under those applications' storage policy. The
+Cloudflare queue-only adapter cannot perform terminal account deletion.
 
 ## Identity directory
 

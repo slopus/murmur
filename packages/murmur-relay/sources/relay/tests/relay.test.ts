@@ -131,6 +131,80 @@ describe("identity queue relay", () => {
         }
     });
 
+    test("authenticates terminal account deletion, treats absence as a no-op, and rejects replay", async () => {
+        const accountSecret = secret(54);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        try {
+            const request = signedDelivery(accountSecret, [], {
+                id: 55,
+                now: NOW,
+                ciphertext: canonicalJson({ version: 1, type: "delete_account" }),
+            });
+            await expect(relay.deleteAccount(request)).resolves.toBeUndefined();
+            await expect(relay.deleteAccount(request)).rejects.toMatchObject({
+                status: 409,
+                body: { error: "replay" },
+            });
+            await expect(
+                relay.deleteAccount({ ...request, signature: new Uint8Array(64) }),
+            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
+            await expect(
+                relay.deleteAccount(
+                    signedDelivery(secret(56), [], {
+                        id: 56,
+                        now: NOW,
+                        ciphertext: canonicalJson({ version: 1, type: "delete_account" }),
+                    }),
+                ),
+            ).resolves.toBeUndefined();
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("derives device delivery ownership from the authoritative roster", async () => {
+        const accountSecret = secret(57);
+        const account = identity(accountSecret);
+        const deviceSecret = secret(58);
+        const device = identity(deviceSecret);
+        const recipient = identity(secret(59));
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        try {
+            await relay.mutateDeviceRoster(
+                signedDelivery(accountSecret, recipients(device), {
+                    id: 57,
+                    now: NOW,
+                    ciphertext: canonicalJson({
+                        version: 1,
+                        type: "register",
+                        deviceKey: encodeBase64Url(device),
+                        resetGeneration: 0,
+                        keyPackage: encodeBase64Url(new Uint8Array([1])),
+                    }),
+                }),
+                "relay-tests",
+            );
+            await expect(
+                relay.publish(
+                    signedDelivery(deviceSecret, recipients(recipient), { id: 58, now: NOW }),
+                    "relay-tests",
+                ),
+            ).rejects.toMatchObject({ status: 401, body: { error: "unauthorized" } });
+            await expect(
+                relay.publish(
+                    signedDelivery(deviceSecret, recipients(recipient), {
+                        id: 59,
+                        now: NOW,
+                        senderAccount: account,
+                    }),
+                    "relay-tests",
+                ),
+            ).resolves.toMatchObject({ duplicate: false });
+        } finally {
+            await relay.close();
+        }
+    });
+
     test("enforces signatures, ciphertext, recipient, TTL, and signed-request time limits", async () => {
         let now = NOW;
         const aliceSecret = secret(3);
@@ -354,6 +428,9 @@ describe("identity queue relay", () => {
             async readDeviceRoster() {
                 return undefined;
             },
+            async readDeviceAccount() {
+                return undefined;
+            },
             async mutateDeviceRoster() {
                 throw new Error("not used");
             },
@@ -371,6 +448,9 @@ describe("identity queue relay", () => {
                 throw new Error("Unused");
             },
             async deleteSessionDeliveries(): Promise<number> {
+                throw new Error("Unused");
+            },
+            async deleteAccountState(): Promise<void> {
                 throw new Error("Unused");
             },
             async readQueue(

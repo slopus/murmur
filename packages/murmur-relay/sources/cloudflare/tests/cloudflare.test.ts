@@ -16,6 +16,29 @@ import type {
     MurmurCloudflareEnvironment,
 } from "../types.js";
 
+class CapturingSocket implements CloudflareServerWebSocket {
+    readonly messages: string[] = [];
+    attachment: ReturnType<CloudflareServerWebSocket["deserializeAttachment"]> = {
+        device: encodeBase64Url(identity(secret(120))),
+        admissionPrincipal: "account-120",
+        expiresAt: Date.now() + 60_000,
+    };
+
+    send(message: string): void {
+        this.messages.push(message);
+    }
+
+    close(): void {}
+
+    serializeAttachment(value: NonNullable<typeof this.attachment>): void {
+        this.attachment = value;
+    }
+
+    deserializeAttachment(): typeof this.attachment {
+        return this.attachment;
+    }
+}
+
 class MemoryStorage implements DurableObjectStorageLike {
     readonly values = new Map<string, unknown>();
     alarm: number | null = null;
@@ -127,6 +150,30 @@ const unusedNamespace: DurableObjectNamespaceLike = {
 };
 
 describe("Cloudflare durable fanout", () => {
+    test("returns an explicit unsupported response for terminal account deletion", async () => {
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: unusedNamespace,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        const inbox = new MurmurInboxDurableObject(new MemoryState(), environment);
+        const socket = new CapturingSocket();
+        await inbox.webSocketMessage(
+            socket,
+            JSON.stringify({
+                version: 1,
+                id: "AAAAAAAAAAAAAAAAAAAAAAAA",
+                operation: "delete_account",
+                body: null,
+            }),
+        );
+        expect(JSON.parse(socket.messages[0]!) as unknown).toMatchObject({
+            status: 501,
+            body: { error: "account_deletion_unavailable" },
+        });
+    });
+
     test("rejects duplicate keys on internal Fetch JSON boundaries", async () => {
         const environment: MurmurCloudflareEnvironment = {
             MURMUR_INBOXES: unusedNamespace,

@@ -93,6 +93,24 @@ export function parseSessionDeletionRequest(value: Uint8Array): Uint8Array {
     return bytesValue(input.sessionId, "session deletion ID", IDENTITY_BYTES);
 }
 
+/** Strictly decode one account-signed terminal account-deletion request body. */
+export function parseAccountDeletionRequest(value: Uint8Array): void {
+    if (!(value instanceof Uint8Array) || value.length < 1 || value.length > 1_024) {
+        throw new RelayError(400, "Invalid account deletion request", { error: "malformed" });
+    }
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(textDecoder.decode(value)) as unknown;
+    } catch {
+        throw new RelayError(400, "Invalid account deletion request", { error: "malformed" });
+    }
+    const input = objectValue(parsed, "account deletion request");
+    exactKeys(input, ["version", "type"], "account deletion request");
+    if (input.version !== 1 || input.type !== "delete_account") {
+        throw new RelayError(400, "Invalid account deletion request", { error: "malformed" });
+    }
+}
+
 function validateIdentity(value: unknown, name: string): asserts value is Uint8Array {
     if (!(value instanceof Uint8Array) || value.length !== IDENTITY_BYTES) {
         throw new RelayError(400, `Invalid ${name}`, { error: "malformed" });
@@ -134,6 +152,7 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
             "version",
             "id",
             "sender",
+            "senderAccount",
             "recipients",
             "targetAccounts",
             "ownerAccount",
@@ -149,6 +168,7 @@ export function validateSignedDeliveryShape(delivery: SignedDelivery): void {
         throw new RelayError(400, "Invalid delivery", { error: "malformed" });
     }
     validateIdentity(delivery.sender, "delivery sender");
+    validateIdentity(delivery.senderAccount, "delivery sender account");
     if (!Array.isArray(delivery.recipients)) {
         throw new RelayError(400, "Invalid delivery recipients", { error: "malformed" });
     }
@@ -207,6 +227,7 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
         version: 1,
         id: delivery.id,
         sender: encodeBase64Url(delivery.sender),
+        senderAccount: encodeBase64Url(delivery.senderAccount),
         recipients: delivery.recipients.map(encodeBase64Url),
         targetAccounts: delivery.targetAccounts.map((target) => ({
             accountKey: encodeBase64Url(target.accountKey),
@@ -231,6 +252,7 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
             "version",
             "id",
             "sender",
+            "senderAccount",
             "recipients",
             "targetAccounts",
             "ownerAccount",
@@ -255,6 +277,7 @@ export function parseSignedDelivery(value: unknown): SignedDelivery {
         version: 1,
         id: input.id,
         sender: bytesValue(input.sender, "delivery sender", IDENTITY_BYTES),
+        senderAccount: bytesValue(input.senderAccount, "delivery sender account", IDENTITY_BYTES),
         recipients: input.recipients.map((recipient) =>
             bytesValue(recipient, "delivery recipient", IDENTITY_BYTES),
         ),

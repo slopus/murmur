@@ -2,7 +2,8 @@
 
 End-to-end Fetch coverage for publish, authenticated read, acknowledgement,
 bounded bodies and responses, exact CORS reflection, oversized-delivery skip
-metadata, mandatory admission context, and per-address admission bounds.
+metadata, mandatory admission context, per-address admission bounds, and
+terminal account-deletion success, replay, and no-oracle behavior.
 
 Directory coverage verifies valid, expired, forged, and budget-exhausted
 tickets, identical known/unknown response envelopes, and the deliberate

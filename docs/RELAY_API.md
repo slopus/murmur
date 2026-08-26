@@ -25,9 +25,11 @@ revisions. A `409 stale_roster` response includes the relay's current roster so
 the sender can durably retarget and retry. Deliveries with no account targets
 retain pure exact-inbox semantics.
 
-Session deliveries additionally carry nullable `ownerAccount` and `sessionId`
-fields. They must either both be null or both identify the immutable session
-owner and exact 32-byte MLS group ID.
+Every delivery carries `senderAccount`, the account that owns its pending
+outbound relay state. For a device sender, the relay verifies current roster
+membership. Session deliveries additionally carry nullable `ownerAccount` and
+`sessionId` fields. They must either both be null or both identify the immutable
+session owner and exact 32-byte MLS group ID.
 
 ## `POST /v1/sessions/delete`
 
@@ -36,6 +38,19 @@ Accepts an account-identity-signed, recipientless delivery whose ciphertext is
 the delivery operation ID and durably removes all pending deliveries tagged
 with that exact sender account and session ID. Affected inbox continuity
 generations advance. Success returns `{ removed }`; replay returns `409`.
+
+## `POST /v1/accounts/delete`
+
+Accepts an account-identity-signed, recipientless delivery whose ciphertext is
+`{ version: 1, type: "delete_account" }`. In one transaction the relay removes
+the account's directory pools and history, roster and roster nonces, device
+inboxes and continuity state, raw session-deletion nonces, and every pending
+outbound delivery whose signed `senderAccount` is that account. Surviving shared
+delivery references and global counters remain exact.
+
+Success is always `{ deleted: true }` for a valid first request, including when
+the account had no state, so the route is not an existence oracle. A request-ID
+replay returns `409`; its tombstone stores only a SHA-256 account digest.
 
 ## `POST /v1/device-rosters/read`
 

@@ -578,7 +578,7 @@ describe("identity queue store conformance", () => {
         database.close();
     });
 
-    test("rejects a mismatched schema version without migration", async () => {
+    test("rejects a mismatched schema version without rewriting it", async () => {
         const sqlite = new DatabaseSync(":memory:");
         const sqliteStore = new SqliteRelayStore(":memory:", { database: sqlite });
         sqlite.exec("UPDATE murmur_queue_schema SET version = 2 WHERE singleton = 1");
@@ -709,6 +709,249 @@ describe("identity queue store conformance", () => {
             } finally {
                 await store.close();
             }
+        }
+    });
+
+    test("terminally deletes account-owned state without exposing account existence", async () => {
+        const accountSecret = secret(101);
+        const account = identity(accountSecret);
+        const deviceSecret = secret(102);
+        const device = identity(deviceSecret);
+        const survivor = identity(secret(103));
+        const externalSecret = secret(104);
+        const external = identity(externalSecret);
+        const mutation = canonicalJson({
+            version: 1,
+            type: "register",
+            deviceKey: encodeBase64Url(device),
+            resetGeneration: 0,
+            keyPackage: encodeBase64Url(new Uint8Array([1])),
+        });
+        for (const store of await stores()) {
+            try {
+                await store.mutateDeviceRoster(
+                    signedDelivery(accountSecret, recipients(device), {
+                        id: 105,
+                        ciphertext: mutation,
+                    }),
+                    {
+                        version: 1,
+                        type: "register",
+                        deviceKey: device,
+                        resetGeneration: 0,
+                        keyPackage: new Uint8Array([1]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await store.publish(
+                    signedDelivery(deviceSecret, recipients(survivor), {
+                        id: 106,
+                        senderAccount: account,
+                    }),
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await store.publish(
+                    signedDelivery(externalSecret, recipients(device, survivor), { id: 107 }),
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                await store.deleteSessionDeliveries(
+                    account,
+                    new Uint8Array(32).fill(108),
+                    signedDelivery(accountSecret, [], { id: 108 }).id,
+                    NOW,
+                );
+                const before = await store.readQueue(survivor, null, 10, NOW, PAGE);
+                const requestId = signedDelivery(accountSecret, [], { id: 109 }).id;
+                await expect(store.deleteAccountState(account, requestId, NOW)).resolves.toBe(
+                    undefined,
+                );
+                expect(await store.readDeviceRoster(account)).toBeUndefined();
+                expect((await store.readQueue(device, null, 10, NOW, PAGE)).deliveries).toEqual([]);
+                const after = await store.readQueue(survivor, null, 10, NOW, PAGE);
+                expect(after.deliveries).toHaveLength(1);
+                expect(after.deliveries[0]?.delivery.sender).toEqual(external);
+                expect(encodeBase64Url(after.generation)).not.toBe(
+                    encodeBase64Url(before.generation),
+                );
+                await expect(
+                    store.deleteAccountState(account, requestId, NOW),
+                ).rejects.toMatchObject({ status: 409, body: { error: "replay" } });
+
+                const absent = identity(secret(110));
+                const absentRequest = signedDelivery(secret(110), [], { id: 110 }).id;
+                await expect(store.deleteAccountState(absent, absentRequest, NOW)).resolves.toBe(
+                    undefined,
+                );
+                expect(await store.readDeviceRoster(absent)).toBeUndefined();
+
+                const deletedClaim = await store.claimDirectory(
+                    account,
+                    {
+                        issuer: "account-deletion-test",
+                        ticketId: new Uint8Array(32).fill(121),
+                        expiresAt: NOW + 1_000,
+                        claimBudget: 1,
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                const absentClaim = await store.claimDirectory(
+                    absent,
+                    {
+                        issuer: "account-deletion-test",
+                        ticketId: new Uint8Array(32).fill(122),
+                        expiresAt: NOW + 1_000,
+                        claimBudget: 1,
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(deletedClaim).toEqual({
+                    version: 1,
+                    accountKey: account,
+                    rosterRevision: 0,
+                    devices: [],
+                });
+                expect(absentClaim).toEqual({
+                    version: 1,
+                    accountKey: absent,
+                    rosterRevision: 0,
+                    devices: [],
+                });
+            } finally {
+                await store.close();
+            }
+        }
+    });
+
+    test("leaves no raw SQLite account rows after the terminal cascade", async () => {
+        const database = new DatabaseSync(":memory:");
+        const store = new SqliteRelayStore(":memory:", { database });
+        const accountSecret = secret(111);
+        const account = identity(accountSecret);
+        const deviceSecret = secret(112);
+        const device = identity(deviceSecret);
+        const survivor = identity(secret(113));
+        try {
+            await store.mutateDeviceRoster(
+                signedDelivery(accountSecret, recipients(device), { id: 114 }),
+                {
+                    version: 1,
+                    type: "register",
+                    deviceKey: device,
+                    resetGeneration: 0,
+                    keyPackage: new Uint8Array([1]),
+                },
+                NOW,
+                LIMITS,
+                ADMISSION_PRINCIPAL,
+            );
+            const directoryReference = new Uint8Array(32).fill(118);
+            const spentNotification = signedDelivery(deviceSecret, recipients(device), {
+                id: 118,
+                senderAccount: account,
+                ciphertext: canonicalJson({
+                    version: 1,
+                    type: "directory_prekey_spent",
+                    reference: encodeBase64Url(directoryReference),
+                }),
+                expiresAt: NOW + 60_000,
+            });
+            await store.uploadDirectoryPrekeys(
+                signedDelivery(accountSecret, [], { id: 119 }),
+                {
+                    version: 1,
+                    type: "directory_prekey_upload",
+                    mode: "rotate",
+                    deviceKey: device,
+                    resetGeneration: 0,
+                    oneTimePrekeys: [
+                        {
+                            reference: directoryReference,
+                            keyPackage: new Uint8Array([2]),
+                            expiresAt: NOW + 60_000,
+                            spentNotification,
+                        },
+                    ],
+                    lastResort: {
+                        reference: new Uint8Array(32).fill(120),
+                        keyPackage: new Uint8Array([3]),
+                        expiresAt: NOW + 60_000,
+                    },
+                },
+                NOW,
+            );
+            await store.publish(
+                signedDelivery(deviceSecret, recipients(device, survivor), {
+                    id: 115,
+                    senderAccount: account,
+                }),
+                NOW,
+                LIMITS,
+                ADMISSION_PRINCIPAL,
+            );
+            await store.deleteSessionDeliveries(
+                account,
+                new Uint8Array(32).fill(116),
+                signedDelivery(accountSecret, [], { id: 116 }).id,
+                NOW,
+            );
+            await store.deleteAccountState(
+                account,
+                signedDelivery(accountSecret, [], { id: 117 }).id,
+                NOW,
+            );
+            const accountTables = [
+                ["murmur_device_rosters", "account_key"],
+                ["murmur_device_roster_devices", "account_key"],
+                ["murmur_device_roster_nonces", "account_key"],
+                ["murmur_directory_devices", "account_key"],
+                ["murmur_directory_prekeys", "account_key"],
+                ["murmur_directory_prekey_references", "account_key"],
+                ["murmur_directory_upload_nonces", "account_key"],
+                ["murmur_session_deletion_nonces", "owner_account"],
+                ["murmur_queue_deliveries", "sender_account"],
+            ] as const;
+            for (const [table, column] of accountTables) {
+                expect(
+                    database
+                        .prepare(`SELECT COUNT(*) AS count FROM ${table} WHERE ${column} = ?`)
+                        .get(account),
+                ).toEqual({ count: 0 });
+            }
+            expect(
+                database
+                    .prepare(
+                        `SELECT
+                            (SELECT COUNT(*) FROM murmur_queues WHERE recipient IN (?, ?)) AS queues,
+                            (SELECT COUNT(*) FROM murmur_queue_references
+                             WHERE recipient IN (?, ?)) AS refs,
+                            (SELECT COUNT(*) FROM murmur_account_deletion_nonces) AS tombstones,
+                            (SELECT pending_items FROM murmur_queue_global) AS pending_items,
+                            (SELECT COUNT(*) FROM murmur_queue_deliveries) AS actual_items,
+                            (SELECT pending_references FROM murmur_queue_global) AS pending_refs,
+                            (SELECT COUNT(*) FROM murmur_queue_references) AS actual_refs`,
+                    )
+                    .get(account, device, account, device),
+            ).toEqual({
+                queues: 0,
+                refs: 0,
+                tombstones: 1,
+                pending_items: 0,
+                actual_items: 0,
+                pending_refs: 0,
+                actual_refs: 0,
+            });
+        } finally {
+            await store.close();
         }
     });
 

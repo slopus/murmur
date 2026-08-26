@@ -168,6 +168,7 @@ The application owns opaque descriptors and update bytes. Murmur exposes:
 - `activateSession`, `ignoreSession`, and `abandonSession`;
 - `send`, `addMember`, `removeMember`, `leaveSession`, and owner-only
   `deleteSession`;
+- terminal `deleteAccount`;
 - `grantAdmin`, `revokeAdmin`, and `setPolicies`;
 - optional typed services registered under stable IDs.
 
@@ -195,6 +196,12 @@ Registration and removal are account-identity-signed relay mutations. Their
 ordinary inbox notifications drive MLS convergence. Any restored device may
 remove itself or another device with `removeDevice(deviceKey)`. Dormancy
 reporting is advisory; removal remains an explicit application decision.
+
+`deleteAccount()` is terminal. It persists and retries one signed relay request,
+then clears every local store key and destroys both identity roots only after
+relay confirmation. It does not erase authenticated MLS events already held by
+other members; those members converge later through silence or explicit
+removal.
 
 ## Storage and recovery
 

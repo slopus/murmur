@@ -97,6 +97,7 @@ const bobAdmission = await alice.claimAccount(bob.identity, ticket);
 const session = await alice.createSession({
     descriptor: encode('{"protocol":"chat","version":1}'),
     members: [bobAdmission],
+    sendPolicy: "admins",
 });
 
 await alice.synchronize({ waitMilliseconds: 0 });
@@ -165,13 +166,17 @@ The application owns opaque descriptors and update bytes. Murmur exposes:
 - `createSession`, `session`, and bounded `sessions` listing;
 - `claimAccount` and explicit directory `rotate`;
 - `activateSession`, `ignoreSession`, and `abandonSession`;
-- `send`, `addMember`, `removeMember`, and `leaveSession`;
+- `send`, `addMember`, `removeMember`, `leaveSession`, and owner-only
+  `deleteSession`;
+- terminal `deleteAccount`;
 - `grantAdmin`, `revokeAdmin`, and `setPolicies`;
 - optional typed services registered under stable IDs.
 
 The immutable session owner is always an admin. Policy controls whether admins
-may assign admins and whether every member may add another member. A committer
-adopts its own Commit only after the authenticated queue echo arrives.
+may assign admins, whether every member may add another member, and whether
+everyone or only admins may send application events. Only the owner may change
+policy or terminally delete the session. A committer adopts its own Commit only
+after the authenticated queue echo arrives.
 
 ## Multiple devices
 
@@ -191,6 +196,12 @@ Registration and removal are account-identity-signed relay mutations. Their
 ordinary inbox notifications drive MLS convergence. Any restored device may
 remove itself or another device with `removeDevice(deviceKey)`. Dormancy
 reporting is advisory; removal remains an explicit application decision.
+
+`deleteAccount()` is terminal. It persists and retries one signed relay request,
+then clears every local store key and destroys both identity roots only after
+relay confirmation. It does not erase authenticated MLS events already held by
+other members; those members converge later through silence or explicit
+removal.
 
 ## Storage and recovery
 

@@ -27,6 +27,7 @@ function delivery(id: string, marker: number = 1): SignedDelivery {
         version: 1,
         id,
         sender: IDENTITY.slice(),
+        senderAccount: IDENTITY.slice(),
         recipients: [SECOND_IDENTITY.slice()],
         targetAccounts: [],
         ownerAccount: null,

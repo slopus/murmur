@@ -33,6 +33,7 @@ export interface SignedDeliveryJson {
     readonly version: 1;
     readonly id: string;
     readonly sender: string;
+    readonly senderAccount: string;
     readonly recipients: readonly string[];
     readonly targetAccounts: readonly {
         readonly accountKey: string;
@@ -128,6 +129,11 @@ export function encodeSessionDeletionRequest(sessionId: Uint8Array): Uint8Array 
     });
 }
 
+/** Encode one account-signed terminal account-deletion request body. */
+export function encodeAccountDeletionRequest(): Uint8Array {
+    return canonicalJsonBytes({ version: 1, type: "delete_account" });
+}
+
 /**
  * Encode one delivery for relay JSON from a custom transport implementation.
  */
@@ -136,6 +142,7 @@ export function signedDeliveryToJson(delivery: SignedDelivery): SignedDeliveryJs
         version: 1,
         id: delivery.id,
         sender: encodeBase64Url(delivery.sender),
+        senderAccount: encodeBase64Url(delivery.senderAccount),
         recipients: delivery.recipients.map(encodeBase64Url),
         targetAccounts: delivery.targetAccounts.map((target) => ({
             accountKey: encodeBase64Url(target.accountKey),
@@ -163,6 +170,7 @@ function deliverySigningBytes(delivery: SignedDelivery): Uint8Array {
 export function validateSignedDelivery(delivery: SignedDelivery): void {
     validateDeliveryId(delivery.id);
     validateIdentityPublicKey({ publicKey: delivery.sender });
+    validateIdentityPublicKey({ publicKey: delivery.senderAccount });
     if (
         delivery.version !== 1 ||
         !Number.isSafeInteger(delivery.createdAt) ||
@@ -228,6 +236,7 @@ export function createSignedDelivery(
         version: 1,
         id: options.id ?? encodeBase64Url(randomBytes(24)),
         sender: identity.publicKey.slice(),
+        senderAccount: options.senderAccount?.slice() ?? identity.publicKey.slice(),
         recipients: recipients.map((value) => value.slice()).sort(compareBytes),
         targetAccounts: (options.targetAccounts ?? [])
             .map((target) => ({
@@ -254,6 +263,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
             "version",
             "id",
             "sender",
+            "senderAccount",
             "recipients",
             "targetAccounts",
             "ownerAccount",
@@ -269,6 +279,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         input.version !== 1 ||
         typeof input.id !== "string" ||
         typeof input.sender !== "string" ||
+        typeof input.senderAccount !== "string" ||
         !Array.isArray(input.recipients) ||
         input.recipients.some((entry) => typeof entry !== "string") ||
         !Array.isArray(input.targetAccounts) ||
@@ -283,6 +294,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         version: 1,
         id: input.id,
         sender: decodeBase64Url(input.sender),
+        senderAccount: decodeBase64Url(input.senderAccount),
         recipients: input.recipients.map((entry) => decodeBase64Url(entry as string)),
         targetAccounts: input.targetAccounts.map((entry) => {
             const target = object(entry, "delivery target account");
@@ -312,6 +324,7 @@ function parseSignedDeliveryValue(value: unknown, validateIdentity: boolean): Si
         validateDeliveryId(delivery.id);
         if (
             delivery.sender.length !== 32 ||
+            delivery.senderAccount.length !== 32 ||
             delivery.version !== 1 ||
             !Number.isSafeInteger(delivery.createdAt) ||
             delivery.createdAt < 0 ||

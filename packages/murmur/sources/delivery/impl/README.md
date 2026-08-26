@@ -1,12 +1,13 @@
 # Delivery implementation
 
 `deliveryHttpTransport.ts` implements the current HTTP/SSE transport, including
-strict directory upload and exact-account claim responses.
+strict directory operations plus session and account deletion.
 `deliveryNegotiation.ts` signs temporary-session requests and validates routed
 WebSocket tickets. `deliveryWebSocketTransport.ts` implements the current
-WebSocket framing while keeping every queue operation device-signed.
+WebSocket framing, including account-signed terminal operations.
 
-`deliveryCodec.ts` owns the exact relay-compatible signed wire format.
+`deliveryCodec.ts` owns the exact relay-compatible signed wire format and binds
+each sender to the account that owns its outbound relay state.
 `deliveryHttpTransport.ts` implements bounded fetch requests and the
 recipient-authenticated SSE connection. `deliverySse.ts` strictly parses
 heartbeats and exact delivery records with per-event and heartbeat-timeout

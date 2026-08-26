@@ -347,6 +347,14 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         return value.removed;
     }
 
+    async deleteAccount(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+        const value = object(
+            await this.#post("/v1/accounts/delete", signedDeliveryToJson(delivery), signal),
+        );
+        exact(value, ["deleted"]);
+        if (value.deleted !== true) throw new Error("Invalid relay response");
+    }
+
     async readDeviceRoster(
         accountKey: Uint8Array,
         signal?: AbortSignal,

@@ -197,6 +197,7 @@ describe("negotiated relay sessions", () => {
                         version: delivery.version,
                         id: delivery.id,
                         sender: encodeBase64Url(delivery.sender),
+                        senderAccount: encodeBase64Url(delivery.senderAccount),
                         recipients: delivery.recipients.map(encodeBase64Url),
                         targetAccounts: delivery.targetAccounts.map((target) => ({
                             accountKey: encodeBase64Url(target.accountKey),
@@ -250,6 +251,7 @@ describe("negotiated relay sessions", () => {
 
     test("roundtrips continuity acknowledgement through the production WebSocket client", async () => {
         const identityKeyPair = generateIdentityKeyPair();
+        const accountKeyPair = generateIdentityKeyPair();
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const token = createRelaySessionToken(TOKEN_SECRET, {
             device: identityKeyPair.publicKey,
@@ -301,8 +303,20 @@ describe("negotiated relay sessions", () => {
                     }),
                 ),
             ).resolves.toMatchObject({ deliveries: [] });
+            const deletion = createSignedDelivery(
+                accountKeyPair,
+                [],
+                canonicalJson({ version: 1, type: "delete_account" }),
+                { createdAt: NOW, expiresAt: NOW + 60_000 },
+            );
+            await expect(transport.deleteAccount(deletion)).resolves.toBeUndefined();
+            await expect(transport.deleteAccount(deletion)).rejects.toMatchObject({
+                status: 409,
+                code: "replay",
+            });
         } finally {
             destroyIdentity(identityKeyPair);
+            destroyIdentity(accountKeyPair);
             await relay.close();
         }
     });

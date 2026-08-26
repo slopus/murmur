@@ -50,7 +50,7 @@ the same fallback package are valid.
 One sender-signed delivery contains:
 
 - a random operation ID;
-- sender and exact recipient public identities;
+- sender, owning sender account, and exact recipient public identities;
 - nullable owner-account and session identifiers for relay-side terminal cleanup;
 - creation and expiry times;
 - opaque ciphertext;
@@ -129,6 +129,26 @@ The relay rejects stale revisions or omitted current devices and returns the
 current roster. The client durably observes it, retargets the exact outbox, and
 drives ordinary MLS Add or Remove convergence. Pure inbox publication has no
 roster target and is unchanged.
+
+Every ordinary device publication signs its owning account. The relay accepts
+that ownership only when the sender is an active device in the current roster;
+account-signed control traffic names the account itself. This binding lets the
+relay remove every pending outbound delivery owned by an account without
+interpreting ciphertext.
+
+## Account deletion
+
+`deleteAccount()` durably submits one account-identity-signed, replay-protected
+terminal request. The relay handles an authenticated missing account as the
+same successful no-op as an existing account, then atomically removes the
+account roster, dependent directory state, every device inbox and continuity
+row, raw account nonces, and all pending outbound deliveries owned by the
+account. A hashed request tombstone remains for the delivery-retention window.
+
+Only after relay confirmation does the client remove every local store key and
+destroy its device and account roots in memory. This operation does not erase
+MLS events already authenticated and stored by remote members. Their sessions
+remain until silence or an authorized member removal makes them converge.
 
 ## Continuity loss
 

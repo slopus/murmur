@@ -1175,6 +1175,7 @@ export class SessionEngine {
                     const request = createSignedDelivery(this.#accountIdentity, [], requestBody, {
                         createdAt: now,
                         expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        senderAccount: this.#accountKey,
                     });
                     await setAndZero(
                         transaction,
@@ -1931,6 +1932,7 @@ export class SessionEngine {
                         id: record.request.id,
                         createdAt: now,
                         expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        senderAccount: this.#accountKey,
                     },
                 );
                 let notice = record.notice;
@@ -1943,6 +1945,7 @@ export class SessionEngine {
                             id: record.notice.id,
                             createdAt: now,
                             expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                            senderAccount: this.#accountKey,
                             targetAccounts: record.notice.targetAccounts,
                             ...(record.notice.ownerAccount === null
                                 ? {}
@@ -2289,6 +2292,7 @@ export class SessionEngine {
                 const delivery = createSignedDelivery(this.#identity, members, ciphertext, {
                     createdAt: now,
                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                    senderAccount: this.#accountKey,
                     targetAccounts: await this.#targetAccounts(transaction, epoch),
                     ownerAccount: roles.owner,
                     sessionId: id,
@@ -2604,6 +2608,7 @@ export class SessionEngine {
                     {
                         createdAt: now,
                         expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                        senderAccount: this.#accountKey,
                         targetAccounts: await this.#targetAccounts(
                             transaction,
                             epoch,
@@ -2659,6 +2664,7 @@ export class SessionEngine {
                                 {
                                     createdAt: now,
                                     expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                                    senderAccount: this.#accountKey,
                                     ownerAccount: nextRoles.owner,
                                     sessionId: id,
                                 },
@@ -3562,6 +3568,7 @@ export class SessionEngine {
                         {
                             createdAt: now,
                             expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                            senderAccount: this.#accountKey,
                             targetAccounts: await this.#targetAccounts(transaction, next),
                             ...(dependent.delivery.ownerAccount === null
                                 ? {}
@@ -4533,6 +4540,7 @@ export class SessionEngine {
             {
                 createdAt: now,
                 expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                senderAccount: this.#accountKey,
                 targetAccounts: [...targets.values()],
                 ...(record.delivery.ownerAccount === null
                     ? {}
@@ -4623,6 +4631,7 @@ export class SessionEngine {
             {
                 createdAt: now,
                 expiresAt: now + DELIVERY_TTL_MILLISECONDS,
+                senderAccount: this.#accountKey,
                 targetAccounts: record.delivery.targetAccounts,
                 ...(record.delivery.ownerAccount === null
                     ? {}

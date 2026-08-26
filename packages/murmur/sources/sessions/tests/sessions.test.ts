@@ -74,6 +74,52 @@ async function prefixCount(store: MurmurStore, prefix: string): Promise<number> 
 }
 
 describe("stateful MLS sessions", () => {
+    test("retries terminal account deletion and wipes every local key only after confirmation", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const store = new MemoryMurmurStore();
+        const base = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        let dropFirstConfirmation = true;
+        const transport: DeliveryTransport = {
+            publish: (delivery, signal) => base.publish(delivery, signal),
+            deleteSession: (delivery, signal) => base.deleteSession(delivery, signal),
+            deleteAccount: async (delivery, signal) => {
+                await base.deleteAccount(delivery, signal);
+                if (dropFirstConfirmation) {
+                    dropFirstConfirmation = false;
+                    throw new DeliveryTransportError(0, "connection_lost");
+                }
+            },
+            read: (request, signal) => base.read(request, signal),
+            acknowledge: (request, signal) => base.acknowledge(request, signal),
+            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
+            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            uploadDirectoryPrekeys: (delivery, signal) =>
+                base.uploadDirectoryPrekeys(delivery, signal),
+            claimDirectory: (account, ticket, signal) =>
+                base.claimDirectory(account, ticket, signal),
+        };
+        const value = await MurmurClient.open({ transport, store, now: () => NOW });
+        const account = value.identity;
+        try {
+            await store.set("application/unrelated", new Uint8Array([1, 2, 3]));
+            await expect(value.deleteAccount()).rejects.toMatchObject({
+                code: "connection_lost",
+            });
+            expect(await prefixCount(store, "")).toBeGreaterThan(0);
+            expect(await relay.readDeviceRoster(account)).toBeUndefined();
+
+            await expect(value.deleteAccount()).resolves.toBeUndefined();
+            expect(await prefixCount(store, "")).toBe(0);
+            expect(() => value.identity).toThrow("closed");
+            await expect(value.sessions()).rejects.toThrow("closed");
+        } finally {
+            value.close();
+            await relay.close();
+        }
+    });
+
     test("queues initial group messages offline and relays Commit, Welcome, then messages after restart", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const aliceStore = new MemoryMurmurStore();

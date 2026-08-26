@@ -15,3 +15,7 @@ utils/      self-contained encoding and byte helpers
 
 `index.ts` is the only package entry point. The published surface remains
 browser-safe and side-effect free.
+
+The public client includes durable session cleanup and terminal account
+deletion. Account deletion clears the relay ownership boundary first, then the
+entire application-provided store.

@@ -10,6 +10,11 @@ account-signed deletion installs a durable tombstone, resumes partial inbox
 purges idempotently, rejects replay, and advances continuity in every affected
 inbox, including historical member inboxes not named by the final MLS notice.
 
+This queue-only adapter does not own the current account roster or directory,
+so `delete_account` returns `501 account_deletion_unavailable`. Terminal account
+deletion requires the standalone SQLite or PostgreSQL relay, where all linked
+state shares one transaction boundary.
+
 Each inbox stores required sequence, acknowledgement, continuity-generation,
 pending-item, and pending-byte metadata in one exact shape. Invalid metadata
 fails closed. Streams emit continuity before ordered queued deliveries.

@@ -4,11 +4,15 @@ import {
     InboxContinuityLossError,
     WebSocketDeliveryTransport,
     createSignedDelivery,
+    encodeAccountDeletionRequest,
+    parseSignedDelivery,
+    signedDeliveryToJson,
     type DeliveryFetch,
     type DeliveryDeviceRoster,
     type DeliveryDirectoryClaim,
     type RelaySessionProvider,
     type DeliveryTransport,
+    type SignedDelivery,
     type WebSocketDeliveryTransportOptions,
 } from "../delivery/index.js";
 import {
@@ -121,6 +125,7 @@ export { MurmurResetRequiredError } from "./types.js";
 
 const IDENTITY_KEY = "murmur/identity/root";
 const ACCOUNT_ROOT_KEY = "murmur/accounts/v1/root";
+const ACCOUNT_DELETION_KEY = "murmur/accounts/v1/deletion";
 const RESET_PENDING_KEY = "murmur/reset/v1/pending";
 const ACCOUNT_DEVICE_ACTIVITY_PREFIX = "murmur/accounts/v1/device-activity/";
 const MURMUR_KEY_PREFIX = "murmur/";
@@ -330,6 +335,7 @@ export class MurmurClient {
     #syncWakeResolve: (() => void) | undefined;
     #syncRetryTimer: ReturnType<typeof setTimeout> | undefined;
     #updatesActive = false;
+    #accountDeletionActive = false;
 
     private constructor(
         identity: IdentityKeyPair,
@@ -599,7 +605,11 @@ export class MurmurClient {
                         this.#identity,
                         [this.#identity.publicKey],
                         encodeDirectorySpentNotification(reference),
-                        { createdAt: now, expiresAt: notificationExpiresAt },
+                        {
+                            createdAt: now,
+                            expiresAt: notificationExpiresAt,
+                            senderAccount: this.#account.publicKey,
+                        },
                     ),
                 });
             }
@@ -728,7 +738,7 @@ export class MurmurClient {
                 this.#identity,
                 [this.#identity.publicKey],
                 encodeDirectorySpentNotification(prekey.reference),
-                { createdAt: now, expiresAt },
+                { createdAt: now, expiresAt, senderAccount: this.#account.publicKey },
             ),
         };
     }
@@ -1170,6 +1180,100 @@ export class MurmurClient {
         const deletionId = await this.#exclusive(() => this.#engine.delete(id));
         this.#signalSync();
         return deletionId;
+    }
+
+    /**
+     * Terminally delete this account at the relay, then atomically destroy all local state.
+     *
+     * A replay response confirms an earlier accepted request after a crash. Remote MLS history
+     * and copies held by other members are not erased by account deletion.
+     */
+    async deleteAccount(): Promise<void> {
+        this.#assertOpen();
+        if (this.#transport.deleteAccount === undefined) {
+            throw new Error("Delivery transport does not support account deletion");
+        }
+        if (this.#pendingOperations > 0 || this.#syncActive || this.#updatesActive) {
+            throw new Error("Account deletion requires an idle Murmur client");
+        }
+        this.#accountDeletionActive = true;
+        this.#pendingOperations += 1;
+        let request: SignedDelivery | undefined;
+        try {
+            const stored = await this.#store.get(ACCOUNT_DELETION_KEY);
+            if (stored === undefined) {
+                const now = this.#now();
+                request = createSignedDelivery(this.#account, [], encodeAccountDeletionRequest(), {
+                    createdAt: now,
+                    expiresAt: now + DIRECTORY_NOTIFICATION_TTL_MILLISECONDS,
+                    senderAccount: this.#account.publicKey,
+                });
+            } else {
+                try {
+                    request = parseSignedDelivery(JSON.parse(utf8Decode(stored)) as unknown);
+                    if (
+                        !equalBytes(request.sender, this.#account.publicKey) ||
+                        !equalBytes(request.senderAccount, this.#account.publicKey)
+                    ) {
+                        throw new Error("Stored account deletion names a different account");
+                    }
+                    const now = this.#now();
+                    request = createSignedDelivery(this.#account, [], request.ciphertext, {
+                        id: request.id,
+                        createdAt: now,
+                        expiresAt: now + DIRECTORY_NOTIFICATION_TTL_MILLISECONDS,
+                        senderAccount: this.#account.publicKey,
+                    });
+                } finally {
+                    zeroBytes(stored);
+                }
+            }
+            const encoded = canonicalJsonBytes(signedDeliveryToJson(request) as never);
+            try {
+                await this.#store.set(ACCOUNT_DELETION_KEY, encoded);
+            } finally {
+                zeroBytes(encoded);
+            }
+            try {
+                await this.#transport.deleteAccount(request);
+            } catch (error: unknown) {
+                if (!(error instanceof DeliveryTransportError && error.code === "replay")) {
+                    throw error;
+                }
+            }
+            await this.#store.transaction(async (transaction) => {
+                let after: string | undefined;
+                for (;;) {
+                    const page = await transaction.scan("", {
+                        ...(after === undefined ? {} : { after }),
+                        limit: RESET_PURGE_SCAN_LIMIT,
+                    });
+                    if (page.size === 0) break;
+                    for (const [key, value] of page) {
+                        after = key;
+                        try {
+                            await transaction.delete(key);
+                        } finally {
+                            zeroBytes(value);
+                        }
+                    }
+                    if (page.size < RESET_PURGE_SCAN_LIMIT) break;
+                }
+            });
+            this.#closed = true;
+            this.#services.clear();
+            destroyIdentity(this.#identity);
+            destroyIdentity(this.#account);
+        } finally {
+            if (request !== undefined) {
+                zeroBytes(request.sender);
+                zeroBytes(request.senderAccount);
+                zeroBytes(request.ciphertext);
+                zeroBytes(request.signature);
+            }
+            this.#pendingOperations -= 1;
+            this.#accountDeletionActive = false;
+        }
     }
 
     /**
@@ -1717,6 +1821,7 @@ export class MurmurClient {
 
     #assertOpen(): void {
         if (this.#closed) throw new Error("Murmur client is closed");
+        if (this.#accountDeletionActive) throw new Error("Murmur account deletion is active");
     }
 
     async #tracked<T>(operation: () => Promise<T>): Promise<T> {

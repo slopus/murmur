@@ -13,4 +13,7 @@ utils/       strict JSON, logging, bytes, and UUID helpers
 websocket/   authenticated WebSocket protocol
 ```
 
-The relay stores opaque pending ciphertext and continuity metadata only.
+The relay stores opaque pending ciphertext, continuity metadata, current
+account rosters, and account-linked directory state. Standalone storage owns
+transactional terminal account deletion; the queue-only Cloudflare adapter
+returns an explicit unsupported-operation response.

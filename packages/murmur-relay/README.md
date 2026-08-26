@@ -11,6 +11,10 @@ directory prekey pools.
 - PostgreSQL through `pg`, with database-backed wake notifications.
 - Cloudflare Durable Objects for inboxes and manifest-first fanout.
 
+The Cloudflare adapter is queue-only and does not implement terminal account
+deletion. That operation requires the standalone SQLite or PostgreSQL ownership
+transaction.
+
 ## Run locally
 
 ```bash
@@ -31,6 +35,7 @@ fanout limits before exposing the process publicly.
 | `GET`  | `/health`                   | Storage and wake-source readiness  |
 | `POST` | `/v1/deliveries`            | Atomic signed ciphertext multicast |
 | `POST` | `/v1/sessions/delete`       | Signed terminal session purge      |
+| `POST` | `/v1/accounts/delete`       | Signed terminal account cascade    |
 | `POST` | `/v1/queue/read`            | Signed bounded inbox read          |
 | `POST` | `/v1/queue/events`          | Authenticated ordered SSE stream   |
 | `POST` | `/v1/queue/ack`             | Signed monotonic prefix trim       |
@@ -43,6 +48,10 @@ Directory construction requires a `DirectoryTicketVerifier`. Production
 deployments should connect it to their authentication server. The exported
 `LocalDirectoryTicketIssuer` is suitable for local deployments and tests; its
 tickets carry an expiry and atomic exact-claim budget.
+
+Account deletion is account-signed and replay-protected. SQLite and PostgreSQL
+remove the complete ownership cascade in one transaction and return the same
+success for an authenticated account with no retained state.
 
 See [deployment](../../docs/DEPLOYMENT.md) and the complete
 [relay API](../../docs/RELAY_API.md).

@@ -381,6 +381,17 @@ export function createRelayFetchHandler(
                 const removed = await relay.deleteSession(delivery);
                 return boundedJson({ removed }, relay.options.maximumJsonBodyBytes, corsHeaders);
             }
+            if (request.method === "POST" && url.pathname === "/v1/accounts/delete") {
+                const delivery = parseSignedDelivery(
+                    await readJson(request, relay.options.maximumJsonBodyBytes),
+                );
+                await relay.deleteAccount(delivery);
+                return boundedJson(
+                    { deleted: true },
+                    relay.options.maximumJsonBodyBytes,
+                    corsHeaders,
+                );
+            }
             if (request.method === "POST" && url.pathname === "/v1/device-rosters/read") {
                 const accountKey = parseDeviceRosterLookup(
                     await readJson(request, relay.options.maximumJsonBodyBytes),

@@ -12,6 +12,8 @@ export interface SignedDelivery {
     readonly version: 1;
     readonly id: string;
     readonly sender: Uint8Array;
+    /** Account that owns this outbound relay state, signed into the delivery. */
+    readonly senderAccount: Uint8Array;
     readonly recipients: readonly Uint8Array[];
     /** Exact logical account-roster revisions used to select recipient inboxes. */
     readonly targetAccounts: readonly DeliveryAccountTarget[];
@@ -203,6 +205,8 @@ export interface DeliveryTransport {
     publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
     /** Apply one account-signed, replay-protected session relay-state deletion. */
     deleteSession?(delivery: SignedDelivery, signal?: AbortSignal): Promise<number>;
+    /** Apply one account-signed, replay-protected terminal account deletion. */
+    deleteAccount?(delivery: SignedDelivery, signal?: AbortSignal): Promise<void>;
     read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
     acknowledge(request: SignedInboxAck, signal?: AbortSignal): Promise<InboxAcknowledgement>;
     /** Read the relay's one current roster for an exact account identity key. */
@@ -236,6 +240,8 @@ export interface CreateDeliveryOptions {
     readonly id?: string;
     readonly createdAt?: number;
     readonly expiresAt: number;
+    /** Account that owns the sender's outbound relay state. Defaults to the signer. */
+    readonly senderAccount?: Uint8Array;
     /** Exact account-roster revisions checked against relay-owned current state. */
     readonly targetAccounts?: readonly DeliveryAccountTarget[];
     /** Session owner and identifier must be supplied together for session traffic. */

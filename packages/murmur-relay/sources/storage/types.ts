@@ -74,6 +74,10 @@ export interface RelayStore {
         requestId: string,
         now: number,
     ): Promise<number>;
+    /** Replay-protected terminal removal of every row owned by one account. */
+    deleteAccountState(accountKey: Uint8Array, requestId: string, now: number): Promise<void>;
+    /** Resolve the unique current account that owns one active device key. */
+    readDeviceAccount(deviceKey: Uint8Array): Promise<Uint8Array | undefined>;
     /** Read one current roster by exact public account identity key. */
     readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined>;
     /** Atomically apply and notify one replay-protected identity-signed roster mutation. */

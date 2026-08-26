@@ -28,7 +28,13 @@ const textEncoder = new TextEncoder();
 
 interface RequestFrame {
     readonly id: string;
-    readonly operation: "publish" | "delete_session" | "read" | "acknowledge" | "stream";
+    readonly operation:
+        | "publish"
+        | "delete_session"
+        | "delete_account"
+        | "read"
+        | "acknowledge"
+        | "stream";
     readonly body: unknown;
 }
 
@@ -66,6 +72,7 @@ function frame(value: string, maximumBytes: number): RequestFrame {
         !/^[A-Za-z0-9_-]{24}$/.test(input.id) ||
         (input.operation !== "publish" &&
             input.operation !== "delete_session" &&
+            input.operation !== "delete_account" &&
             input.operation !== "read" &&
             input.operation !== "acknowledge" &&
             input.operation !== "stream")
@@ -151,6 +158,12 @@ export class RelayWebSocketSession {
                 const delivery = parseSignedDelivery(request.body);
                 const removed = await this.#relay.deleteSession(delivery);
                 this.#send(response(request.id, 200, { removed }));
+                return;
+            }
+            if (request.operation === "delete_account") {
+                const delivery = parseSignedDelivery(request.body);
+                await this.#relay.deleteAccount(delivery);
+                this.#send(response(request.id, 200, { deleted: true }));
                 return;
             }
             if (request.operation === "read") {

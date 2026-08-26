@@ -333,6 +333,15 @@ export class MurmurInboxDurableObject {
                 send(socket, responseFrame(frame.id, response.status, await response.json()));
                 return;
             }
+            if (frame.operation === "delete_account") {
+                send(
+                    socket,
+                    responseFrame(frame.id, 501, {
+                        error: "account_deletion_unavailable",
+                    }),
+                );
+                return;
+            }
             if (frame.operation === "read") {
                 const read = parseSignedQueueRead(frame.body);
                 this.#authorizeRead(authorization.device, read, false);
