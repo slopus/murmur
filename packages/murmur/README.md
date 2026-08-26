@@ -860,11 +860,50 @@ convergence with a fresh Welcome; reappearing sessions keep their descriptors
 and expose `reAdmission: true`. Application history transfer stays
 application-owned.
 
-The repository also contains internal, deliberately unexported groundwork for
-private group state — Ristretto255 credential mathematics, encrypted member
-identifiers, and an opaque group-state service that cannot read its members
-(`packages/murmur/sources/math`, `privateGroups`, `privateGroupState`). It
-requires external cryptographic audit before any production exposure.
+### Experimental private-group state
+
+`privateGroupState()` exposes an opaque canonical byte record bound to one
+active MLS session. The session creator generates one stable 32-byte secret;
+Murmur carries it inside the authenticated Commit and each recipient's sealed
+Welcome, persists it with the session, and never returns it to application
+code. A joining member can open the state only after authenticated admission
+has completed locally.
+
+```ts
+const state = await murmur.privateGroupState(session.id);
+
+// The owner initializes the canonical record once.
+const initial = await state.create(new TextEncoder().encode("shared settings"));
+
+// An admitted member opens the existing record.
+const joined = await state.join();
+
+// Reads are available to every live member; writes require owner or admin.
+const current = await state.read();
+const next = await state.mutate(new TextEncoder().encode("updated settings"));
+
+state.close();
+```
+
+When `MurmurClient.open()` receives `relay`, the private-state handle uses that
+same URL and `fetch` implementation. Applications using custom delivery
+transports configure `privateGroupState: { relay, fetch }` or provide a custom
+`PrivateGroupStateTransport`. The handle derives authorization from the live,
+authenticated MLS owner/admin/member roster. It verifies encrypted canonical
+records and durably stores every accepted version and revision hash before the
+operation resolves, so rollback or forked history fails closed across restart.
+The service sees opaque member identifiers, fixed roles, ciphertext sizes,
+revision timing, and member counts, but not account identities, session
+descriptors, policies, or record attributes.
+
+This API is **EXPERIMENTAL**, not production-complete. Two security gaps remain:
+
+- The Ristretto255 credential, presentation, and encrypted-record construction
+  requires an independent external cryptographic audit.
+- Canonical replacements are not yet bound to the relay event ID of the
+  winning MLS Commit (`commitEventId` remains `null`), so the state service
+  cannot independently reject a valid-looking write derived from a losing
+  membership fork.
 
 ## Typed synchronization services
 

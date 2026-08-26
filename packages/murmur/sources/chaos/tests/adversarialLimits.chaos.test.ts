@@ -457,6 +457,7 @@ describe("adversarial inputs and resource limits", () => {
                     epoch: 7n,
                     commit: utf8Encode("valid-commit"),
                     roles,
+                    privateGroupMasterSecret: new Uint8Array(32).fill(7),
                 }),
             );
             expect(wire.kind).toBe("commit");

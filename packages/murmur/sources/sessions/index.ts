@@ -41,6 +41,12 @@ import {
 } from "../mls/index.js";
 import type { MurmurStore } from "../storage/index.js";
 import {
+    createReadyPrivateGroupState,
+    type MurmurPrivateGroupState,
+} from "../privateGroupState/impl/readyPrivateGroupState.js";
+import { destroyPrivateGroupSessionState } from "../privateGroupState/impl/sessionState.js";
+import type { PrivateGroupStateConnection } from "../privateGroupState/types.js";
+import {
     canonicalJsonBytes,
     decodeBase64Url,
     encodeBase64Url,
@@ -335,6 +341,14 @@ export interface MurmurClientOptions {
     readonly discoveryTransport?: DiscoveryTransport;
     /** Fetch implementation used by the built-in HTTP delivery and discovery transports. */
     readonly fetch?: DeliveryFetch;
+    /**
+     * EXPERIMENTAL private-group state connection.
+     *
+     * A relay URL automatically supplies the matching HTTP connection when this is omitted.
+     * Custom delivery transports must provide this explicitly before using
+     * `privateGroupState`.
+     */
+    readonly privateGroupState?: PrivateGroupStateConnection;
     /** Exclusive durable state store for this client identity. */
     readonly store: MurmurStore;
     /**
@@ -360,6 +374,8 @@ export class MurmurClient {
     #contacts: ContactEngine;
     readonly #services = new Map<string, MurmurService>();
     readonly #discoveryTransport: DiscoveryTransport | undefined;
+    readonly #privateGroupStateConnection: PrivateGroupStateConnection | undefined;
+    readonly #privateGroupStates = new Map<string, MurmurPrivateGroupState>();
     readonly #store: MurmurStore;
     readonly #now: () => number;
     #account: IdentityKeyPair | undefined;
@@ -379,6 +395,7 @@ export class MurmurClient {
         store: MurmurStore,
         transport: DeliveryTransport,
         discoveryTransport: DiscoveryTransport | undefined,
+        privateGroupStateConnection: PrivateGroupStateConnection | undefined,
         limits: MurmurSessionLimits,
         now: () => number,
         services: readonly MurmurServiceRegistration[],
@@ -390,6 +407,7 @@ export class MurmurClient {
         this.#store = store;
         this.#now = now;
         this.#discoveryTransport = discoveryTransport;
+        this.#privateGroupStateConnection = privateGroupStateConnection;
         this.#account = account;
         this.#deviceCredential = deviceCredential;
         this.#engine = new SessionEngine(
@@ -521,12 +539,21 @@ export class MurmurClient {
                           options.relay,
                           options.fetch === undefined ? {} : { fetch: options.fetch },
                       ));
+            const privateGroupStateConnection =
+                options.privateGroupState ??
+                (options.relay === undefined
+                    ? undefined
+                    : {
+                          relay: options.relay,
+                          ...(options.fetch === undefined ? {} : { fetch: options.fetch }),
+                      });
             const client = new MurmurClient(
                 identity,
                 invitationRevocation,
                 options.store,
                 transport,
                 discoveryTransport,
+                privateGroupStateConnection,
                 options.limits ?? {},
                 options.now ?? Date.now,
                 services,
@@ -797,6 +824,7 @@ export class MurmurClient {
                 zeroBytes(accountRoot);
                 zeroBytes(rosterBytes);
             }
+            this.#closePrivateGroupStates();
             this.#account = provisioned.account;
             this.#deviceCredential = credential.slice();
             this.#engine.adoptDeviceCredential(credential);
@@ -1096,6 +1124,7 @@ export class MurmurClient {
                 this.#contacts.rejectInTransaction(transaction, sessionId),
             ),
         );
+        this.#closePrivateGroupState(sessionId);
     }
 
     /** Queue a typed removal and retain the contact until its authenticated echo. */
@@ -1254,6 +1283,57 @@ export class MurmurClient {
         return this.#tracked(() => this.#engine.get(id));
     }
 
+    /**
+     * EXPERIMENTAL open the private canonical state bound to one active MLS session.
+     *
+     * The member-only group secret remains inside Murmur. The returned handle derives
+     * authorization from the live authenticated session roster and durably retains its
+     * rollback-protection tip before resolving any accepted operation.
+     */
+    async privateGroupState(id: Uint8Array): Promise<MurmurPrivateGroupState> {
+        return this.#exclusive(async () => {
+            if (!(id instanceof Uint8Array) || id.length !== 32) {
+                throw new Error("Private-group session ID must be 32 bytes");
+            }
+            if (this.#privateGroupStateConnection === undefined) {
+                throw new Error("No private-group state connection is configured");
+            }
+            const key = encodeBase64Url(id);
+            const existing = this.#privateGroupStates.get(key);
+            if (existing !== undefined) return existing;
+            const state = await this.#engine.privateGroupSessionState(id);
+            if (state === undefined) throw new Error("Unknown session");
+            const sessionId = id.slice();
+            let handle: MurmurPrivateGroupState | undefined;
+            try {
+                handle = await createReadyPrivateGroupState({
+                    identity: this.#account ?? this.#identity,
+                    state,
+                    connection: this.#privateGroupStateConnection,
+                    session: () => this.#tracked(() => this.#engine.get(sessionId)),
+                    persistTrustedTip: (tip) =>
+                        this.#exclusive(() =>
+                            this.#engine.persistPrivateGroupTrustedTip(sessionId, tip),
+                        ),
+                    onClose: () => {
+                        if (handle !== undefined && this.#privateGroupStates.get(key) === handle) {
+                            this.#privateGroupStates.delete(key);
+                        }
+                        zeroBytes(sessionId);
+                    },
+                    now: this.#now,
+                });
+                this.#privateGroupStates.set(key, handle);
+                return handle;
+            } catch (error: unknown) {
+                zeroBytes(sessionId);
+                throw error;
+            } finally {
+                destroyPrivateGroupSessionState(state);
+            }
+        });
+    }
+
     /** List one bounded page of local sessions in durable key order. */
     async sessions(options: MurmurSessionListOptions = {}): Promise<MurmurSessionPage> {
         return this.#tracked(() => this.#engine.list(options));
@@ -1268,11 +1348,13 @@ export class MurmurClient {
     /** Terminally reject and destroy an application-owned pending session. */
     async ignoreSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.ignore(id));
+        this.#closePrivateGroupState(id);
     }
 
     /** Abandon a blocked local membership operation and destroy the whole session. */
     async abandonSession(id: Uint8Array): Promise<void> {
         await this.#exclusive(() => this.#engine.abandon(id));
+        this.#closePrivateGroupState(id);
     }
 
     /**
@@ -1593,7 +1675,10 @@ export class MurmurClient {
     ): Promise<never> {
         if (onReset === undefined) throw new MurmurResetRequiredError(reset, false);
         await onReset(reset);
-        await this.#exclusive(() => this.#purgeReset(reset));
+        await this.#exclusive(async () => {
+            await this.#purgeReset(reset);
+            this.#closePrivateGroupStates();
+        });
         throw new MurmurResetRequiredError(reset, true);
     }
 
@@ -1741,6 +1826,7 @@ export class MurmurClient {
             throw new Error("Cannot close Murmur while an operation is pending");
         }
         this.#closed = true;
+        this.#closePrivateGroupStates();
         destroyIdentity(this.#identity);
         destroyIdentity(this.#invitationRevocation);
         if (this.#account !== undefined) destroyIdentity(this.#account);
@@ -2062,6 +2148,7 @@ export class MurmurClient {
                         await this.#exclusive(() =>
                             this.#engine.destroyOwned(sessionId, "contact"),
                         );
+                        this.#closePrivateGroupState(sessionId);
                     }
                     const committedContactEvents = contactEvents;
                     const committedAccountEvents = accountEvents;
@@ -2431,6 +2518,15 @@ export class MurmurClient {
             const timeout = setTimeout(finish, milliseconds);
             signal.addEventListener("abort", finish, { once: true });
         });
+    }
+
+    #closePrivateGroupState(id: Uint8Array): void {
+        this.#privateGroupStates.get(encodeBase64Url(id))?.close();
+    }
+
+    #closePrivateGroupStates(): void {
+        for (const handle of this.#privateGroupStates.values()) handle.close();
+        this.#privateGroupStates.clear();
     }
 
     #assertOpen(): void {

@@ -183,10 +183,13 @@ import {
     type MurmurClientOptions,
     type MurmurContactProfile,
     type MurmurContactUpdated,
+    type MurmurPrivateGroupState,
     type MurmurService,
     type MurmurSyncOptions,
     type MurmurSessionPage,
     type MurmurStore,
+    type PrivateGroupStateConnection,
+    type PrivateGroupStateSnapshot,
     type RelaySessionProvider,
     type RelaySessionTicket,
     type SignedInvitationRevocation,
@@ -211,6 +214,10 @@ const proof: SignedRelaySessionRequest | undefined = undefined;
 const revocation: SignedInvitationRevocation | undefined = undefined;
 const options: MurmurClientOptions = {
     relay: new URL("https://relay.example"),
+    privateGroupState: {
+        relay: new URL("https://relay.example"),
+        fetch: deliveryFetch,
+    },
     store,
     fetch: deliveryFetch,
     identity,
@@ -235,6 +242,14 @@ const exerciseSharing = async (client: MurmurClient): Promise<void> => {
     await client.revokeInvitation(new Uint8Array(32));
     await client.revokeInvitations();
 };
+const privateStateConnection: PrivateGroupStateConnection = {
+    relay: "https://relay.example",
+    fetch: deliveryFetch,
+};
+const exercisePrivateState = async (client: MurmurClient): Promise<PrivateGroupStateSnapshot> => {
+    const state: MurmurPrivateGroupState = await client.privateGroupState(new Uint8Array(32));
+    return await state.read();
+};
 const page: MurmurSessionPage | undefined = undefined;
 const discovery: DiscoveryBundle | undefined = undefined;
 void transport;
@@ -250,6 +265,8 @@ void ticket;
 void proof;
 void revocation;
 void exerciseSharing;
+void privateStateConnection;
+void exercisePrivateState;
 void WebSocketDeliveryTransport;
 destroyIdentity(identity);
 `,

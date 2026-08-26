@@ -1,10 +1,17 @@
 import type { SignedDelivery } from "../../delivery/index.js";
 import { parseSignedDelivery, signedDeliveryToJson } from "../../delivery/index.js";
 import {
+    decodePrivateGroupSessionState,
+    destroyPrivateGroupSessionState,
+    encodePrivateGroupSessionState,
+    type PrivateGroupSessionState,
+} from "../../privateGroupState/impl/sessionState.js";
+import {
     canonicalJsonBytes,
     decodeBase64Url,
     encodeBase64Url,
     utf8Decode,
+    zeroBytes,
     type JsonValue,
 } from "../../utils/index.js";
 import { decodeSessionRoles, encodeSessionRoles, type SessionRoles } from "./sessionFrames.js";
@@ -23,6 +30,7 @@ export interface SessionRecord {
     readonly previousEpochExpiresAt?: number;
     readonly previousMessagesRemaining?: number;
     readonly roles: SessionRoles;
+    readonly privateGroupState: PrivateGroupSessionState;
     readonly removalGenerations: readonly SessionRemovalGeneration[];
     readonly bootstrapKeyPackageReference?: Uint8Array;
     readonly reAdmission?: boolean;
@@ -157,15 +165,21 @@ export function encodeSessionRecord(record: SessionRecord): Uint8Array {
     ) {
         throw new Error("Invalid session removal generations");
     }
-    return canonicalJsonBytes({
-        ...common,
-        roles: encodeBase64Url(encodeSessionRoles(record.roles)),
-        removalGenerations,
-        bootstrapKeyPackageReference:
-            record.bootstrapKeyPackageReference === undefined
-                ? null
-                : encodeBase64Url(record.bootstrapKeyPackageReference),
-    } as unknown as JsonValue);
+    const privateGroupState = encodePrivateGroupSessionState(record.privateGroupState);
+    try {
+        return canonicalJsonBytes({
+            ...common,
+            roles: encodeBase64Url(encodeSessionRoles(record.roles)),
+            privateGroupState: encodeBase64Url(privateGroupState),
+            removalGenerations,
+            bootstrapKeyPackageReference:
+                record.bootstrapKeyPackageReference === undefined
+                    ? null
+                    : encodeBase64Url(record.bootstrapKeyPackageReference),
+        } as unknown as JsonValue);
+    } finally {
+        zeroBytes(privateGroupState);
+    }
 }
 
 export function decodeSessionRecord(value: Uint8Array): SessionRecord {
@@ -184,6 +198,7 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
         "previousEpochExpiresAt",
         "previousMessagesRemaining",
         "roles",
+        "privateGroupState",
         "removalGenerations",
         "bootstrapKeyPackageReference",
         ...(Object.hasOwn(input, "reAdmission") ? ["reAdmission"] : []),
@@ -206,6 +221,7 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
             (typeof input.previousGeneration !== "string" ||
                 !/^(0|[1-9]\d*)$/.test(input.previousGeneration))) ||
         typeof input.roles !== "string" ||
+        typeof input.privateGroupState !== "string" ||
         !Array.isArray(input.removalGenerations) ||
         input.removalGenerations.length > 256 ||
         (input.bootstrapKeyPackageReference !== null &&
@@ -233,48 +249,65 @@ export function decodeSessionRecord(value: Uint8Array): SessionRecord {
     ) {
         throw new Error("Invalid session removal generations");
     }
-    return {
-        version: 2,
-        status: input.status,
-        descriptor: bytes(input.descriptor, 1024 * 1024, "session descriptor"),
-        epoch: bytes(input.epoch, 64 * 1024 * 1024, "session epoch"),
-        generation: BigInt(input.generation),
-        bufferedEvents: integer(input.bufferedEvents, 100_000, "buffered event count"),
-        bufferedBytes: integer(input.bufferedBytes, 1024 * 1024 * 1024, "buffered event bytes"),
-        ...(input.stagedCommitId === null ? {} : { stagedCommitId: input.stagedCommitId }),
-        ...(input.previousEpoch === null
-            ? {}
-            : {
-                  previousEpoch: bytes(
-                      input.previousEpoch,
-                      64 * 1024 * 1024,
-                      "previous session epoch",
-                  ),
-                  previousGeneration: BigInt(input.previousGeneration as string),
-                  previousEpochExpiresAt: integer(
-                      input.previousEpochExpiresAt,
-                      Number.MAX_SAFE_INTEGER,
-                      "previous epoch expiry",
-                  ),
-                  previousMessagesRemaining: integer(
-                      input.previousMessagesRemaining,
-                      1_000,
-                      "previous epoch message count",
-                  ),
-              }),
-        roles: decodeSessionRoles(bytes(input.roles, 64 * 1024, "session roles")),
-        removalGenerations,
-        ...(input.reAdmission === true ? { reAdmission: true } : {}),
-        ...(input.bootstrapKeyPackageReference === null
-            ? {}
-            : {
-                  bootstrapKeyPackageReference: bytes(
-                      input.bootstrapKeyPackageReference,
-                      32,
-                      "bootstrap KeyPackage reference",
-                  ),
-              }),
-    };
+    const privateGroupStateBytes = bytes(
+        input.privateGroupState,
+        1024,
+        "private-group session state",
+    );
+    let privateGroupState: PrivateGroupSessionState;
+    try {
+        privateGroupState = decodePrivateGroupSessionState(privateGroupStateBytes);
+    } finally {
+        zeroBytes(privateGroupStateBytes);
+    }
+    try {
+        return {
+            version: 2,
+            status: input.status,
+            descriptor: bytes(input.descriptor, 1024 * 1024, "session descriptor"),
+            epoch: bytes(input.epoch, 64 * 1024 * 1024, "session epoch"),
+            generation: BigInt(input.generation),
+            bufferedEvents: integer(input.bufferedEvents, 100_000, "buffered event count"),
+            bufferedBytes: integer(input.bufferedBytes, 1024 * 1024 * 1024, "buffered event bytes"),
+            ...(input.stagedCommitId === null ? {} : { stagedCommitId: input.stagedCommitId }),
+            ...(input.previousEpoch === null
+                ? {}
+                : {
+                      previousEpoch: bytes(
+                          input.previousEpoch,
+                          64 * 1024 * 1024,
+                          "previous session epoch",
+                      ),
+                      previousGeneration: BigInt(input.previousGeneration as string),
+                      previousEpochExpiresAt: integer(
+                          input.previousEpochExpiresAt,
+                          Number.MAX_SAFE_INTEGER,
+                          "previous epoch expiry",
+                      ),
+                      previousMessagesRemaining: integer(
+                          input.previousMessagesRemaining,
+                          1_000,
+                          "previous epoch message count",
+                      ),
+                  }),
+            roles: decodeSessionRoles(bytes(input.roles, 64 * 1024, "session roles")),
+            privateGroupState,
+            removalGenerations,
+            ...(input.reAdmission === true ? { reAdmission: true } : {}),
+            ...(input.bootstrapKeyPackageReference === null
+                ? {}
+                : {
+                      bootstrapKeyPackageReference: bytes(
+                          input.bootstrapKeyPackageReference,
+                          32,
+                          "bootstrap KeyPackage reference",
+                      ),
+                  }),
+        };
+    } catch (error: unknown) {
+        destroyPrivateGroupSessionState(privateGroupState);
+        throw error;
+    }
 }
 
 export function encodeOutboxRecord(record: SessionOutboxRecord): Uint8Array {

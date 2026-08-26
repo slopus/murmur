@@ -47,6 +47,13 @@ import {
 } from "../../mls/index.js";
 import type { MurmurStore, StoreTransaction } from "../../storage/index.js";
 import {
+    createPrivateGroupSessionState,
+    destroyPrivateGroupSessionState,
+    updatePrivateGroupSessionTrustedTip,
+    type PrivateGroupSessionState,
+} from "../../privateGroupState/impl/sessionState.js";
+import type { PrivateGroupTrustedTip } from "../../privateGroupState/types.js";
+import {
     ROUTING_MARKER_PREFIX,
     decodeSessionRouting,
     decodeSessionOwner,
@@ -84,7 +91,7 @@ import {
     encodeAccountResetCiphertext,
     encodeBootstrapCiphertext,
     encodeBootstrapFrame,
-    encodeRolesControl,
+    encodeSessionControl,
     encodePrivateCiphertext,
     encodeProvisioningCiphertext,
     encodePrivateFrame,
@@ -483,11 +490,21 @@ async function setAndZero(
 }
 
 function restoreEpoch(identity: IdentityKeyPair, record: SessionRecord): MlsEpochState {
-    return MlsEpochState.deserialize(record.epoch, {
-        localSigningSecretKey: identity.secretKey,
-        authenticateCredential: authenticateMurmurMlsCredential,
-        minimumPersistenceGeneration: record.generation,
-    });
+    try {
+        const epoch = MlsEpochState.deserialize(record.epoch, {
+            localSigningSecretKey: identity.secretKey,
+            authenticateCredential: authenticateMurmurMlsCredential,
+            minimumPersistenceGeneration: record.generation,
+        });
+        if (!equalBytes(epoch.groupId, record.privateGroupState.sessionId)) {
+            epoch.destroy();
+            throw new Error("Private-group state does not match its MLS session");
+        }
+        return epoch;
+    } catch (error: unknown) {
+        destroyPrivateGroupSessionState(record.privateGroupState);
+        throw error;
+    }
 }
 
 function restorePreviousEpoch(
@@ -1000,6 +1017,7 @@ export class SessionEngine {
             credentialIdentity: this.#credentialIdentity,
         });
         const id = epoch.groupId;
+        const privateGroupState = createPrivateGroupSessionState(id);
         const roles = normalizeSessionRoles({
             owner: this.#accountKey,
             admins: [],
@@ -1018,6 +1036,7 @@ export class SessionEngine {
                 bufferedEvents: 0,
                 bufferedBytes: 0,
                 roles,
+                privateGroupState,
                 removalGenerations: [],
             };
             await this.#store.transaction(async (transaction) => {
@@ -1035,6 +1054,7 @@ export class SessionEngine {
             });
         } finally {
             epoch.destroy();
+            destroyPrivateGroupSessionState(privateGroupState);
             if (checkpoint !== undefined) zeroBytes(checkpoint);
         }
         if (members.length > 0) {
@@ -1073,6 +1093,70 @@ export class SessionEngine {
             this.#zeroSessionRecord(record);
             zeroBytes(bytes);
         }
+    }
+
+    /** Return a defensive member-only state snapshot for one active MLS session. */
+    async privateGroupSessionState(id: Uint8Array): Promise<PrivateGroupSessionState | undefined> {
+        const bytes = await this.#store.get(stateKey(id));
+        if (bytes === undefined) return undefined;
+        const record = decodeSessionRecord(bytes);
+        const epoch = restoreEpoch(this.#identity, record);
+        try {
+            if (record.status !== "active") {
+                throw new Error("Private-group state requires an active MLS session");
+            }
+            return {
+                version: 1,
+                sessionId: record.privateGroupState.sessionId.slice(),
+                masterSecret: record.privateGroupState.masterSecret.slice(),
+                ...(record.privateGroupState.trustedTip === undefined
+                    ? {}
+                    : {
+                          trustedTip: {
+                              canonicalVersion:
+                                  record.privateGroupState.trustedTip.canonicalVersion,
+                              revision: record.privateGroupState.trustedTip.revision,
+                              revisionHash:
+                                  record.privateGroupState.trustedTip.revisionHash.slice(),
+                          },
+                      }),
+            };
+        } finally {
+            epoch.destroy();
+            this.#zeroSessionRecord(record);
+            zeroBytes(bytes);
+        }
+    }
+
+    /** Atomically retain one accepted private-group canonical tip with its active session. */
+    async persistPrivateGroupTrustedTip(
+        id: Uint8Array,
+        tip: PrivateGroupTrustedTip,
+    ): Promise<void> {
+        await this.#store.transaction(async (transaction) => {
+            const bytes = await transaction.get(stateKey(id));
+            if (bytes === undefined) throw new Error("Unknown session");
+            const record = decodeSessionRecord(bytes);
+            let updated: PrivateGroupSessionState | undefined;
+            try {
+                if (
+                    record.status !== "active" ||
+                    !equalBytes(record.privateGroupState.sessionId, id)
+                ) {
+                    throw new Error("Private-group state requires an active MLS session");
+                }
+                updated = updatePrivateGroupSessionTrustedTip(record.privateGroupState, tip);
+                await setAndZero(
+                    transaction,
+                    stateKey(id),
+                    encodeSessionRecord({ ...record, privateGroupState: updated }),
+                );
+            } finally {
+                if (updated !== undefined) destroyPrivateGroupSessionState(updated);
+                this.#zeroSessionRecord(record);
+                zeroBytes(bytes);
+            }
+        });
     }
 
     async list(options: MurmurSessionListOptions = {}): Promise<MurmurSessionPage> {
@@ -2362,17 +2446,20 @@ export class SessionEngine {
         epoch: MlsEpochState,
         currentRoles: SessionRoles,
         nextRoles: SessionRoles,
+        privateGroupMasterSecret: Uint8Array,
         commit: ReturnType<typeof decodeMlsTreeCommit>,
         createdAt: number = this.#now(),
     ): Promise<boolean> {
+        let control: ReturnType<typeof decodeSessionControl> | undefined;
         try {
-            const control = decodeSessionControl(commit.authenticatedData);
+            control = decodeSessionControl(commit.authenticatedData);
             if (
                 commit.sender < 0 ||
                 commit.sender >= epoch.memberSignatureKeys.length ||
                 epoch.memberSignatureKeys[commit.sender] === undefined ||
-                !equalBytes(control.owner, nextRoles.owner) ||
-                !sessionRolesEqual(control, nextRoles) ||
+                !equalBytes(control.privateGroupMasterSecret, privateGroupMasterSecret) ||
+                !equalBytes(control.roles.owner, nextRoles.owner) ||
+                !sessionRolesEqual(control.roles, nextRoles) ||
                 !equalBytes(currentRoles.owner, nextRoles.owner)
             ) {
                 return false;
@@ -2471,6 +2558,8 @@ export class SessionEngine {
             return true;
         } catch {
             return false;
+        } finally {
+            if (control !== undefined) zeroBytes(control.privateGroupMasterSecret);
         }
     }
 
@@ -2545,7 +2634,13 @@ export class SessionEngine {
                 const now = this.#now();
                 commitKey = epoch.exportSecret(COMMIT_EXPORT_LABEL, COMMIT_EXPORT_CONTEXT, 32);
                 const nextRoles = normalizeSessionRoles(roles);
-                transition = epoch.prepareCommit(proposals, encodeRolesControl(nextRoles));
+                transition = epoch.prepareCommit(
+                    proposals,
+                    encodeSessionControl({
+                        roles: nextRoles,
+                        privateGroupMasterSecret: record.privateGroupState.masterSecret,
+                    }),
+                );
                 const commitMessage = decodeMlsTreeCommit(transition.commit);
                 if (
                     !(await this.#validRoleCommit(
@@ -2553,6 +2648,7 @@ export class SessionEngine {
                         epoch,
                         record.roles,
                         nextRoles,
+                        record.privateGroupState.masterSecret,
                         commitMessage,
                         now,
                     ))
@@ -2565,6 +2661,7 @@ export class SessionEngine {
                     epoch: epoch.context.epoch,
                     commit: transition.commit,
                     roles: nextRoles,
+                    privateGroupMasterSecret: record.privateGroupState.masterSecret,
                 });
                 if (commitCiphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
                     throw new Error("Session Commit exceeds the configured ciphertext limit");
@@ -2595,6 +2692,7 @@ export class SessionEngine {
                         commit: transition.commit,
                         keyPackageReference: mlsKeyPackageReference(addition.keyPackage),
                         roles: nextRoles,
+                        privateGroupMasterSecret: record.privateGroupState.masterSecret,
                     });
                     try {
                         const box = sealBox(
@@ -2826,8 +2924,8 @@ export class SessionEngine {
         } catch {
             throw new TerminalInboxDeliveryError("invalid_bootstrap_box");
         }
+        let frame: ReturnType<typeof decodeBootstrapFrame> | undefined;
         try {
-            let frame: ReturnType<typeof decodeBootstrapFrame>;
             let commit: ReturnType<typeof decodeMlsTreeCommit>;
             try {
                 frame = decodeBootstrapFrame(plaintext);
@@ -2885,11 +2983,21 @@ export class SessionEngine {
                 ) {
                     throw new Error("Bootstrap KeyPackage is stale or mismatched");
                 }
-                if (
-                    !equalBytes(commit.confirmationTag, frame.confirmationTag) ||
-                    !sessionRolesEqual(decodeSessionControl(commit.authenticatedData), frame.roles)
-                ) {
-                    throw new Error("Bootstrap Commit control mismatch");
+                let control: ReturnType<typeof decodeSessionControl> | undefined;
+                try {
+                    control = decodeSessionControl(commit.authenticatedData);
+                    if (
+                        !equalBytes(commit.confirmationTag, frame.confirmationTag) ||
+                        !sessionRolesEqual(control.roles, frame.roles) ||
+                        !equalBytes(
+                            control.privateGroupMasterSecret,
+                            frame.privateGroupMasterSecret,
+                        )
+                    ) {
+                        throw new Error("Bootstrap Commit control mismatch");
+                    }
+                } finally {
+                    if (control !== undefined) zeroBytes(control.privateGroupMasterSecret);
                 }
                 const tree = decodeMlsRatchetTree(frame.tree, {
                     groupId: frame.groupId,
@@ -2919,9 +3027,10 @@ export class SessionEngine {
                     throw new Error("Bootstrap exceeds the configured member limit");
                 }
                 const accounts = activeAccounts(epoch);
+                const frameRoles = frame.roles;
                 if (
-                    !accounts.some((account) => equalBytes(account, frame.roles.owner)) ||
-                    frame.roles.admins.some(
+                    !accounts.some((account) => equalBytes(account, frameRoles.owner)) ||
+                    frameRoles.admins.some(
                         (admin) => !accounts.some((account) => equalBytes(account, admin)),
                     )
                 ) {
@@ -2955,6 +3064,11 @@ export class SessionEngine {
                         bufferedEvents: 0,
                         bufferedBytes: 0,
                         roles: frame.roles,
+                        privateGroupState: {
+                            version: 1,
+                            sessionId: frame.groupId.slice(),
+                            masterSecret: frame.privateGroupMasterSecret.slice(),
+                        },
                         removalGenerations: [],
                         bootstrapKeyPackageReference: frame.keyPackageReference,
                         ...(reAdmission ? { reAdmission: true } : {}),
@@ -2981,6 +3095,7 @@ export class SessionEngine {
                 zeroBytes(bundleBytes);
             }
         } finally {
+            if (frame !== undefined) zeroBytes(frame.privateGroupMasterSecret);
             zeroBytes(plaintext);
         }
     }
@@ -3302,6 +3417,7 @@ export class SessionEngine {
     ): Promise<void> {
         const epoch = restoreEpoch(this.#identity, record);
         let key: Uint8Array | undefined;
+        let frame: ReturnType<typeof openCommitCiphertext> | undefined;
         try {
             if (!exactRecipients(queued.delivery, activeMembers(epoch))) {
                 throw new TerminalInboxDeliveryError("commit_recipient_set");
@@ -3317,7 +3433,6 @@ export class SessionEngine {
                 return;
             }
             key = epoch.exportSecret(COMMIT_EXPORT_LABEL, COMMIT_EXPORT_CONTEXT, 32);
-            let frame: ReturnType<typeof openCommitCiphertext>;
             let commit: ReturnType<typeof decodeMlsTreeCommit>;
             try {
                 frame = openCommitCiphertext(key, wire);
@@ -3334,13 +3449,20 @@ export class SessionEngine {
             }
             const expectedSender = epoch.memberSignatureKeys[commit.sender];
             let controlMatches = false;
+            let control: ReturnType<typeof decodeSessionControl> | undefined;
             try {
-                controlMatches = sessionRolesEqual(
-                    decodeSessionControl(commit.authenticatedData),
-                    frame.roles,
-                );
+                control = decodeSessionControl(commit.authenticatedData);
+                controlMatches =
+                    sessionRolesEqual(control.roles, frame.roles) &&
+                    equalBytes(control.privateGroupMasterSecret, frame.privateGroupMasterSecret) &&
+                    equalBytes(
+                        frame.privateGroupMasterSecret,
+                        record.privateGroupState.masterSecret,
+                    );
             } catch {
                 controlMatches = false;
+            } finally {
+                if (control !== undefined) zeroBytes(control.privateGroupMasterSecret);
             }
             if (
                 expectedSender === undefined ||
@@ -3351,6 +3473,7 @@ export class SessionEngine {
                     epoch,
                     record.roles,
                     frame.roles,
+                    record.privateGroupState.masterSecret,
                     commit,
                     queued.delivery.createdAt,
                 ))
@@ -3466,6 +3589,7 @@ export class SessionEngine {
             }
         } finally {
             if (key !== undefined) zeroBytes(key);
+            if (frame !== undefined) zeroBytes(frame.privateGroupMasterSecret);
             this.#zeroSessionRecord(record);
         }
     }
@@ -5217,6 +5341,7 @@ export class SessionEngine {
     #zeroSessionRecord(record: SessionRecord): void {
         zeroBytes(record.epoch);
         if (record.previousEpoch !== undefined) zeroBytes(record.previousEpoch);
+        destroyPrivateGroupSessionState(record.privateGroupState);
     }
 
     async #rejectSession(transaction: StoreTransaction, id: Uint8Array): Promise<void> {

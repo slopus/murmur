@@ -1,6 +1,12 @@
 import { describe, expect, test } from "vitest";
 import { canonicalJsonBytes, encodeBase64Url, utf8Encode } from "../../../utils/index.js";
-import { parseSessionCiphertext, sealCommitCiphertext } from "../sessionFrames.js";
+import {
+    decodeSessionControl,
+    encodeSessionControl,
+    openCommitCiphertext,
+    parseSessionCiphertext,
+    sealCommitCiphertext,
+} from "../sessionFrames.js";
 
 const MAXIMUM_UINT64 = 2n ** 64n - 1n;
 
@@ -60,8 +66,39 @@ describe("session frame codecs", () => {
                     epoch,
                     commit: utf8Encode("commit"),
                     roles,
+                    privateGroupMasterSecret: new Uint8Array(32),
                 }),
             ).toThrow("Invalid Commit frame");
         }
+    });
+
+    test("authenticates and encrypts one exact private-group master secret with the roles", () => {
+        const roles = {
+            owner: new Uint8Array(32).fill(1),
+            admins: [new Uint8Array(32).fill(2)],
+            adminsAssignAdmins: true,
+            anyoneCanAddMembers: false,
+        };
+        const privateGroupMasterSecret = new Uint8Array(32).fill(3);
+        const control = decodeSessionControl(
+            encodeSessionControl({ roles, privateGroupMasterSecret }),
+        );
+        expect(control).toEqual({ roles, privateGroupMasterSecret });
+
+        const key = new Uint8Array(32).fill(4);
+        const ciphertext = sealCommitCiphertext(key, {
+            version: 1,
+            groupId: utf8Encode("group"),
+            epoch: 1n,
+            commit: utf8Encode("commit"),
+            roles,
+            privateGroupMasterSecret,
+        });
+        const wire = parseSessionCiphertext(ciphertext);
+        if (wire.kind !== "commit") throw new Error("Expected Commit ciphertext");
+        expect(openCommitCiphertext(key, wire)).toMatchObject({
+            roles,
+            privateGroupMasterSecret,
+        });
     });
 });

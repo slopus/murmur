@@ -33,6 +33,12 @@ export interface SessionRoles {
     readonly anyoneCanAddMembers: boolean;
 }
 
+/** MLS-authenticated session metadata shared by every current logical member. */
+export interface SessionControl {
+    readonly roles: SessionRoles;
+    readonly privateGroupMasterSecret: Uint8Array;
+}
+
 const MAXIMUM_ROLE_ADMINS = 256;
 
 /** Copy role state into a normalized, deduplicated, canonically ordered value. */
@@ -131,6 +137,7 @@ export interface BootstrapFrame {
     readonly commit: Uint8Array;
     readonly keyPackageReference: Uint8Array;
     readonly roles: SessionRoles;
+    readonly privateGroupMasterSecret: Uint8Array;
 }
 
 export type PrivateSessionFrame =
@@ -150,6 +157,7 @@ export interface CommitFrame {
     readonly epoch: bigint;
     readonly commit: Uint8Array;
     readonly roles: SessionRoles;
+    readonly privateGroupMasterSecret: Uint8Array;
 }
 
 export type SessionCiphertext =
@@ -268,7 +276,11 @@ function commitAad(groupId: Uint8Array, epoch: bigint): Uint8Array {
 
 export function sealCommitCiphertext(key: Uint8Array, frame: CommitFrame): Uint8Array {
     if (key.length !== 32) throw new Error("Invalid Commit frame key");
-    if (frame.epoch < 0n || frame.epoch > MAXIMUM_UINT64) {
+    if (
+        frame.epoch < 0n ||
+        frame.epoch > MAXIMUM_UINT64 ||
+        frame.privateGroupMasterSecret.length !== 32
+    ) {
         throw new Error("Invalid Commit frame");
     }
     const nonce = randomBytes(12);
@@ -278,6 +290,7 @@ export function sealCommitCiphertext(key: Uint8Array, frame: CommitFrame): Uint8
         epoch: frame.epoch.toString(),
         commit: encodeBase64Url(frame.commit),
         roles: rolesToJson(frame.roles),
+        privateGroupMasterSecret: encodeBase64Url(frame.privateGroupMasterSecret),
     } as never);
     try {
         const ciphertext = gcm(key, nonce, commitAad(frame.groupId, frame.epoch)).encrypt(
@@ -351,7 +364,11 @@ export function openCommitCiphertext(
     );
     try {
         const input = parseJson(plaintext, "Commit frame");
-        exact(input, ["version", "groupId", "epoch", "commit", "roles"], "Commit frame");
+        exact(
+            input,
+            ["version", "groupId", "epoch", "commit", "roles", "privateGroupMasterSecret"],
+            "Commit frame",
+        );
         if (input.version !== 1) throw new Error("Invalid Commit frame");
         const frame: CommitFrame = {
             version: 1,
@@ -359,8 +376,18 @@ export function openCommitCiphertext(
             epoch: decimalUint64(input.epoch, "Commit frame"),
             commit: bytes(input.commit, 64 * 1024 * 1024, "Commit"),
             roles: rolesFromJson(input.roles, "Commit roles"),
+            privateGroupMasterSecret: bytes(
+                input.privateGroupMasterSecret,
+                32,
+                "Commit private-group master secret",
+            ),
         };
-        if (!equalBytes(frame.groupId, wire.groupId) || frame.epoch !== wire.epoch) {
+        if (
+            !equalBytes(frame.groupId, wire.groupId) ||
+            frame.epoch !== wire.epoch ||
+            frame.privateGroupMasterSecret.length !== 32
+        ) {
+            zeroBytes(frame.privateGroupMasterSecret);
             throw new Error("Commit frame header mismatch");
         }
         return frame;
@@ -370,6 +397,9 @@ export function openCommitCiphertext(
 }
 
 export function encodeBootstrapFrame(frame: BootstrapFrame): Uint8Array {
+    if (frame.privateGroupMasterSecret.length !== 32) {
+        throw new Error("Invalid bootstrap frame");
+    }
     return canonicalJsonBytes({
         version: 1,
         inviter: encodeBase64Url(frame.inviter),
@@ -381,6 +411,7 @@ export function encodeBootstrapFrame(frame: BootstrapFrame): Uint8Array {
         commit: encodeBase64Url(frame.commit),
         keyPackageReference: encodeBase64Url(frame.keyPackageReference),
         roles: rolesToJson(frame.roles),
+        privateGroupMasterSecret: encodeBase64Url(frame.privateGroupMasterSecret),
     } as never);
 }
 
@@ -399,12 +430,14 @@ export function decodeBootstrapFrame(value: Uint8Array): BootstrapFrame {
             "commit",
             "keyPackageReference",
             "roles",
+            "privateGroupMasterSecret",
         ],
         "bootstrap frame",
     );
     if (input.version !== 1) throw new Error("Invalid bootstrap frame");
-    return {
-        version: 1,
+    const roles = rolesFromJson(input.roles, "bootstrap roles");
+    const common = {
+        version: 1 as const,
         inviter: bytes(input.inviter, 32, "bootstrap inviter"),
         groupId: bytes(input.groupId, 255, "bootstrap group ID"),
         descriptor: bytes(input.descriptor, 1024 * 1024, "bootstrap descriptor"),
@@ -413,25 +446,55 @@ export function decodeBootstrapFrame(value: Uint8Array): BootstrapFrame {
         confirmationTag: bytes(input.confirmationTag, 32, "Commit confirmation tag"),
         commit: bytes(input.commit, 64 * 1024 * 1024, "bootstrap Commit"),
         keyPackageReference: bytes(input.keyPackageReference, 32, "KeyPackage reference"),
-        roles: rolesFromJson(input.roles, "bootstrap roles"),
+        roles,
+    };
+    const privateGroupMasterSecret = bytes(
+        input.privateGroupMasterSecret,
+        32,
+        "bootstrap private-group master secret",
+    );
+    if (privateGroupMasterSecret.length !== 32) {
+        zeroBytes(privateGroupMasterSecret);
+        throw new Error("Invalid bootstrap frame");
+    }
+    return {
+        ...common,
+        privateGroupMasterSecret,
     };
 }
 
-/** Encode role state as the Commit's authenticated-data control. */
-export function encodeRolesControl(roles: SessionRoles): Uint8Array {
+/** Encode roles and the stable private-group secret as authenticated Commit control. */
+export function encodeSessionControl(control: SessionControl): Uint8Array {
+    if (control.privateGroupMasterSecret.length !== 32) {
+        throw new Error("Invalid session control");
+    }
     return canonicalJsonBytes({
-        version: 2,
-        type: "roles",
-        roles: rolesToJson(roles),
+        version: 3,
+        type: "session",
+        roles: rolesToJson(control.roles),
+        privateGroupMasterSecret: encodeBase64Url(control.privateGroupMasterSecret),
     } as never);
 }
 
-/** Decode role state from one Commit's authenticated-data control. */
-export function decodeSessionControl(value: Uint8Array): SessionRoles {
+/** Decode roles and the stable private-group secret from Commit authenticated data. */
+export function decodeSessionControl(value: Uint8Array): SessionControl {
     const input = parseJson(value, "session control");
-    if (input.version === 2 && input.type === "roles") {
-        exact(input, ["version", "type", "roles"], "roles control");
-        return rolesFromJson(input.roles, "roles control");
+    if (input.version === 3 && input.type === "session") {
+        exact(input, ["version", "type", "roles", "privateGroupMasterSecret"], "session control");
+        const roles = rolesFromJson(input.roles, "session control roles");
+        const privateGroupMasterSecret = bytes(
+            input.privateGroupMasterSecret,
+            32,
+            "session control private-group master secret",
+        );
+        if (privateGroupMasterSecret.length !== 32) {
+            zeroBytes(privateGroupMasterSecret);
+            throw new Error("Invalid session control");
+        }
+        return {
+            roles,
+            privateGroupMasterSecret,
+        };
     }
     throw new Error("Invalid session control");
 }

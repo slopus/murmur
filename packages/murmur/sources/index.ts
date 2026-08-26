@@ -132,7 +132,14 @@ export type {
 } from "./accounts/index.js";
 /** EXPERIMENTAL credential-authority construction for trusted relay hosts. */
 export { createPrivateGroupCredentialAuthorityFromSecret } from "./privateGroupState/index.js";
-export type { PrivateGroupCredentialAuthorityAdapter } from "./privateGroupState/index.js";
+export type {
+    MurmurPrivateGroupState,
+    PrivateGroupCredentialAuthorityAdapter,
+    PrivateGroupStateConnection,
+    PrivateGroupStateFetch,
+    PrivateGroupStateSnapshot,
+    PrivateGroupStateTransport,
+} from "./privateGroupState/index.js";
 export type {
     AccountDiscoveryBundle,
     DiscoveryBundle,

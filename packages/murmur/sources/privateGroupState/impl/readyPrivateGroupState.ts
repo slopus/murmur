@@ -39,6 +39,7 @@ export interface ReadyPrivateGroupStateOptions {
     readonly connection: PrivateGroupStateConnection;
     readonly session: () => MurmurSession | undefined | Promise<MurmurSession | undefined>;
     readonly persistTrustedTip: (tip: PrivateGroupTrustedTip) => void | Promise<void>;
+    readonly onClose?: () => void;
     readonly now?: () => number;
 }
 
@@ -119,6 +120,7 @@ class ReadyPrivateGroupState implements MurmurPrivateGroupState {
     readonly #persistTrustedTip: ReadyPrivateGroupStateOptions["persistTrustedTip"];
     readonly #authenticationContext: Uint8Array;
     readonly #now: () => number;
+    readonly #onClose: (() => void) | undefined;
     #credential: PrivateGroupAccountCredential | undefined;
     #token: CachedToken | undefined;
     #current: StoredPrivateGroupStateRecord | undefined;
@@ -134,6 +136,7 @@ class ReadyPrivateGroupState implements MurmurPrivateGroupState {
         this.#persistTrustedTip = options.persistTrustedTip;
         this.#authenticationContext = authenticationContext(this.#accountIdentifier);
         this.#now = options.now ?? Date.now;
+        this.#onClose = options.onClose;
         this.#initialized = options.state.trustedTip !== undefined;
         this.#client = new PrivateGroupStateClient({
             accountIdentifier: this.#accountIdentifier,
@@ -211,6 +214,7 @@ class ReadyPrivateGroupState implements MurmurPrivateGroupState {
         zeroBytes(this.#accountIdentifier);
         zeroBytes(this.#authenticationContext);
         this.#client.close();
+        this.#onClose?.();
     }
 
     async #readCurrent(): Promise<PrivateGroupStateSnapshot> {
@@ -228,9 +232,13 @@ class ReadyPrivateGroupState implements MurmurPrivateGroupState {
         const session = await this.#session();
         if (
             session === undefined ||
-            session.status !== "active" ||
+            session.status === "removed" ||
             !equalBytes(session.id, this.#sessionId)
         ) {
+            this.close();
+            throw new Error("Private-group state requires its active authenticated MLS session");
+        }
+        if (session.status !== "active") {
             throw new Error("Private-group state requires its active authenticated MLS session");
         }
         const roles = rolesFromSession(session);
