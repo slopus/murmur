@@ -33,6 +33,7 @@ const CREDENTIAL_LIFETIME = 5 * 60_000;
 const CHALLENGE_LIFETIME = 30_000;
 const TOKEN_LIFETIME = 60_000;
 const CAMPAIGN_SEED = 0x524f_4c45;
+const UUID_V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 interface ServiceTraceEntry {
     readonly operation: string;
@@ -310,6 +311,19 @@ function expectOpaqueRecord(fixture: PrivateFixture, record: PrivateGroupStateRe
         expect(containsSequence(raw, utf8Encode(encodeBase64Url(account)))).toBe(false);
         expect(trace).not.toContain(encodeBase64Url(account));
     }
+}
+
+function uuidV7VersionFields(value: unknown): readonly string[] {
+    if (value === null || typeof value !== "object" || value instanceof Uint8Array) return [];
+    const versions: string[] = [];
+    for (const [key, child] of Object.entries(value)) {
+        if (key.toLowerCase().includes("version") && typeof child === "string") {
+            if (UUID_V7.test(child)) versions.push(child);
+        } else {
+            versions.push(...uuidV7VersionFields(child));
+        }
+    }
+    return versions;
 }
 
 describe("private canonical roster chaos", () => {
@@ -782,4 +796,130 @@ describe("private canonical roster chaos", () => {
             fixture.close();
         }
     }, 120_000);
+
+    test.fails("ROSTER-08 PRODUCT FINDING canonical records carry a server-assigned UUIDv7 version", async () => {
+        const fixture = privateFixture();
+        try {
+            const baseline = await createBaseline(fixture);
+            expect(uuidV7VersionFields(baseline.current)).toHaveLength(1);
+        } finally {
+            fixture.close();
+        }
+    });
+
+    test.fails("ROSTER-09 PRODUCT FINDING an exact accepted replacement retry returns the same result", async () => {
+        const fixture = privateFixture();
+        try {
+            const baseline = await createBaseline(fixture);
+            const nextContent = content(
+                fixture,
+                baselineAssignments(fixture),
+                "idempotent exact retry",
+                { adminsAssignAdmins: true, anyoneCanAddMembers: false },
+            );
+            const next = fixture.clientA.buildSuccessorRecord(baseline.current, nextContent);
+            const options = replacementOptions(baseline.current, next, baseline.ownerToken);
+            const accepted = await fixture.transport.replaceRecord(options);
+            const retried = await fixture.transport.replaceRecord(options);
+            expect(retried.revisionHash).toEqual(accepted.revisionHash);
+            expect(retried.record).toEqual(accepted.record);
+            expect(fixture.store.read(fixture.clientA.opaqueGroupId)?.record.revision).toBe(2);
+        } finally {
+            fixture.close();
+        }
+    });
+
+    test("ROSTER-10 restart rejects downgrade while the canonical record outlives credentials", async () => {
+        const fixture = privateFixture();
+        try {
+            const baseline = await createBaseline(fixture);
+            const nextContent = content(
+                fixture,
+                baselineAssignments(fixture),
+                "durable canonical version",
+                { adminsAssignAdmins: true, anyoneCanAddMembers: true },
+            );
+            const nextRecord = fixture.clientA.buildSuccessorRecord(baseline.current, nextContent);
+            const accepted = await fixture.transport.replaceRecord(
+                replacementOptions(baseline.current, nextRecord, baseline.ownerToken),
+            );
+            fixture.clientA.acceptRecord(accepted, nextContent);
+
+            fixture.clock.value += 365 * 24 * 60 * 60_000;
+            const reopened = fixture.newClient(0, {
+                revision: accepted.record.revision,
+                revisionHash: accepted.revisionHash,
+            });
+            const credential = await reopened.obtainCredential(utf8Encode("one year later"));
+            const token = await reopened.authorize(credential, "owner", "access");
+            const current = await reopened.readGroup(token, nextContent);
+            expect(current.record.revisionHash).toEqual(accepted.revisionHash);
+            expect(utf8Decode(current.attributes)).toBe("durable canonical version");
+            expect(() => reopened.acceptRecord(baseline.current, baseline.content)).toThrow();
+        } finally {
+            fixture.close();
+        }
+    });
+
+    test("ROSTER-11 tokens stay bound to their exact encrypted member entry", async () => {
+        const fixture = privateFixture();
+        try {
+            const baseline = await createBaseline(fixture);
+            const replacementAssignments: readonly PrivateGroupAccountRole[] = [
+                { accountIdentifier: fixture.accounts[0]!, role: "owner" },
+                { accountIdentifier: fixture.accounts[2]!, role: "member" },
+                { accountIdentifier: fixture.accounts[3]!, role: "administrator" },
+            ];
+            const nextContent = content(fixture, replacementAssignments, "admin entry replaced");
+            const nextRecord = fixture.clientA.buildSuccessorRecord(baseline.current, nextContent);
+            const accepted = await fixture.transport.replaceRecord(
+                replacementOptions(baseline.current, nextRecord, baseline.ownerToken),
+            );
+            fixture.clientA.acceptRecord(accepted, nextContent);
+
+            await expect(
+                fixture.transport.readRecord({
+                    opaqueGroupId: fixture.clientA.opaqueGroupId,
+                    token: baseline.adminToken.bytes,
+                }),
+            ).rejects.toThrow("member entry is no longer authorized");
+
+            const replacementAdmin = fixture.newClient(3);
+            const credential = await replacementAdmin.obtainCredential(
+                utf8Encode("replacement admin"),
+            );
+            const token = await replacementAdmin.authorize(credential, "administrator", "access");
+            const opened = await replacementAdmin.readGroup(token, nextContent);
+            expect(opened.record.revisionHash).toEqual(accepted.revisionHash);
+        } finally {
+            fixture.close();
+        }
+    });
+
+    test.fails("ROSTER-12 PRODUCT FINDING service rejects a direct child without winning MLS proof", async () => {
+        const fixture = privateFixture();
+        try {
+            const baseline = await createBaseline(fixture);
+            const losingContent = content(
+                fixture,
+                [
+                    ...baselineAssignments(fixture),
+                    { accountIdentifier: fixture.accounts[4]!, role: "member" },
+                ],
+                "losing MLS child",
+            );
+            const losingRecord = fixture.clientA.buildSuccessorRecord(
+                baseline.current,
+                losingContent,
+            );
+            await expect(
+                fixture.transport.replaceRecord(
+                    replacementOptions(baseline.current, losingRecord, baseline.ownerToken),
+                ),
+            ).rejects.toThrow();
+            expect(fixture.store.read(fixture.clientA.opaqueGroupId)?.record.revision).toBe(1);
+        } finally {
+            fixture.close();
+        }
+    });
 });

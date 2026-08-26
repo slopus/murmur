@@ -1,8 +1,10 @@
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
+import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
 import {
     DeliveryTransportError,
     HttpDeliveryTransport,
+    createSignedDelivery,
     type DeliveryFetch,
     type DeliveryPublishOutcome,
     type DeliveryTransport,
@@ -14,6 +16,7 @@ import {
 import { MemoryMurmurStore, type MurmurStore } from "../../storage/index.js";
 import {
     MurmurClient,
+    type MurmurResetEvent,
     type MurmurSession,
     type MurmurSessionPolicies,
     type MurmurUpdate,
@@ -985,6 +988,220 @@ describe("role, policy, and private-roster session races", () => {
             ).rejects.toThrow();
         } finally {
             bobSecond.client.close();
+            await fixture.close();
+        }
+    }, 120_000);
+
+    test("ROLE-09 owner-transfer-adjacent forged races preserve the immutable owner", async () => {
+        for (const winner of ["forged-first", "owner-revoke-first"] as const) {
+            const fixture = await createRoleFixture({
+                adminsAssignAdmins: true,
+                anyoneCanAddMembers: false,
+            });
+            try {
+                if (winner === "owner-revoke-first") fixture.bob.gate.blocked = true;
+                await rewriteRoles(fixture.bob, fixture.sessionId, (roles) => ({
+                    ...roles,
+                    owner: fixture.bob.client.accountKey,
+                    admins: [fixture.alice.client.accountKey],
+                }));
+                await fixture.bob.client.removeMember(
+                    fixture.sessionId,
+                    fixture.alice.client.accountKey,
+                );
+                await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                if (winner === "forged-first") {
+                    await synchronize([fixture.alice, fixture.carol, fixture.dave], 2);
+                }
+
+                await fixture.alice.client.revokeAdmin(
+                    fixture.sessionId,
+                    fixture.bob.client.accountKey,
+                );
+                await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+                fixture.bob.gate.blocked = false;
+                await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+
+                for (const actor of [fixture.alice, fixture.carol, fixture.dave]) {
+                    const session = await requireSession(actor, fixture.sessionId);
+                    expect(session.owner).toEqual(fixture.alice.client.accountKey);
+                    expect(
+                        session.admins.filter((admin) => equalBytes(admin, session.owner)),
+                    ).toHaveLength(1);
+                    expect(
+                        session.members.some((member) =>
+                            equalBytes(member, fixture.alice.client.accountKey),
+                        ),
+                    ).toBe(true);
+                    expect(
+                        session.admins.some((admin) =>
+                            equalBytes(admin, fixture.bob.client.accountKey),
+                        ),
+                    ).toBe(false);
+                }
+
+                await fixture.alice.client.grantAdmin(
+                    fixture.sessionId,
+                    fixture.carol.client.accountKey,
+                );
+                await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+                expect(
+                    (await requireSession(fixture.dave, fixture.sessionId)).admins.some((admin) =>
+                        equalBytes(admin, fixture.carol.client.accountKey),
+                    ),
+                ).toBe(true);
+            } finally {
+                await fixture.close();
+            }
+        }
+    }, 120_000);
+
+    test("ROLE-10 policy re-enable cannot resurrect a grant from a concurrently revoked admin", async () => {
+        for (const winner of ["grant-first", "owner-controls-first"] as const) {
+            const fixture = await createRoleFixture({
+                adminsAssignAdmins: true,
+                anyoneCanAddMembers: false,
+            });
+            try {
+                fixture.bob.gate.blocked = winner === "owner-controls-first";
+                await fixture.bob.client.grantAdmin(
+                    fixture.sessionId,
+                    fixture.carol.client.accountKey,
+                );
+                if (winner === "grant-first") {
+                    await synchronize([fixture.bob, fixture.alice, fixture.carol, fixture.dave], 3);
+                } else {
+                    await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                }
+
+                await fixture.alice.client.setPolicies(fixture.sessionId, {
+                    adminsAssignAdmins: false,
+                    anyoneCanAddMembers: false,
+                });
+                await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+                await fixture.alice.client.revokeAdmin(
+                    fixture.sessionId,
+                    fixture.bob.client.accountKey,
+                );
+                await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+                await fixture.alice.client.setPolicies(fixture.sessionId, {
+                    adminsAssignAdmins: true,
+                    anyoneCanAddMembers: false,
+                });
+                await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+
+                fixture.bob.gate.blocked = false;
+                await synchronize([fixture.bob, fixture.alice, fixture.carol, fixture.dave], 6);
+                const final = await requireSession(fixture.alice, fixture.sessionId);
+                expect(final.policies).toEqual({
+                    adminsAssignAdmins: true,
+                    anyoneCanAddMembers: false,
+                });
+                expect(
+                    final.admins.some((admin) => equalBytes(admin, fixture.bob.client.accountKey)),
+                ).toBe(false);
+                expect(
+                    final.admins.some((admin) =>
+                        equalBytes(admin, fixture.carol.client.accountKey),
+                    ),
+                ).toBe(winner === "grant-first");
+                expect(final.admins.filter((admin) => equalBytes(admin, final.owner))).toHaveLength(
+                    1,
+                );
+                expect(await intentKeys(fixture.bob.store)).toEqual([]);
+            } finally {
+                await fixture.close();
+            }
+        }
+    }, 120_000);
+
+    test("ROLE-11 continuity reset purges a stale grant and re-admits into winning roles", async () => {
+        const fixture = await createRoleFixture({
+            adminsAssignAdmins: true,
+            anyoneCanAddMembers: false,
+        });
+        const expiringSender = generateIdentityKeyPair();
+        try {
+            fixture.bob.gate.blocked = true;
+            await fixture.bob.client.grantAdmin(fixture.sessionId, fixture.carol.client.accountKey);
+            await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+
+            await fixture.base.publish(
+                createSignedDelivery(
+                    expiringSender,
+                    [fixture.bob.client.identity],
+                    utf8Encode("role-reset-gap"),
+                    { createdAt: fixture.now.value, expiresAt: fixture.now.value + 1 },
+                ),
+            );
+            fixture.now.value += 2;
+            await expect(fixture.relay.pruneExpired()).resolves.toBe(1);
+
+            await fixture.alice.client.setPolicies(fixture.sessionId, {
+                adminsAssignAdmins: false,
+                anyoneCanAddMembers: false,
+            });
+            await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+            await fixture.alice.client.revokeAdmin(
+                fixture.sessionId,
+                fixture.bob.client.accountKey,
+            );
+            await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
+            const winner = roleSnapshot(await requireSession(fixture.alice, fixture.sessionId));
+
+            fixture.bob.gate.blocked = false;
+            await expect(
+                fixture.bob.client.synchronize({ waitMilliseconds: 0 }),
+            ).rejects.toMatchObject({
+                name: "MurmurResetRequiredError",
+                committed: false,
+            });
+            const snapshots: MurmurResetEvent[] = [];
+            await expect(
+                fixture.bob.client.synchronize(
+                    { waitMilliseconds: 0 },
+                    {
+                        onReset: (reset) => {
+                            snapshots.push(reset);
+                        },
+                    },
+                ),
+            ).rejects.toMatchObject({
+                name: "MurmurResetRequiredError",
+                committed: true,
+            });
+            expect(snapshots).toHaveLength(1);
+            const stale = snapshots[0]!.sessions.find((session) =>
+                equalBytes(session.id, fixture.sessionId),
+            );
+            expect(stale?.policies.adminsAssignAdmins).toBe(true);
+            expect(
+                stale?.admins.some((admin) => equalBytes(admin, fixture.bob.client.accountKey)),
+            ).toBe(true);
+            expect(
+                stale?.admins.some((admin) => equalBytes(admin, fixture.carol.client.accountKey)),
+            ).toBe(false);
+            expect(await fixture.bob.client.session(fixture.sessionId)).toBeUndefined();
+            expect(await intentKeys(fixture.bob.store)).toEqual([]);
+
+            for (let cycle = 0; cycle < 12; cycle += 1) {
+                await synchronize([fixture.alice, fixture.carol, fixture.dave, fixture.bob], 1);
+            }
+            await expect(fixture.bob.client.session(fixture.sessionId)).resolves.toMatchObject({
+                status: "pending",
+                reAdmission: true,
+            });
+            await fixture.bob.client.activateSession(fixture.sessionId);
+            expect(roleSnapshot(await requireSession(fixture.bob, fixture.sessionId))).toEqual(
+                winner,
+            );
+            await expect(
+                fixture.bob.client.grantAdmin(fixture.sessionId, fixture.carol.client.accountKey),
+            ).rejects.toThrow();
+            expect(await intentKeys(fixture.bob.store)).toEqual([]);
+        } finally {
+            destroyIdentity(expiringSender);
             await fixture.close();
         }
     }, 120_000);
