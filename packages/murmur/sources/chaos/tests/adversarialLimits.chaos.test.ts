@@ -486,9 +486,7 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
-    // PRODUCT FINDING: parseSessionCiphertext currently accepts unbounded decimal epochs,
-    // including the uint64 wrap at 2^64. Keep the exact uint64 maximum as the live control.
-    test.fails("ADV-05 PRODUCT FINDING Commit framing enforces the uint64 epoch ceiling", () => {
+    test("ADV-05 Commit framing enforces the uint64 epoch ceiling", () => {
         const frame = (epoch: bigint): Uint8Array =>
             new Uint8Array([
                 3,
@@ -1595,9 +1593,7 @@ describe("adversarial inputs and resource limits", () => {
         }
     });
 
-    // PRODUCT FINDING: JSON.parse keeps the final duplicate field, so a hostile earlier value
-    // is invisible to the relay's otherwise-exact object validation and can publish valid bytes.
-    test.fails("ADV-13 PRODUCT FINDING HTTP rejects duplicate security fields atomically", async () => {
+    test("ADV-13 HTTP rejects duplicate security fields atomically", async () => {
         const fixture = relayFixture();
         const sender = generateIdentityKeyPair();
         const recipient = generateIdentityKeyPair();
@@ -1628,7 +1624,7 @@ describe("adversarial inputs and resource limits", () => {
             const page = await fixture.transport.read(
                 createSignedInboxRead(recipient, { createdAt: NOW }),
             );
-            expect(statuses.every((status) => status >= 400)).toBe(true);
+            expect(statuses).toEqual([400, 400, 400, 400]);
             expect(page.deliveries).toHaveLength(0);
         } finally {
             await closeFixture(fixture, [sender, recipient]);
