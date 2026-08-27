@@ -90,4 +90,8 @@ export interface MurmurCloudflareEnvironment {
     readonly MURMUR_RELAY_TOKEN_SECRET: string;
     /** Exact public `wss:` URL returned by the application's ticket issuer. */
     readonly MURMUR_RELAY_ENDPOINT: string;
+    /** WorkOS User Management client whose access tokens authorize ticket issuance. */
+    readonly WORKOS_CLIENT_ID?: string;
+    /** Optional exact WorkOS issuer override used by local deployments. */
+    readonly WORKOS_ISSUER?: string;
 }

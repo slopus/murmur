@@ -264,6 +264,41 @@ async function publish(
 }
 
 describe("Cloudflare durable fanout", () => {
+    test("durably limits directory-ticket issuance per authenticated principal", async () => {
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: unusedNamespace,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(new Uint8Array(32).fill(9)),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        for (let index = 0; index < 8; index += 1) {
+            const response = await fanout.fetch(
+                internalRequest("/v2/directory-ticket/authorize", {
+                    admissionPrincipal: "workos-user-1",
+                }),
+            );
+            expect(response.status).toBe(200);
+        }
+
+        const throttled = await fanout.fetch(
+            internalRequest("/v2/directory-ticket/authorize", {
+                admissionPrincipal: "workos-user-1",
+            }),
+        );
+        const otherPrincipal = await fanout.fetch(
+            internalRequest("/v2/directory-ticket/authorize", {
+                admissionPrincipal: "workos-user-2",
+            }),
+        );
+
+        expect(throttled.status).toBe(429);
+        await expect(throttled.json()).resolves.toMatchObject({
+            error: "rate_limited",
+        });
+        expect(otherPrincipal.status).toBe(200);
+    });
+
     test("routes terminal account deletion through the authenticated inbox", async () => {
         const now = Date.now();
         const accountSecret = secret(120);

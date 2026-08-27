@@ -25,3 +25,9 @@ checks health, invalid-ticket rejection, authenticated multicast, duplicate
 publication, inbox order, device binding, acknowledgement, streaming, and
 reconnect redelivery. Run it with `pnpm test:staging`; the signing capability is
 provided only through `MURMUR_RELAY_STAGING_TOKEN_SECRET`.
+
+`stagingWorkOS.e2e.ts` exercises the public WorkOS-authenticated ingress instead of receiving the
+relay signing capability. It reads an ignored `.context/workos-staging.json` file containing
+exactly `{ "workosApiKey": "..." }`, creates two temporary staging users, opens one Murmur account
+for each user, forms a group, exchanges messages in both directions, and deletes the users. It
+never reads credentials from environment variables.

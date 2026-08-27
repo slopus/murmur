@@ -1,4 +1,5 @@
 import { DurableFanoutCoordinator } from "../fanout/index.js";
+import { sha256 } from "@noble/hashes/sha2";
 import { LocalDirectoryTicketIssuer } from "../directory/index.js";
 import type {
     DurableFanoutStore,
@@ -55,6 +56,9 @@ const MAXIMUM_GLOBAL_ITEMS = 100_000;
 const MAXIMUM_GLOBAL_BYTES = 8 * 1024 * 1024 * 1024;
 const MAXIMUM_GLOBAL_REFERENCES = 1_000_000;
 const PRUNE_BATCH = 100;
+const DIRECTORY_TICKET_ISSUANCE_LIMIT = 8;
+const DIRECTORY_TICKET_ISSUANCE_WINDOW_MILLISECONDS = 60_000;
+const DIRECTORY_TICKET_ISSUANCE_PREFIX = "directory-ticket:issuance:";
 
 interface FanoutMetadata {
     readonly lastEventId: string | null;
@@ -104,6 +108,11 @@ interface SessionDeletionRecord {
 interface SessionDeletionExpiryRecord {
     readonly deletionKey: string;
     readonly tombstoneKey: string;
+}
+
+interface DirectoryTicketIssuanceRecord {
+    readonly issued: number;
+    readonly windowStartedAt: number;
 }
 
 function indexKey(delivery: SignedDelivery): string {
@@ -280,6 +289,14 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                 const request = parseDirectoryClaimRequest(input);
                 const claim = await this.#claimDirectory(request.accountKey, request.ticket);
                 return json(directoryClaimToJson(claim), 200);
+            }
+            if (url.pathname === "/v2/directory-ticket/authorize") {
+                const admissionPrincipal = this.#admissionPrincipal(input.admissionPrincipal);
+                const retryAfterMilliseconds =
+                    await this.#authorizeDirectoryTicket(admissionPrincipal);
+                return retryAfterMilliseconds === undefined
+                    ? json({ authorized: true }, 200)
+                    : json({ error: "rate_limited", retryAfterMilliseconds }, 429);
             }
             if (url.pathname !== "/v2/publish") {
                 return json({ error: "not_found" }, 404);
@@ -737,6 +754,37 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
             await this.#coordinator.publish(notification, `directory-ticket:${claims.issuer}`);
         }
         return result.claim;
+    }
+
+    async #authorizeDirectoryTicket(admissionPrincipal: string): Promise<number | undefined> {
+        const now = Date.now();
+        const key = `${DIRECTORY_TICKET_ISSUANCE_PREFIX}${encodeBase64Url(
+            sha256(textEncoder.encode(admissionPrincipal)),
+        )}`;
+        return this.#state.storage.transaction(async (transaction) => {
+            const existing = await transaction.get<DirectoryTicketIssuanceRecord>(key);
+            if (
+                existing === undefined ||
+                existing.windowStartedAt + DIRECTORY_TICKET_ISSUANCE_WINDOW_MILLISECONDS <= now
+            ) {
+                await transaction.put<DirectoryTicketIssuanceRecord>(key, {
+                    issued: 1,
+                    windowStartedAt: now,
+                });
+                return undefined;
+            }
+            if (existing.issued >= DIRECTORY_TICKET_ISSUANCE_LIMIT) {
+                return Math.max(
+                    1,
+                    existing.windowStartedAt + DIRECTORY_TICKET_ISSUANCE_WINDOW_MILLISECONDS - now,
+                );
+            }
+            await transaction.put<DirectoryTicketIssuanceRecord>(key, {
+                ...existing,
+                issued: existing.issued + 1,
+            });
+            return undefined;
+        });
     }
 
     async #deleteAccount(delivery: SignedDelivery): Promise<void> {

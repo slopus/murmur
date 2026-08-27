@@ -32,5 +32,6 @@
     ],
     "vars": {
         "MURMUR_RELAY_ENDPOINT": "wss://murmur-relay-staging.bulka-llc.workers.dev/v2/connect",
+        "WORKOS_CLIENT_ID": "client_01KZD3XE4EW1AF1P6WTFHBPR4J",
     },
 }

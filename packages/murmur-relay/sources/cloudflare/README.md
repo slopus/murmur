@@ -29,11 +29,15 @@ Each inbox stores required sequence, acknowledgement, continuity-generation,
 pending-item, and pending-byte metadata in one exact shape. Invalid metadata
 fails closed. Streams emit continuity before ordered queued deliveries.
 
-The application server remains responsible for user authentication and ticket
-issuance. Staging and production require a canonical base64url
-`MURMUR_RELAY_TOKEN_SECRET` and exact public `MURMUR_RELAY_ENDPOINT`. Cloudflare
-directory tickets use `LocalDirectoryTicketIssuer` with issuer
-`murmur-cloudflare-directory` and the domain-separated
-`deriveCloudflareDirectoryTicketSecret()` result as its signing seed; the
-authenticated application server must issue those short-lived, budgeted
-tickets.
+The public Worker also acts as Happy's authentication ingress. `POST /v2/session` verifies a
+WorkOS User Management bearer token and a device-signed proof, then returns a short-lived ticket
+bound to that device, the exact deployment WebSocket, and the WorkOS user ID as its admission
+principal. `POST /v2/directory-ticket` verifies the same bearer token and returns a short-lived,
+eight-claim directory ticket. The singleton fanout object durably limits each WorkOS account to
+eight new directory tickets per minute, while other authenticated accounts remain independent.
+Neither endpoint exposes the relay signing secret.
+
+Staging and production require a canonical base64url `MURMUR_RELAY_TOKEN_SECRET`, the exact public
+`MURMUR_RELAY_ENDPOINT`, and the environment's public `WORKOS_CLIENT_ID`. Cloudflare directory
+tickets use `LocalDirectoryTicketIssuer` with issuer `murmur-cloudflare-directory` and the
+domain-separated `deriveCloudflareDirectoryTicketSecret()` result as its signing seed.

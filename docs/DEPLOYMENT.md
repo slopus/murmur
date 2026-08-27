@@ -46,6 +46,8 @@ The Worker configuration binds:
 - `MURMUR_INBOXES` to `MurmurInboxDurableObject`;
 - `MURMUR_FANOUT` to `MurmurFanoutDurableObject`;
 - `MURMUR_RELAY_TOKEN_SECRET` as a secret;
+- `WORKOS_CLIENT_ID` as the public WorkOS User Management client accepted by the Cloudflare ticket
+  issuer;
 - `MURMUR_RELAY_ENDPOINT` as the exact public `wss:` endpoint.
 
 Deploy staging or production with the package scripts:
@@ -55,12 +57,14 @@ pnpm --filter @slopus/murmur-relay cloudflare:deploy:staging
 pnpm --filter @slopus/murmur-relay cloudflare:deploy:production
 ```
 
-The application's authenticated server issues short-lived relay session
-tickets. The Worker verifies each ticket before upgrading to WebSocket. Durable
-Objects retain bounded pending deliveries and alarms prune expiry. The same
-server issues directory tickets with `LocalDirectoryTicketIssuer`, issuer
+The Worker verifies WorkOS access tokens and issues short-lived relay session
+tickets before upgrading them to WebSocket connections. Durable Objects retain
+bounded pending deliveries and alarms prune expiry. The Worker also issues
+directory tickets with `LocalDirectoryTicketIssuer`, issuer
 `murmur-cloudflare-directory`, and the domain-separated result of
-`deriveCloudflareDirectoryTicketSecret(MURMUR_RELAY_TOKEN_SECRET)`.
+`deriveCloudflareDirectoryTicketSecret(MURMUR_RELAY_TOKEN_SECRET)`. The singleton
+fanout object durably limits each WorkOS account to eight new directory tickets
+per minute.
 
 The singleton fanout object stores authoritative rosters, directory pools, and
 relay-visible session state in Durable Object SQLite. Session publications use
