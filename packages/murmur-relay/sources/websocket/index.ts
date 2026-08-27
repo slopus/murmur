@@ -303,7 +303,7 @@ export class RelayWebSocketSession {
                     JSON.stringify(
                         queued === null
                             ? { version: 1, id, type: "heartbeat", body: null }
-                            : "type" in queued
+                            : "type" in queued && queued.type === "continuity"
                               ? {
                                     version: 1,
                                     id,
@@ -316,16 +316,25 @@ export class RelayWebSocketSession {
                                         acknowledgedSequence: queued.acknowledgedSequence,
                                     },
                                 }
-                              : {
-                                    version: 1,
-                                    id,
-                                    type: "delivery",
-                                    body: {
-                                        eventId: queued.eventId,
-                                        sequence: queued.sequence,
-                                        delivery: signedDeliveryToJson(queued.delivery),
-                                    },
-                                },
+                              : "type" in queued
+                                ? {
+                                      version: 1,
+                                      id,
+                                      type: "device_roster_changed",
+                                      body: {
+                                          accountKey: encodeBase64Url(queued.accountKey),
+                                      },
+                                  }
+                                : {
+                                      version: 1,
+                                      id,
+                                      type: "delivery",
+                                      body: {
+                                          eventId: queued.eventId,
+                                          sequence: queued.sequence,
+                                          delivery: signedDeliveryToJson(queued.delivery),
+                                      },
+                                  },
                     ),
                 );
             }

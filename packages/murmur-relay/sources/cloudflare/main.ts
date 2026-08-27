@@ -3,8 +3,8 @@ import { createRelaySessionFetchHandler, verifyRelaySessionToken } from "../sess
 import { RelayError } from "../protocol/index.js";
 import { encodeBase64Url } from "../utils/base64Url.js";
 import { relaySessionTokenFromWebSocketProtocols } from "../websocket/index.js";
-import { MurmurFanoutDurableObject } from "./fanoutDurableObject.js";
-import { MurmurInboxDurableObject } from "./inboxDurableObject.js";
+import { MurmurFanoutDurableObject as MurmurFanoutDurableObjectImplementation } from "./fanoutDurableObject.js";
+import { MurmurInboxDurableObject as MurmurInboxDurableObjectImplementation } from "./inboxDurableObject.js";
 import { deriveCloudflareDirectoryTicketSecret, parseTokenSecret } from "./impl/cloudflareCodec.js";
 import type { MurmurCloudflareEnvironment } from "./types.js";
 import {
@@ -12,7 +12,11 @@ import {
     type AuthenticateWorkOSAccessToken,
 } from "./workosAuthentication.js";
 
-export { MurmurFanoutDurableObject, MurmurInboxDurableObject };
+/** Fresh fanout namespace for the breaking owner-encrypted device-metadata roster schema. */
+export class MurmurFanoutV2DurableObject extends MurmurFanoutDurableObjectImplementation {}
+
+/** Fresh inbox namespace paired with the fanout reset so no old relay state survives it. */
+export class MurmurInboxV2DurableObject extends MurmurInboxDurableObjectImplementation {}
 
 const DIRECTORY_TICKET_TTL_MILLISECONDS = 60_000;
 const DIRECTORY_TICKET_CLAIM_BUDGET = 8;
@@ -97,6 +101,17 @@ export function createMurmurCloudflareWorker(options: MurmurCloudflareWorkerOpti
                         admissionPrincipal: userId,
                         endpoint: environment.MURMUR_RELAY_ENDPOINT,
                     }),
+                    onIssued: async (_request, _proof, token) => {
+                        const fanoutId = environment.MURMUR_FANOUT.idFromName(FANOUT_OBJECT_NAME);
+                        const response = await environment.MURMUR_FANOUT.get(fanoutId).fetch(
+                            new Request("https://murmur.internal/v2/roster/access", {
+                                method: "POST",
+                                headers: { "content-type": "application/json" },
+                                body: JSON.stringify({ token }),
+                            }),
+                        );
+                        if (!response.ok) throw new Error("Failed to record device access");
+                    },
                 })(request);
             }
             if (request.method === "POST" && url.pathname === "/v2/directory-ticket") {

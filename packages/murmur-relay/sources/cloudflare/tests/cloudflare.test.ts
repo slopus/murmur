@@ -2,6 +2,7 @@ import { DatabaseSync, type SQLInputValue } from "node:sqlite";
 import { describe, expect, test } from "vitest";
 import { LocalDirectoryTicketIssuer } from "../../directory/index.js";
 import { signedDeliveryToJson, type SignedDelivery } from "../../protocol/index.js";
+import { createRelaySessionToken } from "../../session/index.js";
 import { identity, recipients, secret, signedDelivery } from "../../protocol/tests/helpers.js";
 import { encodeBase64Url } from "../../utils/base64Url.js";
 import { MurmurFanoutDurableObject } from "../fanoutDurableObject.js";
@@ -229,8 +230,9 @@ async function registerDevice(
     deviceKey: Uint8Array,
     now: number,
     id: number,
+    rosterDevices: readonly Uint8Array[] = [deviceKey],
 ): Promise<Response> {
-    const delivery = signedDelivery(accountSecret, recipients(deviceKey), {
+    const delivery = signedDelivery(accountSecret, recipients(...rosterDevices), {
         id,
         now,
         expiresAt: now + 60_000,
@@ -240,6 +242,7 @@ async function registerDevice(
             deviceKey: encodeBase64Url(deviceKey),
             resetGeneration: 0,
             keyPackage: encodeBase64Url(new Uint8Array([id, 1, 2])),
+            encryptedMetadata: encodeBase64Url(new Uint8Array([id])),
         }),
     });
     return fanout.fetch(
@@ -264,6 +267,44 @@ async function publish(
 }
 
 describe("Cloudflare durable fanout", () => {
+    test("records access only from a valid relay capability without advancing roster revision", async () => {
+        const tokenSecret = new Uint8Array(32).fill(9);
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: unusedNamespace,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(tokenSecret),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        const accountSecret = secret(121);
+        const deviceKey = identity(secret(122));
+        const now = Date.now();
+        expect((await registerDevice(fanout, accountSecret, deviceKey, now, 122)).status).toBe(200);
+        const token = createRelaySessionToken(tokenSecret, {
+            admissionPrincipal: "workos-user-1",
+            endpoint: environment.MURMUR_RELAY_ENDPOINT,
+            device: deviceKey,
+            issuedAt: now + 700,
+            expiresAt: now + 60_000,
+        });
+        const access = await fanout.fetch(internalRequest("/v2/roster/access", { token }));
+        expect(access.status).toBe(200);
+        expect(await access.json()).toEqual({ recorded: true });
+        const roster = await fanout.fetch(
+            internalRequest("/v2/roster/read", {
+                version: 1,
+                accountKey: encodeBase64Url(identity(accountSecret)),
+            }),
+        );
+        expect(await roster.json()).toMatchObject({
+            roster: { revision: 1, devices: [{ lastAccessedAt: now + 700 }] },
+        });
+        const rejected = await fanout.fetch(
+            internalRequest("/v2/roster/access", { token: `${token}tampered` }),
+        );
+        expect(rejected.status).toBe(401);
+    });
+
     test("durably limits directory-ticket issuance per authenticated principal", async () => {
         const environment: MurmurCloudflareEnvironment = {
             MURMUR_INBOXES: unusedNamespace,
@@ -552,6 +593,73 @@ describe("Cloudflare durable fanout", () => {
                     .storage.list({ prefix: "inbox:event:" })
             ).size,
         ).toBe(1);
+    });
+
+    test("notifies only connected owner streams when roster devices change", async () => {
+        const now = Date.now();
+        const accountSecret = secret(180);
+        const account = identity(accountSecret);
+        const firstDevice = identity(secret(181));
+        const secondDevice = identity(secret(182));
+        const tokenSecret = new Uint8Array(32).fill(9);
+        const inboxes = new InboxNamespace();
+        const environment: MurmurCloudflareEnvironment = {
+            MURMUR_INBOXES: inboxes,
+            MURMUR_FANOUT: unusedNamespace,
+            MURMUR_RELAY_TOKEN_SECRET: encodeBase64Url(tokenSecret),
+            MURMUR_RELAY_ENDPOINT: "wss://relay.test/v2/connect",
+        };
+        inboxes.setEnvironment(environment);
+        const fanout = new MurmurFanoutDurableObject(new MemoryState(), environment);
+        expect((await registerDevice(fanout, accountSecret, firstDevice, now, 180)).status).toBe(
+            200,
+        );
+        const state = inboxes.states.get(encodeBase64Url(firstDevice))!;
+        const streamSocket = new CapturingSocket();
+        streamSocket.serializeAttachment({
+            device: encodeBase64Url(firstDevice),
+            admissionPrincipal: "account-180",
+            expiresAt: now + 60_000,
+            started: true,
+            streamId: "AAAAAAAAAAAAAAAAAAAAAAAA",
+            after: null,
+        });
+        const requestSocket = new CapturingSocket();
+        requestSocket.serializeAttachment({
+            device: encodeBase64Url(firstDevice),
+            admissionPrincipal: "account-180",
+            expiresAt: now + 60_000,
+            started: true,
+        });
+        state.sockets.push(streamSocket, requestSocket);
+
+        expect(
+            (
+                await registerDevice(fanout, accountSecret, secondDevice, now + 1, 182, [
+                    firstDevice,
+                    secondDevice,
+                ])
+            ).status,
+        ).toBe(200);
+        expect(JSON.parse(streamSocket.messages[0]!) as unknown).toEqual({
+            version: 1,
+            id: "AAAAAAAAAAAAAAAAAAAAAAAA",
+            type: "device_roster_changed",
+            body: { accountKey: encodeBase64Url(account) },
+        });
+        expect(requestSocket.messages).toEqual([]);
+
+        const token = createRelaySessionToken(tokenSecret, {
+            admissionPrincipal: "account-180",
+            endpoint: environment.MURMUR_RELAY_ENDPOINT,
+            device: secondDevice,
+            issuedAt: now + 2,
+            expiresAt: now + 60_000,
+        });
+        expect((await fanout.fetch(internalRequest("/v2/roster/access", { token }))).status).toBe(
+            200,
+        );
+        expect(streamSocket.messages).toHaveLength(2);
     });
 
     test("rotates, claims, spends, and falls back to a last-resort directory prekey", async () => {

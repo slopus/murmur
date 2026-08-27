@@ -536,6 +536,21 @@ export class PostgresRelayStore implements RelayStore {
         );
     }
 
+    async recordDeviceAccess(deviceKey: Uint8Array, accessedAt: number): Promise<boolean> {
+        this.#assertOpen();
+        if (deviceKey.length !== 32 || !Number.isSafeInteger(accessedAt) || accessedAt < 0) {
+            throw new Error("Invalid device access record");
+        }
+        const result = await this.#database.query(
+            `UPDATE murmur_device_roster_devices
+             SET last_accessed_at = GREATEST(last_accessed_at, $1)
+             WHERE device_key = $2
+             RETURNING device_key`,
+            [accessedAt, deviceKey],
+        );
+        return result.rows.length > 0;
+    }
+
     async readDeviceAccount(deviceKey: Uint8Array): Promise<Uint8Array | undefined> {
         this.#assertOpen();
         if (deviceKey.length !== 32) throw new Error("Invalid device identity key");
@@ -844,10 +859,26 @@ export class PostgresRelayStore implements RelayStore {
                 devices.set(encodedDevice, {
                     deviceKey: mutation.deviceKey,
                     resetGeneration: mutation.resetGeneration,
+                    lastAccessedAt: now,
+                    encryptedMetadata: mutation.encryptedMetadata,
                 });
                 admissions.set(encodedDevice, {
                     deviceKey: mutation.deviceKey,
                     keyPackage: mutation.keyPackage,
+                });
+            } else if (mutation.type === "update_metadata") {
+                if (
+                    existing === undefined ||
+                    mutation.resetGeneration !== existing.resetGeneration
+                ) {
+                    throw new RelayError(409, "Device metadata update names stale roster state", {
+                        error: "reset_generation",
+                        expectedGeneration: existing?.resetGeneration ?? null,
+                    });
+                }
+                devices.set(encodedDevice, {
+                    ...existing,
+                    encryptedMetadata: mutation.encryptedMetadata,
                 });
             } else {
                 if (
@@ -888,7 +919,10 @@ export class PostgresRelayStore implements RelayStore {
                  ON CONFLICT (account_key) DO UPDATE SET revision = excluded.revision`,
                 [delivery.sender, revision],
             );
-            if (mutation.type === "remove" || existing !== undefined) {
+            if (
+                mutation.type === "remove" ||
+                (mutation.type === "register" && existing !== undefined)
+            ) {
                 await transaction.query(
                     `DELETE FROM murmur_device_roster_devices
                      WHERE account_key = $1 AND device_key = $2`,
@@ -900,16 +934,24 @@ export class PostgresRelayStore implements RelayStore {
                 if (storedAdmission === undefined) throw new Error("Missing roster admission");
                 await transaction.query(
                     `INSERT INTO murmur_device_roster_devices
-                        (account_key, device_key, reset_generation, key_package)
-                     VALUES ($1, $2, $3, $4)
+                        (account_key, device_key, reset_generation, last_accessed_at, key_package,
+                         encrypted_metadata)
+                     VALUES ($1, $2, $3, $4, $5, $6)
                      ON CONFLICT (account_key, device_key) DO UPDATE SET
                         reset_generation = excluded.reset_generation,
-                        key_package = excluded.key_package`,
+                        last_accessed_at = GREATEST(
+                            murmur_device_roster_devices.last_accessed_at,
+                            excluded.last_accessed_at
+                        ),
+                        key_package = excluded.key_package,
+                        encrypted_metadata = excluded.encrypted_metadata`,
                     [
                         delivery.sender,
                         entry.deviceKey,
                         entry.resetGeneration,
+                        entry.lastAccessedAt,
                         storedAdmission.keyPackage,
+                        entry.encryptedMetadata,
                     ],
                 );
             }
@@ -925,6 +967,8 @@ export class PostgresRelayStore implements RelayStore {
                 devices: sortedDevices.map((entry) => ({
                     deviceKey: entry.deviceKey.slice(),
                     resetGeneration: entry.resetGeneration,
+                    lastAccessedAt: entry.lastAccessedAt,
+                    encryptedMetadata: entry.encryptedMetadata.slice(),
                 })),
                 admissions: sortedDevices.map((entry) => {
                     const value = admissions.get(encodeBase64Url(entry.deviceKey));
@@ -1640,9 +1684,11 @@ export class PostgresRelayStore implements RelayStore {
         const entries = await query.query<{
             device_key: unknown;
             reset_generation: unknown;
+            last_accessed_at: unknown;
             key_package: unknown;
+            encrypted_metadata: unknown;
         }>(
-            `SELECT device_key, reset_generation, key_package
+            `SELECT device_key, reset_generation, last_accessed_at, key_package, encrypted_metadata
              FROM murmur_device_roster_devices
              WHERE account_key = $1 ORDER BY device_key`,
             [accountKey],
@@ -1654,6 +1700,8 @@ export class PostgresRelayStore implements RelayStore {
             devices: entries.rows.map((entry) => ({
                 deviceKey: copyBytes(entry.device_key, "roster device key"),
                 resetGeneration: safeNumberColumn(entry.reset_generation),
+                lastAccessedAt: safeNumberColumn(entry.last_accessed_at),
+                encryptedMetadata: copyBytes(entry.encrypted_metadata, "encrypted device metadata"),
             })),
             admissions: entries.rows.map((entry) => ({
                 deviceKey: copyBytes(entry.device_key, "roster device key"),

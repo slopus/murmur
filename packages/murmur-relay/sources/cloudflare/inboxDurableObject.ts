@@ -31,6 +31,7 @@ import {
     MAXIMUM_QUEUE_ITEMS,
     STREAM_HEARTBEAT_MILLISECONDS,
     decodeStoredDelivery,
+    deviceRosterChangedFrame,
     continuityFrame,
     deliveryFrame,
     encodedDeliveryBytes,
@@ -197,6 +198,36 @@ export class MurmurInboxDurableObject {
     /** Accept authenticated sockets or idempotent internal fanout insertions. */
     async fetch(request: Request): Promise<Response> {
         const url = new URL(request.url);
+        if (request.method === "POST" && url.pathname === "/v2/roster-changed") {
+            try {
+                const input = object(await requestJson(request));
+                exact(input, ["accountKey", "recipient"]);
+                if (typeof input.accountKey !== "string" || typeof input.recipient !== "string") {
+                    throw new RelayError(400, "Invalid device roster notification", {
+                        error: "malformed",
+                    });
+                }
+                const accountKey = decodeBase64Url(input.accountKey, 32);
+                const recipient = decodeBase64Url(input.recipient, 32);
+                const encodedRecipient = encodeBase64Url(recipient);
+                let notified = 0;
+                for (const socket of this.#state.getWebSockets()) {
+                    const authorization = attachment(socket);
+                    if (
+                        authorization.device !== encodedRecipient ||
+                        authorization.streamId === undefined
+                    ) {
+                        continue;
+                    }
+                    send(socket, deviceRosterChangedFrame(authorization.streamId, accountKey));
+                    notified += 1;
+                }
+                return json({ notified }, 200);
+            } catch (error: unknown) {
+                if (error instanceof RelayError) return json(error.body, error.status);
+                return json({ error: "internal" }, 500);
+            }
+        }
         if (request.method === "POST" && url.pathname === "/v2/purge") {
             try {
                 const input = object(await requestJson(request));

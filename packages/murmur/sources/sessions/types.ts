@@ -1,6 +1,7 @@
 import type { InboxSyncResult } from "../delivery/index.js";
 import type {
     MurmurDeviceAdded,
+    MurmurDeviceRosterEntry,
     MurmurDeviceRevoked,
     MurmurDormantDevice,
 } from "../accounts/types.js";
@@ -124,6 +125,10 @@ export interface MurmurSyncOptions {
     readonly onDeviceAdded?: (devices: readonly MurmurDeviceAdded[]) => void | Promise<void>;
     /** Runs when a device of this account is durably revoked. */
     readonly onDeviceRevoked?: (devices: readonly MurmurDeviceRevoked[]) => void | Promise<void>;
+    /** Runs with the refreshed owner roster after a connected relay reports a change. */
+    readonly onDevicesChanged?: (
+        devices: readonly MurmurDeviceRosterEntry[],
+    ) => void | Promise<void>;
     /** Reports sibling devices silent for six months; revocation remains application-directed. */
     readonly onDeviceDormant?: (devices: readonly MurmurDormantDevice[]) => void | Promise<void>;
 }

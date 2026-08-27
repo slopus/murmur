@@ -48,10 +48,14 @@ and derives the fanout. Every delivery binds its sender account so ownership
 cleanup does not depend on message contents.
 
 The relay owns one current device roster and its per-device directory prekey
-pools per exact account identity. It also holds MLS-adjacent session routing
-state—epoch, owner, members, admins, and policies—from signed visible controls.
-It never learns MLS secrets, descriptors, or application contents, and members
-independently verify visible controls against encrypted MLS state.
+pools per exact account identity. Each roster entry may carry bounded metadata
+encrypted by the owning application; the relay stores and routes those bytes
+without a decryption key. The relay separately records the latest successful
+session-token issuance time for each active device without advancing roster
+revision. It also holds MLS-adjacent session routing state—epoch, owner, members,
+admins, and policies—from signed visible controls. It never
+learns MLS secrets, descriptors, device metadata, or application contents, and
+members independently verify visible controls against encrypted MLS state.
 
 Directory claims are authorized by opaque authentication-server tickets. A
 pluggable verifier supplies issuer, expiry, ticket ID, and claim budget; storage

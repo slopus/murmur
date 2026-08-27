@@ -56,13 +56,24 @@ replay returns `409`; its tombstone stores only a SHA-256 account digest.
 
 Accepts `{ accountKey }` for one exact public account identity. Returns the
 current roster, including its revision, active device keys, reset generations,
-and current MLS admission KeyPackages, or `404` when no roster exists.
+latest relay session-token issuance times, owner-encrypted metadata, and current
+MLS admission KeyPackages, or `404` when no roster exists. Encrypted metadata is
+opaque base64url with a 16 KiB decoded limit. Access-time updates are monotonic
+and do not advance roster revision.
+
+Connected WebSocket and SSE streams receive `device_roster_changed` with the
+exact account key after any roster or access-time change affecting their
+account. This is an ephemeral invalidation only. Clients read the current roster
+before displaying or acting on the change.
 
 ## `POST /v1/device-rosters/mutate`
 
 Accepts an account-identity-signed ordinary delivery whose ciphertext is one
-strict register or remove mutation. The relay replay-protects the mutation and
-atomically commits both the current roster and the notification queued to every
+strict register, metadata-update, or remove mutation. Registration requires
+opaque encrypted metadata. Metadata update replaces only those bytes and must
+name the current reset generation; it does not rotate MLS admission material or
+delete directory prekeys. The relay replay-protects the mutation and atomically
+commits both the current roster and the notification queued to every
 post-mutation device inbox. Success returns the resulting roster.
 
 ## `POST /v1/directory/upload`

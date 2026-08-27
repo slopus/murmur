@@ -22,7 +22,8 @@ const ACCOUNT_DELETION_NONCE_RETENTION_MILLISECONDS = 180 * 24 * 60 * 60 * 1_000
 export const RELAY_CONTROL_SQL = Object.freeze({
     readDeviceAccount: "SELECT account_key FROM murmur_device_roster_devices WHERE device_key = ?",
     readRoster: "SELECT revision FROM murmur_device_rosters WHERE account_key = ?",
-    readRosterDevices: `SELECT device_key, reset_generation, key_package
+    readRosterDevices: `SELECT device_key, reset_generation, last_accessed_at, key_package,
+            encrypted_metadata
         FROM murmur_device_roster_devices
         WHERE account_key = ? ORDER BY device_key`,
     readSession: `SELECT owner_account, epoch, admins_assign_admins,
@@ -119,12 +120,31 @@ export class RelayControlSqlStore {
             devices: entries.map((entry) => ({
                 deviceKey: copyBytes(entry.device_key, "roster device key"),
                 resetGeneration: integerColumn(entry.reset_generation, "device reset generation"),
+                lastAccessedAt: integerColumn(entry.last_accessed_at, "device last access time"),
+                encryptedMetadata: copyBytes(entry.encrypted_metadata, "encrypted device metadata"),
             })),
             admissions: entries.map((entry) => ({
                 deviceKey: copyBytes(entry.device_key, "roster device key"),
                 keyPackage: copyBytes(entry.key_package, "roster KeyPackage"),
             })),
         };
+    }
+
+    /** Record token issuance for an active device without changing roster cryptographic state. */
+    recordDeviceAccess(deviceKey: Uint8Array, accessedAt: number): boolean {
+        if (deviceKey.length !== 32 || !Number.isSafeInteger(accessedAt) || accessedAt < 0) {
+            throw new Error("Invalid device access record");
+        }
+        this.#run(
+            `UPDATE murmur_device_roster_devices
+             SET last_accessed_at = MAX(last_accessed_at, ?)
+             WHERE device_key = ?`,
+            accessedAt,
+            deviceKey,
+        );
+        return (
+            integerColumn(this.#requiredGet("SELECT changes() AS count").count, "access count") > 0
+        );
     }
 
     /** Read relay-visible membership and role state for one exact session. */
@@ -365,10 +385,23 @@ export class RelayControlSqlStore {
             devices.set(encodedDevice, {
                 deviceKey: mutation.deviceKey,
                 resetGeneration: mutation.resetGeneration,
+                lastAccessedAt: now,
+                encryptedMetadata: mutation.encryptedMetadata,
             });
             admissions.set(encodedDevice, {
                 deviceKey: mutation.deviceKey,
                 keyPackage: mutation.keyPackage,
+            });
+        } else if (mutation.type === "update_metadata") {
+            if (existing === undefined || mutation.resetGeneration !== existing.resetGeneration) {
+                throw new RelayError(409, "Device metadata update names stale roster state", {
+                    error: "reset_generation",
+                    expectedGeneration: existing?.resetGeneration ?? null,
+                });
+            }
+            devices.set(encodedDevice, {
+                ...existing,
+                encryptedMetadata: mutation.encryptedMetadata,
             });
         } else {
             if (existing === undefined || mutation.resetGeneration !== existing.resetGeneration) {
@@ -402,7 +435,10 @@ export class RelayControlSqlStore {
             delivery.sender,
             revision,
         );
-        if (mutation.type === "remove" || existing !== undefined) {
+        if (
+            mutation.type === "remove" ||
+            (mutation.type === "register" && existing !== undefined)
+        ) {
             this.#run(
                 `DELETE FROM murmur_device_roster_devices
                  WHERE account_key = ? AND device_key = ?`,
@@ -415,15 +451,23 @@ export class RelayControlSqlStore {
             if (admission === undefined) throw new Error("Missing roster admission");
             this.#run(
                 `INSERT INTO murmur_device_roster_devices
-                    (account_key, device_key, reset_generation, key_package)
-                 VALUES (?, ?, ?, ?)
+                    (account_key, device_key, reset_generation, last_accessed_at, key_package,
+                     encrypted_metadata)
+                 VALUES (?, ?, ?, ?, ?, ?)
                  ON CONFLICT (account_key, device_key) DO UPDATE SET
                     reset_generation = excluded.reset_generation,
-                    key_package = excluded.key_package`,
+                    last_accessed_at = MAX(
+                        murmur_device_roster_devices.last_accessed_at,
+                        excluded.last_accessed_at
+                    ),
+                    key_package = excluded.key_package,
+                    encrypted_metadata = excluded.encrypted_metadata`,
                 delivery.sender,
                 entry.deviceKey,
                 entry.resetGeneration,
+                entry.lastAccessedAt,
                 admission.keyPackage,
+                entry.encryptedMetadata,
             );
         }
         this.#run(
@@ -893,9 +937,9 @@ export class RelayControlSqlStore {
             PRAGMA foreign_keys = ON;
             CREATE TABLE IF NOT EXISTS murmur_control_schema (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-                version INTEGER NOT NULL CHECK (version = 1)
+                version INTEGER NOT NULL CHECK (version = 3)
             ) STRICT;
-            INSERT OR IGNORE INTO murmur_control_schema (singleton, version) VALUES (1, 1);
+            INSERT OR IGNORE INTO murmur_control_schema (singleton, version) VALUES (1, 3);
             CREATE TABLE IF NOT EXISTS murmur_device_rosters (
                 account_key BLOB PRIMARY KEY CHECK (length(account_key) = 32),
                 revision INTEGER NOT NULL CHECK (revision >= 1)
@@ -905,7 +949,9 @@ export class RelayControlSqlStore {
                     ON DELETE CASCADE,
                 device_key BLOB NOT NULL CHECK (length(device_key) = 32),
                 reset_generation INTEGER NOT NULL CHECK (reset_generation >= 0),
+                last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= 0),
                 key_package BLOB NOT NULL CHECK (length(key_package) > 0),
+                encrypted_metadata BLOB NOT NULL CHECK (length(encrypted_metadata) <= 16384),
                 PRIMARY KEY (account_key, device_key)
             ) STRICT;
             CREATE UNIQUE INDEX IF NOT EXISTS murmur_device_roster_device_identity
@@ -1008,7 +1054,7 @@ export class RelayControlSqlStore {
                 `SELECT version FROM murmur_control_schema WHERE singleton = 1`,
             )
             .one();
-        if (integerColumn(schema.version, "control schema version") !== 1) {
+        if (integerColumn(schema.version, "control schema version") !== 3) {
             throw new Error("Unsupported relay control schema version");
         }
     }

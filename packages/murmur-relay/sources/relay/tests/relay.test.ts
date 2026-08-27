@@ -180,6 +180,7 @@ describe("identity queue relay", () => {
                         deviceKey: encodeBase64Url(device),
                         resetGeneration: 0,
                         keyPackage: encodeBase64Url(new Uint8Array([1])),
+                        encryptedMetadata: encodeBase64Url(new Uint8Array([2])),
                     }),
                 }),
                 "relay-tests",
@@ -200,6 +201,48 @@ describe("identity queue relay", () => {
                     "relay-tests",
                 ),
             ).resolves.toMatchObject({ duplicate: false });
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("notifies a connected account device when its owner roster changes", async () => {
+        const accountSecret = secret(60);
+        const account = identity(accountSecret);
+        const deviceSecret = secret(61);
+        const device = identity(deviceSecret);
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        try {
+            await relay.mutateDeviceRoster(
+                signedDelivery(accountSecret, recipients(device), {
+                    id: 60,
+                    now: NOW,
+                    ciphertext: canonicalJson({
+                        version: 1,
+                        type: "register",
+                        deviceKey: encodeBase64Url(device),
+                        resetGeneration: 0,
+                        keyPackage: encodeBase64Url(new Uint8Array([1])),
+                        encryptedMetadata: encodeBase64Url(new Uint8Array()),
+                    }),
+                }),
+                "relay-tests",
+            );
+            const subscription = await relay.openQueueEventStream(
+                signedRead(deviceSecret, { limit: 1, now: NOW }),
+            );
+            const iterator = subscription.events[Symbol.asyncIterator]();
+            await expect(iterator.next()).resolves.toMatchObject({
+                value: { type: "continuity" },
+            });
+            await expect(iterator.next()).resolves.toMatchObject({
+                value: { delivery: { sender: account } },
+            });
+            await expect(relay.recordDeviceAccess(device, NOW + 1_000)).resolves.toBe(true);
+            await expect(iterator.next()).resolves.toMatchObject({
+                value: { type: "device_roster_changed", accountKey: account },
+            });
+            subscription.close();
         } finally {
             await relay.close();
         }
@@ -427,6 +470,9 @@ describe("identity queue relay", () => {
         const store: RelayStore = {
             async readDeviceRoster() {
                 return undefined;
+            },
+            async recordDeviceAccess() {
+                return false;
             },
             async readDeviceAccount() {
                 return undefined;

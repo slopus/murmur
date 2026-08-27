@@ -437,7 +437,9 @@ describe("delivery client", () => {
             start(controller) {
                 controller.enqueue(
                     utf8Encode(
-                        `event: continuity\ndata: ${JSON.stringify({
+                        `event: device_roster_changed\ndata: ${JSON.stringify({
+                            accountKey: encodeBase64Url(identity.publicKey),
+                        })}\n\nevent: continuity\ndata: ${JSON.stringify({
                             generation: encodeBase64Url(new Uint8Array(32)),
                             head: eventId,
                             headSequence: 1,
@@ -460,14 +462,18 @@ describe("delivery client", () => {
             fetch: async () =>
                 new Response(body, { headers: { "content-type": "text/event-stream" } }),
         });
+        const rosterChanges: Uint8Array[] = [];
         const stream = transport.stream(
             createSignedInboxRead(identity, { createdAt: NOW, waitMilliseconds: 0 }),
+            undefined,
+            { onDeviceRosterChanged: (accountKey) => rosterChanges.push(accountKey.slice()) },
         );
 
         await expect(stream.next()).resolves.toMatchObject({
             done: false,
             value: { type: "continuity" },
         });
+        expect(rosterChanges).toEqual([identity.publicKey]);
         await expect(stream.next()).resolves.toMatchObject({
             done: false,
             value: { eventId },

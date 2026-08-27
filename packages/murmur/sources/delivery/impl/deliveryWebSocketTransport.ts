@@ -111,13 +111,24 @@ function roster(value: unknown): DeliveryDeviceRoster {
         revision: safeInteger(input.revision),
         devices: input.devices.map((candidate) => {
             const entry = object(candidate);
-            exact(entry, ["deviceKey", "resetGeneration"]);
-            if (typeof entry.deviceKey !== "string") {
+            exact(entry, ["deviceKey", "resetGeneration", "lastAccessedAt", "encryptedMetadata"]);
+            if (
+                typeof entry.deviceKey !== "string" ||
+                typeof entry.encryptedMetadata !== "string"
+            ) {
                 throw new Error("Invalid relay WebSocket message");
             }
             const deviceKey = decodeBase64Url(entry.deviceKey);
-            if (deviceKey.length !== 32) throw new Error("Invalid relay WebSocket message");
-            return { deviceKey, resetGeneration: safeInteger(entry.resetGeneration) };
+            const encryptedMetadata = decodeBase64Url(entry.encryptedMetadata);
+            if (deviceKey.length !== 32 || encryptedMetadata.length > 16 * 1024) {
+                throw new Error("Invalid relay WebSocket message");
+            }
+            return {
+                deviceKey,
+                resetGeneration: safeInteger(entry.resetGeneration),
+                lastAccessedAt: safeInteger(entry.lastAccessedAt),
+                encryptedMetadata,
+            };
         }),
         admissions: input.admissions.map((candidate) => {
             const entry = object(candidate);
@@ -582,6 +593,24 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
                 }
                 if (input.type === "heartbeat") {
                     if (input.body !== null) throw new Error("Invalid relay stream heartbeat");
+                    resetHeartbeat();
+                    return;
+                }
+                if (input.type === "device_roster_changed") {
+                    if (!connected) throw new Error("Invalid relay stream message");
+                    const body = object(input.body);
+                    exact(body, ["accountKey"]);
+                    if (typeof body.accountKey !== "string") {
+                        throw new Error("Invalid relay stream message");
+                    }
+                    const accountKey = decodeBase64Url(body.accountKey);
+                    if (
+                        accountKey.length !== 32 ||
+                        encodeBase64Url(accountKey) !== body.accountKey
+                    ) {
+                        throw new Error("Invalid relay stream message");
+                    }
+                    hooks.onDeviceRosterChanged?.(accountKey);
                     resetHeartbeat();
                     return;
                 }

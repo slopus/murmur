@@ -134,6 +134,15 @@ export function heartbeatFrame(id: string): string {
     return JSON.stringify({ version: 1, id, type: "heartbeat", body: null });
 }
 
+export function deviceRosterChangedFrame(id: string, accountKey: Uint8Array): string {
+    return JSON.stringify({
+        version: 1,
+        id,
+        type: "device_roster_changed",
+        body: { accountKey: encodeBase64Url(accountKey) },
+    });
+}
+
 export function send(socket: CloudflareServerWebSocket, message: string): void {
     if (textEncoder.encode(message).length > MAXIMUM_MESSAGE_BYTES) {
         throw new Error("WebSocket response exceeds limit");

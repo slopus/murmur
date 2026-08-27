@@ -109,6 +109,8 @@ export interface DeliveryDeviceRoster {
     readonly devices: readonly {
         readonly deviceKey: Uint8Array;
         readonly resetGeneration: number;
+        readonly lastAccessedAt: number;
+        readonly encryptedMetadata: Uint8Array;
     }[];
     readonly admissions: readonly {
         readonly deviceKey: Uint8Array;
@@ -242,6 +244,8 @@ export interface WebSocketDeliveryTransportOptions {
 /** Optional lifecycle hooks for opening one delivery event stream. */
 export interface DeliveryStreamHooks {
     readonly onConnected?: () => void | Promise<void>;
+    /** Ephemeral hint that the authenticated account roster should be read again. */
+    readonly onDeviceRosterChanged?: (accountKey: Uint8Array) => void;
 }
 
 /**
@@ -341,6 +345,7 @@ export interface InboxSyncOptions {
 export interface InboxStreamOptions {
     readonly signal: AbortSignal;
     readonly onConnected?: () => void | Promise<void>;
+    readonly onDeviceRosterChanged?: (accountKey: Uint8Array) => void;
 }
 
 /** Durable terminal-rejection summary. */

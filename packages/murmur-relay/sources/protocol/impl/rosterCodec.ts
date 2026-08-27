@@ -6,6 +6,7 @@ import { equalBytes } from "../../utils/bytes.js";
 
 const MAXIMUM_DEVICES = 256;
 const MAXIMUM_KEY_PACKAGE_BYTES = 1024 * 1024;
+const MAXIMUM_ENCRYPTED_METADATA_BYTES = 16 * 1024;
 const textDecoder = new TextDecoder("utf-8", { fatal: true });
 
 function malformed(message: string): never {
@@ -74,6 +75,8 @@ export function deviceRosterToJson(roster: DeviceRoster): DeviceRosterJson {
         devices: roster.devices.map((entry) => ({
             deviceKey: encodeBase64Url(entry.deviceKey),
             resetGeneration: entry.resetGeneration,
+            lastAccessedAt: entry.lastAccessedAt,
+            encryptedMetadata: encodeBase64Url(entry.encryptedMetadata),
         })),
         admissions: roster.admissions.map((entry) => ({
             deviceKey: encodeBase64Url(entry.deviceKey),
@@ -98,6 +101,10 @@ export function validateDeviceRoster(roster: DeviceRoster): void {
     for (const entry of roster.devices) {
         identity(encodeBase64Url(entry.deviceKey), "device roster key");
         integer(entry.resetGeneration, "device reset generation");
+        integer(entry.lastAccessedAt, "device last access time");
+        if (entry.encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+            malformed("Invalid device roster metadata");
+        }
         if (previous !== undefined && compareBytes(previous, entry.deviceKey) >= 0) {
             malformed("Device roster entries must be sorted and unique");
         }
@@ -138,10 +145,28 @@ export function parseDeviceRoster(value: unknown): DeviceRoster {
         revision: integer(input.revision, "device roster revision", 1),
         devices: input.devices.map((candidate) => {
             const entry = object(candidate, "device roster entry");
-            exact(entry, ["deviceKey", "resetGeneration"], "device roster entry");
+            exact(
+                entry,
+                ["deviceKey", "resetGeneration", "lastAccessedAt", "encryptedMetadata"],
+                "device roster entry",
+            );
+            if (typeof entry.encryptedMetadata !== "string") {
+                return malformed("Invalid device roster metadata");
+            }
+            let encryptedMetadata: Uint8Array;
+            try {
+                encryptedMetadata = decodeBase64Url(entry.encryptedMetadata);
+            } catch {
+                return malformed("Invalid device roster metadata");
+            }
+            if (encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+                return malformed("Invalid device roster metadata");
+            }
             return {
                 deviceKey: identity(entry.deviceKey, "device roster key"),
                 resetGeneration: integer(entry.resetGeneration, "device reset generation"),
+                lastAccessedAt: integer(entry.lastAccessedAt, "device last access time"),
+                encryptedMetadata,
             };
         }),
         admissions: input.admissions.map((candidate) => {
@@ -173,7 +198,10 @@ export function parseDeviceRosterMutation(bytes: Uint8Array): DeviceRosterMutati
         return malformed("Invalid device roster mutation");
     }
     const input = object(parsed, "device roster mutation");
-    if (input.version !== 1 || (input.type !== "register" && input.type !== "remove")) {
+    if (
+        input.version !== 1 ||
+        (input.type !== "register" && input.type !== "update_metadata" && input.type !== "remove")
+    ) {
         return malformed("Invalid device roster mutation");
     }
     const base = {
@@ -185,9 +213,29 @@ export function parseDeviceRosterMutation(bytes: Uint8Array): DeviceRosterMutati
         exact(input, ["version", "type", "deviceKey", "resetGeneration"], "device removal");
         return { ...base, type: "remove" };
     }
+    if (input.type === "update_metadata") {
+        exact(
+            input,
+            ["version", "type", "deviceKey", "resetGeneration", "encryptedMetadata"],
+            "device metadata update",
+        );
+        if (typeof input.encryptedMetadata !== "string") {
+            return malformed("Invalid device metadata update");
+        }
+        let encryptedMetadata: Uint8Array;
+        try {
+            encryptedMetadata = decodeBase64Url(input.encryptedMetadata);
+        } catch {
+            return malformed("Invalid device metadata update");
+        }
+        if (encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+            return malformed("Invalid device metadata update");
+        }
+        return { ...base, type: "update_metadata", encryptedMetadata };
+    }
     exact(
         input,
-        ["version", "type", "deviceKey", "resetGeneration", "keyPackage"],
+        ["version", "type", "deviceKey", "resetGeneration", "keyPackage", "encryptedMetadata"],
         "device registration",
     );
     if (typeof input.keyPackage !== "string") return malformed("Invalid device registration");
@@ -200,5 +248,17 @@ export function parseDeviceRosterMutation(bytes: Uint8Array): DeviceRosterMutati
     if (keyPackage.length < 1 || keyPackage.length > MAXIMUM_KEY_PACKAGE_BYTES) {
         return malformed("Invalid device registration");
     }
-    return { ...base, type: "register", keyPackage };
+    if (typeof input.encryptedMetadata !== "string") {
+        return malformed("Invalid device registration");
+    }
+    let encryptedMetadata: Uint8Array;
+    try {
+        encryptedMetadata = decodeBase64Url(input.encryptedMetadata);
+    } catch {
+        return malformed("Invalid device registration");
+    }
+    if (encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+        return malformed("Invalid device registration");
+    }
+    return { ...base, type: "register", keyPackage, encryptedMetadata };
 }

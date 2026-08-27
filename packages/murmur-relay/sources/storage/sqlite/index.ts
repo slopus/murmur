@@ -506,6 +506,21 @@ export class SqliteRelayStore implements RelayStore {
         return this.#readDeviceRoster(accountKey);
     }
 
+    async recordDeviceAccess(deviceKey: Uint8Array, accessedAt: number): Promise<boolean> {
+        this.#assertOpen();
+        if (deviceKey.length !== 32 || !Number.isSafeInteger(accessedAt) || accessedAt < 0) {
+            throw new Error("Invalid device access record");
+        }
+        const result = this.#run(
+            `UPDATE murmur_device_roster_devices
+             SET last_accessed_at = MAX(last_accessed_at, ?)
+             WHERE device_key = ?`,
+            BigInt(accessedAt),
+            deviceKey,
+        );
+        return result.changes > 0;
+    }
+
     async readDeviceAccount(deviceKey: Uint8Array): Promise<Uint8Array | undefined> {
         this.#assertOpen();
         if (deviceKey.length !== 32) throw new Error("Invalid device identity key");
@@ -757,10 +772,26 @@ export class SqliteRelayStore implements RelayStore {
                 devices.set(encodedDevice, {
                     deviceKey: mutation.deviceKey,
                     resetGeneration: mutation.resetGeneration,
+                    lastAccessedAt: now,
+                    encryptedMetadata: mutation.encryptedMetadata,
                 });
                 admissions.set(encodedDevice, {
                     deviceKey: mutation.deviceKey,
                     keyPackage: mutation.keyPackage,
+                });
+            } else if (mutation.type === "update_metadata") {
+                if (
+                    existing === undefined ||
+                    mutation.resetGeneration !== existing.resetGeneration
+                ) {
+                    throw new RelayError(409, "Device metadata update names stale roster state", {
+                        error: "reset_generation",
+                        expectedGeneration: existing?.resetGeneration ?? null,
+                    });
+                }
+                devices.set(encodedDevice, {
+                    ...existing,
+                    encryptedMetadata: mutation.encryptedMetadata,
                 });
             } else {
                 if (
@@ -798,7 +829,10 @@ export class SqliteRelayStore implements RelayStore {
                 delivery.sender,
                 BigInt(revision),
             );
-            if (mutation.type === "remove" || existing !== undefined) {
+            if (
+                mutation.type === "remove" ||
+                (mutation.type === "register" && existing !== undefined)
+            ) {
                 this.#run(
                     `DELETE FROM murmur_device_roster_devices
                      WHERE account_key = ? AND device_key = ?`,
@@ -811,15 +845,23 @@ export class SqliteRelayStore implements RelayStore {
                 if (storedAdmission === undefined) throw new Error("Missing roster admission");
                 this.#run(
                     `INSERT INTO murmur_device_roster_devices
-                        (account_key, device_key, reset_generation, key_package)
-                     VALUES (?, ?, ?, ?)
+                        (account_key, device_key, reset_generation, last_accessed_at, key_package,
+                         encrypted_metadata)
+                     VALUES (?, ?, ?, ?, ?, ?)
                      ON CONFLICT (account_key, device_key) DO UPDATE SET
                         reset_generation = excluded.reset_generation,
-                        key_package = excluded.key_package`,
+                        last_accessed_at = MAX(
+                            murmur_device_roster_devices.last_accessed_at,
+                            excluded.last_accessed_at
+                        ),
+                        key_package = excluded.key_package,
+                        encrypted_metadata = excluded.encrypted_metadata`,
                     delivery.sender,
                     entry.deviceKey,
                     BigInt(entry.resetGeneration),
+                    BigInt(entry.lastAccessedAt),
                     storedAdmission.keyPackage,
+                    entry.encryptedMetadata,
                 );
             }
             this.#run(
@@ -836,6 +878,8 @@ export class SqliteRelayStore implements RelayStore {
                 devices: sortedDevices.map((entry) => ({
                     deviceKey: entry.deviceKey.slice(),
                     resetGeneration: entry.resetGeneration,
+                    lastAccessedAt: entry.lastAccessedAt,
+                    encryptedMetadata: entry.encryptedMetadata.slice(),
                 })),
                 admissions: sortedDevices.map((entry) => {
                     const value = admissions.get(encodeBase64Url(entry.deviceKey));
@@ -1535,6 +1579,8 @@ export class SqliteRelayStore implements RelayStore {
             devices: entries.map((entry) => ({
                 deviceKey: copyBytes(entry.device_key, "roster device key"),
                 resetGeneration: safeNumberColumn(entry.reset_generation),
+                lastAccessedAt: safeNumberColumn(entry.last_accessed_at),
+                encryptedMetadata: copyBytes(entry.encrypted_metadata, "encrypted device metadata"),
             })),
             admissions: entries.map((entry) => ({
                 deviceKey: copyBytes(entry.device_key, "roster device key"),
@@ -1562,7 +1608,7 @@ export class SqliteRelayStore implements RelayStore {
             const schema = this.#requiredGet(
                 "SELECT version FROM murmur_queue_schema WHERE singleton = 1",
             );
-            if (bigintColumn(schema.version) !== 3n) {
+            if (bigintColumn(schema.version) !== 5n) {
                 throw new Error("Unsupported SQLite queue schema version");
             }
             const tables = this.#requiredGet(
@@ -1600,7 +1646,7 @@ export class SqliteRelayStore implements RelayStore {
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 version INTEGER NOT NULL
             ) STRICT;
-            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3);
+            INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 5);
             CREATE TABLE murmur_queue_global (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
                 last_event_id TEXT CHECK (
@@ -1719,7 +1765,9 @@ export class SqliteRelayStore implements RelayStore {
                     ON DELETE CASCADE,
                 device_key BLOB NOT NULL CHECK (length(device_key) = 32),
                 reset_generation INTEGER NOT NULL CHECK (reset_generation >= 0),
+                last_accessed_at INTEGER NOT NULL CHECK (last_accessed_at >= 0),
                 key_package BLOB NOT NULL CHECK (length(key_package) > 0),
+                encrypted_metadata BLOB NOT NULL CHECK (length(encrypted_metadata) <= 16384),
                 PRIMARY KEY (account_key, device_key)
             ) STRICT;
             CREATE UNIQUE INDEX murmur_device_roster_device_identity

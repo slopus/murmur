@@ -18,6 +18,7 @@ export type {
     RelaySessionAuthorizer,
     RelaySessionClaims,
     RelaySessionIssuerOptions,
+    RelaySessionIssuedObserver,
     RelaySessionRoute,
     SignedRelaySessionRequest,
     SignedRelaySessionRequestJson,
@@ -128,6 +129,7 @@ export function createRelaySessionFetchHandler(
                 issuedAt,
                 expiresAt,
             });
+            await options.onIssued?.(request, proof, token);
             return json(
                 {
                     version: 1,

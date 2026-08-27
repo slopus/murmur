@@ -128,6 +128,15 @@ function queueEventResponse(
                     return;
                 }
                 if ("type" in next.value) {
+                    if (next.value.type === "device_roster_changed") {
+                        const data = JSON.stringify({
+                            accountKey: encodeBase64Url(next.value.accountKey),
+                        });
+                        controller.enqueue(
+                            textEncoder.encode(`event: device_roster_changed\ndata: ${data}\n\n`),
+                        );
+                        return;
+                    }
                     const data = JSON.stringify({
                         generation: encodeBase64Url(next.value.generation),
                         head: next.value.head,

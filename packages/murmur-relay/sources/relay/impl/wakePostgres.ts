@@ -3,6 +3,7 @@ import { POSTGRES_WAKE_CHANNEL } from "../../storage/postgres/index.js";
 import type { WakeSource } from "../types.js";
 
 const RECONNECT_MILLISECONDS = 1_000;
+const DEVICE_ROSTER_WAKE_PREFIX = "device-roster:";
 
 /** Dedicated resilient Postgres LISTEN connection for cross-instance queue wakes. */
 export class PostgresWakeSource implements WakeSource {
@@ -21,8 +22,11 @@ export class PostgresWakeSource implements WakeSource {
      * Publication notifications are emitted by PostgresRelayStore inside its
      * transaction; this method is intentionally a no-op after local commit.
      */
-    async notify(_queueId: string): Promise<void> {
-        // The store's transactional pg_notify is the authoritative cross-instance wake.
+    async notify(queueId: string): Promise<void> {
+        if (!queueId.startsWith(DEVICE_ROSTER_WAKE_PREFIX)) return;
+        const client = this.#client;
+        if (client === undefined) throw new Error("Postgres wake source is unavailable");
+        await client.query("SELECT pg_notify($1, $2)", [POSTGRES_WAKE_CHANNEL, queueId]);
     }
 
     /** Register a listener and establish the dedicated LISTEN connection. */

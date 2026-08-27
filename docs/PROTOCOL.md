@@ -134,10 +134,21 @@ effect without reapplying protocol state.
 
 Restoring an account identity on a new store generates an independent device
 inbox key and account-signs a self-registration mutation containing its reset
-generation and current MLS KeyPackage. The relay replay-protects the mutation,
-atomically updates its one current roster, and queues that same ordinary
-delivery to every post-mutation device inbox. Account-signed removal may name
-the current device or any sibling.
+generation, current MLS KeyPackage, and at most 16 KiB of application-encrypted
+owner metadata. The relay replay-protects the mutation, atomically updates its
+one current roster, and queues that same ordinary delivery to every
+post-mutation device inbox. A metadata-only mutation preserves the device reset
+generation, relay-owned access time, and directory material. Successful relay
+session-token issuance monotonically updates that device's `lastAccessedAt`
+without changing the roster revision. Account-signed removal may name the
+current device or any sibling. Murmur and the relay treat metadata as opaque
+bytes and never receive its encryption key.
+
+After either kind of roster change, the relay emits an ephemeral
+`device_roster_changed` invalidation to each currently connected post-change
+device stream. It identifies only the account and does not replace an
+authenticated roster read. Offline devices receive no invalidation; signed
+registration and removal deliveries remain the durable convergence mechanism.
 
 Account-targeted deliveries sign each account key and source roster revision.
 The relay rejects stale revisions or omitted current devices and returns the

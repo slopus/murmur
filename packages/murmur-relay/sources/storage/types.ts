@@ -90,6 +90,8 @@ export interface RelayStore {
     readSessionState(sessionId: Uint8Array): Promise<RelaySessionState | undefined>;
     /** Read one current roster by exact public account identity key. */
     readDeviceRoster(accountKey: Uint8Array): Promise<DeviceRoster | undefined>;
+    /** Record successful session-token issuance without advancing the roster revision. */
+    recordDeviceAccess(deviceKey: Uint8Array, accessedAt: number): Promise<boolean>;
     /** Atomically apply and notify one replay-protected identity-signed roster mutation. */
     mutateDeviceRoster(
         delivery: SignedDelivery,

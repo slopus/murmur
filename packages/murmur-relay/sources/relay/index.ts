@@ -24,12 +24,13 @@ import type {
     QueuePage,
     RelayStore,
 } from "../storage/index.js";
-import { encodeBase64Url } from "../utils/base64Url.js";
+import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
 import { InProcessWakeSource } from "./impl/wakeInProcess.js";
 import type {
     QueueEventSubscription,
     QueueContinuityEvent,
+    QueueDeviceRosterChangedEvent,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,
@@ -40,6 +41,7 @@ export { PostgresWakeSource } from "./impl/wakePostgres.js";
 export type {
     QueueEventSubscription,
     QueueContinuityEvent,
+    QueueDeviceRosterChangedEvent,
     RelayOptions,
     ResolvedRelayOptions,
     WakeSource,
@@ -53,11 +55,34 @@ const HARD_MAXIMUM_DELIVERY_TTL_MILLISECONDS = DELIVERY_RETENTION_MILLISECONDS;
 const HARD_MAXIMUM_RECIPIENTS = 1_024;
 const HARD_MAXIMUM_QUEUE_ITEMS = 25_000;
 const QUEUE_STREAM_HEARTBEAT_MILLISECONDS = 15_000;
+const DEVICE_ROSTER_WAKE_PREFIX = "device-roster:";
 
 interface Waiter {
     readonly resolve: (reason: "wake" | "timeout") => void;
     readonly reject: (error: Error) => void;
     readonly counted: boolean;
+}
+
+function deviceRosterWakeSignal(accountKey: Uint8Array, deviceKey: Uint8Array): string {
+    return `${DEVICE_ROSTER_WAKE_PREFIX}${encodeBase64Url(accountKey)}:${encodeBase64Url(deviceKey)}`;
+}
+
+function parseDeviceRosterWakeSignal(
+    value: string,
+): { readonly accountKey: Uint8Array; readonly queueId: string } | undefined {
+    if (!value.startsWith(DEVICE_ROSTER_WAKE_PREFIX)) return undefined;
+    const [account, device, extra] = value.slice(DEVICE_ROSTER_WAKE_PREFIX.length).split(":");
+    if (account === undefined || device === undefined || extra !== undefined) return undefined;
+    try {
+        const accountKey = decodeBase64Url(account, 32);
+        const deviceKey = decodeBase64Url(device, 32);
+        if (encodeBase64Url(accountKey) !== account || encodeBase64Url(deviceKey) !== device) {
+            return undefined;
+        }
+        return { accountKey, queueId: device };
+    } catch {
+        return undefined;
+    }
 }
 
 function positiveInteger(value: number, name: string): number {
@@ -174,6 +199,10 @@ export class RelayService {
     readonly #wakeSubscription: Promise<void>;
     readonly #waiters = new Map<string, Set<Waiter>>();
     readonly #streamCounts = new Map<string, number>();
+    readonly #deviceRosterChanges = new Map<
+        string,
+        { readonly accountKey: Uint8Array; readonly version: number }
+    >();
     readonly #streamClosers = new Set<() => void>();
     #waiterCount = 0;
     #streamCount = 0;
@@ -191,7 +220,20 @@ export class RelayService {
         this.#wakeSource = wakeSource;
         this.#now = now;
         this.#directoryTicketVerifier = directoryTicketVerifier;
-        this.#wakeSubscription = wakeSource.subscribe((queueId) => this.#wake(queueId));
+        this.#wakeSubscription = wakeSource.subscribe((signal) => {
+            const roster = parseDeviceRosterWakeSignal(signal);
+            if (roster === undefined) {
+                this.#wake(signal);
+                return;
+            }
+            if (!this.#streamCounts.has(roster.queueId)) return;
+            const previous = this.#deviceRosterChanges.get(roster.queueId);
+            this.#deviceRosterChanges.set(roster.queueId, {
+                accountKey: roster.accountKey.slice(),
+                version: (previous?.version ?? 0) + 1,
+            });
+            this.#wake(roster.queueId);
+        });
         void this.#wakeSubscription.catch(() => undefined);
     }
 
@@ -352,6 +394,24 @@ export class RelayService {
         return this.#store.readDeviceRoster(accountKey);
     }
 
+    /** Record successful relay-session issuance without changing roster revision. */
+    async recordDeviceAccess(
+        deviceKey: Uint8Array,
+        accessedAt: number = this.#now(),
+    ): Promise<boolean> {
+        this.#assertOpen();
+        if (deviceKey.length !== 32 || !Number.isSafeInteger(accessedAt) || accessedAt < 0) {
+            throw new RelayError(400, "Invalid device access record", { error: "malformed" });
+        }
+        const accountKey = await this.#store.readDeviceAccount(deviceKey);
+        const recorded = await this.#store.recordDeviceAccess(deviceKey, accessedAt);
+        if (recorded && accountKey !== undefined) {
+            const roster = await this.#store.readDeviceRoster(accountKey);
+            if (roster !== undefined) await this.#notifyDeviceRosterChanged(roster);
+        }
+        return recorded;
+    }
+
     /** Validate, apply, and enqueue one identity-signed roster mutation. */
     async mutateDeviceRoster(
         delivery: SignedDelivery,
@@ -422,6 +482,7 @@ export class RelayService {
             this.#wake(queueId);
             await this.#wakeSource.notify(queueId).catch(() => undefined);
         }
+        await this.#notifyDeviceRosterChanged(roster);
         return roster;
     }
 
@@ -656,6 +717,7 @@ export class RelayService {
             const remaining = (this.#streamCounts.get(queueId) ?? 1) - 1;
             if (remaining === 0) {
                 this.#streamCounts.delete(queueId);
+                this.#deviceRosterChanges.delete(queueId);
             } else {
                 this.#streamCounts.set(queueId, remaining);
             }
@@ -755,12 +817,27 @@ export class RelayService {
         queueId: string,
         signal: AbortSignal,
         close: () => void,
-    ): AsyncGenerator<QueuedDelivery | QueueContinuityEvent | null> {
+    ): AsyncGenerator<
+        QueuedDelivery | QueueContinuityEvent | QueueDeviceRosterChangedEvent | null
+    > {
         let after = request.after;
         let observedGeneration: Uint8Array | undefined;
+        let observedDeviceRosterVersion = 0;
         const constraints = { maximumEncodedBytes: Number.MAX_SAFE_INTEGER };
         try {
             while (!signal.aborted) {
+                const deviceRosterChange = this.#deviceRosterChanges.get(queueId);
+                if (
+                    deviceRosterChange !== undefined &&
+                    deviceRosterChange.version > observedDeviceRosterVersion
+                ) {
+                    observedDeviceRosterVersion = deviceRosterChange.version;
+                    yield {
+                        type: "device_roster_changed",
+                        accountKey: deviceRosterChange.accountKey.slice(),
+                    };
+                    continue;
+                }
                 let page = await this.#store.readQueue(
                     request.recipient,
                     after,
@@ -831,6 +908,16 @@ export class RelayService {
             });
         }
         return sha256(new TextEncoder().encode(admissionPrincipal));
+    }
+
+    async #notifyDeviceRosterChanged(roster: DeviceRoster): Promise<void> {
+        await Promise.all(
+            roster.devices.map((device) =>
+                this.#wakeSource
+                    .notify(deviceRosterWakeSignal(roster.accountKey, device.deviceKey))
+                    .catch(() => undefined),
+            ),
+        );
     }
 
     #registerWait(

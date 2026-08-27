@@ -82,7 +82,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 const schemaVersion = bigintColumn(versionRow.version);
-                if (schemaVersion !== 3n) {
+                if (schemaVersion !== 5n) {
                     throw new Error("Unsupported Postgres queue schema version");
                 }
                 if (
@@ -113,7 +113,7 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     version bigint NOT NULL
                 )`,
-                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 3)`,
+                `INSERT INTO murmur_queue_schema (singleton, version) VALUES (1, 5)`,
                 `CREATE TABLE murmur_queue_global (
                     singleton bigint PRIMARY KEY CHECK (singleton = 1),
                     last_event_id uuid,
@@ -230,7 +230,10 @@ export async function createPostgresRelaySchema(database: PostgresDatabase): Pro
                         ON DELETE CASCADE,
                     device_key bytea NOT NULL CHECK (octet_length(device_key) = 32),
                     reset_generation bigint NOT NULL CHECK (reset_generation >= 0),
+                    last_accessed_at bigint NOT NULL CHECK (last_accessed_at >= 0),
                     key_package bytea NOT NULL CHECK (octet_length(key_package) > 0),
+                    encrypted_metadata bytea NOT NULL
+                        CHECK (octet_length(encrypted_metadata) <= 16384),
                     PRIMARY KEY (account_key, device_key)
                 )`,
                 `CREATE UNIQUE INDEX murmur_device_roster_device_identity

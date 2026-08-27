@@ -448,6 +448,9 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
                 const after = point(this.#context, "stream.connected", "after", ordinal);
                 await applyResponseControl(this.#context, after, signal);
             },
+            ...(hooks.onDeviceRosterChanged === undefined
+                ? {}
+                : { onDeviceRosterChanged: hooks.onDeviceRosterChanged }),
         };
         const iterable = delegateStream.call(
             this.#context.delegate,

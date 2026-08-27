@@ -13,6 +13,123 @@ import { MemoryMurmurStore } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
 
 describe("restored-account device registration", () => {
+    test("registers sibling devices and updates owner-encrypted metadata in place", async () => {
+        const issuer = new LocalDirectoryTicketIssuer();
+        const relayStore = new SqliteRelayStore(":memory:");
+        const relay = new RelayService(relayStore, {}, undefined, Date.now, issuer);
+        const handler = createRelayFetchHandler(relay, {
+            defaultAdmissionPrincipal: "test",
+            requireRemoteAddress: false,
+        });
+        const fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+            handler(new Request(input, init));
+        const transport = (): HttpDeliveryTransport =>
+            new HttpDeliveryTransport("https://relay.test", { fetch });
+        const account = generateIdentityKeyPair();
+        const firstStore = new MemoryMurmurStore();
+        const secondStore = new MemoryMurmurStore();
+        let first: MurmurClient | undefined;
+        let second: MurmurClient | undefined;
+        let reopened: MurmurClient | undefined;
+        let claimant: MurmurClient | undefined;
+        let firstMetadataDevice: Uint8Array | undefined;
+        let secondMetadataDevice: Uint8Array | undefined;
+        try {
+            first = await MurmurClient.open({
+                identity: account,
+                transport: transport(),
+                store: firstStore,
+                encryptDeviceMetadata: (deviceKey) => {
+                    firstMetadataDevice = deviceKey.slice();
+                    return new Uint8Array([1]);
+                },
+            });
+            second = await MurmurClient.open({
+                identity: account,
+                transport: transport(),
+                store: secondStore,
+                encryptDeviceMetadata: async (deviceKey) => {
+                    secondMetadataDevice = deviceKey.slice();
+                    return new Uint8Array([2]);
+                },
+            });
+            expect(firstMetadataDevice).toEqual(first.deviceKey);
+            expect(secondMetadataDevice).toEqual(second.deviceKey);
+
+            const registered = await transport().readDeviceRoster(account.publicKey);
+            expect(registered?.devices).toHaveLength(2);
+            expect(registered?.devices.map((entry) => entry.encryptedMetadata[0]).sort()).toEqual([
+                1, 2,
+            ]);
+            const firstRegistered = registered?.devices.find(
+                (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(first!.deviceKey),
+            );
+            expect(firstRegistered?.lastAccessedAt).toEqual(expect.any(Number));
+            await relay.recordDeviceAccess(
+                first.deviceKey,
+                firstRegistered!.lastAccessedAt + 1_000,
+            );
+            const refreshed = await first.devices();
+            expect(
+                refreshed.find(
+                    (entry) =>
+                        encodeBase64Url(entry.deviceKey) === encodeBase64Url(first!.deviceKey),
+                )?.lastAccessedAt,
+            ).toBe(firstRegistered!.lastAccessedAt + 1_000);
+            expect((await transport().readDeviceRoster(account.publicKey))?.revision).toBe(
+                registered?.revision,
+            );
+            const secondGeneration = registered?.devices.find(
+                (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(second!.deviceKey),
+            )?.resetGeneration;
+
+            claimant = await MurmurClient.open({
+                transport: transport(),
+                store: new MemoryMurmurStore(),
+            });
+            const beforeUpdate = await claimant.claimAccount(
+                account.publicKey,
+                issuer.issue({ expiresAt: Date.now() + 60_000, claimBudget: 2 }),
+            );
+            expect(beforeUpdate.members).toHaveLength(2);
+
+            const secondDeviceKey = second.deviceKey;
+            second.close();
+            second = undefined;
+            reopened = await MurmurClient.open({
+                identity: account,
+                transport: transport(),
+                store: secondStore,
+                encryptDeviceMetadata: (deviceKey) => {
+                    expect(deviceKey).toEqual(secondDeviceKey);
+                    return new Uint8Array([3]);
+                },
+            });
+
+            const updated = await transport().readDeviceRoster(account.publicKey);
+            const updatedSecond = updated?.devices.find(
+                (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(secondDeviceKey),
+            );
+            expect(updatedSecond).toMatchObject({
+                resetGeneration: secondGeneration,
+                encryptedMetadata: new Uint8Array([3]),
+            });
+            expect(updated?.devices).toHaveLength(2);
+
+            const afterUpdate = await claimant.claimAccount(
+                account.publicKey,
+                issuer.issue({ expiresAt: Date.now() + 60_000, claimBudget: 2 }),
+            );
+            expect(afterUpdate.members).toHaveLength(2);
+        } finally {
+            first?.close();
+            second?.close();
+            reopened?.close();
+            claimant?.close();
+            await relay.close();
+        }
+    });
+
     test("self-registers a second device and removes it", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"));
         const handler = createRelayFetchHandler(relay, {

@@ -380,7 +380,14 @@ export class InboxProcessor {
                 this.#dependencies.transport,
                 request,
                 options.signal,
-                options.onConnected === undefined ? {} : { onConnected: options.onConnected },
+                {
+                    ...(options.onConnected === undefined
+                        ? {}
+                        : { onConnected: options.onConnected }),
+                    ...(options.onDeviceRosterChanged === undefined
+                        ? {}
+                        : { onDeviceRosterChanged: options.onDeviceRosterChanged }),
+                },
             )) {
                 if ("type" in queued) {
                     await this.#exclusive(async () => {

@@ -78,6 +78,39 @@ async function prefixCount(store: MurmurStore, prefix: string): Promise<number> 
 }
 
 describe("stateful MLS sessions", () => {
+    test("refreshes and reports owner devices after a connected relay invalidation", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const value = await client(relay);
+        const controller = new AbortController();
+        let connect!: () => void;
+        const connected = new Promise<void>((resolve) => {
+            connect = resolve;
+        });
+        let report!: (devices: Awaited<ReturnType<MurmurClient["devices"]>>) => void;
+        const changed = new Promise<Awaited<ReturnType<MurmurClient["devices"]>>>((resolve) => {
+            report = resolve;
+        });
+        const realtime = value.sync({
+            abort: controller.signal,
+            onConnected: connect,
+            onDevicesChanged: report,
+        });
+        try {
+            await connected;
+            await expect(relay.recordDeviceAccess(value.deviceKey, NOW + 1_000)).resolves.toBe(
+                true,
+            );
+            await expect(changed).resolves.toMatchObject([
+                { deviceKey: value.deviceKey, lastAccessedAt: NOW + 1_000 },
+            ]);
+        } finally {
+            controller.abort();
+            await realtime;
+            value.close();
+            await relay.close();
+        }
+    });
+
     test("retries terminal account deletion and wipes every local key only after confirmation", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const store = new MemoryMurmurStore();

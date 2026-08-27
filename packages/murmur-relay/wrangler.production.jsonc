@@ -6,11 +6,11 @@
         "bindings": [
             {
                 "name": "MURMUR_INBOXES",
-                "class_name": "MurmurInboxDurableObject",
+                "class_name": "MurmurInboxV2DurableObject",
             },
             {
                 "name": "MURMUR_FANOUT",
-                "class_name": "MurmurFanoutDurableObject",
+                "class_name": "MurmurFanoutV2DurableObject",
             },
         ],
     },
@@ -28,6 +28,14 @@
         {
             "tag": "v3",
             "deleted_classes": ["MurmurPrivateGroupDurableObject"],
+        },
+        {
+            "tag": "v4",
+            "new_sqlite_classes": ["MurmurInboxV2DurableObject", "MurmurFanoutV2DurableObject"],
+        },
+        {
+            "tag": "v5",
+            "deleted_classes": ["MurmurInboxDurableObject", "MurmurFanoutDurableObject"],
         },
     ],
     "vars": {

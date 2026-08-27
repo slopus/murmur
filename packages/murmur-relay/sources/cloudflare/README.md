@@ -18,6 +18,12 @@ exact roster-derived device set in the retry manifest. Roster mutations and
 one-time-prekey claims use the same manifest-first fanout path for their inbox
 notifications.
 
+Roster and device-access changes also fan out an ephemeral owner-only
+invalidation to active stream sockets in each current device inbox. Request
+sockets never receive unsolicited frames, offline devices retain no live hint,
+and the invalidation carries no encrypted metadata or authoritative roster
+contents.
+
 Terminal account deletion first removes the roster, directory, and every
 affected session from control SQLite. The response means this state is already
 unreachable and an inbox cascade is durably scheduled; alarms retry each exact

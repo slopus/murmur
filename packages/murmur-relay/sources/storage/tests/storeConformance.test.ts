@@ -90,6 +90,7 @@ describe("identity queue store conformance", () => {
                 deviceKey: encodeBase64Url(deviceKey),
                 resetGeneration: 0,
                 keyPackage: encodeBase64Url(new Uint8Array([id])),
+                encryptedMetadata: encodeBase64Url(new Uint8Array([id])),
             });
             await relay.mutateDeviceRoster(
                 signedDelivery(accountSecret, recipients(...currentDevices), {
@@ -383,6 +384,7 @@ describe("identity queue store conformance", () => {
                 deviceKey: encodeBase64Url(deviceKey),
                 resetGeneration: 0,
                 keyPackage: encodeBase64Url(new Uint8Array([9])),
+                encryptedMetadata: encodeBase64Url(new Uint8Array([9])),
             });
         const spent = (
             deviceSecret: Uint8Array,
@@ -448,6 +450,7 @@ describe("identity queue store conformance", () => {
                         deviceKey: first,
                         resetGeneration: 0,
                         keyPackage: new Uint8Array([9]),
+                        encryptedMetadata: new Uint8Array([1]),
                     },
                     NOW,
                     LIMITS,
@@ -464,6 +467,7 @@ describe("identity queue store conformance", () => {
                         deviceKey: second,
                         resetGeneration: 0,
                         keyPackage: new Uint8Array([9]),
+                        encryptedMetadata: new Uint8Array([2]),
                     },
                     NOW,
                     LIMITS,
@@ -503,6 +507,7 @@ describe("identity queue store conformance", () => {
                         deviceKey: third,
                         resetGeneration: 0,
                         keyPackage: new Uint8Array([9]),
+                        encryptedMetadata: new Uint8Array([3]),
                     },
                     NOW,
                     LIMITS,
@@ -724,7 +729,10 @@ describe("identity queue store conformance", () => {
                 deviceKey: encodeBase64Url(deviceKey),
                 resetGeneration,
                 ...(type === "register"
-                    ? { keyPackage: encodeBase64Url(new Uint8Array([resetGeneration + 1])) }
+                    ? {
+                          keyPackage: encodeBase64Url(new Uint8Array([resetGeneration + 1])),
+                          encryptedMetadata: encodeBase64Url(new Uint8Array([resetGeneration + 1])),
+                      }
                     : {}),
             });
         for (const store of await stores()) {
@@ -742,6 +750,7 @@ describe("identity queue store conformance", () => {
                             deviceKey: first,
                             resetGeneration: 0,
                             keyPackage: new Uint8Array([1]),
+                            encryptedMetadata: new Uint8Array([1]),
                         },
                         NOW,
                         { ...LIMITS, maximumGlobalItems: 0 },
@@ -757,12 +766,16 @@ describe("identity queue store conformance", () => {
                         deviceKey: first,
                         resetGeneration: 0,
                         keyPackage: new Uint8Array([1]),
+                        encryptedMetadata: new Uint8Array([1]),
                     },
                     NOW,
                     LIMITS,
                     ADMISSION_PRINCIPAL,
                 );
-                expect(firstRoster).toMatchObject({ revision: 1 });
+                expect(firstRoster).toMatchObject({
+                    revision: 1,
+                    devices: [{ lastAccessedAt: NOW }],
+                });
                 await expect(
                     store.mutateDeviceRoster(
                         firstMutation,
@@ -772,6 +785,7 @@ describe("identity queue store conformance", () => {
                             deviceKey: first,
                             resetGeneration: 0,
                             keyPackage: new Uint8Array([1]),
+                            encryptedMetadata: new Uint8Array([1]),
                         },
                         NOW,
                         LIMITS,
@@ -792,12 +806,25 @@ describe("identity queue store conformance", () => {
                         deviceKey: second,
                         resetGeneration: 0,
                         keyPackage: new Uint8Array([1]),
+                        encryptedMetadata: new Uint8Array([2]),
                     },
                     NOW,
                     LIMITS,
                     ADMISSION_PRINCIPAL,
                 );
                 expect(secondRoster.devices).toHaveLength(2);
+                await expect(store.recordDeviceAccess(first, NOW + 500)).resolves.toBe(true);
+                await expect(store.recordDeviceAccess(first, NOW - 500)).resolves.toBe(true);
+                await expect(store.recordDeviceAccess(identity(secret(199)), NOW)).resolves.toBe(
+                    false,
+                );
+                const accessedRoster = await store.readDeviceRoster(account);
+                expect(accessedRoster).toMatchObject({ revision: 2 });
+                expect(
+                    accessedRoster?.devices.find(
+                        (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(first),
+                    )?.lastAccessedAt,
+                ).toBe(NOW + 500);
 
                 await expect(
                     store.publish(
@@ -819,6 +846,44 @@ describe("identity queue store conformance", () => {
                     store.publish(converged, NOW, LIMITS, ADMISSION_PRINCIPAL),
                 ).resolves.toMatchObject({ duplicate: false });
 
+                const metadataUpdate = signedDelivery(accountSecret, currentRecipients, {
+                    id: 199,
+                    ciphertext: canonicalJson({
+                        version: 1,
+                        type: "update_metadata",
+                        deviceKey: encodeBase64Url(second),
+                        resetGeneration: 0,
+                        encryptedMetadata: encodeBase64Url(new Uint8Array([3])),
+                    }),
+                });
+                const metadataRoster = await store.mutateDeviceRoster(
+                    metadataUpdate,
+                    {
+                        version: 1,
+                        type: "update_metadata",
+                        deviceKey: second,
+                        resetGeneration: 0,
+                        encryptedMetadata: new Uint8Array([3]),
+                    },
+                    NOW,
+                    LIMITS,
+                    ADMISSION_PRINCIPAL,
+                );
+                expect(metadataRoster.revision).toBe(3);
+                expect(
+                    metadataRoster.devices.find(
+                        (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(second),
+                    ),
+                ).toMatchObject({
+                    resetGeneration: 0,
+                    encryptedMetadata: new Uint8Array([3]),
+                });
+                expect(
+                    metadataRoster.admissions.find(
+                        (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(second),
+                    )?.keyPackage,
+                ).toEqual(new Uint8Array([1]));
+
                 const reset = signedDelivery(accountSecret, currentRecipients, {
                     id: 95,
                     ciphertext: mutationBytes("register", second, 1),
@@ -833,6 +898,7 @@ describe("identity queue store conformance", () => {
                                 deviceKey: second,
                                 resetGeneration: 1,
                                 keyPackage: new Uint8Array([2]),
+                                encryptedMetadata: new Uint8Array([4]),
                             },
                             NOW,
                             LIMITS,
@@ -878,7 +944,7 @@ describe("identity queue store conformance", () => {
                     store.publish(
                         signedDelivery(secret(94), recipients(first), {
                             id: 98,
-                            targetAccounts: [{ accountKey: account, rosterRevision: 4 }],
+                            targetAccounts: [{ accountKey: account, rosterRevision: 5 }],
                         }),
                         NOW,
                         LIMITS,
@@ -1049,6 +1115,7 @@ describe("identity queue store conformance", () => {
             deviceKey: encodeBase64Url(device),
             resetGeneration: 0,
             keyPackage: encodeBase64Url(new Uint8Array([1])),
+            encryptedMetadata: encodeBase64Url(new Uint8Array([5])),
         });
         for (const store of await stores()) {
             try {
@@ -1063,6 +1130,7 @@ describe("identity queue store conformance", () => {
                         deviceKey: device,
                         resetGeneration: 0,
                         keyPackage: new Uint8Array([1]),
+                        encryptedMetadata: new Uint8Array([5]),
                     },
                     NOW,
                     LIMITS,
@@ -1172,6 +1240,7 @@ describe("identity queue store conformance", () => {
                     deviceKey: device,
                     resetGeneration: 0,
                     keyPackage: new Uint8Array([1]),
+                    encryptedMetadata: new Uint8Array([6]),
                 },
                 NOW,
                 LIMITS,

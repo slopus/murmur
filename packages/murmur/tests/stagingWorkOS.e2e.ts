@@ -10,7 +10,9 @@ import {
 } from "../sources/index.js";
 import { decodeBase64Url, utf8Decode, utf8Encode } from "../sources/utils/index.js";
 
-const CREDENTIALS_URL = new URL("../../../.context/workos-staging.json", import.meta.url);
+const CREDENTIALS_URL =
+    process.env["WORKOS_STAGING_CREDENTIALS_FILE"] ??
+    new URL("../../../.context/workos-staging.json", import.meta.url);
 const WORKOS_CLIENT_ID = "client_01KZD3XE4EW1AF1P6WTFHBPR4J";
 const SESSION_ISSUER = "https://murmur-relay-staging.bulka-llc.workers.dev/v2/session";
 const DIRECTORY_ISSUER = "https://murmur-relay-staging.bulka-llc.workers.dev/v2/directory-ticket";
@@ -47,8 +49,13 @@ function authenticatedFetch(accessToken: string): typeof fetch {
     };
 }
 
-function openClient(identity: IdentityKeyPair, accessToken: string): Promise<MurmurClient> {
+function openClient(
+    identity: IdentityKeyPair,
+    accessToken: string,
+    encryptedMetadata: Uint8Array,
+): Promise<MurmurClient> {
     return MurmurClient.open({
+        encryptDeviceMetadata: () => encryptedMetadata,
         identity,
         sessionProvider: new HttpRelaySessionProvider(SESSION_ISSUER, {
             fetch: authenticatedFetch(accessToken),
@@ -127,9 +134,23 @@ describe.runIf(stagingCredentials !== undefined)("WorkOS-authenticated Murmur st
 
             const aliceIdentity = generateIdentityKeyPair();
             const bobIdentity = generateIdentityKeyPair();
-            aliceClient = await openClient(aliceIdentity, aliceAuthentication.accessToken);
-            bobClient = await openClient(bobIdentity, bobAuthentication.accessToken);
+            aliceClient = await openClient(
+                aliceIdentity,
+                aliceAuthentication.accessToken,
+                new Uint8Array([1, 2, 3]),
+            );
+            bobClient = await openClient(
+                bobIdentity,
+                bobAuthentication.accessToken,
+                new Uint8Array([4, 5, 6]),
+            );
             await settle([aliceClient, bobClient]);
+            await expect(aliceClient.devices()).resolves.toEqual([
+                expect.objectContaining({ encryptedMetadata: new Uint8Array([1, 2, 3]) }),
+            ]);
+            await expect(bobClient.devices()).resolves.toEqual([
+                expect.objectContaining({ encryptedMetadata: new Uint8Array([4, 5, 6]) }),
+            ]);
 
             const claim = await aliceClient.claimAccount(
                 bobIdentity.publicKey,

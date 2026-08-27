@@ -43,8 +43,8 @@ create and are not themselves Sybil resistance.
 
 The Worker configuration binds:
 
-- `MURMUR_INBOXES` to `MurmurInboxDurableObject`;
-- `MURMUR_FANOUT` to `MurmurFanoutDurableObject`;
+- `MURMUR_INBOXES` to the current inbox Durable Object class;
+- `MURMUR_FANOUT` to the current fanout Durable Object class;
 - `MURMUR_RELAY_TOKEN_SECRET` as a secret;
 - `WORKOS_CLIENT_ID` as the public WorkOS User Management client accepted by the Cloudflare ticket
   issuer;

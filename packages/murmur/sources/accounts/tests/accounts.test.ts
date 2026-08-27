@@ -16,7 +16,14 @@ describe("relay-owned device roster codecs", () => {
             version: 1,
             accountKey: account.publicKey,
             revision: 3,
-            devices: [{ deviceKey: device.publicKey, resetGeneration: 2 }],
+            devices: [
+                {
+                    deviceKey: device.publicKey,
+                    resetGeneration: 2,
+                    lastAccessedAt: 1_700_000_000_000,
+                    encryptedMetadata: new Uint8Array([9, 10]),
+                },
+            ],
             admissions: [{ deviceKey: device.publicKey, keyPackage: new Uint8Array([1, 2, 3]) }],
         };
         expect(parseDeviceRoster(serializeDeviceRoster(roster))).toEqual(roster);
@@ -30,8 +37,19 @@ describe("relay-owned device roster codecs", () => {
             deviceKey: device.publicKey,
             resetGeneration: 4,
             keyPackage: new Uint8Array([7, 8]),
+            encryptedMetadata: new Uint8Array([9, 10]),
         };
         expect(decodeDeviceRosterMutation(encodeDeviceRosterMutation(register))).toEqual(register);
+        const updateMetadata = {
+            version: 1 as const,
+            type: "update_metadata" as const,
+            deviceKey: device.publicKey,
+            resetGeneration: 4,
+            encryptedMetadata: new Uint8Array([11, 12]),
+        };
+        expect(decodeDeviceRosterMutation(encodeDeviceRosterMutation(updateMetadata))).toEqual(
+            updateMetadata,
+        );
         const remove = {
             version: 1 as const,
             type: "remove" as const,
@@ -53,7 +71,12 @@ describe("relay-owned device roster codecs", () => {
                 version: 1,
                 accountKey: account.publicKey,
                 revision: 1,
-                devices: ordered.map((deviceKey) => ({ deviceKey, resetGeneration: 0 })),
+                devices: ordered.map((deviceKey) => ({
+                    deviceKey,
+                    resetGeneration: 0,
+                    lastAccessedAt: 1_700_000_000_000,
+                    encryptedMetadata: new Uint8Array(),
+                })),
                 admissions: ordered.map((deviceKey) => ({
                     deviceKey,
                     keyPackage: new Uint8Array([1]),

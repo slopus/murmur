@@ -101,6 +101,7 @@ describe("identity queue HTTP API", () => {
                     deviceKey: encodeBase64Url(device),
                     resetGeneration: 0,
                     keyPackage: encodeBase64Url(new Uint8Array([7])),
+                    encryptedMetadata: encodeBase64Url(new Uint8Array([8])),
                 }),
             });
             await relay.mutateDeviceRoster(mutation, "directory-http-tests");

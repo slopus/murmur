@@ -40,10 +40,18 @@ export type RelaySessionAuthorizer = (
     proof: SignedRelaySessionRequest,
 ) => Promise<RelaySessionRoute | undefined>;
 
+/** Hook invoked with the newly signed capability immediately before it is returned. */
+export type RelaySessionIssuedObserver = (
+    request: Request,
+    proof: SignedRelaySessionRequest,
+    token: string,
+) => Promise<void>;
+
 /** Policy for a Fetch-compatible authenticated relay-session endpoint. */
 export interface RelaySessionIssuerOptions {
     readonly tokenSecret: Uint8Array;
     readonly authorize: RelaySessionAuthorizer;
+    readonly onIssued?: RelaySessionIssuedObserver;
     readonly now?: () => number;
     readonly ticketTtlMilliseconds?: number;
     readonly maximumAuthenticationSkewMilliseconds?: number;

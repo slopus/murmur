@@ -14,6 +14,7 @@ import type {
 
 const MAXIMUM_ROSTER_DEVICES = 256;
 const MAXIMUM_KEY_PACKAGE_BYTES = 1024 * 1024;
+const MAXIMUM_ENCRYPTED_METADATA_BYTES = 16 * 1024;
 
 function object(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -64,6 +65,8 @@ export function serializeDeviceRoster(roster: MurmurDeviceRoster): Uint8Array {
         devices: roster.devices.map((entry) => ({
             deviceKey: encodeBase64Url(entry.deviceKey),
             resetGeneration: entry.resetGeneration,
+            lastAccessedAt: entry.lastAccessedAt,
+            encryptedMetadata: encodeBase64Url(entry.encryptedMetadata),
         })),
         admissions: roster.admissions.map((entry) => ({
             deviceKey: encodeBase64Url(entry.deviceKey),
@@ -98,10 +101,23 @@ export function parseDeviceRosterValue(value: unknown): MurmurDeviceRoster {
     }
     const devices = input.devices.map((candidate): MurmurDeviceRosterEntry => {
         const entry = object(candidate, "device roster entry");
-        exact(entry, ["deviceKey", "resetGeneration"], "device roster entry");
+        exact(
+            entry,
+            ["deviceKey", "resetGeneration", "lastAccessedAt", "encryptedMetadata"],
+            "device roster entry",
+        );
+        if (typeof entry.encryptedMetadata !== "string") {
+            throw new Error("Invalid device roster metadata");
+        }
+        const encryptedMetadata = decodeBase64Url(entry.encryptedMetadata);
+        if (encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+            throw new Error("Invalid device roster metadata");
+        }
         return {
             deviceKey: identity(entry.deviceKey, "device roster key"),
             resetGeneration: generation(entry.resetGeneration, "device reset generation"),
+            lastAccessedAt: generation(entry.lastAccessedAt, "device last access time"),
+            encryptedMetadata,
         };
     });
     const admissions = input.admissions.map((candidate) => {
@@ -146,6 +162,10 @@ export function validateDeviceRoster(roster: MurmurDeviceRoster): void {
     for (const entry of roster.devices) {
         validateIdentityPublicKey({ publicKey: entry.deviceKey });
         generation(entry.resetGeneration, "device reset generation");
+        generation(entry.lastAccessedAt, "device last access time");
+        if (entry.encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+            throw new Error("Invalid device roster metadata");
+        }
         if (previous !== undefined && compareBytes(previous, entry.deviceKey) >= 0) {
             throw new Error("Device roster entries must be sorted and unique");
         }
@@ -171,9 +191,10 @@ export function encodeDeviceRosterMutation(mutation: MurmurDeviceRosterMutation)
     if (mutation.type === "register") {
         if (
             mutation.keyPackage.length < 1 ||
-            mutation.keyPackage.length > MAXIMUM_KEY_PACKAGE_BYTES
+            mutation.keyPackage.length > MAXIMUM_KEY_PACKAGE_BYTES ||
+            mutation.encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES
         ) {
-            throw new Error("Invalid device registration KeyPackage");
+            throw new Error("Invalid device registration");
         }
         return canonicalJsonBytes({
             version: 1,
@@ -181,6 +202,19 @@ export function encodeDeviceRosterMutation(mutation: MurmurDeviceRosterMutation)
             deviceKey: encodeBase64Url(mutation.deviceKey),
             resetGeneration: mutation.resetGeneration,
             keyPackage: encodeBase64Url(mutation.keyPackage),
+            encryptedMetadata: encodeBase64Url(mutation.encryptedMetadata),
+        });
+    }
+    if (mutation.type === "update_metadata") {
+        if (mutation.encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+            throw new Error("Invalid encrypted device metadata");
+        }
+        return canonicalJsonBytes({
+            version: 1,
+            type: "update_metadata",
+            deviceKey: encodeBase64Url(mutation.deviceKey),
+            resetGeneration: mutation.resetGeneration,
+            encryptedMetadata: encodeBase64Url(mutation.encryptedMetadata),
         });
     }
     return canonicalJsonBytes({
@@ -200,7 +234,10 @@ export function decodeDeviceRosterMutation(bytes: Uint8Array): MurmurDeviceRoste
         throw new Error("Invalid device roster mutation");
     }
     const input = object(parsed, "device roster mutation");
-    if (input.version !== 1 || (input.type !== "register" && input.type !== "remove")) {
+    if (
+        input.version !== 1 ||
+        (input.type !== "register" && input.type !== "update_metadata" && input.type !== "remove")
+    ) {
         throw new Error("Invalid device roster mutation");
     }
     const base = {
@@ -212,9 +249,24 @@ export function decodeDeviceRosterMutation(bytes: Uint8Array): MurmurDeviceRoste
         exact(input, ["version", "type", "deviceKey", "resetGeneration"], "device removal");
         return { ...base, type: "remove" };
     }
+    if (input.type === "update_metadata") {
+        exact(
+            input,
+            ["version", "type", "deviceKey", "resetGeneration", "encryptedMetadata"],
+            "device metadata update",
+        );
+        if (typeof input.encryptedMetadata !== "string") {
+            throw new Error("Invalid device metadata update");
+        }
+        const encryptedMetadata = decodeBase64Url(input.encryptedMetadata);
+        if (encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+            throw new Error("Invalid device metadata update");
+        }
+        return { ...base, type: "update_metadata", encryptedMetadata };
+    }
     exact(
         input,
-        ["version", "type", "deviceKey", "resetGeneration", "keyPackage"],
+        ["version", "type", "deviceKey", "resetGeneration", "keyPackage", "encryptedMetadata"],
         "device registration",
     );
     if (typeof input.keyPackage !== "string") throw new Error("Invalid device registration");
@@ -222,5 +274,12 @@ export function decodeDeviceRosterMutation(bytes: Uint8Array): MurmurDeviceRoste
     if (keyPackage.length < 1 || keyPackage.length > MAXIMUM_KEY_PACKAGE_BYTES) {
         throw new Error("Invalid device registration");
     }
-    return { ...base, type: "register", keyPackage };
+    if (typeof input.encryptedMetadata !== "string") {
+        throw new Error("Invalid device registration");
+    }
+    const encryptedMetadata = decodeBase64Url(input.encryptedMetadata);
+    if (encryptedMetadata.length > MAXIMUM_ENCRYPTED_METADATA_BYTES) {
+        throw new Error("Invalid device registration");
+    }
+    return { ...base, type: "register", keyPackage, encryptedMetadata };
 }

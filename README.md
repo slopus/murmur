@@ -190,6 +190,7 @@ const secondDevice = await MurmurClient.open({
     identity: restoredAccount,
     relay,
     store: secondStore,
+    encryptDeviceMetadata: (deviceKey) => encryptLocalDeviceMetadata(deviceKey),
 });
 await secondDevice.synchronize({ waitMilliseconds: 0 });
 ```
@@ -198,6 +199,25 @@ Registration and removal are account-identity-signed relay mutations. Their
 ordinary inbox notifications drive MLS convergence. Any restored device may
 remove itself or another device with `removeDevice(deviceKey)`. Dormancy
 reporting is advisory; removal remains an explicit application decision.
+
+An application may attach up to 16 KiB of owner-encrypted metadata to each
+roster entry. Murmur supplies the stable device key to `encryptDeviceMetadata`
+so the ciphertext can be bound to that exact account/device pair, but neither
+Murmur nor the relay decrypts it. `devices()` returns defensive copies of the
+opaque bytes and refreshes the roster from the relay. Each entry also carries
+`lastAccessedAt`, the relay-owned time when that device most recently received
+a session token. Token issuance updates this timestamp monotonically without
+advancing the cryptographic roster revision. Reopening with changed ciphertext
+updates only metadata: the device key, reset generation, access time, directory
+material, and MLS membership remain unchanged. Omitting the callback preserves
+an existing value.
+
+While `sync()` is connected, the relay sends an owner-only roster invalidation
+to every current account device stream after registration, removal, metadata
+change, or access-time change. Murmur reads the authoritative roster, updates
+its local observation, and invokes `onDevicesChanged` with defensive copies.
+The notification carries no metadata and is deliberately ephemeral; durable
+device additions and removals still arrive through the ordered inbox.
 
 `deleteAccount()` is terminal. It persists and retries one signed relay request,
 then clears every local store key and destroys both identity roots only after

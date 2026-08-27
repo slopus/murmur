@@ -54,9 +54,17 @@ export interface QueueContinuityEvent {
     readonly acknowledgedSequence: number;
 }
 
+/** Ephemeral owner-only hint that one account roster should be read again. */
+export interface QueueDeviceRosterChangedEvent {
+    readonly type: "device_roster_changed";
+    readonly accountKey: Uint8Array;
+}
+
 /** One pull-driven recipient SSE subscription; `null` represents a heartbeat. */
 export interface QueueEventSubscription {
-    readonly events: AsyncIterable<QueuedDelivery | QueueContinuityEvent | null>;
+    readonly events: AsyncIterable<
+        QueuedDelivery | QueueContinuityEvent | QueueDeviceRosterChangedEvent | null
+    >;
     close(): void;
 }
 

@@ -129,6 +129,7 @@ describe("negotiated relay sessions", () => {
 
     test("lets the application authorize a device and issues an endpoint-bound token", async () => {
         const aliceSecret = secret(1);
+        let observedToken: string | undefined;
         const handler = createRelaySessionFetchHandler({
             tokenSecret: TOKEN_SECRET,
             now: () => NOW,
@@ -137,6 +138,10 @@ describe("negotiated relay sessions", () => {
                 proof.device.every((byte, index) => byte === identity(aliceSecret)[index])
                     ? { endpoint: ENDPOINT, admissionPrincipal: "account-42" }
                     : undefined,
+            onIssued: async (_request, proof, token) => {
+                expect(proof.device).toEqual(identity(aliceSecret));
+                observedToken = token;
+            },
         });
         const response = await handler(
             new Request("https://app.test/v2/murmur-session", {
@@ -158,6 +163,7 @@ describe("negotiated relay sessions", () => {
             expectedEndpoint: ENDPOINT,
         });
         expect(claims.device).toEqual(identity(aliceSecret));
+        expect(observedToken).toBe(ticket.token);
         expect(claims.admissionPrincipal).toBe("account-42");
         expect(ticket.expiresAt).toBe(NOW + 5 * 60 * 1_000);
         const tampered = `${ticket.token.startsWith("A") ? "B" : "A"}${ticket.token.slice(1)}`;

@@ -23,6 +23,7 @@ import {
     signedDeliveryToJson,
     validateSignedDeliveryShape,
     verifyDeliverySignature,
+    type DeviceRoster,
     type DirectoryClaim,
     type SignedDelivery,
     type SignedDeliveryJson,
@@ -33,6 +34,7 @@ import { decodeBase64Url, encodeBase64Url } from "../utils/base64Url.js";
 import { equalBytes } from "../utils/bytes.js";
 import { DuplicateJsonKeyError, parseStrictJson } from "../utils/strictJson.js";
 import { nextUuidV7 } from "../utils/uuidV7.js";
+import { verifyRelaySessionToken } from "../session/index.js";
 import {
     MAXIMUM_AUTHENTICATION_SKEW_MILLISECONDS,
     MAXIMUM_CIPHERTEXT_BYTES,
@@ -40,6 +42,7 @@ import {
     MAXIMUM_RECIPIENTS,
     deriveCloudflareDirectoryTicketSecret,
     object,
+    parseTokenSecret,
     textEncoder,
 } from "./impl/cloudflareCodec.js";
 import type { DurableObjectStateLike, MurmurCloudflareEnvironment } from "./types.js";
@@ -273,6 +276,25 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
                     { roster: roster === undefined ? null : deviceRosterToJson(roster) },
                     200,
                 );
+            }
+            if (url.pathname === "/v2/roster/access") {
+                if (Object.keys(input).length !== 1 || typeof input.token !== "string") {
+                    throw new RelayError(400, "Invalid device access record", {
+                        error: "malformed",
+                    });
+                }
+                const claims = verifyRelaySessionToken(
+                    parseTokenSecret(this.#environment.MURMUR_RELAY_TOKEN_SECRET),
+                    input.token,
+                    { expectedEndpoint: this.#environment.MURMUR_RELAY_ENDPOINT },
+                );
+                const accountKey = this.#control.readDeviceAccount(claims.device);
+                const recorded = this.#control.recordDeviceAccess(claims.device, claims.issuedAt);
+                if (recorded && accountKey !== undefined) {
+                    const roster = this.#control.readDeviceRoster(accountKey);
+                    if (roster !== undefined) await this.#notifyDeviceRosterChanged(roster);
+                }
+                return json({ recorded }, 200);
             }
             if (url.pathname === "/v2/roster/mutate") {
                 const delivery = parseSignedDelivery(input.delivery);
@@ -690,7 +712,29 @@ export class MurmurFanoutDurableObject implements DurableFanoutStore, FanoutRetr
         if (delivery.recipients.length > 0) {
             await this.#coordinator.publish(delivery, admissionPrincipal);
         }
+        await this.#notifyDeviceRosterChanged(roster);
         return roster;
+    }
+
+    async #notifyDeviceRosterChanged(roster: DeviceRoster): Promise<void> {
+        await Promise.all(
+            roster.devices.map(async (device) => {
+                const recipient = encodeBase64Url(device.deviceKey);
+                const id = this.#environment.MURMUR_INBOXES.idFromName(recipient);
+                await this.#environment.MURMUR_INBOXES.get(id)
+                    .fetch(
+                        new Request("https://murmur.internal/v2/roster-changed", {
+                            method: "POST",
+                            headers: { "content-type": "application/json" },
+                            body: JSON.stringify({
+                                accountKey: encodeBase64Url(roster.accountKey),
+                                recipient,
+                            }),
+                        }),
+                    )
+                    .catch(() => undefined);
+            }),
+        );
     }
 
     #uploadDirectoryPrekeys(delivery: SignedDelivery): void {

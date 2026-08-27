@@ -1,4 +1,5 @@
 import {
+    DeliveryStaleRosterError,
     DeliveryTransportError,
     HttpDeliveryTransport,
     InboxContinuityLossError,
@@ -312,6 +313,14 @@ export interface MurmurClientOptions {
      * When the store already contains an identity, the supplied public key must match it.
      */
     readonly identity?: IdentityKeyPair;
+    /**
+     * Produce opaque application-encrypted metadata for this device's owner-only roster entry.
+     *
+     * Murmur calls this after loading the stable device key so the application can bind its
+     * ciphertext to that key. Murmur and the relay never decrypt the result. Omission preserves
+     * existing metadata and registers a new device with an empty value.
+     */
+    readonly encryptDeviceMetadata?: (deviceKey: Uint8Array) => Uint8Array | Promise<Uint8Array>;
     /** Optional resource bounds; omitted fields use Murmur's defaults. */
     readonly limits?: MurmurSessionLimits;
     /** Clock override used for protocol timestamps and expiry checks. Defaults to `Date.now`. */
@@ -329,12 +338,15 @@ export class MurmurClient {
     readonly #now: () => number;
     readonly #account: IdentityKeyPair;
     readonly #transport: DeliveryTransport;
+    readonly #encryptedDeviceMetadata: Uint8Array | undefined;
     #closed = false;
     #operationTail: Promise<void> = Promise.resolve();
     #pendingOperations = 0;
     #syncActive = false;
     #syncWakePending = false;
     #syncWakeResolve: (() => void) | undefined;
+    #deviceRosterChangeVersion = 0;
+    #consumedDeviceRosterChangeVersion = 0;
     #syncRetryTimer: ReturnType<typeof setTimeout> | undefined;
     #updatesActive = false;
     #accountDeletionActive = false;
@@ -349,12 +361,14 @@ export class MurmurClient {
         now: () => number,
         services: readonly MurmurServiceRegistration[],
         account: IdentityKeyPair,
+        encryptedDeviceMetadata: Uint8Array | undefined,
     ) {
         this.#identity = identity;
         this.#store = store;
         this.#now = now;
         this.#account = account;
         this.#transport = transport;
+        this.#encryptedDeviceMetadata = encryptedDeviceMetadata?.slice();
         this.#engine = new SessionEngine(
             identity,
             store,
@@ -446,6 +460,22 @@ export class MurmurClient {
             if (identity === undefined || account === undefined) {
                 throw new Error("Murmur account did not open");
             }
+            const encryptedDeviceMetadata =
+                options.encryptDeviceMetadata === undefined
+                    ? undefined
+                    : await options.encryptDeviceMetadata(identity.publicKey.slice());
+            if (
+                encryptedDeviceMetadata !== undefined &&
+                !(encryptedDeviceMetadata instanceof Uint8Array)
+            ) {
+                throw new Error("Encrypted device metadata must be bytes");
+            }
+            if (
+                encryptedDeviceMetadata !== undefined &&
+                encryptedDeviceMetadata.length > 16 * 1024
+            ) {
+                throw new Error("Encrypted device metadata exceeds 16 KiB");
+            }
             const transport =
                 options.transport ??
                 (options.sessionProvider === undefined
@@ -466,6 +496,7 @@ export class MurmurClient {
                 options.now ?? Date.now,
                 services,
                 account,
+                encryptedDeviceMetadata,
             );
             await client.#ensureRegistered();
             await client.#ensureDirectoryEntry();
@@ -498,13 +529,18 @@ export class MurmurClient {
     /** Read this account's authenticated device roster entries. */
     async devices(): Promise<readonly MurmurDeviceRosterEntry[]> {
         return this.#tracked(async () => {
-            const roster = await this.#ownRoster();
+            const remote = await this.#transport.readDeviceRoster?.(this.#account.publicKey);
+            if (remote !== undefined) {
+                await this.#observeRoster(`lookup-${remote.revision}`, remote);
+            }
+            const roster = remote ?? (await this.#ownRoster());
             return roster === undefined
                 ? []
                 : roster.devices.map((entry) =>
                       Object.freeze({
                           ...entry,
                           deviceKey: entry.deviceKey.slice(),
+                          encryptedMetadata: entry.encryptedMetadata.slice(),
                       }),
                   );
         });
@@ -918,14 +954,49 @@ export class MurmurClient {
         }
     }
 
-    async #ensureRegistered(forceReset: boolean = false): Promise<void> {
+    async #ensureRegistered(forceReset: boolean = false, staleAttempts: number = 0): Promise<void> {
         const current = await this.#transport.readDeviceRoster?.(this.#account.publicKey);
         const currentEntry = current?.devices.find((entry) =>
             equalBytes(entry.deviceKey, this.#identity.publicKey),
         );
-        if (!forceReset && current !== undefined && currentEntry !== undefined) {
+        if (
+            !forceReset &&
+            current !== undefined &&
+            currentEntry !== undefined &&
+            (this.#encryptedDeviceMetadata === undefined ||
+                equalBytes(currentEntry.encryptedMetadata, this.#encryptedDeviceMetadata))
+        ) {
             await this.#observeRoster(`lookup-${current.revision}`, current);
             return;
+        }
+        if (!forceReset && current !== undefined && currentEntry !== undefined) {
+            if (this.#transport.mutateDeviceRoster === undefined) {
+                throw new Error("Delivery transport does not support device rosters");
+            }
+            const now = this.#now();
+            const delivery = createSignedDelivery(
+                this.#account,
+                current.devices.map((entry) => entry.deviceKey),
+                encodeDeviceRosterMutation({
+                    version: 1,
+                    type: "update_metadata",
+                    deviceKey: this.#identity.publicKey,
+                    resetGeneration: currentEntry.resetGeneration,
+                    encryptedMetadata: this.#encryptedDeviceMetadata!,
+                }),
+                { createdAt: now, expiresAt: now + 180 * 24 * 60 * 60 * 1_000 - 60_000 },
+            );
+            try {
+                const roster = await this.#transport.mutateDeviceRoster(delivery);
+                await this.#observeRoster(delivery.id, roster);
+                return;
+            } catch (error: unknown) {
+                if (error instanceof DeliveryStaleRosterError && staleAttempts < 7) {
+                    await this.#ensureRegistered(forceReset, staleAttempts + 1);
+                    return;
+                }
+                throw error;
+            }
         }
         const bundle = createMlsKeyPackage(
             this.#identity,
@@ -980,6 +1051,10 @@ export class MurmurClient {
                     resetGeneration:
                         currentEntry === undefined ? 0 : currentEntry.resetGeneration + 1,
                     keyPackage,
+                    encryptedMetadata:
+                        this.#encryptedDeviceMetadata ??
+                        currentEntry?.encryptedMetadata ??
+                        new Uint8Array(),
                 }),
                 { createdAt: now, expiresAt: now + 180 * 24 * 60 * 60 * 1_000 - 60_000 },
             );
@@ -997,6 +1072,11 @@ export class MurmurClient {
                                       currentEntry === undefined
                                           ? 0
                                           : currentEntry.resetGeneration + 1,
+                                  lastAccessedAt: now,
+                                  encryptedMetadata:
+                                      this.#encryptedDeviceMetadata ??
+                                      currentEntry?.encryptedMetadata ??
+                                      new Uint8Array(),
                               },
                           ].sort((left, right) =>
                               encodeBase64Url(left.deviceKey).localeCompare(
@@ -1008,7 +1088,14 @@ export class MurmurClient {
                               { deviceKey: this.#identity.publicKey, keyPackage },
                           ],
                       }
-                    : await this.#transport.mutateDeviceRoster(delivery);
+                    : await this.#transport.mutateDeviceRoster(delivery).catch(async (error) => {
+                          if (error instanceof DeliveryStaleRosterError && staleAttempts < 7) {
+                              await this.#ensureRegistered(forceReset, staleAttempts + 1);
+                              return undefined;
+                          }
+                          throw error;
+                      });
+            if (roster === undefined) return;
             await this.#observeRoster(delivery.id, roster);
         } finally {
             destroyMlsKeyPackageBundle(bundle);
@@ -1528,6 +1615,13 @@ export class MurmurClient {
                         connected = true;
                         await options.onConnected?.();
                     },
+                    onDeviceRosterChanged: (accountKey) => {
+                        if (!equalBytes(accountKey, this.#account.publicKey)) {
+                            throw new Error("Relay reported another account's device roster");
+                        }
+                        this.#deviceRosterChangeVersion += 1;
+                        this.#signalSync();
+                    },
                 });
                 const iterator = stream[Symbol.asyncIterator]();
                 let next = iterator.next();
@@ -1541,6 +1635,7 @@ export class MurmurClient {
                             if (signal.aborted) break;
                             await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
                             await this.#deliverUpdates(options);
+                            await this.#consumeDeviceRosterChanges(options);
                             continue;
                         }
                         if (outcome.result.done) break;
@@ -1607,6 +1702,15 @@ export class MurmurClient {
         this.#syncWakePending = true;
         this.#syncWakeResolve?.();
         this.#syncWakeResolve = undefined;
+    }
+
+    async #consumeDeviceRosterChanges(options: MurmurSyncOptions): Promise<void> {
+        const version = this.#deviceRosterChangeVersion;
+        if (version <= this.#consumedDeviceRosterChangeVersion) return;
+        const devices = await this.devices();
+        await options.onDevicesChanged?.(devices);
+        this.#consumedDeviceRosterChangeVersion = version;
+        if (this.#deviceRosterChangeVersion > version) this.#signalSync();
     }
 
     async #deliverUpdates(

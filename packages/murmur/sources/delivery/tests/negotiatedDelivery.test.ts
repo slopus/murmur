@@ -173,6 +173,14 @@ describe("negotiated WebSocket delivery", () => {
                             socket.receive({
                                 version: 1,
                                 id: frame.id,
+                                type: "device_roster_changed",
+                                body: { accountKey: encodeBase64Url(identity.publicKey) },
+                            }),
+                        );
+                        queueMicrotask(() =>
+                            socket.receive({
+                                version: 1,
+                                id: frame.id,
                                 type: "continuity",
                                 body: {
                                     generation: GENERATION,
@@ -212,9 +220,11 @@ describe("negotiated WebSocket delivery", () => {
         ).resolves.toMatchObject({ removed: 1, sequence: 1 });
 
         const controller = new AbortController();
+        const rosterChanges: Uint8Array[] = [];
         const events = transport.stream(
             createSignedInboxRead(identity, { createdAt: NOW, limit: 1 }),
             controller.signal,
+            { onDeviceRosterChanged: (accountKey) => rosterChanges.push(accountKey.slice()) },
         );
         const iterator = events[Symbol.asyncIterator]();
         const continuity = await iterator.next();
@@ -226,6 +236,7 @@ describe("negotiated WebSocket delivery", () => {
             headSequence: 1,
         });
         expect(streamed.value).toMatchObject({ eventId: EVENT_ID, sequence: 1 });
+        expect(rosterChanges).toEqual([identity.publicKey]);
 
         expect(issued).toHaveLength(1);
         expect(verifySignedRelaySessionRequest(issued[0]!)).toBe(true);
@@ -258,7 +269,14 @@ describe("negotiated WebSocket delivery", () => {
             version: 1,
             accountKey: encodeBase64Url(identity.publicKey),
             revision: 1,
-            devices: [{ deviceKey: encodeBase64Url(identity.publicKey), resetGeneration: 0 }],
+            devices: [
+                {
+                    deviceKey: encodeBase64Url(identity.publicKey),
+                    resetGeneration: 0,
+                    lastAccessedAt: 1_700_000_000_000,
+                    encryptedMetadata: encodeBase64Url(new Uint8Array([7])),
+                },
+            ],
             admissions: [
                 {
                     deviceKey: encodeBase64Url(identity.publicKey),
@@ -302,6 +320,7 @@ describe("negotiated WebSocket delivery", () => {
 
         await expect(transport.readDeviceRoster(identity.publicKey)).resolves.toMatchObject({
             revision: 1,
+            devices: [{ encryptedMetadata: new Uint8Array([7]) }],
         });
         await expect(transport.mutateDeviceRoster(delivery)).resolves.toMatchObject({
             revision: 1,

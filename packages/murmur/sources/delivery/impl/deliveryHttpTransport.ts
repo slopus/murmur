@@ -185,11 +185,24 @@ function roster(value: unknown): DeliveryDeviceRoster {
         revision: safeInteger(input.revision),
         devices: input.devices.map((candidate) => {
             const entry = object(candidate);
-            exact(entry, ["deviceKey", "resetGeneration"]);
-            if (typeof entry.deviceKey !== "string") throw new Error("Invalid relay response");
+            exact(entry, ["deviceKey", "resetGeneration", "lastAccessedAt", "encryptedMetadata"]);
+            if (
+                typeof entry.deviceKey !== "string" ||
+                typeof entry.encryptedMetadata !== "string"
+            ) {
+                throw new Error("Invalid relay response");
+            }
             const deviceKey = decodeBase64Url(entry.deviceKey);
-            if (deviceKey.length !== 32) throw new Error("Invalid relay response");
-            return { deviceKey, resetGeneration: safeInteger(entry.resetGeneration) };
+            const encryptedMetadata = decodeBase64Url(entry.encryptedMetadata);
+            if (deviceKey.length !== 32 || encryptedMetadata.length > 16 * 1024) {
+                throw new Error("Invalid relay response");
+            }
+            return {
+                deviceKey,
+                resetGeneration: safeInteger(entry.resetGeneration),
+                lastAccessedAt: safeInteger(entry.lastAccessedAt),
+                encryptedMetadata,
+            };
         }),
         admissions: input.admissions.map((candidate) => {
             const entry = object(candidate);
@@ -512,6 +525,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
                     controller,
                     this.#maximumResponseBytes,
                     this.#streamHeartbeatTimeoutMilliseconds,
+                    hooks.onDeviceRosterChanged,
                 );
             } catch (error: unknown) {
                 if (controller.signal.aborted) throw error;

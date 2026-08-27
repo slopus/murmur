@@ -3,6 +3,10 @@ export interface MurmurDeviceRosterEntry {
     readonly deviceKey: Uint8Array;
     /** Monotonic continuity-reset generation for this physical device key. */
     readonly resetGeneration: number;
+    /** Relay-owned Unix timestamp in milliseconds of the latest issued session token. */
+    readonly lastAccessedAt: number;
+    /** Application-encrypted owner-only metadata; the relay treats these bytes as opaque. */
+    readonly encryptedMetadata: Uint8Array;
 }
 
 /** Current admission material associated with an active roster device. */
@@ -28,6 +32,14 @@ export type MurmurDeviceRosterMutation =
           readonly deviceKey: Uint8Array;
           readonly resetGeneration: number;
           readonly keyPackage: Uint8Array;
+          readonly encryptedMetadata: Uint8Array;
+      }
+    | {
+          readonly version: 1;
+          readonly type: "update_metadata";
+          readonly deviceKey: Uint8Array;
+          readonly resetGeneration: number;
+          readonly encryptedMetadata: Uint8Array;
       }
     | {
           readonly version: 1;

@@ -176,6 +176,8 @@ export interface SignedQueueAckJson {
 export interface DeviceRosterEntry {
     readonly deviceKey: Uint8Array;
     readonly resetGeneration: number;
+    readonly lastAccessedAt: number;
+    readonly encryptedMetadata: Uint8Array;
 }
 
 /** Current admission material associated with an active roster device. */
@@ -198,7 +200,12 @@ export interface DeviceRosterJson {
     readonly version: 1;
     readonly accountKey: string;
     readonly revision: number;
-    readonly devices: readonly { readonly deviceKey: string; readonly resetGeneration: number }[];
+    readonly devices: readonly {
+        readonly deviceKey: string;
+        readonly resetGeneration: number;
+        readonly lastAccessedAt: number;
+        readonly encryptedMetadata: string;
+    }[];
     readonly admissions: readonly { readonly deviceKey: string; readonly keyPackage: string }[];
 }
 
@@ -210,6 +217,14 @@ export type DeviceRosterMutation =
           readonly deviceKey: Uint8Array;
           readonly resetGeneration: number;
           readonly keyPackage: Uint8Array;
+          readonly encryptedMetadata: Uint8Array;
+      }
+    | {
+          readonly version: 1;
+          readonly type: "update_metadata";
+          readonly deviceKey: Uint8Array;
+          readonly resetGeneration: number;
+          readonly encryptedMetadata: Uint8Array;
       }
     | {
           readonly version: 1;

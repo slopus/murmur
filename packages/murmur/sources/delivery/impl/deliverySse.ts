@@ -1,4 +1,5 @@
 import type { InboxStreamEvent } from "../types.js";
+import { decodeBase64Url, encodeBase64Url } from "../../utils/index.js";
 import { parseInboxContinuity, parseInboxDelivery } from "./deliveryCodec.js";
 
 interface TimedReadOptions {
@@ -41,6 +42,7 @@ export async function* decodeDeliveryEventStream(
     controller: AbortController,
     maximumEventBytes: number,
     heartbeatTimeoutMilliseconds: number,
+    onDeviceRosterChanged?: (accountKey: Uint8Array) => void,
 ): AsyncGenerator<InboxStreamEvent> {
     const reader = response.body?.getReader();
     if (reader === undefined) throw new Error("Delivery event stream has no body");
@@ -58,9 +60,11 @@ export async function* decodeDeliveryEventStream(
             return undefined;
         }
         if (
-            (eventName !== "delivery" && eventName !== "continuity") ||
+            (eventName !== "delivery" &&
+                eventName !== "continuity" &&
+                eventName !== "device_roster_changed") ||
             (eventName === "delivery" && eventId.length === 0) ||
-            (eventName === "continuity" && eventId.length !== 0)
+            (eventName !== "delivery" && eventId.length !== 0)
         ) {
             throw new Error("Invalid delivery event stream record");
         }
@@ -69,6 +73,28 @@ export async function* decodeDeliveryEventStream(
             parsed = JSON.parse(data.join("\n")) as unknown;
         } catch {
             throw new Error("Invalid delivery event stream JSON");
+        }
+        if (eventName === "device_roster_changed") {
+            if (
+                parsed === null ||
+                typeof parsed !== "object" ||
+                Array.isArray(parsed) ||
+                Object.keys(parsed).length !== 1 ||
+                typeof (parsed as { readonly accountKey?: unknown }).accountKey !== "string"
+            ) {
+                throw new Error("Invalid device roster change event");
+            }
+            const encoded = (parsed as { readonly accountKey: string }).accountKey;
+            const accountKey = decodeBase64Url(encoded);
+            if (accountKey.length !== 32 || encodeBase64Url(accountKey) !== encoded) {
+                throw new Error("Invalid device roster change event");
+            }
+            onDeviceRosterChanged?.(accountKey);
+            eventName = "";
+            eventId = "";
+            data = [];
+            eventCharacters = 0;
+            return undefined;
         }
         const queued =
             eventName === "continuity" ? parseInboxContinuity(parsed) : parseInboxDelivery(parsed);

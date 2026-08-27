@@ -1169,6 +1169,7 @@ describe("adversarial inputs and resource limits", () => {
             deviceKey: peer.publicKey,
             resetGeneration: 0,
             keyPackage: utf8Encode("mutation-key-package"),
+            encryptedMetadata: new Uint8Array(),
         });
         const roles = encodeSessionRoles({
             owner: identity.publicKey,

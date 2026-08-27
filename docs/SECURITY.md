@@ -84,6 +84,17 @@ removing devices without a sibling approval step. Review dormant-device reports
 and remove lost devices promptly. The relay rejects account-targeted traffic
 whose signed roster revision is stale while MLS membership converges.
 
+Device metadata is visible only as application ciphertext. Derive its
+encryption key separately from account identity and bind the authenticated
+ciphertext to both the account and stable device key. Never send its plaintext
+or encryption key to Murmur or the relay.
+
+The relay owns `lastAccessedAt` and updates it only after application
+authentication, device-proof verification, and relay-capability signing. This
+time is owner-visible operational metadata rather than encrypted application
+metadata; it must not be used as sole proof that a device remains under the
+owner's control.
+
 Account deletion removes relay-owned and local technical state, but it is not
 retroactive erasure from other members. Authenticated MLS events already held
 by remote applications remain under those applications' storage policy. The
