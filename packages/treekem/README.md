@@ -9,40 +9,20 @@ import * as treekem from "@slopus/treekem";
 
 const alice = treekem.keyPair();
 const bob = treekem.keyPair();
-const carol = treekem.keyPair();
 
-const created = treekem.create(alice, [bob.publicKey, carol.publicKey]);
+const created = treekem.create(alice);
 
-let aliceGroup = created.group;
-let bobGroup = treekem.join(bob.secretKey, created.publicWelcome[bob.publicKey]!);
-const carolGroup = treekem.join(carol.secretKey, created.publicWelcome[carol.publicKey]!);
-
-// All three groups have the same secretKey and members.
-// Their secretState values are private and different.
-
-const dave = treekem.keyPair();
-const changed = treekem.update(aliceGroup.secretState, {
-    remove: [carol.publicKey],
-    add: [dave.publicKey],
+const added = treekem.update(created.secretState, {
+    add: [bob.publicKey],
 });
 
-aliceGroup = changed.group;
-bobGroup = treekem.apply(bobGroup.secretState, changed.publicGroupMessage);
-const daveGroup = treekem.join(dave.secretKey, changed.publicWelcome[dave.publicKey]!);
+const joined = treekem.join(bob.secretKey, added.publicWelcome[bob.publicKey]!);
 
-// aliceGroup, bobGroup, and daveGroup now converge.
-// carolGroup cannot apply the removal update.
+const rotated = treekem.update(joined.secretState);
 
-treekem.destroy(
-    aliceGroup.secretState,
-    aliceGroup.secretKey,
-    bobGroup.secretState,
-    bobGroup.secretKey,
-    carolGroup.secretState,
-    carolGroup.secretKey,
-    daveGroup.secretState,
-    daveGroup.secretKey,
-);
+const applied = treekem.apply(added.group.secretState, rotated.publicGroupMessage);
+
+// rotated.group and applied now have the same secretKey and members.
 ```
 
 Every local group has exactly this shape:
@@ -107,7 +87,6 @@ An untrusted public server may persist and deliver only the public values:
 | ----------------------------- | ------------------- | ------------------------------------------ |
 | `keyPair().publicKey`         | Yes                 | Public admission material                  |
 | `group.members`               | Yes                 | Current stable member public keys          |
-| `create().publicWelcome[key]` | Yes, until consumed | Recipient-encrypted initial joining state  |
 | `update().publicGroupMessage` | Yes, until consumed | Signed update for existing members         |
 | `update().publicWelcome[key]` | Yes, until consumed | Recipient-encrypted joining state          |
 | `keyPair().secretKey`         | Never               | One-use admission secret                   |
@@ -134,9 +113,7 @@ versioned wire format. It is not an MLS wire implementation.
 ## API
 
 - `keyPair(): TreeKemKeyPair` creates a one-use string admission key pair.
-- `create(keyPair, publicKeys?): TreeKemUpdateResult` creates a group containing
-  the creator plus zero or more additional member public keys. It returns one
-  unique entry in `publicWelcome` for every additional member.
+- `create(keyPair): TreeKemGroup` creates a group containing only the creator.
 - `update(secretState, changes?): TreeKemUpdateResult` refreshes the sender path
   and atomically adds or removes zero or more members. Removals happen before
   additions. It returns the replacement local `group`, one
