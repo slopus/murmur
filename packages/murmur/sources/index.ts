@@ -88,7 +88,12 @@ export type {
     MurmurServiceRegistration,
     MurmurServiceSessionDescriptor,
 } from "./services/index.js";
-export { MurmurClient, MurmurResetRequiredError } from "./sessions/index.js";
+export {
+    MurmurCallbackError,
+    MurmurClient,
+    MurmurError,
+    MurmurResetRequiredError,
+} from "./sessions/index.js";
 export type {
     CreateMurmurSessionOptions,
     MurmurClientOptions,
@@ -103,6 +108,10 @@ export type {
     MurmurSessionPage,
     MurmurSessionPolicies,
     MurmurSessionChangedEvent,
+    MurmurEffectBlocked,
+    MurmurCallbackName,
+    MurmurErrorCode,
+    MurmurIssueRecovery,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,

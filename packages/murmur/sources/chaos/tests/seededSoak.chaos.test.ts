@@ -1954,8 +1954,8 @@ describe("seeded soak and refinement", () => {
                 status: "pending",
             });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             destroyIdentity(expiringSender);
             await relay.close();
         }

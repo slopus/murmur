@@ -88,6 +88,7 @@ import type {
     MurmurSynchronizeResult,
     MurmurUpdate,
 } from "../types.js";
+import { MurmurError } from "../types.js";
 import {
     decodeBootstrapFrame,
     decodeSessionControl,
@@ -145,9 +146,30 @@ const ADMISSION_BARRIER_PREFIX = "murmur/admission-barriers/";
 const EPOCH_OUTBOX_INDEX_PREFIX = "murmur/epoch-outboxes/";
 const POST_COMMIT_OUTBOX_INDEX_PREFIX = "murmur/post-commit-outboxes/";
 const APPLICATION_UPDATE_PREFIX = "murmur/application-updates/";
+const SERVICE_UPDATE_DELIVERED_PREFIX = "murmur/service-update-delivered/";
 const SESSION_DELETION_OUTBOX_PREFIX = "murmur/session-deletion-outboxes/";
 const SESSION_DELETED_EVENT_PREFIX = "murmur/session-deleted-events/";
 const SESSION_CHANGED_EVENT_PREFIX = "murmur/session-changed-events/";
+
+const AUTOMATIC_ISSUE_CODES = new Set([
+    "corrupt_application_update",
+    "corrupt_application_update_index",
+    "corrupt_membership_operation",
+    "corrupt_outbox",
+    "corrupt_service_update_receipt",
+    "corrupt_session_changed_event",
+    "corrupt_session_changed_event_index",
+    "corrupt_session_intent",
+    "corrupt_session_route",
+    "corrupt_session_state",
+    "orphaned_application_update_index",
+    "orphaned_session_changed_event",
+    "orphaned_session_changed_event_index",
+    "orphaned_session_route",
+    "refreshed_application_expiry",
+    "refreshed_bootstrap_expiry",
+    "refreshed_commit_expiry",
+]);
 const SESSION_CHANGED_EVENT_INDEX_PREFIX = "murmur/session-changed-event-index/";
 const SESSION_RETAINED_DESCRIPTOR_PREFIX = "murmur/session-retained-descriptors/";
 const RESET_READMISSION_PREFIX = "murmur/reset/v1/re-admissions/";
@@ -242,6 +264,10 @@ function bufferPrefix(id: Uint8Array): string {
 
 function applicationUpdateKey(eventId: string): string {
     return `${APPLICATION_UPDATE_PREFIX}${eventId}`;
+}
+
+function serviceUpdateDeliveredKey(eventId: string): string {
+    return `${SERVICE_UPDATE_DELIVERED_PREFIX}${eventId}`;
 }
 
 function sessionDeletionOutboxKey(deliveryId: string): string {
@@ -394,9 +420,12 @@ function decodeIssue(id: string, bytes: Uint8Array): MurmurSessionIssue {
     ) {
         throw new Error("Invalid session issue");
     }
+    const automatic = AUTOMATIC_ISSUE_CODES.has(input.code);
     return {
         id,
         code: input.code,
+        severity: automatic ? "warning" : "error",
+        recovery: automatic ? "automatic" : "inspect",
         ...(input.sessionId === null
             ? {}
             : { sessionId: decodeBase64Url(input.sessionId as string) }),
@@ -716,7 +745,7 @@ export class SessionEngine {
             this.#limits.maximumOutboxes < 1 ||
             this.#limits.maximumOutboxes > DEFAULT_MAXIMUM_OUTBOXES
         ) {
-            throw new Error("Invalid Murmur session limits");
+            throw new MurmurError("invalid_configuration", "Invalid Murmur session limits");
         }
         this.#inbox = new InboxProcessor(
             { identity, store, transport },
@@ -1072,14 +1101,17 @@ export class SessionEngine {
         operation?: (transaction: Context, id: Uint8Array) => Promise<void>,
     ): Promise<MurmurSession> {
         if (options.descriptor.length > 1024 * 1024) {
-            throw new Error("Session descriptor is too large");
+            throw new MurmurError("invalid_argument", "Session descriptor is too large");
         }
         const members = options.members;
         if (members.length < 1) {
-            throw new Error("A session requires at least two members");
+            throw new MurmurError("invalid_argument", "A session requires at least two members");
         }
         if (members.length + 1 > this.#limits.maximumMembersPerSession) {
-            throw new Error("Session membership exceeds the configured limit");
+            throw new MurmurError(
+                "resource_exhausted",
+                "Session membership exceeds the configured limit",
+            );
         }
         const memberIdentities = new Set<string>();
         for (const member of members) {
@@ -1088,14 +1120,14 @@ export class SessionEngine {
                 !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
                 !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity)
             ) {
-                throw new Error("Invalid session member KeyPackage");
+                throw new MurmurError("invalid_argument", "Invalid session member KeyPackage");
             }
             const identity = encodeBase64Url(member.identity);
             if (
                 equalBytes(member.identity, this.#identity.publicKey) ||
                 memberIdentities.has(identity)
             ) {
-                throw new Error("Session members must be distinct");
+                throw new MurmurError("invalid_argument", "Session members must be distinct");
             }
             memberIdentities.add(identity);
         }
@@ -1129,7 +1161,7 @@ export class SessionEngine {
                 const existingState = await this.#store.get(transaction, stateKey(id));
                 if (existingState !== undefined) {
                     zeroBytes(existingState);
-                    throw new Error("Session already exists");
+                    throw new MurmurError("already_exists", "Session already exists");
                 }
                 await this.#claimKeyPackages(transaction, members);
                 await setAndZero(
@@ -1198,7 +1230,7 @@ export class SessionEngine {
             limit > SESSION_LIST_LIMIT ||
             (options.after !== undefined && !/^[A-Za-z0-9_-]+$/.test(options.after))
         ) {
-            throw new Error("Invalid session-list options");
+            throw new MurmurError("invalid_argument", "Invalid session-list options");
         }
         const entries = await this.#store.scan(ctx, SESSION_STATE_PREFIX, {
             ...(options.after === undefined
@@ -1230,8 +1262,13 @@ export class SessionEngine {
 
     async activate(ctx: Context, id: Uint8Array): Promise<void> {
         await this.#store.tx(ctx, async (transaction) => {
+            await setAndZero(
+                this.#store,
+                transaction,
+                sessionOwnerKey(id),
+                encodeSessionOwner({ version: 1, owner: "account" }),
+            );
             await this.#activatePending(transaction, id);
-            await this.#deleteSessionChangedEvents(transaction, id);
             await this.#deleteRoutingMarkers(transaction, id);
         });
     }
@@ -1272,10 +1309,12 @@ export class SessionEngine {
     async ignore(ctx: Context, id: Uint8Array): Promise<void> {
         await this.#store.tx(ctx, async (transaction) => {
             const bytes = await this.#store.get(transaction, stateKey(id));
-            if (bytes === undefined) throw new Error("Unknown session");
+            if (bytes === undefined) throw new MurmurError("not_found", "Unknown session");
             const record = decodeSessionRecord(bytes);
             try {
-                if (record.status !== "pending") throw new Error("Session is not pending");
+                if (record.status !== "pending") {
+                    throw new MurmurError("invalid_state", "Session is not pending");
+                }
             } finally {
                 this.#zeroSessionRecord(record);
                 zeroBytes(bytes);
@@ -1288,7 +1327,7 @@ export class SessionEngine {
     async abandon(ctx: Context, id: Uint8Array): Promise<void> {
         await this.#store.tx(ctx, async (transaction) => {
             const bytes = await this.#store.get(transaction, stateKey(id));
-            if (bytes === undefined) throw new Error("Unknown session");
+            if (bytes === undefined) throw new MurmurError("not_found", "Unknown session");
             const record = decodeSessionRecord(bytes);
             const barrier = await this.#store.get(transaction, admissionBarrierKey(id));
             try {
@@ -1298,7 +1337,10 @@ export class SessionEngine {
                     barrier === undefined &&
                     (await this.#readyBootstrapParentForSession(transaction, id)) === undefined
                 ) {
-                    throw new Error("Session has no blocked membership operation");
+                    throw new MurmurError(
+                        "invalid_state",
+                        "Session has no blocked membership operation",
+                    );
                 }
             } finally {
                 this.#zeroSessionRecord(record);
@@ -1314,23 +1356,34 @@ export class SessionEngine {
     async delete(ctx: Context, id: Uint8Array): Promise<string> {
         return this.#store.tx(ctx, async (transaction) => {
             const stateBytes = await this.#store.get(transaction, stateKey(id));
-            if (stateBytes === undefined) throw new Error("Unknown active session");
+            if (stateBytes === undefined) {
+                throw new MurmurError("not_found", "Unknown active session");
+            }
             const record = decodeSessionRecord(stateBytes);
             let outboxBytes: Uint8Array | undefined;
             let requestBody: Uint8Array | undefined;
             try {
                 if (!equalBytes(record.roles.owner, this.#accountKey)) {
-                    throw new Error("Only the session owner may delete the session");
+                    throw new MurmurError(
+                        "permission_denied",
+                        "Only the session owner may delete the session",
+                    );
                 }
                 if (this.#transport.deleteSession === undefined) {
-                    throw new Error("Delivery transport does not support session deletion");
+                    throw new MurmurError(
+                        "unsupported",
+                        "Delivery transport does not support session deletion",
+                    );
                 }
                 if (
                     record.status !== "active" ||
                     record.stagedCommitId !== undefined ||
                     (await this.#readyBootstrapParentForSession(transaction, id)) !== undefined
                 ) {
-                    throw new Error("Session deletion requires an idle active session");
+                    throw new MurmurError(
+                        "busy",
+                        "Session deletion requires an idle active session",
+                    );
                 }
                 const owner = await this.#sessionOwner(transaction, id);
                 const noticeId = await this.#queuePrivate(
@@ -1495,6 +1548,12 @@ export class SessionEngine {
                         key !== applicationUpdateKey(eventId)
                     ) {
                         await this.#store.delete(transaction, key);
+                        if (RELAY_EVENT_ID.test(eventId)) {
+                            await this.#store.delete(
+                                transaction,
+                                serviceUpdateDeliveredKey(eventId),
+                            );
+                        }
                         await this.#quarantine(
                             transaction,
                             RELAY_EVENT_ID.test(eventId) ? eventId : "application-update-index",
@@ -1510,6 +1569,7 @@ export class SessionEngine {
                     );
                     if (bufferedBytes === undefined) {
                         await this.#store.delete(transaction, key);
+                        await this.#store.delete(transaction, serviceUpdateDeliveredKey(eventId));
                         await this.#quarantine(
                             transaction,
                             eventId,
@@ -1710,6 +1770,8 @@ export class SessionEngine {
                                     recordKey,
                                     encodeSessionChangedEvent(event),
                                 );
+                            } else if (owner?.owner === "account") {
+                                // Application-owned lifecycle records intentionally omit serviceId.
                             } else if (
                                 candidates.some(
                                     (other) =>
@@ -1773,7 +1835,7 @@ export class SessionEngine {
                             key: recordKey,
                             indexKey: candidate.key,
                             id: event.id,
-                            service: event.serviceId!,
+                            ...(event.serviceId === undefined ? {} : { service: event.serviceId }),
                             sessionId: event.sessionId,
                             status: event.status,
                             descriptor: descriptor!,
@@ -1808,6 +1870,10 @@ export class SessionEngine {
                                 `${bufferPrefix(candidate.sessionId)}${candidate.eventId}`,
                             );
                             await this.#store.delete(transaction, candidate.key);
+                            await this.#store.delete(
+                                transaction,
+                                serviceUpdateDeliveredKey(candidate.eventId),
+                            );
                             await this.#quarantine(
                                 transaction,
                                 candidate.eventId,
@@ -1879,6 +1945,51 @@ export class SessionEngine {
         });
     }
 
+    async serviceUpdateDelivered(ctx: Context, eventId: string): Promise<boolean> {
+        return this.#store.tx(ctx, async (transaction) => {
+            const bytes = await this.#store.get(transaction, serviceUpdateDeliveredKey(eventId));
+            if (bytes === undefined) return false;
+            try {
+                if (bytes.length === 0) return true;
+                const sessionIdValue = await this.#store.get(
+                    transaction,
+                    applicationUpdateKey(eventId),
+                );
+                try {
+                    await this.#store.delete(transaction, serviceUpdateDeliveredKey(eventId));
+                    await this.#quarantine(
+                        transaction,
+                        eventId,
+                        "corrupt_service_update_receipt",
+                        sessionIdValue?.length === 32 ? sessionIdValue : undefined,
+                        "application",
+                    );
+                } finally {
+                    if (sessionIdValue !== undefined) zeroBytes(sessionIdValue);
+                }
+                return false;
+            } finally {
+                zeroBytes(bytes);
+            }
+        });
+    }
+
+    async markServiceUpdateDelivered(ctx: Context, eventId: string): Promise<void> {
+        await this.#store.tx(ctx, async (transaction) => {
+            const indexedSession = await this.#store.get(
+                transaction,
+                applicationUpdateKey(eventId),
+            );
+            if (indexedSession === undefined) return;
+            zeroBytes(indexedSession);
+            await this.#store.set(
+                transaction,
+                serviceUpdateDeliveredKey(eventId),
+                new Uint8Array(),
+            );
+        });
+    }
+
     async commitUpdates(
         ctx: Context,
         prepared: PreparedUpdates,
@@ -1938,6 +2049,10 @@ export class SessionEngine {
                         const bufferedBytes = await this.#store.get(transaction, bufferedKey);
                         if (bufferedBytes === undefined) {
                             await this.#store.delete(transaction, key);
+                            await this.#store.delete(
+                                transaction,
+                                serviceUpdateDeliveredKey(eventId),
+                            );
                             continue;
                         }
                         let buffered: ReturnType<typeof decodeBufferedEvent> | undefined;
@@ -1955,6 +2070,10 @@ export class SessionEngine {
                             changes.set(encodedId, change);
                             await this.#store.delete(transaction, bufferedKey);
                             await this.#store.delete(transaction, key);
+                            await this.#store.delete(
+                                transaction,
+                                serviceUpdateDeliveredKey(eventId),
+                            );
                         } finally {
                             if (buffered !== undefined) {
                                 zeroBytes(buffered.sender);
@@ -2036,22 +2155,29 @@ export class SessionEngine {
             !verifyMlsKeyPackage(member.keyPackage, Math.floor(this.#now() / 1_000)) ||
             !equalBytes(member.keyPackage.leafNode.signatureKey, member.identity)
         ) {
-            throw new Error("Invalid Add KeyPackage");
+            throw new MurmurError("invalid_argument", "Invalid Add KeyPackage");
         }
         const account = keyPackageAccount(member.keyPackage);
         const encodedKeyPackage = encodeMlsKeyPackage(member.keyPackage);
         await this.#store.tx(ctx, async (transaction) => {
             const stateBytes = await this.#store.get(transaction, stateKey(id));
-            if (stateBytes === undefined) throw new Error("Unknown active session");
+            if (stateBytes === undefined) {
+                throw new MurmurError("not_found", "Unknown active session");
+            }
             const record = decodeSessionRecord(stateBytes);
             const epoch = restoreEpoch(this.#identity, record);
             try {
-                if (record.status !== "active") throw new Error("Unknown active session");
+                if (record.status !== "active") {
+                    throw new MurmurError("not_found", "Unknown active session");
+                }
                 if (
                     !isSessionAdmin(record.roles, this.#accountKey) &&
                     !record.roles.anyoneCanAddMembers
                 ) {
-                    throw new Error("The local account may not add session members");
+                    throw new MurmurError(
+                        "permission_denied",
+                        "The local account may not add session members",
+                    );
                 }
                 await this.#claimKeyPackages(transaction, [member]);
                 await operation?.(transaction);
@@ -2094,36 +2220,54 @@ export class SessionEngine {
         ctx: Context,
         id: Uint8Array,
         policies: {
-            readonly adminsAssignAdmins: boolean;
-            readonly anyoneCanAddMembers: boolean;
+            readonly adminsAssignAdmins?: boolean;
+            readonly anyoneCanAddMembers?: boolean;
             readonly sendPolicy?: "everyone" | "admins";
         },
     ): Promise<void> {
         if (
-            typeof policies.adminsAssignAdmins !== "boolean" ||
-            typeof policies.anyoneCanAddMembers !== "boolean" ||
+            (policies.adminsAssignAdmins !== undefined &&
+                typeof policies.adminsAssignAdmins !== "boolean") ||
+            (policies.anyoneCanAddMembers !== undefined &&
+                typeof policies.anyoneCanAddMembers !== "boolean") ||
             (policies.sendPolicy !== undefined &&
                 policies.sendPolicy !== "everyone" &&
                 policies.sendPolicy !== "admins")
         ) {
-            throw new Error("Invalid session policies");
+            throw new MurmurError("invalid_argument", "Invalid session policies");
+        }
+        if (
+            policies.adminsAssignAdmins === undefined &&
+            policies.anyoneCanAddMembers === undefined &&
+            policies.sendPolicy === undefined
+        ) {
+            throw new MurmurError("invalid_argument", "Session policy change is empty");
         }
         await this.#store.tx(ctx, async (transaction) => {
             const stateBytes = await this.#store.get(transaction, stateKey(id));
-            if (stateBytes === undefined) throw new Error("Unknown active session");
+            if (stateBytes === undefined) {
+                throw new MurmurError("not_found", "Unknown active session");
+            }
             const record = decodeSessionRecord(stateBytes);
             const epoch = restoreEpoch(this.#identity, record);
             try {
-                if (record.status !== "active") throw new Error("Unknown active session");
+                if (record.status !== "active") {
+                    throw new MurmurError("not_found", "Unknown active session");
+                }
                 if (!equalBytes(record.roles.owner, this.#accountKey)) {
-                    throw new Error("Only the session owner may change policies");
+                    throw new MurmurError(
+                        "permission_denied",
+                        "Only the session owner may change policies",
+                    );
                 }
                 await this.#queueSessionIntent(transaction, {
                     version: 1,
                     kind: "set_policies",
                     sessionId: id.slice(),
-                    adminsAssignAdmins: policies.adminsAssignAdmins,
-                    anyoneCanAddMembers: policies.anyoneCanAddMembers,
+                    adminsAssignAdmins:
+                        policies.adminsAssignAdmins ?? record.roles.adminsAssignAdmins,
+                    anyoneCanAddMembers:
+                        policies.anyoneCanAddMembers ?? record.roles.anyoneCanAddMembers,
                     sendPolicy: policies.sendPolicy ?? record.roles.sendPolicy,
                 });
             } finally {
@@ -2140,36 +2284,67 @@ export class SessionEngine {
         kind: "remove" | "grant_admin" | "revoke_admin" | "leave",
         account: Uint8Array,
     ): Promise<void> {
-        if (account.length !== 32) throw new Error("Invalid session account");
+        if (account.length !== 32) {
+            throw new MurmurError("invalid_argument", "Invalid session account");
+        }
         await this.#store.tx(ctx, async (transaction) => {
             const stateBytes = await this.#store.get(transaction, stateKey(id));
-            if (stateBytes === undefined) throw new Error("Unknown active session");
+            if (stateBytes === undefined) {
+                throw new MurmurError("not_found", "Unknown active session");
+            }
             const record = decodeSessionRecord(stateBytes);
             const epoch = restoreEpoch(this.#identity, record);
             try {
-                if (record.status !== "active") throw new Error("Unknown active session");
+                if (record.status !== "active") {
+                    throw new MurmurError("not_found", "Unknown active session");
+                }
                 const owner = equalBytes(record.roles.owner, this.#accountKey);
                 const admin = isSessionAdmin(record.roles, this.#accountKey);
                 if (kind === "remove") {
                     if (equalBytes(account, record.roles.owner)) {
-                        throw new Error("The session owner cannot be removed");
+                        throw new MurmurError(
+                            "permission_denied",
+                            "The session owner cannot be removed",
+                        );
                     }
                     if (!equalBytes(account, this.#accountKey) && !admin) {
-                        throw new Error("Only an admin may remove another account");
+                        throw new MurmurError(
+                            "permission_denied",
+                            "Only an admin may remove another account",
+                        );
                     }
                 } else if (kind === "leave") {
-                    if (owner) throw new Error("The session owner cannot leave");
+                    if (owner) {
+                        throw new MurmurError(
+                            "permission_denied",
+                            "The session owner cannot leave",
+                        );
+                    }
                 } else if (kind === "grant_admin") {
                     if (!owner && !(admin && record.roles.adminsAssignAdmins)) {
-                        throw new Error("The local account may not grant admin");
+                        throw new MurmurError(
+                            "permission_denied",
+                            "The local account may not grant admin",
+                        );
                     }
                     if (accountLeaves(epoch, account).length === 0) {
-                        throw new Error("An admin must be a current session member");
+                        throw new MurmurError(
+                            "invalid_argument",
+                            "An admin must be a current session member",
+                        );
                     }
                 } else {
-                    if (!owner) throw new Error("Only the session owner may revoke admin");
+                    if (!owner) {
+                        throw new MurmurError(
+                            "permission_denied",
+                            "Only the session owner may revoke admin",
+                        );
+                    }
                     if (equalBytes(account, record.roles.owner)) {
-                        throw new Error("The session owner cannot be demoted");
+                        throw new MurmurError(
+                            "permission_denied",
+                            "The session owner cannot be demoted",
+                        );
                     }
                 }
                 await this.#queueSessionIntent(transaction, {
@@ -2191,7 +2366,7 @@ export class SessionEngine {
             limit: MAXIMUM_SESSION_INTENTS,
         });
         if (current.size >= MAXIMUM_SESSION_INTENTS) {
-            throw new Error("Session intent capacity exceeded");
+            throw new MurmurError("resource_exhausted", "Session intent capacity exceeded");
         }
         const id = encodeBase64Url(randomBytes(24));
         await setAndZero(this.#store, transaction, intentKey(id), encodeSessionIntent(intent));
@@ -2777,10 +2952,13 @@ export class SessionEngine {
                     })
                 ).size >= this.#limits.maximumOutboxes
             ) {
-                throw new Error("Local session outbox capacity exceeded");
+                throw new MurmurError(
+                    "resource_exhausted",
+                    "Local session outbox capacity exceeded",
+                );
             }
             const bytes = await this.#store.get(transaction, stateKey(id));
-            if (bytes === undefined) throw new Error("Unknown session");
+            if (bytes === undefined) throw new MurmurError("not_found", "Unknown session");
             const record = decodeSessionRecord(bytes);
             let parentCommitId: string | undefined;
             let parentBytes: Uint8Array | undefined;
@@ -2789,7 +2967,9 @@ export class SessionEngine {
             let applicationData: Uint8Array | undefined;
             let checkpoint: Uint8Array | undefined;
             try {
-                if (record.status === "removed") throw new Error("Unknown session");
+                if (record.status === "removed") {
+                    throw new MurmurError("not_found", "Unknown session");
+                }
                 if (record.stagedCommitId === undefined) {
                     if (record.status === "creating") {
                         throw new Error("Creating session is missing its staged epoch");
@@ -2827,11 +3007,17 @@ export class SessionEngine {
                     roles.sendPolicy === "admins" &&
                     !isSessionAdmin(roles, this.#accountKey)
                 ) {
-                    throw new Error("The local account may not send session events");
+                    throw new MurmurError(
+                        "permission_denied",
+                        "The local account may not send session events",
+                    );
                 }
                 const members = activeMembers(epoch);
                 if (members.length > this.#limits.maximumMembersPerSession) {
-                    throw new Error("Session exceeds the configured member limit");
+                    throw new MurmurError(
+                        "resource_exhausted",
+                        "Session exceeds the configured member limit",
+                    );
                 }
                 if (
                     frame.type === "application" &&
@@ -2843,13 +3029,19 @@ export class SessionEngine {
                                     512,
                             ))
                 ) {
-                    throw new Error("Session application payload exceeds the configured limit");
+                    throw new MurmurError(
+                        "resource_exhausted",
+                        "Session application payload exceeds the configured limit",
+                    );
                 }
                 applicationData = encodePrivateFrame(frame);
                 const message = epoch.seal(applicationData);
                 const ciphertext = encodePrivateCiphertext(message);
                 if (ciphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
-                    throw new Error("Session delivery exceeds the configured ciphertext limit");
+                    throw new MurmurError(
+                        "resource_exhausted",
+                        "Session delivery exceeds the configured ciphertext limit",
+                    );
                 }
                 const now = this.#now();
                 const direct = frame.type === "delete";
@@ -3098,13 +3290,13 @@ export class SessionEngine {
     ): Promise<void> {
         const prepare = async (transaction: Context): Promise<void> => {
             const bytes = await this.#store.get(transaction, stateKey(id));
-            if (bytes === undefined) throw new Error("Unknown session");
+            if (bytes === undefined) throw new MurmurError("not_found", "Unknown session");
             const record = decodeSessionRecord(bytes);
             if (
                 (record.status !== "active" && record.status !== "creating") ||
                 record.stagedCommitId !== undefined
             ) {
-                throw new Error("Only an idle session may create a Commit");
+                throw new MurmurError("busy", "Only an idle session may create a Commit");
             }
             const epoch = restoreEpoch(this.#identity, record);
             let transition: ReturnType<MlsEpochState["prepareCommit"]> | undefined;
@@ -3123,14 +3315,20 @@ export class SessionEngine {
                     ) ||
                     removalIds.some((identity) => !memberIds.has(identity))
                 ) {
-                    throw new Error("Invalid or conflicting session membership change");
+                    throw new MurmurError(
+                        "invalid_argument",
+                        "Invalid or conflicting session membership change",
+                    );
                 }
                 const projectedMembers = members.length + additions.length - removals.length;
                 if (
                     projectedMembers < 1 ||
                     projectedMembers > this.#limits.maximumMembersPerSession
                 ) {
-                    throw new Error("Session membership exceeds the configured limit");
+                    throw new MurmurError(
+                        "resource_exhausted",
+                        "Session membership exceeds the configured limit",
+                    );
                 }
                 const requiredOutboxes = 1 + additions.length + (additions.length > 0 ? 1 : 0);
                 const outboxCount = (
@@ -3139,7 +3337,10 @@ export class SessionEngine {
                     })
                 ).size;
                 if (outboxCount > this.#limits.maximumOutboxes - requiredOutboxes) {
-                    throw new Error("Local session outbox capacity exceeded");
+                    throw new MurmurError(
+                        "resource_exhausted",
+                        "Local session outbox capacity exceeded",
+                    );
                 }
                 const proposals: MlsEpochCommitProposal[] = [
                     ...additions.map(
@@ -3175,7 +3376,7 @@ export class SessionEngine {
                         now,
                     ))
                 ) {
-                    throw new Error("Unauthorized session Commit");
+                    throw new MurmurError("permission_denied", "Unauthorized session Commit");
                 }
                 const commitCiphertext = sealCommitCiphertext(commitKey, {
                     version: 1,
@@ -3185,7 +3386,10 @@ export class SessionEngine {
                     roles: nextRoles,
                 });
                 if (commitCiphertext.length > this.#limits.maximumDeliveryCiphertextBytes) {
-                    throw new Error("Session Commit exceeds the configured ciphertext limit");
+                    throw new MurmurError(
+                        "resource_exhausted",
+                        "Session Commit exceeds the configured ciphertext limit",
+                    );
                 }
                 stagedCheckpoint = transition.transition.serialize();
                 const preview = MlsEpochState.deserialize(stagedCheckpoint, {
@@ -4298,7 +4502,7 @@ export class SessionEngine {
             } catch (error: unknown) {
                 if (error instanceof MlsLocalMemberRemovedError) {
                     const owner = await this.#sessionOwner(transaction, frame.groupId);
-                    if (owner?.owner === "service") {
+                    if (owner?.owner === "service" || owner?.owner === "account") {
                         await this.#store.set(
                             transaction,
                             sessionRetainedDescriptorKey(frame.groupId),
@@ -4312,7 +4516,7 @@ export class SessionEngine {
                             { ...record, roles: frame.roles },
                             expectedMembers!,
                             "removed",
-                            owner.serviceId,
+                            owner.owner === "service" ? owner.serviceId : undefined,
                         );
                     } else {
                         await this.#deleteSession(transaction, frame.groupId);
@@ -4700,7 +4904,13 @@ export class SessionEngine {
                 : undefined;
         const resolvedServiceId =
             serviceId ?? (owner?.owner === "service" ? owner.serviceId : undefined);
-        if (resolvedServiceId === undefined && record.status !== "pending") return;
+        if (
+            resolvedServiceId === undefined &&
+            owner?.owner !== "account" &&
+            record.status !== "pending"
+        ) {
+            return;
+        }
         if (members.length < 1 || members.length > this.#limits.maximumMembersPerSession) {
             await this.#quarantine(
                 transaction,
@@ -4822,10 +5032,12 @@ export class SessionEngine {
 
     async #activatePending(transaction: Context, id: Uint8Array): Promise<void> {
         const stateBytes = await this.#store.get(transaction, stateKey(id));
-        if (stateBytes === undefined) throw new Error("Unknown session");
+        if (stateBytes === undefined) throw new MurmurError("not_found", "Unknown session");
         const record = decodeSessionRecord(stateBytes);
         try {
-            if (record.status !== "pending") throw new Error("Session is not pending");
+            if (record.status !== "pending") {
+                throw new MurmurError("invalid_state", "Session is not pending");
+            }
             await this.#store.delete(transaction, pendingKey(id));
             if (record.bootstrapKeyPackageReference !== undefined) {
                 const reusable = await this.#store.get(
@@ -4928,6 +5140,7 @@ export class SessionEngine {
                 } catch {
                     await this.#store.delete(transaction, key);
                     await this.#store.delete(transaction, applicationUpdateKey(eventId));
+                    await this.#store.delete(transaction, serviceUpdateDeliveredKey(eventId));
                     await this.#quarantine(
                         transaction,
                         RELAY_EVENT_ID.test(eventId) ? eventId : "application-update",
@@ -4943,6 +5156,7 @@ export class SessionEngine {
                 ) {
                     await this.#store.delete(transaction, key);
                     await this.#store.delete(transaction, applicationUpdateKey(eventId));
+                    await this.#store.delete(transaction, serviceUpdateDeliveredKey(eventId));
                     await this.#quarantine(
                         transaction,
                         RELAY_EVENT_ID.test(eventId) ? eventId : "application-update",
@@ -6219,10 +6433,9 @@ export class SessionEngine {
             if (page.size === 0) break;
             for (const [key, value] of page) {
                 bufferedAfter = key;
-                await this.#store.delete(
-                    transaction,
-                    applicationUpdateKey(key.slice(bufferedPrefix.length)),
-                );
+                const eventId = key.slice(bufferedPrefix.length);
+                await this.#store.delete(transaction, applicationUpdateKey(eventId));
+                await this.#store.delete(transaction, serviceUpdateDeliveredKey(eventId));
                 zeroBytes(value);
             }
             if (page.size < OUTBOX_SCAN_ITEMS) break;

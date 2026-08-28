@@ -633,9 +633,9 @@ async function runLiveIntentCapacity(
             recoveredMembers,
         });
     } finally {
-        alice.close(ctx);
-        bob.close(ctx);
-        carol.close(ctx);
+        alice.close();
+        bob.close();
+        carol.close();
         await relay.close();
     }
 }
@@ -749,8 +749,8 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
             followUp: Object.freeze(followUp.slice()),
         });
     } finally {
-        alice.close(ctx);
-        bob.close(ctx);
+        alice.close();
+        bob.close();
         await relay.close();
     }
 }
@@ -826,7 +826,7 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
             acknowledgedPage.acknowledgedThrough === queuedCursor;
         zeroBytes(acknowledgedPage.generation);
 
-        bob.close(ctx);
+        bob.close();
         constrained.restoreCapacity();
         bob = await relayClient(relay, constrained);
         await bob.synchronize(
@@ -854,8 +854,8 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
             relayAcknowledgedBeforeDrain,
         });
     } finally {
-        alice.close(ctx);
-        bob.close(ctx);
+        alice.close();
+        bob.close();
         await relay.close();
     }
 }
@@ -891,10 +891,10 @@ async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorrupti
 
         const corruptedId = await alice.send(ctx, session.id, utf8Encode(`corrupt-${label}`));
         const outboxKey = `${OUTBOX_PREFIX}${corruptedId}`;
-        alice.close(ctx);
+        alice.close();
         aliceStore.clientClosed();
         aliceOpen = false;
-        bob.close(ctx);
+        bob.close();
         const original = await aliceStore.snapshotExact(outboxKey);
         const operator = random.oneIn(2) ? "flip" : "truncate";
         let offset: number;
@@ -937,9 +937,9 @@ async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorrupti
             recoveredDeliveries: Object.freeze(recoveredDeliveries.slice()),
         });
     } finally {
-        alice.close(ctx);
+        alice.close();
         if (aliceOpen) aliceStore.clientClosed();
-        bob.close(ctx);
+        bob.close();
         await relay.close();
     }
 }
@@ -1097,15 +1097,15 @@ describe("storage corruption and capacity chaos", () => {
                 await bob.synchronize(ctx, { waitMilliseconds: 0 });
             }
             expect(await prefixCount(aliceBaseline, OUTBOX_PREFIX)).toBe(0);
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
 
             const calibrationDelegate = await cloneMemoryStore(aliceBaseline);
             const calibrationStore = new CapacityMurmurStore(calibrationDelegate, {});
             const calibrationClient = await relayClient(relay, calibrationStore);
             await calibrationClient.send(ctx, session.id, utf8Encode("calibration"));
             const sendWrites = calibrationStore.writeOrdinal;
-            calibrationClient.close(ctx);
+            calibrationClient.close();
             expect(sendWrites).toBeGreaterThan(0);
             expect(sendWrites).toBeLessThanOrEqual(20);
 
@@ -1140,12 +1140,12 @@ describe("storage corruption and capacity chaos", () => {
                 expect(followUp).toEqual([`follow-up-${nth}`]);
                 await copyDeliveryProgress(aliceDelegate, aliceBaseline);
                 await copyDeliveryProgress(bobDelegate, bobBaseline);
-                alice.close(ctx);
-                bob.close(ctx);
+                alice.close();
+                bob.close();
             }
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     }, 120_000);
@@ -1405,10 +1405,10 @@ describe("storage corruption and capacity chaos", () => {
             await carol.synchronize(ctx);
             await activate(carol, healthy.id);
 
-            alice.close(ctx);
+            alice.close();
             aliceStore.clientClosed();
-            bob.close(ctx);
-            carol.close(ctx);
+            bob.close();
+            carol.close();
             const damagedKey = `${SESSION_STATE_PREFIX}${encodeBase64Url(damaged.id)}`;
             const selected = await aliceStore.snapshotExact(damagedKey);
             await aliceStore.truncateExact(damagedKey, 3);
@@ -1448,7 +1448,7 @@ describe("storage corruption and capacity chaos", () => {
                 (await aliceStore.scan(ctx, "murmur/session-quarantine/", { limit: 20 })).size,
             ).toBeLessThanOrEqual(1);
         } finally {
-            alice.close(ctx);
+            alice.close();
             if (aliceStore.trace.length > 0) {
                 try {
                     aliceStore.clientClosed();
@@ -1456,8 +1456,8 @@ describe("storage corruption and capacity chaos", () => {
                     // The mutation guard itself verifies balanced lifecycle transitions.
                 }
             }
-            bob.close(ctx);
-            carol.close(ctx);
+            bob.close();
+            carol.close();
             await relay.close();
         }
     }, 120_000);
@@ -1484,7 +1484,7 @@ describe("storage corruption and capacity chaos", () => {
         let client = await MurmurClient.open(ctx, { store: fixture, transport, now: () => NOW });
         fixture.clientOpened();
         const publicIdentity = client.identity;
-        client.close(ctx);
+        client.close();
         fixture.clientClosed();
         const original = await fixture.snapshotExact(IDENTITY_KEY);
         const mutationCases: readonly ((store: InspectableStoreFixture) => Promise<void>)[] = [
@@ -1513,7 +1513,7 @@ describe("storage corruption and capacity chaos", () => {
         await expect(fixture.flipExact(IDENTITY_KEY, 0)).rejects.toThrow(
             "requires every store client to be closed",
         );
-        client.close(ctx);
+        client.close();
         fixture.clientClosed();
 
         const sentinel = utf8Encode("ST-08 sentinel secret plaintext");

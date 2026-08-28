@@ -16,7 +16,14 @@ import {
 } from "../../crypto/index.js";
 import { MemoryMurmurStore, type MurmurStore } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
-import { MurmurClient, type MurmurSessionLimits, type MurmurUpdate } from "../index.js";
+import {
+    MurmurClient,
+    MurmurError,
+    type MurmurEffectBlocked,
+    type MurmurSessionChangedEvent,
+    type MurmurSessionLimits,
+    type MurmurUpdate,
+} from "../index.js";
 import { decodeSessionRecord, encodeSessionRecord } from "../impl/sessionRecords.js";
 
 const ctx = createRootContext().named("test");
@@ -110,7 +117,7 @@ describe("stateful MLS sessions", () => {
         } finally {
             controller.abort();
             await realtime;
-            value.close(ctx);
+            value.close();
             await relay.close();
         }
     });
@@ -158,7 +165,174 @@ describe("stateful MLS sessions", () => {
             expect(() => value.identity).toThrow("closed");
             await expect(value.sessions(ctx)).rejects.toThrow("closed");
         } finally {
-            value.close(ctx);
+            value.close();
+            await relay.close();
+        }
+    });
+
+    test("reports application-owned lifecycle and applies fully partial policies", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const alice = await client(relay);
+        const bob = await client(relay);
+        const events: MurmurSessionChangedEvent[] = [];
+        try {
+            const session = await alice.createSession(ctx, {
+                descriptor: utf8Encode("application lifecycle"),
+                members: [await bob.createKeyPackage(ctx)],
+                adminsAssignAdmins: true,
+                anyoneCanAddMembers: true,
+            });
+            await alice.synchronize(
+                ctx,
+                {},
+                {
+                    onSessionsChanged: async (_ctx, changed) => {
+                        events.push(...changed);
+                    },
+                },
+            );
+            expect(events).toHaveLength(1);
+            expect(events[0]).toMatchObject({
+                sessionId: session.id,
+                status: "active",
+            });
+            expect(events[0]?.service).toBeUndefined();
+
+            const blockedEffects: MurmurEffectBlocked[] = [];
+            const route = await bob.synchronize(
+                ctx,
+                { waitMilliseconds: 0 },
+                {
+                    onEffectBlocked: async (_ctx, blocked) => {
+                        blockedEffects.push(blocked);
+                    },
+                },
+            );
+            expect(route.blocked).toMatchObject({
+                reason: "unresolved_route",
+                sessionId: session.id,
+            });
+            expect(blockedEffects).toEqual([route.blocked]);
+            await bob.activateSession(ctx, session.id);
+            const remoteEvents: MurmurSessionChangedEvent[] = [];
+            await bob.synchronize(
+                ctx,
+                { waitMilliseconds: 0 },
+                {
+                    onSessionsChanged: async (_ctx, changed) => {
+                        remoteEvents.push(...changed);
+                    },
+                },
+            );
+            expect(remoteEvents).toHaveLength(1);
+            expect(remoteEvents[0]).toMatchObject({
+                id: route.blocked?.id,
+                sessionId: session.id,
+                status: "active",
+            });
+            expect(remoteEvents[0]?.service).toBeUndefined();
+
+            await alice.setPolicies(ctx, session.id, { anyoneCanAddMembers: false });
+            await alice.synchronize(
+                ctx,
+                {},
+                {
+                    onSessionsChanged: async (_ctx, changed) => {
+                        events.push(...changed);
+                    },
+                },
+            );
+            await alice.synchronize(
+                ctx,
+                {},
+                {
+                    onSessionsChanged: async (_ctx, changed) => {
+                        events.push(...changed);
+                    },
+                },
+            );
+            expect(events).toHaveLength(2);
+            expect(events[1]?.policies).toEqual({
+                adminsAssignAdmins: true,
+                anyoneCanAddMembers: false,
+                sendPolicy: "everyone",
+            });
+            await expect(alice.setPolicies(ctx, session.id, {})).rejects.toMatchObject({
+                code: "invalid_argument",
+            });
+        } finally {
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
+    test("opens offline, wraps its generated account, and exposes typed failures", async () => {
+        let transportCalls = 0;
+        const transport: DeliveryTransport = {
+            publish: async () => {
+                transportCalls += 1;
+                throw new Error("offline");
+            },
+            read: async () => {
+                transportCalls += 1;
+                throw new Error("offline");
+            },
+            acknowledge: async () => {
+                transportCalls += 1;
+                throw new Error("offline");
+            },
+            readDeviceRoster: async () => {
+                transportCalls += 1;
+                throw new Error("offline");
+            },
+        };
+        const value = await MurmurClient.open(ctx, {
+            transport,
+            store: new MemoryMurmurStore(),
+            connection: "deferred",
+        });
+        const identity = value.identity;
+        try {
+            expect(transportCalls).toBe(0);
+            expect(await value.sessions(ctx)).toEqual({ sessions: [], cursor: null });
+            const secret = await value.createAccountSecret("correct horse battery staple");
+            expect(secret.blob).not.toBe("");
+            expect(secret.generatedSecret).not.toBe("");
+            expect(value.identity).toEqual(identity);
+            await expect(value.setPolicies(ctx, new Uint8Array(32), {})).rejects.toSatisfy(
+                (error: unknown) =>
+                    error instanceof MurmurError && error.code === "invalid_argument",
+            );
+            expect(transportCalls).toBe(0);
+        } finally {
+            value.close();
+        }
+    });
+
+    test("gracefully disposes a persistent synchronization loop", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const value = await client(relay);
+        let reportConnected!: () => void;
+        const connected = new Promise<void>((resolve) => {
+            reportConnected = resolve;
+        });
+        const syncing = value.sync(ctx, {
+            onConnected: async () => {
+                await expect(value.dispose()).rejects.toMatchObject({
+                    code: "invalid_state",
+                });
+                reportConnected();
+            },
+        });
+        try {
+            await connected;
+            await new Promise<void>((resolve) => setTimeout(resolve, 0));
+            await value.dispose();
+            await expect(syncing).resolves.toBeUndefined();
+            expect(() => value.deviceKey).toThrow("closed");
+        } finally {
+            await value.dispose();
             await relay.close();
         }
     });
@@ -215,7 +389,7 @@ describe("stateful MLS sessions", () => {
             ).toBe(3);
 
             const aliceIdentity = alice.deviceKey;
-            alice.close(ctx);
+            alice.close();
             alice = await MurmurClient.open(ctx, {
                 transport: recording,
                 store: aliceStore,
@@ -262,8 +436,8 @@ describe("stateful MLS sessions", () => {
             ).toBe(2);
             expect(received).toEqual(["first offline", "second offline"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -375,8 +549,8 @@ describe("stateful MLS sessions", () => {
                     (value): value is Promise<void> => value !== undefined,
                 ),
             );
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -429,8 +603,8 @@ describe("stateful MLS sessions", () => {
             expect(await bob.session(ctx, first.id)).toMatchObject({ bufferedEvents: 0 });
             expect(await bob.session(ctx, second.id)).toMatchObject({ bufferedEvents: 0 });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -482,8 +656,8 @@ describe("stateful MLS sessions", () => {
             expect(received).toEqual(["from pending", "hello"]);
             expect(utf8Decode((await bobStore.get(ctx, "application/last"))!)).toBe("hello");
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -493,12 +667,12 @@ describe("stateful MLS sessions", () => {
         const store = new MemoryMurmurStore();
         const first = await client(relay, store);
         const identity = first.identity;
-        first.close(ctx);
+        first.close();
         const reopened = await client(relay, store);
         try {
             expect(reopened.identity).toEqual(identity);
         } finally {
-            reopened.close(ctx);
+            reopened.close();
             await relay.close();
         }
     });
@@ -641,9 +815,9 @@ describe("stateful MLS sessions", () => {
             expect(await carol.session(ctx, session.id)).toBeUndefined();
             expect((await alice.session(ctx, session.id))?.owner).toEqual(alice.identity);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     }, 120_000);
@@ -705,10 +879,10 @@ describe("stateful MLS sessions", () => {
             expect(await alice.issues(ctx)).toEqual([]);
             expect(await carol.issues(ctx)).toEqual([]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
-            dave.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
+            dave.close();
             await relay.close();
         }
     });
@@ -793,8 +967,8 @@ describe("stateful MLS sessions", () => {
             expect(await bob.session(ctx, session.id)).toBeUndefined();
             expect(await prefixCount(bobStore, "murmur/pending-membership-controls/")).toBe(0);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             if (aliceDeviceIdentity !== undefined) destroyIdentity(aliceDeviceIdentity);
             destroyIdentity(aliceIdentity);
             await relay.close();
@@ -889,8 +1063,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual([]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             if (bobDeviceIdentity !== undefined) destroyIdentity(bobDeviceIdentity);
             destroyIdentity(bobIdentity);
             await relay.close();
@@ -910,7 +1084,7 @@ describe("stateful MLS sessions", () => {
             await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
 
-            await bob.leave(ctx, session.id);
+            await bob.leaveSession(ctx, session.id);
             await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
@@ -919,8 +1093,8 @@ describe("stateful MLS sessions", () => {
             expect((await alice.session(ctx, session.id))?.members).toEqual([alice.identity]);
             expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1006,9 +1180,9 @@ describe("stateful MLS sessions", () => {
             expect((await bob.session(ctx, session.id))?.members).toHaveLength(2);
             expect(await carol.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1064,9 +1238,9 @@ describe("stateful MLS sessions", () => {
             expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
             expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1147,10 +1321,10 @@ describe("stateful MLS sessions", () => {
                 expect((await actor.session(ctx, session.id))?.members).toHaveLength(3);
                 expect(await dave.session(ctx, session.id)).toBeUndefined();
             } finally {
-                alice.close(ctx);
-                bob.close(ctx);
-                carol.close(ctx);
-                dave.close(ctx);
+                alice.close();
+                bob.close();
+                carol.close();
+                dave.close();
                 await relay.close();
             }
         };
@@ -1236,9 +1410,9 @@ describe("stateful MLS sessions", () => {
             expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
             expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1303,9 +1477,9 @@ describe("stateful MLS sessions", () => {
             expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
             expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1391,9 +1565,9 @@ describe("stateful MLS sessions", () => {
             expect(bobReceived).toEqual(["welcome carol"]);
             expect(carolReceived).toEqual([]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1441,7 +1615,7 @@ describe("stateful MLS sessions", () => {
                 transientPublicationFailures: 2,
                 terminalPublicationFailures: 0,
             });
-            alice.close(ctx);
+            alice.close();
             alice = await MurmurClient.open(ctx, {
                 transport: base,
                 store: aliceStore,
@@ -1455,8 +1629,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual(["durable"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1480,7 +1654,7 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize(ctx);
         } finally {
             destroyIdentity(attacker);
-            alice.close(ctx);
+            alice.close();
             await relay.close();
         }
     });
@@ -1544,8 +1718,8 @@ describe("stateful MLS sessions", () => {
                 bufferedEvents: 0,
             });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1573,14 +1747,21 @@ describe("stateful MLS sessions", () => {
                 status: "active",
                 bufferedEvents: 1,
             });
+            expect(await bob.issues(ctx)).toContainEqual(
+                expect.objectContaining({
+                    code: "active_buffer_capacity",
+                    severity: "error",
+                    recovery: "inspect",
+                }),
+            );
             const events: string[] = [];
             await consume(bob, async (event) => {
                 events.push(utf8Decode(event.bytes));
             });
             expect(events).toEqual(["first"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1605,8 +1786,8 @@ describe("stateful MLS sessions", () => {
             expect(await bob.session(ctx, session.id)).toBeUndefined();
             await bob.synchronize(ctx);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1637,9 +1818,9 @@ describe("stateful MLS sessions", () => {
             });
             expect(events).toEqual(["from prior epoch"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1705,8 +1886,8 @@ describe("stateful MLS sessions", () => {
             await alice.synchronize(ctx);
         } finally {
             destroyIdentity(attacker);
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1770,9 +1951,9 @@ describe("stateful MLS sessions", () => {
             expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
             expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1827,9 +2008,9 @@ describe("stateful MLS sessions", () => {
             expect(await bob.session(ctx, session.id)).toBeUndefined();
             expect(await carol.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1863,8 +2044,8 @@ describe("stateful MLS sessions", () => {
             await bob.synchronize(ctx);
             expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1912,9 +2093,9 @@ describe("stateful MLS sessions", () => {
             expect(received).toEqual(["still delivered"]);
             expect(await alice.session(ctx, damaged.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1956,9 +2137,9 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual(["small"]);
         } finally {
-            outboxConstrained.close(ctx);
-            ciphertextConstrained.close(ctx);
-            bob.close(ctx);
+            outboxConstrained.close();
+            ciphertextConstrained.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1989,8 +2170,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(events).toEqual(["accepted"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -2072,8 +2253,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual(["queued while offline"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -2136,9 +2317,9 @@ describe("stateful MLS sessions", () => {
             expect(received).toEqual(["after remove"]);
             expect((await bob.session(ctx, session.id))?.members).toHaveLength(2);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -2200,8 +2381,8 @@ describe("stateful MLS sessions", () => {
                 members: [alice.identity, bob.identity],
             });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -2237,9 +2418,9 @@ describe("stateful MLS sessions", () => {
             });
             expect(events).toEqual([]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -2265,9 +2446,9 @@ describe("stateful MLS sessions", () => {
             expect(second.sessions).toHaveLength(1);
             expect(second.sessions[0]?.id).not.toEqual(first.sessions[0]?.id);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -2289,8 +2470,8 @@ describe("stateful MLS sessions", () => {
                 }),
             ).rejects.toThrow("already used");
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -2333,8 +2514,8 @@ describe("stateful MLS sessions", () => {
             expect(await alice.session(ctx, session.id)).toBeUndefined();
             expect((await alice.synchronize(ctx)).pendingOutboxes).toBe(0);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -2392,9 +2573,9 @@ describe("stateful MLS sessions", () => {
             await bob.synchronize(ctx);
             expect(await bob.session(ctx, second.id)).toMatchObject({ status: "pending" });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             destroyIdentity(carolIdentity);
             await relay.close();
         }
@@ -2434,13 +2615,16 @@ describe("stateful MLS sessions", () => {
         const synchronizing = murmur.synchronize(ctx);
         await started;
         const discovering = murmur.createKeyPackage(ctx);
-        expect(() => murmur.close(ctx)).toThrow("operation is pending");
+        expect(() => murmur.close()).toThrow("operation is pending");
         releaseRead();
         await synchronizing;
         await discovering;
         const reading = murmur.sessions(ctx);
-        expect(() => murmur.close(ctx)).toThrow("operation is pending");
+        expect(() => murmur.close()).toThrow("operation is pending");
+        const disposing = murmur.dispose();
         await reading;
-        murmur.close(ctx);
+        await disposing;
+        expect(() => murmur.identity).toThrow("closed");
+        await expect(murmur.dispose()).resolves.toBeUndefined();
     });
 });

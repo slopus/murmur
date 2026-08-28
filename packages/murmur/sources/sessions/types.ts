@@ -74,10 +74,10 @@ export interface MurmurSessionPolicies {
     readonly sendPolicy: MurmurSessionSendPolicy;
 }
 
-/** Owner-controlled policy update. Omitted send policy keeps its current value. */
+/** Owner-controlled policy update. Every omitted field keeps its current value. */
 export interface MurmurSessionPolicyChanges {
-    readonly adminsAssignAdmins: boolean;
-    readonly anyoneCanAddMembers: boolean;
+    readonly adminsAssignAdmins?: boolean;
+    readonly anyoneCanAddMembers?: boolean;
     readonly sendPolicy?: MurmurSessionSendPolicy;
 }
 
@@ -101,11 +101,12 @@ export interface MurmurSessionDeletedEvent {
     readonly service: string;
 }
 
-/** Complete confirmed state of one service-owned session after a durable lifecycle change. */
+/** Complete confirmed state of one session after a durable lifecycle change. */
 export interface MurmurSessionChangedEvent {
     /** Stable bootstrap or Commit delivery ID reused when the callback retries. */
     readonly id: string;
-    readonly service: string;
+    /** Stable service owner; omitted for an application-owned session. */
+    readonly service?: string;
     readonly sessionId: Uint8Array;
     readonly status: "active" | "removed";
     readonly descriptor: Uint8Array;
@@ -135,12 +136,13 @@ export interface MurmurSyncOptions {
     /**
      * Runs for one ordered application-update batch.
      *
-     * Murmur commits the whole batch after this hook resolves. Throwing or
-     * omitting the hook leaves updates pending.
+     * Murmur commits the whole batch after this hook resolves. Throwing leaves
+     * every update pending. Omitting the hook blocks application-owned updates;
+     * service-owned updates settle after their registered service handles them.
      */
     readonly onUpdates?: (ctx: Context, updates: readonly MurmurUpdate[]) => void | Promise<void>;
     /**
-     * Runs for complete confirmed snapshots of service-owned sessions.
+     * Runs for complete confirmed snapshots of application- and service-owned sessions.
      *
      * Murmur records each snapshot with the bootstrap or Commit that produced
      * it. Throwing keeps the same event IDs pending across retries and restarts.
@@ -149,6 +151,8 @@ export interface MurmurSyncOptions {
         ctx: Context,
         events: readonly MurmurSessionChangedEvent[],
     ) => void | Promise<void>;
+    /** Reports why the global relay-effect head cannot currently be consumed. */
+    readonly onEffectBlocked?: (ctx: Context, blocked: MurmurEffectBlocked) => void | Promise<void>;
     /** Reports the bounded durable issue set when its public contents change. */
     readonly onIssues?: (
         ctx: Context,
@@ -248,14 +252,88 @@ export interface MurmurSynchronizeOptions {
     readonly signal?: AbortSignal;
 }
 
+/** Machine-readable public operation failure categories. */
+export type MurmurErrorCode =
+    | "already_exists"
+    | "busy"
+    | "callback_failed"
+    | "closed"
+    | "invalid_argument"
+    | "invalid_configuration"
+    | "invalid_state"
+    | "not_found"
+    | "permission_denied"
+    | "resource_exhausted"
+    | "unsupported";
+
+/** Typed failure from a Murmur client or session operation. */
+export class MurmurError extends Error {
+    readonly code: MurmurErrorCode;
+
+    constructor(code: MurmurErrorCode, message: string, options?: ErrorOptions) {
+        super(message, options);
+        this.name = "MurmurError";
+        this.code = code;
+    }
+}
+
+/** Public callback boundary whose failure kept durable work pending. */
+export type MurmurCallbackName =
+    | "service.onNewSession"
+    | "service.onUpdate"
+    | "service.onSessionDeleted"
+    | "onConnected"
+    | "onDisconnected"
+    | "onReset"
+    | "onUpdates"
+    | "onSessionsChanged"
+    | "onEffectBlocked"
+    | "onIssues"
+    | "onDevicesChanged"
+    | "onDeviceAdded"
+    | "onDeviceRevoked"
+    | "onDeviceDormant";
+
+/** Typed callback failure with the exact durable event IDs available for retry. */
+export class MurmurCallbackError extends MurmurError {
+    readonly callback: MurmurCallbackName;
+    readonly eventIds: readonly string[];
+
+    constructor(callback: MurmurCallbackName, eventIds: readonly string[], cause: unknown) {
+        const detail = cause instanceof Error ? `: ${cause.message}` : "";
+        super("callback_failed", `${callback} failed${detail}`, { cause });
+        this.name = "MurmurCallbackError";
+        this.callback = callback;
+        this.eventIds = Object.freeze([...eventIds]);
+    }
+}
+
+/** Whether Murmur recovered automatically or the application must act. */
+export type MurmurIssueRecovery = "automatic" | "inspect";
+
 /** One durable session or publication diagnostic retained by Murmur. */
 export interface MurmurSessionIssue {
     readonly id: string;
     readonly code: string;
+    readonly severity: "warning" | "error";
+    readonly recovery: MurmurIssueRecovery;
     readonly sessionId?: Uint8Array;
     readonly kind?: "application" | "commit" | "bootstrap" | "session";
     readonly operationId?: string;
 }
+
+/** Durable relay-effect head currently preventing global application progress. */
+export type MurmurEffectBlocked =
+    | {
+          readonly reason: "missing_update_handler";
+          readonly id: string;
+          readonly sessionId: Uint8Array;
+      }
+    | {
+          readonly reason: "unresolved_route";
+          readonly id: string;
+          readonly sessionId: Uint8Array;
+      };
 
 /** Observable result of one synchronization cycle. */
 export interface MurmurSynchronizeResult {
@@ -265,4 +343,6 @@ export interface MurmurSynchronizeResult {
     readonly terminalPublicationFailures: number;
     readonly pendingOutboxes: number;
     readonly issues: readonly MurmurSessionIssue[];
+    /** Present when the oldest durable relay effect could not be consumed. */
+    readonly blocked?: MurmurEffectBlocked;
 }

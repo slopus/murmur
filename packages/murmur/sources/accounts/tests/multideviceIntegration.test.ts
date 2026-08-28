@@ -98,7 +98,7 @@ describe("restored-account device registration", () => {
             expect(beforeUpdate.members).toHaveLength(2);
 
             const secondDeviceKey = second.deviceKey;
-            second.close(ctx);
+            second.close();
             second = undefined;
             reopened = await MurmurClient.open(ctx, {
                 identity: account,
@@ -127,10 +127,10 @@ describe("restored-account device registration", () => {
             );
             expect(afterUpdate.members).toHaveLength(2);
         } finally {
-            first?.close(ctx);
-            second?.close(ctx);
-            reopened?.close(ctx);
-            claimant?.close(ctx);
+            first?.close();
+            second?.close();
+            reopened?.close();
+            claimant?.close();
             await relay.close();
         }
     });
@@ -186,9 +186,9 @@ describe("restored-account device registration", () => {
             await first.removeDevice(ctx, second.deviceKey);
             expect(await first.devices(ctx)).toHaveLength(1);
         } finally {
-            first.close(ctx);
-            second.close(ctx);
-            peer.close(ctx);
+            first.close();
+            second.close();
+            peer.close();
             await relay.close();
         }
     });
@@ -321,9 +321,9 @@ describe("restored-account device registration", () => {
             }
             expect(received).toContain("expanded roster delivery");
         } finally {
-            sender.close(ctx);
-            firstTarget.close(ctx);
-            secondTarget?.close(ctx);
+            sender.close();
+            firstTarget.close();
+            secondTarget?.close();
             await relay.close();
         }
     });
@@ -377,8 +377,8 @@ describe("identity directory", () => {
             );
             expect(afterRotation.members[0]?.source).toBe("one_time");
         } finally {
-            owner.close(ctx);
-            claimant.close(ctx);
+            owner.close();
+            claimant.close();
             await relay.close();
         }
     });
@@ -455,9 +455,9 @@ describe("identity directory", () => {
             }
             expect((await secondClaimant.session(ctx, firstSession.id))?.status).toBe("pending");
         } finally {
-            target.close(ctx);
-            firstClaimant.close(ctx);
-            secondClaimant.close(ctx);
+            target.close();
+            firstClaimant.close();
+            secondClaimant.close();
             await relay.close();
         }
     });

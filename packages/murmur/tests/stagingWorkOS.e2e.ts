@@ -216,8 +216,8 @@ describe.runIf(stagingCredentials !== undefined)("WorkOS-authenticated Murmur st
             await aliceClient.deleteAccount(ctx);
             await bobClient.deleteAccount(ctx);
         } finally {
-            await aliceClient?.close(ctx);
-            await bobClient?.close(ctx);
+            await aliceClient?.close();
+            await bobClient?.close();
             for (const userId of createdUserIds.reverse()) {
                 await workos.userManagement.deleteUser(userId).catch(() => undefined);
             }

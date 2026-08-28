@@ -15,15 +15,21 @@ updates remain bounded and hidden until activation. The identity-wide update
 batch drains only after every required service and application callback
 resolves.
 
+Callback failures surface as `MurmurCallbackError` with the outer callback name,
+durable event IDs when available, and the original failure as `cause`. Graceful
+`dispose()` cannot run while a callback is active because that callback is itself
+in-flight work; such an attempt fails immediately.
+
 The implementation persists session records, active and staged epochs, intents,
 outboxes, replay markers, routing decisions, and queue progress atomically.
-For service-owned sessions it also persists complete confirmed lifecycle
-snapshots with the bootstrap or Commit that produced them. The identity-wide
+For application- and service-owned sessions it also persists complete confirmed
+lifecycle snapshots with the bootstrap or Commit that produced them. The identity-wide
 callback settles those records only after it resolves, and a removed local
 account receives its final snapshot before the session is destroyed.
 
 Creation selects an `everyone` or `admins` send policy. Policy changes are
-owner-only and Commit-bound; local sends and exact-epoch remote senders are
+fully partial, owner-only, and Commit-bound; omitted fields resolve against the
+confirmed state at queue time. Local sends and exact-epoch remote senders are
 checked before application data is accepted. Signed visible controls summarize
 each creation, Commit, and ongoing message. A mismatch with decrypted MLS state
 is durably quarantined. A newly added device keeps the bounded signed membership
@@ -46,5 +52,7 @@ members; those sessions converge later through silence or explicit removal.
 `claimAccount()` validates every returned MLS signature, lifetime, device key,
 and account credential before exposing an immutable claim. `createSession()`
 and `addMember()` flatten that claim into device-level MLS additions. Client
-open publishes initial directory material, ordinary spent notices trigger
-replenishment, and `rotate()` replaces the local directory generation.
+open publishes initial directory material unless `connection: "deferred"` is
+selected. A later `connect()` or synchronization performs registration and
+directory initialization. Ordinary spent notices trigger replenishment, and
+`rotate()` replaces the local directory generation.

@@ -349,7 +349,7 @@ async function addActor(fixture: RaceFixture, name: ActorName): Promise<RaceActo
 }
 
 async function reopen(actor: RaceActor, fixture: RaceFixture): Promise<void> {
-    actor.client.close(ctx);
+    actor.client.close();
     actor.client = await MurmurClient.open(ctx, {
         store: actor.store,
         transport: actor.transport,
@@ -362,7 +362,7 @@ async function reopenWithStore(
     fixture: RaceFixture,
     store: MurmurStore,
 ): Promise<void> {
-    actor.client.close(ctx);
+    actor.client.close();
     actor.client = await MurmurClient.open(ctx, {
         store,
         transport: actor.transport,
@@ -481,7 +481,7 @@ async function activeFixture(
     await carol.client.activateSession(ctx, session.id);
     await synchronize(alice);
     if (options.grantBob ?? true) {
-        await alice.client.grantAdmin(ctx, session.id, bob.client.accountKey);
+        await alice.client.grantAdmin(ctx, session.id, bob.client.identity);
     }
     await settle(fixture, session.id, ["alice", "bob", "carol"]);
     for (const actor of fixture.actors.values()) {
@@ -494,7 +494,7 @@ async function activeFixture(
 async function closeFixture(fixture: RaceFixture): Promise<void> {
     for (const actor of fixture.actors.values()) {
         try {
-            actor.client.close(ctx);
+            actor.client.close();
         } catch {
             // A test can deliberately terminate while an obsolete client is unwinding.
         }
@@ -599,7 +599,7 @@ async function assertNoOutboxes(actors: readonly RaceActor[]): Promise<void> {
 }
 
 function memberCount(session: MurmurSession | undefined, actor: RaceActor): number {
-    const key = encodeBase64Url(actor.client.accountKey);
+    const key = encodeBase64Url(actor.client.identity);
     return session?.members.map(encodeBase64Url).filter((member) => member === key).length ?? 0;
 }
 
@@ -787,7 +787,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.alice.client.removeMember(
                     ctx,
                     fixture.session.id,
-                    fixture.dave.client.accountKey,
+                    fixture.dave.client.identity,
                 );
                 await synchronize(fixture.alice);
                 await fixture.bob.client.addMember(
@@ -839,7 +839,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.alice.client.removeMember(
                     ctx,
                     fixture.session.id,
-                    fixture.dave.client.accountKey,
+                    fixture.dave.client.identity,
                 );
                 await synchronize(fixture.alice);
                 await synchronize(fixture.bob);
@@ -950,13 +950,13 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.alice.client.grantAdmin(
                     ctx,
                     fixture.session.id,
-                    fixture.bob.client.accountKey,
+                    fixture.bob.client.identity,
                 );
                 await expect(
                     fixture.bob.client.removeMember(
                         ctx,
                         fixture.session.id,
-                        fixture.carol.client.accountKey,
+                        fixture.carol.client.identity,
                     ),
                 ).rejects.toThrow("admin");
                 expect((await storeCounts(fixture.bob.store))[INTENT_PREFIX]).toBe(0);
@@ -964,7 +964,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.bob.client.removeMember(
                     ctx,
                     fixture.session.id,
-                    fixture.carol.client.accountKey,
+                    fixture.carol.client.identity,
                 );
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol"]);
                 expect(
@@ -994,7 +994,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.alice.client.revokeAdmin(
                     ctx,
                     fixture.session.id,
-                    fixture.bob.client.accountKey,
+                    fixture.bob.client.identity,
                 );
                 const pending = await stageTwo(fixture, fixture.bob, fixture.alice);
                 await releaseTwo(fixture, fixture.bob, fixture.alice, pending);
@@ -1004,7 +1004,7 @@ describe("Commit race and intent convergence chaos", () => {
                 const final = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(memberCount(final, fixture.dave)).toBe(1);
                 expect(final?.admins.map(encodeBase64Url)).not.toContain(
-                    encodeBase64Url(fixture.bob.client.accountKey),
+                    encodeBase64Url(fixture.bob.client.identity),
                 );
             } finally {
                 await closeFixture(fixture);
@@ -1026,7 +1026,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.alice.client.revokeAdmin(
                     ctx,
                     fixture.session.id,
-                    fixture.bob.client.accountKey,
+                    fixture.bob.client.identity,
                 );
                 const pending = await stageTwo(fixture, fixture.bob, fixture.alice);
                 await releaseTwo(fixture, fixture.alice, fixture.bob, [pending[1], pending[0]]);
@@ -1121,7 +1121,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.bob.client.removeMember(
                     ctx,
                     fixture.session.id,
-                    fixture.carol.client.accountKey,
+                    fixture.carol.client.identity,
                 );
                 fixture.gate.arm();
                 const firstAttempt = synchronize(fixture.bob);
@@ -1671,7 +1671,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await fixture.bob.client.removeMember(
                     ctx,
                     fixture.session.id,
-                    fixture.carol.client.accountKey,
+                    fixture.carol.client.identity,
                 );
                 await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
@@ -1864,7 +1864,7 @@ describe("Commit race and intent convergence chaos", () => {
                     await fixture.bob.client.removeMember(
                         ctx,
                         fixture.session.id,
-                        fixture.carol.client.accountKey,
+                        fixture.carol.client.identity,
                     );
                     fixture.gate.arm();
                     const staged = synchronize(fixture.bob);

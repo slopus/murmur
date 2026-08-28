@@ -75,6 +75,13 @@ Unlocking requires both inputs. Password changes authenticate and preserve the
 complete encrypted root payload while rotating its salt and nonce. There is no
 server involvement or reset path; losing either input is final.
 
+When `open()` generated the account identity, wrap it directly from the client
+without exposing its secret key:
+
+```ts
+const accountSecret = await murmur.createAccountSecret(password);
+```
+
 ## Directory session example
 
 The application obtains a claim ticket from its authentication server and
@@ -126,6 +133,14 @@ const carolAdmission = await alice.claimAccount(ctx, carolIdentity, anotherTicke
 await alice.addMember(ctx, session.id, carolAdmission);
 ```
 
+Set `connection: "deferred"` to open or restore local state without contacting
+the relay. Call `connect(ctx)` explicitly, or begin synchronization, when the
+network is available. `idle()` waits for active work; `dispose()` aborts a
+persistent synchronization loop, waits for in-flight work, and destroys the
+client's in-memory keys. Immediate `close()` remains available for an idle
+client. Calling `dispose()` while a Murmur callback is running fails fast because
+the callback itself is in-flight work.
+
 Opening an HTTP-backed client automatically publishes a small one-use
 KeyPackage pool and one multi-use last-resort package per device. Claims prefer
 one-use packages. Their ordinary inbox spent notices trigger automatic
@@ -154,6 +169,7 @@ await murmur.sync(ctx, {
     onDisconnected: (_ctx, error) => console.log("disconnected", error),
     onUpdates: async (_ctx, updates) => applyAtomically(updates),
     onSessionsChanged: async (_ctx, sessions) => applySessionSnapshotsAtomically(sessions),
+    onEffectBlocked: async (_ctx, blocked) => reportBlockedHead(blocked),
     onIssues: async (_ctx, issues) => recordSessionIssues(issues),
     onDeviceAdded: async (_ctx, events) => recordAddedDevices(events),
     onDeviceRevoked: async (_ctx, events) => recordRevokedDevices(events),
@@ -164,18 +180,23 @@ await murmur.sync(ctx, {
 
 Murmur drains an application-update batch only after `onUpdates` resolves.
 Throwing leaves the same durable batch available for retry. Stable relay event
-IDs support application-level idempotency.
+IDs support application-level idempotency. If an application-owned update has
+no `onUpdates` handler, `synchronize()` reports its exact durable head in
+`result.blocked`; `onEffectBlocked` provides the same visibility to `sync()`.
+Callback failures use `MurmurCallbackError`, preserving the outer callback name,
+its durable event IDs when available, and the original failure as `cause`.
 
-`onSessionsChanged` receives complete confirmed snapshots of service-owned
-sessions after activation and every adopted membership, device, role, or policy
-Commit. Each snapshot includes the stable relay event ID, registered service ID,
-status, descriptor, members, owner, admins, and policies. A device removed from a
-session receives one final `removed` snapshot before Murmur destroys that local
-session. Throwing retries the same event across restarts. Omitting the optional
-hook drains these snapshots without retaining unused lifecycle history.
+`onSessionsChanged` receives complete confirmed snapshots of application- and
+service-owned sessions after activation and every adopted membership, device,
+role, or policy Commit. Each snapshot includes the stable relay event ID,
+optional registered service ID, status, descriptor, members, owner, admins, and
+policies. A device removed from a session receives one final `removed` snapshot
+before Murmur destroys that local session. Throwing retries the same event across
+restarts. Omitting the optional hook drains these snapshots without retaining
+unused lifecycle history.
 
 Murmur durably indexes every route decision, application update, and confirmed
-service lifecycle snapshot by its authenticated relay event ID. The identity-wide
+lifecycle snapshot by its authenticated relay event ID. The identity-wide
 queue is drained strictly from its global head: one route decision, one lifecycle
 snapshot, or one contiguous application-update segment at a time. A failed
 callback or unresolved route blocks every later relay-derived effect, including
@@ -195,7 +216,8 @@ local account, earlier updates and lifecycle snapshots retain the descriptor and
 service owner, drain before the final `removed` snapshot, and only then release
 their retained delivery state. Local owner deletion remains terminal and purges
 that session's pending callbacks.
-`onIssues` exposes Murmur's existing bounded durable issue set when it changes;
+`onIssues` exposes Murmur's existing bounded durable issue set when it changes.
+Each issue includes machine-readable severity and recovery guidance;
 malformed issue records are dropped rather than wedging synchronization.
 Applications use stable operation IDs on valid issues for idempotent
 terminal-failure handling.
@@ -221,7 +243,23 @@ The immutable session owner is always an admin. Policy controls whether admins
 may assign admins, whether every member may add another member, and whether
 everyone or only admins may send application events. Only the owner may change
 policy or terminally delete the session. A committer adopts its own Commit only
-after the authenticated queue echo arrives.
+after the authenticated queue echo arrives. Every `setPolicies` field is
+optional; omitted fields resolve against confirmed state when the intent is
+queued, and an empty change is rejected.
+
+Incoming sessions are offered in lexical service-ID order, independent of
+registration order, and the first claim wins. With no services, the route waits
+and globally blocks later relay effects. With at least one service, a route that
+every service declines is permanently ignored. Unregistering a durable owner
+does not change stored ownership: later updates and deletion notifications for
+that absent service are consumed. Service handlers must therefore remain
+registered for owned sessions.
+
+A claimed update first invokes `service.onUpdate`, then appears in the optional
+identity-wide `onUpdates` batch. Murmur durably records a completed service step,
+so a later global-hook failure retries the global callback without deliberately
+repeating the service callback. As with any external callback, a process crash
+between the callback and its receipt may still repeat the stable event ID.
 
 ## Multiple devices
 
@@ -285,8 +323,9 @@ They do not parse MLS or retain conversation history. Production ingress must
 provide non-Sybil admission because public identities are inexpensive to
 create.
 
-See [relay deployment](docs/DEPLOYMENT.md), [relay API](docs/RELAY_API.md), and
-the [protocol reference](docs/PROTOCOL.md).
+See [relay deployment](https://github.com/slopus/murmur/blob/main/docs/DEPLOYMENT.md),
+[relay API](https://github.com/slopus/murmur/blob/main/docs/RELAY_API.md), and the
+[protocol reference](https://github.com/slopus/murmur/blob/main/docs/PROTOCOL.md).
 
 ## Security properties
 
@@ -298,7 +337,8 @@ the [protocol reference](docs/PROTOCOL.md).
 - Relay authentication comparisons are constant-time.
 - `@slopus/murmur` has no `node:*` imports or runtime side effects.
 
-Review [SECURITY.md](docs/SECURITY.md) before production use.
+Review [SECURITY.md](https://github.com/slopus/murmur/blob/main/docs/SECURITY.md)
+before production use.
 
 ## Development
 

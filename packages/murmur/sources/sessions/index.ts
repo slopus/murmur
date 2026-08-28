@@ -23,6 +23,8 @@ import {
     generateIdentityKeyPair,
     type IdentityKeyPair,
 } from "../crypto/index.js";
+import { createAccountSecret as wrapAccountSecret } from "../identity/index.js";
+import type { CreatedAccountSecret } from "../identity/index.js";
 import {
     createMlsKeyPackage,
     decodeMlsKeyPackage,
@@ -94,6 +96,8 @@ import type {
     MurmurClaimedSessionMember,
     MurmurSessionPolicyChanges,
     MurmurSessionChangedEvent,
+    MurmurEffectBlocked,
+    MurmurCallbackName,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,
@@ -101,7 +105,7 @@ import type {
     MurmurSynchronizeResult,
     MurmurUpdate,
 } from "./types.js";
-import { MurmurResetRequiredError } from "./types.js";
+import { MurmurCallbackError, MurmurError, MurmurResetRequiredError } from "./types.js";
 
 export type {
     CreateMurmurSessionOptions,
@@ -119,6 +123,10 @@ export type {
     MurmurSessionSendPolicy,
     MurmurSessionDeletedEvent,
     MurmurSessionChangedEvent,
+    MurmurEffectBlocked,
+    MurmurCallbackName,
+    MurmurErrorCode,
+    MurmurIssueRecovery,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,
@@ -126,7 +134,7 @@ export type {
     MurmurSynchronizeResult,
     MurmurUpdate,
 } from "./types.js";
-export { MurmurResetRequiredError } from "./types.js";
+export { MurmurCallbackError, MurmurError, MurmurResetRequiredError } from "./types.js";
 
 const IDENTITY_KEY = "murmur/identity/root";
 const ACCOUNT_ROOT_KEY = "murmur/accounts/v1/root";
@@ -334,6 +342,12 @@ export interface MurmurClientOptions {
     readonly now?: () => number;
     /** Optional typed services available to claim and process sessions. */
     readonly services?: readonly MurmurServiceRegistration[];
+    /**
+     * Whether opening immediately registers with the relay. Defaults to `"immediate"`.
+     * Use `"deferred"` to inspect durable local state offline; `connect()` or the next
+     * synchronization operation performs registration later.
+     */
+    readonly connection?: "immediate" | "deferred";
 }
 
 /** Stateful identity, bootstrap, and opaque MLS-session facade. */
@@ -361,6 +375,10 @@ export class MurmurClient {
     #accountDeletionActive = false;
     #peerRosterRefreshOrdinal = 0;
     #peerRosterCursor = 0;
+    #networkReady = false;
+    #disposeAbort: AbortController | undefined;
+    #idleResolvers = new Set<() => void>();
+    #callbackDepth = 0;
 
     private constructor(
         identity: IdentityKeyPair,
@@ -394,13 +412,21 @@ export class MurmurClient {
 
     /** Open or create one durable per-device Murmur identity and its account state. */
     static async open(ctx: Context, options: MurmurClientOptions): Promise<MurmurClient> {
+        if (
+            options.connection !== undefined &&
+            options.connection !== "immediate" &&
+            options.connection !== "deferred"
+        ) {
+            throw new MurmurError("invalid_configuration", "Invalid connection mode");
+        }
         const deliveryChoices = [
             options.relay !== undefined,
             options.transport !== undefined,
             options.sessionProvider !== undefined,
         ].filter(Boolean).length;
         if (deliveryChoices !== 1) {
-            throw new Error(
+            throw new MurmurError(
+                "invalid_configuration",
                 "Provide exactly one relay URL, delivery transport, or relay-session provider",
             );
         }
@@ -409,7 +435,7 @@ export class MurmurClient {
         for (const registration of services) {
             validateMurmurServiceRegistration(registration);
             if (serviceIds.has(registration.id)) {
-                throw new Error("Murmur service IDs must be unique");
+                throw new MurmurError("invalid_configuration", "Murmur service IDs must be unique");
             }
             serviceIds.add(registration.id);
         }
@@ -442,7 +468,10 @@ export class MurmurClient {
                             options.identity !== undefined &&
                             !equalBytes(account.publicKey, options.identity.publicKey)
                         ) {
-                            throw new Error("Stored Murmur account differs from supplied identity");
+                            throw new MurmurError(
+                                "invalid_configuration",
+                                "Stored Murmur account differs from supplied identity",
+                            );
                         }
                     } finally {
                         zeroBytes(storedAccount);
@@ -477,13 +506,19 @@ export class MurmurClient {
                 encryptedDeviceMetadata !== undefined &&
                 !(encryptedDeviceMetadata instanceof Uint8Array)
             ) {
-                throw new Error("Encrypted device metadata must be bytes");
+                throw new MurmurError(
+                    "invalid_argument",
+                    "Encrypted device metadata must be bytes",
+                );
             }
             if (
                 encryptedDeviceMetadata !== undefined &&
                 encryptedDeviceMetadata.length > 16 * 1024
             ) {
-                throw new Error("Encrypted device metadata exceeds 16 KiB");
+                throw new MurmurError(
+                    "resource_exhausted",
+                    "Encrypted device metadata exceeds 16 KiB",
+                );
             }
             const transport =
                 options.transport ??
@@ -507,8 +542,7 @@ export class MurmurClient {
                 account,
                 encryptedDeviceMetadata,
             );
-            await client.#ensureRegistered(ctx);
-            await client.#ensureDirectoryEntry(ctx);
+            if (options.connection !== "deferred") await client.connect(ctx);
             return client;
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
@@ -529,10 +563,20 @@ export class MurmurClient {
         return this.#identity.publicKey.slice();
     }
 
-    /** Stable account identity shared by every restored device. */
-    get accountKey(): Uint8Array {
+    /** Register this device and replenish its directory entry after a deferred open. */
+    async connect(ctx: Context): Promise<void> {
+        await this.#exclusive(ctx, () => this.#connect(ctx));
+    }
+
+    /** Wrap this client's account root without exposing the secret key. */
+    async createAccountSecret(password: string): Promise<CreatedAccountSecret> {
         this.#assertOpen();
-        return this.#account.publicKey.slice();
+        this.#pendingOperations += 1;
+        try {
+            return await wrapAccountSecret(this.#account, password);
+        } finally {
+            this.#finishOperation();
+        }
     }
 
     /** Read this account's authenticated device roster entries. */
@@ -742,7 +786,12 @@ export class MurmurClient {
         const entry = roster?.devices.find((device) =>
             equalBytes(device.deviceKey, this.#identity.publicKey),
         );
-        if (entry === undefined) throw new Error("Local device is absent from its account roster");
+        if (entry === undefined) {
+            throw new MurmurError(
+                "invalid_state",
+                "Local device is absent from its account roster",
+            );
+        }
         const now = this.#now();
         const delivery = createSignedDelivery(
             this.#account,
@@ -849,14 +898,16 @@ export class MurmurClient {
             const admission = roster?.admissions.find((entry) =>
                 equalBytes(entry.deviceKey, this.#identity.publicKey),
             );
-            if (admission === undefined) throw new Error("Local device admission is missing");
+            if (admission === undefined) {
+                throw new MurmurError("invalid_state", "Local device admission is missing");
+            }
             const keyPackage = decodeMlsKeyPackage(admission.keyPackage);
             if (
                 !verifyMlsKeyPackage(keyPackage, Math.floor(this.#now() / 1_000)) ||
                 !equalBytes(keyPackage.leafNode.signatureKey, this.#identity.publicKey) ||
                 !equalBytes(keyPackage.leafNode.credential.identity, this.#account.publicKey)
             ) {
-                throw new Error("Local last-resort KeyPackage is invalid");
+                throw new MurmurError("invalid_state", "Local last-resort KeyPackage is invalid");
             }
             lastResort = {
                 reference: mlsKeyPackageReference(keyPackage),
@@ -894,7 +945,10 @@ export class MurmurClient {
 
     async #rotateDirectoryEntry(ctx: Context): Promise<void> {
         if (this.#transport.uploadDirectoryPrekeys === undefined) {
-            throw new Error("Delivery transport does not support identity-directory uploads");
+            throw new MurmurError(
+                "unsupported",
+                "Delivery transport does not support identity-directory uploads",
+            );
         }
         const previousOneTime = await this.#directoryMetadata(ctx, DIRECTORY_ONE_TIME_PREFIX);
         const previousLast = await this.#localDirectoryPrekey(ctx, DIRECTORY_LAST_RESORT_KEY);
@@ -918,7 +972,7 @@ export class MurmurClient {
         claim: DeliveryDirectoryClaim,
     ): MurmurAccountClaim {
         if (!equalBytes(requestedIdentity, claim.accountKey)) {
-            throw new Error("Directory claim names a different account");
+            throw new MurmurError("invalid_state", "Directory claim names a different account");
         }
         const devices = new Set<string>();
         const members = claim.devices.map((device): MurmurClaimedSessionMember => {
@@ -930,7 +984,10 @@ export class MurmurClient {
                 !equalBytes(keyPackage.leafNode.signatureKey, device.deviceKey) ||
                 !equalBytes(keyPackage.leafNode.credential.identity, requestedIdentity)
             ) {
-                throw new Error("Directory returned invalid MLS admission material");
+                throw new MurmurError(
+                    "invalid_state",
+                    "Directory returned invalid MLS admission material",
+                );
             }
             devices.add(encodedDevice);
             return Object.freeze({
@@ -960,7 +1017,7 @@ export class MurmurClient {
                         (member) => !equalBytes(member.identity, admission.identity),
                     )
                 ) {
-                    throw new Error("Invalid claimed account admission");
+                    throw new MurmurError("invalid_argument", "Invalid claimed account admission");
                 }
                 flattened.push(...admission.members);
             } else {
@@ -1012,7 +1069,10 @@ export class MurmurClient {
         }
         if (!forceReset && current !== undefined && currentEntry !== undefined) {
             if (this.#transport.mutateDeviceRoster === undefined) {
-                throw new Error("Delivery transport does not support device rosters");
+                throw new MurmurError(
+                    "unsupported",
+                    "Delivery transport does not support device rosters",
+                );
             }
             const now = this.#now();
             const delivery = createSignedDelivery(
@@ -1149,13 +1209,20 @@ export class MurmurClient {
     async removeDevice(ctx: Context, deviceKey: Uint8Array): Promise<void> {
         await this.#exclusive(ctx, async () => {
             const roster = await this.#ownRoster(ctx);
-            if (roster === undefined) throw new Error("Account has no device roster");
+            if (roster === undefined) {
+                throw new MurmurError("not_found", "Account has no device roster");
+            }
             const entry = roster.devices.find((candidate) =>
                 equalBytes(candidate.deviceKey, deviceKey),
             );
-            if (entry === undefined) throw new Error("Device is not registered");
+            if (entry === undefined) {
+                throw new MurmurError("not_found", "Device is not registered");
+            }
             if (this.#transport.mutateDeviceRoster === undefined) {
-                throw new Error("Delivery transport does not support device rosters");
+                throw new MurmurError(
+                    "unsupported",
+                    "Delivery transport does not support device rosters",
+                );
             }
             const recipients = roster.devices
                 .filter((candidate) => !equalBytes(candidate.deviceKey, deviceKey))
@@ -1179,17 +1246,17 @@ export class MurmurClient {
     }
 
     /** Register one optional typed service under its durable stable ID. */
-    registerService(_ctx: Context, registration: MurmurServiceRegistration): void {
+    registerService(registration: MurmurServiceRegistration): void {
         this.#assertOpen();
         validateMurmurServiceRegistration(registration);
         if (this.#services.has(registration.id)) {
-            throw new Error("Murmur service is already registered");
+            throw new MurmurError("already_exists", "Murmur service is already registered");
         }
         this.#services.set(registration.id, registration.service);
     }
 
     /** Disable one optional service without changing its durable state. */
-    unregisterService(_ctx: Context, id: string): void {
+    unregisterService(id: string): void {
         this.#assertOpen();
         this.#services.delete(id);
     }
@@ -1237,10 +1304,13 @@ export class MurmurClient {
         return this.#tracked(ctx, async () => {
             validateIdentityPublicKey({ publicKey: identityKey });
             if (ticket.length < 1 || ticket.length > 8 * 1024) {
-                throw new Error("Invalid directory claim ticket");
+                throw new MurmurError("invalid_argument", "Invalid directory claim ticket");
             }
             if (this.#transport.claimDirectory === undefined) {
-                throw new Error("Delivery transport does not support identity-directory claims");
+                throw new MurmurError(
+                    "unsupported",
+                    "Delivery transport does not support identity-directory claims",
+                );
             }
             const claim = await this.#transport.claimDirectory(ctx, identityKey, ticket);
             return this.#publicAccountClaim(identityKey, claim);
@@ -1256,10 +1326,10 @@ export class MurmurClient {
     async createSession(ctx: Context, options: CreateMurmurSessionOptions): Promise<MurmurSession> {
         const owner =
             options.service === undefined
-                ? undefined
+                ? ({ version: 1, owner: "account" } as const)
                 : ({ version: 1, owner: "service", serviceId: options.service } as const);
         if (options.service !== undefined && !this.#services.has(options.service)) {
-            throw new Error("Session service is not registered");
+            throw new MurmurError("invalid_argument", "Session service is not registered");
         }
         const session = await this.#exclusive(ctx, () =>
             this.#engine.create(
@@ -1276,7 +1346,10 @@ export class MurmurClient {
                     members: this.#flattenAdmissions(options.members).map((member) => {
                         const keyPackage = decodeMlsKeyPackage(member.keyPackage);
                         if (!equalBytes(keyPackage.leafNode.credential.identity, member.identity)) {
-                            throw new Error("Session member account does not match its KeyPackage");
+                            throw new MurmurError(
+                                "invalid_argument",
+                                "Session member account does not match its KeyPackage",
+                            );
                         }
                         return { identity: keyPackage.leafNode.signatureKey, keyPackage };
                     }),
@@ -1333,10 +1406,13 @@ export class MurmurClient {
     async deleteAccount(ctx: Context): Promise<void> {
         this.#assertOpen();
         if (this.#transport.deleteAccount === undefined) {
-            throw new Error("Delivery transport does not support account deletion");
+            throw new MurmurError(
+                "unsupported",
+                "Delivery transport does not support account deletion",
+            );
         }
         if (this.#pendingOperations > 0 || this.#syncActive || this.#updatesActive) {
-            throw new Error("Account deletion requires an idle Murmur client");
+            throw new MurmurError("busy", "Account deletion requires an idle Murmur client");
         }
         this.#accountDeletionActive = true;
         this.#pendingOperations += 1;
@@ -1413,8 +1489,8 @@ export class MurmurClient {
                 zeroBytes(request.ciphertext);
                 zeroBytes(request.signature);
             }
-            this.#pendingOperations -= 1;
             this.#accountDeletionActive = false;
+            this.#finishOperation();
         }
     }
 
@@ -1436,7 +1512,10 @@ export class MurmurClient {
             for (const admission of this.#flattenAdmissions([member])) {
                 const keyPackage = decodeMlsKeyPackage(admission.keyPackage);
                 if (!equalBytes(keyPackage.leafNode.credential.identity, admission.identity)) {
-                    throw new Error("Session member account does not match its KeyPackage");
+                    throw new MurmurError(
+                        "invalid_argument",
+                        "Session member account does not match its KeyPackage",
+                    );
                 }
                 await this.#engine.add(ctx, id, {
                     identity: keyPackage.leafNode.signatureKey,
@@ -1476,7 +1555,7 @@ export class MurmurClient {
     }
 
     /** Durably request removal of every local-account device from one session. */
-    async leave(ctx: Context, id: Uint8Array): Promise<void> {
+    async leaveSession(ctx: Context, id: Uint8Array): Promise<void> {
         await this.#exclusive(ctx, () => this.#engine.leave(ctx, id));
         this.#signalSync();
     }
@@ -1603,7 +1682,7 @@ export class MurmurClient {
         onReset: MurmurSyncOptions["onReset"],
     ): Promise<never> {
         if (onReset === undefined) throw new MurmurResetRequiredError(reset, false);
-        await onReset(ctx, reset);
+        await this.#invokeCallback("onReset", [reset.id], () => onReset(ctx, reset));
         await this.#exclusive(ctx, async () => {
             await this.#purgeReset(ctx, reset);
         });
@@ -1623,6 +1702,7 @@ export class MurmurClient {
             MurmurSyncOptions,
             | "onUpdates"
             | "onSessionsChanged"
+            | "onEffectBlocked"
             | "onIssues"
             | "onDeviceAdded"
             | "onDeviceRevoked"
@@ -1631,7 +1711,7 @@ export class MurmurClient {
         > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
-            throw new Error("Cannot page synchronization while SSE sync is active");
+            throw new MurmurError("busy", "Cannot page synchronization while SSE sync is active");
         }
         const pendingReset = await this.#pendingReset(ctx);
         if (pendingReset !== undefined) {
@@ -1646,8 +1726,8 @@ export class MurmurClient {
             const reset = await this.#exclusive(ctx, () => this.#recordReset(ctx, error));
             return this.#completeReset(ctx, reset, lifecycle.onReset);
         }
-        await this.#deliverUpdates(ctx, lifecycle);
-        return result;
+        const delivery = await this.#deliverUpdates(ctx, lifecycle);
+        return delivery.blocked === undefined ? result : { ...result, blocked: delivery.blocked };
     }
 
     /**
@@ -1658,9 +1738,15 @@ export class MurmurClient {
      */
     async sync(ctx: Context, options: MurmurSyncOptions = {}): Promise<void> {
         this.#assertOpen();
-        if (this.#syncActive) throw new Error("Murmur synchronization is active");
-        const signal = options.abort ?? new AbortController().signal;
-        if (signal.aborted) return;
+        if (this.#syncActive) {
+            throw new MurmurError("busy", "Murmur synchronization is active");
+        }
+        if (options.abort?.aborted === true) return;
+        const controller = new AbortController();
+        const abortFromOptions = (): void => controller.abort(options.abort?.reason);
+        options.abort?.addEventListener("abort", abortFromOptions, { once: true });
+        const signal = controller.signal;
+        this.#disposeAbort = controller;
         this.#syncActive = true;
         this.#pendingOperations += 1;
         const wakeOnAbort = (): void => this.#signalSync();
@@ -1679,11 +1765,18 @@ export class MurmurClient {
                     signal,
                     onConnected: async (callbackCtx) => {
                         connected = true;
-                        await options.onConnected?.(callbackCtx);
+                        if (options.onConnected !== undefined) {
+                            await this.#invokeCallback("onConnected", [], () =>
+                                options.onConnected!(callbackCtx),
+                            );
+                        }
                     },
                     onDeviceRosterChanged: (_callbackCtx, accountKey) => {
                         if (!equalBytes(accountKey, this.#account.publicKey)) {
-                            throw new Error("Relay reported another account's device roster");
+                            throw new MurmurError(
+                                "invalid_state",
+                                "Relay reported another account's device roster",
+                            );
                         }
                         this.#deviceRosterChangeVersion += 1;
                         this.#signalSync();
@@ -1734,7 +1827,11 @@ export class MurmurClient {
                     try {
                         await iterator.return?.();
                     } finally {
-                        if (connected) await options.onDisconnected?.(ctx, disconnectedBy);
+                        if (connected && options.onDisconnected !== undefined) {
+                            await this.#invokeCallback("onDisconnected", [], () =>
+                                options.onDisconnected!(ctx, disconnectedBy),
+                            );
+                        }
                     }
                 }
                 if (!signal.aborted) {
@@ -1742,6 +1839,8 @@ export class MurmurClient {
                 }
             }
         } finally {
+            options.abort?.removeEventListener("abort", abortFromOptions);
+            if (this.#disposeAbort === controller) this.#disposeAbort = undefined;
             signal.removeEventListener("abort", wakeOnAbort);
             this.#syncActive = false;
             this.#syncWakePending = false;
@@ -1750,15 +1849,37 @@ export class MurmurClient {
                 clearTimeout(this.#syncRetryTimer);
                 this.#syncRetryTimer = undefined;
             }
-            this.#pendingOperations -= 1;
+            this.#finishOperation();
         }
     }
 
-    /** Destroy in-memory identity material. Durable state remains application-owned. */
-    close(_ctx: Context): void {
+    /** Resolve once every currently active operation and synchronization loop has settled. */
+    async idle(): Promise<void> {
+        if (this.#pendingOperations === 0) return;
+        await new Promise<void>((resolve) => this.#idleResolvers.add(resolve));
+    }
+
+    /** Stop synchronization, await active work, then destroy in-memory identity material. */
+    async dispose(): Promise<void> {
+        if (this.#closed) return;
+        if (this.#callbackDepth > 0) {
+            throw new MurmurError(
+                "invalid_state",
+                "Cannot await Murmur disposal from inside a Murmur callback",
+            );
+        }
+        while (!this.#closed) {
+            this.#disposeAbort?.abort();
+            await this.idle();
+            if (this.#pendingOperations === 0) this.close();
+        }
+    }
+
+    /** Destroy in-memory identity material immediately. Durable state remains application-owned. */
+    close(): void {
         if (this.#closed) return;
         if (this.#pendingOperations > 0) {
-            throw new Error("Cannot close Murmur while an operation is pending");
+            throw new MurmurError("busy", "Cannot close Murmur while an operation is pending");
         }
         this.#closed = true;
         destroyIdentity(this.#identity);
@@ -1776,7 +1897,11 @@ export class MurmurClient {
         const version = this.#deviceRosterChangeVersion;
         if (version <= this.#consumedDeviceRosterChangeVersion) return;
         const devices = await this.devices(ctx);
-        await options.onDevicesChanged?.(ctx, devices);
+        if (options.onDevicesChanged !== undefined) {
+            await this.#invokeCallback("onDevicesChanged", [], () =>
+                options.onDevicesChanged!(ctx, devices),
+            );
+        }
         this.#consumedDeviceRosterChangeVersion = version;
         if (this.#deviceRosterChangeVersion > version) this.#signalSync();
     }
@@ -1787,16 +1912,18 @@ export class MurmurClient {
             MurmurSyncOptions,
             | "onUpdates"
             | "onSessionsChanged"
+            | "onEffectBlocked"
             | "onIssues"
             | "onDeviceAdded"
             | "onDeviceRevoked"
             | "onDeviceDormant"
         >,
-    ): Promise<number> {
-        if (this.#updatesActive) return 0;
+    ): Promise<{ readonly delivered: number; readonly blocked?: MurmurEffectBlocked }> {
+        if (this.#updatesActive) return { delivered: 0 };
         this.#updatesActive = true;
         this.#pendingOperations += 1;
         let delivered = 0;
+        let blockedEffect: MurmurEffectBlocked | undefined;
         try {
             await this.#deliverIssues(ctx, lifecycle.onIssues);
             for (;;) {
@@ -1834,9 +1961,14 @@ export class MurmurClient {
                             ([left], [right]) => left.localeCompare(right),
                         )) {
                             if (
-                                await service.onNewSession(
-                                    ctx,
-                                    createMurmurServiceSessionDescriptor(route.session),
+                                await this.#invokeCallback(
+                                    "service.onNewSession",
+                                    [route.eventId],
+                                    () =>
+                                        service.onNewSession(
+                                            ctx,
+                                            createMurmurServiceSessionDescriptor(route.session),
+                                        ),
                                 )
                             ) {
                                 owner = {
@@ -1848,6 +1980,18 @@ export class MurmurClient {
                             }
                         }
                         if (owner === undefined && this.#services.size === 0) {
+                            blockedEffect = Object.freeze({
+                                reason: "unresolved_route",
+                                id: route.eventId,
+                                sessionId: route.session.id.slice(),
+                            });
+                            if (lifecycle.onEffectBlocked !== undefined) {
+                                await this.#invokeCallback(
+                                    "onEffectBlocked",
+                                    [blockedEffect.id],
+                                    () => lifecycle.onEffectBlocked!(ctx, blockedEffect!),
+                                );
+                            }
                             break;
                         }
                         const decision: SessionRouteDecision = {
@@ -1875,7 +2019,7 @@ export class MurmurClient {
                         const event = head.event;
                         const publicEvent: MurmurSessionChangedEvent = Object.freeze({
                             id: event.id,
-                            service: event.service,
+                            ...(event.service === undefined ? {} : { service: event.service }),
                             sessionId: event.sessionId.slice(),
                             status: event.status,
                             descriptor: event.descriptor.slice(),
@@ -1885,7 +2029,11 @@ export class MurmurClient {
                             policies: Object.freeze({ ...event.policies }),
                             ...(event.reAdmission === true ? { reAdmission: true } : {}),
                         });
-                        await lifecycle.onSessionsChanged?.(ctx, Object.freeze([publicEvent]));
+                        if (lifecycle.onSessionsChanged !== undefined) {
+                            await this.#invokeCallback("onSessionsChanged", [publicEvent.id], () =>
+                                lifecycle.onSessionsChanged!(ctx, Object.freeze([publicEvent])),
+                            );
+                        }
                         await this.#exclusive(ctx, () =>
                             this.#engine.commitUpdates(
                                 ctx,
@@ -1907,14 +2055,17 @@ export class MurmurClient {
                         }
                         const consumedKeys = new Set<string>();
                         const globalUpdates: MurmurUpdate[] = [];
-                        let blocked = false;
+                        let segmentBlocked: (typeof updates)[number]["event"] | undefined;
                         for (const { event: update } of updates) {
                             if (update.owner?.owner === "ignored") {
                                 consumedKeys.add(update.key);
                                 continue;
                             }
-                            if (update.owner === undefined && lifecycle.onUpdates === undefined) {
-                                blocked = true;
+                            if (
+                                (update.owner === undefined || update.owner.owner === "account") &&
+                                lifecycle.onUpdates === undefined
+                            ) {
+                                segmentBlocked = update;
                                 break;
                             }
                             const publicUpdate: MurmurUpdate = Object.freeze({
@@ -1932,14 +2083,46 @@ export class MurmurClient {
                                     consumedKeys.add(update.key);
                                     continue;
                                 }
-                                await service.onUpdate(ctx, publicUpdate);
+                                const alreadyDelivered = await this.#exclusive(ctx, () =>
+                                    this.#engine.serviceUpdateDelivered(ctx, update.id),
+                                );
+                                if (!alreadyDelivered) {
+                                    await this.#invokeCallback(
+                                        "service.onUpdate",
+                                        [publicUpdate.id],
+                                        () => service.onUpdate(ctx, publicUpdate),
+                                    );
+                                    await this.#exclusive(ctx, () =>
+                                        this.#engine.markServiceUpdateDelivered(ctx, update.id),
+                                    );
+                                }
                             }
                             globalUpdates.push(publicUpdate);
                             consumedKeys.add(update.key);
                         }
-                        if (blocked && consumedKeys.size === 0) break;
+                        if (segmentBlocked !== undefined && consumedKeys.size === 0) {
+                            blockedEffect = Object.freeze({
+                                reason: "missing_update_handler",
+                                id: segmentBlocked.id,
+                                sessionId: segmentBlocked.sessionId.slice(),
+                            });
+                            if (lifecycle.onEffectBlocked !== undefined) {
+                                await this.#invokeCallback(
+                                    "onEffectBlocked",
+                                    [blockedEffect.id],
+                                    () => lifecycle.onEffectBlocked!(ctx, blockedEffect!),
+                                );
+                            }
+                            break;
+                        }
                         if (globalUpdates.length > 0) {
-                            await lifecycle.onUpdates?.(ctx, Object.freeze(globalUpdates));
+                            if (lifecycle.onUpdates !== undefined) {
+                                await this.#invokeCallback(
+                                    "onUpdates",
+                                    globalUpdates.map((update) => update.id),
+                                    () => lifecycle.onUpdates!(ctx, Object.freeze(globalUpdates)),
+                                );
+                            }
                         }
                         await this.#exclusive(ctx, () =>
                             this.#engine.commitUpdates(
@@ -1958,30 +2141,53 @@ export class MurmurClient {
                     const consumedDeletionKeys = new Set<string>();
                     for (const deletion of prepared.deletions) {
                         const service = this.#services.get(deletion.service);
-                        await service?.onSessionDeleted?.(
-                            ctx,
-                            Object.freeze({
-                                id: deletion.id,
-                                sessionId: deletion.sessionId.slice(),
-                                owner: deletion.owner.slice(),
-                                service: deletion.service,
-                            }),
-                        );
+                        if (service?.onSessionDeleted !== undefined) {
+                            await this.#invokeCallback(
+                                "service.onSessionDeleted",
+                                [deletion.id],
+                                () =>
+                                    service.onSessionDeleted!(
+                                        ctx,
+                                        Object.freeze({
+                                            id: deletion.id,
+                                            sessionId: deletion.sessionId.slice(),
+                                            owner: deletion.owner.slice(),
+                                            service: deletion.service,
+                                        }),
+                                    ),
+                            );
+                        }
                         consumedDeletionKeys.add(deletion.key);
                     }
                     if (lifecycle.onDeviceDormant !== undefined) {
                         const dormant = await this.dormantDevices(ctx);
-                        if (dormant.length > 0) await lifecycle.onDeviceDormant(ctx, dormant);
+                        if (dormant.length > 0) {
+                            await this.#invokeCallback("onDeviceDormant", [], () =>
+                                lifecycle.onDeviceDormant!(ctx, dormant),
+                            );
+                        }
                     }
                     const accountEvents: PreparedAccountEvents = await prepareAccountEvents(
                         ctx,
                         this.#store,
                     );
                     if (accountEvents.added.length > 0) {
-                        await lifecycle.onDeviceAdded?.(ctx, accountEvents.added);
+                        if (lifecycle.onDeviceAdded !== undefined) {
+                            await this.#invokeCallback(
+                                "onDeviceAdded",
+                                accountEvents.added.map((event) => event.id),
+                                () => lifecycle.onDeviceAdded!(ctx, accountEvents.added),
+                            );
+                        }
                     }
                     if (accountEvents.revoked.length > 0) {
-                        await lifecycle.onDeviceRevoked?.(ctx, accountEvents.revoked);
+                        if (lifecycle.onDeviceRevoked !== undefined) {
+                            await this.#invokeCallback(
+                                "onDeviceRevoked",
+                                accountEvents.revoked.map((event) => event.id),
+                                () => lifecycle.onDeviceRevoked!(ctx, accountEvents.revoked),
+                            );
+                        }
                     }
                     if (consumedDeletionKeys.size === 0 && accountEvents.keys.length === 0) {
                         if (!prepared.exhausted) continue;
@@ -2010,9 +2216,11 @@ export class MurmurClient {
                 }
             }
             await this.#deliverIssues(ctx, lifecycle.onIssues);
-            return delivered;
+            return blockedEffect === undefined
+                ? { delivered }
+                : { delivered, blocked: blockedEffect };
         } finally {
-            this.#pendingOperations -= 1;
+            this.#finishOperation();
             this.#updatesActive = false;
         }
     }
@@ -2034,18 +2242,23 @@ export class MurmurClient {
         );
         try {
             if (issues.length > 0 && fingerprint !== this.#reportedIssueFingerprint) {
-                await onIssues(
-                    ctx,
-                    Object.freeze(
-                        issues.map((issue) =>
-                            Object.freeze({
-                                ...issue,
-                                ...(issue.sessionId === undefined
-                                    ? {}
-                                    : { sessionId: issue.sessionId.slice() }),
-                            }),
+                await this.#invokeCallback(
+                    "onIssues",
+                    issues.map((issue) => issue.id),
+                    () =>
+                        onIssues(
+                            ctx,
+                            Object.freeze(
+                                issues.map((issue) =>
+                                    Object.freeze({
+                                        ...issue,
+                                        ...(issue.sessionId === undefined
+                                            ? {}
+                                            : { sessionId: issue.sessionId.slice() }),
+                                    }),
+                                ),
+                            ),
                         ),
-                    ),
                 );
             }
             this.#reportedIssueVersion = observedVersion;
@@ -2086,6 +2299,7 @@ export class MurmurClient {
 
     /** Refresh relay-owned account state before automatic MLS convergence. */
     async #queueAccountWork(ctx: Context): Promise<void> {
+        await this.#connect(ctx);
         await this.#store.set(
             ctx,
             `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(this.#identity.publicKey)}`,
@@ -2140,6 +2354,13 @@ export class MurmurClient {
         await this.#ensureDirectoryEntry(ctx);
     }
 
+    async #connect(ctx: Context): Promise<void> {
+        if (this.#networkReady) return;
+        await this.#ensureRegistered(ctx);
+        await this.#ensureDirectoryEntry(ctx);
+        this.#networkReady = true;
+    }
+
     #waitSyncWake(): Promise<void> {
         if (this.#syncWakePending) {
             this.#syncWakePending = false;
@@ -2187,8 +2408,32 @@ export class MurmurClient {
     }
 
     #assertOpen(): void {
-        if (this.#closed) throw new Error("Murmur client is closed");
-        if (this.#accountDeletionActive) throw new Error("Murmur account deletion is active");
+        if (this.#closed) throw new MurmurError("closed", "Murmur client is closed");
+        if (this.#accountDeletionActive) {
+            throw new MurmurError("busy", "Murmur account deletion is active");
+        }
+    }
+
+    #finishOperation(): void {
+        this.#pendingOperations -= 1;
+        if (this.#pendingOperations !== 0) return;
+        for (const resolve of this.#idleResolvers) resolve();
+        this.#idleResolvers.clear();
+    }
+
+    async #invokeCallback<T>(
+        callback: MurmurCallbackName,
+        eventIds: readonly string[],
+        operation: () => T | Promise<T>,
+    ): Promise<T> {
+        this.#callbackDepth += 1;
+        try {
+            return await operation();
+        } catch (error: unknown) {
+            throw new MurmurCallbackError(callback, eventIds, error);
+        } finally {
+            this.#callbackDepth -= 1;
+        }
     }
 
     async #tracked<T>(ctx: Context, operation: () => Promise<T>): Promise<T> {
@@ -2197,7 +2442,7 @@ export class MurmurClient {
         try {
             return await operation();
         } finally {
-            this.#pendingOperations -= 1;
+            this.#finishOperation();
         }
     }
 
@@ -2214,7 +2459,7 @@ export class MurmurClient {
             this.#assertOpen();
             return await operation();
         } finally {
-            this.#pendingOperations -= 1;
+            this.#finishOperation();
             release();
         }
     }

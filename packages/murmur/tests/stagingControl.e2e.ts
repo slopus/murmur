@@ -161,8 +161,8 @@ describe.runIf(tokenSecret !== undefined)("deployed Cloudflare staging control p
 
             await aliceClient.deleteAccount(ctx);
         } finally {
-            await aliceClient.close(ctx);
-            await bobClient.close(ctx);
+            await aliceClient.close();
+            await bobClient.close();
         }
     }, 120_000);
 });

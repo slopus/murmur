@@ -1249,8 +1249,8 @@ describe("network and delivery contract chaos", () => {
             expect(fixture.recording.published[4]?.id).toBe(fixture.recording.published[3]?.id);
             schedule.assertConsumed();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await fixture.relay.close();
         }
     }, 30_000);
@@ -1318,8 +1318,8 @@ describe("network and delivery contract chaos", () => {
             expect(updates).toEqual(["after Welcome"]);
             schedule.assertConsumed();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await fixture.relay.close();
         }
     }, 30_000);
@@ -1361,7 +1361,7 @@ describe("network and delivery contract chaos", () => {
             await bob.activateSession(ctx, session.id);
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
 
-            alice.close(ctx);
+            alice.close();
             const recording = new RecordingDeliveryTransport(fixture.http);
             const schedule = new SeededChaosSchedule(0x4e455418, [
                 {
@@ -1405,7 +1405,7 @@ describe("network and delivery contract chaos", () => {
             });
             expect(await dave.session(ctx, session.id)).toBeUndefined();
 
-            alice.close(ctx);
+            alice.close();
             alice = await murmurClient(aliceIdentity, recording, aliceStore, fixture.clock.now);
             expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
@@ -1433,10 +1433,10 @@ describe("network and delivery contract chaos", () => {
             expect((await dave.session(ctx, session.id))?.members).toHaveLength(4);
             schedule.assertConsumed();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
-            dave.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
+            dave.close();
             await fixture.relay.close();
         }
     }, 60_000);
@@ -1611,8 +1611,8 @@ describe("network and delivery contract chaos", () => {
                 reAdmission: true,
             });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             destroyIdentity(expiringSender);
             await fixture.relay.close();
         }

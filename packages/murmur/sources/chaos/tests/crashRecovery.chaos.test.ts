@@ -305,7 +305,7 @@ async function reopen(actor: ChaosActor, clock: ManualVirtualClock): Promise<voi
 async function closeFixture(fixture: ChaosFixture): Promise<void> {
     for (const actor of fixture.actors) {
         try {
-            actor.client.close(ctx);
+            actor.client.close();
         } catch {
             // A deliberately abandoned operation can retain only the dead client instance.
         }
@@ -667,7 +667,7 @@ describe("crash and transaction recovery chaos", () => {
                     expect((await delegate.scan(ctx, "murmur/identity/", { limit: 10 })).size).toBe(
                         1,
                     );
-                    reopened.close(ctx);
+                    reopened.close();
                 } finally {
                     await closeFixture(fixture);
                 }

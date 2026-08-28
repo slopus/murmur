@@ -386,8 +386,8 @@ describe("adversarial inputs and resource limits", () => {
                 "live-after-invalid-commit",
             );
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await closeFixture(fixture, [aliceIdentity, bobIdentity, attacker]);
         }
     }, 120_000);
@@ -745,8 +745,8 @@ describe("adversarial inputs and resource limits", () => {
                 }),
             ).rejects.toThrow("already used");
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await fixture.relay.close();
         }
     });
@@ -836,8 +836,8 @@ describe("adversarial inputs and resource limits", () => {
                 "current-after-prior-abuse",
             );
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await fixture.relay.close();
         }
     }, 120_000);

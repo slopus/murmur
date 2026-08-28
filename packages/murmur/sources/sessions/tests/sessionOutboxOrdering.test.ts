@@ -76,7 +76,7 @@ describe("session outbox ordering", () => {
             for (const value of expected) {
                 await alice.send(ctx, session.id, utf8Encode(value));
             }
-            alice.close(ctx);
+            alice.close();
             let failFirstApplication = true;
             const transientHead: DeliveryTransport = {
                 publish: (_ctx, delivery, signal) => {
@@ -107,8 +107,8 @@ describe("session outbox ordering", () => {
             });
             expect(received).toEqual(expected);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
         // Relay-derived fanout adds a round trip per publication, so this

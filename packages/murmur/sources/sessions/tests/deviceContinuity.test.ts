@@ -71,8 +71,8 @@ describe("device inbox continuity", () => {
             now += 2;
             await expect(relay.pruneExpired()).resolves.toBe(1);
 
-            await expect(
-                bob.synchronize(
+            const failure = await bob
+                .synchronize(
                     ctx,
                     { waitMilliseconds: 0 },
                     {
@@ -81,8 +81,13 @@ describe("device inbox continuity", () => {
                             throw new Error("application retry");
                         },
                     },
-                ),
-            ).rejects.toThrow("application retry");
+                )
+                .catch((error: unknown) => error);
+            expect(failure).toMatchObject({
+                code: "callback_failed",
+                callback: "onReset",
+                eventIds: [snapshots[0]?.id],
+            });
             expect(await bob.session(ctx, created.id)).toBeDefined();
             expect(await bobStore.get(ctx, "murmur/reset/v1/pending")).toBeDefined();
 
@@ -128,8 +133,8 @@ describe("device inbox continuity", () => {
                 status: "pending",
             });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             destroyIdentity(expiringSender);
             await relay.close();
         }

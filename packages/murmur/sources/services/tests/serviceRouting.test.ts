@@ -5,9 +5,9 @@ import type { DeliveryFetch } from "../../delivery/index.js";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
-import { MurmurClient } from "../../sessions/index.js";
+import { MurmurCallbackError, MurmurClient } from "../../sessions/index.js";
 import type { MurmurService } from "../index.js";
-import type { MurmurSessionChangedEvent } from "../../sessions/index.js";
+import type { MurmurSessionChangedEvent, MurmurSessionIssue } from "../../sessions/index.js";
 
 const ctx = createRootContext().named("test");
 
@@ -93,7 +93,7 @@ describe("typed session services", () => {
             expect(bobUpdates).toEqual(["first"]);
             expect(global).toEqual(["notes:first"]);
 
-            bob.close(ctx);
+            bob.close();
             bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
@@ -107,8 +107,8 @@ describe("typed session services", () => {
             expect(claims).toBe(1);
             expect(bobUpdates).toEqual(["first", "second"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -156,7 +156,7 @@ describe("typed session services", () => {
             await alice.synchronize(ctx);
             await bob.synchronize(ctx, { limit: 256, waitMilliseconds: 0 });
 
-            bob.close(ctx);
+            bob.close();
             bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
@@ -199,8 +199,8 @@ describe("typed session services", () => {
                 "session:true",
             ]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -242,8 +242,8 @@ describe("typed session services", () => {
             await bob.synchronize(ctx);
             expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -290,15 +290,107 @@ describe("typed session services", () => {
             await alice.synchronize(ctx);
             await alice.send(ctx, session.id, utf8Encode("stable"));
             await alice.synchronize(ctx);
-            await expect(bob.synchronize(ctx)).rejects.toThrow("retry this service batch");
+            await expect(bob.synchronize(ctx)).rejects.toMatchObject({
+                code: "callback_failed",
+                callback: "service.onUpdate",
+            });
             expect(await bob.session(ctx, session.id)).toMatchObject({ bufferedEvents: 1 });
             await bob.synchronize(ctx);
             expect(seen).toHaveLength(2);
             expect(seen[0]).toBe(seen[1]);
             expect(await bob.session(ctx, session.id)).toMatchObject({ bufferedEvents: 0 });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
+            await relay.close();
+        }
+    });
+
+    test("does not repeat a completed service callback when the global hook retries", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const fetch = relayFetch(relay);
+        const bobStore = new MemoryMurmurStore();
+        let serviceAttempts = 0;
+        const globalIds: string[] = [];
+        const receiver: MurmurService = {
+            onNewSession: async () => true,
+            onUpdate: async () => {
+                serviceAttempts += 1;
+            },
+        };
+        const sender: MurmurService = {
+            onNewSession: async () => true,
+            onUpdate: async () => {},
+        };
+        const alice = await MurmurClient.open(ctx, {
+            relay: "https://relay.test",
+            fetch,
+            store: new MemoryMurmurStore(),
+            now: () => NOW,
+            services: [{ id: "receipt", service: sender }],
+        });
+        let bob = await MurmurClient.open(ctx, {
+            relay: "https://relay.test",
+            fetch,
+            store: bobStore,
+            now: () => NOW,
+            services: [{ id: "receipt", service: receiver }],
+        });
+        try {
+            const session = await alice.createSession(ctx, {
+                descriptor: utf8Encode("service receipt"),
+                members: [await bob.createKeyPackage(ctx)],
+                service: "receipt",
+            });
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
+            await alice.send(ctx, session.id, utf8Encode("once"));
+            await alice.synchronize(ctx);
+            await expect(
+                bob.synchronize(
+                    ctx,
+                    {},
+                    {
+                        onUpdates: async (_ctx, updates) => {
+                            globalIds.push(...updates.map((update) => update.id));
+                            throw new MurmurCallbackError(
+                                "onIssues",
+                                ["inner"],
+                                new Error("retry global hook"),
+                            );
+                        },
+                    },
+                ),
+            ).rejects.toMatchObject({
+                code: "callback_failed",
+                callback: "onUpdates",
+                cause: expect.objectContaining({ callback: "onIssues" }),
+            });
+            expect(serviceAttempts).toBe(1);
+            bob.close();
+            bob = await MurmurClient.open(ctx, {
+                relay: "https://relay.test",
+                fetch,
+                store: bobStore,
+                now: () => NOW,
+                services: [{ id: "receipt", service: receiver }],
+            });
+            await bob.synchronize(
+                ctx,
+                {},
+                {
+                    onUpdates: async (_ctx, updates) => {
+                        globalIds.push(...updates.map((update) => update.id));
+                    },
+                },
+            );
+            expect(serviceAttempts).toBe(1);
+            expect(globalIds).toHaveLength(2);
+            expect(globalIds[0]).toBe(globalIds[1]);
+        } finally {
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -357,8 +449,8 @@ describe("typed session services", () => {
             await bob.synchronize(ctx);
             expect(memberEvents).toEqual([deletionId, deletionId]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -449,7 +541,7 @@ describe("typed session services", () => {
             });
             await alice.synchronize(ctx);
 
-            bob.close(ctx);
+            bob.close();
             bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
@@ -488,7 +580,7 @@ describe("typed session services", () => {
                 },
             });
 
-            await bob.leave(ctx, session.id);
+            await bob.leaveSession(ctx, session.id);
             await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
@@ -512,8 +604,8 @@ describe("typed session services", () => {
             });
             expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -567,8 +659,8 @@ describe("typed session services", () => {
             expect(snapshots).toHaveLength(2);
             expect(snapshots[1]!.policies.adminsAssignAdmins).toBe(true);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -648,9 +740,9 @@ describe("typed session services", () => {
                 expect.arrayContaining([alice.identity, bob.identity]),
             );
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -730,8 +822,8 @@ describe("typed session services", () => {
             ]);
             expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -783,8 +875,8 @@ describe("typed session services", () => {
             expect(snapshots).toHaveLength(1);
             expect(snapshots[0]).toMatchObject({ reAdmission: true, status: "active" });
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -850,13 +942,13 @@ describe("typed session services", () => {
             }
             expect(snapshots).toHaveLength(1);
             expect(snapshots[0]!.members).toEqual(
-                expect.arrayContaining([alice.identity, bob.accountKey]),
+                expect.arrayContaining([alice.identity, bob.identity]),
             );
             expect(snapshots[0]!.members).toHaveLength(2);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            second?.close(ctx);
+            alice.close();
+            bob.close();
+            second?.close();
             destroyIdentity(bobAccount);
             await relay.close();
         }
@@ -958,8 +1050,8 @@ describe("typed session services", () => {
             );
             expect(order).toEqual(["deleted"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -997,7 +1089,7 @@ describe("typed session services", () => {
             await alice.send(ctx, applicationSession.id, utf8Encode("deferred application update"));
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
 
-            bob.close(ctx);
+            bob.close();
             bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
@@ -1021,7 +1113,7 @@ describe("typed session services", () => {
             });
             await alice.synchronize(ctx, { waitMilliseconds: 0 });
             const snapshots: MurmurSessionChangedEvent[] = [];
-            await bob.synchronize(
+            const blocked = await bob.synchronize(
                 ctx,
                 { waitMilliseconds: 0 },
                 {
@@ -1030,7 +1122,13 @@ describe("typed session services", () => {
                     },
                 },
             );
-            expect(snapshots).toEqual([]);
+            expect(blocked.blocked).toMatchObject({
+                reason: "missing_update_handler",
+                sessionId: applicationSession.id,
+            });
+            expect(snapshots).toHaveLength(1);
+            expect(snapshots[0]?.sessionId).toEqual(applicationSession.id);
+            expect(snapshots[0]?.service).toBeUndefined();
             const rawUpdates: string[] = [];
             await bob.synchronize(
                 ctx,
@@ -1045,8 +1143,8 @@ describe("typed session services", () => {
                 },
             );
             expect(rawUpdates).toEqual(["deferred application update"]);
-            expect(snapshots).toHaveLength(1);
-            expect(snapshots[0]!.sessionId).toEqual(serviceSession.id);
+            expect(snapshots).toHaveLength(2);
+            expect(snapshots[1]!.sessionId).toEqual(serviceSession.id);
             expect(await bob.session(ctx, applicationSession.id)).toMatchObject({
                 bufferedEvents: 0,
             });
@@ -1058,8 +1156,8 @@ describe("typed session services", () => {
                 ).size,
             ).toBe(0);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1107,7 +1205,7 @@ describe("typed session services", () => {
                 { onSessionsChanged: async () => {} },
             );
 
-            bob.close(ctx);
+            bob.close();
             bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
@@ -1147,7 +1245,7 @@ describe("typed session services", () => {
             ).resolves.toBeDefined();
             expect(order).toEqual([]);
 
-            bob.close(ctx);
+            bob.close();
             bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
@@ -1176,8 +1274,8 @@ describe("typed session services", () => {
                 "session:pending",
             ]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1268,9 +1366,9 @@ describe("typed session services", () => {
         } finally {
             releaseUpdate();
             await synchronization?.catch(() => {});
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1353,9 +1451,9 @@ describe("typed session services", () => {
             );
             expect(retained.members).toHaveLength(2);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
-            carol.close(ctx);
+            alice.close();
+            bob.close();
+            carol.close();
             await relay.close();
         }
     });
@@ -1441,8 +1539,8 @@ describe("typed session services", () => {
             expect(snapshots[0]!.id <= retried.inbox.cursor!).toBe(true);
             expect(retried.inbox.cursor).not.toBe(deferred.inbox.cursor);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1535,8 +1633,8 @@ describe("typed session services", () => {
             ]);
             expect(globalOrder).toEqual(serviceOrder);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1634,8 +1732,8 @@ describe("typed session services", () => {
             expect(order[257]).toBe("session-change");
             expect(globalOrder).toEqual(order);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     }, 120_000);
@@ -1806,8 +1904,8 @@ describe("typed session services", () => {
             await bob.synchronize(ctx, { waitMilliseconds: 0 });
             expect(received).toEqual(["ordered update", "healthy update"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1893,8 +1991,8 @@ describe("typed session services", () => {
             await bob.synchronize(ctx, { waitMilliseconds: 0 });
             expect(received).toEqual(["healthy"]);
         } finally {
-            alice.close(ctx);
-            bob.close(ctx);
+            alice.close();
+            bob.close();
             await relay.close();
         }
     });
@@ -1912,21 +2010,27 @@ describe("typed session services", () => {
             await store.set(ctx, "murmur/session-quarantine/corrupt", utf8Encode("{"));
             await store.set(ctx, `murmur/session-intents/${"A".repeat(32)}`, utf8Encode("{"));
             const issues: string[] = [];
+            const observedIssues: MurmurSessionIssue[] = [];
             let callbacks = 0;
             const lifecycle = {
-                onIssues: async (
-                    _ctx: typeof ctx,
-                    current: readonly { readonly code: string }[],
-                ) => {
+                onIssues: async (_ctx: typeof ctx, current: readonly MurmurSessionIssue[]) => {
                     callbacks += 1;
                     expect(Object.isFrozen(current)).toBe(true);
                     expect(current.every((issue) => Object.isFrozen(issue))).toBe(true);
                     expect(current.length).toBeLessThanOrEqual(256);
+                    observedIssues.push(...current);
                     issues.push(...current.map(({ code }) => code));
                 },
             };
             await murmur.synchronize(ctx, { waitMilliseconds: 0 }, lifecycle);
             expect(issues).toContain("corrupt_session_intent");
+            expect(observedIssues).toContainEqual(
+                expect.objectContaining({
+                    code: "corrupt_session_intent",
+                    severity: "warning",
+                    recovery: "automatic",
+                }),
+            );
             expect(await store.get(ctx, "murmur/session-quarantine/corrupt")).toBeUndefined();
             await murmur.synchronize(ctx, { waitMilliseconds: 0 }, lifecycle);
             expect(callbacks).toBe(1);
@@ -1934,7 +2038,7 @@ describe("typed session services", () => {
             await murmur.synchronize(ctx, { waitMilliseconds: 0 }, lifecycle);
             expect(callbacks).toBe(1);
         } finally {
-            murmur.close(ctx);
+            murmur.close();
             await relay.close();
         }
     });
