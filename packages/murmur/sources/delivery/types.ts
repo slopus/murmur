@@ -1,5 +1,7 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import type { IdentityKeyPair } from "../crypto/index.js";
-import type { MurmurStore, StoreTransaction } from "../storage/index.js";
+import type { MurmurStore } from "../storage/index.js";
 
 /** One signed claim about the relay roster used to expand an account target. */
 export interface DeliveryAccountTarget {
@@ -170,7 +172,11 @@ export interface InboxAcknowledgement {
 }
 
 /** Browser-safe fetch signature used by the HTTP delivery transport. */
-export type DeliveryFetch = (input: RequestInfo | URL, init?: RequestInit) => Promise<Response>;
+export type DeliveryFetch = (
+    ctx: Context,
+    input: RequestInfo | URL,
+    init?: RequestInit,
+) => Promise<Response>;
 
 /** Signed proof used when requesting a short-lived negotiated relay session. */
 export interface SignedRelaySessionRequest {
@@ -192,7 +198,11 @@ export interface RelaySessionTicket {
 
 /** Application-provided session issuer, normally backed by its authenticated server. */
 export interface RelaySessionProvider {
-    issue(request: SignedRelaySessionRequest, signal?: AbortSignal): Promise<RelaySessionTicket>;
+    issue(
+        ctx: Context,
+        request: SignedRelaySessionRequest,
+        signal?: AbortSignal,
+    ): Promise<RelaySessionTicket>;
 }
 
 /** Minimal WebSocket message event used by the browser-safe transport seam. */
@@ -220,6 +230,7 @@ export interface DeliveryWebSocket {
 
 /** Factory used to open a WebSocket without imposing a runtime dependency. */
 export type DeliveryWebSocketFactory = (
+    ctx: Context,
     url: string,
     protocols: readonly string[],
 ) => DeliveryWebSocket;
@@ -243,9 +254,9 @@ export interface WebSocketDeliveryTransportOptions {
 
 /** Optional lifecycle hooks for opening one delivery event stream. */
 export interface DeliveryStreamHooks {
-    readonly onConnected?: () => void | Promise<void>;
+    readonly onConnected?: (ctx: Context) => void | Promise<void>;
     /** Ephemeral hint that the authenticated account roster should be read again. */
-    readonly onDeviceRosterChanged?: (accountKey: Uint8Array) => void;
+    readonly onDeviceRosterChanged?: (ctx: Context, accountKey: Uint8Array) => void;
 }
 
 /**
@@ -254,33 +265,49 @@ export interface DeliveryStreamHooks {
  * WebSocket transports do not fit the application's relay integration.
  */
 export interface DeliveryTransport {
-    publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome>;
+    publish(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome>;
     /** Apply one account-signed, replay-protected session relay-state deletion. */
-    deleteSession?(delivery: SignedDelivery, signal?: AbortSignal): Promise<number>;
+    deleteSession?(ctx: Context, delivery: SignedDelivery, signal?: AbortSignal): Promise<number>;
     /** Apply one account-signed, replay-protected terminal account deletion. */
-    deleteAccount?(delivery: SignedDelivery, signal?: AbortSignal): Promise<void>;
-    read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
-    acknowledge(request: SignedInboxAck, signal?: AbortSignal): Promise<InboxAcknowledgement>;
+    deleteAccount?(ctx: Context, delivery: SignedDelivery, signal?: AbortSignal): Promise<void>;
+    read(ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage>;
+    acknowledge(
+        ctx: Context,
+        request: SignedInboxAck,
+        signal?: AbortSignal,
+    ): Promise<InboxAcknowledgement>;
     /** Read the relay's one current roster for an exact account identity key. */
     readDeviceRoster?(
+        ctx: Context,
         accountKey: Uint8Array,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster | undefined>;
     /** Apply and enqueue one account-signed roster-mutation delivery. */
     mutateDeviceRoster?(
+        ctx: Context,
         delivery: SignedDelivery,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster>;
     /** Upload one account-signed replacement or replenishment for this device. */
-    uploadDirectoryPrekeys?(delivery: SignedDelivery, signal?: AbortSignal): Promise<void>;
+    uploadDirectoryPrekeys?(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<void>;
     /** Spend one opaque authentication ticket on an exact identity-directory claim. */
     claimDirectory?(
+        ctx: Context,
         accountKey: Uint8Array,
         ticket: Uint8Array,
         signal?: AbortSignal,
     ): Promise<DeliveryDirectoryClaim>;
     /** Stream exact queued events in recipient inbox order when supported. */
     stream?(
+        ctx: Context,
         request: SignedInboxRead,
         signal?: AbortSignal,
         hooks?: DeliveryStreamHooks,
@@ -316,7 +343,8 @@ export interface CreateInboxReadOptions {
  * `InboxProcessor` integrations. Ordinary applications use sync callbacks.
  */
 export type InboxDeliveryHandler = (
-    transaction: StoreTransaction,
+    ctx: Context,
+    store: MurmurStore,
     delivery: InboxDelivery,
 ) => Promise<void>;
 
@@ -344,8 +372,8 @@ export interface InboxSyncOptions {
 /** One recipient SSE session; a signal is required to define its lifetime. */
 export interface InboxStreamOptions {
     readonly signal: AbortSignal;
-    readonly onConnected?: () => void | Promise<void>;
-    readonly onDeviceRosterChanged?: (accountKey: Uint8Array) => void;
+    readonly onConnected?: (ctx: Context) => void | Promise<void>;
+    readonly onDeviceRosterChanged?: (ctx: Context, accountKey: Uint8Array) => void;
 }
 
 /** Durable terminal-rejection summary. */

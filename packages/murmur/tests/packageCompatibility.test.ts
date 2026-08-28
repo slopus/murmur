@@ -162,6 +162,7 @@ for (const specifier of blocked) {
             await writeFile(
                 join(consumerDirectory, "consumer.ts"),
                 `
+import { createRootContext } from "@steve.kite/stdlib";
 import {
     HttpDeliveryTransport,
     HttpRelaySessionProvider,
@@ -187,8 +188,9 @@ import {
     type SignedRelaySessionRequest,
 } from "@slopus/murmur";
 
+const ctx = createRootContext().named("consumer");
 const store: MurmurStore = new MemoryMurmurStore();
-const deliveryFetch: DeliveryFetch = globalThis.fetch;
+const deliveryFetch: DeliveryFetch = (_ctx, input, init) => globalThis.fetch(input, init);
 const transport = new HttpDeliveryTransport("https://relay.example", { fetch: deliveryFetch });
 const identity: IdentityKeyPair = generateIdentityKeyPair();
 const protectedIdentity: Promise<CreatedAccountSecret> = createAccountSecret(identity, "password");
@@ -215,14 +217,14 @@ const options: MurmurClientOptions = {
     }],
 };
 const service: MurmurService = options.services![0]!.service;
-const opening: Promise<MurmurClient> = MurmurClient.open(options);
+const opening: Promise<MurmurClient> = MurmurClient.open(ctx, options);
 const syncOptions: MurmurSyncOptions = {
     abort: new AbortController().signal,
-    onUpdates: async (updates) => void updates,
+    onUpdates: async (_ctx, updates) => void updates,
 };
 const createSession = async (client: MurmurClient): Promise<void> => {
-    const member: MurmurSessionMember = await client.createKeyPackage();
-    await client.createSession({ descriptor: new Uint8Array([1]), members: [member] });
+    const member: MurmurSessionMember = await client.createKeyPackage(ctx);
+    await client.createSession(ctx, { descriptor: new Uint8Array([1]), members: [member] });
 };
 const page: MurmurSessionPage | undefined = undefined;
 void transport;

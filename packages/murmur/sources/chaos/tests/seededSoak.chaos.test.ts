@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 /**
  * Deterministic composed chaos profiles.
  *
@@ -47,6 +48,8 @@ import {
     SeededChaosSchedule,
     SeededRandom,
 } from "../index.js";
+
+const ctx = createRootContext().named("test");
 
 const NOW = 1_700_000_000_000;
 const MINUTE = 60_000;
@@ -1063,9 +1066,9 @@ class SoakHarness {
             schedule,
         });
         await store
-            .transaction(async (transaction) => {
-                await transaction.set(`${prefix}/a`, new Uint8Array([1]));
-                await transaction.set(`${prefix}/b`, new Uint8Array([2]));
+            .tx(ctx, async (transaction) => {
+                await store.set(transaction, `${prefix}/a`, new Uint8Array([1]));
+                await store.set(transaction, `${prefix}/b`, new Uint8Array([2]));
             })
             .then(
                 () => {
@@ -1073,8 +1076,8 @@ class SoakHarness {
                 },
                 () => undefined,
             );
-        const first = await actor.store.get(`${prefix}/a`);
-        const second = await actor.store.get(`${prefix}/b`);
+        const first = await actor.store.get(ctx, `${prefix}/a`);
+        const second = await actor.store.get(ctx, `${prefix}/b`);
         this.#check(
             "I02",
             action.mode === "rollback"
@@ -1437,7 +1440,7 @@ class SoakHarness {
         const storeRows = (
             await Promise.all(
                 this.#actors.map(
-                    async (actor) => (await actor.store.scan("", { limit: 10_000 })).size,
+                    async (actor) => (await actor.store.scan(ctx, "", { limit: 10_000 })).size,
                 ),
             )
         ).reduce((total, count) => total + count, 0);
@@ -1740,7 +1743,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         defaultAdmissionPrincipal: "seeded-soak",
         maximumRequestsPerMinutePerAddress: 1_000_000,
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 function publicSessionSnapshot(session: MurmurSession): string {
@@ -1849,13 +1852,13 @@ describe("seeded soak and refinement", () => {
         const aliceStore = new MemoryMurmurStore();
         const bobStore = new MemoryMurmurStore();
         const fetch = relayFetch(relay);
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: aliceStore,
             now: () => now,
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: bobStore,
@@ -1865,20 +1868,21 @@ describe("seeded soak and refinement", () => {
         const snapshots: MurmurResetEvent[] = [];
         const identityBefore = bob.identity;
         try {
-            const created = await alice.createSession({
+            const created = await alice.createSession(ctx, {
                 descriptor: utf8Encode("seeded-soak-reset"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.activateSession(created.id);
-            const before = await bob.session(created.id);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.activateSession(ctx, created.id);
+            const before = await bob.session(ctx, created.id);
             if (before === undefined) throw new Error("Missing active reset session");
-            await bobStore.set("murmur/soak/technical", utf8Encode("purge"));
-            await bobStore.set("application/soak-preserved", utf8Encode("retain"));
+            await bobStore.set(ctx, "murmur/soak/technical", utf8Encode("purge"));
+            await bobStore.set(ctx, "application/soak-preserved", utf8Encode("retain"));
 
             const transport = new HttpDeliveryTransport("https://relay.test", { fetch });
             await transport.publish(
+                ctx,
                 createSignedDelivery(
                     expiringSender,
                     [bob.deviceKey],
@@ -1891,23 +1895,25 @@ describe("seeded soak and refinement", () => {
 
             await expect(
                 bob.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onReset: (reset) => {
+                        onReset: (_ctx, reset) => {
                             snapshots.push(reset);
                             throw new Error("retry reset callback");
                         },
                     },
                 ),
             ).rejects.toThrow("retry reset callback");
-            expect(await bob.session(created.id)).toBeDefined();
-            expect(await bobStore.get("murmur/reset/v1/pending")).toBeDefined();
+            expect(await bob.session(ctx, created.id)).toBeDefined();
+            expect(await bobStore.get(ctx, "murmur/reset/v1/pending")).toBeDefined();
 
             await expect(
                 bob.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onReset: (reset) => {
+                        onReset: (_ctx, reset) => {
                             snapshots.push(reset);
                         },
                     },
@@ -1929,27 +1935,27 @@ describe("seeded soak and refinement", () => {
                     policies: snapshots[1]!.sessions[0]!.policies,
                 }),
             );
-            expect(await bob.session(created.id)).toBeUndefined();
+            expect(await bob.session(ctx, created.id)).toBeUndefined();
             expect(equalBytes(identityBefore, bob.identity)).toBe(true);
-            expect(await bobStore.get("murmur/soak/technical")).toBeUndefined();
-            expect(await bobStore.get("application/soak-preserved")).toBeDefined();
-            expect(await bobStore.get("murmur/reset/v1/pending")).toBeUndefined();
-            await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
+            expect(await bobStore.get(ctx, "murmur/soak/technical")).toBeUndefined();
+            expect(await bobStore.get(ctx, "application/soak-preserved")).toBeDefined();
+            expect(await bobStore.get(ctx, "murmur/reset/v1/pending")).toBeUndefined();
+            await expect(bob.synchronize(ctx, { waitMilliseconds: 0 })).resolves.toMatchObject({
                 inbox: { processed: 1 },
             });
 
-            await alice.send(created.id, utf8Encode("refresh restored soak roster"));
+            await alice.send(ctx, created.id, utf8Encode("refresh restored soak roster"));
             for (let cycle = 0; cycle < 8; cycle += 1) {
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await bob.synchronize({ waitMilliseconds: 0 });
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
             }
-            await expect(bob.session(created.id)).resolves.toMatchObject({
+            await expect(bob.session(ctx, created.id)).resolves.toMatchObject({
                 descriptor: created.descriptor,
                 status: "pending",
             });
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             destroyIdentity(expiringSender);
             await relay.close();
         }

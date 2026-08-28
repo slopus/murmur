@@ -1,3 +1,5 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import type { IdentityKeyPair } from "../../crypto/index.js";
 import { randomBytes } from "../../crypto/index.js";
 import { decodeBase64Url, encodeBase64Url, equalBytes, utf8Encode } from "../../utils/index.js";
@@ -189,7 +191,11 @@ function directoryClaim(value: unknown): DeliveryDirectoryClaim {
     };
 }
 
-function defaultWebSocketFactory(url: string, protocols: readonly string[]): DeliveryWebSocket {
+function defaultWebSocketFactory(
+    _ctx: Context,
+    url: string,
+    protocols: readonly string[],
+): DeliveryWebSocket {
     return new WebSocket(url, [...protocols]) as unknown as DeliveryWebSocket;
 }
 
@@ -333,11 +339,20 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     }
 
     /** Publish one exact signed delivery after negotiating its routed endpoint. */
-    async publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    async publish(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         if (!equalBytes(delivery.sender, this.#identity.publicKey)) {
             throw new Error("Delivery sender differs from the negotiated device");
         }
-        const response = await this.#request("publish", signedDeliveryToJson(delivery), signal);
+        const response = await this.#request(
+            ctx,
+            "publish",
+            signedDeliveryToJson(delivery),
+            signal,
+        );
         if (response.status < 200 || response.status >= 300) {
             throwFailure(response.status, response.body);
         }
@@ -349,8 +364,13 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         return { eventId: uuid(body.eventId), duplicate: body.duplicate };
     }
 
-    async deleteSession(delivery: SignedDelivery, signal?: AbortSignal): Promise<number> {
+    async deleteSession(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<number> {
         const response = await this.#request(
+            ctx,
             "delete_session",
             signedDeliveryToJson(delivery),
             signal,
@@ -370,8 +390,13 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         return body.removed;
     }
 
-    async deleteAccount(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+    async deleteAccount(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<void> {
         const response = await this.#request(
+            ctx,
             "delete_account",
             signedDeliveryToJson(delivery),
             signal,
@@ -385,11 +410,13 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     }
 
     async readDeviceRoster(
+        ctx: Context,
         accountKey: Uint8Array,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster | undefined> {
         if (accountKey.length !== 32) throw new Error("Invalid account identity key");
         const response = await this.#request(
+            ctx,
             "read_device_roster",
             { version: 1, accountKey: encodeBase64Url(accountKey) },
             signal,
@@ -403,10 +430,12 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     }
 
     async mutateDeviceRoster(
+        ctx: Context,
         delivery: SignedDelivery,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster> {
         const response = await this.#request(
+            ctx,
             "mutate_device_roster",
             signedDeliveryToJson(delivery),
             signal,
@@ -419,8 +448,13 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         return roster(body.roster);
     }
 
-    async uploadDirectoryPrekeys(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+    async uploadDirectoryPrekeys(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<void> {
         const response = await this.#request(
+            ctx,
             "upload_directory_prekeys",
             signedDeliveryToJson(delivery),
             signal,
@@ -434,6 +468,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     }
 
     async claimDirectory(
+        ctx: Context,
         accountKey: Uint8Array,
         ticket: Uint8Array,
         signal?: AbortSignal,
@@ -442,6 +477,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
             throw new Error("Invalid directory claim");
         }
         const response = await this.#request(
+            ctx,
             "claim_directory",
             {
                 version: 1,
@@ -457,9 +493,9 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     }
 
     /** Read one bounded page from the negotiated device inbox. */
-    async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+    async read(ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
         this.#assertRecipient(request.recipient);
-        const response = await this.#request("read", signedInboxReadToJson(request), signal);
+        const response = await this.#request(ctx, "read", signedInboxReadToJson(request), signal);
         if (response.status < 200 || response.status >= 300) {
             throwFailure(response.status, response.body);
         }
@@ -468,11 +504,17 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
 
     /** Acknowledge and trim one processed prefix of the negotiated device inbox. */
     async acknowledge(
+        ctx: Context,
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<InboxAcknowledgement> {
         this.#assertRecipient(request.recipient);
-        const response = await this.#request("acknowledge", signedInboxAckToJson(request), signal);
+        const response = await this.#request(
+            ctx,
+            "acknowledge",
+            signedInboxAckToJson(request),
+            signal,
+        );
         if (response.status < 200 || response.status >= 300) {
             throwFailure(response.status, response.body);
         }
@@ -502,6 +544,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
 
     /** Stream exact queued deliveries over a negotiated WebSocket. */
     async *stream(
+        ctx: Context,
         request: SignedInboxRead,
         signal?: AbortSignal,
         hooks: DeliveryStreamHooks = {},
@@ -511,10 +554,10 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
             throw new Error("Delivery event streams require a zero wait duration");
         }
         if (isAborted(signal)) return;
-        const ticket = await this.#getTicket(signal);
+        const ticket = await this.#getTicket(ctx, signal);
         if (isAborted(signal)) return;
         const requestId = encodeBase64Url(randomBytes(18));
-        const socket = this.#openSocket(ticket);
+        const socket = this.#openSocket(ctx, ticket);
         const queued: InboxStreamEvent[] = [];
         let wake: (() => void) | undefined;
         let connected = false;
@@ -610,7 +653,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
                     ) {
                         throw new Error("Invalid relay stream message");
                     }
-                    hooks.onDeviceRosterChanged?.(accountKey);
+                    hooks.onDeviceRosterChanged?.(ctx, accountKey);
                     resetHeartbeat();
                     return;
                 }
@@ -647,7 +690,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
             }
             if (failure !== undefined) throw failure;
             if (ended) return;
-            await hooks.onConnected?.();
+            await hooks.onConnected?.(ctx);
             for (;;) {
                 while (queued.length > 0) yield queued.shift()!;
                 if (failure !== undefined) throw failure;
@@ -665,15 +708,16 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
     }
 
     async #request(
+        ctx: Context,
         operation: WebSocketOperation,
         body: unknown,
         signal?: AbortSignal,
     ): Promise<WebSocketResponse> {
         if (signal !== undefined && isAborted(signal)) throw abortError(signal);
-        const ticket = await this.#getTicket(signal);
+        const ticket = await this.#getTicket(ctx, signal);
         if (signal !== undefined && isAborted(signal)) throw abortError(signal);
         const requestId = encodeBase64Url(randomBytes(18));
-        const socket = this.#openSocket(ticket);
+        const socket = this.#openSocket(ctx, ticket);
         return new Promise<WebSocketResponse>((resolve, reject) => {
             let settled = false;
             const cleanup = (): void => {
@@ -723,7 +767,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         });
     }
 
-    async #getTicket(signal?: AbortSignal): Promise<RelaySessionTicket> {
+    async #getTicket(ctx: Context, signal?: AbortSignal): Promise<RelaySessionTicket> {
         const now = this.#now();
         if (
             this.#ticket !== undefined &&
@@ -732,7 +776,7 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
             return this.#ticket;
         }
         this.#ticketPromise ??= this.#sessionProvider
-            .issue(createSignedRelaySessionRequest(this.#identity, now))
+            .issue(ctx, createSignedRelaySessionRequest(this.#identity, now))
             .then((value) => {
                 const ticket = parseRelaySessionTicket(value);
                 if (ticket.expiresAt <= this.#now()) {
@@ -762,8 +806,8 @@ export class WebSocketDeliveryTransport implements DeliveryTransport {
         });
     }
 
-    #openSocket(ticket: RelaySessionTicket): DeliveryWebSocket {
-        return this.#webSocketFactory(ticket.endpoint, [
+    #openSocket(ctx: Context, ticket: RelaySessionTicket): DeliveryWebSocket {
+        return this.#webSocketFactory(ctx, ticket.endpoint, [
             PROTOCOL,
             `${TICKET_PROTOCOL_PREFIX}${ticket.token}`,
         ]);

@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import type { DeliveryFetch } from "../../delivery/index.js";
@@ -6,6 +7,8 @@ import { utf8Decode, utf8Encode } from "../../utils/index.js";
 import { MurmurClient } from "../../sessions/index.js";
 import type { MurmurService } from "../index.js";
 
+const ctx = createRootContext().named("test");
+
 const NOW = 1_700_000_000_000;
 
 function relayFetch(relay: RelayService): DeliveryFetch {
@@ -13,7 +16,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "service-routing-tests",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 describe("typed session services", () => {
@@ -24,26 +27,26 @@ describe("typed session services", () => {
         const bobUpdates: string[] = [];
         let claims = 0;
         const bobService: MurmurService = {
-            onNewSession: async (session) => {
+            onNewSession: async (_ctx, session) => {
                 claims += 1;
                 return utf8Decode(session.descriptor) === "notes-v1";
             },
-            onUpdate: async (update) => {
+            onUpdate: async (_ctx, update) => {
                 bobUpdates.push(utf8Decode(update.bytes));
             },
         };
         const noop: MurmurService = {
-            onNewSession: async () => true,
-            onUpdate: async () => {},
+            onNewSession: async (_ctx) => true,
+            onUpdate: async (_ctx) => {},
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
             now: () => NOW,
             services: [{ id: "notes", service: noop }],
         });
-        let bob = await MurmurClient.open({
+        let bob = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: bobStore,
@@ -51,24 +54,25 @@ describe("typed session services", () => {
             services: [{ id: "notes", service: bobService }],
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("notes-v1"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
                 service: "notes",
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await alice.synchronize();
-            expect(await bob.session(session.id)).toMatchObject({ status: "active" });
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toMatchObject({ status: "active" });
             expect(claims).toBe(1);
 
-            await alice.send(session.id, utf8Encode("first"));
-            await alice.synchronize();
+            await alice.send(ctx, session.id, utf8Encode("first"));
+            await alice.synchronize(ctx);
             const global: string[] = [];
             await bob.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (updates) => {
+                    onUpdates: async (_ctx, updates) => {
                         global.push(
                             ...updates.map(
                                 (update) => `${update.service}:${utf8Decode(update.bytes)}`,
@@ -80,22 +84,22 @@ describe("typed session services", () => {
             expect(bobUpdates).toEqual(["first"]);
             expect(global).toEqual(["notes:first"]);
 
-            bob.close();
-            bob = await MurmurClient.open({
+            bob.close(ctx);
+            bob = await MurmurClient.open(ctx, {
                 relay: "https://relay.test",
                 fetch,
                 store: bobStore,
                 now: () => NOW,
                 services: [{ id: "notes", service: bobService }],
             });
-            await alice.send(session.id, utf8Encode("second"));
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.send(ctx, session.id, utf8Encode("second"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             expect(claims).toBe(1);
             expect(bobUpdates).toEqual(["first", "second"]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -103,13 +107,13 @@ describe("typed session services", () => {
     test("durably ignores a session declined by every registered service", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const fetch = relayFetch(relay);
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
@@ -118,8 +122,8 @@ describe("typed session services", () => {
                 {
                     id: "declines",
                     service: {
-                        onNewSession: async () => false,
-                        onUpdate: async () => {
+                        onNewSession: async (_ctx) => false,
+                        onUpdate: async (_ctx) => {
                             throw new Error("Declined service received an update");
                         },
                     },
@@ -127,18 +131,18 @@ describe("typed session services", () => {
             ],
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("unknown-v1"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -149,25 +153,25 @@ describe("typed session services", () => {
         let attempts = 0;
         const seen: string[] = [];
         const receiver: MurmurService = {
-            onNewSession: async () => true,
-            onUpdate: async (update) => {
+            onNewSession: async (_ctx) => true,
+            onUpdate: async (_ctx, update) => {
                 attempts += 1;
                 seen.push(update.id);
                 if (attempts === 1) throw new Error("retry this service batch");
             },
         };
         const sender: MurmurService = {
-            onNewSession: async () => true,
-            onUpdate: async () => {},
+            onNewSession: async (_ctx) => true,
+            onUpdate: async (_ctx) => {},
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
             now: () => NOW,
             services: [{ id: "retry", service: sender }],
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
@@ -175,25 +179,25 @@ describe("typed session services", () => {
             services: [{ id: "retry", service: receiver }],
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("retry"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
                 service: "retry",
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await alice.synchronize();
-            await alice.send(session.id, utf8Encode("stable"));
-            await alice.synchronize();
-            await expect(bob.synchronize()).rejects.toThrow("retry this service batch");
-            expect(await bob.session(session.id)).toMatchObject({ bufferedEvents: 1 });
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
+            await alice.send(ctx, session.id, utf8Encode("stable"));
+            await alice.synchronize(ctx);
+            await expect(bob.synchronize(ctx)).rejects.toThrow("retry this service batch");
+            expect(await bob.session(ctx, session.id)).toMatchObject({ bufferedEvents: 1 });
+            await bob.synchronize(ctx);
             expect(seen).toHaveLength(2);
             expect(seen[0]).toBe(seen[1]);
-            expect(await bob.session(session.id)).toMatchObject({ bufferedEvents: 0 });
+            expect(await bob.session(ctx, session.id)).toMatchObject({ bufferedEvents: 0 });
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -205,29 +209,29 @@ describe("typed session services", () => {
         const memberEvents: string[] = [];
         let memberAttempts = 0;
         const ownerService: MurmurService = {
-            onNewSession: async () => true,
-            onUpdate: async () => {},
-            onSessionDeleted: async (event) => {
+            onNewSession: async (_ctx) => true,
+            onUpdate: async (_ctx) => {},
+            onSessionDeleted: async (_ctx, event) => {
                 ownerEvents.push(event.id);
             },
         };
         const memberService: MurmurService = {
-            onNewSession: async () => true,
-            onUpdate: async () => {},
-            onSessionDeleted: async (event) => {
+            onNewSession: async (_ctx) => true,
+            onUpdate: async (_ctx) => {},
+            onSessionDeleted: async (_ctx, event) => {
                 memberAttempts += 1;
                 memberEvents.push(event.id);
                 if (memberAttempts === 1) throw new Error("retry deletion event");
             },
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
             now: () => NOW,
             services: [{ id: "notes", service: ownerService }],
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             relay: "https://relay.test",
             fetch,
             store: new MemoryMurmurStore(),
@@ -235,25 +239,25 @@ describe("typed session services", () => {
             services: [{ id: "notes", service: memberService }],
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("delete-service"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
                 service: "notes",
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await alice.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
 
-            const deletionId = await alice.deleteSession(session.id);
-            await alice.synchronize();
+            const deletionId = await alice.deleteSession(ctx, session.id);
+            await alice.synchronize(ctx);
             expect(ownerEvents).toEqual([deletionId]);
-            await expect(bob.synchronize()).rejects.toThrow("retry deletion event");
-            await expect(bob.session(session.id)).resolves.toBeUndefined();
-            await bob.synchronize();
+            await expect(bob.synchronize(ctx)).rejects.toThrow("retry deletion event");
+            await expect(bob.session(ctx, session.id)).resolves.toBeUndefined();
+            await bob.synchronize(ctx);
             expect(memberEvents).toEqual([deletionId, deletionId]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });

@@ -1,3 +1,5 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import type { IdentityKeyPair } from "../../crypto/index.js";
 import {
     randomBytes,
@@ -233,7 +235,7 @@ export class HttpRelaySessionProvider implements RelaySessionProvider {
         if (this.#url.protocol !== "https:" && this.#url.protocol !== "http:") {
             throw new Error("Relay-session issuer URL must use HTTP or HTTPS");
         }
-        this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+        this.#fetch = options.fetch ?? ((_ctx, input, init) => globalThis.fetch(input, init));
         this.#maximumResponseBytes = options.maximumResponseBytes ?? DEFAULT_MAXIMUM_RESPONSE_BYTES;
         this.#requestTimeoutMilliseconds =
             options.requestTimeoutMilliseconds ?? DEFAULT_REQUEST_TIMEOUT_MILLISECONDS;
@@ -251,6 +253,7 @@ export class HttpRelaySessionProvider implements RelaySessionProvider {
 
     /** Ask the application server to authenticate and route one device. */
     async issue(
+        ctx: Context,
         request: SignedRelaySessionRequest,
         signal?: AbortSignal,
     ): Promise<RelaySessionTicket> {
@@ -267,7 +270,7 @@ export class HttpRelaySessionProvider implements RelaySessionProvider {
             this.#requestTimeoutMilliseconds,
         );
         try {
-            const response = await this.#fetch(this.#url, {
+            const response = await this.#fetch(ctx, this.#url, {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify(signedRelaySessionRequestToJson(request)),

@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import {
     parseSignedRelaySessionRequest as parseServerSessionRequest,
     verifyRelaySessionRequest,
@@ -22,6 +23,8 @@ import {
     type RelaySessionProvider,
     type SignedRelaySessionRequest,
 } from "../index.js";
+
+const ctx = createRootContext().named("test");
 
 const NOW = 1_720_000_000_000;
 const EVENT_ID = "0190b2e0-8000-7000-8000-000000000001";
@@ -78,7 +81,7 @@ describe("negotiated WebSocket delivery", () => {
         const identity = generateIdentityKeyPair();
         let captured: SignedRelaySessionRequest | undefined;
         const provider = new HttpRelaySessionProvider("https://app.test/v2/murmur-session", {
-            fetch: async (_input, initialization) => {
+            fetch: async (_ctx, _input, initialization) => {
                 captured = parseSignedRelaySessionRequest(
                     JSON.parse(String(initialization?.body)) as unknown,
                 );
@@ -92,7 +95,7 @@ describe("negotiated WebSocket delivery", () => {
             },
         });
         const proof = createSignedRelaySessionRequest(identity, NOW, new Uint8Array(24).fill(7));
-        const ticket = await provider.issue(proof);
+        const ticket = await provider.issue(ctx, proof);
 
         expect(ticket.endpoint).toBe("wss://relay.test/v2/connect");
         expect(captured).toBeDefined();
@@ -112,7 +115,7 @@ describe("negotiated WebSocket delivery", () => {
         );
         const issued: SignedRelaySessionRequest[] = [];
         const provider: RelaySessionProvider = {
-            issue: (request) => {
+            issue: (_ctx, request) => {
                 issued.push(request);
                 return Promise.resolve({
                     version: 1,
@@ -126,7 +129,7 @@ describe("negotiated WebSocket delivery", () => {
         const protocols: (readonly string[])[] = [];
         const transport = new WebSocketDeliveryTransport(identity, provider, {
             now: () => NOW,
-            webSocketFactory: (_url, offered) => {
+            webSocketFactory: (_ctx, _url, offered) => {
                 protocols.push(offered);
                 return new FakeWebSocket((frame, socket) => {
                     if (frame.operation === "publish") {
@@ -208,23 +211,24 @@ describe("negotiated WebSocket delivery", () => {
             },
         });
 
-        await expect(transport.publish(delivery)).resolves.toEqual({
+        await expect(transport.publish(ctx, delivery)).resolves.toEqual({
             eventId: EVENT_ID,
             duplicate: false,
         });
         await expect(
-            transport.read(createSignedInboxRead(identity, { createdAt: NOW, limit: 1 })),
+            transport.read(ctx, createSignedInboxRead(identity, { createdAt: NOW, limit: 1 })),
         ).resolves.toMatchObject({ head: EVENT_ID, deliveries: [] });
         await expect(
-            transport.acknowledge(createSignedInboxAck(identity, EVENT_ID, NOW)),
+            transport.acknowledge(ctx, createSignedInboxAck(identity, EVENT_ID, NOW)),
         ).resolves.toMatchObject({ removed: 1, sequence: 1 });
 
         const controller = new AbortController();
         const rosterChanges: Uint8Array[] = [];
         const events = transport.stream(
+            ctx,
             createSignedInboxRead(identity, { createdAt: NOW, limit: 1 }),
             controller.signal,
-            { onDeviceRosterChanged: (accountKey) => rosterChanges.push(accountKey.slice()) },
+            { onDeviceRosterChanged: (_ctx, accountKey) => rosterChanges.push(accountKey.slice()) },
         );
         const iterator = events[Symbol.asyncIterator]();
         const continuity = await iterator.next();
@@ -255,7 +259,7 @@ describe("negotiated WebSocket delivery", () => {
             expiresAt: NOW + 60_000,
         });
         const provider: RelaySessionProvider = {
-            issue: () =>
+            issue: (_ctx) =>
                 Promise.resolve({
                     version: 1,
                     protocol: "murmur-websocket-v1",
@@ -286,7 +290,7 @@ describe("negotiated WebSocket delivery", () => {
         };
         const transport = new WebSocketDeliveryTransport(identity, provider, {
             now: () => NOW,
-            webSocketFactory: () =>
+            webSocketFactory: (_ctx) =>
                 new FakeWebSocket((frame, socket) => {
                     operations.push(frame.operation);
                     const body =
@@ -318,16 +322,16 @@ describe("negotiated WebSocket delivery", () => {
                 }),
         });
 
-        await expect(transport.readDeviceRoster(identity.publicKey)).resolves.toMatchObject({
+        await expect(transport.readDeviceRoster(ctx, identity.publicKey)).resolves.toMatchObject({
             revision: 1,
             devices: [{ encryptedMetadata: new Uint8Array([7]) }],
         });
-        await expect(transport.mutateDeviceRoster(delivery)).resolves.toMatchObject({
+        await expect(transport.mutateDeviceRoster(ctx, delivery)).resolves.toMatchObject({
             revision: 1,
         });
-        await expect(transport.uploadDirectoryPrekeys(delivery)).resolves.toBeUndefined();
+        await expect(transport.uploadDirectoryPrekeys(ctx, delivery)).resolves.toBeUndefined();
         await expect(
-            transport.claimDirectory(identity.publicKey, new Uint8Array([1])),
+            transport.claimDirectory(ctx, identity.publicKey, new Uint8Array([1])),
         ).resolves.toMatchObject({ devices: [{ source: "one_time" }] });
         expect(operations).toEqual([
             "read_device_roster",

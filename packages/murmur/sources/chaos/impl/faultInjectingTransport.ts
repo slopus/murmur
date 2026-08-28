@@ -1,3 +1,5 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import type {
     DeliveryPublishOutcome,
     DeliveryStreamHooks,
@@ -272,23 +274,24 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             counts: new Map(),
         };
         if (options.delegate.stream !== undefined) {
-            this.stream = (request, signal, hooks) => this.#stream(request, signal, hooks);
+            this.stream = (ctx, request, signal, hooks) =>
+                this.#stream(ctx, request, signal, hooks);
         }
         if (options.delegate.deleteAccount !== undefined) {
-            this.deleteAccount = (delivery, signal) =>
-                options.delegate.deleteAccount!(cloneDelivery(delivery), signal);
+            this.deleteAccount = (ctx, delivery, signal) =>
+                options.delegate.deleteAccount!(ctx, cloneDelivery(delivery), signal);
         }
         if (options.delegate.deleteSession !== undefined) {
-            this.deleteSession = (delivery, signal) =>
-                options.delegate.deleteSession!(cloneDelivery(delivery), signal);
+            this.deleteSession = (ctx, delivery, signal) =>
+                options.delegate.deleteSession!(ctx, cloneDelivery(delivery), signal);
         }
         if (options.delegate.readDeviceRoster !== undefined) {
-            this.readDeviceRoster = (accountKey, signal) =>
-                options.delegate.readDeviceRoster!(accountKey, signal);
+            this.readDeviceRoster = (ctx, accountKey, signal) =>
+                options.delegate.readDeviceRoster!(ctx, accountKey, signal);
         }
         if (options.delegate.mutateDeviceRoster !== undefined) {
-            this.mutateDeviceRoster = (delivery, signal) =>
-                options.delegate.mutateDeviceRoster!(delivery, signal);
+            this.mutateDeviceRoster = (ctx, delivery, signal) =>
+                options.delegate.mutateDeviceRoster!(ctx, delivery, signal);
         }
     }
 
@@ -297,7 +300,11 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         return new Map(this.#context.counts);
     }
 
-    async publish(input: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    async publish(
+        ctx: Context,
+        input: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         const ordinal = nextOrdinal(this.#context, "publish");
         let delivery = cloneDelivery(input);
         const before = point(this.#context, "publish", "before", ordinal, delivery);
@@ -311,19 +318,19 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         if (request.dropped) {
             throw new ChaosInjectedError(before, "Injected dropped transport request");
         }
-        let outcome = await this.#context.delegate.publish(delivery, signal);
+        let outcome = await this.#context.delegate.publish(ctx, delivery, signal);
         for (let copy = 0; copy < request.duplicateCopies; copy += 1) {
-            outcome = await this.#context.delegate.publish(delivery, signal);
+            outcome = await this.#context.delegate.publish(ctx, delivery, signal);
         }
         const after = point(this.#context, "publish", "after", ordinal, delivery);
         const duplicates = await applyResponseControl(this.#context, after, signal);
         for (let copy = 0; copy < duplicates; copy += 1) {
-            await this.#context.delegate.publish(delivery, signal);
+            await this.#context.delegate.publish(ctx, delivery, signal);
         }
         return { eventId: outcome.eventId, duplicate: outcome.duplicate };
     }
 
-    async read(input: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+    async read(ctx: Context, input: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
         const ordinal = nextOrdinal(this.#context, "read");
         let request = cloneRead(input);
         const before = point(this.#context, "read", "before", ordinal);
@@ -337,9 +344,9 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         if (requestEffects.dropped) {
             throw new ChaosInjectedError(before, "Injected dropped transport request");
         }
-        let page = clonePage(await this.#context.delegate.read(request, signal));
+        let page = clonePage(await this.#context.delegate.read(ctx, request, signal));
         for (let copy = 0; copy < requestEffects.duplicateCopies; copy += 1) {
-            page = clonePage(await this.#context.delegate.read(request, signal));
+            page = clonePage(await this.#context.delegate.read(ctx, request, signal));
         }
 
         const after = point(this.#context, "read", "after", ordinal);
@@ -391,6 +398,7 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
     }
 
     async acknowledge(
+        ctx: Context,
         input: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<{ readonly removed: number }> {
@@ -407,19 +415,20 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         if (requestEffects.dropped) {
             throw new ChaosInjectedError(before, "Injected dropped transport request");
         }
-        let outcome = await this.#context.delegate.acknowledge(request, signal);
+        let outcome = await this.#context.delegate.acknowledge(ctx, request, signal);
         for (let copy = 0; copy < requestEffects.duplicateCopies; copy += 1) {
-            outcome = await this.#context.delegate.acknowledge(request, signal);
+            outcome = await this.#context.delegate.acknowledge(ctx, request, signal);
         }
         const after = point(this.#context, "acknowledge", "after", ordinal);
         const duplicates = await applyResponseControl(this.#context, after, signal);
         for (let copy = 0; copy < duplicates; copy += 1) {
-            await this.#context.delegate.acknowledge(request, signal);
+            await this.#context.delegate.acknowledge(ctx, request, signal);
         }
         return { removed: outcome.removed };
     }
 
     async *#stream(
+        ctx: Context,
         input: SignedInboxRead,
         signal?: AbortSignal,
         hooks: DeliveryStreamHooks = {},
@@ -440,11 +449,11 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
             throw new ChaosInjectedError(beforeOpen, "Injected dropped stream request");
         }
         const connectedHooks: DeliveryStreamHooks = {
-            onConnected: async (): Promise<void> => {
+            onConnected: async (callbackCtx): Promise<void> => {
                 const ordinal = nextOrdinal(this.#context, "stream.connected");
                 const before = point(this.#context, "stream.connected", "before", ordinal);
                 await applyResponseControl(this.#context, before, signal);
-                await hooks.onConnected?.();
+                await hooks.onConnected?.(callbackCtx);
                 const after = point(this.#context, "stream.connected", "after", ordinal);
                 await applyResponseControl(this.#context, after, signal);
             },
@@ -454,6 +463,7 @@ export class FaultInjectingDeliveryTransport implements DeliveryTransport {
         };
         const iterable = delegateStream.call(
             this.#context.delegate,
+            ctx,
             request,
             signal,
             connectedHooks,

@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import {
     RelayService,
     RelayWebSocketSession,
@@ -52,6 +53,8 @@ import {
     type ChaosRule,
 } from "../index.js";
 
+const ctx = createRootContext().named("test");
+
 const NOW = 1_700_000_000_000;
 const DAY_MILLISECONDS = 24 * 60 * 60 * 1_000;
 const TWENTY_NINE_DAYS = 29 * DAY_MILLISECONDS;
@@ -62,7 +65,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "network-delivery-chaos",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 function cloneDelivery(delivery: SignedDelivery): SignedDelivery {
@@ -122,43 +125,50 @@ class RecordingDeliveryTransport implements DeliveryTransport {
     constructor(delegate: DeliveryTransport) {
         this.#delegate = delegate;
         if (delegate.deleteAccount !== undefined) {
-            this.deleteAccount = (delivery, signal) => delegate.deleteAccount!(delivery, signal);
+            this.deleteAccount = (_ctx, delivery, signal) =>
+                delegate.deleteAccount!(ctx, delivery, signal);
         }
         if (delegate.deleteSession !== undefined) {
-            this.deleteSession = (delivery, signal) => delegate.deleteSession!(delivery, signal);
+            this.deleteSession = (_ctx, delivery, signal) =>
+                delegate.deleteSession!(ctx, delivery, signal);
         }
         if (delegate.mutateDeviceRoster !== undefined) {
-            this.mutateDeviceRoster = (delivery, signal) =>
-                delegate.mutateDeviceRoster!(delivery, signal);
+            this.mutateDeviceRoster = (_ctx, delivery, signal) =>
+                delegate.mutateDeviceRoster!(ctx, delivery, signal);
         }
         if (delegate.readDeviceRoster !== undefined) {
-            this.readDeviceRoster = (accountKey, signal) =>
-                delegate.readDeviceRoster!(accountKey, signal);
+            this.readDeviceRoster = (_ctx, accountKey, signal) =>
+                delegate.readDeviceRoster!(ctx, accountKey, signal);
         }
         if (delegate.stream !== undefined) {
-            this.stream = (request, signal, hooks) => {
+            this.stream = (_ctx, request, signal, hooks) => {
                 this.reads.push(cloneRead(request));
-                return delegate.stream!.call(delegate, request, signal, hooks);
+                return delegate.stream!.call(delegate, ctx, request, signal, hooks);
             };
         }
     }
 
-    async publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    async publish(
+        _ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         this.published.push(cloneDelivery(delivery));
-        return this.#delegate.publish(delivery, signal);
+        return this.#delegate.publish(ctx, delivery, signal);
     }
 
-    async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+    async read(_ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
         this.reads.push(cloneRead(request));
-        return this.#delegate.read(request, signal);
+        return this.#delegate.read(ctx, request, signal);
     }
 
     async acknowledge(
+        _ctx: Context,
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<{ readonly removed: number }> {
         this.acknowledgements.push(cloneAck(request));
-        return this.#delegate.acknowledge(request, signal);
+        return this.#delegate.acknowledge(ctx, request, signal);
     }
 }
 
@@ -220,7 +230,7 @@ function negotiatedTransport(
 ): WebSocketDeliveryTransport {
     const endpoint = "wss://relay.test/v2/connect";
     const provider: RelaySessionProvider = {
-        issue: async () => ({
+        issue: async (_ctx) => ({
             version: 1,
             protocol: "murmur-websocket-v1",
             endpoint,
@@ -230,7 +240,7 @@ function negotiatedTransport(
     };
     return new WebSocketDeliveryTransport(identity, provider, {
         now: fixture.clock.now,
-        webSocketFactory: () =>
+        webSocketFactory: (_ctx) =>
             new RelayBackedWebSocket(fixture.relay, {
                 version: 1,
                 protocol: "murmur-websocket-v1",
@@ -250,14 +260,15 @@ async function murmurClient(
     store: MemoryMurmurStore,
     now: () => number,
 ): Promise<MurmurClient> {
-    return MurmurClient.open({ identity, transport, store, now });
+    return MurmurClient.open(ctx, { identity, transport, store, now });
 }
 
 async function drainUpdates(client: MurmurClient, values: string[]): Promise<void> {
     await client.synchronize(
+        ctx,
         { waitMilliseconds: 0 },
         {
-            onUpdates: (updates: readonly MurmurUpdate[]) => {
+            onUpdates: (_ctx, updates: readonly MurmurUpdate[]) => {
                 values.push(...updates.map((update) => utf8Decode(update.bytes)));
             },
         },
@@ -287,11 +298,13 @@ async function inbox(
 ): Promise<InboxPage> {
     try {
         return await transport.read(
+            ctx,
             createSignedInboxRead(recipient, { after, limit: 256, createdAt: now }),
         );
     } catch (error: unknown) {
         if (!(error instanceof DeliveryCursorTrimmedError) || after !== null) throw error;
         return transport.read(
+            ctx,
             createSignedInboxRead(recipient, {
                 after: error.acknowledgedThrough,
                 limit: 256,
@@ -307,7 +320,7 @@ async function clientInbox(
     now: number,
     after: string | null = null,
 ): Promise<InboxPage> {
-    const root = await store.get("murmur/identity/root");
+    const root = await store.get(ctx, "murmur/identity/root");
     if (root === undefined) throw new Error("Missing Murmur device identity");
     const identity = decodeIdentityRoot(root);
     try {
@@ -332,9 +345,13 @@ function processor(
 ): InboxProcessor {
     return new InboxProcessor(
         { identity, transport, store },
-        async (transaction, queued) => {
+        async (transaction, staged, queued) => {
             const label = utf8Decode(queued.delivery.ciphertext);
-            await transaction.set(`application/${queued.delivery.id}`, queued.delivery.ciphertext);
+            await staged.set(
+                transaction,
+                `application/${queued.delivery.id}`,
+                queued.delivery.ciphertext,
+            );
             effects.push(label);
         },
         { now },
@@ -362,11 +379,11 @@ describe("network and delivery contract chaos", () => {
         });
         try {
             for (let attempt = 0; attempt < 3; attempt += 1) {
-                await expect(transport.publish(delivery)).rejects.toThrow("relay unreachable");
+                await expect(transport.publish(ctx, delivery)).rejects.toThrow("relay unreachable");
                 expect(fixture.recording.published).toHaveLength(0);
                 expect((await inbox(fixture.http, bob, NOW)).deliveries).toHaveLength(0);
             }
-            const accepted = await transport.publish(delivery);
+            const accepted = await transport.publish(ctx, delivery);
             expect(accepted.duplicate).toBe(false);
             expect(fixture.recording.published).toHaveLength(1);
             expectExactDelivery(fixture.recording.published[0]!, delivery);
@@ -399,11 +416,13 @@ describe("network and delivery contract chaos", () => {
         });
         try {
             for (let attempt = 0; attempt < 3; attempt += 1) {
-                await expect(transport.publish(delivery)).rejects.toBeInstanceOf(
+                await expect(transport.publish(ctx, delivery)).rejects.toBeInstanceOf(
                     ChaosInjectedError,
                 );
             }
-            await expect(transport.publish(delivery)).resolves.toMatchObject({ duplicate: true });
+            await expect(transport.publish(ctx, delivery)).resolves.toMatchObject({
+                duplicate: true,
+            });
             expect(fixture.recording.published).toHaveLength(4);
             for (const attempted of fixture.recording.published) {
                 expectExactDelivery(attempted, delivery);
@@ -433,13 +452,13 @@ describe("network and delivery contract chaos", () => {
         const accepted = labeledDelivery(alice, recipients, "NET-03 accepted");
         const rejected = labeledDelivery(alice, recipients, "NET-03 rejected");
         try {
-            await acceptedFixture.http.publish(accepted);
+            await acceptedFixture.http.publish(ctx, accepted);
             for (const recipient of recipients) {
                 const page = await inbox(acceptedFixture.http, recipient, NOW);
                 expect(page.deliveries.map((item) => item.delivery.id)).toEqual([accepted.id]);
             }
 
-            await expect(rejectedFixture.http.publish(rejected)).rejects.toBeInstanceOf(
+            await expect(rejectedFixture.http.publish(ctx, rejected)).rejects.toBeInstanceOf(
                 DeliveryTransportError,
             );
             for (const recipient of recipients) {
@@ -485,12 +504,12 @@ describe("network and delivery contract chaos", () => {
         });
         try {
             const responses: string[] = [];
-            const first = transport.publish(earlyCreated).then((outcome) => {
+            const first = transport.publish(ctx, earlyCreated).then((outcome) => {
                 responses.push("early-created");
                 return outcome;
             });
             await entered;
-            const second = await transport.publish(lateCreated);
+            const second = await transport.publish(ctx, lateCreated);
             responses.push("late-created");
             releaseDelay?.();
             const firstOutcome = await first;
@@ -528,7 +547,7 @@ describe("network and delivery contract chaos", () => {
             });
             const preAborted = new AbortController();
             preAborted.abort(new Error("abort before publish"));
-            await expect(immediate.publish(before, preAborted.signal)).rejects.toThrow(
+            await expect(immediate.publish(ctx, before, preAborted.signal)).rejects.toThrow(
                 "abort before publish",
             );
 
@@ -546,7 +565,7 @@ describe("network and delivery contract chaos", () => {
                 schedule: duringSchedule,
                 delay: () => duringController.abort(new Error("abort blocked publish")),
             });
-            await expect(blocked.publish(during, duringController.signal)).rejects.toThrow(
+            await expect(blocked.publish(ctx, during, duringController.signal)).rejects.toThrow(
                 "abort blocked publish",
             );
 
@@ -564,10 +583,10 @@ describe("network and delivery contract chaos", () => {
                 schedule: afterSchedule,
                 delay: () => afterController.abort(new Error("abort accepted publish")),
             });
-            await expect(ambiguous.publish(after, afterController.signal)).rejects.toThrow(
+            await expect(ambiguous.publish(ctx, after, afterController.signal)).rejects.toThrow(
                 "abort accepted publish",
             );
-            await expect(immediate.publish(after)).resolves.toMatchObject({ duplicate: true });
+            await expect(immediate.publish(ctx, after)).resolves.toMatchObject({ duplicate: true });
 
             expect(fixture.recording.published.map((item) => item.id)).toEqual([
                 after.id,
@@ -605,12 +624,15 @@ describe("network and delivery contract chaos", () => {
                 NOW + 1_000,
                 NOW + TWENTY_NINE_DAYS,
             );
-            await expect(fixture.http.publish(lagged)).resolves.toMatchObject({ duplicate: false });
-            await expect(fixture.http.publish(leading)).resolves.toMatchObject({
+            await expect(fixture.http.publish(ctx, lagged)).resolves.toMatchObject({
+                duplicate: false,
+            });
+            await expect(fixture.http.publish(ctx, leading)).resolves.toMatchObject({
                 duplicate: false,
             });
             await expect(
                 fixture.http.publish(
+                    ctx,
                     labeledDelivery(
                         alice,
                         [bob],
@@ -652,22 +674,22 @@ describe("network and delivery contract chaos", () => {
         const inboxProcessor = processor(bob, fault, store, effects, () => NOW);
         try {
             for (let index = 0; index < 3; index += 1) {
-                await fixture.http.publish(labeledDelivery(alice, [bob], `event-${index}`));
+                await fixture.http.publish(ctx, labeledDelivery(alice, [bob], `event-${index}`));
             }
-            await expect(inboxProcessor.synchronize()).rejects.toThrow(
+            await expect(inboxProcessor.synchronize(ctx)).rejects.toThrow(
                 "Inbox continuity was irrecoverably lost",
             );
             expect(effects).toEqual([]);
-            expect(await inboxProcessor.cursor()).toBeNull();
+            expect(await inboxProcessor.cursor(ctx)).toBeNull();
 
-            const applied = await inboxProcessor.synchronize();
+            const applied = await inboxProcessor.synchronize(ctx);
             expect(applied).toMatchObject({ processed: 3, rejected: 0, exhausted: true });
-            const cursor = await inboxProcessor.cursor();
-            await expect(inboxProcessor.synchronize()).rejects.toThrow(
+            const cursor = await inboxProcessor.cursor(ctx);
+            await expect(inboxProcessor.synchronize(ctx)).rejects.toThrow(
                 "Inbox continuity was irrecoverably lost",
             );
             expect(effects).toEqual(["event-0", "event-1", "event-2"]);
-            expect(await inboxProcessor.cursor()).toBe(cursor);
+            expect(await inboxProcessor.cursor(ctx)).toBe(cursor);
             schedule.assertConsumed();
         } finally {
             await fixture.relay.close();
@@ -694,14 +716,14 @@ describe("network and delivery contract chaos", () => {
         const inboxProcessor = processor(bob, fault, new MemoryMurmurStore(), effects, () => NOW);
         try {
             for (let index = 0; index < 3; index += 1) {
-                await fixture.http.publish(labeledDelivery(alice, [bob], `ordered-${index}`));
+                await fixture.http.publish(ctx, labeledDelivery(alice, [bob], `ordered-${index}`));
             }
-            await expect(inboxProcessor.synchronize()).rejects.toThrow(
+            await expect(inboxProcessor.synchronize(ctx)).rejects.toThrow(
                 "Inbox continuity was irrecoverably lost",
             );
-            expect(await inboxProcessor.cursor()).toBeNull();
+            expect(await inboxProcessor.cursor(ctx)).toBeNull();
             expect(fixture.recording.acknowledgements).toHaveLength(0);
-            await expect(inboxProcessor.synchronize()).resolves.toMatchObject({ processed: 3 });
+            await expect(inboxProcessor.synchronize(ctx)).resolves.toMatchObject({ processed: 3 });
             expect(effects).toEqual(["ordered-0", "ordered-1", "ordered-2"]);
             schedule.assertConsumed();
         } finally {
@@ -736,13 +758,13 @@ describe("network and delivery contract chaos", () => {
             );
             try {
                 for (let index = 0; index < 3; index += 1) {
-                    await fixture.http.publish(labeledDelivery(alice, [bob], `tail-${index}`));
+                    await fixture.http.publish(ctx, labeledDelivery(alice, [bob], `tail-${index}`));
                 }
-                const first = await inboxProcessor.synchronize({ limit: requestedLimit });
+                const first = await inboxProcessor.synchronize(ctx, { limit: requestedLimit });
                 expect(first).toMatchObject({ processed: 1, exhausted: false });
                 const cursors = [first.cursor!];
                 while (effects.length < 3) {
-                    const next = await inboxProcessor.synchronize({ limit: requestedLimit });
+                    const next = await inboxProcessor.synchronize(ctx, { limit: requestedLimit });
                     cursors.push(next.cursor!);
                 }
                 expect(effects).toEqual(["tail-0", "tail-1", "tail-2"]);
@@ -775,16 +797,16 @@ describe("network and delivery contract chaos", () => {
         const effects: string[] = [];
         const inboxProcessor = processor(bob, fault, new MemoryMurmurStore(), effects, () => NOW);
         try {
-            await fixture.http.publish(labeledDelivery(alice, [bob], "hidden-gap"));
+            await fixture.http.publish(ctx, labeledDelivery(alice, [bob], "hidden-gap"));
             for (let read = 0; read < 5; read += 1) {
-                await expect(inboxProcessor.synchronize()).resolves.toMatchObject({
+                await expect(inboxProcessor.synchronize(ctx)).resolves.toMatchObject({
                     processed: 0,
                     exhausted: false,
                     cursor: null,
                 });
             }
             expect(fixture.recording.acknowledgements).toHaveLength(0);
-            await expect(inboxProcessor.synchronize()).resolves.toMatchObject({ processed: 1 });
+            await expect(inboxProcessor.synchronize(ctx)).resolves.toMatchObject({ processed: 1 });
             expect(effects).toEqual(["hidden-gap"]);
             schedule.assertConsumed();
         } finally {
@@ -823,17 +845,19 @@ describe("network and delivery contract chaos", () => {
         const faultProcessor = processor(bob, fault, store, effects, () => NOW);
         try {
             for (let index = 0; index < 3; index += 1) {
-                await fixture.http.publish(labeledDelivery(alice, [bob], `stream-${index}`));
+                await fixture.http.publish(ctx, labeledDelivery(alice, [bob], `stream-${index}`));
             }
             for (const message of ["stream unavailable", "lost transport response"]) {
                 const controller = new AbortController();
-                const iterator = faultProcessor.stream({ signal: controller.signal });
+                const iterator = faultProcessor.stream(ctx, { signal: controller.signal });
                 await expect(iterator.next()).rejects.toThrow(message);
                 controller.abort();
             }
 
             const duplicateController = new AbortController();
-            const duplicateStream = faultProcessor.stream({ signal: duplicateController.signal });
+            const duplicateStream = faultProcessor.stream(ctx, {
+                signal: duplicateController.signal,
+            });
             await expect(duplicateStream.next()).resolves.toMatchObject({
                 done: false,
                 value: { processed: 1 },
@@ -845,9 +869,9 @@ describe("network and delivery contract chaos", () => {
             const clean = processor(bob, fixture.http, store, effects, () => NOW);
             const reconnectController = new AbortController();
             let connected = 0;
-            const reconnect = clean.stream({
+            const reconnect = clean.stream(ctx, {
                 signal: reconnectController.signal,
-                onConnected: () => {
+                onConnected: (_ctx) => {
                     connected += 1;
                 },
             });
@@ -870,7 +894,7 @@ describe("network and delivery contract chaos", () => {
         const bob = generateIdentityKeyPair();
         const delivery = labeledDelivery(alice, [bob], "poll-after-invalid-stream");
         try {
-            await fixture.http.publish(delivery);
+            await fixture.http.publish(ctx, delivery);
             const request = createSignedInboxRead(bob, {
                 createdAt: NOW,
                 waitMilliseconds: 0,
@@ -885,7 +909,7 @@ describe("network and delivery contract chaos", () => {
             for (const frame of invalidFrames) {
                 const malformed = new HttpDeliveryTransport("https://relay.test", {
                     maximumResponseBytes: 256,
-                    fetch: async () =>
+                    fetch: async (_ctx) =>
                         new Response(frame, {
                             headers: { "content-type": "text/event-stream" },
                         }),
@@ -895,8 +919,8 @@ describe("network and delivery contract chaos", () => {
                     delegate: malformed,
                     schedule: new SeededChaosSchedule(0x4e45540c),
                 });
-                const stream = wrapped.stream!(request, undefined, {
-                    onConnected: () => {
+                const stream = wrapped.stream!(ctx, request, undefined, {
+                    onConnected: (_ctx) => {
                         callbacks += 1;
                     },
                 });
@@ -913,7 +937,7 @@ describe("network and delivery contract chaos", () => {
 
             const effects: string[] = [];
             const clean = processor(bob, fixture.http, new MemoryMurmurStore(), effects, () => NOW);
-            await expect(clean.synchronize()).resolves.toMatchObject({ processed: 1 });
+            await expect(clean.synchronize(ctx)).resolves.toMatchObject({ processed: 1 });
             expect(effects).toEqual(["poll-after-invalid-stream"]);
         } finally {
             await fixture.relay.close();
@@ -926,8 +950,9 @@ describe("network and delivery contract chaos", () => {
         const transport = negotiatedTransport(fixture, identity);
         try {
             const delivery = labeledDelivery(identity, [identity], "WebSocket continuity ack");
-            const published = await transport.publish(delivery);
+            const published = await transport.publish(ctx, delivery);
             const page = await transport.read(
+                ctx,
                 createSignedInboxRead(identity, {
                     createdAt: fixture.clock.now(),
                     waitMilliseconds: 0,
@@ -937,6 +962,7 @@ describe("network and delivery contract chaos", () => {
             expect(page.generation).toBeInstanceOf(Uint8Array);
             await expect(
                 transport.acknowledge(
+                    ctx,
                     createSignedInboxAck(identity, published.eventId, fixture.clock.now()),
                 ),
             ).resolves.toMatchObject({
@@ -970,17 +996,19 @@ describe("network and delivery contract chaos", () => {
         const effects: string[] = [];
         const inboxProcessor = processor(bob, fault, new MemoryMurmurStore(), effects, () => NOW);
         try {
-            await fixture.http.publish(labeledDelivery(alice, [bob], "ack-once"));
-            await expect(inboxProcessor.synchronize()).rejects.toThrow("ack relay unreachable");
+            await fixture.http.publish(ctx, labeledDelivery(alice, [bob], "ack-once"));
+            await expect(inboxProcessor.synchronize(ctx)).rejects.toThrow("ack relay unreachable");
             expect(effects).toEqual(["ack-once"]);
-            const cursor = await inboxProcessor.cursor();
+            const cursor = await inboxProcessor.cursor(ctx);
             expect(cursor).not.toBeNull();
             expect((await inbox(fixture.http, bob, NOW)).deliveries).toHaveLength(1);
 
             for (let retry = 0; retry < 2; retry += 1) {
-                await expect(inboxProcessor.synchronize()).rejects.toThrow("ack relay unreachable");
+                await expect(inboxProcessor.synchronize(ctx)).rejects.toThrow(
+                    "ack relay unreachable",
+                );
             }
-            await expect(inboxProcessor.synchronize()).resolves.toMatchObject({ processed: 0 });
+            await expect(inboxProcessor.synchronize(ctx)).resolves.toMatchObject({ processed: 0 });
             expect(effects).toEqual(["ack-once"]);
             expect(fixture.recording.acknowledgements).toHaveLength(1);
             expect(fixture.recording.acknowledgements[0]!.through).toBe(cursor);
@@ -1012,12 +1040,16 @@ describe("network and delivery contract chaos", () => {
         const inboxProcessor = processor(bob, fault, new MemoryMurmurStore(), effects, () => NOW);
         try {
             for (let index = 0; index < 2; index += 1) {
-                await fixture.http.publish(labeledDelivery(alice, [bob], `ack-loss-${index}`));
+                await fixture.http.publish(ctx, labeledDelivery(alice, [bob], `ack-loss-${index}`));
             }
-            await expect(inboxProcessor.synchronize()).rejects.toBeInstanceOf(ChaosInjectedError);
-            const cursor = await inboxProcessor.cursor();
-            await expect(inboxProcessor.synchronize()).rejects.toBeInstanceOf(ChaosInjectedError);
-            await expect(inboxProcessor.synchronize()).resolves.toMatchObject({ processed: 0 });
+            await expect(inboxProcessor.synchronize(ctx)).rejects.toBeInstanceOf(
+                ChaosInjectedError,
+            );
+            const cursor = await inboxProcessor.cursor(ctx);
+            await expect(inboxProcessor.synchronize(ctx)).rejects.toBeInstanceOf(
+                ChaosInjectedError,
+            );
+            await expect(inboxProcessor.synchronize(ctx)).resolves.toMatchObject({ processed: 0 });
             expect(effects).toEqual(["ack-loss-0", "ack-loss-1"]);
             expect(fixture.recording.acknowledgements.map((ack) => ack.through)).toEqual([
                 cursor,
@@ -1037,7 +1069,10 @@ describe("network and delivery contract chaos", () => {
         const bob = generateIdentityKeyPair();
         const carol = generateIdentityKeyPair();
         try {
-            const outcome = await fixture.http.publish(labeledDelivery(alice, [bob], "retain-me"));
+            const outcome = await fixture.http.publish(
+                ctx,
+                labeledDelivery(alice, [bob], "retain-me"),
+            );
             const valid = createSignedInboxAck(bob, outcome.eventId, NOW);
             const forgedThrough = {
                 ...cloneAck(valid),
@@ -1049,13 +1084,13 @@ describe("network and delivery contract chaos", () => {
             const stale = createSignedInboxAck(bob, outcome.eventId, NOW - 1_001);
             const future = createSignedInboxAck(bob, outcome.eventId, NOW + 1_001);
             for (const invalid of [forgedThrough, wrongRecipient, forgedSignature, stale, future]) {
-                await expect(fixture.http.acknowledge(invalid)).rejects.toMatchObject({
+                await expect(fixture.http.acknowledge(ctx, invalid)).rejects.toMatchObject({
                     status: 401,
                     code: "unauthorized",
                 });
                 expect((await inbox(fixture.http, bob, NOW)).deliveries).toHaveLength(1);
             }
-            await expect(fixture.http.acknowledge(valid)).resolves.toMatchObject({
+            await expect(fixture.http.acknowledge(ctx, valid)).resolves.toMatchObject({
                 removed: 1,
                 sequence: 1,
             });
@@ -1096,14 +1131,17 @@ describe("network and delivery contract chaos", () => {
         });
         try {
             await aliceTransport.publish(
+                ctx,
                 labeledDelivery(alice, [bob, carol], "alice fanout", NOW, NOW + TWENTY_NINE_DAYS),
             );
             await expect(
                 bobTransport.publish(
+                    ctx,
                     labeledDelivery(bob, [alice], "blocked bob", NOW, NOW + TWENTY_NINE_DAYS),
                 ),
             ).rejects.toThrow("bob publish partition");
             await fixture.http.publish(
+                ctx,
                 labeledDelivery(carol, [alice], "carol to alice", NOW, NOW + TWENTY_NINE_DAYS),
             );
 
@@ -1113,6 +1151,7 @@ describe("network and delivery contract chaos", () => {
 
             fixture.clock.advance(12 * 60 * 60 * 1_000);
             await bobTransport.publish(
+                ctx,
                 labeledDelivery(
                     bob,
                     [alice],
@@ -1163,14 +1202,14 @@ describe("network and delivery contract chaos", () => {
         const alice = await murmurClient(aliceIdentity, fault, aliceStore, fixture.clock.now);
         const bob = await murmurClient(bobIdentity, fixture.http, bobStore, fixture.clock.now);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("negotiated commit reconnect"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await expect(alice.synchronize({ waitMilliseconds: 0 })).rejects.toThrow(
+            await expect(alice.synchronize(ctx, { waitMilliseconds: 0 })).rejects.toThrow(
                 "negotiated reconnect",
             );
-            expect(await alice.session(session.id)).toMatchObject({ status: "creating" });
+            expect(await alice.session(ctx, session.id)).toMatchObject({ status: "creating" });
             const bobBeforeWelcome = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(
                 bobBeforeWelcome.deliveries
@@ -1184,12 +1223,12 @@ describe("network and delivery contract chaos", () => {
                     .filter((kind) => kind === 3),
             ).toEqual([3]);
 
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
                 transientPublicationFailures: 0,
                 pendingOutboxes: 1,
             });
-            expect(await alice.session(session.id)).toMatchObject({
+            expect(await alice.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 members: [alice.identity, bob.identity],
             });
@@ -1203,15 +1242,15 @@ describe("network and delivery contract chaos", () => {
                     .map(({ delivery }) => delivery.ciphertext[0])
                     .filter((kind) => kind === 1 || kind === 2),
             ).toEqual([1, 2]);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
-            await alice.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await bob.session(ctx, session.id)).toMatchObject({ status: "pending" });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
             expect(fault.operationCounts.get("publish")).toBe(5);
             expect(fixture.recording.published[4]?.id).toBe(fixture.recording.published[3]?.id);
             schedule.assertConsumed();
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await fixture.relay.close();
         }
     }, 30_000);
@@ -1242,16 +1281,16 @@ describe("network and delivery contract chaos", () => {
         const alice = await murmurClient(aliceIdentity, fault, aliceStore, fixture.clock.now);
         const bob = await murmurClient(bobIdentity, fixture.http, bobStore, fixture.clock.now);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("Welcome reconnect"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 2,
             });
-            expect(await alice.session(session.id)).toMatchObject({ status: "active" });
+            expect(await alice.session(ctx, session.id)).toMatchObject({ status: "active" });
             expect(fixture.recording.published.map(({ ciphertext }) => ciphertext[0])).toEqual([3]);
             const bobBeforeWelcome = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(
@@ -1260,8 +1299,8 @@ describe("network and delivery contract chaos", () => {
                     .filter((kind) => kind === 1 || kind === 2),
             ).toEqual([]);
 
-            const queued = await alice.send(session.id, utf8Encode("after Welcome"));
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            const queued = await alice.send(ctx, session.id, utf8Encode("after Welcome"));
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
                 transientPublicationFailures: 0,
                 pendingOutboxes: 1,
@@ -1271,16 +1310,16 @@ describe("network and delivery contract chaos", () => {
             ]);
             expect(fixture.recording.published.at(-1)?.id).toBe(queued);
 
-            await bob.synchronize({ waitMilliseconds: 0 });
-            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
-            await bob.activateSession(session.id);
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await bob.session(ctx, session.id)).toMatchObject({ status: "pending" });
+            await bob.activateSession(ctx, session.id);
             const updates: string[] = [];
             await drainUpdates(bob, updates);
             expect(updates).toEqual(["after Welcome"]);
             schedule.assertConsumed();
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await fixture.relay.close();
         }
     }, 30_000);
@@ -1312,17 +1351,17 @@ describe("network and delivery contract chaos", () => {
             fixture.clock.now,
         );
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("admission completion reconnect"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
                 anyoneCanAddMembers: true,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.activateSession(session.id);
-            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.activateSession(ctx, session.id);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
 
-            alice.close();
+            alice.close(ctx);
             const recording = new RecordingDeliveryTransport(fixture.http);
             const schedule = new SeededChaosSchedule(0x4e455418, [
                 {
@@ -1342,62 +1381,62 @@ describe("network and delivery contract chaos", () => {
                 classifyDelivery: (delivery) => delivery.ciphertext[0],
             });
             alice = await murmurClient(aliceIdentity, fault, aliceStore, fixture.clock.now);
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
                 transientPublicationFailures: 0,
                 pendingOutboxes: 3,
             });
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 2,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 1,
             });
             expect(recording.published.map(({ ciphertext }) => ciphertext[0])).toEqual([3, 3, 1]);
-            await carol.synchronize({ waitMilliseconds: 0 });
-            await carol.activateSession(session.id);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            expect((await bob.session(session.id))?.members).toHaveLength(3);
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.activateSession(ctx, session.id);
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
 
-            await bob.addMember(session.id, await dave.createKeyPackage());
-            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            await bob.addMember(ctx, session.id, await dave.createKeyPackage(ctx));
+            expect(await bob.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 0,
                 pendingOutboxes: 3,
             });
-            expect(await dave.session(session.id)).toBeUndefined();
+            expect(await dave.session(ctx, session.id)).toBeUndefined();
 
-            alice.close();
+            alice.close(ctx);
             alice = await murmurClient(aliceIdentity, recording, aliceStore, fixture.clock.now);
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
                 pendingOutboxes: 0,
             });
             expect(recording.published.map(({ ciphertext }) => ciphertext[0])).toEqual([
                 3, 3, 1, 2,
             ]);
-            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await bob.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 1,
                 pendingOutboxes: 3,
             });
-            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await bob.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
                 pendingOutboxes: 1,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            await dave.synchronize({ waitMilliseconds: 0 });
-            await dave.activateSession(session.id);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            expect((await alice.session(session.id))?.members).toHaveLength(4);
-            expect((await bob.session(session.id))?.members).toHaveLength(4);
-            expect((await carol.session(session.id))?.members).toHaveLength(4);
-            expect((await dave.session(session.id))?.members).toHaveLength(4);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            await dave.synchronize(ctx, { waitMilliseconds: 0 });
+            await dave.activateSession(ctx, session.id);
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(4);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(4);
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(4);
+            expect((await dave.session(ctx, session.id))?.members).toHaveLength(4);
             schedule.assertConsumed();
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
-            dave.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
+            dave.close(ctx);
             await fixture.relay.close();
         }
     }, 60_000);
@@ -1422,16 +1461,16 @@ describe("network and delivery contract chaos", () => {
         const bobDelivery = labeledDelivery(bob, [alice], "bob commit");
         try {
             for (let attempt = 0; attempt < 3; attempt += 1) {
-                await expect(bobTransport.publish(bobDelivery)).rejects.toBeInstanceOf(
+                await expect(bobTransport.publish(ctx, bobDelivery)).rejects.toBeInstanceOf(
                     ChaosInjectedError,
                 );
             }
             const aliceDelivery = labeledDelivery(alice, [bob], "alice competing commit");
-            await fixture.http.publish(aliceDelivery);
+            await fixture.http.publish(ctx, aliceDelivery);
             expect((await inbox(fixture.http, bob, NOW)).deliveries[0]!.delivery.id).toBe(
                 aliceDelivery.id,
             );
-            await expect(bobTransport.publish(bobDelivery)).resolves.toMatchObject({
+            await expect(bobTransport.publish(ctx, bobDelivery)).resolves.toMatchObject({
                 duplicate: false,
             });
             expect(
@@ -1451,6 +1490,7 @@ describe("network and delivery contract chaos", () => {
         const expiresAt = NOW + TWENTY_NINE_DAYS;
         try {
             await fixture.http.publish(
+                ctx,
                 labeledDelivery(alice, [carol], "offline-carol", NOW, expiresAt),
             );
             fixture.clock.set(expiresAt - 1);
@@ -1467,6 +1507,7 @@ describe("network and delivery contract chaos", () => {
             expect(await fixture.relay.pruneExpired()).toBe(0);
 
             await fixture.http.publish(
+                ctx,
                 labeledDelivery(
                     alice,
                     [carol],
@@ -1500,21 +1541,22 @@ describe("network and delivery contract chaos", () => {
         const bob = await murmurClient(bobIdentity, fixture.http, bobStore, fixture.clock.now);
         const resets: MurmurResetEvent[] = [];
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("six-month continuity"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.activateSession(session.id);
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.activateSession(ctx, session.id);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
 
             const baseline = await clientInbox(fixture.http, bobStore, fixture.clock.now());
             expect(baseline.generation).toBeDefined();
             expect(baseline.headSequence).toBe(baseline.acknowledgedSequence);
             const expiresAt = NOW + SIX_MONTHS;
             await fixture.http.publish(
+                ctx,
                 createSignedDelivery(
                     expiringSender,
                     [bob.deviceKey],
@@ -1536,9 +1578,10 @@ describe("network and delivery contract chaos", () => {
 
             await expect(
                 bob.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onReset: (reset) => {
+                        onReset: (_ctx, reset) => {
                             resets.push(reset);
                         },
                     },
@@ -1550,26 +1593,26 @@ describe("network and delivery contract chaos", () => {
             expect(resets).toHaveLength(1);
             expect(resets[0]?.sessions).toHaveLength(1);
             expect(equalBytes(resets[0]!.sessions[0]!.id, session.id)).toBe(true);
-            expect(await bob.session(session.id)).toBeUndefined();
-            expect(await bobStore.get("murmur/reset/v1/pending")).toBeUndefined();
-            await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
+            expect(await bobStore.get(ctx, "murmur/reset/v1/pending")).toBeUndefined();
+            await expect(bob.synchronize(ctx, { waitMilliseconds: 0 })).resolves.toMatchObject({
                 inbox: { processed: 1 },
             });
-            expect(await bob.session(session.id)).toBeUndefined();
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
 
             for (let round = 0; round < 8; round += 1) {
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await bob.synchronize({ waitMilliseconds: 0 });
-                if ((await bob.session(session.id))?.reAdmission === true) break;
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
+                if ((await bob.session(ctx, session.id))?.reAdmission === true) break;
             }
-            expect(await bob.session(session.id)).toMatchObject({
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "pending",
                 descriptor: session.descriptor,
                 reAdmission: true,
             });
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             destroyIdentity(expiringSender);
             await fixture.relay.close();
         }
@@ -1582,11 +1625,13 @@ describe("network and delivery contract chaos", () => {
         try {
             await expect(
                 hardFixture.http.publish(
+                    ctx,
                     labeledDelivery(alice, [bob], "hard edge", NOW, NOW + SIX_MONTHS),
                 ),
             ).resolves.toMatchObject({ duplicate: false });
             await expect(
                 hardFixture.http.publish(
+                    ctx,
                     labeledDelivery(alice, [bob], "over hard edge", NOW, NOW + SIX_MONTHS + 1),
                 ),
             ).rejects.toMatchObject({ status: 401, code: "unauthorized" });
@@ -1650,13 +1695,13 @@ describe("network and delivery contract chaos", () => {
             try {
                 for (;;) {
                     try {
-                        await fault.publish(deliveries[0]!);
+                        await fault.publish(ctx, deliveries[0]!);
                         break;
                     } catch (error: unknown) {
                         expect(error).toBeInstanceOf(ChaosInjectedError);
                     }
                 }
-                for (const delivery of deliveries.slice(1)) await fault.publish(delivery);
+                for (const delivery of deliveries.slice(1)) await fault.publish(ctx, delivery);
 
                 const page = await inbox(fault, bob, fixture.clock.now());
                 const labels: string[] = [];
@@ -1668,8 +1713,10 @@ describe("network and delivery contract chaos", () => {
                 }
                 expect(page.head).not.toBeNull();
                 const ack = createSignedInboxAck(bob, page.head!, fixture.clock.now());
-                await expect(fault.acknowledge(ack)).rejects.toBeInstanceOf(ChaosInjectedError);
-                await fault.acknowledge(ack);
+                await expect(fault.acknowledge(ctx, ack)).rejects.toBeInstanceOf(
+                    ChaosInjectedError,
+                );
+                await fault.acknowledge(ctx, ack);
 
                 const script = Array.from({ length: 30 }, () => random.integer(0, 6));
                 for (const operation of script) {
@@ -1677,7 +1724,7 @@ describe("network and delivery contract chaos", () => {
                         const controller = new AbortController();
                         controller.abort(new Error("seeded partition"));
                         await expect(
-                            fault.publish(deliveries[0]!, controller.signal),
+                            fault.publish(ctx, deliveries[0]!, controller.signal),
                         ).rejects.toThrow("seeded partition");
                     } else if (operation === 1) {
                         await inbox(fault, bob, fixture.clock.now());
@@ -1687,6 +1734,7 @@ describe("network and delivery contract chaos", () => {
                         fixture.clock.advance(1);
                     } else {
                         await fault.acknowledge(
+                            ctx,
                             createSignedInboxAck(bob, page.head!, fixture.clock.now()),
                         );
                     }

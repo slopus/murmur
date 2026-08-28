@@ -1,6 +1,8 @@
-import type { MurmurStore, StoreScanOptions, StoreTransaction } from "./types.js";
+import { createContextNamespace, withAfterCommit, type Context } from "@steve.kite/stdlib";
 
-export type { MurmurStore, StoreScanOptions, StoreTransaction } from "./types.js";
+import type { MurmurStore, StoreScanOptions } from "./types.js";
+
+export type { MurmurStore, StoreScanOptions } from "./types.js";
 
 /** Largest bounded store scan accepted by every Murmur store. */
 export const MAXIMUM_STORE_SCAN_ITEMS = 10_000;
@@ -8,55 +10,61 @@ export const MAXIMUM_STORE_SCAN_ITEMS = 10_000;
 /** Ephemeral store with serialized transactions. */
 export class MemoryMurmurStore implements MurmurStore {
     readonly #values = new Map<string, Uint8Array>();
+    readonly #transaction = createContextNamespace<
+        { readonly store: MemoryMurmurStore; active: boolean } | undefined
+    >("memory-murmur-store-transaction", undefined, { detachable: false });
     #transactionTail: Promise<void> = Promise.resolve();
 
     /** Return a defensive byte copy for one key. */
-    async get(key: string): Promise<Uint8Array | undefined> {
-        return this.#exclusive(async () => this.#get(key));
+    async get(ctx: Context, key: string): Promise<Uint8Array | undefined> {
+        return this.#access(ctx, async () => this.#get(key));
     }
 
     /** Store a defensive byte copy. */
-    async set(key: string, value: Uint8Array): Promise<void> {
-        await this.#exclusive(async () => this.#set(key, value));
+    async set(ctx: Context, key: string, value: Uint8Array): Promise<void> {
+        await this.#access(ctx, async () => this.#set(key, value));
     }
 
     /** Remove one key when present. */
-    async delete(key: string): Promise<void> {
-        await this.#exclusive(async () => this.#delete(key));
+    async delete(ctx: Context, key: string): Promise<void> {
+        await this.#access(ctx, async () => this.#delete(key));
     }
 
     /** Return defensive copies of entries under one prefix. */
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#exclusive(async () => this.#list(prefix));
+    async list(ctx: Context, prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#access(ctx, async () => this.#list(prefix));
     }
 
     /** Return one bounded lexicographically ordered page under a prefix. */
     async scan(
+        ctx: Context,
         prefix: string,
         options: StoreScanOptions,
     ): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#exclusive(async () => this.#scan(prefix, options));
+        return this.#access(ctx, async () => this.#scan(prefix, options));
     }
 
     /** Run one serialized in-memory transaction with rollback on throw. */
-    async transaction<Result>(
-        operation: (transaction: StoreTransaction) => Promise<Result>,
-    ): Promise<Result> {
-        return this.#exclusive(async () => {
+    async tx<Result>(ctx: Context, operation: (ctx: Context) => Promise<Result>): Promise<Result> {
+        const current = this.#transaction.get(ctx);
+        if (current !== undefined) {
+            if (current.store !== this) {
+                throw new Error("Murmur transaction belongs to another store");
+            }
+            if (current.active) return operation(ctx);
+        }
+
+        let runAfterCommit: (() => Promise<void>) | undefined;
+        const result = await this.#exclusive(async () => {
             const snapshot = new Map(
                 [...this.#values].map(([key, value]) => [key, value.slice()] as const),
             );
-            const transaction: StoreTransaction = {
-                get: async (key): Promise<Uint8Array | undefined> => this.#get(key),
-                set: async (key, value): Promise<void> => this.#set(key, value),
-                delete: async (key): Promise<void> => this.#delete(key),
-                list: async (prefix): Promise<ReadonlyMap<string, Uint8Array>> =>
-                    this.#list(prefix),
-                scan: async (prefix, options): Promise<ReadonlyMap<string, Uint8Array>> =>
-                    this.#scan(prefix, options),
-            };
+            const [afterCommitCtx, run] = withAfterCommit(ctx);
+            runAfterCommit = run;
+            const state = { store: this, active: true };
+            const tx = this.#transaction.set(afterCommitCtx, state);
             try {
-                return await operation(transaction);
+                return await operation(tx);
             } catch (error: unknown) {
                 for (const value of this.#values.values()) {
                     value.fill(0);
@@ -68,11 +76,14 @@ export class MemoryMurmurStore implements MurmurStore {
                 snapshot.clear();
                 throw error;
             } finally {
+                state.active = false;
                 for (const value of snapshot.values()) {
                     value.fill(0);
                 }
             }
         });
+        await runAfterCommit?.();
+        return result;
     }
 
     #get(key: string): Uint8Array | undefined {
@@ -134,5 +145,12 @@ export class MemoryMurmurStore implements MurmurStore {
         } finally {
             release?.();
         }
+    }
+
+    async #access<Result>(ctx: Context, operation: () => Promise<Result>): Promise<Result> {
+        const current = this.#transaction.get(ctx);
+        if (current === undefined) return this.#exclusive(operation);
+        if (current.store !== this) throw new Error("Murmur transaction belongs to another store");
+        return current.active ? operation() : this.#exclusive(operation);
     }
 }

@@ -32,6 +32,8 @@ import {
     serializeMlsKeyPackageBundle,
     verifyMlsKeyPackage,
 } from "../mls/index.js";
+import type { Context } from "@steve.kite/stdlib";
+
 import type { MurmurStore } from "../storage/index.js";
 import {
     canonicalJsonBytes,
@@ -320,7 +322,10 @@ export interface MurmurClientOptions {
      * ciphertext to that key. Murmur and the relay never decrypt the result. Omission preserves
      * existing metadata and registers a new device with an empty value.
      */
-    readonly encryptDeviceMetadata?: (deviceKey: Uint8Array) => Uint8Array | Promise<Uint8Array>;
+    readonly encryptDeviceMetadata?: (
+        ctx: Context,
+        deviceKey: Uint8Array,
+    ) => Uint8Array | Promise<Uint8Array>;
     /** Optional resource bounds; omitted fields use Murmur's defaults. */
     readonly limits?: MurmurSessionLimits;
     /** Clock override used for protocol timestamps and expiry checks. Defaults to `Date.now`. */
@@ -384,7 +389,7 @@ export class MurmurClient {
     }
 
     /** Open or create one durable per-device Murmur identity and its account state. */
-    static async open(options: MurmurClientOptions): Promise<MurmurClient> {
+    static async open(ctx: Context, options: MurmurClientOptions): Promise<MurmurClient> {
         const deliveryChoices = [
             options.relay !== undefined,
             options.transport !== undefined,
@@ -407,8 +412,8 @@ export class MurmurClient {
         let identity: IdentityKeyPair | undefined;
         let account: IdentityKeyPair | undefined;
         try {
-            await options.store.transaction(async (transaction) => {
-                const stored = await transaction.get(IDENTITY_KEY);
+            await options.store.tx(ctx, async (transaction) => {
+                const stored = await options.store.get(transaction, IDENTITY_KEY);
                 if (stored !== undefined) {
                     try {
                         identity = decodeIdentityRoot(stored);
@@ -419,13 +424,13 @@ export class MurmurClient {
                     identity = generateIdentityKeyPair();
                     const encoded = encodeIdentityRoot(identity);
                     try {
-                        await transaction.set(IDENTITY_KEY, encoded);
+                        await options.store.set(transaction, IDENTITY_KEY, encoded);
                     } finally {
                         zeroBytes(encoded);
                     }
                 }
 
-                const storedAccount = await transaction.get(ACCOUNT_ROOT_KEY);
+                const storedAccount = await options.store.get(transaction, ACCOUNT_ROOT_KEY);
                 if (storedAccount !== undefined) {
                     try {
                         account = decodeIdentityRoot(storedAccount);
@@ -451,7 +456,7 @@ export class MurmurClient {
                     }
                     const encoded = encodeIdentityRoot(account);
                     try {
-                        await transaction.set(ACCOUNT_ROOT_KEY, encoded);
+                        await options.store.set(transaction, ACCOUNT_ROOT_KEY, encoded);
                     } finally {
                         zeroBytes(encoded);
                     }
@@ -463,7 +468,7 @@ export class MurmurClient {
             const encryptedDeviceMetadata =
                 options.encryptDeviceMetadata === undefined
                     ? undefined
-                    : await options.encryptDeviceMetadata(identity.publicKey.slice());
+                    : await options.encryptDeviceMetadata(ctx, identity.publicKey.slice());
             if (
                 encryptedDeviceMetadata !== undefined &&
                 !(encryptedDeviceMetadata instanceof Uint8Array)
@@ -498,8 +503,8 @@ export class MurmurClient {
                 account,
                 encryptedDeviceMetadata,
             );
-            await client.#ensureRegistered();
-            await client.#ensureDirectoryEntry();
+            await client.#ensureRegistered(ctx);
+            await client.#ensureDirectoryEntry(ctx);
             return client;
         } catch (error: unknown) {
             if (identity !== undefined) destroyIdentity(identity);
@@ -527,13 +532,13 @@ export class MurmurClient {
     }
 
     /** Read this account's authenticated device roster entries. */
-    async devices(): Promise<readonly MurmurDeviceRosterEntry[]> {
-        return this.#tracked(async () => {
-            const remote = await this.#transport.readDeviceRoster?.(this.#account.publicKey);
+    async devices(ctx: Context): Promise<readonly MurmurDeviceRosterEntry[]> {
+        return this.#tracked(ctx, async () => {
+            const remote = await this.#transport.readDeviceRoster?.(ctx, this.#account.publicKey);
             if (remote !== undefined) {
-                await this.#observeRoster(`lookup-${remote.revision}`, remote);
+                await this.#observeRoster(ctx, `lookup-${remote.revision}`, remote);
             }
-            const roster = remote ?? (await this.#ownRoster());
+            const roster = remote ?? (await this.#ownRoster(ctx));
             return roster === undefined
                 ? []
                 : roster.devices.map((entry) =>
@@ -547,9 +552,9 @@ export class MurmurClient {
     }
 
     /** List active sibling devices with no authenticated activity for six months. */
-    async dormantDevices(): Promise<readonly MurmurDormantDevice[]> {
-        return this.#tracked(async () => {
-            const roster = await this.#ownRoster();
+    async dormantDevices(ctx: Context): Promise<readonly MurmurDormantDevice[]> {
+        return this.#tracked(ctx, async () => {
+            const roster = await this.#ownRoster(ctx);
             if (roster === undefined) return [];
             const now = this.#now();
             const dormant: MurmurDormantDevice[] = [];
@@ -558,6 +563,7 @@ export class MurmurClient {
                     continue;
                 }
                 const bytes = await this.#store.get(
+                    ctx,
                     `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(entry.deviceKey)}`,
                 );
                 let lastActivityAt = 0;
@@ -587,8 +593,8 @@ export class MurmurClient {
         });
     }
 
-    async #ownRoster(): Promise<MurmurDeviceRoster | undefined> {
-        const bytes = await this.#store.get(ACCOUNT_ROSTER_KEY);
+    async #ownRoster(ctx: Context): Promise<MurmurDeviceRoster | undefined> {
+        const bytes = await this.#store.get(ctx, ACCOUNT_ROSTER_KEY);
         if (bytes === undefined) return undefined;
         try {
             return parseDeviceRoster(bytes);
@@ -597,8 +603,11 @@ export class MurmurClient {
         }
     }
 
-    async #localDirectoryPrekey(key: string): Promise<DirectoryLocalPrekey | undefined> {
-        const bytes = await this.#store.get(key);
+    async #localDirectoryPrekey(
+        ctx: Context,
+        key: string,
+    ): Promise<DirectoryLocalPrekey | undefined> {
+        const bytes = await this.#store.get(ctx, key);
         if (bytes === undefined) return undefined;
         try {
             return decodeDirectoryLocalPrekey(bytes);
@@ -608,6 +617,7 @@ export class MurmurClient {
     }
 
     async #directoryOneTimePrekeys(
+        ctx: Context,
         count: number,
         pending: boolean,
     ): Promise<readonly MurmurDirectoryOneTimePrekey[]> {
@@ -653,15 +663,23 @@ export class MurmurClient {
                     ),
                 });
             }
-            await this.#engine.storeKeyPackages(stored);
-            await this.#store.transaction(async (transaction) => {
+            await this.#engine.storeKeyPackages(ctx, stored);
+            await this.#store.tx(ctx, async (transaction) => {
                 for (const prekey of prekeys) {
                     const metadata = encodeDirectoryLocalPrekey(prekey);
                     const suffix = encodeBase64Url(prekey.reference);
                     try {
-                        await transaction.set(`${DIRECTORY_ONE_TIME_PREFIX}${suffix}`, metadata);
+                        await this.#store.set(
+                            transaction,
+                            `${DIRECTORY_ONE_TIME_PREFIX}${suffix}`,
+                            metadata,
+                        );
                         if (pending) {
-                            await transaction.set(`${DIRECTORY_PENDING_PREFIX}${suffix}`, metadata);
+                            await this.#store.set(
+                                transaction,
+                                `${DIRECTORY_PENDING_PREFIX}${suffix}`,
+                                metadata,
+                            );
                         }
                     } finally {
                         zeroBytes(metadata);
@@ -677,7 +695,7 @@ export class MurmurClient {
         }
     }
 
-    async #createDirectoryLastResort(): Promise<DirectoryLocalPrekey> {
+    async #createDirectoryLastResort(ctx: Context): Promise<DirectoryLocalPrekey> {
         const bundle = createMlsKeyPackage(
             this.#identity,
             Math.floor(this.#now() / 1_000),
@@ -690,7 +708,7 @@ export class MurmurClient {
             const expiresAt = Number((bundle.keyPackage.leafNode.notAfter + 1n) * 1_000n);
             const privateBytes = serializeMlsKeyPackageBundle(bundle);
             try {
-                await this.#engine.storeKeyPackages([
+                await this.#engine.storeKeyPackages(ctx, [
                     { reference, bytes: privateBytes, expiresAt, reusable: true },
                 ]);
             } finally {
@@ -699,7 +717,7 @@ export class MurmurClient {
             const lastResort = { reference, keyPackage, expiresAt };
             const metadata = encodeDirectoryLocalPrekey(lastResort);
             try {
-                await this.#store.set(DIRECTORY_LAST_RESORT_KEY, metadata);
+                await this.#store.set(ctx, DIRECTORY_LAST_RESORT_KEY, metadata);
             } finally {
                 zeroBytes(metadata);
             }
@@ -710,12 +728,13 @@ export class MurmurClient {
     }
 
     async #directoryUpload(
+        ctx: Context,
         mode: "replenish" | "rotate",
         lastResort: DirectoryLocalPrekey,
         oneTimePrekeys: readonly MurmurDirectoryOneTimePrekey[],
     ): Promise<void> {
         if (this.#transport.uploadDirectoryPrekeys === undefined) return;
-        const roster = await this.#ownRoster();
+        const roster = await this.#ownRoster(ctx);
         const entry = roster?.devices.find((device) =>
             equalBytes(device.deviceKey, this.#identity.publicKey),
         );
@@ -735,7 +754,7 @@ export class MurmurClient {
             }),
             { createdAt: now, expiresAt: now + DIRECTORY_NOTIFICATION_TTL_MILLISECONDS },
         );
-        await this.#transport.uploadDirectoryPrekeys(delivery);
+        await this.#transport.uploadDirectoryPrekeys(ctx, delivery);
         if (roster !== undefined) {
             const updated: MurmurDeviceRoster = {
                 ...roster,
@@ -750,15 +769,18 @@ export class MurmurClient {
             };
             const bytes = serializeDeviceRoster(updated);
             try {
-                await this.#store.set(ACCOUNT_ROSTER_KEY, bytes);
+                await this.#store.set(ctx, ACCOUNT_ROSTER_KEY, bytes);
             } finally {
                 zeroBytes(bytes);
             }
         }
     }
 
-    async #directoryMetadata(prefix: string): Promise<Map<string, DirectoryLocalPrekey>> {
-        const page = await this.#store.scan(prefix, { limit: 512 });
+    async #directoryMetadata(
+        ctx: Context,
+        prefix: string,
+    ): Promise<Map<string, DirectoryLocalPrekey>> {
+        const page = await this.#store.scan(ctx, prefix, { limit: 512 });
         const values = new Map<string, DirectoryLocalPrekey>();
         try {
             for (const [key, bytes] of page) values.set(key, decodeDirectoryLocalPrekey(bytes));
@@ -783,8 +805,8 @@ export class MurmurClient {
         };
     }
 
-    async #replenishDirectoryEntry(lastResort: DirectoryLocalPrekey): Promise<void> {
-        const spentPage = await this.#store.scan(DIRECTORY_SPENT_PREFIX, { limit: 256 });
+    async #replenishDirectoryEntry(ctx: Context, lastResort: DirectoryLocalPrekey): Promise<void> {
+        const spentPage = await this.#store.scan(ctx, DIRECTORY_SPENT_PREFIX, { limit: 256 });
         const pendingSpent: string[] = [];
         try {
             for (const [key, bytes] of spentPage) {
@@ -794,30 +816,32 @@ export class MurmurClient {
             for (const bytes of spentPage.values()) zeroBytes(bytes);
         }
         if (pendingSpent.length === 0) return;
-        let pending = await this.#directoryMetadata(DIRECTORY_PENDING_PREFIX);
+        let pending = await this.#directoryMetadata(ctx, DIRECTORY_PENDING_PREFIX);
         if (pending.size < pendingSpent.length) {
-            await this.#directoryOneTimePrekeys(pendingSpent.length - pending.size, true);
-            pending = await this.#directoryMetadata(DIRECTORY_PENDING_PREFIX);
+            await this.#directoryOneTimePrekeys(ctx, pendingSpent.length - pending.size, true);
+            pending = await this.#directoryMetadata(ctx, DIRECTORY_PENDING_PREFIX);
         }
         const selected = [...pending.entries()].slice(0, pendingSpent.length);
         await this.#directoryUpload(
+            ctx,
             "replenish",
             lastResort,
             selected
                 .map(([, prekey]) => this.#spentNotification(prekey))
                 .sort((left, right) => compareDirectoryReferences(left.reference, right.reference)),
         );
-        await this.#store.transaction(async (transaction) => {
-            for (const [key] of selected) await transaction.delete(key);
-            for (const key of pendingSpent) await transaction.set(key, utf8Encode("replenished"));
+        await this.#store.tx(ctx, async (transaction) => {
+            for (const [key] of selected) await this.#store.delete(transaction, key);
+            for (const key of pendingSpent)
+                await this.#store.set(transaction, key, utf8Encode("replenished"));
         });
     }
 
-    async #ensureDirectoryEntry(): Promise<void> {
+    async #ensureDirectoryEntry(ctx: Context): Promise<void> {
         if (this.#transport.uploadDirectoryPrekeys === undefined) return;
-        let lastResort = await this.#localDirectoryPrekey(DIRECTORY_LAST_RESORT_KEY);
+        let lastResort = await this.#localDirectoryPrekey(ctx, DIRECTORY_LAST_RESORT_KEY);
         if (lastResort === undefined) {
-            const roster = await this.#ownRoster();
+            const roster = await this.#ownRoster(ctx);
             const admission = roster?.admissions.find((entry) =>
                 equalBytes(entry.deviceKey, this.#identity.publicKey),
             );
@@ -837,50 +861,52 @@ export class MurmurClient {
             };
             const metadata = encodeDirectoryLocalPrekey(lastResort);
             try {
-                await this.#store.set(DIRECTORY_LAST_RESORT_KEY, metadata);
+                await this.#store.set(ctx, DIRECTORY_LAST_RESORT_KEY, metadata);
             } finally {
                 zeroBytes(metadata);
             }
         }
-        const initialized = await this.#store.get(DIRECTORY_INITIALIZED_KEY);
+        const initialized = await this.#store.get(ctx, DIRECTORY_INITIALIZED_KEY);
         if (initialized !== undefined) {
             zeroBytes(initialized);
             if (lastResort.expiresAt <= this.#now()) {
-                await this.#rotateDirectoryEntry();
+                await this.#rotateDirectoryEntry(ctx);
             } else {
-                await this.#replenishDirectoryEntry(lastResort);
+                await this.#replenishDirectoryEntry(ctx, lastResort);
             }
             return;
         }
-        const previous = await this.#directoryMetadata(DIRECTORY_ONE_TIME_PREFIX);
+        const previous = await this.#directoryMetadata(ctx, DIRECTORY_ONE_TIME_PREFIX);
         const oneTimePrekeys = await this.#directoryOneTimePrekeys(
+            ctx,
             DIRECTORY_ONE_TIME_POOL_SIZE,
             false,
         );
-        await this.#directoryUpload("rotate", lastResort, oneTimePrekeys);
-        await this.#store.set(DIRECTORY_INITIALIZED_KEY, new Uint8Array([1]));
+        await this.#directoryUpload(ctx, "rotate", lastResort, oneTimePrekeys);
+        await this.#store.set(ctx, DIRECTORY_INITIALIZED_KEY, new Uint8Array([1]));
         const oldReferences = [...previous.values()].map((entry) => entry.reference);
-        if (oldReferences.length > 0) await this.#engine.deleteKeyPackages(oldReferences);
+        if (oldReferences.length > 0) await this.#engine.deleteKeyPackages(ctx, oldReferences);
     }
 
-    async #rotateDirectoryEntry(): Promise<void> {
+    async #rotateDirectoryEntry(ctx: Context): Promise<void> {
         if (this.#transport.uploadDirectoryPrekeys === undefined) {
             throw new Error("Delivery transport does not support identity-directory uploads");
         }
-        const previousOneTime = await this.#directoryMetadata(DIRECTORY_ONE_TIME_PREFIX);
-        const previousLast = await this.#localDirectoryPrekey(DIRECTORY_LAST_RESORT_KEY);
-        const lastResort = await this.#createDirectoryLastResort();
+        const previousOneTime = await this.#directoryMetadata(ctx, DIRECTORY_ONE_TIME_PREFIX);
+        const previousLast = await this.#localDirectoryPrekey(ctx, DIRECTORY_LAST_RESORT_KEY);
+        const lastResort = await this.#createDirectoryLastResort(ctx);
         const oneTimePrekeys = await this.#directoryOneTimePrekeys(
+            ctx,
             DIRECTORY_ONE_TIME_POOL_SIZE,
             false,
         );
-        await this.#directoryUpload("rotate", lastResort, oneTimePrekeys);
-        await this.#store.set(DIRECTORY_INITIALIZED_KEY, new Uint8Array([1]));
+        await this.#directoryUpload(ctx, "rotate", lastResort, oneTimePrekeys);
+        await this.#store.set(ctx, DIRECTORY_INITIALIZED_KEY, new Uint8Array([1]));
         const references = [
             ...[...previousOneTime.values()].map((entry) => entry.reference),
             ...(previousLast === undefined ? [] : [previousLast.reference]),
         ];
-        if (references.length > 0) await this.#engine.deleteKeyPackages(references);
+        if (references.length > 0) await this.#engine.deleteKeyPackages(ctx, references);
     }
 
     #publicAccountClaim(
@@ -941,21 +967,32 @@ export class MurmurClient {
     }
 
     async #observeRoster(
+        ctx: Context,
         eventId: string,
         roster: MurmurDeviceRoster | DeliveryDeviceRoster,
     ): Promise<void> {
         const bytes = serializeDeviceRoster(roster);
         try {
-            await this.#store.transaction((transaction) =>
-                observeDeviceRoster(transaction, this.#account.publicKey, eventId, bytes),
+            await this.#store.tx(ctx, (transaction) =>
+                observeDeviceRoster(
+                    transaction,
+                    this.#store,
+                    this.#account.publicKey,
+                    eventId,
+                    bytes,
+                ),
             );
         } finally {
             zeroBytes(bytes);
         }
     }
 
-    async #ensureRegistered(forceReset: boolean = false, staleAttempts: number = 0): Promise<void> {
-        const current = await this.#transport.readDeviceRoster?.(this.#account.publicKey);
+    async #ensureRegistered(
+        ctx: Context,
+        forceReset: boolean = false,
+        staleAttempts: number = 0,
+    ): Promise<void> {
+        const current = await this.#transport.readDeviceRoster?.(ctx, this.#account.publicKey);
         const currentEntry = current?.devices.find((entry) =>
             equalBytes(entry.deviceKey, this.#identity.publicKey),
         );
@@ -966,7 +1003,7 @@ export class MurmurClient {
             (this.#encryptedDeviceMetadata === undefined ||
                 equalBytes(currentEntry.encryptedMetadata, this.#encryptedDeviceMetadata))
         ) {
-            await this.#observeRoster(`lookup-${current.revision}`, current);
+            await this.#observeRoster(ctx, `lookup-${current.revision}`, current);
             return;
         }
         if (!forceReset && current !== undefined && currentEntry !== undefined) {
@@ -987,12 +1024,12 @@ export class MurmurClient {
                 { createdAt: now, expiresAt: now + 180 * 24 * 60 * 60 * 1_000 - 60_000 },
             );
             try {
-                const roster = await this.#transport.mutateDeviceRoster(delivery);
-                await this.#observeRoster(delivery.id, roster);
+                const roster = await this.#transport.mutateDeviceRoster(ctx, delivery);
+                await this.#observeRoster(ctx, delivery.id, roster);
                 return;
             } catch (error: unknown) {
                 if (error instanceof DeliveryStaleRosterError && staleAttempts < 7) {
-                    await this.#ensureRegistered(forceReset, staleAttempts + 1);
+                    await this.#ensureRegistered(ctx, forceReset, staleAttempts + 1);
                     return;
                 }
                 throw error;
@@ -1008,7 +1045,7 @@ export class MurmurClient {
             const reference = mlsKeyPackageReference(bundle.keyPackage);
             const stored = serializeMlsKeyPackageBundle(bundle);
             try {
-                await this.#engine.storeKeyPackages([
+                await this.#engine.storeKeyPackages(ctx, [
                     {
                         reference,
                         bytes: stored,
@@ -1027,11 +1064,11 @@ export class MurmurClient {
                 expiresAt,
             });
             try {
-                await this.#store.set(DIRECTORY_LAST_RESORT_KEY, directoryMetadata);
+                await this.#store.set(ctx, DIRECTORY_LAST_RESORT_KEY, directoryMetadata);
             } finally {
                 zeroBytes(directoryMetadata);
             }
-            await this.#store.delete(DIRECTORY_INITIALIZED_KEY);
+            await this.#store.delete(ctx, DIRECTORY_INITIALIZED_KEY);
             const recipients = [
                 ...new Map(
                     [
@@ -1088,24 +1125,26 @@ export class MurmurClient {
                               { deviceKey: this.#identity.publicKey, keyPackage },
                           ],
                       }
-                    : await this.#transport.mutateDeviceRoster(delivery).catch(async (error) => {
-                          if (error instanceof DeliveryStaleRosterError && staleAttempts < 7) {
-                              await this.#ensureRegistered(forceReset, staleAttempts + 1);
-                              return undefined;
-                          }
-                          throw error;
-                      });
+                    : await this.#transport
+                          .mutateDeviceRoster(ctx, delivery)
+                          .catch(async (error) => {
+                              if (error instanceof DeliveryStaleRosterError && staleAttempts < 7) {
+                                  await this.#ensureRegistered(ctx, forceReset, staleAttempts + 1);
+                                  return undefined;
+                              }
+                              throw error;
+                          });
             if (roster === undefined) return;
-            await this.#observeRoster(delivery.id, roster);
+            await this.#observeRoster(ctx, delivery.id, roster);
         } finally {
             destroyMlsKeyPackageBundle(bundle);
         }
     }
 
     /** Remove any account device, including this device, using the account identity key. */
-    async removeDevice(deviceKey: Uint8Array): Promise<void> {
-        await this.#exclusive(async () => {
-            const roster = await this.#ownRoster();
+    async removeDevice(ctx: Context, deviceKey: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, async () => {
+            const roster = await this.#ownRoster(ctx);
             if (roster === undefined) throw new Error("Account has no device roster");
             const entry = roster.devices.find((candidate) =>
                 equalBytes(candidate.deviceKey, deviceKey),
@@ -1129,14 +1168,14 @@ export class MurmurClient {
                 }),
                 { createdAt: now, expiresAt: now + 180 * 24 * 60 * 60 * 1_000 - 60_000 },
             );
-            const updated = await this.#transport.mutateDeviceRoster(delivery);
-            await this.#observeRoster(delivery.id, updated);
+            const updated = await this.#transport.mutateDeviceRoster(ctx, delivery);
+            await this.#observeRoster(ctx, delivery.id, updated);
         });
         this.#signalSync();
     }
 
     /** Register one optional typed service under its durable stable ID. */
-    registerService(registration: MurmurServiceRegistration): void {
+    registerService(_ctx: Context, registration: MurmurServiceRegistration): void {
         this.#assertOpen();
         validateMurmurServiceRegistration(registration);
         if (this.#services.has(registration.id)) {
@@ -1146,14 +1185,14 @@ export class MurmurClient {
     }
 
     /** Disable one optional service without changing its durable state. */
-    unregisterService(id: string): void {
+    unregisterService(_ctx: Context, id: string): void {
         this.#assertOpen();
         this.#services.delete(id);
     }
 
     /** Create and durably retain one bare MLS KeyPackage for direct session admission. */
-    async createKeyPackage(): Promise<MurmurSessionMember> {
-        return this.#exclusive(async () => {
+    async createKeyPackage(ctx: Context): Promise<MurmurSessionMember> {
+        return this.#exclusive(ctx, async () => {
             const bundle = createMlsKeyPackage(
                 this.#identity,
                 Math.floor(this.#now() / 1_000),
@@ -1164,7 +1203,7 @@ export class MurmurClient {
                 const reference = mlsKeyPackageReference(bundle.keyPackage);
                 const bytes = serializeMlsKeyPackageBundle(bundle);
                 try {
-                    await this.#engine.storeKeyPackages([
+                    await this.#engine.storeKeyPackages(ctx, [
                         {
                             reference,
                             bytes,
@@ -1186,8 +1225,12 @@ export class MurmurClient {
     }
 
     /** Claim one exact account from the relay directory using an authentication ticket. */
-    async claimAccount(identityKey: Uint8Array, ticket: Uint8Array): Promise<MurmurAccountClaim> {
-        return this.#tracked(async () => {
+    async claimAccount(
+        ctx: Context,
+        identityKey: Uint8Array,
+        ticket: Uint8Array,
+    ): Promise<MurmurAccountClaim> {
+        return this.#tracked(ctx, async () => {
             validateIdentityPublicKey({ publicKey: identityKey });
             if (ticket.length < 1 || ticket.length > 8 * 1024) {
                 throw new Error("Invalid directory claim ticket");
@@ -1195,18 +1238,18 @@ export class MurmurClient {
             if (this.#transport.claimDirectory === undefined) {
                 throw new Error("Delivery transport does not support identity-directory claims");
             }
-            const claim = await this.#transport.claimDirectory(identityKey, ticket);
+            const claim = await this.#transport.claimDirectory(ctx, identityKey, ticket);
             return this.#publicAccountClaim(identityKey, claim);
         });
     }
 
     /** Rotate all unclaimed one-use prekeys and this device's multi-use fallback. */
-    async rotate(): Promise<void> {
-        await this.#exclusive(() => this.#rotateDirectoryEntry());
+    async rotate(ctx: Context): Promise<void> {
+        await this.#exclusive(ctx, () => this.#rotateDirectoryEntry(ctx));
     }
 
     /** Create a two-or-more-member MLS session from bare MLS admission material. */
-    async createSession(options: CreateMurmurSessionOptions): Promise<MurmurSession> {
+    async createSession(ctx: Context, options: CreateMurmurSessionOptions): Promise<MurmurSession> {
         const owner =
             options.service === undefined
                 ? undefined
@@ -1214,8 +1257,9 @@ export class MurmurClient {
         if (options.service !== undefined && !this.#services.has(options.service)) {
             throw new Error("Session service is not registered");
         }
-        const session = await this.#exclusive(() =>
+        const session = await this.#exclusive(ctx, () =>
             this.#engine.create(
+                ctx,
                 {
                     descriptor: options.descriptor,
                     ...(options.adminsAssignAdmins === undefined
@@ -1241,34 +1285,37 @@ export class MurmurClient {
     }
 
     /** Return a defensive snapshot of one local session, or `undefined` when it is unknown. */
-    async session(id: Uint8Array): Promise<MurmurSession | undefined> {
-        return this.#tracked(() => this.#engine.get(id));
+    async session(ctx: Context, id: Uint8Array): Promise<MurmurSession | undefined> {
+        return this.#tracked(ctx, () => this.#engine.get(ctx, id));
     }
 
     /** List one bounded page of local sessions in durable key order. */
-    async sessions(options: MurmurSessionListOptions = {}): Promise<MurmurSessionPage> {
-        return this.#tracked(() => this.#engine.list(options));
+    async sessions(
+        ctx: Context,
+        options: MurmurSessionListOptions = {},
+    ): Promise<MurmurSessionPage> {
+        return this.#tracked(ctx, () => this.#engine.list(ctx, options));
     }
 
     /** Activate an application-owned pending session and release its buffered updates. */
-    async activateSession(id: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.activate(id));
+    async activateSession(ctx: Context, id: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.activate(ctx, id));
         this.#signalSync();
     }
 
     /** Terminally reject and destroy an application-owned pending session. */
-    async ignoreSession(id: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.ignore(id));
+    async ignoreSession(ctx: Context, id: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.ignore(ctx, id));
     }
 
     /** Abandon a blocked local membership operation and destroy the whole session. */
-    async abandonSession(id: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.abandon(id));
+    async abandonSession(ctx: Context, id: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.abandon(ctx, id));
     }
 
     /** Owner-only durable deletion of one session and its relay-linked pending state. */
-    async deleteSession(id: Uint8Array): Promise<string> {
-        const deletionId = await this.#exclusive(() => this.#engine.delete(id));
+    async deleteSession(ctx: Context, id: Uint8Array): Promise<string> {
+        const deletionId = await this.#exclusive(ctx, () => this.#engine.delete(ctx, id));
         this.#signalSync();
         return deletionId;
     }
@@ -1279,7 +1326,7 @@ export class MurmurClient {
      * A replay response confirms an earlier accepted request after a crash. Remote MLS history
      * and copies held by other members are not erased by account deletion.
      */
-    async deleteAccount(): Promise<void> {
+    async deleteAccount(ctx: Context): Promise<void> {
         this.#assertOpen();
         if (this.#transport.deleteAccount === undefined) {
             throw new Error("Delivery transport does not support account deletion");
@@ -1291,7 +1338,7 @@ export class MurmurClient {
         this.#pendingOperations += 1;
         let request: SignedDelivery | undefined;
         try {
-            const stored = await this.#store.get(ACCOUNT_DELETION_KEY);
+            const stored = await this.#store.get(ctx, ACCOUNT_DELETION_KEY);
             if (stored === undefined) {
                 const now = this.#now();
                 request = createSignedDelivery(this.#account, [], encodeAccountDeletionRequest(), {
@@ -1321,21 +1368,21 @@ export class MurmurClient {
             }
             const encoded = canonicalJsonBytes(signedDeliveryToJson(request) as never);
             try {
-                await this.#store.set(ACCOUNT_DELETION_KEY, encoded);
+                await this.#store.set(ctx, ACCOUNT_DELETION_KEY, encoded);
             } finally {
                 zeroBytes(encoded);
             }
             try {
-                await this.#transport.deleteAccount(request);
+                await this.#transport.deleteAccount(ctx, request);
             } catch (error: unknown) {
                 if (!(error instanceof DeliveryTransportError && error.code === "replay")) {
                     throw error;
                 }
             }
-            await this.#store.transaction(async (transaction) => {
+            await this.#store.tx(ctx, async (transaction) => {
                 let after: string | undefined;
                 for (;;) {
-                    const page = await transaction.scan("", {
+                    const page = await this.#store.scan(transaction, "", {
                         ...(after === undefined ? {} : { after }),
                         limit: RESET_PURGE_SCAN_LIMIT,
                     });
@@ -1343,7 +1390,7 @@ export class MurmurClient {
                     for (const [key, value] of page) {
                         after = key;
                         try {
-                            await transaction.delete(key);
+                            await this.#store.delete(transaction, key);
                         } finally {
                             zeroBytes(value);
                         }
@@ -1373,21 +1420,21 @@ export class MurmurClient {
      * Sends made while a membership Commit is staged use its post-Commit epoch and publish
      * only after that Commit is adopted from its relay echo and every required Welcome publishes.
      */
-    async send(id: Uint8Array, bytes: Uint8Array): Promise<string> {
-        const deliveryId = await this.#exclusive(() => this.#engine.send(id, bytes));
+    async send(ctx: Context, id: Uint8Array, bytes: Uint8Array): Promise<string> {
+        const deliveryId = await this.#exclusive(ctx, () => this.#engine.send(ctx, id, bytes));
         this.#signalSync();
         return deliveryId;
     }
 
     /** Durably request one MLS member addition from bare admission material. */
-    async addMember(id: Uint8Array, member: MurmurSessionAdmission): Promise<void> {
-        await this.#exclusive(async () => {
+    async addMember(ctx: Context, id: Uint8Array, member: MurmurSessionAdmission): Promise<void> {
+        await this.#exclusive(ctx, async () => {
             for (const admission of this.#flattenAdmissions([member])) {
                 const keyPackage = decodeMlsKeyPackage(admission.keyPackage);
                 if (!equalBytes(keyPackage.leafNode.credential.identity, admission.identity)) {
                     throw new Error("Session member account does not match its KeyPackage");
                 }
-                await this.#engine.add(id, {
+                await this.#engine.add(ctx, id, {
                     identity: keyPackage.leafNode.signatureKey,
                     keyPackage,
                 });
@@ -1397,42 +1444,46 @@ export class MurmurClient {
     }
 
     /** Durably request removal of one non-owner account and return before convergence. */
-    async removeMember(id: Uint8Array, identity: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.remove(id, identity));
+    async removeMember(ctx: Context, id: Uint8Array, identity: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.remove(ctx, id, identity));
         this.#signalSync();
     }
 
     /** Durably request an admin grant and return before its Commit is published. */
-    async grantAdmin(id: Uint8Array, account: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.grantAdmin(id, account));
+    async grantAdmin(ctx: Context, id: Uint8Array, account: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.grantAdmin(ctx, id, account));
         this.#signalSync();
     }
 
     /** Durably request an owner-authorized admin revocation. */
-    async revokeAdmin(id: Uint8Array, account: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.revokeAdmin(id, account));
+    async revokeAdmin(ctx: Context, id: Uint8Array, account: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.revokeAdmin(ctx, id, account));
         this.#signalSync();
     }
 
     /** Durably request owner-controlled policy changes. */
-    async setPolicies(id: Uint8Array, policies: MurmurSessionPolicyChanges): Promise<void> {
-        await this.#exclusive(() => this.#engine.setPolicies(id, policies));
+    async setPolicies(
+        ctx: Context,
+        id: Uint8Array,
+        policies: MurmurSessionPolicyChanges,
+    ): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.setPolicies(ctx, id, policies));
         this.#signalSync();
     }
 
     /** Durably request removal of every local-account device from one session. */
-    async leave(id: Uint8Array): Promise<void> {
-        await this.#exclusive(() => this.#engine.leave(id));
+    async leave(ctx: Context, id: Uint8Array): Promise<void> {
+        await this.#exclusive(ctx, () => this.#engine.leave(ctx, id));
         this.#signalSync();
     }
 
     /** Return the bounded, durable diagnostics retained for terminal session failures. */
-    async issues(): Promise<readonly MurmurSessionIssue[]> {
-        return this.#tracked(() => this.#engine.issues());
+    async issues(ctx: Context): Promise<readonly MurmurSessionIssue[]> {
+        return this.#tracked(ctx, () => this.#engine.issues(ctx));
     }
 
-    async #pendingReset(): Promise<MurmurResetEvent | undefined> {
-        const bytes = await this.#store.get(RESET_PENDING_KEY);
+    async #pendingReset(ctx: Context): Promise<MurmurResetEvent | undefined> {
+        const bytes = await this.#store.get(ctx, RESET_PENDING_KEY);
         if (bytes === undefined) return undefined;
         try {
             return decodeResetEvent(bytes);
@@ -1441,13 +1492,13 @@ export class MurmurClient {
         }
     }
 
-    async #recordReset(loss: InboxContinuityLossError): Promise<MurmurResetEvent> {
-        const existing = await this.#pendingReset();
+    async #recordReset(ctx: Context, loss: InboxContinuityLossError): Promise<MurmurResetEvent> {
+        const existing = await this.#pendingReset(ctx);
         if (existing !== undefined) return existing;
         const sessions: MurmurResetSession[] = [];
         let cursor: string | null = null;
         do {
-            const page = await this.#engine.list(cursor === null ? {} : { after: cursor });
+            const page = await this.#engine.list(ctx, cursor === null ? {} : { after: cursor });
             for (const session of page.sessions) {
                 sessions.push(
                     Object.freeze({
@@ -1473,10 +1524,11 @@ export class MurmurClient {
         });
         const encoded = encodeResetEvent(reset);
         try {
-            await this.#store.transaction(async (transaction) => {
-                const pending = await transaction.get(RESET_PENDING_KEY);
+            await this.#store.tx(ctx, async (transaction) => {
+                const pending = await this.#store.get(transaction, RESET_PENDING_KEY);
                 try {
-                    if (pending === undefined) await transaction.set(RESET_PENDING_KEY, encoded);
+                    if (pending === undefined)
+                        await this.#store.set(transaction, RESET_PENDING_KEY, encoded);
                 } finally {
                     if (pending !== undefined) zeroBytes(pending);
                 }
@@ -1484,7 +1536,7 @@ export class MurmurClient {
         } finally {
             zeroBytes(encoded);
         }
-        return (await this.#pendingReset())!;
+        return (await this.#pendingReset(ctx))!;
     }
 
     #preserveAcrossReset(key: string): boolean {
@@ -1498,11 +1550,11 @@ export class MurmurClient {
         );
     }
 
-    async #purgeReset(reset: MurmurResetEvent): Promise<void> {
-        await this.#store.transaction(async (transaction) => {
+    async #purgeReset(ctx: Context, reset: MurmurResetEvent): Promise<void> {
+        await this.#store.tx(ctx, async (transaction) => {
             let after: string | undefined;
             for (;;) {
-                const page = await transaction.scan(MURMUR_KEY_PREFIX, {
+                const page = await this.#store.scan(transaction, MURMUR_KEY_PREFIX, {
                     ...(after === undefined ? {} : { after }),
                     limit: RESET_PURGE_SCAN_LIMIT,
                 });
@@ -1510,7 +1562,8 @@ export class MurmurClient {
                 for (const [key, value] of page) {
                     after = key;
                     try {
-                        if (!this.#preserveAcrossReset(key)) await transaction.delete(key);
+                        if (!this.#preserveAcrossReset(key))
+                            await this.#store.delete(transaction, key);
                     } finally {
                         zeroBytes(value);
                     }
@@ -1518,7 +1571,8 @@ export class MurmurClient {
                 if (page.size < RESET_PURGE_SCAN_LIMIT) break;
             }
             for (const session of reset.sessions) {
-                await transaction.set(
+                await this.#store.set(
+                    transaction,
                     `${RESET_READMISSION_PREFIX}${encodeBase64Url(session.id)}`,
                     session.descriptor,
                 );
@@ -1529,24 +1583,25 @@ export class MurmurClient {
                 reset.head,
                 reset.headSequence,
             );
-            await transaction.delete(RESET_PENDING_KEY);
+            await this.#store.delete(transaction, RESET_PENDING_KEY);
         });
         try {
-            await this.#engine.acknowledgeInboxBaseline(reset.head);
+            await this.#engine.acknowledgeInboxBaseline(ctx, reset.head);
         } catch {
             // The committed cursor causes the next synchronization to retry this signed ACK.
         }
-        await this.#ensureRegistered(true);
+        await this.#ensureRegistered(ctx, true);
     }
 
     async #completeReset(
+        ctx: Context,
         reset: MurmurResetEvent,
         onReset: MurmurSyncOptions["onReset"],
     ): Promise<never> {
         if (onReset === undefined) throw new MurmurResetRequiredError(reset, false);
-        await onReset(reset);
-        await this.#exclusive(async () => {
-            await this.#purgeReset(reset);
+        await onReset(ctx, reset);
+        await this.#exclusive(ctx, async () => {
+            await this.#purgeReset(ctx, reset);
         });
         throw new MurmurResetRequiredError(reset, true);
     }
@@ -1558,6 +1613,7 @@ export class MurmurClient {
      * foreground form cannot run while the persistent synchronization loop is active.
      */
     async synchronize(
+        ctx: Context,
         options: MurmurSynchronizeOptions = {},
         lifecycle: Pick<
             MurmurSyncOptions,
@@ -1567,20 +1623,20 @@ export class MurmurClient {
         if (this.#syncActive) {
             throw new Error("Cannot page synchronization while SSE sync is active");
         }
-        const pendingReset = await this.#pendingReset();
+        const pendingReset = await this.#pendingReset(ctx);
         if (pendingReset !== undefined) {
-            return this.#completeReset(pendingReset, lifecycle.onReset);
+            return this.#completeReset(ctx, pendingReset, lifecycle.onReset);
         }
-        await this.#exclusive(() => this.#queueAccountWork());
+        await this.#exclusive(ctx, () => this.#queueAccountWork(ctx));
         let result: MurmurSynchronizeResult;
         try {
-            result = await this.#exclusive(() => this.#engine.synchronize(options));
+            result = await this.#exclusive(ctx, () => this.#engine.synchronize(ctx, options));
         } catch (error: unknown) {
             if (!(error instanceof InboxContinuityLossError)) throw error;
-            const reset = await this.#exclusive(() => this.#recordReset(error));
-            return this.#completeReset(reset, lifecycle.onReset);
+            const reset = await this.#exclusive(ctx, () => this.#recordReset(ctx, error));
+            return this.#completeReset(ctx, reset, lifecycle.onReset);
         }
-        await this.#deliverUpdates(lifecycle);
+        await this.#deliverUpdates(ctx, lifecycle);
         return result;
     }
 
@@ -1590,7 +1646,7 @@ export class MurmurClient {
      * Streamed deliveries are transactionally processed and acknowledged in
      * inbox order. Durable outbound work wakes this loop for publication.
      */
-    async sync(options: MurmurSyncOptions = {}): Promise<void> {
+    async sync(ctx: Context, options: MurmurSyncOptions = {}): Promise<void> {
         this.#assertOpen();
         if (this.#syncActive) throw new Error("Murmur synchronization is active");
         const signal = options.abort ?? new AbortController().signal;
@@ -1600,22 +1656,22 @@ export class MurmurClient {
         const wakeOnAbort = (): void => this.#signalSync();
         signal.addEventListener("abort", wakeOnAbort, { once: true });
         try {
-            const pendingReset = await this.#pendingReset();
+            const pendingReset = await this.#pendingReset(ctx);
             if (pendingReset !== undefined) {
-                await this.#completeReset(pendingReset, options.onReset);
+                await this.#completeReset(ctx, pendingReset, options.onReset);
             }
-            await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
-            await this.#deliverUpdates(options);
+            await this.#flushSync(ctx, SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
+            await this.#deliverUpdates(ctx, options);
             while (!signal.aborted) {
                 let connected = false;
                 let disconnectedBy: unknown;
-                const stream = this.#engine.streamInbox({
+                const stream = this.#engine.streamInbox(ctx, {
                     signal,
-                    onConnected: async () => {
+                    onConnected: async (callbackCtx) => {
                         connected = true;
-                        await options.onConnected?.();
+                        await options.onConnected?.(callbackCtx);
                     },
-                    onDeviceRosterChanged: (accountKey) => {
+                    onDeviceRosterChanged: (_callbackCtx, accountKey) => {
                         if (!equalBytes(accountKey, this.#account.publicKey)) {
                             throw new Error("Relay reported another account's device roster");
                         }
@@ -1633,19 +1689,19 @@ export class MurmurClient {
                         ]);
                         if (outcome.type === "wake") {
                             if (signal.aborted) break;
-                            await this.#flushSync(SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
-                            await this.#deliverUpdates(options);
-                            await this.#consumeDeviceRosterChanges(options);
+                            await this.#flushSync(ctx, SYNC_RECONNECT_DELAY_MILLISECONDS, signal);
+                            await this.#deliverUpdates(ctx, options);
+                            await this.#consumeDeviceRosterChanges(ctx, options);
                             continue;
                         }
                         if (outcome.result.done) break;
-                        const result = await this.#exclusive(() =>
-                            this.#engine.completeStreamEvent(outcome.result.value, signal),
+                        const result = await this.#exclusive(ctx, () =>
+                            this.#engine.completeStreamEvent(ctx, outcome.result.value, signal),
                         );
                         if (result.transientPublicationFailures > 0) {
                             this.#scheduleSyncWake(SYNC_RECONNECT_DELAY_MILLISECONDS);
                         }
-                        await this.#deliverUpdates(options);
+                        await this.#deliverUpdates(ctx, options);
                         if (signal.aborted) break;
                         next = iterator.next();
                     }
@@ -1653,8 +1709,10 @@ export class MurmurClient {
                     disconnectedBy = error;
                     if (signal.aborted) break;
                     if (error instanceof InboxContinuityLossError) {
-                        const reset = await this.#exclusive(() => this.#recordReset(error));
-                        await this.#completeReset(reset, options.onReset);
+                        const reset = await this.#exclusive(ctx, () =>
+                            this.#recordReset(ctx, error),
+                        );
+                        await this.#completeReset(ctx, reset, options.onReset);
                     }
                     if (
                         !(error instanceof DeliveryTransportError) ||
@@ -1666,7 +1724,7 @@ export class MurmurClient {
                     try {
                         await iterator.return?.();
                     } finally {
-                        if (connected) await options.onDisconnected?.(disconnectedBy);
+                        if (connected) await options.onDisconnected?.(ctx, disconnectedBy);
                     }
                 }
                 if (!signal.aborted) {
@@ -1687,7 +1745,7 @@ export class MurmurClient {
     }
 
     /** Destroy in-memory identity material. Durable state remains application-owned. */
-    close(): void {
+    close(_ctx: Context): void {
         if (this.#closed) return;
         if (this.#pendingOperations > 0) {
             throw new Error("Cannot close Murmur while an operation is pending");
@@ -1704,16 +1762,17 @@ export class MurmurClient {
         this.#syncWakeResolve = undefined;
     }
 
-    async #consumeDeviceRosterChanges(options: MurmurSyncOptions): Promise<void> {
+    async #consumeDeviceRosterChanges(ctx: Context, options: MurmurSyncOptions): Promise<void> {
         const version = this.#deviceRosterChangeVersion;
         if (version <= this.#consumedDeviceRosterChangeVersion) return;
-        const devices = await this.devices();
-        await options.onDevicesChanged?.(devices);
+        const devices = await this.devices(ctx);
+        await options.onDevicesChanged?.(ctx, devices);
         this.#consumedDeviceRosterChangeVersion = version;
         if (this.#deviceRosterChangeVersion > version) this.#signalSync();
     }
 
     async #deliverUpdates(
+        ctx: Context,
         lifecycle: Pick<
             MurmurSyncOptions,
             "onUpdates" | "onDeviceAdded" | "onDeviceRevoked" | "onDeviceDormant"
@@ -1725,12 +1784,12 @@ export class MurmurClient {
         let delivered = 0;
         try {
             if (lifecycle.onDeviceDormant !== undefined) {
-                const dormant = await this.dormantDevices();
-                if (dormant.length > 0) await lifecycle.onDeviceDormant(dormant);
+                const dormant = await this.dormantDevices(ctx);
+                if (dormant.length > 0) await lifecycle.onDeviceDormant(ctx, dormant);
             }
             for (;;) {
-                await this.#exclusive(() => this.#queueAccountWork());
-                const prepared = await this.#exclusive(() => this.#engine.prepareUpdates());
+                await this.#exclusive(ctx, () => this.#queueAccountWork(ctx));
+                const prepared = await this.#exclusive(ctx, () => this.#engine.prepareUpdates(ctx));
                 const decisions: SessionRouteDecision[] = [];
                 const consumedKeys = new Set<string>();
                 const consumedDeletionKeys = new Set<string>();
@@ -1746,6 +1805,7 @@ export class MurmurClient {
                         )) {
                             if (
                                 await service.onNewSession(
+                                    ctx,
                                     createMurmurServiceSessionDescriptor(route.session),
                                 )
                             ) {
@@ -1791,7 +1851,7 @@ export class MurmurClient {
                                 consumedKeys.add(update.key);
                                 continue;
                             }
-                            await service.onUpdate(publicUpdate);
+                            await service.onUpdate(ctx, publicUpdate);
                         }
                         globalUpdates.push(publicUpdate);
                         consumedKeys.add(update.key);
@@ -1800,6 +1860,7 @@ export class MurmurClient {
                         const service = this.#services.get(deletion.service);
                         if (service !== undefined) {
                             await service.onSessionDeleted?.(
+                                ctx,
                                 Object.freeze({
                                     id: deletion.id,
                                     sessionId: deletion.sessionId.slice(),
@@ -1810,7 +1871,7 @@ export class MurmurClient {
                         }
                         consumedDeletionKeys.add(deletion.key);
                     }
-                    accountEvents = await prepareAccountEvents(this.#store);
+                    accountEvents = await prepareAccountEvents(ctx, this.#store);
                     if (
                         decisions.length === 0 &&
                         consumedKeys.size === 0 &&
@@ -1820,17 +1881,18 @@ export class MurmurClient {
                         break;
                     }
                     if (globalUpdates.length > 0) {
-                        await lifecycle.onUpdates?.(Object.freeze(globalUpdates));
+                        await lifecycle.onUpdates?.(ctx, Object.freeze(globalUpdates));
                     }
                     if (accountEvents.added.length > 0) {
-                        await lifecycle.onDeviceAdded?.(accountEvents.added);
+                        await lifecycle.onDeviceAdded?.(ctx, accountEvents.added);
                     }
                     if (accountEvents.revoked.length > 0) {
-                        await lifecycle.onDeviceRevoked?.(accountEvents.revoked);
+                        await lifecycle.onDeviceRevoked?.(ctx, accountEvents.revoked);
                     }
                     const committedAccountEvents = accountEvents;
-                    await this.#exclusive(() =>
+                    await this.#exclusive(ctx, () =>
                         this.#engine.commitUpdates(
+                            ctx,
                             prepared,
                             decisions,
                             consumedKeys,
@@ -1838,6 +1900,7 @@ export class MurmurClient {
                             async (transaction) => {
                                 await deletePreparedAccountEvents(
                                     transaction,
+                                    this.#store,
                                     committedAccountEvents,
                                 );
                             },
@@ -1877,14 +1940,16 @@ export class MurmurClient {
     }
 
     /** Refresh relay-owned account state before automatic MLS convergence. */
-    async #queueAccountWork(): Promise<void> {
+    async #queueAccountWork(ctx: Context): Promise<void> {
         await this.#store.set(
+            ctx,
             `${ACCOUNT_DEVICE_ACTIVITY_PREFIX}${encodeBase64Url(this.#identity.publicKey)}`,
             utf8Encode(String(this.#now()).padStart(16, "0")),
         );
         const readDeviceRoster = this.#transport.readDeviceRoster;
-        const roster = await readDeviceRoster?.call(this.#transport, this.#account.publicKey);
-        if (roster !== undefined) await this.#observeRoster(`lookup-${roster.revision}`, roster);
+        const roster = await readDeviceRoster?.call(this.#transport, ctx, this.#account.publicKey);
+        if (roster !== undefined)
+            await this.#observeRoster(ctx, `lookup-${roster.revision}`, roster);
         this.#peerRosterRefreshOrdinal =
             (this.#peerRosterRefreshOrdinal + 1) % PEER_ROSTER_REFRESH_INTERVAL;
         if (readDeviceRoster !== undefined && this.#peerRosterRefreshOrdinal === 0) {
@@ -1893,7 +1958,10 @@ export class MurmurClient {
             do {
                 let page: MurmurSessionPage;
                 try {
-                    page = await this.#engine.list(cursor === undefined ? {} : { after: cursor });
+                    page = await this.#engine.list(
+                        ctx,
+                        cursor === undefined ? {} : { after: cursor },
+                    );
                 } catch {
                     // Session synchronization owns corruption quarantine. An opportunistic
                     // peer-roster refresh must not preempt that isolated recovery path.
@@ -1914,16 +1982,17 @@ export class MurmurClient {
             if (selected !== undefined) {
                 this.#peerRosterCursor += 1;
                 const [encodedAccount, account] = selected;
-                const peerRoster = await readDeviceRoster.call(this.#transport, account);
+                const peerRoster = await readDeviceRoster.call(this.#transport, ctx, account);
                 if (peerRoster !== undefined) {
                     await this.#observeRoster(
+                        ctx,
                         `lookup-${encodedAccount}-${peerRoster.revision}`,
                         peerRoster,
                     );
                 }
             }
         }
-        await this.#ensureDirectoryEntry();
+        await this.#ensureDirectoryEntry(ctx);
     }
 
     #waitSyncWake(): Promise<void> {
@@ -1939,10 +2008,10 @@ export class MurmurClient {
         });
     }
 
-    async #flushSync(milliseconds: number, signal: AbortSignal): Promise<void> {
-        const retry = await this.#exclusive(async () => {
-            await this.#queueAccountWork();
-            return this.#engine.flush(signal);
+    async #flushSync(ctx: Context, milliseconds: number, signal: AbortSignal): Promise<void> {
+        const retry = await this.#exclusive(ctx, async () => {
+            await this.#queueAccountWork(ctx);
+            return this.#engine.flush(ctx, signal);
         });
         if (retry) {
             this.#scheduleSyncWake(milliseconds);
@@ -1977,7 +2046,7 @@ export class MurmurClient {
         if (this.#accountDeletionActive) throw new Error("Murmur account deletion is active");
     }
 
-    async #tracked<T>(operation: () => Promise<T>): Promise<T> {
+    async #tracked<T>(ctx: Context, operation: () => Promise<T>): Promise<T> {
         this.#assertOpen();
         this.#pendingOperations += 1;
         try {
@@ -1987,7 +2056,7 @@ export class MurmurClient {
         }
     }
 
-    async #exclusive<T>(operation: () => Promise<T>): Promise<T> {
+    async #exclusive<T>(ctx: Context, operation: () => Promise<T>): Promise<T> {
         this.#assertOpen();
         this.#pendingOperations += 1;
         const prior = this.#operationTail;

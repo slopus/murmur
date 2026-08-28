@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
@@ -41,6 +42,8 @@ import {
     zeroBytes,
 } from "../../utils/index.js";
 
+const ctx = createRootContext().named("test");
+
 const NOW = 1_700_000_000_000;
 const SESSION_STATE_PREFIX = "murmur/session-states/";
 const SESSION_INTENT_PREFIX = "murmur/session-intents/";
@@ -80,7 +83,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "role-policy-chaos",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 class CommitGateTransport implements DeliveryTransport {
@@ -92,47 +95,58 @@ class CommitGateTransport implements DeliveryTransport {
         this.#delegate = delegate;
     }
 
-    async publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    async publish(
+        _ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         if (delivery.ciphertext[0] === 3) this.published.push(cloneDelivery(delivery));
         if (this.blocked && delivery.ciphertext[0] === 3) {
             throw new DeliveryTransportError(429, "role_commit_blocked");
         }
-        return this.#delegate.publish(delivery, signal);
+        return this.#delegate.publish(ctx, delivery, signal);
     }
 
-    async deleteSession(delivery: SignedDelivery, signal?: AbortSignal): Promise<number> {
+    async deleteSession(
+        _ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<number> {
         if (this.#delegate.deleteSession === undefined) {
             throw new Error("Delivery transport does not support session deletion");
         }
-        return this.#delegate.deleteSession(delivery, signal);
+        return this.#delegate.deleteSession(ctx, delivery, signal);
     }
 
-    async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
-        return this.#delegate.read(request, signal);
+    async read(_ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+        return this.#delegate.read(ctx, request, signal);
     }
 
     async acknowledge(
+        _ctx: Context,
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<{ readonly removed: number }> {
-        return this.#delegate.acknowledge(request, signal);
+        return this.#delegate.acknowledge(ctx, request, signal);
     }
 
     async readDeviceRoster(
+        _ctx: Context,
         accountKey: Uint8Array,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster | undefined> {
-        return this.#delegate.readDeviceRoster?.(accountKey, signal);
+        return this.#delegate.readDeviceRoster?.(ctx, accountKey, signal);
     }
 
     async mutateDeviceRoster(
+        _ctx: Context,
         delivery: SignedDelivery,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster> {
         if (this.#delegate.mutateDeviceRoster === undefined) {
             throw new Error("Delivery transport does not support device rosters");
         }
-        return this.#delegate.mutateDeviceRoster(delivery, signal);
+        return this.#delegate.mutateDeviceRoster(ctx, delivery, signal);
     }
 }
 
@@ -168,7 +182,7 @@ async function openActor(
         name,
         store,
         gate,
-        client: await MurmurClient.open({ transport: gate, store, now }),
+        client: await MurmurClient.open(ctx, { transport: gate, store, now }),
     };
 }
 
@@ -188,25 +202,25 @@ async function createRoleFixture(policies: MurmurSessionPolicyChanges): Promise<
     const erin = await openActor("erin", base, () => now.value);
     const actors = [alice, bob, carol, dave, erin] as const;
     try {
-        const session = await alice.client.createSession({
+        const session = await alice.client.createSession(ctx, {
             descriptor: utf8Encode("role-policy chaos"),
             adminsAssignAdmins: policies.adminsAssignAdmins,
             anyoneCanAddMembers: policies.anyoneCanAddMembers,
             sendPolicy: policies.sendPolicy ?? "everyone",
             members: [
-                await bob.client.createKeyPackage(),
-                await carol.client.createKeyPackage(),
-                await dave.client.createKeyPackage(),
+                await bob.client.createKeyPackage(ctx),
+                await carol.client.createKeyPackage(ctx),
+                await dave.client.createKeyPackage(ctx),
             ],
         });
         await synchronize([alice, bob, carol, dave], 2);
         for (const actor of [bob, carol, dave]) {
-            const current = await actor.client.session(session.id);
-            if (current?.status === "pending") await actor.client.activateSession(session.id);
+            const current = await actor.client.session(ctx, session.id);
+            if (current?.status === "pending") await actor.client.activateSession(ctx, session.id);
         }
-        await alice.client.grantAdmin(session.id, bob.client.accountKey);
+        await alice.client.grantAdmin(ctx, session.id, bob.client.accountKey);
         await synchronize([alice, bob, carol, dave], 3);
-        expect(await alice.client.session(session.id)).toMatchObject({
+        expect(await alice.client.session(ctx, session.id)).toMatchObject({
             owner: alice.client.accountKey,
             admins: expect.arrayContaining([alice.client.accountKey, bob.client.accountKey]),
             policies: { ...policies, sendPolicy: policies.sendPolicy ?? "everyone" },
@@ -223,12 +237,12 @@ async function createRoleFixture(policies: MurmurSessionPolicyChanges): Promise<
             sessionId: session.id,
             now,
             close: async (): Promise<void> => {
-                for (const actor of actors) actor.client.close();
+                for (const actor of actors) actor.client.close(ctx);
                 await relay.close();
             },
         };
     } catch (error: unknown) {
-        for (const actor of actors) actor.client.close();
+        for (const actor of actors) actor.client.close(ctx);
         await relay.close();
         throw error;
     }
@@ -237,7 +251,7 @@ async function createRoleFixture(policies: MurmurSessionPolicyChanges): Promise<
 async function synchronize(actors: readonly Actor[], rounds: number): Promise<void> {
     for (let round = 0; round < rounds; round += 1) {
         for (const actor of actors) {
-            await actor.client.synchronize({ waitMilliseconds: 0 });
+            await actor.client.synchronize(ctx, { waitMilliseconds: 0 });
             await new Promise<void>((resolve) => setTimeout(resolve, 0));
         }
     }
@@ -246,9 +260,10 @@ async function synchronize(actors: readonly Actor[], rounds: number): Promise<vo
 async function consume(actor: Actor): Promise<readonly MurmurUpdate[]> {
     const updates: MurmurUpdate[] = [];
     await actor.client.synchronize(
+        ctx,
         { waitMilliseconds: 0 },
         {
-            onUpdates: async (batch) => {
+            onUpdates: async (_ctx, batch) => {
                 updates.push(...batch);
             },
         },
@@ -257,7 +272,7 @@ async function consume(actor: Actor): Promise<readonly MurmurUpdate[]> {
 }
 
 async function intentKeys(store: MurmurStore): Promise<readonly string[]> {
-    const page = await store.scan(SESSION_INTENT_PREFIX, { limit: 256 });
+    const page = await store.scan(ctx, SESSION_INTENT_PREFIX, { limit: 256 });
     try {
         return [...page.keys()];
     } finally {
@@ -267,8 +282,8 @@ async function intentKeys(store: MurmurStore): Promise<readonly string[]> {
 
 async function clearIntents(store: MurmurStore): Promise<void> {
     const keys = await intentKeys(store);
-    await store.transaction(async (transaction) => {
-        for (const key of keys) await transaction.delete(key);
+    await store.tx(ctx, async (transaction) => {
+        for (const key of keys) await store.delete(transaction, key);
     });
 }
 
@@ -290,11 +305,15 @@ async function rewriteRoles(
     mutate: (roles: SessionRoles) => SessionRoles,
 ): Promise<void> {
     const key = `${SESSION_STATE_PREFIX}${encodeBase64Url(sessionId)}`;
-    const bytes = await actor.store.get(key);
+    const bytes = await actor.store.get(ctx, key);
     if (bytes === undefined) throw new Error("Missing role-chaos session state");
     const record = decodeSessionRecord(bytes);
     try {
-        await actor.store.set(key, encodeSessionRecord({ ...record, roles: mutate(record.roles) }));
+        await actor.store.set(
+            ctx,
+            key,
+            encodeSessionRecord({ ...record, roles: mutate(record.roles) }),
+        );
     } finally {
         zeroRecord(record);
         zeroBytes(bytes);
@@ -319,7 +338,7 @@ function roleSnapshot(session: MurmurSession): object {
 }
 
 async function requireSession(actor: Actor, sessionId: Uint8Array): Promise<MurmurSession> {
-    const session = await actor.client.session(sessionId);
+    const session = await actor.client.session(ctx, sessionId);
     if (session === undefined) throw new Error(`${actor.name} is missing the role-chaos session`);
     return session;
 }
@@ -328,15 +347,15 @@ async function cloneMemoryStore(source: MurmurStore): Promise<MemoryMurmurStore>
     const target = new MemoryMurmurStore();
     let after: string | undefined;
     for (;;) {
-        const page = await source.scan("", {
+        const page = await source.scan(ctx, "", {
             ...(after === undefined ? {} : { after }),
             limit: 256,
         });
         try {
-            await target.transaction(async (transaction) => {
+            await target.tx(ctx, async (transaction) => {
                 for (const [key, value] of page) {
                     after = key;
-                    await transaction.set(key, value);
+                    await target.set(transaction, key, value);
                 }
             });
         } finally {
@@ -348,10 +367,10 @@ async function cloneMemoryStore(source: MurmurStore): Promise<MemoryMurmurStore>
 
 async function copyDeliveryProgress(source: MurmurStore, target: MurmurStore): Promise<void> {
     for (const key of DELIVERY_STATE_KEYS) {
-        const value = await source.get(key);
+        const value = await source.get(ctx, key);
         try {
-            if (value === undefined) await target.delete(key);
-            else await target.set(key, value);
+            if (value === undefined) await target.delete(ctx, key);
+            else await target.set(ctx, key, value);
         } finally {
             if (value !== undefined) zeroBytes(value);
         }
@@ -377,44 +396,44 @@ describe("role, policy, and private-roster session races", () => {
                             name: "owner grants a member admin",
                             actor: fixture.alice,
                             allowed: true,
-                            operation: () => a.grantAdmin(id, d.accountKey),
+                            operation: () => a.grantAdmin(ctx, id, d.accountKey),
                         },
                         {
                             name: "admin grant follows adminsAssignAdmins",
                             actor: fixture.bob,
                             allowed: adminsAssignAdmins,
-                            operation: () => b.grantAdmin(id, d.accountKey),
+                            operation: () => b.grantAdmin(ctx, id, d.accountKey),
                         },
                         {
                             name: "plain member never grants admin",
                             actor: fixture.carol,
                             allowed: false,
-                            operation: () => c.grantAdmin(id, d.accountKey),
+                            operation: () => c.grantAdmin(ctx, id, d.accountKey),
                         },
                         {
                             name: "owner revokes a non-owner admin",
                             actor: fixture.alice,
                             allowed: true,
-                            operation: () => a.revokeAdmin(id, b.accountKey),
+                            operation: () => a.revokeAdmin(ctx, id, b.accountKey),
                         },
                         {
                             name: "admin never revokes admin",
                             actor: fixture.bob,
                             allowed: false,
-                            operation: () => b.revokeAdmin(id, b.accountKey),
+                            operation: () => b.revokeAdmin(ctx, id, b.accountKey),
                         },
                         {
                             name: "member never revokes admin",
                             actor: fixture.carol,
                             allowed: false,
-                            operation: () => c.revokeAdmin(id, b.accountKey),
+                            operation: () => c.revokeAdmin(ctx, id, b.accountKey),
                         },
                         {
                             name: "owner updates policy",
                             actor: fixture.alice,
                             allowed: true,
                             operation: () =>
-                                a.setPolicies(id, {
+                                a.setPolicies(ctx, id, {
                                     adminsAssignAdmins: !adminsAssignAdmins,
                                     anyoneCanAddMembers: !anyoneCanAddMembers,
                                 }),
@@ -424,7 +443,7 @@ describe("role, policy, and private-roster session races", () => {
                             actor: fixture.bob,
                             allowed: false,
                             operation: () =>
-                                b.setPolicies(id, {
+                                b.setPolicies(ctx, id, {
                                     adminsAssignAdmins,
                                     anyoneCanAddMembers,
                                 }),
@@ -434,7 +453,7 @@ describe("role, policy, and private-roster session races", () => {
                             actor: fixture.carol,
                             allowed: false,
                             operation: () =>
-                                c.setPolicies(id, {
+                                c.setPolicies(ctx, id, {
                                     adminsAssignAdmins,
                                     anyoneCanAddMembers,
                                 }),
@@ -444,75 +463,87 @@ describe("role, policy, and private-roster session races", () => {
                             actor: fixture.alice,
                             allowed: true,
                             operation: async () =>
-                                a.addMember(id, await fixture.erin.client.createKeyPackage()),
+                                a.addMember(
+                                    ctx,
+                                    id,
+                                    await fixture.erin.client.createKeyPackage(ctx),
+                                ),
                         },
                         {
                             name: "admin adds",
                             actor: fixture.bob,
                             allowed: true,
                             operation: async () =>
-                                b.addMember(id, await fixture.erin.client.createKeyPackage()),
+                                b.addMember(
+                                    ctx,
+                                    id,
+                                    await fixture.erin.client.createKeyPackage(ctx),
+                                ),
                         },
                         {
                             name: "member add follows anyoneCanAddMembers",
                             actor: fixture.carol,
                             allowed: anyoneCanAddMembers,
                             operation: async () =>
-                                c.addMember(id, await fixture.erin.client.createKeyPackage()),
+                                c.addMember(
+                                    ctx,
+                                    id,
+                                    await fixture.erin.client.createKeyPackage(ctx),
+                                ),
                         },
                         {
                             name: "admin removes another member",
                             actor: fixture.bob,
                             allowed: true,
-                            operation: () => b.removeMember(id, d.accountKey),
+                            operation: () => b.removeMember(ctx, id, d.accountKey),
                         },
                         {
                             name: "member cannot remove another member",
                             actor: fixture.carol,
                             allowed: false,
-                            operation: () => c.removeMember(id, d.accountKey),
+                            operation: () => c.removeMember(ctx, id, d.accountKey),
                         },
                         {
                             name: "member removes self",
                             actor: fixture.carol,
                             allowed: true,
-                            operation: () => c.removeMember(id, c.accountKey),
+                            operation: () => c.removeMember(ctx, id, c.accountKey),
                         },
                         {
                             name: "owner cannot remove self",
                             actor: fixture.alice,
                             allowed: false,
-                            operation: () => a.removeMember(id, a.accountKey),
+                            operation: () => a.removeMember(ctx, id, a.accountKey),
                         },
                         {
                             name: "admin cannot remove owner",
                             actor: fixture.bob,
                             allowed: false,
-                            operation: () => b.removeMember(id, a.accountKey),
+                            operation: () => b.removeMember(ctx, id, a.accountKey),
                         },
                         {
                             name: "owner cannot demote self",
                             actor: fixture.alice,
                             allowed: false,
-                            operation: () => a.revokeAdmin(id, a.accountKey),
+                            operation: () => a.revokeAdmin(ctx, id, a.accountKey),
                         },
                         {
                             name: "owner cannot leave",
                             actor: fixture.alice,
                             allowed: false,
-                            operation: () => a.leave(id),
+                            operation: () => a.leave(ctx, id),
                         },
                         {
                             name: "member may leave",
                             actor: fixture.carol,
                             allowed: true,
-                            operation: () => c.leave(id),
+                            operation: () => c.leave(ctx, id),
                         },
                     ];
                     for (const row of rows) await assertAdmission(row);
 
                     if (adminsAssignAdmins) {
-                        await a.grantAdmin(id, c.accountKey);
+                        await a.grantAdmin(ctx, id, c.accountKey);
                         await synchronize(
                             [fixture.alice, fixture.bob, fixture.carol, fixture.dave],
                             3,
@@ -521,7 +552,7 @@ describe("role, policy, and private-roster session races", () => {
                             name: "promoted member grants when policy permits",
                             actor: fixture.carol,
                             allowed: true,
-                            operation: () => c.grantAdmin(id, d.accountKey),
+                            operation: () => c.grantAdmin(ctx, id, d.accountKey),
                         });
                     }
                 } finally {
@@ -539,7 +570,7 @@ describe("role, policy, and private-roster session races", () => {
         });
         try {
             await expect(
-                fixture.carol.client.send(fixture.sessionId, utf8Encode("local-forbidden")),
+                fixture.carol.client.send(ctx, fixture.sessionId, utf8Encode("local-forbidden")),
             ).rejects.toThrow("may not send");
 
             const forgedStore = await cloneMemoryStore(fixture.carol.store);
@@ -554,9 +585,9 @@ describe("role, policy, and private-roster session races", () => {
                     ...roles,
                     sendPolicy: "everyone",
                 }));
-                await forged.client.send(fixture.sessionId, utf8Encode("forged-remote"));
+                await forged.client.send(ctx, fixture.sessionId, utf8Encode("forged-remote"));
                 await expect(
-                    forged.client.synchronize({ waitMilliseconds: 0 }),
+                    forged.client.synchronize(ctx, { waitMilliseconds: 0 }),
                 ).resolves.toMatchObject({
                     published: 0,
                     terminalPublicationFailures: 1,
@@ -566,9 +597,9 @@ describe("role, policy, and private-roster session races", () => {
                 expect(
                     (await consume(fixture.dave)).map((update) => utf8Decode(update.bytes)),
                 ).not.toContain("forged-remote");
-                expect(await fixture.alice.client.issues()).toEqual([]);
+                expect(await fixture.alice.client.issues(ctx)).toEqual([]);
             } finally {
-                forged.client.close();
+                forged.client.close(ctx);
             }
         } finally {
             await fixture.close();
@@ -581,9 +612,9 @@ describe("role, policy, and private-roster session races", () => {
             anyoneCanAddMembers: false,
         });
         try {
-            await expect(fixture.carol.client.deleteSession(fixture.sessionId)).rejects.toThrow(
-                "Only the session owner",
-            );
+            await expect(
+                fixture.carol.client.deleteSession(ctx, fixture.sessionId),
+            ).rejects.toThrow("Only the session owner");
 
             const forgedStore = await cloneMemoryStore(fixture.carol.store);
             const forged = await openActor(
@@ -597,30 +628,34 @@ describe("role, policy, and private-roster session races", () => {
                     ...roles,
                     owner: fixture.carol.client.accountKey,
                 }));
-                await forged.client.deleteSession(fixture.sessionId);
-                await forged.client.synchronize({ waitMilliseconds: 0 });
+                await forged.client.deleteSession(ctx, fixture.sessionId);
+                await forged.client.synchronize(ctx, { waitMilliseconds: 0 });
                 await copyDeliveryProgress(forged.store, fixture.carol.store);
                 await synchronize([fixture.alice, fixture.bob, fixture.dave], 2);
                 for (const actor of [fixture.alice, fixture.bob, fixture.dave]) {
-                    await expect(actor.client.session(fixture.sessionId)).resolves.toBeDefined();
+                    await expect(
+                        actor.client.session(ctx, fixture.sessionId),
+                    ).resolves.toBeDefined();
                 }
-                expect(await fixture.alice.client.issues()).toEqual(
+                expect(await fixture.alice.client.issues(ctx)).toEqual(
                     expect.arrayContaining([
                         expect.objectContaining({ code: "unauthorized_session_deletion" }),
                     ]),
                 );
             } finally {
-                forged.client.close();
+                forged.client.close(ctx);
             }
 
-            const deletionId = await fixture.alice.client.deleteSession(fixture.sessionId);
+            const deletionId = await fixture.alice.client.deleteSession(ctx, fixture.sessionId);
             expect(deletionId).toMatch(/^[A-Za-z0-9_-]{32}$/);
-            await expect(fixture.alice.client.session(fixture.sessionId)).resolves.toBeUndefined();
+            await expect(
+                fixture.alice.client.session(ctx, fixture.sessionId),
+            ).resolves.toBeUndefined();
 
-            await fixture.alice.client.synchronize({ waitMilliseconds: 0 });
+            await fixture.alice.client.synchronize(ctx, { waitMilliseconds: 0 });
             await synchronize([fixture.bob, fixture.carol, fixture.dave], 2);
             for (const actor of [fixture.bob, fixture.carol, fixture.dave]) {
-                await expect(actor.client.session(fixture.sessionId)).resolves.toBeUndefined();
+                await expect(actor.client.session(ctx, fixture.sessionId)).resolves.toBeUndefined();
             }
         } finally {
             await fixture.close();
@@ -685,8 +720,9 @@ describe("role, policy, and private-roster session races", () => {
                         anyoneCanAddMembers: true,
                     }));
                     await attacker.client.addMember(
+                        ctx,
                         fixture.sessionId,
-                        await fixture.erin.client.createKeyPackage(),
+                        await fixture.erin.client.createKeyPackage(ctx),
                     );
                 } else if (attack === "admin-grant") {
                     await rewriteRoles(attacker, fixture.sessionId, (roles) => ({
@@ -694,6 +730,7 @@ describe("role, policy, and private-roster session races", () => {
                         adminsAssignAdmins: true,
                     }));
                     await attacker.client.grantAdmin(
+                        ctx,
                         fixture.sessionId,
                         fixture.dave.client.accountKey,
                     );
@@ -705,18 +742,19 @@ describe("role, policy, and private-roster session races", () => {
                     }));
                     if (attack === "admin-revoke") {
                         await attacker.client.revokeAdmin(
+                            ctx,
                             fixture.sessionId,
                             fixture.alice.client.accountKey,
                         );
                     } else {
-                        await attacker.client.setPolicies(fixture.sessionId, {
+                        await attacker.client.setPolicies(ctx, fixture.sessionId, {
                             adminsAssignAdmins: true,
                             anyoneCanAddMembers: true,
                         });
                     }
                 }
                 await expect(
-                    attacker.client.synchronize({ waitMilliseconds: 0 }),
+                    attacker.client.synchronize(ctx, { waitMilliseconds: 0 }),
                 ).resolves.toMatchObject({
                     published: 0,
                     transientPublicationFailures: 1,
@@ -727,14 +765,15 @@ describe("role, policy, and private-roster session races", () => {
                     expect(roleSnapshot(await requireSession(actor, fixture.sessionId))).toEqual(
                         before,
                     );
-                    expect(await actor.client.issues()).toEqual([]);
+                    expect(await actor.client.issues(ctx)).toEqual([]);
                 }
 
                 await fixture.alice.client.send(
+                    ctx,
                     fixture.sessionId,
                     utf8Encode(`valid-after-${attack}`),
                 );
-                await fixture.alice.client.synchronize({ waitMilliseconds: 0 });
+                await fixture.alice.client.synchronize(ctx, { waitMilliseconds: 0 });
                 const updates = await consume(fixture.dave);
                 expect(updates.map((update) => utf8Decode(update.bytes))).toContain(
                     `valid-after-${attack}`,
@@ -754,15 +793,16 @@ describe("role, policy, and private-roster session races", () => {
             try {
                 fixture.bob.gate.blocked = winner === "policy";
                 await fixture.bob.client.grantAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.carol.client.accountKey,
                 );
                 if (winner === "grant") {
                     await synchronize([fixture.bob, fixture.alice, fixture.carol, fixture.dave], 2);
                 } else {
-                    await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                    await fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                 }
-                await fixture.alice.client.setPolicies(fixture.sessionId, {
+                await fixture.alice.client.setPolicies(ctx, fixture.sessionId, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: false,
                 });
@@ -791,11 +831,13 @@ describe("role, policy, and private-roster session races", () => {
         try {
             duplicate.bob.gate.blocked = true;
             await duplicate.bob.client.grantAdmin(
+                ctx,
                 duplicate.sessionId,
                 duplicate.carol.client.accountKey,
             );
-            await duplicate.bob.client.synchronize({ waitMilliseconds: 0 });
+            await duplicate.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
             await duplicate.alice.client.grantAdmin(
+                ctx,
                 duplicate.sessionId,
                 duplicate.carol.client.accountKey,
             );
@@ -820,15 +862,17 @@ describe("role, policy, and private-roster session races", () => {
             try {
                 fixture.bob.gate.blocked = winner === "alice-revoke";
                 await fixture.bob.client.grantAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.carol.client.accountKey,
                 );
                 if (winner === "bob-grant") {
                     await synchronize([fixture.bob, fixture.alice, fixture.carol, fixture.dave], 2);
                 } else {
-                    await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                    await fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                 }
                 await fixture.alice.client.revokeAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.bob.client.accountKey,
                 );
@@ -846,6 +890,7 @@ describe("role, policy, and private-roster session races", () => {
                 ).toBe(winner === "bob-grant");
                 if (winner === "bob-grant") {
                     await fixture.alice.client.revokeAdmin(
+                        ctx,
                         fixture.sessionId,
                         fixture.carol.client.accountKey,
                     );
@@ -871,15 +916,16 @@ describe("role, policy, and private-roster session races", () => {
             try {
                 fixture.carol.gate.blocked = winner === "policy";
                 await fixture.carol.client.addMember(
+                    ctx,
                     fixture.sessionId,
-                    await fixture.erin.client.createKeyPackage(),
+                    await fixture.erin.client.createKeyPackage(ctx),
                 );
                 if (winner === "add") {
                     await synchronize([fixture.carol, fixture.alice, fixture.bob, fixture.dave], 3);
                 } else {
-                    await fixture.carol.client.synchronize({ waitMilliseconds: 0 });
+                    await fixture.carol.client.synchronize(ctx, { waitMilliseconds: 0 });
                 }
-                await fixture.alice.client.setPolicies(fixture.sessionId, {
+                await fixture.alice.client.setPolicies(ctx, fixture.sessionId, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: false,
                 });
@@ -905,18 +951,19 @@ describe("role, policy, and private-roster session races", () => {
         try {
             crashed.carol.gate.blocked = true;
             await crashed.carol.client.addMember(
+                ctx,
                 crashed.sessionId,
-                await crashed.erin.client.createKeyPackage(),
+                await crashed.erin.client.createKeyPackage(ctx),
             );
-            await crashed.carol.client.synchronize({ waitMilliseconds: 0 });
-            await crashed.alice.client.setPolicies(crashed.sessionId, {
+            await crashed.carol.client.synchronize(ctx, { waitMilliseconds: 0 });
+            await crashed.alice.client.setPolicies(ctx, crashed.sessionId, {
                 adminsAssignAdmins: false,
                 anyoneCanAddMembers: false,
             });
             await synchronize([crashed.alice, crashed.bob, crashed.dave], 3);
-            crashed.carol.client.close();
+            crashed.carol.client.close(ctx);
             crashed.carol.gate.blocked = false;
-            crashed.carol.client = await MurmurClient.open({
+            crashed.carol.client = await MurmurClient.open(ctx, {
                 transport: crashed.carol.gate,
                 store: crashed.carol.store,
                 now: () => crashed.now.value,
@@ -937,15 +984,17 @@ describe("role, policy, and private-roster session races", () => {
                 anyoneCanAddMembers: false,
             });
             try {
-                await fixture.carol.client.leave(fixture.sessionId);
-                await fixture.carol.client.synchronize({ waitMilliseconds: 0 });
+                await fixture.carol.client.leave(ctx, fixture.sessionId);
+                await fixture.carol.client.synchronize(ctx, { waitMilliseconds: 0 });
                 if (ownerAction === "grant") {
                     await fixture.alice.client.grantAdmin(
+                        ctx,
                         fixture.sessionId,
                         fixture.carol.client.accountKey,
                     );
                 } else {
                     await fixture.alice.client.removeMember(
+                        ctx,
                         fixture.sessionId,
                         fixture.carol.client.accountKey,
                     );
@@ -962,7 +1011,7 @@ describe("role, policy, and private-roster session races", () => {
                         equalBytes(admin, fixture.carol.client.accountKey),
                     ),
                 ).toBe(false);
-                expect((await fixture.alice.client.issues()).length).toBeLessThanOrEqual(1);
+                expect((await fixture.alice.client.issues(ctx)).length).toBeLessThanOrEqual(1);
             } finally {
                 await fixture.close();
             }
@@ -979,6 +1028,7 @@ describe("role, policy, and private-roster session races", () => {
             const outsideStore = await cloneMemoryStore(fixture.bob.store);
             const controlStore = await cloneMemoryStore(fixture.bob.store);
             await fixture.alice.client.removeMember(
+                ctx,
                 fixture.sessionId,
                 fixture.bob.client.accountKey,
             );
@@ -1005,11 +1055,12 @@ describe("role, policy, and private-roster session races", () => {
             );
             try {
                 await oldWithin.client.send(
+                    ctx,
                     fixture.sessionId,
                     utf8Encode("old epoch within grace"),
                 );
                 await expect(
-                    oldWithin.client.synchronize({ waitMilliseconds: 0 }),
+                    oldWithin.client.synchronize(ctx, { waitMilliseconds: 0 }),
                 ).resolves.toMatchObject({
                     published: 0,
                     terminalPublicationFailures: 1,
@@ -1021,11 +1072,12 @@ describe("role, policy, and private-roster session races", () => {
                 await copyDeliveryProgress(oldWithin.store, oldOutside.store);
                 fixture.now.value += PREVIOUS_EPOCH_GRACE_MILLISECONDS + 1;
                 await oldOutside.client.send(
+                    ctx,
                     fixture.sessionId,
                     utf8Encode("old epoch outside grace"),
                 );
                 await expect(
-                    oldOutside.client.synchronize({ waitMilliseconds: 0 }),
+                    oldOutside.client.synchronize(ctx, { waitMilliseconds: 0 }),
                 ).resolves.toMatchObject({
                     published: 0,
                     terminalPublicationFailures: 1,
@@ -1038,11 +1090,12 @@ describe("role, policy, and private-roster session races", () => {
 
                 await copyDeliveryProgress(oldOutside.store, oldControl.store);
                 await oldControl.client.grantAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.carol.client.accountKey,
                 );
                 await expect(
-                    oldControl.client.synchronize({ waitMilliseconds: 0 }),
+                    oldControl.client.synchronize(ctx, { waitMilliseconds: 0 }),
                 ).resolves.toMatchObject({
                     published: 0,
                     transientPublicationFailures: 1,
@@ -1055,7 +1108,7 @@ describe("role, policy, and private-roster session races", () => {
                 }
                 const captured = oldControl.gate.published.at(-1);
                 if (captured === undefined) throw new Error("Old admin Commit was not captured");
-                await expect(fixture.base.publish(captured)).rejects.toMatchObject({
+                await expect(fixture.base.publish(ctx, captured)).rejects.toMatchObject({
                     status: 403,
                     code: "session_unauthorized",
                 });
@@ -1064,9 +1117,9 @@ describe("role, policy, and private-roster session races", () => {
                     roleSnapshot(await requireSession(fixture.alice, fixture.sessionId)),
                 ).toEqual(removed);
             } finally {
-                oldWithin.client.close();
-                oldOutside.client.close();
-                oldControl.client.close();
+                oldWithin.client.close(ctx);
+                oldOutside.client.close(ctx);
+                oldControl.client.close(ctx);
             }
         } finally {
             await fixture.close();
@@ -1087,21 +1140,23 @@ describe("role, policy, and private-roster session races", () => {
                     admins: [fixture.alice.client.accountKey],
                 }));
                 await fixture.bob.client.removeMember(
+                    ctx,
                     fixture.sessionId,
                     fixture.alice.client.accountKey,
                 );
-                await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                await fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                 if (winner === "forged-first") {
                     await synchronize([fixture.alice, fixture.carol, fixture.dave], 2);
                 }
 
                 await fixture.alice.client.revokeAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.bob.client.accountKey,
                 );
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
                 fixture.bob.gate.blocked = false;
-                await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                await fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
 
                 for (const actor of [fixture.alice, fixture.carol, fixture.dave]) {
@@ -1123,6 +1178,7 @@ describe("role, policy, and private-roster session races", () => {
                 }
 
                 await fixture.alice.client.grantAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.carol.client.accountKey,
                 );
@@ -1147,26 +1203,28 @@ describe("role, policy, and private-roster session races", () => {
             try {
                 fixture.bob.gate.blocked = winner === "owner-controls-first";
                 await fixture.bob.client.grantAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.carol.client.accountKey,
                 );
                 if (winner === "grant-first") {
                     await synchronize([fixture.bob, fixture.alice, fixture.carol, fixture.dave], 3);
                 } else {
-                    await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+                    await fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                 }
 
-                await fixture.alice.client.setPolicies(fixture.sessionId, {
+                await fixture.alice.client.setPolicies(ctx, fixture.sessionId, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: false,
                 });
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
                 await fixture.alice.client.revokeAdmin(
+                    ctx,
                     fixture.sessionId,
                     fixture.bob.client.accountKey,
                 );
                 await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
-                await fixture.alice.client.setPolicies(fixture.sessionId, {
+                await fixture.alice.client.setPolicies(ctx, fixture.sessionId, {
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: false,
                 });
@@ -1206,10 +1264,15 @@ describe("role, policy, and private-roster session races", () => {
         const expiringSender = generateIdentityKeyPair();
         try {
             fixture.bob.gate.blocked = true;
-            await fixture.bob.client.grantAdmin(fixture.sessionId, fixture.carol.client.accountKey);
-            await fixture.bob.client.synchronize({ waitMilliseconds: 0 });
+            await fixture.bob.client.grantAdmin(
+                ctx,
+                fixture.sessionId,
+                fixture.carol.client.accountKey,
+            );
+            await fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 });
 
             await fixture.base.publish(
+                ctx,
                 createSignedDelivery(
                     expiringSender,
                     [fixture.bob.client.deviceKey],
@@ -1220,12 +1283,13 @@ describe("role, policy, and private-roster session races", () => {
             fixture.now.value += 2;
             await expect(fixture.relay.pruneExpired()).resolves.toBe(1);
 
-            await fixture.alice.client.setPolicies(fixture.sessionId, {
+            await fixture.alice.client.setPolicies(ctx, fixture.sessionId, {
                 adminsAssignAdmins: false,
                 anyoneCanAddMembers: false,
             });
             await synchronize([fixture.alice, fixture.carol, fixture.dave], 3);
             await fixture.alice.client.revokeAdmin(
+                ctx,
                 fixture.sessionId,
                 fixture.bob.client.accountKey,
             );
@@ -1234,7 +1298,7 @@ describe("role, policy, and private-roster session races", () => {
 
             fixture.bob.gate.blocked = false;
             await expect(
-                fixture.bob.client.synchronize({ waitMilliseconds: 0 }),
+                fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 }),
             ).rejects.toMatchObject({
                 name: "MurmurResetRequiredError",
                 committed: false,
@@ -1242,9 +1306,10 @@ describe("role, policy, and private-roster session races", () => {
             const snapshots: MurmurResetEvent[] = [];
             await expect(
                 fixture.bob.client.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onReset: (reset) => {
+                        onReset: (_ctx, reset) => {
                             snapshots.push(reset);
                         },
                     },
@@ -1264,25 +1329,32 @@ describe("role, policy, and private-roster session races", () => {
             expect(
                 stale?.admins.some((admin) => equalBytes(admin, fixture.carol.client.accountKey)),
             ).toBe(false);
-            expect(await fixture.bob.client.session(fixture.sessionId)).toBeUndefined();
+            expect(await fixture.bob.client.session(ctx, fixture.sessionId)).toBeUndefined();
             expect(await intentKeys(fixture.bob.store)).toEqual([]);
 
             await fixture.alice.client.send(
+                ctx,
                 fixture.sessionId,
                 utf8Encode("refresh reset role roster"),
             );
             for (let cycle = 0; cycle < 12; cycle += 1) {
                 await synchronize([fixture.alice, fixture.carol, fixture.dave, fixture.bob], 1);
             }
-            await expect(fixture.bob.client.session(fixture.sessionId)).resolves.toMatchObject({
-                status: "pending",
-            });
-            await fixture.bob.client.activateSession(fixture.sessionId);
+            await expect(fixture.bob.client.session(ctx, fixture.sessionId)).resolves.toMatchObject(
+                {
+                    status: "pending",
+                },
+            );
+            await fixture.bob.client.activateSession(ctx, fixture.sessionId);
             expect(roleSnapshot(await requireSession(fixture.bob, fixture.sessionId))).toEqual(
                 winner,
             );
             await expect(
-                fixture.bob.client.grantAdmin(fixture.sessionId, fixture.carol.client.accountKey),
+                fixture.bob.client.grantAdmin(
+                    ctx,
+                    fixture.sessionId,
+                    fixture.carol.client.accountKey,
+                ),
             ).rejects.toThrow();
             expect(await intentKeys(fixture.bob.store)).toEqual([]);
         } finally {

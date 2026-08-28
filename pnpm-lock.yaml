@@ -35,6 +35,9 @@ importers:
       '@noble/hashes':
         specifier: ^1.7.1
         version: 1.8.0
+      '@steve.kite/stdlib':
+        specifier: 0.0.12
+        version: 0.0.12
     devDependencies:
       '@slopus/murmur-relay':
         specifier: workspace:*
@@ -79,6 +82,9 @@ importers:
       '@electric-sql/pglite':
         specifier: ^0.2.17
         version: 0.2.17
+      '@steve.kite/stdlib':
+        specifier: 0.0.12
+        version: 0.0.12
       '@types/node':
         specifier: '>=22'
         version: 24.13.3
@@ -625,6 +631,9 @@ packages:
     resolution: {integrity: sha512-MOG/3gTOn4Fwf574RVOaY61I5o6P90legkFADiTyn1hyjNydT+cerU2rLUwPdZkKKyJ+iT+K9p7WXK4LM1Ka6g==}
     cpu: [x64]
     os: [win32]
+
+  '@steve.kite/stdlib@0.0.12':
+    resolution: {integrity: sha512-A7YpunkXilK+VbKL5KoaDl+FiDdO6Bc84+mxCtaAxuKSoK4MgsZX6WZWKkzxUebU2dmFgLwuBESQTndWby17BQ==}
 
   '@types/chai@5.2.3':
     resolution: {integrity: sha512-Mw558oeA9fFbv65/y4mHtXDs9bPnFMZAL/jxdPFUpOHHIXX91mcgEHbS5Lahr+pwZFR8A7GQleRWeI6cGFC2UA==}
@@ -1370,6 +1379,8 @@ snapshots:
 
   '@rollup/rollup-win32-x64-msvc@4.62.3':
     optional: true
+
+  '@steve.kite/stdlib@0.0.12': {}
 
   '@types/chai@5.2.3':
     dependencies:

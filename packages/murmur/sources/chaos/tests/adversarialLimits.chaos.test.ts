@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import {
     DELIVERY_RETENTION_MILLISECONDS,
     RelayService,
@@ -59,6 +60,8 @@ import {
 } from "../../utils/index.js";
 import { SeededRandom } from "../index.js";
 
+const ctx = createRootContext().named("test");
+
 const NOW = 1_700_000_000_000;
 const MINUTE_MILLISECONDS = 60_000;
 const SIX_MONTHS_MILLISECONDS = 180 * 24 * 60 * MINUTE_MILLISECONDS;
@@ -103,7 +106,7 @@ class ScriptedWebSocket implements DeliveryWebSocket {
 
 function relaySessionProvider(): RelaySessionProvider {
     return {
-        issue: async () => ({
+        issue: async (_ctx) => ({
             version: 1,
             protocol: "murmur-websocket-v1",
             endpoint: "wss://relay.test/v2/connect",
@@ -118,7 +121,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "adversarial-limits-chaos",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 interface RelayFixture {
@@ -197,14 +200,18 @@ describe("adversarial inputs and resource limits", () => {
         ] as const;
         const processor = new InboxProcessor(
             { identity: recipient, transport: fixture.transport, store },
-            async (transaction, queued) => {
+            async (transaction, staged, queued) => {
                 const label = utf8Decode(queued.delivery.ciphertext);
                 if (label.startsWith("poison/")) {
                     throw new TerminalInboxDeliveryError(
                         `invalid_${label.slice("poison/".length).replaceAll("-", "_")}`,
                     );
                 }
-                await transaction.set(`application/${queued.delivery.id}`, utf8Encode(label));
+                await staged.set(
+                    transaction,
+                    `application/${queued.delivery.id}`,
+                    utf8Encode(label),
+                );
                 effects.push(label);
             },
             { now: () => NOW, maximumRejections: 8 },
@@ -213,33 +220,35 @@ describe("adversarial inputs and resource limits", () => {
             for (let index = 0; index < 100; index += 1) {
                 const label = poisonClasses[index % poisonClasses.length]!;
                 await fixture.transport.publish(
+                    ctx,
                     delivery(sender, [recipient.publicKey], utf8Encode(`poison/${label}`)),
                 );
             }
             await fixture.transport.publish(
+                ctx,
                 delivery(sender, [recipient.publicKey], utf8Encode("valid-after-poison")),
             );
 
-            await expect(processor.synchronize({ limit: 50 })).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx, { limit: 50 })).resolves.toMatchObject({
                 processed: 0,
                 rejected: 50,
                 exhausted: false,
             });
-            await expect(processor.synchronize({ limit: 50 })).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx, { limit: 50 })).resolves.toMatchObject({
                 processed: 0,
                 rejected: 50,
                 exhausted: false,
             });
-            await expect(processor.synchronize({ limit: 50 })).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx, { limit: 50 })).resolves.toMatchObject({
                 processed: 1,
                 rejected: 0,
                 exhausted: true,
             });
 
             expect(effects).toEqual(["valid-after-poison"]);
-            expect(await store.list("application/")).toHaveLength(1);
-            expect(await processor.rejections()).toHaveLength(8);
-            expect(await processor.continuity()).toMatchObject({ sequence: 101 });
+            expect(await store.list(ctx, "application/")).toHaveLength(1);
+            expect(await processor.rejections(ctx)).toHaveLength(8);
+            expect(await processor.continuity(ctx)).toMatchObject({ sequence: 101 });
         } finally {
             await closeFixture(fixture, [sender, recipient]);
         }
@@ -326,48 +335,49 @@ describe("adversarial inputs and resource limits", () => {
         const aliceIdentity = generateIdentityKeyPair();
         const bobIdentity = generateIdentityKeyPair();
         const attacker = generateIdentityKeyPair();
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             identity: aliceIdentity,
             transport: fixture.transport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             identity: bobIdentity,
             transport: fixture.transport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("adversarial-commit-order"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.activateSession(session.id);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.activateSession(ctx, session.id);
 
             const poison = delivery(attacker, [bob.deviceKey], new Uint8Array([3, 0xff, 0x00]));
-            await fixture.transport.publish(poison);
-            await alice.setPolicies(session.id, {
+            await fixture.transport.publish(ctx, poison);
+            await alice.setPolicies(ctx, session.id, {
                 adminsAssignAdmins: true,
                 anyoneCanAddMembers: true,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            const synchronized = await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            const synchronized = await bob.synchronize(ctx, { waitMilliseconds: 0 });
 
             expect(synchronized.inbox).toMatchObject({ rejected: 1, processed: 1 });
-            expect(await bob.session(session.id)).toMatchObject({
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 policies: { adminsAssignAdmins: true, anyoneCanAddMembers: true },
             });
 
-            await alice.send(session.id, utf8Encode("live-after-invalid-commit"));
-            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.send(ctx, session.id, utf8Encode("live-after-invalid-commit"));
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
             const updates: MurmurUpdate[] = [];
             await bob.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (batch) => {
+                    onUpdates: async (_ctx, batch) => {
                         updates.push(...batch);
                     },
                 },
@@ -376,8 +386,8 @@ describe("adversarial inputs and resource limits", () => {
                 "live-after-invalid-commit",
             );
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await closeFixture(fixture, [aliceIdentity, bobIdentity, attacker]);
         }
     }, 120_000);
@@ -477,17 +487,21 @@ describe("adversarial inputs and resource limits", () => {
                 NOW,
                 NOW + SIX_MONTHS_MILLISECONDS,
             );
-            await expect(fixture.transport.publish(exact)).resolves.toMatchObject({
+            await expect(fixture.transport.publish(ctx, exact)).resolves.toMatchObject({
                 duplicate: false,
             });
-            await expect(fixture.transport.publish(exact)).resolves.toMatchObject({
+            await expect(fixture.transport.publish(ctx, exact)).resolves.toMatchObject({
                 duplicate: true,
             });
             await expect(
-                fixture.transport.publish(delivery(sender, [first.publicKey], new Uint8Array(5))),
+                fixture.transport.publish(
+                    ctx,
+                    delivery(sender, [first.publicKey], new Uint8Array(5)),
+                ),
             ).rejects.toMatchObject({ status: 413 });
             await expect(
                 fixture.transport.publish(
+                    ctx,
                     delivery(
                         sender,
                         [first.publicKey, second.publicKey, third.publicKey],
@@ -497,6 +511,7 @@ describe("adversarial inputs and resource limits", () => {
             ).rejects.toMatchObject({ status: 413 });
             await expect(
                 fixture.transport.publish(
+                    ctx,
                     delivery(
                         sender,
                         [first.publicKey],
@@ -537,6 +552,7 @@ describe("adversarial inputs and resource limits", () => {
             };
             await expect(fixture.relay.readQueue(wrongRead)).rejects.toMatchObject({ status: 401 });
             const firstPage = await fixture.transport.read(
+                ctx,
                 createSignedInboxRead(first, { createdAt: NOW }),
             );
             const eventId = firstPage.deliveries[0]!.eventId;
@@ -553,6 +569,7 @@ describe("adversarial inputs and resource limits", () => {
 
             await expect(
                 fixture.transport.publish(
+                    ctx,
                     delivery(sender, [third.publicKey], new Uint8Array(1), NOW, NOW + 2),
                 ),
             ).rejects.toMatchObject({ status: 503 });
@@ -598,7 +615,7 @@ describe("adversarial inputs and resource limits", () => {
         try {
             for (const page of malformedPages) {
                 const transport = new HttpDeliveryTransport("https://relay.test", {
-                    fetch: async (): Promise<Response> =>
+                    fetch: async (_ctx): Promise<Response> =>
                         new Response(JSON.stringify(page), {
                             status: 200,
                             headers: { "content-type": "application/json" },
@@ -606,11 +623,11 @@ describe("adversarial inputs and resource limits", () => {
                 });
                 const processor = new InboxProcessor(
                     { identity: recipient, transport, store },
-                    async () => undefined,
+                    async (_ctx) => undefined,
                     { now: () => NOW },
                 );
-                await expect(processor.synchronize()).rejects.toThrow();
-                expect(await processor.continuity()).toBeUndefined();
+                await expect(processor.synchronize(ctx)).rejects.toThrow();
+                expect(await processor.continuity(ctx)).toBeUndefined();
             }
             expect(validRead.recipient).toEqual(recipient.publicKey);
         } finally {
@@ -629,30 +646,30 @@ describe("adversarial inputs and resource limits", () => {
                 transport: fixture.transport,
                 store: new MemoryMurmurStore(),
             },
-            async (_transaction, queued) => {
+            async (_ctx, _transaction, queued) => {
                 effects.push(queued.delivery.id);
             },
             { now: () => NOW },
         );
         try {
             const replayed = delivery(sender, [recipient.publicKey], utf8Encode("late replay"));
-            const firstPublication = await fixture.transport.publish(replayed);
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            const firstPublication = await fixture.transport.publish(ctx, replayed);
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 1,
                 rejected: 0,
             });
-            const firstContinuity = await processor.continuity();
+            const firstContinuity = await processor.continuity(ctx);
             expect(firstContinuity).toMatchObject({ sequence: 1 });
 
-            const latePublication = await fixture.transport.publish(replayed);
+            const latePublication = await fixture.transport.publish(ctx, replayed);
             expect(latePublication).toMatchObject({ duplicate: false });
             expect(latePublication.eventId).not.toBe(firstPublication.eventId);
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 0,
                 rejected: 1,
             });
             expect(effects).toEqual([replayed.id]);
-            const replayContinuity = await processor.continuity();
+            const replayContinuity = await processor.continuity(ctx);
             expect(replayContinuity).toMatchObject({ sequence: 2 });
             expect(replayContinuity?.generation).toEqual(firstContinuity?.generation);
 
@@ -662,18 +679,19 @@ describe("adversarial inputs and resource limits", () => {
                 [recipient.publicKey],
                 utf8Encode("must wait for reset"),
             );
-            await fixture.transport.publish(afterRestore);
-            const loss = await processor.synchronize().catch((error: unknown) => error);
+            await fixture.transport.publish(ctx, afterRestore);
+            const loss = await processor.synchronize(ctx).catch((error: unknown) => error);
             expect(loss).toBeInstanceOf(InboxContinuityLossError);
             expect(loss).toMatchObject({
                 reason: "generation_changed",
                 expectedSequence: 3,
                 observedSequence: 3,
             });
-            expect(await processor.continuity()).toEqual(replayContinuity);
+            expect(await processor.continuity(ctx)).toEqual(replayContinuity);
             expect(effects).toEqual([replayed.id]);
 
             const pending = await fixture.transport.read(
+                ctx,
                 createSignedInboxRead(recipient, {
                     after: latePublication.eventId,
                     createdAt: NOW,
@@ -690,24 +708,24 @@ describe("adversarial inputs and resource limits", () => {
 
     test("ADV-09 concurrent and sequential KeyPackage claims admit exactly once", async () => {
         const fixture = relayFixture();
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: fixture.transport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             transport: fixture.transport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         try {
-            const replayed = await bob.createKeyPackage();
+            const replayed = await bob.createKeyPackage(ctx);
             const concurrent = await Promise.allSettled([
-                alice.createSession({
+                alice.createSession(ctx, {
                     descriptor: utf8Encode("concurrent KeyPackage claim A"),
                     members: [replayed],
                 }),
-                alice.createSession({
+                alice.createSession(ctx, {
                     descriptor: utf8Encode("concurrent KeyPackage claim B"),
                     members: [replayed],
                 }),
@@ -719,16 +737,16 @@ describe("adversarial inputs and resource limits", () => {
                     message: expect.stringContaining("already used"),
                 }),
             });
-            expect((await alice.sessions()).sessions).toHaveLength(1);
+            expect((await alice.sessions(ctx)).sessions).toHaveLength(1);
             await expect(
-                alice.createSession({
+                alice.createSession(ctx, {
                     descriptor: utf8Encode("replayed KeyPackage claim"),
                     members: [replayed],
                 }),
             ).rejects.toThrow("already used");
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await fixture.relay.close();
         }
     });
@@ -736,39 +754,40 @@ describe("adversarial inputs and resource limits", () => {
     test("ADV-10 prior-epoch traffic is capped at 64 messages and five minutes", async () => {
         let now = NOW;
         const fixture = relayFixture({}, () => now);
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: fixture.transport,
             store: new MemoryMurmurStore(),
             now: () => now,
         });
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             transport: fixture.transport,
             store: new MemoryMurmurStore(),
             now: () => now,
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("prior-epoch-adversarial"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await bob.activateSession(session.id);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.activateSession(ctx, session.id);
 
             for (let index = 0; index < 65; index += 1) {
-                await bob.send(session.id, utf8Encode(`prior-${index}`));
+                await bob.send(ctx, session.id, utf8Encode(`prior-${index}`));
             }
-            await alice.setPolicies(session.id, {
+            await alice.setPolicies(ctx, session.id, {
                 adminsAssignAdmins: false,
                 anyoneCanAddMembers: true,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             const boundedUpdates: MurmurUpdate[] = [];
             const bounded = await alice.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (batch) => {
+                    onUpdates: async (_ctx, batch) => {
                         boundedUpdates.push(...batch);
                     },
                 },
@@ -778,19 +797,20 @@ describe("adversarial inputs and resource limits", () => {
                 boundedUpdates.filter((update) => utf8Decode(update.bytes).startsWith("prior-")),
             ).toHaveLength(64);
 
-            await bob.send(session.id, utf8Encode("expired-prior"));
-            await alice.setPolicies(session.id, {
+            await bob.send(ctx, session.id, utf8Encode("expired-prior"));
+            await alice.setPolicies(ctx, session.id, {
                 adminsAssignAdmins: true,
                 anyoneCanAddMembers: true,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
             now += 5 * MINUTE_MILLISECONDS + 1;
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             const expiredUpdates: MurmurUpdate[] = [];
             const expired = await alice.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (batch) => {
+                    onUpdates: async (_ctx, batch) => {
                         expiredUpdates.push(...batch);
                     },
                 },
@@ -800,13 +820,14 @@ describe("adversarial inputs and resource limits", () => {
                 "expired-prior",
             );
 
-            await bob.send(session.id, utf8Encode("current-after-prior-abuse"));
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.send(ctx, session.id, utf8Encode("current-after-prior-abuse"));
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             const current: MurmurUpdate[] = [];
             await alice.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (batch) => {
+                    onUpdates: async (_ctx, batch) => {
                         current.push(...batch);
                     },
                 },
@@ -815,8 +836,8 @@ describe("adversarial inputs and resource limits", () => {
                 "current-after-prior-abuse",
             );
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await fixture.relay.close();
         }
     }, 120_000);
@@ -885,6 +906,7 @@ describe("adversarial inputs and resource limits", () => {
             expect(
                 (
                     await fixture.transport.read(
+                        ctx,
                         createSignedInboxRead(recipient, { createdAt: NOW }),
                     )
                 ).deliveries.map((queued) => queued.delivery.id),
@@ -915,35 +937,35 @@ describe("adversarial inputs and resource limits", () => {
             new WebSocketDeliveryTransport(identity, relaySessionProvider(), {
                 now: () => NOW,
                 maximumMessageBytes,
-                webSocketFactory: () =>
+                webSocketFactory: (_ctx) =>
                     new ScriptedWebSocket((frame, socket) => {
                         socket.receive(response(responseText(frame.id)));
                     }),
             });
         const read = createSignedInboxRead(identity, { createdAt: NOW, limit: 1 });
         try {
-            await expect(transport(exactBytes, (valid) => valid).read(read)).resolves.toMatchObject(
-                {
-                    head: STREAM_EVENT_ID,
-                    headSequence: 1,
-                },
-            );
             await expect(
-                transport(exactBytes - 1, (valid) => valid).read(read),
+                transport(exactBytes, (valid) => valid).read(ctx, read),
+            ).resolves.toMatchObject({
+                head: STREAM_EVENT_ID,
+                headSequence: 1,
+            });
+            await expect(
+                transport(exactBytes - 1, (valid) => valid).read(ctx, read),
             ).rejects.toMatchObject({ code: "invalid_response" });
             await expect(
-                transport(exactBytes, (valid) => valid.slice(0, -1)).read(read),
+                transport(exactBytes, (valid) => valid.slice(0, -1)).read(ctx, read),
             ).rejects.toMatchObject({ code: "invalid_response" });
             await expect(
-                transport(exactBytes, (valid) => utf8Encode(valid)).read(read),
+                transport(exactBytes, (valid) => utf8Encode(valid)).read(ctx, read),
             ).rejects.toMatchObject({ code: "invalid_response" });
 
-            await expect(transport(exactBytes, (valid) => valid).read(read)).resolves.toMatchObject(
-                {
-                    deliveries: [],
-                    exhausted: true,
-                },
-            );
+            await expect(
+                transport(exactBytes, (valid) => valid).read(ctx, read),
+            ).resolves.toMatchObject({
+                deliveries: [],
+                exhausted: true,
+            });
 
             const streamTransport = (
                 script: (frame: WebSocketRequestFrame, socket: ScriptedWebSocket) => void,
@@ -951,7 +973,7 @@ describe("adversarial inputs and resource limits", () => {
                 new WebSocketDeliveryTransport(identity, relaySessionProvider(), {
                     now: () => NOW,
                     maximumMessageBytes: exactBytes,
-                    webSocketFactory: () => new ScriptedWebSocket(script),
+                    webSocketFactory: (_ctx) => new ScriptedWebSocket(script),
                 });
             const streamRead = createSignedInboxRead(identity, {
                 createdAt: NOW,
@@ -960,12 +982,12 @@ describe("adversarial inputs and resource limits", () => {
             });
             await expect(
                 streamTransport((_frame, socket) => socket.receive("{"))
-                    .stream(streamRead)
+                    .stream(ctx, streamRead)
                     .next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
             await expect(
                 streamTransport((_frame, socket) => socket.receive(new Uint8Array([1, 2, 3])))
-                    .stream(streamRead)
+                    .stream(ctx, streamRead)
                     .next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
             await expect(
@@ -979,12 +1001,12 @@ describe("adversarial inputs and resource limits", () => {
                         }),
                     ),
                 )
-                    .stream(streamRead)
+                    .stream(ctx, streamRead)
                     .next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
             await expect(
                 streamTransport((_frame, socket) => socket.receive("x".repeat(exactBytes + 1)))
-                    .stream(streamRead)
+                    .stream(ctx, streamRead)
                     .next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
 
@@ -1014,7 +1036,7 @@ describe("adversarial inputs and resource limits", () => {
                         }),
                     ),
                 );
-            }).stream(streamRead);
+            }).stream(ctx, streamRead);
             await expect(live.next()).resolves.toMatchObject({
                 value: { type: "continuity", head: STREAM_EVENT_ID },
             });
@@ -1043,13 +1065,13 @@ describe("adversarial inputs and resource limits", () => {
         const transport = (body: Uint8Array, maximumResponseBytes: number): HttpDeliveryTransport =>
             new HttpDeliveryTransport("https://relay.test", {
                 maximumResponseBytes,
-                fetch: async () =>
+                fetch: async (_ctx) =>
                     new Response(body.slice(), {
                         headers: { "content-type": "text/event-stream" },
                     }),
             });
         try {
-            const exact = transport(event, event.length).stream(request);
+            const exact = transport(event, event.length).stream(ctx, request);
             await expect(exact.next()).resolves.toMatchObject({
                 done: false,
                 value: { type: "continuity", headSequence: 1 },
@@ -1058,19 +1080,19 @@ describe("adversarial inputs and resource limits", () => {
 
             await expect(
                 transport(event, event.length - 1)
-                    .stream(request)
+                    .stream(ctx, request)
                     .next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
             await expect(
-                transport(event.slice(0, -1), event.length).stream(request).next(),
+                transport(event.slice(0, -1), event.length).stream(ctx, request).next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
             await expect(
                 transport(new Uint8Array([0xc3]), event.length)
-                    .stream(request)
+                    .stream(ctx, request)
                     .next(),
             ).rejects.toMatchObject({ code: "invalid_stream" });
 
-            const live = transport(event, event.length).stream(request);
+            const live = transport(event, event.length).stream(ctx, request);
             await expect(live.next()).resolves.toMatchObject({
                 value: { type: "continuity", head: STREAM_EVENT_ID },
             });
@@ -1109,6 +1131,7 @@ describe("adversarial inputs and resource limits", () => {
                 statuses.push(response.status);
             }
             const page = await fixture.transport.read(
+                ctx,
                 createSignedInboxRead(recipient, { createdAt: NOW }),
             );
             expect(statuses).toEqual([400, 400, 400, 400]);
@@ -1130,7 +1153,7 @@ describe("adversarial inputs and resource limits", () => {
                 transport: fixture.transport,
                 store: new MemoryMurmurStore(),
             },
-            async (_transaction, queued) => {
+            async (_ctx, _transaction, queued) => {
                 effects.push(queued.delivery.id);
             },
             { now: () => NOW },
@@ -1143,15 +1166,15 @@ describe("adversarial inputs and resource limits", () => {
                 }
             }
             expect(duplicates).toBe(999);
-            await expect(processor.synchronize()).resolves.toMatchObject({ processed: 1 });
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({ processed: 1 });
             expect(effects).toEqual([replayed.id]);
-            const cursor = await processor.cursor();
+            const cursor = await processor.cursor(ctx);
             if (cursor === null) throw new Error("Missing replay-storm cursor");
             const ack = createSignedInboxAck(recipient, cursor, NOW);
             for (let replay = 0; replay < 1_000; replay += 1) {
                 await expect(fixture.relay.acknowledge(ack)).resolves.toMatchObject({ removed: 0 });
             }
-            await expect(processor.synchronize()).resolves.toMatchObject({ processed: 0 });
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({ processed: 0 });
             expect(effects).toHaveLength(1);
         } finally {
             await closeFixture(fixture, [sender, recipient]);

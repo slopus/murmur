@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import { existsSync, readFileSync } from "node:fs";
 import { WorkOS } from "@workos-inc/node";
 import { describe, expect, test } from "vitest";
@@ -6,9 +7,12 @@ import {
     MemoryMurmurStore,
     MurmurClient,
     generateIdentityKeyPair,
+    type DeliveryFetch,
     type IdentityKeyPair,
 } from "../sources/index.js";
 import { decodeBase64Url, utf8Decode, utf8Encode } from "../sources/utils/index.js";
+
+const ctx = createRootContext().named("test");
 
 const CREDENTIALS_URL =
     process.env["WORKOS_STAGING_CREDENTIALS_FILE"] ??
@@ -41,8 +45,8 @@ function credentials(): StagingCredentials | undefined {
 
 const stagingCredentials = credentials();
 
-function authenticatedFetch(accessToken: string): typeof fetch {
-    return async (input, init) => {
+function authenticatedFetch(accessToken: string): DeliveryFetch {
+    return async (_ctx, input, init) => {
         const headers = new Headers(init?.headers);
         headers.set("authorization", `Bearer ${accessToken}`);
         return fetch(input, { ...init, headers });
@@ -54,8 +58,8 @@ function openClient(
     accessToken: string,
     encryptedMetadata: Uint8Array,
 ): Promise<MurmurClient> {
-    return MurmurClient.open({
-        encryptDeviceMetadata: () => encryptedMetadata,
+    return MurmurClient.open(ctx, {
+        encryptDeviceMetadata: (_ctx) => encryptedMetadata,
         identity,
         sessionProvider: new HttpRelaySessionProvider(SESSION_ISSUER, {
             fetch: authenticatedFetch(accessToken),
@@ -70,7 +74,9 @@ function openClient(
 }
 
 async function directoryTicket(accessToken: string): Promise<Uint8Array> {
-    const response = await authenticatedFetch(accessToken)(DIRECTORY_ISSUER, { method: "POST" });
+    const response = await authenticatedFetch(accessToken)(ctx, DIRECTORY_ISSUER, {
+        method: "POST",
+    });
     if (!response.ok) throw new Error(`Directory ticket request failed (${response.status})`);
     const value = (await response.json()) as unknown;
     if (
@@ -87,7 +93,7 @@ async function directoryTicket(accessToken: string): Promise<Uint8Array> {
 
 async function settle(clients: readonly MurmurClient[]): Promise<void> {
     for (let round = 0; round < SYNCHRONIZE_ROUNDS; round += 1) {
-        for (const client of clients) await client.synchronize({ waitMilliseconds: 0 });
+        for (const client of clients) await client.synchronize(ctx, { waitMilliseconds: 0 });
     }
 }
 
@@ -145,36 +151,38 @@ describe.runIf(stagingCredentials !== undefined)("WorkOS-authenticated Murmur st
                 new Uint8Array([4, 5, 6]),
             );
             await settle([aliceClient, bobClient]);
-            await expect(aliceClient.devices()).resolves.toEqual([
+            await expect(aliceClient.devices(ctx)).resolves.toEqual([
                 expect.objectContaining({ encryptedMetadata: new Uint8Array([1, 2, 3]) }),
             ]);
-            await expect(bobClient.devices()).resolves.toEqual([
+            await expect(bobClient.devices(ctx)).resolves.toEqual([
                 expect.objectContaining({ encryptedMetadata: new Uint8Array([4, 5, 6]) }),
             ]);
 
             const claim = await aliceClient.claimAccount(
+                ctx,
                 bobIdentity.publicKey,
                 await directoryTicket(aliceAuthentication.accessToken),
             );
-            const group = await aliceClient.createSession({
+            const group = await aliceClient.createSession(ctx, {
                 descriptor: utf8Encode("workos-staging-group"),
                 members: [claim],
                 sendPolicy: "everyone",
             });
             await settle([aliceClient, bobClient]);
-            if ((await bobClient.session(group.id))?.status === "pending") {
-                await bobClient.activateSession(group.id);
+            if ((await bobClient.session(ctx, group.id))?.status === "pending") {
+                await bobClient.activateSession(ctx, group.id);
             }
-            expect((await bobClient.session(group.id))?.status).toBe("active");
+            expect((await bobClient.session(ctx, group.id))?.status).toBe("active");
 
             const bobReceived: string[] = [];
-            await aliceClient.send(group.id, utf8Encode("hello from alice"));
+            await aliceClient.send(ctx, group.id, utf8Encode("hello from alice"));
             for (let round = 0; round < SYNCHRONIZE_ROUNDS; round += 1) {
-                await aliceClient.synchronize({ waitMilliseconds: 0 });
+                await aliceClient.synchronize(ctx, { waitMilliseconds: 0 });
                 await bobClient.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onUpdates: (updates) => {
+                        onUpdates: (_ctx, updates) => {
                             for (const update of updates)
                                 bobReceived.push(utf8Decode(update.bytes));
                         },
@@ -185,13 +193,14 @@ describe.runIf(stagingCredentials !== undefined)("WorkOS-authenticated Murmur st
             expect(bobReceived).toContain("hello from alice");
 
             const aliceReceived: string[] = [];
-            await bobClient.send(group.id, utf8Encode("hello from bob"));
+            await bobClient.send(ctx, group.id, utf8Encode("hello from bob"));
             for (let round = 0; round < SYNCHRONIZE_ROUNDS; round += 1) {
-                await bobClient.synchronize({ waitMilliseconds: 0 });
+                await bobClient.synchronize(ctx, { waitMilliseconds: 0 });
                 await aliceClient.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onUpdates: (updates) => {
+                        onUpdates: (_ctx, updates) => {
                             for (const update of updates) {
                                 aliceReceived.push(utf8Decode(update.bytes));
                             }
@@ -202,13 +211,13 @@ describe.runIf(stagingCredentials !== undefined)("WorkOS-authenticated Murmur st
             }
             expect(aliceReceived).toContain("hello from bob");
 
-            await aliceClient.deleteSession(group.id);
+            await aliceClient.deleteSession(ctx, group.id);
             await settle([aliceClient, bobClient]);
-            await aliceClient.deleteAccount();
-            await bobClient.deleteAccount();
+            await aliceClient.deleteAccount(ctx);
+            await bobClient.deleteAccount(ctx);
         } finally {
-            await aliceClient?.close();
-            await bobClient?.close();
+            await aliceClient?.close(ctx);
+            await bobClient?.close(ctx);
             for (const userId of createdUserIds.reverse()) {
                 await workos.userManagement.deleteUser(userId).catch(() => undefined);
             }

@@ -38,11 +38,12 @@ function fieldValue(line: string, separator: number): string {
 
 /** Strictly decode a bounded sequence of exact Murmur delivery SSE events. */
 export async function* decodeDeliveryEventStream(
+    ctx: Context,
     response: Response,
     controller: AbortController,
     maximumEventBytes: number,
     heartbeatTimeoutMilliseconds: number,
-    onDeviceRosterChanged?: (accountKey: Uint8Array) => void,
+    onDeviceRosterChanged?: (ctx: Context, accountKey: Uint8Array) => void,
 ): AsyncGenerator<InboxStreamEvent> {
     const reader = response.body?.getReader();
     if (reader === undefined) throw new Error("Delivery event stream has no body");
@@ -89,7 +90,7 @@ export async function* decodeDeliveryEventStream(
             if (accountKey.length !== 32 || encodeBase64Url(accountKey) !== encoded) {
                 throw new Error("Invalid device roster change event");
             }
-            onDeviceRosterChanged?.(accountKey);
+            onDeviceRosterChanged?.(ctx, accountKey);
             eventName = "";
             eventId = "";
             data = [];
@@ -161,3 +162,4 @@ export async function* decodeDeliveryEventStream(
         reader.releaseLock();
     }
 }
+import type { Context } from "@steve.kite/stdlib";

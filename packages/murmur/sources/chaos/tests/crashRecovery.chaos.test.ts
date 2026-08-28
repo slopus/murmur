@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import type {
@@ -30,6 +31,8 @@ import type {
     ChaosSchedule,
     ChaosTraceEntry,
 } from "../index.js";
+
+const ctx = createRootContext().named("test");
 
 const NOW = 1_700_000_000_000;
 const CRASH_LADDER_SEED = 0x4352_4153;
@@ -147,25 +150,32 @@ class ObservingTransport implements DeliveryTransport {
     constructor(delegate: DeliveryTransport) {
         this.#delegate = delegate;
         if (delegate.deleteAccount !== undefined) {
-            this.deleteAccount = (delivery, signal) => delegate.deleteAccount!(delivery, signal);
+            this.deleteAccount = (_ctx, delivery, signal) =>
+                delegate.deleteAccount!(ctx, delivery, signal);
         }
         if (delegate.deleteSession !== undefined) {
-            this.deleteSession = (delivery, signal) => delegate.deleteSession!(delivery, signal);
+            this.deleteSession = (_ctx, delivery, signal) =>
+                delegate.deleteSession!(ctx, delivery, signal);
         }
         if (delegate.mutateDeviceRoster !== undefined) {
-            this.mutateDeviceRoster = (delivery, signal) =>
-                delegate.mutateDeviceRoster!(delivery, signal);
+            this.mutateDeviceRoster = (_ctx, delivery, signal) =>
+                delegate.mutateDeviceRoster!(ctx, delivery, signal);
         }
         if (delegate.readDeviceRoster !== undefined) {
-            this.readDeviceRoster = (accountKey, signal) =>
-                delegate.readDeviceRoster!(accountKey, signal);
+            this.readDeviceRoster = (_ctx, accountKey, signal) =>
+                delegate.readDeviceRoster!(ctx, accountKey, signal);
         }
         if (delegate.stream !== undefined) {
-            this.stream = (request, signal, hooks) => delegate.stream!(request, signal, hooks);
+            this.stream = (_ctx, request, signal, hooks) =>
+                delegate.stream!(ctx, request, signal, hooks);
         }
     }
 
-    async publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    async publish(
+        _ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         this.publishAttempts.push({
             ...delivery,
             sender: delivery.sender.slice(),
@@ -173,23 +183,24 @@ class ObservingTransport implements DeliveryTransport {
             ciphertext: delivery.ciphertext.slice(),
             signature: delivery.signature.slice(),
         });
-        const outcome = await this.#delegate.publish(delivery, signal);
+        const outcome = await this.#delegate.publish(ctx, delivery, signal);
         this.accepted.set(delivery.id, outcome.eventId);
         return outcome;
     }
 
-    async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
-        const page = await this.#delegate.read(request, signal);
+    async read(_ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+        const page = await this.#delegate.read(ctx, request, signal);
         this.reads.push(page);
         return page;
     }
 
     async acknowledge(
+        _ctx: Context,
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<{ readonly removed: number }> {
         this.acknowledgements.push(request.through);
-        return this.#delegate.acknowledge(request, signal);
+        return this.#delegate.acknowledge(ctx, request, signal);
     }
 }
 
@@ -224,7 +235,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "crash-recovery-chaos",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 async function createFixture(seed: number): Promise<ChaosFixture> {
@@ -262,7 +273,7 @@ async function createActor(fixture: ChaosFixture, name: ChaosActor["name"]): Pro
         delay: () => delay.handle(),
         classifyDelivery: (delivery) => delivery.ciphertext[0],
     });
-    const client = await MurmurClient.open({
+    const client = await MurmurClient.open(ctx, {
         store,
         transport,
         now: fixture.clock.now,
@@ -284,7 +295,7 @@ async function createActor(fixture: ChaosFixture, name: ChaosActor["name"]): Pro
 }
 
 async function reopen(actor: ChaosActor, clock: ManualVirtualClock): Promise<void> {
-    actor.client = await MurmurClient.open({
+    actor.client = await MurmurClient.open(ctx, {
         store: actor.store,
         transport: actor.transport,
         now: clock.now,
@@ -294,7 +305,7 @@ async function reopen(actor: ChaosActor, clock: ManualVirtualClock): Promise<voi
 async function closeFixture(fixture: ChaosFixture): Promise<void> {
     for (const actor of fixture.actors) {
         try {
-            actor.client.close();
+            actor.client.close(ctx);
         } catch {
             // A deliberately abandoned operation can retain only the dead client instance.
         }
@@ -302,8 +313,8 @@ async function closeFixture(fixture: ChaosFixture): Promise<void> {
     await fixture.relay.close();
 }
 
-function updateHook(actor: ChaosActor): (updates: readonly MurmurUpdate[]) => void {
-    return (updates) => {
+function updateHook(actor: ChaosActor): (_ctx: Context, updates: readonly MurmurUpdate[]) => void {
+    return (_ctx, updates) => {
         for (const update of updates) {
             actor.updates.push({ id: update.id, text: utf8Decode(update.bytes) });
         }
@@ -311,7 +322,7 @@ function updateHook(actor: ChaosActor): (updates: readonly MurmurUpdate[]) => vo
 }
 
 async function synchronize(actor: ChaosActor): Promise<void> {
-    await actor.client.synchronize({ waitMilliseconds: 0 }, { onUpdates: updateHook(actor) });
+    await actor.client.synchronize(ctx, { waitMilliseconds: 0 }, { onUpdates: updateHook(actor) });
 }
 
 function normalizeSession(session: MurmurSession | undefined): unknown {
@@ -327,7 +338,7 @@ function normalizeSession(session: MurmurSession | undefined): unknown {
 }
 
 async function prefixSize(store: MurmurStore, prefix: string): Promise<number> {
-    return (await store.scan(prefix, { limit: STORE_LIMIT })).size;
+    return (await store.scan(ctx, prefix, { limit: STORE_LIMIT })).size;
 }
 
 async function stableSnapshot(
@@ -338,8 +349,8 @@ async function stableSnapshot(
     for (const actor of actors) {
         snapshots.push({
             actor: actor.name,
-            session: normalizeSession(await actor.client.session(sessionId)),
-            issues: (await actor.client.issues()).map((issue) => ({
+            session: normalizeSession(await actor.client.session(ctx, sessionId)),
+            issues: (await actor.client.issues(ctx)).map((issue) => ({
                 id: issue.id,
                 code: issue.code,
                 operationId: issue.operationId ?? null,
@@ -380,13 +391,13 @@ async function createActivePair(fixture: ChaosFixture): Promise<{
 }> {
     const alice = await createActor(fixture, "alice");
     const bob = await createActor(fixture, "bob");
-    const session = await alice.client.createSession({
+    const session = await alice.client.createSession(ctx, {
         descriptor: utf8Encode("crash recovery"),
-        members: [await bob.client.createKeyPackage()],
+        members: [await bob.client.createKeyPackage(ctx)],
     });
     await synchronize(alice);
     await synchronize(bob);
-    await bob.client.activateSession(session.id);
+    await bob.client.activateSession(ctx, session.id);
     await synchronize(bob);
     await synchronize(alice);
     alice.updates.length = 0;
@@ -403,15 +414,15 @@ async function createActiveTriple(fixture: ChaosFixture): Promise<{
     const alice = await createActor(fixture, "alice");
     const bob = await createActor(fixture, "bob");
     const carol = await createActor(fixture, "carol");
-    const session = await alice.client.createSession({
+    const session = await alice.client.createSession(ctx, {
         descriptor: utf8Encode("crash recovery triple"),
-        members: [await bob.client.createKeyPackage(), await carol.client.createKeyPackage()],
+        members: [await bob.client.createKeyPackage(ctx), await carol.client.createKeyPackage(ctx)],
     });
     await synchronize(alice);
     await synchronize(bob);
     await synchronize(carol);
-    await bob.client.activateSession(session.id);
-    await carol.client.activateSession(session.id);
+    await bob.client.activateSession(ctx, session.id);
+    await carol.client.activateSession(ctx, session.id);
     await synchronize(alice);
     await synchronize(bob);
     await synchronize(carol);
@@ -528,20 +539,20 @@ function offsetStoreTarget(
 }
 
 async function assertStoreShape(store: MurmurStore): Promise<Record<string, number>> {
-    const outboxes = await store.scan(OUTBOX_PREFIX, { limit: STORE_LIMIT });
+    const outboxes = await store.scan(ctx, OUTBOX_PREFIX, { limit: STORE_LIMIT });
     const outboxIds = new Set([...outboxes.keys()].map((key) => key.slice(OUTBOX_PREFIX.length)));
     const families = {
-        order: await store.scan(OUTBOX_ORDER_PREFIX, { limit: STORE_LIMIT }),
-        epoch: await store.scan(EPOCH_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
-        postCommit: await store.scan(POST_COMMIT_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
-        bootstrap: await store.scan(BOOTSTRAP_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
-        pending: await store.scan(PENDING_SESSION_PREFIX, { limit: STORE_LIMIT }),
-        pendingControls: await store.scan(PENDING_MEMBERSHIP_CONTROL_PREFIX, {
+        order: await store.scan(ctx, OUTBOX_ORDER_PREFIX, { limit: STORE_LIMIT }),
+        epoch: await store.scan(ctx, EPOCH_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
+        postCommit: await store.scan(ctx, POST_COMMIT_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
+        bootstrap: await store.scan(ctx, BOOTSTRAP_OUTBOX_PREFIX, { limit: STORE_LIMIT }),
+        pending: await store.scan(ctx, PENDING_SESSION_PREFIX, { limit: STORE_LIMIT }),
+        pendingControls: await store.scan(ctx, PENDING_MEMBERSHIP_CONTROL_PREFIX, {
             limit: STORE_LIMIT,
         }),
-        states: await store.scan(SESSION_STATE_PREFIX, { limit: STORE_LIMIT }),
-        intents: await store.scan(SESSION_INTENT_PREFIX, { limit: STORE_LIMIT }),
-        issues: await store.scan(QUARANTINE_PREFIX, { limit: STORE_LIMIT }),
+        states: await store.scan(ctx, SESSION_STATE_PREFIX, { limit: STORE_LIMIT }),
+        intents: await store.scan(ctx, SESSION_INTENT_PREFIX, { limit: STORE_LIMIT }),
+        issues: await store.scan(ctx, QUARANTINE_PREFIX, { limit: STORE_LIMIT }),
     };
     for (const key of families.order.keys()) {
         expect(outboxIds.has(key.slice(key.lastIndexOf("/") + 1))).toBe(true);
@@ -625,7 +636,11 @@ describe("crash and transaction recovery chaos", () => {
                     };
                     const reached = cut === "S3" ? delay.block() : undefined;
                     schedule.arm([storeCutRule(cut, target)]);
-                    const first = MurmurClient.open({ store, transport, now: fixture.clock.now });
+                    const first = MurmurClient.open(ctx, {
+                        store,
+                        transport,
+                        now: fixture.clock.now,
+                    });
                     if (cut === "S3") {
                         void first.catch(() => undefined);
                         await reached;
@@ -634,23 +649,25 @@ describe("crash and transaction recovery chaos", () => {
                     }
                     schedule.consume();
 
-                    const root = await delegate.get(IDENTITY_KEY);
+                    const root = await delegate.get(ctx, IDENTITY_KEY);
                     expect(root !== undefined).toBe(cut === "S3");
 
-                    let reopened = await MurmurClient.open({
+                    let reopened = await MurmurClient.open(ctx, {
                         store,
                         transport,
                         now: fixture.clock.now,
                     });
                     const identity = reopened.identity;
-                    reopened = await MurmurClient.open({
+                    reopened = await MurmurClient.open(ctx, {
                         store,
                         transport,
                         now: fixture.clock.now,
                     });
                     expect(reopened.identity).toEqual(identity);
-                    expect((await delegate.scan("murmur/identity/", { limit: 10 })).size).toBe(1);
-                    reopened.close();
+                    expect((await delegate.scan(ctx, "murmur/identity/", { limit: 10 })).size).toBe(
+                        1,
+                    );
+                    reopened.close(ctx);
                 } finally {
                     await closeFixture(fixture);
                 }
@@ -678,7 +695,7 @@ describe("crash and transaction recovery chaos", () => {
                                 `${SESSION_STATE_PREFIX}${encodeBase64Url(session.id)}`,
                             );
                             await executeStoreCut(alice, cut, target, () =>
-                                alice.client.send(session.id, utf8Encode("m1")),
+                                alice.client.send(ctx, session.id, utf8Encode("m1")),
                             );
                             await reopen(alice, fixture.clock);
                             const actors = new Map<ChaosActor["name"], ChaosActor>([
@@ -688,7 +705,7 @@ describe("crash and transaction recovery chaos", () => {
                             await settleSession(actors, session.id, order);
                             expect(updatesWithText(bob, "m1")).toHaveLength(cut === "S3" ? 1 : 0);
 
-                            await alice.client.send(session.id, utf8Encode("m2"));
+                            await alice.client.send(ctx, session.id, utf8Encode("m2"));
                             await settleSession(actors, session.id, order);
                             expect(updatesWithText(bob, "m2")).toHaveLength(1);
                             expect(new Set(bob.updates.map((update) => update.id)).size).toBe(
@@ -716,7 +733,11 @@ describe("crash and transaction recovery chaos", () => {
                     const fixture = await createFixture(0x4352_0300 ^ SYNC_ORDERS.indexOf(order));
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
-                        const deliveryId = await alice.client.send(session.id, utf8Encode("m1"));
+                        const deliveryId = await alice.client.send(
+                            ctx,
+                            session.id,
+                            utf8Encode("m1"),
+                        );
                         const reached = alice.delay.block();
                         alice.transportSchedule.arm([
                             {
@@ -731,7 +752,7 @@ describe("crash and transaction recovery chaos", () => {
                                 effect: { type: "delay", milliseconds: 1 },
                             },
                         ]);
-                        const deadSync = alice.client.synchronize({ waitMilliseconds: 0 });
+                        const deadSync = alice.client.synchronize(ctx, { waitMilliseconds: 0 });
                         void deadSync.catch(() => undefined);
                         await reached;
                         alice.transportSchedule.consume();
@@ -774,10 +795,10 @@ describe("crash and transaction recovery chaos", () => {
                         );
                         try {
                             const { alice, bob, session } = await createActivePair(fixture);
-                            await alice.client.send(session.id, utf8Encode("read-gap"));
+                            await alice.client.send(ctx, session.id, utf8Encode("read-gap"));
                             await synchronize(alice);
                             bob.updates.length = 0;
-                            const cursorBefore = await bob.delegate.get(CURSOR_KEY);
+                            const cursorBefore = await bob.delegate.get(ctx, CURSOR_KEY);
 
                             if (variant === "after-read") {
                                 const reached = bob.delay.block();
@@ -793,11 +814,15 @@ describe("crash and transaction recovery chaos", () => {
                                         effect: { type: "delay", milliseconds: 1 },
                                     },
                                 ]);
-                                const deadSync = bob.client.synchronize({ waitMilliseconds: 0 });
+                                const deadSync = bob.client.synchronize(ctx, {
+                                    waitMilliseconds: 0,
+                                });
                                 void deadSync.catch(() => undefined);
                                 await reached;
                                 bob.transportSchedule.consume();
-                                expect(await bob.delegate.get(CURSOR_KEY)).toEqual(cursorBefore);
+                                expect(await bob.delegate.get(ctx, CURSOR_KEY)).toEqual(
+                                    cursorBefore,
+                                );
                             } else {
                                 const target = offsetStoreTarget(
                                     bob,
@@ -807,7 +832,7 @@ describe("crash and transaction recovery chaos", () => {
                                     APPLICATION_UPDATE_PREFIX,
                                 );
                                 await executeStoreCut(bob, "S3", target, () =>
-                                    bob.client.synchronize({ waitMilliseconds: 0 }),
+                                    bob.client.synchronize(ctx, { waitMilliseconds: 0 }),
                                 );
                                 expect(
                                     await prefixSize(bob.delegate, APPLICATION_UPDATE_PREFIX),
@@ -843,19 +868,20 @@ describe("crash and transaction recovery chaos", () => {
                     const fixture = await createFixture(0x4352_0500 ^ STORE_CUTS.indexOf(cut));
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
-                        await alice.client.send(session.id, utf8Encode(`drain-${cut}`));
+                        await alice.client.send(ctx, session.id, utf8Encode(`drain-${cut}`));
                         await synchronize(alice);
-                        await bob.client.synchronize({ waitMilliseconds: 0 });
+                        await bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                         expect(await prefixSize(bob.delegate, APPLICATION_UPDATE_PREFIX)).toBe(1);
 
                         let callbacks = 0;
                         const reached = cut === "S3" ? bob.delay.block() : undefined;
                         const draining = bob.client.synchronize(
+                            ctx,
                             { waitMilliseconds: 0 },
                             {
-                                onUpdates: (updates) => {
+                                onUpdates: (_ctx, updates) => {
                                     callbacks += 1;
-                                    updateHook(bob)(updates);
+                                    updateHook(bob)(_ctx, updates);
                                     const target = immediateStoreTarget(
                                         bob,
                                         "transaction.delete",
@@ -888,15 +914,16 @@ describe("crash and transaction recovery chaos", () => {
                 const fixture = await createFixture(0x4352_05f0);
                 try {
                     const { alice, bob, session } = await createActivePair(fixture);
-                    await alice.client.send(session.id, utf8Encode("callback-cases"));
+                    await alice.client.send(ctx, session.id, utf8Encode("callback-cases"));
                     await synchronize(alice);
-                    await bob.client.synchronize({ waitMilliseconds: 0 });
+                    await bob.client.synchronize(ctx, { waitMilliseconds: 0 });
 
                     await expect(
                         bob.client.synchronize(
+                            ctx,
                             { waitMilliseconds: 0 },
                             {
-                                onUpdates: () => {
+                                onUpdates: (_ctx) => {
                                     throw new Error("callback rejected");
                                 },
                             },
@@ -907,9 +934,10 @@ describe("crash and transaction recovery chaos", () => {
                     const ambiguousEffects: string[] = [];
                     await expect(
                         bob.client.synchronize(
+                            ctx,
                             { waitMilliseconds: 0 },
                             {
-                                onUpdates: (updates) => {
+                                onUpdates: (_ctx, updates) => {
                                     ambiguousEffects.push(updates[0]!.id);
                                     throw new Error("effect then throw");
                                 },
@@ -923,9 +951,10 @@ describe("crash and transaction recovery chaos", () => {
                         entered = resolve;
                     });
                     const deadSync = bob.client.synchronize(
+                        ctx,
                         { waitMilliseconds: 0 },
                         {
-                            onUpdates: async () => {
+                            onUpdates: async (_ctx) => {
                                 entered?.();
                                 await new Promise<void>(() => undefined);
                             },
@@ -938,7 +967,7 @@ describe("crash and transaction recovery chaos", () => {
                     expect(updatesWithText(bob, "callback-cases")).toHaveLength(1);
                     expect(new Set(ambiguousEffects).size).toBe(1);
 
-                    await alice.client.send(session.id, utf8Encode("ack-loss"));
+                    await alice.client.send(ctx, session.id, utf8Encode("ack-loss"));
                     await synchronize(alice);
                     const ackReached = bob.delay.block();
                     bob.transportSchedule.arm([
@@ -953,7 +982,7 @@ describe("crash and transaction recovery chaos", () => {
                             effect: { type: "delay", milliseconds: 1 },
                         },
                     ]);
-                    const deadAck = bob.client.synchronize({ waitMilliseconds: 0 });
+                    const deadAck = bob.client.synchronize(ctx, { waitMilliseconds: 0 });
                     void deadAck.catch(() => undefined);
                     await ackReached;
                     bob.transportSchedule.consume();
@@ -978,7 +1007,7 @@ describe("crash and transaction recovery chaos", () => {
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
                         const carol = await createActor(fixture, "carol");
-                        const keyPackage = await carol.client.createKeyPackage();
+                        const keyPackage = await carol.client.createKeyPackage(ctx);
                         const target = immediateStoreTarget(
                             alice,
                             "transaction.set",
@@ -986,7 +1015,7 @@ describe("crash and transaction recovery chaos", () => {
                             SESSION_INTENT_PREFIX,
                         );
                         await executeStoreCut(alice, cut, target, () =>
-                            alice.client.addMember(session.id, keyPackage),
+                            alice.client.addMember(ctx, session.id, keyPackage),
                         );
                         await reopen(alice, fixture.clock);
                         const actors = new Map<ChaosActor["name"], ChaosActor>([
@@ -999,22 +1028,25 @@ describe("crash and transaction recovery chaos", () => {
                                 ? (["bob", "alice", "carol"] as const)
                                 : (["alice", "bob", "carol"] as const);
                         await settleSession(actors, session.id, order);
-                        expect((await alice.client.session(session.id))?.members).toHaveLength(
+                        expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(
                             cut === "S3" ? 3 : 2,
                         );
 
                         if (cut !== "S3") {
                             await alice.client.addMember(
+                                ctx,
                                 session.id,
-                                await carol.client.createKeyPackage(),
+                                await carol.client.createKeyPackage(ctx),
                             );
                             await reopen(alice, fixture.clock);
                             await settleSession(actors, session.id, order);
                         }
-                        expect((await alice.client.session(session.id))?.members).toHaveLength(3);
+                        expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(
+                            3,
+                        );
                         expect(await prefixSize(alice.delegate, SESSION_INTENT_PREFIX)).toBe(0);
                         expect(
-                            (await alice.client.issues()).filter(
+                            (await alice.client.issues(ctx)).filter(
                                 (issue) => issue.operationId !== undefined,
                             ),
                         ).toHaveLength(0);
@@ -1037,8 +1069,9 @@ describe("crash and transaction recovery chaos", () => {
                         const { alice, bob, session } = await createActivePair(fixture);
                         const carol = await createActor(fixture, "carol");
                         await alice.client.addMember(
+                            ctx,
                             session.id,
-                            await carol.client.createKeyPackage(),
+                            await carol.client.createKeyPackage(ctx),
                         );
                         const target = offsetStoreTarget(
                             alice,
@@ -1050,10 +1083,12 @@ describe("crash and transaction recovery chaos", () => {
                             alice,
                             cut,
                             target,
-                            () => alice.client.synchronize({ waitMilliseconds: 0 }),
+                            () => alice.client.synchronize(ctx, { waitMilliseconds: 0 }),
                             cut === "S3",
                         );
-                        expect((await alice.client.session(session.id))?.members).toHaveLength(2);
+                        expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(
+                            2,
+                        );
                         await assertStoreShape(alice.delegate);
                         await reopen(alice, fixture.clock);
                         const actors = new Map<ChaosActor["name"], ChaosActor>([
@@ -1062,9 +1097,15 @@ describe("crash and transaction recovery chaos", () => {
                             ["carol", carol],
                         ]);
                         await settleSession(actors, session.id, ["bob", "alice", "carol"]);
-                        expect((await alice.client.session(session.id))?.members).toHaveLength(3);
-                        expect((await bob.client.session(session.id))?.members).toHaveLength(3);
-                        expect((await carol.client.session(session.id))?.status).toBe("pending");
+                        expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(
+                            3,
+                        );
+                        expect((await bob.client.session(ctx, session.id))?.members).toHaveLength(
+                            3,
+                        );
+                        expect((await carol.client.session(ctx, session.id))?.status).toBe(
+                            "pending",
+                        );
                         const acceptedKinds = alice.observer.publishAttempts.map(
                             (delivery) => delivery.ciphertext[0],
                         );
@@ -1090,8 +1131,9 @@ describe("crash and transaction recovery chaos", () => {
                         const carol = await createActor(fixture, "carol");
                         const publicationOffset = alice.observer.publishAttempts.length;
                         await alice.client.addMember(
+                            ctx,
                             session.id,
-                            await carol.client.createKeyPackage(),
+                            await carol.client.createKeyPackage(ctx),
                         );
                         const reached = alice.delay.block();
                         alice.transportSchedule.arm([
@@ -1107,7 +1149,7 @@ describe("crash and transaction recovery chaos", () => {
                                 effect: { type: "delay", milliseconds: 1 },
                             },
                         ]);
-                        const deadSync = alice.client.synchronize({ waitMilliseconds: 0 });
+                        const deadSync = alice.client.synchronize(ctx, { waitMilliseconds: 0 });
                         void deadSync.catch(() => undefined);
                         await reached;
                         alice.transportSchedule.consume();
@@ -1117,7 +1159,7 @@ describe("crash and transaction recovery chaos", () => {
                                 .some((delivery) => delivery.ciphertext[0] === 1),
                         ).toBe(false);
                         await synchronize(carol);
-                        expect(await carol.client.session(session.id)).toBeUndefined();
+                        expect(await carol.client.session(ctx, session.id)).toBeUndefined();
                         expect(carol.updates).toHaveLength(0);
 
                         await reopen(alice, fixture.clock);
@@ -1127,9 +1169,13 @@ describe("crash and transaction recovery chaos", () => {
                             ["carol", carol],
                         ]);
                         await settleSession(actors, session.id, [...order, "carol"]);
-                        expect((await alice.client.session(session.id))?.members).toHaveLength(3);
-                        expect((await carol.client.session(session.id))?.status).toBe("pending");
-                        await carol.client.activateSession(session.id);
+                        expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(
+                            3,
+                        );
+                        expect((await carol.client.session(ctx, session.id))?.status).toBe(
+                            "pending",
+                        );
+                        await carol.client.activateSession(ctx, session.id);
                         await synchronize(carol);
                         expect(carol.updates).toHaveLength(0);
                         const attemptedKinds = alice.observer.publishAttempts
@@ -1154,7 +1200,11 @@ describe("crash and transaction recovery chaos", () => {
                 try {
                     const { alice, bob, session } = await createActivePair(fixture);
                     const carol = await createActor(fixture, "carol");
-                    await alice.client.addMember(session.id, await carol.client.createKeyPackage());
+                    await alice.client.addMember(
+                        ctx,
+                        session.id,
+                        await carol.client.createKeyPackage(ctx),
+                    );
                     const reached = alice.delay.block();
                     alice.transportSchedule.arm([
                         {
@@ -1169,24 +1219,24 @@ describe("crash and transaction recovery chaos", () => {
                             effect: { type: "delay", milliseconds: 1 },
                         },
                     ]);
-                    const deadSync = alice.client.synchronize({ waitMilliseconds: 0 });
+                    const deadSync = alice.client.synchronize(ctx, { waitMilliseconds: 0 });
                     void deadSync.catch(() => undefined);
                     await reached;
                     alice.transportSchedule.consume();
-                    expect((await alice.client.session(session.id))?.members).toHaveLength(2);
+                    expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(2);
                     expect(await prefixSize(alice.delegate, OUTBOX_PREFIX)).toBeGreaterThan(0);
 
                     await reopen(alice, fixture.clock);
-                    expect((await alice.client.session(session.id))?.members).toHaveLength(2);
+                    expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(2);
                     const actors = new Map<ChaosActor["name"], ChaosActor>([
                         ["alice", alice],
                         ["bob", bob],
                         ["carol", carol],
                     ]);
                     await settleSession(actors, session.id, ["bob", "alice", "carol"]);
-                    expect((await alice.client.session(session.id))?.members).toHaveLength(3);
-                    expect((await bob.client.session(session.id))?.members).toHaveLength(3);
-                    expect((await carol.client.session(session.id))?.members).toHaveLength(3);
+                    expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(3);
+                    expect((await bob.client.session(ctx, session.id))?.members).toHaveLength(3);
+                    expect((await carol.client.session(ctx, session.id))?.members).toHaveLength(3);
                     expect((await assertStoreShape(alice.delegate)).outboxes).toBe(0);
                 } finally {
                     await closeFixture(fixture);
@@ -1204,7 +1254,7 @@ describe("crash and transaction recovery chaos", () => {
                     const fixture = await createFixture(0x4352_0a00 ^ STORE_CUTS.indexOf(cut));
                     try {
                         const { alice, bob, session } = await createActivePair(fixture);
-                        await alice.client.removeMember(session.id, bob.client.identity);
+                        await alice.client.removeMember(ctx, session.id, bob.client.identity);
                         const publishReached = alice.delay.block();
                         alice.transportSchedule.arm([
                             {
@@ -1219,13 +1269,13 @@ describe("crash and transaction recovery chaos", () => {
                                 effect: { type: "delay", milliseconds: 1 },
                             },
                         ]);
-                        const deadPublish = alice.client.synchronize({ waitMilliseconds: 0 });
+                        const deadPublish = alice.client.synchronize(ctx, { waitMilliseconds: 0 });
                         void deadPublish.catch(() => undefined);
                         await publishReached;
                         alice.transportSchedule.consume();
                         await reopen(alice, fixture.clock);
 
-                        await bob.client.send(session.id, utf8Encode("removed-prior"));
+                        await bob.client.send(ctx, session.id, utf8Encode("removed-prior"));
                         await synchronize(bob);
                         const target = offsetStoreTarget(
                             alice,
@@ -1234,7 +1284,7 @@ describe("crash and transaction recovery chaos", () => {
                             `${SESSION_STATE_PREFIX}${encodeBase64Url(session.id)}`,
                         );
                         await executeStoreCut(alice, cut, target, () =>
-                            alice.client.synchronize({ waitMilliseconds: 0 }),
+                            alice.client.synchronize(ctx, { waitMilliseconds: 0 }),
                         );
                         await reopen(alice, fixture.clock);
                         const actors = new Map<ChaosActor["name"], ChaosActor>([
@@ -1242,17 +1292,17 @@ describe("crash and transaction recovery chaos", () => {
                             ["bob", bob],
                         ]);
                         await settleSession(actors, session.id, ["alice", "bob"]);
-                        expect((await alice.client.session(session.id))?.members).toEqual([
+                        expect((await alice.client.session(ctx, session.id))?.members).toEqual([
                             alice.client.identity,
                         ]);
-                        expect(await bob.client.session(session.id)).toBeUndefined();
+                        expect(await bob.client.session(ctx, session.id)).toBeUndefined();
                         expect(updatesWithText(alice, "removed-prior")).toHaveLength(0);
 
-                        await alice.client.send(session.id, utf8Encode("new-epoch"));
+                        await alice.client.send(ctx, session.id, utf8Encode("new-epoch"));
                         await settleSession(actors, session.id, ["alice", "bob"]);
                         expect(updatesWithText(bob, "new-epoch")).toHaveLength(0);
                         await expect(
-                            bob.client.removeMember(session.id, alice.client.identity),
+                            bob.client.removeMember(ctx, session.id, alice.client.identity),
                         ).rejects.toThrow("Unknown active session");
                         expect((await assertStoreShape(alice.delegate)).outboxes).toBe(0);
                     } finally {
@@ -1277,20 +1327,21 @@ describe("crash and transaction recovery chaos", () => {
                             ["bob", bob],
                             ["carol", carol],
                         ]);
-                        await alice.client.grantAdmin(session.id, bob.client.identity);
+                        await alice.client.grantAdmin(ctx, session.id, bob.client.identity);
                         await synchronize(alice);
                         await synchronize(alice);
                         await synchronize(bob);
                         await synchronize(carol);
-                        expect((await bob.client.session(session.id))?.admins).toContainEqual(
+                        expect((await bob.client.session(ctx, session.id))?.admins).toContainEqual(
                             bob.client.identity,
                         );
 
-                        await bob.client.removeMember(session.id, carol.client.identity);
+                        await bob.client.removeMember(ctx, session.id, carol.client.identity);
                         await synchronize(bob);
                         await alice.client.addMember(
+                            ctx,
                             session.id,
-                            await carol.client.createKeyPackage(),
+                            await carol.client.createKeyPackage(ctx),
                         );
                         const target = offsetStoreTarget(
                             alice,
@@ -1303,7 +1354,7 @@ describe("crash and transaction recovery chaos", () => {
                             alice,
                             cut,
                             target,
-                            () => alice.client.synchronize({ waitMilliseconds: 0 }),
+                            () => alice.client.synchronize(ctx, { waitMilliseconds: 0 }),
                             false,
                         );
                         await reopen(alice, fixture.clock);
@@ -1313,20 +1364,23 @@ describe("crash and transaction recovery chaos", () => {
                             ["carol", carol],
                         ]);
                         await settleSession(actors, session.id, ["bob", "alice", "carol"]);
-                        const issues = (await alice.client.issues()).filter(
+                        const issues = (await alice.client.issues(ctx)).filter(
                             (issue) => issue.code === "add_intent_removal_generation_advanced",
                         );
                         expect(issues).toHaveLength(1);
                         expect(issues[0]!.operationId).toBeDefined();
                         expect(await prefixSize(alice.delegate, SESSION_INTENT_PREFIX)).toBe(0);
-                        expect(await carol.client.session(session.id)).toBeUndefined();
+                        expect(await carol.client.session(ctx, session.id)).toBeUndefined();
 
                         await alice.client.addMember(
+                            ctx,
                             session.id,
-                            await carol.client.createKeyPackage(),
+                            await carol.client.createKeyPackage(ctx),
                         );
                         await settleSession(actors, session.id, ["alice", "bob", "carol"]);
-                        expect((await alice.client.session(session.id))?.members).toHaveLength(3);
+                        expect((await alice.client.session(ctx, session.id))?.members).toHaveLength(
+                            3,
+                        );
                         expect((await assertStoreShape(alice.delegate)).issues).toBe(1);
                     } finally {
                         await closeFixture(fixture);
@@ -1353,10 +1407,10 @@ describe("crash and transaction recovery chaos", () => {
                     const labels = Array.from({ length: 10 }, (_, index) => `ladder-${index}`);
                     for (let crash = 0; crash < 25; crash += 1) {
                         if (crash < labels.length) {
-                            await alice.client.send(session.id, utf8Encode(labels[crash]!));
+                            await alice.client.send(ctx, session.id, utf8Encode(labels[crash]!));
                         }
                         if (crash === labels.length) {
-                            await alice.client.setPolicies(session.id, {
+                            await alice.client.setPolicies(ctx, session.id, {
                                 adminsAssignAdmins: false,
                                 anyoneCanAddMembers: true,
                             });
@@ -1369,7 +1423,7 @@ describe("crash and transaction recovery chaos", () => {
                             "murmur/",
                         );
                         await executeStoreCut(actor, "S0", target, () =>
-                            actor.client.synchronize({ waitMilliseconds: 0 }),
+                            actor.client.synchronize(ctx, { waitMilliseconds: 0 }),
                         );
                         await reopen(actor, fixture.clock);
                     }
@@ -1388,8 +1442,8 @@ describe("crash and transaction recovery chaos", () => {
                             .map((update) => update.text)
                             .filter((text) => text.startsWith("ladder-")),
                     ).toEqual(labels);
-                    const aliceSession = (await alice.client.session(session.id))!;
-                    const bobSession = (await bob.client.session(session.id))!;
+                    const aliceSession = (await alice.client.session(ctx, session.id))!;
+                    const bobSession = (await bob.client.session(ctx, session.id))!;
                     expect(normalizeSession(bobSession)).toEqual(normalizeSession(aliceSession));
                     expect(aliceSession.policies.anyoneCanAddMembers).toBe(true);
                     const shape = await assertStoreShape(alice.delegate);

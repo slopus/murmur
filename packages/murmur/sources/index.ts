@@ -117,4 +117,4 @@ export type {
     MurmurDormantDevice,
 } from "./accounts/index.js";
 export { MAXIMUM_STORE_SCAN_ITEMS, MemoryMurmurStore } from "./storage/index.js";
-export type { MurmurStore, StoreScanOptions, StoreTransaction } from "./storage/index.js";
+export type { MurmurStore, StoreScanOptions } from "./storage/index.js";

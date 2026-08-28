@@ -1,4 +1,6 @@
-import type { StoreTransaction } from "../../storage/index.js";
+import type { Context } from "@steve.kite/stdlib";
+
+import type { MurmurStore } from "../../storage/index.js";
 import {
     canonicalJsonBytes,
     decodeBase64Url,
@@ -72,11 +74,12 @@ export function decodeDirectoryLocalPrekey(bytes: Uint8Array): DirectoryLocalPre
 
 /** Remove every local marker associated with a KeyPackage consumed by a Welcome. */
 export async function deleteDirectoryPrekeyMarkers(
-    transaction: StoreTransaction,
+    ctx: Context,
+    store: MurmurStore,
     reference: Uint8Array,
 ): Promise<void> {
     const suffix = encodeBase64Url(reference);
-    await transaction.delete(`${DIRECTORY_ONE_TIME_PREFIX}${suffix}`);
-    await transaction.delete(`${DIRECTORY_PENDING_PREFIX}${suffix}`);
-    await transaction.delete(`${DIRECTORY_SPENT_PREFIX}${suffix}`);
+    await store.delete(ctx, `${DIRECTORY_ONE_TIME_PREFIX}${suffix}`);
+    await store.delete(ctx, `${DIRECTORY_PENDING_PREFIX}${suffix}`);
+    await store.delete(ctx, `${DIRECTORY_SPENT_PREFIX}${suffix}`);
 }

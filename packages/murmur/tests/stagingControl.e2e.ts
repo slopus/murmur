@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import {
     LocalDirectoryTicketIssuer,
     createRelaySessionToken,
@@ -17,6 +18,8 @@ import {
 } from "../sources/index.js";
 import { decodeBase64Url, utf8Decode, utf8Encode } from "../sources/utils/index.js";
 
+const ctx = createRootContext().named("test");
+
 const STAGING_ENDPOINT = "wss://murmur-relay-staging.bulka-llc.workers.dev/v2/connect";
 const TICKET_TTL_MILLISECONDS = 60_000;
 const REQUEST_TIMEOUT_MILLISECONDS = 20_000;
@@ -34,7 +37,7 @@ function requireTokenSecret(): Uint8Array {
 
 function sessionProvider(secret: Uint8Array, admissionPrincipal: string): RelaySessionProvider {
     return {
-        issue(request: SignedRelaySessionRequest): Promise<RelaySessionTicket> {
+        issue(_ctx, request: SignedRelaySessionRequest): Promise<RelaySessionTicket> {
             const issuedAt = Date.now();
             const expiresAt = issuedAt + TICKET_TTL_MILLISECONDS;
             return Promise.resolve({
@@ -61,7 +64,7 @@ function openClient(
 ): Promise<MurmurClient> {
     // Murmur builds the socket with its own generated device key, so the
     // negotiated token must bind that device rather than the account identity.
-    return MurmurClient.open({
+    return MurmurClient.open(ctx, {
         identity,
         sessionProvider: sessionProvider(secret, admissionPrincipal),
         webSocket: {
@@ -74,7 +77,7 @@ function openClient(
 
 async function settle(clients: readonly MurmurClient[]): Promise<void> {
     for (let round = 0; round < SYNCHRONIZE_ROUNDS; round += 1) {
-        for (const client of clients) await client.synchronize({ waitMilliseconds: 0 });
+        for (const client of clients) await client.synchronize(ctx, { waitMilliseconds: 0 });
     }
 }
 
@@ -104,6 +107,7 @@ describe.runIf(tokenSecret !== undefined)("deployed Cloudflare staging control p
             await settle([aliceClient, bobClient]);
 
             const claim = await aliceClient.claimAccount(
+                ctx,
                 bob.publicKey,
                 ticketIssuer.issue({
                     expiresAt: Date.now() + TICKET_TTL_MILLISECONDS,
@@ -112,30 +116,31 @@ describe.runIf(tokenSecret !== undefined)("deployed Cloudflare staging control p
             );
             expect(claim.members.length).toBeGreaterThan(0);
 
-            const session = await aliceClient.createSession({
+            const session = await aliceClient.createSession(ctx, {
                 descriptor: utf8Encode("staging-control-session"),
                 members: [claim],
                 sendPolicy: "admins",
             });
             await settle([aliceClient, bobClient]);
 
-            if ((await bobClient.session(session.id))?.status === "pending") {
-                await bobClient.activateSession(session.id);
+            if ((await bobClient.session(ctx, session.id))?.status === "pending") {
+                await bobClient.activateSession(ctx, session.id);
             }
-            expect((await bobClient.session(session.id))?.status).toBe("active");
+            expect((await bobClient.session(ctx, session.id))?.status).toBe("active");
 
             // The relay derives fanout from its own session and roster state;
             // the sender never names a recipient device.
-            await aliceClient.send(session.id, utf8Encode("relay-derived-fanout"));
+            await aliceClient.send(ctx, session.id, utf8Encode("relay-derived-fanout"));
             const received: string[] = [];
             for (let round = 0; round < SYNCHRONIZE_ROUNDS; round += 1) {
                 // Sends persist locally first; Alice's own synchronize is what
                 // publishes her outbox to the relay.
-                await aliceClient.synchronize({ waitMilliseconds: 0 });
+                await aliceClient.synchronize(ctx, { waitMilliseconds: 0 });
                 await bobClient.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onUpdates: (updates) => {
+                        onUpdates: (_ctx, updates) => {
                             for (const update of updates) received.push(utf8Decode(update.bytes));
                         },
                     },
@@ -146,18 +151,18 @@ describe.runIf(tokenSecret !== undefined)("deployed Cloudflare staging control p
 
             // Bob is not an admin, so the admins-only send policy rejects him
             // locally before anything is encrypted.
-            await expect(bobClient.send(session.id, utf8Encode("denied"))).rejects.toThrow();
+            await expect(bobClient.send(ctx, session.id, utf8Encode("denied"))).rejects.toThrow();
 
             // The owner deletes the session and the account cascade removes the
             // remaining control state.
-            await aliceClient.deleteSession(session.id);
+            await aliceClient.deleteSession(ctx, session.id);
             await settle([aliceClient, bobClient]);
-            expect(await aliceClient.session(session.id)).toBeUndefined();
+            expect(await aliceClient.session(ctx, session.id)).toBeUndefined();
 
-            await aliceClient.deleteAccount();
+            await aliceClient.deleteAccount(ctx);
         } finally {
-            await aliceClient.close();
-            await bobClient.close();
+            await aliceClient.close(ctx);
+            await bobClient.close(ctx);
         }
     }, 120_000);
 });

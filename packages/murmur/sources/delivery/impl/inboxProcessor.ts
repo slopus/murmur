@@ -1,5 +1,6 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import { hashBytes } from "../../crypto/index.js";
-import type { StoreTransaction } from "../../storage/index.js";
 import {
     concatBytes,
     decodeBase64Url,
@@ -28,7 +29,7 @@ import {
     createSignedInboxRead,
     verifySignedDelivery,
 } from "./deliveryCodec.js";
-import { StagedStoreTransaction } from "./storeTransactionStage.js";
+import { StagedMurmurStore } from "./storeTransactionStage.js";
 
 const CURSOR_KEY = "murmur/delivery/cursor";
 const CONTINUITY_KEY = "murmur/delivery/continuity";
@@ -283,13 +284,13 @@ export class InboxProcessor {
     }
 
     /** Return the durable local cursor, or `null` before any terminal delivery. */
-    async cursor(): Promise<string | null> {
-        return parseCursor(await this.#dependencies.store.get(CURSOR_KEY));
+    async cursor(ctx: Context): Promise<string | null> {
+        return parseCursor(await this.#dependencies.store.get(ctx, CURSOR_KEY));
     }
 
     /** Return the durable last processed sequence and loss generation. */
-    async continuity(): Promise<Readonly<ContinuityState> | undefined> {
-        const state = parseContinuity(await this.#dependencies.store.get(CONTINUITY_KEY));
+    async continuity(ctx: Context): Promise<Readonly<ContinuityState> | undefined> {
+        const state = parseContinuity(await this.#dependencies.store.get(ctx, CONTINUITY_KEY));
         return state === undefined
             ? undefined
             : { generation: state.generation.slice(), sequence: state.sequence };
@@ -297,7 +298,7 @@ export class InboxProcessor {
 
     /** @internal Adopt a relay-provided post-reset tip in the caller's purge transaction. */
     async adoptBaselineInTransaction(
-        transaction: StoreTransaction,
+        ctx: Context,
         generation: Uint8Array,
         head: string | null,
         headSequence: number,
@@ -306,24 +307,29 @@ export class InboxProcessor {
             throw new Error("Invalid inbox reset baseline");
         }
         if (head === null) {
-            await transaction.delete(CURSOR_KEY);
+            await this.#dependencies.store.delete(ctx, CURSOR_KEY);
         } else {
-            await transaction.set(CURSOR_KEY, cursorBytes(head));
+            await this.#dependencies.store.set(ctx, CURSOR_KEY, cursorBytes(head));
         }
-        await transaction.set(
+        await this.#dependencies.store.set(
+            ctx,
             CONTINUITY_KEY,
             continuityBytes({ generation: generation.slice(), sequence: headSequence }),
         );
     }
 
     /** @internal Acknowledge a baseline already committed by a continuity reset. */
-    async acknowledgeBaseline(head: string | null, signal?: AbortSignal): Promise<void> {
-        if (head !== null) await this.#acknowledge(head, signal);
+    async acknowledgeBaseline(
+        ctx: Context,
+        head: string | null,
+        signal?: AbortSignal,
+    ): Promise<void> {
+        if (head !== null) await this.#acknowledge(ctx, head, signal);
     }
 
     /** Return retained terminal rejections in relay order. */
-    async rejections(): Promise<readonly InboxRejection[]> {
-        const entries = await this.#dependencies.store.scan(REJECTION_PREFIX, {
+    async rejections(ctx: Context): Promise<readonly InboxRejection[]> {
+        const entries = await this.#dependencies.store.scan(ctx, REJECTION_PREFIX, {
             limit: this.#maximumRejections,
         });
         return [...entries.values()].map(parseRejection);
@@ -334,15 +340,15 @@ export class InboxProcessor {
      *
      * Concurrent calls on one processor instance are serialized.
      */
-    async synchronize(options: InboxSyncOptions = {}): Promise<InboxSyncResult> {
+    async synchronize(ctx: Context, options: InboxSyncOptions = {}): Promise<InboxSyncResult> {
         if (this.#streamActive) {
             throw new Error("Cannot page an inbox while its event stream is active");
         }
-        return this.#exclusive(async () => this.#synchronize(options));
+        return this.#exclusive(async () => this.#synchronize(ctx, options));
     }
 
     /** Process and acknowledge exact queued events from one authenticated SSE stream. */
-    async *stream(options: InboxStreamOptions): AsyncGenerator<InboxSyncResult> {
+    async *stream(ctx: Context, options: InboxStreamOptions): AsyncGenerator<InboxSyncResult> {
         if (this.#streamActive) {
             throw new Error("Inbox event stream is already active");
         }
@@ -352,11 +358,11 @@ export class InboxProcessor {
         }
         this.#streamActive = true;
         try {
-            let cursor = await this.cursor();
+            let cursor = await this.cursor(ctx);
             if (cursor !== null) {
-                await this.#pruneReplay(relayEventTime(cursor));
+                await this.#pruneReplay(ctx, relayEventTime(cursor));
                 try {
-                    await this.#acknowledge(cursor, options.signal);
+                    await this.#acknowledge(ctx, cursor, options.signal);
                 } catch (error: unknown) {
                     if (error instanceof DeliveryCursorTrimmedError) {
                         throw new InboxStateRollbackError(cursor, error.acknowledgedThrough);
@@ -378,6 +384,7 @@ export class InboxProcessor {
             });
             for await (const queued of openStream.call(
                 this.#dependencies.transport,
+                ctx,
                 request,
                 options.signal,
                 {
@@ -391,8 +398,8 @@ export class InboxProcessor {
             )) {
                 if ("type" in queued) {
                     await this.#exclusive(async () => {
-                        cursor = await this.cursor();
-                        const continuity = await this.continuity();
+                        cursor = await this.cursor(ctx);
+                        const continuity = await this.continuity(ctx);
                         if (continuity === undefined) {
                             if (cursor !== null || queued.acknowledgedSequence > 0) {
                                 throw this.#continuityLoss(
@@ -403,6 +410,7 @@ export class InboxProcessor {
                                 );
                             }
                             await this.#dependencies.store.set(
+                                ctx,
                                 CONTINUITY_KEY,
                                 continuityBytes({
                                     generation: queued.generation,
@@ -431,13 +439,13 @@ export class InboxProcessor {
                     continue;
                 }
                 const result = await this.#exclusive(async () => {
-                    cursor = await this.cursor();
+                    cursor = await this.cursor(ctx);
                     if (cursor !== null && queued.eventId <= cursor) {
                         throw new Error("Relay returned an out-of-order inbox stream");
                     }
                     const processingNow = relayEventTime(queued.eventId);
                     this.#validateRelayEventTime(queued.eventId, this.#requestTime());
-                    const continuity = await this.continuity();
+                    const continuity = await this.continuity(ctx);
                     const observedSequence = queued.sequence ?? (continuity?.sequence ?? -1) + 1;
                     if (continuity === undefined) {
                         throw new InboxContinuityLossError({
@@ -460,14 +468,15 @@ export class InboxProcessor {
                         });
                     }
                     const outcome = await this.#process(
+                        ctx,
                         { ...queued, sequence: observedSequence },
                         cursor,
                         processingNow,
                         continuity.generation,
                     );
                     cursor = queued.eventId;
-                    await this.#pruneReplay(processingNow);
-                    await this.#acknowledge(cursor, options.signal);
+                    await this.#pruneReplay(ctx, processingNow);
+                    await this.#acknowledge(ctx, cursor, options.signal);
                     return {
                         processed: outcome === "processed" ? 1 : 0,
                         rejected: outcome === "rejected" ? 1 : 0,
@@ -482,12 +491,12 @@ export class InboxProcessor {
         }
     }
 
-    async #synchronize(options: InboxSyncOptions): Promise<InboxSyncResult> {
-        let cursor = await this.cursor();
+    async #synchronize(ctx: Context, options: InboxSyncOptions): Promise<InboxSyncResult> {
+        let cursor = await this.cursor(ctx);
         if (cursor !== null) {
-            await this.#pruneReplay(relayEventTime(cursor));
+            await this.#pruneReplay(ctx, relayEventTime(cursor));
             try {
-                await this.#acknowledge(cursor, options.signal);
+                await this.#acknowledge(ctx, cursor, options.signal);
             } catch (error: unknown) {
                 if (error instanceof DeliveryCursorTrimmedError) {
                     throw new InboxStateRollbackError(cursor, error.acknowledgedThrough);
@@ -514,6 +523,7 @@ export class InboxProcessor {
                 createdAt: this.#requestTime(),
             };
             page = await this.#dependencies.transport.read(
+                ctx,
                 createSignedInboxRead(this.#dependencies.identity, readOptions),
                 options.signal,
             );
@@ -534,7 +544,7 @@ export class InboxProcessor {
                 throw new Error("Relay returned a non-advancing oversized delivery");
             }
             this.#validateRelayEventTime(error.eventId, this.#requestTime());
-            let continuity = await this.continuity();
+            let continuity = await this.continuity(ctx);
             if (continuity === undefined) {
                 if (cursor !== null || error.acknowledgedSequence > 0) {
                     throw this.#continuityLoss(
@@ -545,7 +555,11 @@ export class InboxProcessor {
                     );
                 }
                 continuity = { generation: error.generation.slice(), sequence: 0 };
-                await this.#dependencies.store.set(CONTINUITY_KEY, continuityBytes(continuity));
+                await this.#dependencies.store.set(
+                    ctx,
+                    CONTINUITY_KEY,
+                    continuityBytes(continuity),
+                );
             }
             if (!equalBytes(continuity.generation, error.generation)) {
                 throw this.#continuityLoss(
@@ -567,14 +581,15 @@ export class InboxProcessor {
                 );
             }
             await this.#persistTerminal(
+                ctx,
                 error.eventId,
                 "delivery_too_large",
                 error.generation,
                 error.sequence,
             );
             cursor = error.eventId;
-            await this.#pruneReplay(relayEventTime(cursor));
-            await this.#acknowledge(cursor, options.signal);
+            await this.#pruneReplay(ctx, relayEventTime(cursor));
+            await this.#acknowledge(ctx, cursor, options.signal);
             return { processed: 0, rejected: 1, cursor, exhausted: cursor === error.head };
         }
         let processed = 0;
@@ -588,7 +603,7 @@ export class InboxProcessor {
             throw new Error("Relay returned inconsistent inbox metadata");
         }
         const generation = page.generation?.slice() ?? new Uint8Array(32);
-        let continuity = await this.continuity();
+        let continuity = await this.continuity(ctx);
         if (continuity === undefined) {
             if (cursor !== null) {
                 throw this.#continuityLoss("state_missing", 0, 0, {
@@ -598,10 +613,16 @@ export class InboxProcessor {
                 });
             }
             continuity = { generation, sequence: 0 };
-            await this.#dependencies.store.transaction(async (transaction) => {
-                const existing = parseContinuity(await transaction.get(CONTINUITY_KEY));
+            await this.#dependencies.store.tx(ctx, async (tx) => {
+                const existing = parseContinuity(
+                    await this.#dependencies.store.get(tx, CONTINUITY_KEY),
+                );
                 if (existing === undefined) {
-                    await transaction.set(CONTINUITY_KEY, continuityBytes(continuity!));
+                    await this.#dependencies.store.set(
+                        tx,
+                        CONTINUITY_KEY,
+                        continuityBytes(continuity!),
+                    );
                 }
             });
         } else if (!equalBytes(continuity.generation, generation)) {
@@ -667,6 +688,7 @@ export class InboxProcessor {
         previous = cursor;
         for (const delivery of deliveries) {
             const outcome = await this.#process(
+                ctx,
                 delivery,
                 previous,
                 relayEventTime(delivery.eventId),
@@ -678,24 +700,27 @@ export class InboxProcessor {
         }
         cursor = previous;
         if (cursor !== null && (processed > 0 || rejected > 0)) {
-            await this.#pruneReplay(relayEventTime(cursor));
-            await this.#acknowledge(cursor, options.signal);
+            await this.#pruneReplay(ctx, relayEventTime(cursor));
+            await this.#acknowledge(ctx, cursor, options.signal);
         }
         return { processed, rejected, cursor, exhausted: page.exhausted };
     }
 
     async #process(
+        ctx: Context,
         queued: InboxDelivery,
         expectedCursor: string | null,
         processingNow: number,
         generation: Uint8Array,
     ): Promise<"processed" | "rejected"> {
-        return this.#dependencies.store.transaction(async (transaction) => {
-            const actualCursor = parseCursor(await transaction.get(CURSOR_KEY));
+        return this.#dependencies.store.tx(ctx, async (tx) => {
+            const actualCursor = parseCursor(await this.#dependencies.store.get(tx, CURSOR_KEY));
             if (actualCursor !== expectedCursor) {
                 throw new Error("Inbox cursor changed during synchronization");
             }
-            const actualContinuity = parseContinuity(await transaction.get(CONTINUITY_KEY));
+            const actualContinuity = parseContinuity(
+                await this.#dependencies.store.get(tx, CONTINUITY_KEY),
+            );
             if (
                 actualContinuity === undefined ||
                 !equalBytes(actualContinuity.generation, generation) ||
@@ -708,12 +733,12 @@ export class InboxProcessor {
             const digest = this.#replayDigest(queued);
             if (queued.delivery.expiresAt <= processingNow) {
                 rejection = "expired_delivery";
-            } else if (await this.#terminalContains(transaction, digest, processingNow)) {
+            } else if (await this.#terminalContains(tx, digest, processingNow)) {
                 rejection = "probable_terminal_replay";
             } else if (!verifySignedDelivery(queued.delivery)) {
                 rejection = "invalid_delivery";
                 if (queued.delivery.expiresAt > processingNow) {
-                    await this.#addTerminal(transaction, digest, processingNow);
+                    await this.#addTerminal(tx, digest, processingNow);
                 }
             } else if (
                 queued.delivery.sessionControl === null &&
@@ -721,7 +746,7 @@ export class InboxProcessor {
             ) {
                 rejection = "invalid_recipient";
                 if (queued.delivery.expiresAt > processingNow) {
-                    await this.#addTerminal(transaction, digest, processingNow);
+                    await this.#addTerminal(tx, digest, processingNow);
                 }
             } else if (
                 queued.delivery.expiresAt - processingNow >
@@ -734,17 +759,18 @@ export class InboxProcessor {
             ) {
                 rejection = "future_delivery";
             } else {
-                const replay = await this.#registerReplay(transaction, queued, processingNow);
+                const replay = await this.#registerReplay(tx, queued, processingNow);
                 if (replay !== "new") {
                     rejection = replay;
                 } else {
-                    const staged = new StagedStoreTransaction(
-                        transaction,
+                    const staged = new StagedMurmurStore(
+                        this.#dependencies.store,
+                        tx,
                         this.#allowMurmurMutations,
                     );
                     try {
-                        await this.#handler(staged, queued);
-                        await staged.commit();
+                        await this.#handler(tx, staged, queued);
+                        await staged.commit(tx);
                     } catch (error: unknown) {
                         staged.discard();
                         if (!(error instanceof TerminalInboxDeliveryError)) throw error;
@@ -753,10 +779,11 @@ export class InboxProcessor {
                 }
             }
             if (rejection !== undefined) {
-                await this.#storeRejection(transaction, queued.eventId, rejection);
+                await this.#storeRejection(tx, queued.eventId, rejection);
             }
-            await transaction.set(CURSOR_KEY, cursorBytes(queued.eventId));
-            await transaction.set(
+            await this.#dependencies.store.set(tx, CURSOR_KEY, cursorBytes(queued.eventId));
+            await this.#dependencies.store.set(
+                tx,
                 CONTINUITY_KEY,
                 continuityBytes({ generation, sequence: queued.sequence }),
             );
@@ -785,14 +812,17 @@ export class InboxProcessor {
     }
 
     async #persistTerminal(
+        ctx: Context,
         eventId: string,
         code: string,
         generation: Uint8Array,
         sequence: number,
     ): Promise<void> {
-        await this.#dependencies.store.transaction(async (transaction) => {
-            const cursor = parseCursor(await transaction.get(CURSOR_KEY));
-            const continuity = parseContinuity(await transaction.get(CONTINUITY_KEY));
+        await this.#dependencies.store.tx(ctx, async (tx) => {
+            const cursor = parseCursor(await this.#dependencies.store.get(tx, CURSOR_KEY));
+            const continuity = parseContinuity(
+                await this.#dependencies.store.get(tx, CONTINUITY_KEY),
+            );
             if (cursor !== null && eventId <= cursor) {
                 throw new Error("Relay returned a non-advancing terminal delivery");
             }
@@ -803,30 +833,30 @@ export class InboxProcessor {
             ) {
                 throw new Error("Inbox continuity changed during terminal delivery processing");
             }
-            await this.#storeRejection(transaction, eventId, code);
-            await transaction.set(CURSOR_KEY, cursorBytes(eventId));
-            await transaction.set(CONTINUITY_KEY, continuityBytes({ generation, sequence }));
+            await this.#storeRejection(tx, eventId, code);
+            await this.#dependencies.store.set(tx, CURSOR_KEY, cursorBytes(eventId));
+            await this.#dependencies.store.set(
+                tx,
+                CONTINUITY_KEY,
+                continuityBytes({ generation, sequence }),
+            );
         });
     }
 
-    async #storeRejection(
-        transaction: StoreTransaction,
-        eventId: string,
-        code: string,
-    ): Promise<void> {
+    async #storeRejection(ctx: Context, eventId: string, code: string): Promise<void> {
         const key = `${REJECTION_PREFIX}${eventId}`;
-        await transaction.set(key, rejectionBytes(eventId, code));
-        const entries = await transaction.scan(REJECTION_PREFIX, {
+        await this.#dependencies.store.set(ctx, key, rejectionBytes(eventId, code));
+        const entries = await this.#dependencies.store.scan(ctx, REJECTION_PREFIX, {
             limit: this.#maximumRejections + 1,
         });
         if (entries.size > this.#maximumRejections) {
             const oldest = entries.keys().next().value;
-            if (typeof oldest === "string") await transaction.delete(oldest);
+            if (typeof oldest === "string") await this.#dependencies.store.delete(ctx, oldest);
         }
     }
 
     async #registerReplay(
-        transaction: StoreTransaction,
+        ctx: Context,
         queued: InboxDelivery,
         processingNow: number,
     ): Promise<
@@ -837,17 +867,22 @@ export class InboxProcessor {
         | "replay_capacity"
     > {
         const key = this.#replayKey(queued);
-        const existingBytes = await transaction.get(key);
+        const existingBytes = await this.#dependencies.store.get(ctx, key);
         const fingerprint = this.#deliveryFingerprint(queued);
         if (existingBytes !== undefined) {
             const existing = this.#parseReplay(existingBytes);
             if (queued.delivery.expiresAt > existing.expiresAt) {
-                await transaction.delete(this.#replayExpiryKey(existing.expiresAt, key));
-                await transaction.set(
+                await this.#dependencies.store.delete(
+                    ctx,
+                    this.#replayExpiryKey(existing.expiresAt, key),
+                );
+                await this.#dependencies.store.set(
+                    ctx,
                     key,
                     this.#replayBytes(existing.fingerprint, queued.delivery.expiresAt),
                 );
-                await transaction.set(
+                await this.#dependencies.store.set(
+                    ctx,
                     this.#replayExpiryKey(queued.delivery.expiresAt, key),
                     new Uint8Array(),
                 );
@@ -857,20 +892,25 @@ export class InboxProcessor {
                 : "delivery_id_collision";
         }
         const digest = this.#replayDigest(queued);
-        if (await this.#overflowContains(transaction, digest, processingNow)) {
+        if (await this.#overflowContains(ctx, digest, processingNow)) {
             return "probable_duplicate_delivery";
         }
-        const count = await this.#replayCount(transaction);
+        const count = await this.#replayCount(ctx);
         if (count >= this.#maximumReplayEntries) {
-            await this.#addOverflow(transaction, digest, processingNow);
+            await this.#addOverflow(ctx, digest, processingNow);
             return "replay_capacity";
         }
-        await transaction.set(key, this.#replayBytes(fingerprint, queued.delivery.expiresAt));
-        await transaction.set(
+        await this.#dependencies.store.set(
+            ctx,
+            key,
+            this.#replayBytes(fingerprint, queued.delivery.expiresAt),
+        );
+        await this.#dependencies.store.set(
+            ctx,
             this.#replayExpiryKey(queued.delivery.expiresAt, key),
             new Uint8Array(),
         );
-        await this.#setReplayCount(transaction, count + 1);
+        await this.#setReplayCount(ctx, count + 1);
         return "new";
     }
 
@@ -901,18 +941,18 @@ export class InboxProcessor {
         )}`;
     }
 
-    async #pruneReplay(processingNow: number): Promise<void> {
+    async #pruneReplay(ctx: Context, processingNow: number): Promise<void> {
         const deadline = Date.now() + REPLAY_PRUNE_BUDGET_MILLISECONDS;
         for (;;) {
-            const removed = await this.#dependencies.store.transaction(async (transaction) =>
-                this.#pruneReplayBatch(transaction, processingNow),
+            const removed = await this.#dependencies.store.tx(ctx, async (tx) =>
+                this.#pruneReplayBatch(tx, processingNow),
             );
             if (removed < REPLAY_PRUNE_BATCH_SIZE || Date.now() >= deadline) return;
         }
     }
 
-    async #pruneReplayBatch(transaction: StoreTransaction, now: number): Promise<number> {
-        const indexes = await transaction.scan(REPLAY_EXPIRY_PREFIX, {
+    async #pruneReplayBatch(ctx: Context, now: number): Promise<number> {
+        const indexes = await this.#dependencies.store.scan(ctx, REPLAY_EXPIRY_PREFIX, {
             limit: REPLAY_PRUNE_BATCH_SIZE,
         });
         let removed = 0;
@@ -931,33 +971,32 @@ export class InboxProcessor {
             const expiresAt = Number(expiryText);
             if (!Number.isSafeInteger(expiresAt) || expiresAt > now) break;
             const entryKey = `${REPLAY_ENTRY_PREFIX}${digest}`;
-            const bytes = await transaction.get(entryKey);
+            const bytes = await this.#dependencies.store.get(ctx, entryKey);
             if (bytes === undefined || this.#parseReplay(bytes).expiresAt !== expiresAt) {
                 throw new Error("Inconsistent stored delivery replay index");
             }
-            await transaction.delete(key);
-            await transaction.delete(entryKey);
+            await this.#dependencies.store.delete(ctx, key);
+            await this.#dependencies.store.delete(ctx, entryKey);
             removed += 1;
         }
         if (removed > 0) {
-            const count = await this.#replayCount(transaction);
+            const count = await this.#replayCount(ctx);
             if (count < removed) throw new Error("Invalid stored delivery replay count");
-            await this.#setReplayCount(transaction, count - removed);
+            await this.#setReplayCount(ctx, count - removed);
         }
-        await this.#pruneOverflow(transaction, now);
-        await this.#pruneTerminal(transaction, now);
+        await this.#pruneOverflow(ctx, now);
+        await this.#pruneTerminal(ctx, now);
         return removed;
     }
 
-    async #overflowContains(
-        transaction: StoreTransaction,
-        digest: Uint8Array,
-        now: number,
-    ): Promise<boolean> {
+    async #overflowContains(ctx: Context, digest: Uint8Array, now: number): Promise<boolean> {
         const epoch = Math.floor(now / REPLAY_OVERFLOW_EPOCH_MILLISECONDS);
         for (const candidate of [epoch, epoch - 1]) {
             if (candidate < 0) continue;
-            const bytes = await transaction.get(this.#overflowKey(candidate, digest[0] ?? 0));
+            const bytes = await this.#dependencies.store.get(
+                ctx,
+                this.#overflowKey(candidate, digest[0] ?? 0),
+            );
             if (bytes === undefined) continue;
             this.#validateOverflowShard(bytes);
             if (this.#overflowPositions(digest).every((position) => this.#bit(bytes, position))) {
@@ -967,26 +1006,22 @@ export class InboxProcessor {
         return false;
     }
 
-    async #addOverflow(
-        transaction: StoreTransaction,
-        digest: Uint8Array,
-        now: number,
-    ): Promise<void> {
+    async #addOverflow(ctx: Context, digest: Uint8Array, now: number): Promise<void> {
         const epoch = Math.floor(now / REPLAY_OVERFLOW_EPOCH_MILLISECONDS);
         const key = this.#overflowKey(epoch, digest[0] ?? 0);
-        const existing = await transaction.get(key);
+        const existing = await this.#dependencies.store.get(ctx, key);
         const shard = existing ?? new Uint8Array(REPLAY_OVERFLOW_SHARD_BYTES);
         this.#validateOverflowShard(shard);
         for (const position of this.#overflowPositions(digest)) {
             shard[Math.floor(position / 8)] =
                 (shard[Math.floor(position / 8)] ?? 0) | (1 << (position % 8));
         }
-        await transaction.set(key, shard);
+        await this.#dependencies.store.set(ctx, key, shard);
     }
 
-    async #pruneOverflow(transaction: StoreTransaction, now: number): Promise<void> {
+    async #pruneOverflow(ctx: Context, now: number): Promise<void> {
         const oldestRetained = Math.floor(now / REPLAY_OVERFLOW_EPOCH_MILLISECONDS) - 1;
-        const entries = await transaction.scan(REPLAY_OVERFLOW_PREFIX, {
+        const entries = await this.#dependencies.store.scan(ctx, REPLAY_OVERFLOW_PREFIX, {
             limit: REPLAY_PRUNE_BATCH_SIZE,
         });
         for (const key of entries.keys()) {
@@ -1005,7 +1040,7 @@ export class InboxProcessor {
                 throw new Error("Invalid stored delivery replay overflow epoch");
             }
             if (epoch >= oldestRetained) break;
-            await transaction.delete(key);
+            await this.#dependencies.store.delete(ctx, key);
         }
     }
 
@@ -1050,16 +1085,15 @@ export class InboxProcessor {
         }
     }
 
-    async #terminalContains(
-        transaction: StoreTransaction,
-        digest: Uint8Array,
-        now: number,
-    ): Promise<boolean> {
+    async #terminalContains(ctx: Context, digest: Uint8Array, now: number): Promise<boolean> {
         const epoch = Math.floor(now / REPLAY_OVERFLOW_EPOCH_MILLISECONDS);
         for (let offset = 0; offset < REPLAY_TERMINAL_RETAINED_EPOCHS; offset += 1) {
             const candidate = epoch - offset;
             if (candidate < 0) continue;
-            const bytes = await transaction.get(this.#terminalKey(candidate, digest[0] ?? 0));
+            const bytes = await this.#dependencies.store.get(
+                ctx,
+                this.#terminalKey(candidate, digest[0] ?? 0),
+            );
             if (bytes === undefined) continue;
             this.#validateOverflowShard(bytes);
             if (this.#overflowPositions(digest).every((position) => this.#bit(bytes, position))) {
@@ -1069,28 +1103,24 @@ export class InboxProcessor {
         return false;
     }
 
-    async #addTerminal(
-        transaction: StoreTransaction,
-        digest: Uint8Array,
-        now: number,
-    ): Promise<void> {
+    async #addTerminal(ctx: Context, digest: Uint8Array, now: number): Promise<void> {
         const epoch = Math.floor(now / REPLAY_OVERFLOW_EPOCH_MILLISECONDS);
         const key = this.#terminalKey(epoch, digest[0] ?? 0);
-        const existing = await transaction.get(key);
+        const existing = await this.#dependencies.store.get(ctx, key);
         const shard = existing ?? new Uint8Array(REPLAY_OVERFLOW_SHARD_BYTES);
         this.#validateOverflowShard(shard);
         for (const position of this.#overflowPositions(digest)) {
             shard[Math.floor(position / 8)] =
                 (shard[Math.floor(position / 8)] ?? 0) | (1 << (position % 8));
         }
-        await transaction.set(key, shard);
+        await this.#dependencies.store.set(ctx, key, shard);
     }
 
-    async #pruneTerminal(transaction: StoreTransaction, now: number): Promise<void> {
+    async #pruneTerminal(ctx: Context, now: number): Promise<void> {
         const oldestRetained =
             Math.floor(now / REPLAY_OVERFLOW_EPOCH_MILLISECONDS) -
             (REPLAY_TERMINAL_RETAINED_EPOCHS - 1);
-        const entries = await transaction.scan(REPLAY_TERMINAL_PREFIX, {
+        const entries = await this.#dependencies.store.scan(ctx, REPLAY_TERMINAL_PREFIX, {
             limit: REPLAY_TERMINAL_SHARDS_PER_EPOCH,
         });
         for (const key of entries.keys()) {
@@ -1109,7 +1139,7 @@ export class InboxProcessor {
                 throw new Error("Invalid stored delivery terminal replay epoch");
             }
             if (epoch >= oldestRetained) break;
-            await transaction.delete(key);
+            await this.#dependencies.store.delete(ctx, key);
         }
     }
 
@@ -1128,8 +1158,8 @@ export class InboxProcessor {
             .padStart(2, "0")}`;
     }
 
-    async #replayCount(transaction: StoreTransaction): Promise<number> {
-        const bytes = await transaction.get(REPLAY_COUNT_KEY);
+    async #replayCount(ctx: Context): Promise<number> {
+        const bytes = await this.#dependencies.store.get(ctx, REPLAY_COUNT_KEY);
         if (bytes === undefined) return 0;
         const value = utf8Decode(bytes);
         if (!/^(0|[1-9]\d*)$/.test(value)) {
@@ -1142,14 +1172,14 @@ export class InboxProcessor {
         return count;
     }
 
-    async #setReplayCount(transaction: StoreTransaction, count: number): Promise<void> {
+    async #setReplayCount(ctx: Context, count: number): Promise<void> {
         if (!Number.isSafeInteger(count) || count < 0 || count > HARD_MAXIMUM_REPLAY_ENTRIES) {
             throw new Error("Invalid delivery replay count");
         }
         if (count === 0) {
-            await transaction.delete(REPLAY_COUNT_KEY);
+            await this.#dependencies.store.delete(ctx, REPLAY_COUNT_KEY);
         } else {
-            await transaction.set(REPLAY_COUNT_KEY, utf8Encode(count.toString()));
+            await this.#dependencies.store.set(ctx, REPLAY_COUNT_KEY, utf8Encode(count.toString()));
         }
     }
 
@@ -1209,12 +1239,13 @@ export class InboxProcessor {
         return { fingerprint, expiresAt: record.expiresAt };
     }
 
-    async #acknowledge(cursor: string, signal?: AbortSignal): Promise<void> {
+    async #acknowledge(ctx: Context, cursor: string, signal?: AbortSignal): Promise<void> {
         const outcome = await this.#dependencies.transport.acknowledge(
+            ctx,
             createSignedInboxAck(this.#dependencies.identity, cursor, this.#requestTime()),
             signal,
         );
-        const continuity = await this.continuity();
+        const continuity = await this.continuity(ctx);
         const outcomeGeneration =
             outcome.generation ?? continuity?.generation ?? new Uint8Array(32);
         const outcomeSequence = outcome.sequence ?? continuity?.sequence ?? 0;

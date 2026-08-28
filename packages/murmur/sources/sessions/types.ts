@@ -1,3 +1,5 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import type { InboxSyncResult } from "../delivery/index.js";
 import type {
     MurmurDeviceAdded,
@@ -104,33 +106,43 @@ export interface MurmurSyncOptions {
     /** Stops the persistent loop when aborted. Without it, sync runs until a fatal error. */
     readonly abort?: AbortSignal;
     /** Runs after one SSE connection completes its HTTP handshake. */
-    readonly onConnected?: () => void | Promise<void>;
+    readonly onConnected?: (ctx: Context) => void | Promise<void>;
     /** Runs when that connection closes, before reconnect or final shutdown. */
-    readonly onDisconnected?: (error?: unknown) => void | Promise<void>;
+    readonly onDisconnected?: (ctx: Context, error?: unknown) => void | Promise<void>;
     /**
      * Receives the complete durable session snapshot after inbox continuity loss.
      *
      * Throwing leaves the reset pending and retries this same event. Resolving
      * authorizes Murmur's one-time technical-state purge.
      */
-    readonly onReset?: (reset: MurmurResetEvent) => void | Promise<void>;
+    readonly onReset?: (ctx: Context, reset: MurmurResetEvent) => void | Promise<void>;
     /**
      * Runs for one ordered application-update batch.
      *
      * Murmur commits the whole batch after this hook resolves. Throwing or
      * omitting the hook leaves updates pending.
      */
-    readonly onUpdates?: (updates: readonly MurmurUpdate[]) => void | Promise<void>;
+    readonly onUpdates?: (ctx: Context, updates: readonly MurmurUpdate[]) => void | Promise<void>;
     /** Runs when a device of this account is durably authorized. */
-    readonly onDeviceAdded?: (devices: readonly MurmurDeviceAdded[]) => void | Promise<void>;
+    readonly onDeviceAdded?: (
+        ctx: Context,
+        devices: readonly MurmurDeviceAdded[],
+    ) => void | Promise<void>;
     /** Runs when a device of this account is durably revoked. */
-    readonly onDeviceRevoked?: (devices: readonly MurmurDeviceRevoked[]) => void | Promise<void>;
+    readonly onDeviceRevoked?: (
+        ctx: Context,
+        devices: readonly MurmurDeviceRevoked[],
+    ) => void | Promise<void>;
     /** Runs with the refreshed owner roster after a connected relay reports a change. */
     readonly onDevicesChanged?: (
+        ctx: Context,
         devices: readonly MurmurDeviceRosterEntry[],
     ) => void | Promise<void>;
     /** Reports sibling devices silent for six months; revocation remains application-directed. */
-    readonly onDeviceDormant?: (devices: readonly MurmurDormantDevice[]) => void | Promise<void>;
+    readonly onDeviceDormant?: (
+        ctx: Context,
+        devices: readonly MurmurDormantDevice[],
+    ) => void | Promise<void>;
 }
 
 /** Bounded session-list query. */

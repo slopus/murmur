@@ -1,4 +1,6 @@
-import type { StoreTransaction, MurmurStore } from "../../storage/index.js";
+import type { Context } from "@steve.kite/stdlib";
+
+import type { MurmurStore } from "../../storage/index.js";
 import {
     canonicalJsonBytes,
     decodeBase64Url,
@@ -105,17 +107,21 @@ function decodeEvent(value: Uint8Array): AccountEventRecord {
 
 /** Durably record an own-account roster lifecycle event idempotently. */
 export async function recordAccountEvent(
-    transaction: StoreTransaction,
+    ctx: Context,
+    store: MurmurStore,
     record: AccountEventRecord,
 ): Promise<void> {
-    const page = await transaction.scan(ACCOUNT_EVENT_PREFIX, { limit: MAXIMUM_ACCOUNT_EVENTS });
+    const page = await store.scan(ctx, ACCOUNT_EVENT_PREFIX, { limit: MAXIMUM_ACCOUNT_EVENTS });
     if (page.size >= MAXIMUM_ACCOUNT_EVENTS) throw new Error("Account event capacity exceeded");
-    await transaction.set(eventKey(record.id, record.account, record.device), encodeEvent(record));
+    await store.set(ctx, eventKey(record.id, record.account, record.device), encodeEvent(record));
 }
 
 /** Read one bounded immutable account lifecycle batch. */
-export async function prepareAccountEvents(store: MurmurStore): Promise<PreparedAccountEvents> {
-    const page = await store.scan(ACCOUNT_EVENT_PREFIX, { limit: MAXIMUM_ACCOUNT_EVENTS });
+export async function prepareAccountEvents(
+    ctx: Context,
+    store: MurmurStore,
+): Promise<PreparedAccountEvents> {
+    const page = await store.scan(ctx, ACCOUNT_EVENT_PREFIX, { limit: MAXIMUM_ACCOUNT_EVENTS });
     const keys: string[] = [];
     const added: MurmurDeviceAdded[] = [];
     const revoked: MurmurDeviceRevoked[] = [];
@@ -143,10 +149,11 @@ export async function prepareAccountEvents(store: MurmurStore): Promise<Prepared
 
 /** Delete account events only after every lifecycle callback resolves. */
 export async function deletePreparedAccountEvents(
-    transaction: StoreTransaction,
+    ctx: Context,
+    store: MurmurStore,
     prepared: PreparedAccountEvents,
 ): Promise<void> {
-    for (const key of prepared.keys) await transaction.delete(key);
+    for (const key of prepared.keys) await store.delete(ctx, key);
 }
 
 function peerRosterKey(account: Uint8Array): string {
@@ -185,7 +192,8 @@ function encodeConvergence(
 }
 
 async function queueConvergence(
-    transaction: StoreTransaction,
+    ctx: Context,
+    store: MurmurStore,
     account: Uint8Array,
     device: Uint8Array,
     change: AccountConvergenceJob["change"],
@@ -193,13 +201,14 @@ async function queueConvergence(
     keyPackage?: Uint8Array,
     dependsOn?: string,
 ): Promise<void> {
-    const page = await transaction.scan(ACCOUNT_CONVERGENCE_PREFIX, {
+    const page = await store.scan(ctx, ACCOUNT_CONVERGENCE_PREFIX, {
         limit: MAXIMUM_CONVERGENCE_JOBS,
     });
     if (page.size >= MAXIMUM_CONVERGENCE_JOBS) {
         throw new Error("Account convergence capacity exceeded");
     }
-    await transaction.set(
+    await store.set(
+        ctx,
         convergenceKey(account, device, change),
         encodeConvergence(account, device, change, rosterRevision, keyPackage, dependsOn),
     );
@@ -220,21 +229,22 @@ function acceptsRoster(
 
 /** Apply one relay-authenticated current roster and queue its automatic membership work. */
 export async function observeDeviceRoster(
-    transaction: StoreTransaction,
+    ctx: Context,
+    store: MurmurStore,
     ownAccount: Uint8Array,
     eventId: string,
     rosterBytes: Uint8Array,
 ): Promise<void> {
     const candidate = parseDeviceRoster(rosterBytes);
     const key = rosterKey(candidate.accountKey, ownAccount);
-    const stored = await transaction.get(key);
+    const stored = await store.get(ctx, key);
     let current: MurmurDeviceRoster | undefined;
     try {
         if (stored !== undefined) current = parseDeviceRoster(stored);
         const accepted = acceptsRoster(current, candidate);
         const same = current !== undefined && candidate.revision === current.revision;
         if (!accepted && !same) return;
-        if (accepted) await transaction.set(key, serializeDeviceRoster(candidate));
+        if (accepted) await store.set(ctx, key, serializeDeviceRoster(candidate));
         const before = activeDevices(current);
         const after = activeDevices(candidate);
         const changes: { device: Uint8Array; change: "added" | "revoked" }[] = [];
@@ -261,7 +271,8 @@ export async function observeDeviceRoster(
             )?.keyPackage;
             if (keyPackage !== undefined) {
                 await queueConvergence(
-                    transaction,
+                    ctx,
+                    store,
                     candidate.accountKey,
                     device,
                     "reset_add",
@@ -270,7 +281,7 @@ export async function observeDeviceRoster(
                 );
             }
             if (equalBytes(candidate.accountKey, ownAccount)) {
-                await recordAccountEvent(transaction, {
+                await recordAccountEvent(ctx, store, {
                     version: 1,
                     scope: "own",
                     type: "reset",
@@ -291,7 +302,8 @@ export async function observeDeviceRoster(
                     : undefined;
             if (change.change === "revoked" || keyPackage !== undefined) {
                 await queueConvergence(
-                    transaction,
+                    ctx,
+                    store,
                     candidate.accountKey,
                     change.device,
                     change.change,
@@ -300,7 +312,7 @@ export async function observeDeviceRoster(
                 );
             }
             if (equalBytes(candidate.accountKey, ownAccount)) {
-                await recordAccountEvent(transaction, {
+                await recordAccountEvent(ctx, store, {
                     version: 1,
                     scope: "own",
                     type: change.change,
@@ -378,9 +390,10 @@ function decodeConvergence(key: string, value: Uint8Array): AccountConvergenceJo
 
 /** Read the bounded durable MLS convergence queue. */
 export async function accountConvergenceJobs(
+    ctx: Context,
     store: MurmurStore,
 ): Promise<readonly AccountConvergenceJob[]> {
-    const page = await store.scan(ACCOUNT_CONVERGENCE_PREFIX, {
+    const page = await store.scan(ctx, ACCOUNT_CONVERGENCE_PREFIX, {
         limit: MAXIMUM_CONVERGENCE_JOBS,
     });
     return [...page].map(([key, bytes]) => {
@@ -393,9 +406,13 @@ export async function accountConvergenceJobs(
 }
 
 /** Delete one completed convergence job by its exact prepared key. */
-export async function deleteAccountConvergenceJob(store: MurmurStore, key: string): Promise<void> {
+export async function deleteAccountConvergenceJob(
+    ctx: Context,
+    store: MurmurStore,
+    key: string,
+): Promise<void> {
     if (!key.startsWith(ACCOUNT_CONVERGENCE_PREFIX)) {
         throw new Error("Invalid account convergence key");
     }
-    await store.delete(key);
+    await store.delete(ctx, key);
 }

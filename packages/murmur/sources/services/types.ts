@@ -1,3 +1,5 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import type { MurmurSessionDeletedEvent, MurmurUpdate } from "../sessions/types.js";
 import type { MurmurSessionPolicies } from "../sessions/types.js";
 
@@ -19,10 +21,13 @@ export interface MurmurServiceSessionDescriptor {
  * `onSessionDeleted` when supplied.
  */
 export interface MurmurService {
-    onNewSession(descriptor: MurmurServiceSessionDescriptor): boolean | Promise<boolean>;
-    onUpdate(update: MurmurUpdate): void | Promise<void>;
+    onNewSession(
+        ctx: Context,
+        descriptor: MurmurServiceSessionDescriptor,
+    ): boolean | Promise<boolean>;
+    onUpdate(ctx: Context, update: MurmurUpdate): void | Promise<void>;
     /** Receives one final durable event after an owner deletes a claimed session. */
-    onSessionDeleted?(event: MurmurSessionDeletedEvent): void | Promise<void>;
+    onSessionDeleted?(ctx: Context, event: MurmurSessionDeletedEvent): void | Promise<void>;
 }
 
 /** One service and the explicit stable identifier used for durable routing. */

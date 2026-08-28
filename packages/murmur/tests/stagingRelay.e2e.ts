@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import { createRelaySessionToken } from "@slopus/murmur-relay";
 import { afterAll, describe, expect, test } from "vitest";
 import {
@@ -19,6 +20,8 @@ import {
     utf8Encode,
     zeroBytes,
 } from "../sources/utils/index.js";
+
+const ctx = createRootContext().named("test");
 
 const STAGING_ORIGIN = "https://murmur-relay-staging.bulka-llc.workers.dev";
 const STAGING_ENDPOINT = "wss://murmur-relay-staging.bulka-llc.workers.dev/v2/connect";
@@ -42,7 +45,7 @@ function sessionProvider(
     deviceOverride?: Uint8Array,
 ): RelaySessionProvider {
     return {
-        issue(request: SignedRelaySessionRequest): Promise<RelaySessionTicket> {
+        issue(_ctx, request: SignedRelaySessionRequest): Promise<RelaySessionTicket> {
             const issuedAt = Date.now();
             const expiresAt = issuedAt + TICKET_TTL_MILLISECONDS;
             const device = deviceOverride ?? request.device;
@@ -154,19 +157,20 @@ describe("deployed Cloudflare staging relay", () => {
             );
 
             stage = "publish first delivery";
-            const firstOutcome = await aliceTransport.publish(first);
+            const firstOutcome = await aliceTransport.publish(ctx, first);
             stage = "deduplicate first delivery";
-            await expect(aliceTransport.publish(first)).resolves.toEqual({
+            await expect(aliceTransport.publish(ctx, first)).resolves.toEqual({
                 eventId: firstOutcome.eventId,
                 duplicate: true,
             });
             stage = "publish second delivery";
-            const secondOutcome = await aliceTransport.publish(second);
+            const secondOutcome = await aliceTransport.publish(ctx, second);
             expect(firstOutcome.eventId < secondOutcome.eventId).toBe(true);
             latestEventId = secondOutcome.eventId;
 
             stage = "read Bob's multicast inbox";
             const bobPage = await bobTransport.read(
+                ctx,
                 createSignedInboxRead(bob, { createdAt: Date.now(), limit: 10 }),
             );
             expect(bobPage.deliveries.map((delivery) => delivery.eventId)).toEqual([
@@ -178,6 +182,7 @@ describe("deployed Cloudflare staging relay", () => {
             ).toEqual(["staging-first", "staging-second"]);
             stage = "read Alice's multicast inbox";
             const alicePage = await aliceTransport.read(
+                ctx,
                 createSignedInboxRead(alice, { createdAt: Date.now(), limit: 10 }),
             );
             expect(alicePage.deliveries.map((delivery) => delivery.eventId)).toEqual([
@@ -191,7 +196,7 @@ describe("deployed Cloudflare staging relay", () => {
                 { requestTimeoutMilliseconds: REQUEST_TIMEOUT_MILLISECONDS },
             );
             stage = "reject a misbound device ticket";
-            await expect(misboundTransport.publish(second)).rejects.toMatchObject({
+            await expect(misboundTransport.publish(ctx, second)).rejects.toMatchObject({
                 status: 403,
                 code: "forbidden",
             });
@@ -199,12 +204,14 @@ describe("deployed Cloudflare staging relay", () => {
             stage = "acknowledge Bob's initial inbox";
             await expect(
                 bobTransport.acknowledge(
+                    ctx,
                     createSignedInboxAck(bob, secondOutcome.eventId, Date.now()),
                 ),
             ).resolves.toMatchObject({ removed: 2, sequence: 2 });
             stage = "acknowledge Alice's initial inbox";
             await expect(
                 aliceTransport.acknowledge(
+                    ctx,
                     createSignedInboxAck(alice, secondOutcome.eventId, Date.now()),
                 ),
             ).resolves.toMatchObject({ removed: 2, sequence: 2 });
@@ -217,6 +224,7 @@ describe("deployed Cloudflare staging relay", () => {
                 rejectConnection = reject;
             });
             const stream = bobTransport.stream(
+                ctx,
                 createSignedInboxRead(bob, {
                     after: secondOutcome.eventId,
                     createdAt: Date.now(),
@@ -224,7 +232,7 @@ describe("deployed Cloudflare staging relay", () => {
                     waitMilliseconds: 0,
                 }),
                 streamAbort.signal,
-                { onConnected: () => markConnected?.() },
+                { onConnected: (_ctx) => markConnected?.() },
             );
             // The stream carries continuity updates alongside deliveries, so pull
             // until the delivery frame itself arrives.
@@ -249,7 +257,7 @@ describe("deployed Cloudflare staging relay", () => {
                 },
             );
             stage = "publish to Bob's connected stream";
-            const thirdOutcome = await aliceTransport.publish(third);
+            const thirdOutcome = await aliceTransport.publish(ctx, third);
             latestEventId = thirdOutcome.eventId;
             stage = "receive Bob's streamed delivery";
             const streamed = await within(nextDelivery, REQUEST_TIMEOUT_MILLISECONDS);
@@ -262,6 +270,7 @@ describe("deployed Cloudflare staging relay", () => {
             stage = "read Bob's unacknowledged delivery after reconnect";
             const reconnectedBob = transport(bob, secret, principal);
             const redelivered = await reconnectedBob.read(
+                ctx,
                 createSignedInboxRead(bob, {
                     after: secondOutcome.eventId,
                     createdAt: Date.now(),
@@ -274,14 +283,17 @@ describe("deployed Cloudflare staging relay", () => {
 
             stage = "acknowledge Bob's reconnected inbox";
             await bobTransport.acknowledge(
+                ctx,
                 createSignedInboxAck(bob, thirdOutcome.eventId, Date.now()),
             );
             stage = "acknowledge Alice's streamed delivery";
             await aliceTransport.acknowledge(
+                ctx,
                 createSignedInboxAck(alice, thirdOutcome.eventId, Date.now()),
             );
             stage = "verify Bob's acknowledged inbox is empty";
             const empty = await reconnectedBob.read(
+                ctx,
                 createSignedInboxRead(bob, {
                     after: thirdOutcome.eventId,
                     createdAt: Date.now(),
@@ -295,8 +307,12 @@ describe("deployed Cloudflare staging relay", () => {
         } finally {
             if (latestEventId !== undefined) {
                 await Promise.allSettled([
-                    bobTransport.acknowledge(createSignedInboxAck(bob, latestEventId, Date.now())),
+                    bobTransport.acknowledge(
+                        ctx,
+                        createSignedInboxAck(bob, latestEventId, Date.now()),
+                    ),
                     aliceTransport.acknowledge(
+                        ctx,
                         createSignedInboxAck(alice, latestEventId, Date.now()),
                     ),
                 ]);

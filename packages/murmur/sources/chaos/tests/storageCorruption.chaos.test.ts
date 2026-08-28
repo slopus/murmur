@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import { sha256 } from "@noble/hashes/sha2";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
@@ -16,7 +17,6 @@ import {
     MemoryMurmurStore,
     type MurmurStore,
     type StoreScanOptions,
-    type StoreTransaction,
 } from "../../storage/index.js";
 import { MurmurClient, type MurmurUpdate } from "../../sessions/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
@@ -26,6 +26,8 @@ import {
     SeededRandom,
     settleChaos,
 } from "../index.js";
+
+const ctx = createRootContext().named("test");
 
 const NOW = 1_700_000_000_000;
 const IDENTITY_KEY = "murmur/identity/root";
@@ -130,33 +132,32 @@ class InspectableStoreFixture implements MurmurStore {
         this.#openClients -= 1;
     }
 
-    async get(key: string): Promise<Uint8Array | undefined> {
-        return this.#delegate.get(key);
+    async get(ctx: Context, key: string): Promise<Uint8Array | undefined> {
+        return this.#delegate.get(ctx, key);
     }
 
-    async set(key: string, value: Uint8Array): Promise<void> {
-        await this.#delegate.set(key, value);
+    async set(ctx: Context, key: string, value: Uint8Array): Promise<void> {
+        await this.#delegate.set(ctx, key, value);
     }
 
-    async delete(key: string): Promise<void> {
-        await this.#delegate.delete(key);
+    async delete(ctx: Context, key: string): Promise<void> {
+        await this.#delegate.delete(ctx, key);
     }
 
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#delegate.list(prefix);
+    async list(ctx: Context, prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#delegate.list(ctx, prefix);
     }
 
     async scan(
+        ctx: Context,
         prefix: string,
         options: StoreScanOptions,
     ): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#delegate.scan(prefix, options);
+        return this.#delegate.scan(ctx, prefix, options);
     }
 
-    async transaction<Result>(
-        operation: (transaction: StoreTransaction) => Promise<Result>,
-    ): Promise<Result> {
-        return this.#delegate.transaction(operation);
+    async tx<Result>(ctx: Context, operation: (ctx: Context) => Promise<Result>): Promise<Result> {
+        return this.#delegate.tx(ctx, operation);
     }
 
     async snapshotExact(
@@ -174,13 +175,13 @@ class InspectableStoreFixture implements MurmurStore {
 
     async deleteExact(key: string): Promise<void> {
         const before = await this.#beforeMutation(key, "delete");
-        await this.#delegate.delete(key);
+        await this.#delegate.delete(ctx, key);
         this.#trace.push(before);
     }
 
     async replaceExact(key: string, value: Uint8Array): Promise<void> {
         const before = await this.#beforeMutation(key, "replace");
-        await this.#delegate.set(key, value);
+        await this.#delegate.set(ctx, key, value);
         this.#trace.push(before);
     }
 
@@ -195,7 +196,7 @@ class InspectableStoreFixture implements MurmurStore {
             }
             const before = this.#metadata(key, bytes, "flip", offset);
             bytes[offset] = bytes[offset]! ^ xor;
-            await this.#delegate.set(key, bytes);
+            await this.#delegate.set(ctx, key, bytes);
             this.#trace.push(before);
         } finally {
             zeroBytes(bytes);
@@ -209,7 +210,7 @@ class InspectableStoreFixture implements MurmurStore {
                 throw new Error("Exact truncation must shorten the selected value");
             }
             const before = this.#metadata(key, bytes, "truncate", length);
-            await this.#delegate.set(key, bytes.slice(0, length));
+            await this.#delegate.set(ctx, key, bytes.slice(0, length));
             this.#trace.push(before);
         } finally {
             zeroBytes(bytes);
@@ -226,7 +227,7 @@ class InspectableStoreFixture implements MurmurStore {
             const appended = new Uint8Array(bytes.length + 1);
             appended.set(bytes);
             appended[bytes.length] = byte;
-            await this.#delegate.set(key, appended);
+            await this.#delegate.set(ctx, key, appended);
             zeroBytes(appended);
             this.#trace.push(before);
         } finally {
@@ -238,7 +239,7 @@ class InspectableStoreFixture implements MurmurStore {
         this.#assertMutationAllowed(key);
         const preimage = this.#preimages.get(key);
         if (preimage === undefined) throw new Error("No exact-key pre-corruption copy exists");
-        await this.#delegate.set(key, preimage);
+        await this.#delegate.set(ctx, key, preimage);
     }
 
     async #beforeMutation(
@@ -261,7 +262,7 @@ class InspectableStoreFixture implements MurmurStore {
     }
 
     async #required(key: string): Promise<Uint8Array> {
-        const bytes = await this.#delegate.get(key);
+        const bytes = await this.#delegate.get(ctx, key);
         if (bytes === undefined) throw new Error(`Exact corruption target does not exist: ${key}`);
         return bytes;
     }
@@ -297,47 +298,6 @@ class InspectableStoreFixture implements MurmurStore {
     }
 }
 
-class CapacityStoreView implements StoreTransaction {
-    readonly #delegate: StoreTransaction;
-    readonly #beforeSet: (
-        transaction: StoreTransaction,
-        key: string,
-        value: Uint8Array,
-    ) => Promise<void>;
-
-    constructor(
-        delegate: StoreTransaction,
-        beforeSet: (transaction: StoreTransaction, key: string, value: Uint8Array) => Promise<void>,
-    ) {
-        this.#delegate = delegate;
-        this.#beforeSet = beforeSet;
-    }
-
-    async get(key: string): Promise<Uint8Array | undefined> {
-        return this.#delegate.get(key);
-    }
-
-    async set(key: string, value: Uint8Array): Promise<void> {
-        await this.#beforeSet(this.#delegate, key, value);
-        await this.#delegate.set(key, value);
-    }
-
-    async delete(key: string): Promise<void> {
-        await this.#delegate.delete(key);
-    }
-
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#delegate.list(prefix);
-    }
-
-    async scan(
-        prefix: string,
-        options: StoreScanOptions,
-    ): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#delegate.scan(prefix, options);
-    }
-}
-
 /** Capacity delegate that preserves transaction rollback and never evicts. */
 class CapacityMurmurStore implements MurmurStore {
     readonly #delegate: MurmurStore;
@@ -364,45 +324,38 @@ class CapacityMurmurStore implements MurmurStore {
         this.#enabled = false;
     }
 
-    async get(key: string): Promise<Uint8Array | undefined> {
-        return this.#delegate.get(key);
+    async get(ctx: Context, key: string): Promise<Uint8Array | undefined> {
+        return this.#delegate.get(ctx, key);
     }
 
-    async set(key: string, value: Uint8Array): Promise<void> {
-        await this.#delegate.transaction(async (transaction) => {
-            const view = this.#view(transaction);
-            await view.set(key, value);
+    async set(ctx: Context, key: string, value: Uint8Array): Promise<void> {
+        await this.#delegate.tx(ctx, async (transaction) => {
+            await this.#beforeSet(transaction, key, value);
+            await this.#delegate.set(transaction, key, value);
         });
     }
 
-    async delete(key: string): Promise<void> {
-        await this.#delegate.delete(key);
+    async delete(ctx: Context, key: string): Promise<void> {
+        await this.#delegate.delete(ctx, key);
     }
 
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#delegate.list(prefix);
+    async list(ctx: Context, prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#delegate.list(ctx, prefix);
     }
 
     async scan(
+        ctx: Context,
         prefix: string,
         options: StoreScanOptions,
     ): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#delegate.scan(prefix, options);
+        return this.#delegate.scan(ctx, prefix, options);
     }
 
-    async transaction<Result>(
-        operation: (transaction: StoreTransaction) => Promise<Result>,
-    ): Promise<Result> {
-        return this.#delegate.transaction((transaction) => operation(this.#view(transaction)));
+    async tx<Result>(ctx: Context, operation: (ctx: Context) => Promise<Result>): Promise<Result> {
+        return this.#delegate.tx(ctx, operation);
     }
 
-    #view(transaction: StoreTransaction): StoreTransaction {
-        return new CapacityStoreView(transaction, (candidate, key, value) =>
-            this.#beforeSet(candidate, key, value),
-        );
-    }
-
-    async #beforeSet(transaction: StoreTransaction, key: string, value: Uint8Array): Promise<void> {
+    async #beforeSet(transaction: Context, key: string, value: Uint8Array): Promise<void> {
         this.#writeOrdinal += 1;
         if (!this.#enabled) return;
         if (this.#policy.failWriteOrdinals?.includes(this.#writeOrdinal) === true) {
@@ -415,7 +368,9 @@ class CapacityMurmurStore implements MurmurStore {
             return;
         }
 
-        const values = await transaction.scan("", { limit: MAXIMUM_STORE_SCAN_ITEMS });
+        const values = await this.#delegate.scan(transaction, "", {
+            limit: MAXIMUM_STORE_SCAN_ITEMS,
+        });
         try {
             const existing = values.get(key);
             const keys = values.size + (existing === undefined ? 1 : 0);
@@ -436,11 +391,11 @@ class CapacityMurmurStore implements MurmurStore {
 }
 
 class OfflineTransport implements DeliveryTransport {
-    async publish(_delivery: SignedDelivery): Promise<DeliveryPublishOutcome> {
+    async publish(_ctx: Context, _delivery: SignedDelivery): Promise<DeliveryPublishOutcome> {
         throw new Error("Offline test transport does not publish");
     }
 
-    async read(_request: SignedInboxRead): Promise<InboxPage> {
+    async read(_ctx: Context, _request: SignedInboxRead): Promise<InboxPage> {
         return {
             deliveries: [],
             head: null,
@@ -449,7 +404,10 @@ class OfflineTransport implements DeliveryTransport {
         };
     }
 
-    async acknowledge(_request: SignedInboxAck): Promise<{ readonly removed: number }> {
+    async acknowledge(
+        _ctx: Context,
+        _request: SignedInboxAck,
+    ): Promise<{ readonly removed: number }> {
         return { removed: 0 };
     }
 }
@@ -459,11 +417,11 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "storage-corruption-chaos",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 async function relayClient(relay: RelayService, store: MurmurStore): Promise<MurmurClient> {
-    return MurmurClient.open({
+    return MurmurClient.open(ctx, {
         transport: new HttpDeliveryTransport("https://relay.test", { fetch: relayFetch(relay) }),
         store,
         now: () => NOW,
@@ -471,15 +429,16 @@ async function relayClient(relay: RelayService, store: MurmurStore): Promise<Mur
 }
 
 async function activate(client: MurmurClient, sessionId: Uint8Array): Promise<void> {
-    await client.activateSession(sessionId);
+    await client.activateSession(ctx, sessionId);
 }
 
 async function consume(client: MurmurClient, received: string[]): Promise<number> {
     let count = 0;
     await client.synchronize(
+        ctx,
         { waitMilliseconds: 0 },
         {
-            onUpdates: async (updates: readonly MurmurUpdate[]) => {
+            onUpdates: async (_ctx, updates: readonly MurmurUpdate[]) => {
                 for (const update of updates) received.push(utf8Decode(update.bytes));
                 count += updates.length;
             },
@@ -492,8 +451,8 @@ async function setRecords(
     store: MurmurStore,
     records: readonly Pick<RecordFixture, "key" | "bytes">[],
 ): Promise<void> {
-    await store.transaction(async (transaction) => {
-        for (const fixture of records) await transaction.set(fixture.key, fixture.bytes);
+    await store.tx(ctx, async (transaction) => {
+        for (const fixture of records) await store.set(transaction, fixture.key, fixture.bytes);
     });
 }
 
@@ -505,7 +464,7 @@ async function scanKeys(
     const keys: string[] = [];
     let after: string | undefined;
     for (;;) {
-        const page = await store.scan(prefix, {
+        const page = await store.scan(ctx, prefix, {
             ...(after === undefined ? {} : { after }),
             limit,
         });
@@ -522,15 +481,15 @@ async function cloneMemoryStore(source: MurmurStore): Promise<MemoryMurmurStore>
     const target = new MemoryMurmurStore();
     let after: string | undefined;
     for (;;) {
-        const page = await source.scan("", {
+        const page = await source.scan(ctx, "", {
             ...(after === undefined ? {} : { after }),
             limit: NORMAL_SCAN_LIMIT,
         });
         try {
-            await target.transaction(async (transaction) => {
+            await target.tx(ctx, async (transaction) => {
                 for (const [key, value] of page) {
                     after = key;
-                    await transaction.set(key, value);
+                    await target.set(transaction, key, value);
                 }
             });
         } finally {
@@ -542,10 +501,10 @@ async function cloneMemoryStore(source: MurmurStore): Promise<MemoryMurmurStore>
 
 async function copyDeliveryProgress(source: MurmurStore, target: MurmurStore): Promise<void> {
     for (const key of DELIVERY_STATE_KEYS) {
-        const value = await source.get(key);
+        const value = await source.get(ctx, key);
         try {
-            if (value === undefined) await target.delete(key);
-            else await target.set(key, value);
+            if (value === undefined) await target.delete(ctx, key);
+            else await target.set(ctx, key, value);
         } finally {
             if (value !== undefined) zeroBytes(value);
         }
@@ -553,7 +512,7 @@ async function copyDeliveryProgress(source: MurmurStore, target: MurmurStore): P
 }
 
 async function storeFingerprint(store: MurmurStore): Promise<string> {
-    const values = await store.scan("", { limit: MAXIMUM_STORE_SCAN_ITEMS });
+    const values = await store.scan(ctx, "", { limit: MAXIMUM_STORE_SCAN_ITEMS });
     try {
         return JSON.stringify(
             [...values].map(([key, value]) => ({
@@ -568,7 +527,7 @@ async function storeFingerprint(store: MurmurStore): Promise<string> {
 }
 
 async function requiredText(store: MurmurStore, key: string): Promise<string> {
-    const bytes = await store.get(key);
+    const bytes = await store.get(ctx, key);
     if (bytes === undefined) throw new Error(`Required store key is missing: ${key}`);
     try {
         return utf8Decode(bytes);
@@ -578,7 +537,7 @@ async function requiredText(store: MurmurStore, key: string): Promise<string> {
 }
 
 async function prefixCount(store: MurmurStore, prefix: string): Promise<number> {
-    const values = await store.scan(prefix, { limit: MAXIMUM_STORE_SCAN_ITEMS });
+    const values = await store.scan(ctx, prefix, { limit: MAXIMUM_STORE_SCAN_ITEMS });
     try {
         return values.size;
     } finally {
@@ -610,27 +569,27 @@ async function runLiveIntentCapacity(
     const bob = await relayClient(relay, bobStore);
     const carol = await relayClient(relay, carolStore);
     try {
-        const session = await alice.createSession({
+        const session = await alice.createSession(ctx, {
             descriptor: utf8Encode(`ST-02L ${label}`),
-            members: [await bob.createKeyPackage()],
+            members: [await bob.createKeyPackage(ctx)],
         });
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
-        await bob.activateSession(session.id);
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.activateSession(ctx, session.id);
         for (let round = 0; round < 4; round += 1) {
             if ((await prefixCount(aliceDelegate, OUTBOX_PREFIX)) === 0) break;
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
         }
         expect(await prefixCount(aliceDelegate, OUTBOX_PREFIX)).toBe(0);
-        const carolKeyPackage = await carol.createKeyPackage();
+        const carolKeyPackage = await carol.createKeyPackage(ctx);
 
         const before = await storeFingerprint(aliceDelegate);
         constrained.constrain(
             failedWriteOrdinal === 0 ? {} : { failWriteOrdinals: [failedWriteOrdinal] },
         );
         if (failedWriteOrdinal === 0) {
-            await alice.addMember(session.id, carolKeyPackage);
+            await alice.addMember(ctx, session.id, carolKeyPackage);
             return Object.freeze({
                 seed,
                 failedWriteOrdinal,
@@ -642,26 +601,27 @@ async function runLiveIntentCapacity(
             });
         }
 
-        await expect(alice.addMember(session.id, carolKeyPackage)).rejects.toThrow(
+        await expect(alice.addMember(ctx, session.id, carolKeyPackage)).rejects.toThrow(
             `write ${failedWriteOrdinal}`,
         );
         const observedWrites = constrained.writeOrdinal;
         const after = await storeFingerprint(aliceDelegate);
         const partialIntents = await prefixCount(aliceDelegate, "murmur/session-intents/");
         const partialOutboxes = await prefixCount(aliceDelegate, OUTBOX_PREFIX);
-        expect(await alice.session(session.id)).toMatchObject({ status: "active" });
+        expect(await alice.session(ctx, session.id)).toMatchObject({ status: "active" });
 
         constrained.restoreCapacity();
-        await alice.addMember(session.id, carolKeyPackage);
+        await alice.addMember(ctx, session.id, carolKeyPackage);
         let recoveredMembers = 0;
         for (let round = 0; round < 6; round += 1) {
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            recoveredMembers = (await alice.session(session.id))?.members.length ?? 0;
-            if (recoveredMembers === 3 && (await carol.session(session.id)) !== undefined) break;
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            recoveredMembers = (await alice.session(ctx, session.id))?.members.length ?? 0;
+            if (recoveredMembers === 3 && (await carol.session(ctx, session.id)) !== undefined)
+                break;
         }
-        expect(await carol.session(session.id)).toMatchObject({ status: "pending" });
+        expect(await carol.session(ctx, session.id)).toMatchObject({ status: "pending" });
 
         return Object.freeze({
             seed,
@@ -673,9 +633,9 @@ async function runLiveIntentCapacity(
             recoveredMembers,
         });
     } finally {
-        alice.close();
-        bob.close();
-        carol.close();
+        alice.close(ctx);
+        bob.close(ctx);
+        carol.close(ctx);
         await relay.close();
     }
 }
@@ -699,18 +659,18 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
     const alice = await relayClient(relay, aliceStore);
     const bob = await relayClient(relay, constrained);
     try {
-        const session = await alice.createSession({
+        const session = await alice.createSession(ctx, {
             descriptor: utf8Encode(`ST-03L ${label}`),
-            members: [await bob.createKeyPackage()],
+            members: [await bob.createKeyPackage(ctx)],
         });
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
-        await bob.activateSession(session.id);
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.activateSession(ctx, session.id);
 
         const previousCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
         const message = `capacity-replay-${label}`;
-        await alice.send(session.id, utf8Encode(message));
-        await alice.synchronize({ waitMilliseconds: 0 });
+        await alice.send(ctx, session.id, utf8Encode(message));
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
         const beforePage = await relayStore.readQueue(bob.deviceKey, previousCursor, 2, NOW, {
             maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
         });
@@ -723,9 +683,10 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
         constrained.constrain({ failPrefix: APPLICATION_UPDATE_PREFIX });
         await expect(
             bob.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: () => {
+                    onUpdates: (_ctx) => {
                         callbacks += 1;
                     },
                 },
@@ -745,9 +706,10 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
         const recovered: string[] = [];
         let recoveredId: string | undefined;
         await bob.synchronize(
+            ctx,
             { waitMilliseconds: 0 },
             {
-                onUpdates: (updates) => {
+                onUpdates: (_ctx, updates) => {
                     callbacks += 1;
                     for (const update of updates) {
                         recoveredId = update.id;
@@ -772,9 +734,9 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
         zeroBytes(acknowledgedPage.generation);
 
         const followUpMessage = `capacity-follow-up-${label}`;
-        await alice.send(session.id, utf8Encode(followUpMessage));
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
+        await alice.send(ctx, session.id, utf8Encode(followUpMessage));
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
         const followUp: string[] = [];
         await consume(bob, followUp);
 
@@ -787,8 +749,8 @@ async function runLiveInboundCapacity(seed: number): Promise<LiveCapacityResult>
             followUp: Object.freeze(followUp.slice()),
         });
     } finally {
-        alice.close();
-        bob.close();
+        alice.close(ctx);
+        bob.close(ctx);
         await relay.close();
     }
 }
@@ -813,38 +775,39 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
     const alice = await relayClient(relay, aliceStore);
     let bob = await relayClient(relay, constrained);
     try {
-        const session = await alice.createSession({
+        const session = await alice.createSession(ctx, {
             descriptor: utf8Encode(`ST-04L ${label}`),
-            members: [await bob.createKeyPackage()],
+            members: [await bob.createKeyPackage(ctx)],
         });
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
-        await bob.activateSession(session.id);
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.activateSession(ctx, session.id);
         const previousCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
 
-        await alice.send(session.id, utf8Encode(`owned-effect-${label}`));
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
+        await alice.send(ctx, session.id, utf8Encode(`owned-effect-${label}`));
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
         const queuedCursor = await requiredText(bobDelegate, DELIVERY_CURSOR_KEY);
         expect(queuedCursor).not.toBe(previousCursor);
-        const staged = await bob.session(session.id);
+        const staged = await bob.session(ctx, session.id);
         expect(staged).toMatchObject({ status: "active", bufferedEvents: 1 });
 
         const callbackIds: string[] = [];
         const commitApplicationEffect = async (id: string): Promise<void> => {
             const key = `application/ST-04L/${id}`;
-            const existing = await bobDelegate.get(key);
+            const existing = await bobDelegate.get(ctx, key);
             if (existing === undefined) {
-                await bobDelegate.set(key, utf8Encode(`committed-${label}`));
+                await bobDelegate.set(ctx, key, utf8Encode(`committed-${label}`));
             } else {
                 zeroBytes(existing);
             }
         };
         await expect(
             bob.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (updates) => {
+                    onUpdates: async (_ctx, updates) => {
                         expect(updates).toHaveLength(1);
                         const id = updates[0]!.id;
                         callbackIds.push(id);
@@ -854,7 +817,7 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
                 },
             ),
         ).rejects.toThrow("write 1");
-        const bufferedAfterFailure = (await bob.session(session.id))?.bufferedEvents;
+        const bufferedAfterFailure = (await bob.session(ctx, session.id))?.bufferedEvents;
         const acknowledgedPage = await relayStore.readQueue(bob.deviceKey, queuedCursor, 2, NOW, {
             maximumEncodedBytes: Number.MAX_SAFE_INTEGER,
         });
@@ -863,13 +826,14 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
             acknowledgedPage.acknowledgedThrough === queuedCursor;
         zeroBytes(acknowledgedPage.generation);
 
-        bob.close();
+        bob.close(ctx);
         constrained.restoreCapacity();
         bob = await relayClient(relay, constrained);
         await bob.synchronize(
+            ctx,
             { waitMilliseconds: 0 },
             {
-                onUpdates: async (updates) => {
+                onUpdates: async (_ctx, updates) => {
                     expect(updates).toHaveLength(1);
                     const id = updates[0]!.id;
                     callbackIds.push(id);
@@ -877,7 +841,7 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
                 },
             },
         );
-        const bufferedAfterRecovery = (await bob.session(session.id))?.bufferedEvents;
+        const bufferedAfterRecovery = (await bob.session(ctx, session.id))?.bufferedEvents;
         const durableEffectCount = await prefixCount(bobDelegate, "application/ST-04L/");
 
         return Object.freeze({
@@ -890,8 +854,8 @@ async function runLiveDrainCapacity(seed: number): Promise<LiveDrainResult> {
             relayAcknowledgedBeforeDrain,
         });
     } finally {
-        alice.close();
-        bob.close();
+        alice.close(ctx);
+        bob.close(ctx);
         await relay.close();
     }
 }
@@ -917,20 +881,20 @@ async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorrupti
     aliceStore.clientOpened();
     let bob = await relayClient(relay, bobStore);
     try {
-        const session = await alice.createSession({
+        const session = await alice.createSession(ctx, {
             descriptor: utf8Encode(`ST-07L ${label}`),
-            members: [await bob.createKeyPackage()],
+            members: [await bob.createKeyPackage(ctx)],
         });
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
-        await bob.activateSession(session.id);
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.activateSession(ctx, session.id);
 
-        const corruptedId = await alice.send(session.id, utf8Encode(`corrupt-${label}`));
+        const corruptedId = await alice.send(ctx, session.id, utf8Encode(`corrupt-${label}`));
         const outboxKey = `${OUTBOX_PREFIX}${corruptedId}`;
-        alice.close();
+        alice.close(ctx);
         aliceStore.clientClosed();
         aliceOpen = false;
-        bob.close();
+        bob.close(ctx);
         const original = await aliceStore.snapshotExact(outboxKey);
         const operator = random.oneIn(2) ? "flip" : "truncate";
         let offset: number;
@@ -946,19 +910,19 @@ async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorrupti
         aliceStore.clientOpened();
         aliceOpen = true;
         bob = await relayClient(relay, bobStore);
-        const corruptionOutcome = await alice.synchronize({ waitMilliseconds: 0 });
+        const corruptionOutcome = await alice.synchronize(ctx, { waitMilliseconds: 0 });
         expect(corruptionOutcome).toMatchObject({
             pendingOutboxes: 0,
             terminalPublicationFailures: 1,
         });
-        expect(await alice.session(session.id)).toMatchObject({ status: "active" });
-        await bob.synchronize({ waitMilliseconds: 0 });
+        expect(await alice.session(ctx, session.id)).toMatchObject({ status: "active" });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
         const corruptedDeliveries: string[] = [];
         await consume(bob, corruptedDeliveries);
 
-        await alice.send(session.id, utf8Encode(`recovered-${label}`));
-        await alice.synchronize({ waitMilliseconds: 0 });
-        await bob.synchronize({ waitMilliseconds: 0 });
+        await alice.send(ctx, session.id, utf8Encode(`recovered-${label}`));
+        await alice.synchronize(ctx, { waitMilliseconds: 0 });
+        await bob.synchronize(ctx, { waitMilliseconds: 0 });
         const recoveredDeliveries: string[] = [];
         await consume(bob, recoveredDeliveries);
 
@@ -973,9 +937,9 @@ async function runLiveOutboxCorruption(seed: number): Promise<LiveOutboxCorrupti
             recoveredDeliveries: Object.freeze(recoveredDeliveries.slice()),
         });
     } finally {
-        alice.close();
+        alice.close(ctx);
         if (aliceOpen) aliceStore.clientClosed();
-        bob.close();
+        bob.close(ctx);
         await relay.close();
     }
 }
@@ -995,18 +959,18 @@ async function runContention(): Promise<{
     const operations = Array.from({ length: 20 }, (_, index) =>
         (async (): Promise<void> => {
             await gate;
-            await store.transaction(async (transaction) => {
+            await store.tx(ctx, async (transaction) => {
                 const key = index < 10 ? `contention/independent/${index}` : "contention/shared";
-                const current = await transaction.get(key);
+                const current = await store.get(transaction, key);
                 const next = (current?.[0] ?? 0) + 1;
                 if (current !== undefined) zeroBytes(current);
-                await transaction.set(key, new Uint8Array([next]));
+                await store.set(transaction, key, new Uint8Array([next]));
             });
         })(),
     );
     release();
     const outcomes = await Promise.allSettled(operations);
-    const values = await delegate.scan("contention/", { limit: 32 });
+    const values = await delegate.scan(ctx, "contention/", { limit: 32 });
     try {
         return {
             statuses: outcomes.map((outcome) => outcome.status),
@@ -1045,7 +1009,7 @@ async function campaignRun(seed: number): Promise<string> {
                 if (round === 1) await fixture.restoreExact(selected.key);
             },
             snapshot: async () => {
-                const bytes = await fixture.get(selected.key);
+                const bytes = await fixture.get(ctx, selected.key);
                 if (bytes === undefined) return "missing";
                 try {
                     return digest(bytes);
@@ -1083,7 +1047,7 @@ describe("storage corruption and capacity chaos", () => {
             const delegate = new MemoryMurmurStore();
             const store = new CapacityMurmurStore(delegate, { failWriteOrdinals: [nth] });
             await expect(setRecords(store, writes)).rejects.toThrow("storage capacity failure");
-            expect(await delegate.scan("murmur/", { limit: 16 })).toEqual(new Map());
+            expect(await delegate.scan(ctx, "murmur/", { limit: 16 })).toEqual(new Map());
 
             store.restoreCapacity();
             await setRecords(store, writes);
@@ -1096,23 +1060,23 @@ describe("storage corruption and capacity chaos", () => {
         }
 
         const keyBoundDelegate = new MemoryMurmurStore();
-        await keyBoundDelegate.set("capacity/existing", new Uint8Array([1]));
+        await keyBoundDelegate.set(ctx, "capacity/existing", new Uint8Array([1]));
         const keyBound = new CapacityMurmurStore(keyBoundDelegate, { maximumKeys: 2 });
         await expect(
-            keyBound.transaction(async (transaction) => {
-                await transaction.set("capacity/a", new Uint8Array([1]));
-                await transaction.set("capacity/b", new Uint8Array([1]));
+            keyBound.tx(ctx, async (transaction) => {
+                await keyBound.set(transaction, "capacity/a", new Uint8Array([1]));
+                await keyBound.set(transaction, "capacity/b", new Uint8Array([1]));
             }),
         ).rejects.toThrow("maximum key count");
-        expect(await keyBoundDelegate.get("capacity/a")).toBeUndefined();
-        expect(await keyBoundDelegate.get("capacity/b")).toBeUndefined();
+        expect(await keyBoundDelegate.get(ctx, "capacity/a")).toBeUndefined();
+        expect(await keyBoundDelegate.get(ctx, "capacity/b")).toBeUndefined();
 
         const byteBoundDelegate = new MemoryMurmurStore();
         const byteBound = new CapacityMurmurStore(byteBoundDelegate, { maximumBytes: 3 });
-        await expect(byteBound.set("capacity/bytes", new Uint8Array(4))).rejects.toThrow(
+        await expect(byteBound.set(ctx, "capacity/bytes", new Uint8Array(4))).rejects.toThrow(
             "maximum aggregate bytes",
         );
-        expect(await byteBoundDelegate.get("capacity/bytes")).toBeUndefined();
+        expect(await byteBoundDelegate.get(ctx, "capacity/bytes")).toBeUndefined();
 
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const aliceBaseline = new MemoryMurmurStore();
@@ -1120,28 +1084,28 @@ describe("storage corruption and capacity chaos", () => {
         let alice = await relayClient(relay, aliceBaseline);
         let bob = await relayClient(relay, bobBaseline);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("capacity send ladder"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
             for (let round = 0; round < 4; round += 1) {
                 if ((await prefixCount(aliceBaseline, OUTBOX_PREFIX)) === 0) break;
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await bob.synchronize({ waitMilliseconds: 0 });
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
             }
             expect(await prefixCount(aliceBaseline, OUTBOX_PREFIX)).toBe(0);
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
 
             const calibrationDelegate = await cloneMemoryStore(aliceBaseline);
             const calibrationStore = new CapacityMurmurStore(calibrationDelegate, {});
             const calibrationClient = await relayClient(relay, calibrationStore);
-            await calibrationClient.send(session.id, utf8Encode("calibration"));
+            await calibrationClient.send(ctx, session.id, utf8Encode("calibration"));
             const sendWrites = calibrationStore.writeOrdinal;
-            calibrationClient.close();
+            calibrationClient.close(ctx);
             expect(sendWrites).toBeGreaterThan(0);
             expect(sendWrites).toBeLessThanOrEqual(20);
 
@@ -1153,33 +1117,35 @@ describe("storage corruption and capacity chaos", () => {
                 });
                 alice = await relayClient(relay, constrained);
                 bob = await relayClient(relay, bobDelegate);
-                await expect(alice.send(session.id, utf8Encode(`rejected-${nth}`))).rejects.toThrow(
-                    "storage capacity failure",
+                await expect(
+                    alice.send(ctx, session.id, utf8Encode(`rejected-${nth}`)),
+                ).rejects.toThrow("storage capacity failure");
+                expect(await aliceDelegate.scan(ctx, OUTBOX_PREFIX, { limit: 20 })).toEqual(
+                    new Map(),
                 );
-                expect(await aliceDelegate.scan(OUTBOX_PREFIX, { limit: 20 })).toEqual(new Map());
 
                 constrained.restoreCapacity();
-                await alice.send(session.id, utf8Encode(`recovered-${nth}`));
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await bob.synchronize({ waitMilliseconds: 0 });
+                await alice.send(ctx, session.id, utf8Encode(`recovered-${nth}`));
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
                 const recovered: string[] = [];
                 expect(await consume(bob, recovered)).toBe(1);
                 expect(recovered).toEqual([`recovered-${nth}`]);
 
-                await alice.send(session.id, utf8Encode(`follow-up-${nth}`));
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await bob.synchronize({ waitMilliseconds: 0 });
+                await alice.send(ctx, session.id, utf8Encode(`follow-up-${nth}`));
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
                 const followUp: string[] = [];
                 expect(await consume(bob, followUp)).toBe(1);
                 expect(followUp).toEqual([`follow-up-${nth}`]);
                 await copyDeliveryProgress(aliceDelegate, aliceBaseline);
                 await copyDeliveryProgress(bobDelegate, bobBaseline);
-                alice.close();
-                bob.close();
+                alice.close(ctx);
+                bob.close(ctx);
             }
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     }, 120_000);
@@ -1205,7 +1171,7 @@ describe("storage corruption and capacity chaos", () => {
                 await expect(setRecords(store, records)).rejects.toThrow(
                     "storage capacity failure",
                 );
-                expect(await delegate.scan("murmur/", { limit: 16 })).toEqual(new Map());
+                expect(await delegate.scan(ctx, "murmur/", { limit: 16 })).toEqual(new Map());
                 store.restoreCapacity();
                 await setRecords(store, records);
                 expect(await scanKeys(delegate, "murmur/session-intents/", 1)).toHaveLength(1);
@@ -1218,12 +1184,16 @@ describe("storage corruption and capacity chaos", () => {
             failPrefix: OUTBOX_PREFIX,
         });
         await expect(
-            prefixStore.transaction(async (transaction) => {
-                await transaction.set("murmur/session-intents/add", new Uint8Array([1]));
-                await transaction.set(`${OUTBOX_PREFIX}add`, new Uint8Array([2]));
+            prefixStore.tx(ctx, async (transaction) => {
+                await prefixStore.set(
+                    transaction,
+                    "murmur/session-intents/add",
+                    new Uint8Array([1]),
+                );
+                await prefixStore.set(transaction, `${OUTBOX_PREFIX}add`, new Uint8Array([2]));
             }),
         ).rejects.toThrow(`prefix ${OUTBOX_PREFIX}`);
-        expect(await prefixDelegate.scan("murmur/", { limit: 4 })).toEqual(new Map());
+        expect(await prefixDelegate.scan(ctx, "murmur/", { limit: 4 })).toEqual(new Map());
     });
 
     test("ST-02L real Add intent write ladder rolls back KeyPackage claims and intent state", async () => {
@@ -1255,19 +1225,27 @@ describe("storage corruption and capacity chaos", () => {
             failPrefix: APPLICATION_UPDATE_PREFIX,
         });
         await expect(
-            constrained.transaction(async (transaction) => {
-                await transaction.set(bufferKey, utf8Encode("sentinel application update"));
-                await transaction.set(eventKey, utf8Encode("session"));
+            constrained.tx(ctx, async (transaction) => {
+                await constrained.set(
+                    transaction,
+                    bufferKey,
+                    utf8Encode("sentinel application update"),
+                );
+                await constrained.set(transaction, eventKey, utf8Encode("session"));
             }),
         ).rejects.toThrow("storage capacity failure");
-        expect(await delegate.get(bufferKey)).toBeUndefined();
-        expect(await delegate.get(eventKey)).toBeUndefined();
-        expect(await delegate.get(ACK_KEY)).toBeUndefined();
+        expect(await delegate.get(ctx, bufferKey)).toBeUndefined();
+        expect(await delegate.get(ctx, eventKey)).toBeUndefined();
+        expect(await delegate.get(ctx, ACK_KEY)).toBeUndefined();
 
         constrained.restoreCapacity();
-        await constrained.transaction(async (transaction) => {
-            await transaction.set(bufferKey, utf8Encode("sentinel application update"));
-            await transaction.set(eventKey, utf8Encode("session"));
+        await constrained.tx(ctx, async (transaction) => {
+            await constrained.set(
+                transaction,
+                bufferKey,
+                utf8Encode("sentinel application update"),
+            );
+            await constrained.set(transaction, eventKey, utf8Encode("session"));
         });
 
         let callbacks = 0;
@@ -1276,15 +1254,15 @@ describe("storage corruption and capacity chaos", () => {
             failWriteOrdinals: [1],
         });
         await expect(
-            preCommitFailure.transaction(async (transaction) => {
-                await transaction.delete(bufferKey);
-                await transaction.delete(eventKey);
-                await transaction.set(`${DRAIN_PREFIX}event-1`, new Uint8Array());
-                await transaction.set(ACK_KEY, utf8Encode("event-1"));
+            preCommitFailure.tx(ctx, async (transaction) => {
+                await preCommitFailure.delete(transaction, bufferKey);
+                await preCommitFailure.delete(transaction, eventKey);
+                await preCommitFailure.set(transaction, `${DRAIN_PREFIX}event-1`, new Uint8Array());
+                await preCommitFailure.set(transaction, ACK_KEY, utf8Encode("event-1"));
             }),
         ).rejects.toThrow("storage capacity failure");
-        expect(await delegate.get(eventKey)).toBeDefined();
-        expect(await delegate.get(ACK_KEY)).toBeUndefined();
+        expect(await delegate.get(ctx, eventKey)).toBeDefined();
+        expect(await delegate.get(ctx, ACK_KEY)).toBeUndefined();
         callbacks += 1;
         expect(callbacks).toBe(2);
 
@@ -1301,16 +1279,16 @@ describe("storage corruption and capacity chaos", () => {
             schedule,
         });
         await expect(
-            lostResponse.transaction(async (transaction) => {
-                await transaction.delete(bufferKey);
-                await transaction.delete(eventKey);
-                await transaction.set(`${DRAIN_PREFIX}event-1`, new Uint8Array());
-                await transaction.set(ACK_KEY, utf8Encode("event-1"));
+            lostResponse.tx(ctx, async (transaction) => {
+                await lostResponse.delete(transaction, bufferKey);
+                await lostResponse.delete(transaction, eventKey);
+                await lostResponse.set(transaction, `${DRAIN_PREFIX}event-1`, new Uint8Array());
+                await lostResponse.set(transaction, ACK_KEY, utf8Encode("event-1"));
             }),
         ).rejects.toThrow("lost transaction response");
-        expect(await delegate.get(eventKey)).toBeUndefined();
-        expect(await delegate.get(`${DRAIN_PREFIX}event-1`)).toEqual(new Uint8Array());
-        expect(utf8Decode((await delegate.get(ACK_KEY))!)).toBe("event-1");
+        expect(await delegate.get(ctx, eventKey)).toBeUndefined();
+        expect(await delegate.get(ctx, `${DRAIN_PREFIX}event-1`)).toEqual(new Uint8Array());
+        expect(utf8Decode((await delegate.get(ctx, ACK_KEY))!)).toBe("event-1");
         expect(callbacks).toBe(2);
         schedule.assertConsumed();
     });
@@ -1351,9 +1329,10 @@ describe("storage corruption and capacity chaos", () => {
         for (const prefix of BOUNDED_PREFIXES) {
             for (const size of sizes) {
                 const store = new MemoryMurmurStore();
-                await store.transaction(async (transaction) => {
+                await store.tx(ctx, async (transaction) => {
                     for (let index = 0; index < size; index += 1) {
-                        await transaction.set(
+                        await store.set(
+                            transaction,
                             `${prefix}${index.toString().padStart(6, "0")}`,
                             new Uint8Array([index & 0xff]),
                         );
@@ -1367,22 +1346,24 @@ describe("storage corruption and capacity chaos", () => {
                 expect(await scanKeys(store, prefix, NORMAL_SCAN_LIMIT)).toEqual(expected);
                 expect(await scanKeys(store, prefix, MAXIMUM_STORE_SCAN_ITEMS)).toEqual(expected);
 
-                const before = await store.scan(prefix, { after: `${prefix}!`, limit: 1 });
+                const before = await store.scan(ctx, prefix, { after: `${prefix}!`, limit: 1 });
                 expect([...before.keys()]).toEqual(expected.slice(0, 1));
                 if (size > 0) {
                     const first = expected[0]!;
-                    const afterExact = await store.scan(prefix, { after: first, limit: 1 });
+                    const afterExact = await store.scan(ctx, prefix, { after: first, limit: 1 });
                     expect([...afterExact.keys()]).toEqual(expected.slice(1, 2));
                     const last = expected.at(-1)!;
-                    expect(await store.scan(prefix, { after: last, limit: 1 })).toEqual(new Map());
+                    expect(await store.scan(ctx, prefix, { after: last, limit: 1 })).toEqual(
+                        new Map(),
+                    );
                     const absent = `${prefix}000000~`;
-                    const afterAbsent = await store.scan(prefix, { after: absent, limit: 1 });
+                    const afterAbsent = await store.scan(ctx, prefix, { after: absent, limit: 1 });
                     expect([...afterAbsent.keys()]).toEqual(
                         expected.filter((key) => key > absent).slice(0, 1),
                     );
                 }
                 await expect(
-                    store.scan(prefix, { limit: MAXIMUM_STORE_SCAN_ITEMS + 1 }),
+                    store.scan(ctx, prefix, { limit: MAXIMUM_STORE_SCAN_ITEMS + 1 }),
                 ).rejects.toThrow("Invalid Murmur store scan");
             }
         }
@@ -1408,26 +1389,26 @@ describe("storage corruption and capacity chaos", () => {
         let bob = await relayClient(relay, bobStore);
         let carol = await relayClient(relay, carolStore);
         try {
-            const damaged = await alice.createSession({
+            const damaged = await alice.createSession(ctx, {
                 descriptor: utf8Encode("damaged chaos session"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, damaged.id);
 
-            const healthy = await alice.createSession({
+            const healthy = await alice.createSession(ctx, {
                 descriptor: utf8Encode("healthy chaos session"),
-                members: [await carol.createKeyPackage()],
+                members: [await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await carol.synchronize();
+            await alice.synchronize(ctx);
+            await carol.synchronize(ctx);
             await activate(carol, healthy.id);
 
-            alice.close();
+            alice.close(ctx);
             aliceStore.clientClosed();
-            bob.close();
-            carol.close();
+            bob.close(ctx);
+            carol.close(ctx);
             const damagedKey = `${SESSION_STATE_PREFIX}${encodeBase64Url(damaged.id)}`;
             const selected = await aliceStore.snapshotExact(damagedKey);
             await aliceStore.truncateExact(damagedKey, 3);
@@ -1442,8 +1423,8 @@ describe("storage corruption and capacity chaos", () => {
             aliceStore.clientOpened();
             bob = await relayClient(relay, bobStore);
             carol = await relayClient(relay, carolStore);
-            await alice.send(healthy.id, utf8Encode("healthy after corruption"));
-            const outcome = await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.send(ctx, healthy.id, utf8Encode("healthy after corruption"));
+            const outcome = await alice.synchronize(ctx, { waitMilliseconds: 0 });
             expect(outcome.terminalPublicationFailures).toBe(1);
             expect(outcome.issues).toEqual(
                 expect.arrayContaining([
@@ -1453,10 +1434,10 @@ describe("storage corruption and capacity chaos", () => {
                     }),
                 ]),
             );
-            expect(await alice.session(damaged.id)).toBeUndefined();
-            expect(await alice.session(healthy.id)).toMatchObject({ status: "active" });
+            expect(await alice.session(ctx, damaged.id)).toBeUndefined();
+            expect(await alice.session(ctx, healthy.id)).toMatchObject({ status: "active" });
 
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
             const received: string[] = [];
             expect(await consume(carol, received)).toBe(1);
             expect(received).toEqual(["healthy after corruption"]);
@@ -1464,10 +1445,10 @@ describe("storage corruption and capacity chaos", () => {
             expect(await consume(bob, damagedUpdates)).toBe(0);
             expect(damagedUpdates).toEqual([]);
             expect(
-                (await aliceStore.scan("murmur/session-quarantine/", { limit: 20 })).size,
+                (await aliceStore.scan(ctx, "murmur/session-quarantine/", { limit: 20 })).size,
             ).toBeLessThanOrEqual(1);
         } finally {
-            alice.close();
+            alice.close(ctx);
             if (aliceStore.trace.length > 0) {
                 try {
                     aliceStore.clientClosed();
@@ -1475,8 +1456,8 @@ describe("storage corruption and capacity chaos", () => {
                     // The mutation guard itself verifies balanced lifecycle transitions.
                 }
             }
-            bob.close();
-            carol.close();
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     }, 120_000);
@@ -1500,10 +1481,10 @@ describe("storage corruption and capacity chaos", () => {
     test("ST-08 identity corruption fails closed and traces contain metadata only", async () => {
         const fixture = new InspectableStoreFixture();
         const transport = new OfflineTransport();
-        let client = await MurmurClient.open({ store: fixture, transport, now: () => NOW });
+        let client = await MurmurClient.open(ctx, { store: fixture, transport, now: () => NOW });
         fixture.clientOpened();
         const publicIdentity = client.identity;
-        client.close();
+        client.close(ctx);
         fixture.clientClosed();
         const original = await fixture.snapshotExact(IDENTITY_KEY);
         const mutationCases: readonly ((store: InspectableStoreFixture) => Promise<void>)[] = [
@@ -1517,26 +1498,26 @@ describe("storage corruption and capacity chaos", () => {
         for (const mutate of mutationCases) {
             await fixture.restoreExact(IDENTITY_KEY);
             await mutate(fixture);
-            const corrupted = await fixture.get(IDENTITY_KEY);
+            const corrupted = await fixture.get(ctx, IDENTITY_KEY);
             await expect(
-                MurmurClient.open({ store: fixture, transport, now: () => NOW }),
+                MurmurClient.open(ctx, { store: fixture, transport, now: () => NOW }),
             ).rejects.toThrow();
-            expect(await fixture.get(IDENTITY_KEY)).toEqual(corrupted);
+            expect(await fixture.get(ctx, IDENTITY_KEY)).toEqual(corrupted);
             if (corrupted !== undefined) zeroBytes(corrupted);
         }
 
         await fixture.restoreExact(IDENTITY_KEY);
-        client = await MurmurClient.open({ store: fixture, transport, now: () => NOW });
+        client = await MurmurClient.open(ctx, { store: fixture, transport, now: () => NOW });
         fixture.clientOpened();
         expect(client.identity).toEqual(publicIdentity);
         await expect(fixture.flipExact(IDENTITY_KEY, 0)).rejects.toThrow(
             "requires every store client to be closed",
         );
-        client.close();
+        client.close(ctx);
         fixture.clientClosed();
 
         const sentinel = utf8Encode("ST-08 sentinel secret plaintext");
-        await fixture.set("murmur/chaos/secret-bearing-record", sentinel);
+        await fixture.set(ctx, "murmur/chaos/secret-bearing-record", sentinel);
         await fixture.snapshotExact("murmur/chaos/secret-bearing-record");
         await fixture.flipExact("murmur/chaos/secret-bearing-record", 1);
         const traceJson = JSON.stringify(fixture.trace);
@@ -1559,13 +1540,13 @@ describe("storage corruption and capacity chaos", () => {
             await fixture.appendExact(selected.key, 0);
             await fixture.restoreExact(selected.key);
             await fixture.deleteExact(selected.key);
-            expect(await fixture.get(selected.key)).toBeUndefined();
+            expect(await fixture.get(ctx, selected.key)).toBeUndefined();
             await fixture.restoreExact(selected.key);
             const swapped = RECORD_FIXTURES[(index + 1) % RECORD_FIXTURES.length]!;
             await fixture.replaceExact(selected.key, swapped.bytes);
-            expect(await fixture.get(selected.key)).toEqual(swapped.bytes);
+            expect(await fixture.get(ctx, selected.key)).toEqual(swapped.bytes);
             await fixture.restoreExact(selected.key);
-            const restored = await fixture.get(selected.key);
+            const restored = await fixture.get(ctx, selected.key);
             expect(restored).toBeDefined();
             expect(digest(restored!)).toBe(original.digest);
             zeroBytes(restored!);

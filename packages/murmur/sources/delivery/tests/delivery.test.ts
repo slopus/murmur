@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
@@ -21,6 +22,8 @@ import {
     type SignedInboxRead,
 } from "../index.js";
 
+const ctx = createRootContext().named("test");
+
 const NOW = 1_700_000_000_000;
 
 function relayEventId(sequence: number, time: number = NOW): string {
@@ -35,7 +38,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "delivery-tests",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 describe("delivery client", () => {
@@ -49,6 +52,7 @@ describe("delivery client", () => {
         const store = new MemoryMurmurStore();
         try {
             await transport.publish(
+                ctx,
                 createSignedDelivery(alice, [bob.publicKey], utf8Encode("hello"), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
@@ -56,20 +60,25 @@ describe("delivery client", () => {
             );
             const processor = new InboxProcessor(
                 { identity: bob, store, transport },
-                async (transaction, queued) => {
-                    await transaction.set("application/message", queued.delivery.ciphertext);
+                async (transaction, staged, queued) => {
+                    await staged.set(
+                        transaction,
+                        "application/message",
+                        queued.delivery.ciphertext,
+                    );
                 },
                 { now: () => NOW },
             );
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 1,
                 rejected: 0,
                 exhausted: true,
             });
-            expect(utf8Decode((await store.get("application/message"))!)).toBe("hello");
+            expect(utf8Decode((await store.get(ctx, "application/message"))!)).toBe("hello");
             const page = await transport.read(
+                ctx,
                 createSignedInboxRead(bob, {
-                    after: await processor.cursor(),
+                    after: await processor.cursor(ctx),
                     createdAt: NOW,
                 }),
             );
@@ -89,19 +98,20 @@ describe("delivery client", () => {
         const store = new MemoryMurmurStore();
         let failAcknowledgement = true;
         const transport: DeliveryTransport = {
-            publish: (delivery, signal) => http.publish(delivery, signal),
-            read: (read, signal) => http.read(read, signal),
-            acknowledge: async (acknowledgement, signal) => {
+            publish: (_ctx, delivery, signal) => http.publish(ctx, delivery, signal),
+            read: (_ctx, read, signal) => http.read(ctx, read, signal),
+            acknowledge: async (_ctx, acknowledgement, signal) => {
                 if (failAcknowledgement) {
                     failAcknowledgement = false;
                     throw new Error("injected acknowledgement failure");
                 }
-                return http.acknowledge(acknowledgement, signal);
+                return http.acknowledge(ctx, acknowledgement, signal);
             },
         };
         let applications = 0;
         try {
             await http.publish(
+                ctx,
                 createSignedDelivery(alice, [bob.publicKey], utf8Encode("once"), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
@@ -109,18 +119,18 @@ describe("delivery client", () => {
             );
             const processor = new InboxProcessor(
                 { identity: bob, store, transport },
-                async (transaction) => {
+                async (transaction, staged) => {
                     applications += 1;
-                    await transaction.set("application/applied", utf8Encode("yes"));
+                    await staged.set(transaction, "application/applied", utf8Encode("yes"));
                 },
                 { now: () => NOW },
             );
-            await expect(processor.synchronize()).rejects.toThrow(
+            await expect(processor.synchronize(ctx)).rejects.toThrow(
                 "injected acknowledgement failure",
             );
             expect(applications).toBe(1);
-            expect(await processor.cursor()).not.toBeNull();
-            await expect(processor.synchronize()).resolves.toMatchObject({ processed: 0 });
+            expect(await processor.cursor(ctx)).not.toBeNull();
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({ processed: 0 });
             expect(applications).toBe(1);
         } finally {
             await relay.close();
@@ -138,6 +148,7 @@ describe("delivery client", () => {
         let terminal = false;
         try {
             await transport.publish(
+                ctx,
                 createSignedDelivery(alice, [bob.publicKey], utf8Encode("bad"), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
@@ -145,24 +156,24 @@ describe("delivery client", () => {
             );
             const processor = new InboxProcessor(
                 { identity: bob, store, transport },
-                async (transaction) => {
-                    await transaction.set("application/partial", utf8Encode("rollback"));
+                async (transaction, staged) => {
+                    await staged.set(transaction, "application/partial", utf8Encode("rollback"));
                     if (!terminal) throw new Error("transient");
                     throw new TerminalInboxDeliveryError("unsupported_frame");
                 },
                 { now: () => NOW, maximumRejections: 1 },
             );
-            await expect(processor.synchronize()).rejects.toThrow("transient");
-            expect(await store.get("application/partial")).toBeUndefined();
-            expect(await processor.cursor()).toBeNull();
+            await expect(processor.synchronize(ctx)).rejects.toThrow("transient");
+            expect(await store.get(ctx, "application/partial")).toBeUndefined();
+            expect(await processor.cursor(ctx)).toBeNull();
 
             terminal = true;
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 0,
                 rejected: 1,
             });
-            expect(await store.get("application/partial")).toBeUndefined();
-            expect(await processor.rejections()).toMatchObject([{ code: "unsupported_frame" }]);
+            expect(await store.get(ctx, "application/partial")).toBeUndefined();
+            expect(await processor.rejections(ctx)).toMatchObject([{ code: "unsupported_frame" }]);
         } finally {
             await relay.close();
         }
@@ -174,10 +185,10 @@ describe("delivery client", () => {
         const eventId = relayEventId(1);
         const acknowledgements: SignedInboxAck[] = [];
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async (_read: SignedInboxRead) => {
+            read: async (_ctx, _read: SignedInboxRead) => {
                 throw new OversizedInboxDeliveryError(
                     eventId,
                     1,
@@ -188,26 +199,26 @@ describe("delivery client", () => {
                     new Uint8Array(32),
                 );
             },
-            acknowledge: async (acknowledgement) => {
+            acknowledge: async (_ctx, acknowledgement) => {
                 acknowledgements.push(acknowledgement);
                 return { removed: 1 };
             },
         };
         const processor = new InboxProcessor(
             { identity, store, transport },
-            async () => {
+            async (_ctx) => {
                 throw new Error("handler must not run");
             },
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).resolves.toEqual({
+        await expect(processor.synchronize(ctx)).resolves.toEqual({
             processed: 0,
             rejected: 1,
             cursor: eventId,
             exhausted: true,
         });
         expect(acknowledgements.map((value) => value.through)).toEqual([eventId]);
-        expect(await processor.rejections()).toEqual([{ eventId, code: "delivery_too_large" }]);
+        expect(await processor.rejections(ctx)).toEqual([{ eventId, code: "delivery_too_large" }]);
     });
 
     test("does not advance on inconsistent relay metadata", async () => {
@@ -218,10 +229,10 @@ describe("delivery client", () => {
             expiresAt: NOW + 60_000,
         });
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => ({
+            read: async (_ctx) => ({
                 deliveries: [
                     {
                         eventId: relayEventId(2),
@@ -232,17 +243,17 @@ describe("delivery client", () => {
                 acknowledgedThrough: null,
                 exhausted: true,
             }),
-            acknowledge: async () => {
+            acknowledge: async (_ctx) => {
                 throw new Error("unexpected acknowledgement");
             },
         };
         const processor = new InboxProcessor(
             { identity, store, transport },
-            async () => undefined,
+            async (_ctx) => undefined,
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).rejects.toThrow("out-of-order");
-        expect(await processor.cursor()).toBeNull();
+        await expect(processor.synchronize(ctx)).rejects.toThrow("out-of-order");
+        expect(await processor.cursor(ctx)).toBeNull();
     });
 
     test("rejects a post-trim delivery-ID replay without applying twice", async () => {
@@ -261,22 +272,22 @@ describe("delivery client", () => {
         try {
             const processor = new InboxProcessor(
                 { identity: bob, store, transport },
-                async () => {
+                async (_ctx) => {
                     applications += 1;
                 },
                 { now: () => NOW },
             );
-            await transport.publish(delivery);
-            await expect(processor.synchronize()).resolves.toMatchObject({ processed: 1 });
-            await expect(transport.publish(delivery)).resolves.toMatchObject({
+            await transport.publish(ctx, delivery);
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({ processed: 1 });
+            await expect(transport.publish(ctx, delivery)).resolves.toMatchObject({
                 duplicate: false,
             });
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 0,
                 rejected: 1,
             });
             expect(applications).toBe(1);
-            expect((await processor.rejections()).at(-1)).toMatchObject({
+            expect((await processor.rejections(ctx)).at(-1)).toMatchObject({
                 code: "duplicate_delivery",
             });
         } finally {
@@ -300,30 +311,30 @@ describe("delivery client", () => {
         };
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => ({
+            read: async (_ctx) => ({
                 deliveries: [{ eventId, delivery }],
                 head: eventId,
                 acknowledgedThrough: null,
                 exhausted: true,
             }),
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store, transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).resolves.toMatchObject({
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({
             processed: 0,
             rejected: 1,
         });
         expect(applications).toBe(0);
-        expect(await processor.rejections()).toEqual([{ eventId, code: "expired_delivery" }]);
+        expect(await processor.rejections(ctx)).toEqual([{ eventId, code: "expired_delivery" }]);
     });
 
     test("enforces the signed page limit for a custom transport", async () => {
@@ -333,10 +344,10 @@ describe("delivery client", () => {
             expiresAt: NOW + 60_000,
         });
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => ({
+            read: async (_ctx) => ({
                 deliveries: [
                     {
                         eventId: relayEventId(4),
@@ -351,35 +362,35 @@ describe("delivery client", () => {
                 acknowledgedThrough: null,
                 exhausted: true,
             }),
-            acknowledge: async () => ({ removed: 0 }),
+            acknowledge: async (_ctx) => ({ removed: 0 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => undefined,
+            async (_ctx) => undefined,
             { now: () => NOW },
         );
-        await expect(processor.synchronize({ limit: 1 })).rejects.toThrow("page limit");
-        expect(await processor.cursor()).toBeNull();
+        await expect(processor.synchronize(ctx, { limit: 1 })).rejects.toThrow("page limit");
+        expect(await processor.cursor(ctx)).toBeNull();
     });
 
     test("surfaces a stale local backup as explicit unrecoverable rollback", async () => {
         const identity = generateIdentityKeyPair();
         const remoteCursor = relayEventId(6);
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 throw new DeliveryCursorTrimmedError("cursor_trimmed", remoteCursor);
             },
-            acknowledge: async () => ({ removed: 0 }),
+            acknowledge: async (_ctx) => ({ removed: 0 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => undefined,
+            async (_ctx) => undefined,
             { now: () => NOW },
         );
-        const error = await processor.synchronize().catch((value: unknown) => value);
+        const error = await processor.synchronize(ctx).catch((value: unknown) => value);
         expect(error).toBeInstanceOf(InboxStateRollbackError);
         expect(error).toMatchObject({
             localCursor: null,
@@ -393,7 +404,7 @@ describe("delivery client", () => {
             createdAt: NOW,
             expiresAt: NOW + 60_000,
         });
-        const fetch: DeliveryFetch = async (_input, init) =>
+        const fetch: DeliveryFetch = async (_ctx, _input, init) =>
             new Promise<Response>((_resolve, reject) => {
                 init?.signal?.addEventListener("abort", () => reject(init.signal?.reason), {
                     once: true,
@@ -403,19 +414,20 @@ describe("delivery client", () => {
             fetch,
             requestTimeoutMilliseconds: 5,
         });
-        await expect(transport.publish(delivery)).rejects.toThrow("timed out");
+        await expect(transport.publish(ctx, delivery)).rejects.toThrow("timed out");
     });
 
     test("classifies a malformed event-stream response as retryable", async () => {
         const identity = generateIdentityKeyPair();
         const transport = new HttpDeliveryTransport("https://relay.test", {
-            fetch: async () =>
+            fetch: async (_ctx) =>
                 new Response("route unavailable", {
                     status: 404,
                     headers: { "content-type": "text/plain" },
                 }),
         });
         const stream = transport.stream(
+            ctx,
             createSignedInboxRead(identity, { createdAt: NOW, waitMilliseconds: 0 }),
         );
         const error = await stream.next().catch((value: unknown) => value);
@@ -459,14 +471,15 @@ describe("delivery client", () => {
             },
         });
         const transport = new HttpDeliveryTransport("https://relay.test", {
-            fetch: async () =>
+            fetch: async (_ctx) =>
                 new Response(body, { headers: { "content-type": "text/event-stream" } }),
         });
         const rosterChanges: Uint8Array[] = [];
         const stream = transport.stream(
+            ctx,
             createSignedInboxRead(identity, { createdAt: NOW, waitMilliseconds: 0 }),
             undefined,
-            { onDeviceRosterChanged: (accountKey) => rosterChanges.push(accountKey.slice()) },
+            { onDeviceRosterChanged: (_ctx, accountKey) => rosterChanges.push(accountKey.slice()) },
         );
 
         await expect(stream.next()).resolves.toMatchObject({
@@ -504,32 +517,32 @@ describe("delivery client", () => {
         });
         let applications = 0;
         try {
-            await transport.publish(first);
-            await transport.publish(overflow);
+            await transport.publish(ctx, first);
+            await transport.publish(ctx, overflow);
             const processor = new InboxProcessor(
                 { identity: bob, store: new MemoryMurmurStore(), transport },
-                async () => {
+                async (_ctx) => {
                     applications += 1;
                 },
                 { now: () => NOW, maximumReplayEntries: 1 },
             );
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 1,
                 rejected: 1,
                 exhausted: true,
             });
             expect(applications).toBe(1);
-            expect((await processor.rejections()).at(-1)).toMatchObject({
+            expect((await processor.rejections(ctx)).at(-1)).toMatchObject({
                 code: "replay_capacity",
             });
 
-            await transport.publish(overflow);
-            await expect(processor.synchronize()).resolves.toMatchObject({
+            await transport.publish(ctx, overflow);
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
                 processed: 0,
                 rejected: 1,
             });
             expect(applications).toBe(1);
-            expect((await processor.rejections()).at(-1)).toMatchObject({
+            expect((await processor.rejections(ctx)).at(-1)).toMatchObject({
                 code: "probable_duplicate_delivery",
             });
         } finally {
@@ -540,8 +553,8 @@ describe("delivery client", () => {
     test("keeps staged scans bounded and protects the Murmur namespace", async () => {
         const identity = generateIdentityKeyPair();
         const store = new MemoryMurmurStore();
-        await store.set("application/a", utf8Encode("a"));
-        await store.set("application/b", utf8Encode("b"));
+        await store.set(ctx, "application/a", utf8Encode("a"));
+        await store.set(ctx, "application/b", utf8Encode("b"));
         const eventId = relayEventId(7);
         const delivery = createSignedDelivery(identity, [identity.publicKey], utf8Encode("x"), {
             createdAt: NOW,
@@ -554,27 +567,27 @@ describe("delivery client", () => {
             exhausted: true,
         } as const;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => page,
-            acknowledge: async () => ({ removed: 1 }),
+            read: async (_ctx) => page,
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store, transport },
-            async (transaction) => {
-                await transaction.delete("application/a");
-                const result = await transaction.scan("application/", { limit: 1 });
+            async (transaction, staged) => {
+                await staged.delete(transaction, "application/a");
+                const result = await staged.scan(transaction, "application/", { limit: 1 });
                 expect([...result.keys()]).toEqual(["application/b"]);
-                await transaction.set("murmur/session/attack", utf8Encode("no"));
+                await staged.set(transaction, "murmur/session/attack", utf8Encode("no"));
             },
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).rejects.toThrow(
+        await expect(processor.synchronize(ctx)).rejects.toThrow(
             "cannot mutate delivery processor state",
         );
-        expect(await store.get("application/a")).toEqual(utf8Encode("a"));
-        expect(await processor.cursor()).toBeNull();
+        expect(await store.get(ctx, "application/a")).toEqual(utf8Encode("a"));
+        expect(await processor.cursor(ctx)).toBeNull();
     });
 
     test("ignores local clock jumps for replay and delivery expiry", async () => {
@@ -589,10 +602,10 @@ describe("delivery client", () => {
         let clock = NOW;
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 const eventId = eventIds[reads++]!;
                 return {
                     deliveries: [{ eventId, delivery }],
@@ -601,20 +614,20 @@ describe("delivery client", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             { now: () => clock },
         );
-        await expect(processor.synchronize()).resolves.toMatchObject({ processed: 1 });
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({ processed: 1 });
         clock = NOW + 365 * 24 * 60 * 60 * 1_000;
-        await expect(processor.synchronize()).rejects.toThrow("trusted clock window");
+        await expect(processor.synchronize(ctx)).rejects.toThrow("trusted clock window");
         clock = NOW;
-        await expect(processor.synchronize()).resolves.toMatchObject({ rejected: 1 });
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({ rejected: 1 });
         expect(applications).toBe(1);
     });
 
@@ -627,20 +640,20 @@ describe("delivery client", () => {
         const eventId = relayEventId(15);
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => ({
+            read: async (_ctx) => ({
                 deliveries: [{ eventId, delivery }],
                 head: eventId,
                 acknowledgedThrough: null,
                 exhausted: true,
             }),
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             {
@@ -648,7 +661,7 @@ describe("delivery client", () => {
                 maximumRelayClockSkewMilliseconds: 60 * 60 * 1_000,
             },
         );
-        await expect(processor.synchronize()).resolves.toMatchObject({
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({
             processed: 1,
             rejected: 0,
         });
@@ -676,10 +689,10 @@ describe("delivery client", () => {
         let read = 0;
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 const next = queued[read++]!;
                 return {
                     deliveries: [next],
@@ -688,20 +701,20 @@ describe("delivery client", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             { now: () => NOW },
         );
         for (let index = 0; index < queued.length; index += 1) {
-            await expect(processor.synchronize()).resolves.toMatchObject({ rejected: 1 });
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({ rejected: 1 });
         }
         expect(applications).toBe(0);
-        expect((await processor.rejections()).map(({ code }) => code)).toEqual([
+        expect((await processor.rejections(ctx)).map(({ code }) => code)).toEqual([
             "delivery_ttl_too_long",
             "delivery_ttl_too_long",
             "invalid_delivery",
@@ -727,10 +740,10 @@ describe("delivery client", () => {
         let read = 0;
         const store = new MemoryMurmurStore();
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 const next = queued[read++]!;
                 return {
                     deliveries: [next],
@@ -739,24 +752,25 @@ describe("delivery client", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity: recipient, store, transport },
-            async () => {
+            async (_ctx) => {
                 throw new Error("handler must not run");
             },
             { now: () => now },
         );
 
-        await processor.synchronize();
+        await processor.synchronize(ctx);
         now = NOW + 1;
-        await processor.synchronize();
+        await processor.synchronize(ctx);
         const firstEpoch = Math.floor(NOW / epoch)
             .toString()
             .padStart(12, "0");
         for (let shard = 0; shard < 256; shard += 1) {
             await store.set(
+                ctx,
                 `murmur/delivery/replay/terminal/${firstEpoch}/${shard
                     .toString(16)
                     .padStart(2, "0")}`,
@@ -764,14 +778,14 @@ describe("delivery client", () => {
             );
         }
         now = NOW + 3 * epoch;
-        await processor.synchronize();
+        await processor.synchronize(ctx);
 
-        expect((await processor.rejections()).map(({ code }) => code)).toEqual([
+        expect((await processor.rejections(ctx)).map(({ code }) => code)).toEqual([
             "invalid_delivery",
             "probable_terminal_replay",
             "invalid_delivery",
         ]);
-        expect((await store.list("murmur/delivery/replay/terminal/")).size).toBe(1);
+        expect((await store.list(ctx, "murmur/delivery/replay/terminal/")).size).toBe(1);
     });
 
     test("rejects oversized page arrays before decoding their entries", () => {
@@ -800,10 +814,10 @@ describe("delivery client", () => {
         let read = 0;
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 read += 1;
                 if (read === 1) {
                     return {
@@ -828,23 +842,23 @@ describe("delivery client", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).resolves.toMatchObject({ processed: 1 });
-        await expect(processor.synchronize()).rejects.toThrow("out-of-order");
-        await expect(processor.synchronize()).resolves.toMatchObject({
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({ processed: 1 });
+        await expect(processor.synchronize(ctx)).rejects.toThrow("out-of-order");
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({
             processed: 0,
             rejected: 1,
         });
         expect(applications).toBe(1);
-        expect((await processor.rejections()).at(-1)).toMatchObject({
+        expect((await processor.rejections(ctx)).at(-1)).toMatchObject({
             code: "duplicate_delivery",
         });
     });
@@ -858,10 +872,10 @@ describe("delivery client", () => {
         let read = 0;
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 read += 1;
                 const eventId =
                     read === 1 ? relayEventId(19, Date.UTC(2001, 0, 1)) : relayEventId(20);
@@ -872,18 +886,18 @@ describe("delivery client", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).rejects.toThrow("trusted clock window");
-        expect(await processor.cursor()).toBeNull();
-        await expect(processor.synchronize()).resolves.toMatchObject({
+        await expect(processor.synchronize(ctx)).rejects.toThrow("trusted clock window");
+        expect(await processor.cursor(ctx)).toBeNull();
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({
             processed: 1,
             rejected: 0,
         });
@@ -899,10 +913,10 @@ describe("delivery client", () => {
         let read = 0;
         let applications = 0;
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unexpected publish");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 read += 1;
                 const eventId =
                     read === 1 ? relayEventId(21, NOW - 10 * 60 * 1_000) : relayEventId(22);
@@ -913,23 +927,23 @@ describe("delivery client", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 1 }),
+            acknowledge: async (_ctx) => ({ removed: 1 }),
         };
         const processor = new InboxProcessor(
             { identity, store: new MemoryMurmurStore(), transport },
-            async () => {
+            async (_ctx) => {
                 applications += 1;
             },
             { now: () => NOW },
         );
-        await expect(processor.synchronize()).resolves.toMatchObject({
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({
             processed: 0,
             rejected: 1,
         });
-        expect((await processor.rejections()).at(-1)).toMatchObject({
+        expect((await processor.rejections(ctx)).at(-1)).toMatchObject({
             code: "future_delivery",
         });
-        await expect(processor.synchronize()).resolves.toMatchObject({
+        await expect(processor.synchronize(ctx)).resolves.toMatchObject({
             processed: 1,
             rejected: 0,
         });

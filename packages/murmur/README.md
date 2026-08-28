@@ -28,7 +28,7 @@ private deployment infrastructure.
 ## Install
 
 ```bash
-pnpm add @slopus/murmur
+pnpm add @slopus/murmur @steve.kite/stdlib
 ```
 
 Murmur is ESM-only and requires a `MurmurStore`. `MemoryMurmurStore` is useful
@@ -82,36 +82,39 @@ names the exact account identity it already knows. The resulting account claim
 is accepted directly by both session creation and member addition:
 
 ```ts
+import { createRootContext } from "@steve.kite/stdlib";
 import { MemoryMurmurStore, MurmurClient } from "@slopus/murmur";
 
+const ctx = createRootContext().named("chat");
 const encode = (value: string): Uint8Array => new TextEncoder().encode(value);
 
-const alice = await MurmurClient.open({
+const alice = await MurmurClient.open(ctx, {
     relay: "https://relay.example",
     store: new MemoryMurmurStore(),
 });
-const bob = await MurmurClient.open({
+const bob = await MurmurClient.open(ctx, {
     relay: "https://relay.example",
     store: new MemoryMurmurStore(),
 });
 
-const bobAdmission = await alice.claimAccount(bob.identity, ticket);
-const session = await alice.createSession({
+const bobAdmission = await alice.claimAccount(ctx, bob.identity, ticket);
+const session = await alice.createSession(ctx, {
     descriptor: encode('{"protocol":"chat","version":1}'),
     members: [bobAdmission],
     sendPolicy: "admins",
 });
 
-await alice.synchronize({ waitMilliseconds: 0 });
-await bob.synchronize({ waitMilliseconds: 0 });
-await bob.activateSession(session.id);
+await alice.synchronize(ctx, { waitMilliseconds: 0 });
+await bob.synchronize(ctx, { waitMilliseconds: 0 });
+await bob.activateSession(ctx, session.id);
 
-await alice.send(session.id, encode("hello"));
-await alice.synchronize({ waitMilliseconds: 0 });
+await alice.send(ctx, session.id, encode("hello"));
+await alice.synchronize(ctx, { waitMilliseconds: 0 });
 await bob.synchronize(
+    ctx,
     { waitMilliseconds: 0 },
     {
-        onUpdates: async (updates) => {
+        onUpdates: async (_ctx, updates) => {
             for (const update of updates) {
                 console.log(update.id, update.bytes);
             }
@@ -119,8 +122,8 @@ await bob.synchronize(
     },
 );
 
-const carolAdmission = await alice.claimAccount(carolIdentity, anotherTicket);
-await alice.addMember(session.id, carolAdmission);
+const carolAdmission = await alice.claimAccount(ctx, carolIdentity, anotherTicket);
+await alice.addMember(ctx, session.id, carolAdmission);
 ```
 
 Opening an HTTP-backed client automatically publishes a small one-use
@@ -130,7 +133,7 @@ replenishment. `rotate()` replaces every unclaimed one-use package and the
 last-resort package:
 
 ```ts
-await bob.rotate();
+await bob.rotate(ctx);
 ```
 
 For application-routed admission, `createKeyPackage()` remains available and
@@ -145,15 +148,15 @@ reconnecting loop active:
 ```ts
 const controller = new AbortController();
 
-await murmur.sync({
+await murmur.sync(ctx, {
     abort: controller.signal,
-    onConnected: () => console.log("connected"),
-    onDisconnected: (error) => console.log("disconnected", error),
-    onUpdates: async (updates) => applyAtomically(updates),
-    onDeviceAdded: async (events) => recordAddedDevices(events),
-    onDeviceRevoked: async (events) => recordRevokedDevices(events),
-    onDeviceDormant: async (events) => reviewDormantDevices(events),
-    onReset: async (reset) => preserveApplicationMetadata(reset),
+    onConnected: (_ctx) => console.log("connected"),
+    onDisconnected: (_ctx, error) => console.log("disconnected", error),
+    onUpdates: async (_ctx, updates) => applyAtomically(updates),
+    onDeviceAdded: async (_ctx, events) => recordAddedDevices(events),
+    onDeviceRevoked: async (_ctx, events) => recordRevokedDevices(events),
+    onDeviceDormant: async (_ctx, events) => reviewDormantDevices(events),
+    onReset: async (_ctx, reset) => preserveApplicationMetadata(reset),
 });
 ```
 
@@ -186,24 +189,24 @@ Restoring the same account identity on another store creates a fresh device key
 and self-registers it with the relay-owned current roster:
 
 ```ts
-const secondDevice = await MurmurClient.open({
+const secondDevice = await MurmurClient.open(ctx, {
     identity: restoredAccount,
     relay,
     store: secondStore,
-    encryptDeviceMetadata: (deviceKey) => encryptLocalDeviceMetadata(deviceKey),
+    encryptDeviceMetadata: (_ctx, deviceKey) => encryptLocalDeviceMetadata(deviceKey),
 });
-await secondDevice.synchronize({ waitMilliseconds: 0 });
+await secondDevice.synchronize(ctx, { waitMilliseconds: 0 });
 ```
 
 Registration and removal are account-identity-signed relay mutations. Their
 ordinary inbox notifications drive MLS convergence. Any restored device may
-remove itself or another device with `removeDevice(deviceKey)`. Dormancy
+remove itself or another device with `removeDevice(ctx, deviceKey)`. Dormancy
 reporting is advisory; removal remains an explicit application decision.
 
 An application may attach up to 16 KiB of owner-encrypted metadata to each
 roster entry. Murmur supplies the stable device key to `encryptDeviceMetadata`
 so the ciphertext can be bound to that exact account/device pair, but neither
-Murmur nor the relay decrypts it. `devices()` returns defensive copies of the
+Murmur nor the relay decrypts it. `devices(ctx)` returns defensive copies of the
 opaque bytes and refreshes the roster from the relay. Each entry also carries
 `lastAccessedAt`, the relay-owned time when that device most recently received
 a session token. Token issuance updates this timestamp monotonically without
@@ -219,7 +222,7 @@ its local observation, and invokes `onDevicesChanged` with defensive copies.
 The notification carries no metadata and is deliberately ephemeral; durable
 device additions and removals still arrive through the ordered inbox.
 
-`deleteAccount()` is terminal. It persists and retries one signed relay request,
+`deleteAccount(ctx)` is terminal. It persists and retries one signed relay request,
 then clears every local store key and destroys both identity roots only after
 relay confirmation. It does not erase authenticated MLS events already held by
 other members; those members converge later through silence or explicit

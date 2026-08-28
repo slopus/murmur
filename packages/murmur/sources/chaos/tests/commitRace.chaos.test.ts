@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import { destroyIdentity, generateIdentityKeyPair } from "../../crypto/index.js";
@@ -31,6 +32,8 @@ import {
     settleChaos,
 } from "../index.js";
 import type { ChaosRule } from "../index.js";
+
+const ctx = createRootContext().named("test");
 
 const NOW = 1_700_000_000_000;
 const RACE_SEED = 0x5241_4345;
@@ -128,7 +131,7 @@ class RaceGate {
         signal?: AbortSignal,
     ): Promise<DeliveryPublishOutcome> {
         if (!this.#armed || delivery.ciphertext[0] !== COMMIT_KIND) {
-            return delegate.publish(delivery, signal);
+            return delegate.publish(ctx, delivery, signal);
         }
         return new Promise<DeliveryPublishOutcome>((resolve, reject) => {
             this.#pending.push({ actor, delivery, delegate, resolve, reject });
@@ -152,7 +155,7 @@ class RaceGate {
         if (index < 0) throw new Error(`No pending Commit for ${actor}`);
         const [pending] = this.#pending.splice(index, 1);
         if (pending === undefined) throw new Error(`Missing pending Commit for ${actor}`);
-        const outcome = await pending.delegate.publish(pending.delivery);
+        const outcome = await pending.delegate.publish(ctx, pending.delivery);
         const accepted = {
             actor,
             candidateId: pending.delivery.id,
@@ -174,7 +177,7 @@ class RaceGate {
         const [pending] = this.#pending.splice(index, 1);
         if (pending === undefined) throw new Error(`Missing pending Commit for ${actor}`);
         try {
-            await pending.delegate.publish(pending.delivery);
+            await pending.delegate.publish(ctx, pending.delivery);
         } catch (error: unknown) {
             if (
                 !(error instanceof DeliveryTransportError) ||
@@ -244,13 +247,17 @@ class GatedTransport implements DeliveryTransport {
         this.#hiddenEventId = eventId;
     }
 
-    publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    publish(
+        _ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         this.publications.push(delivery);
         return this.#gate.publish(this.#actor, this.#delegate, delivery, signal);
     }
 
-    async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
-        const page = await this.#delegate.read(request, signal);
+    async read(_ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+        const page = await this.#delegate.read(ctx, request, signal);
         const hidden = this.#hiddenEventId;
         if (hidden === undefined || !page.deliveries.some(({ eventId }) => eventId === hidden)) {
             return page;
@@ -263,28 +270,31 @@ class GatedTransport implements DeliveryTransport {
     }
 
     async acknowledge(
+        _ctx: Context,
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<InboxAcknowledgement> {
         this.acknowledgements.push(request.through);
-        return this.#delegate.acknowledge(request, signal);
+        return this.#delegate.acknowledge(ctx, request, signal);
     }
 
     async readDeviceRoster(
+        _ctx: Context,
         accountKey: Uint8Array,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster | undefined> {
-        return this.#delegate.readDeviceRoster?.(accountKey, signal);
+        return this.#delegate.readDeviceRoster?.(ctx, accountKey, signal);
     }
 
     async mutateDeviceRoster(
+        _ctx: Context,
         delivery: SignedDelivery,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster> {
         if (this.#delegate.mutateDeviceRoster === undefined) {
             throw new Error("Delivery transport does not support device rosters");
         }
-        return this.#delegate.mutateDeviceRoster(delivery, signal);
+        return this.#delegate.mutateDeviceRoster(ctx, delivery, signal);
     }
 }
 
@@ -310,7 +320,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "commit-race-chaos",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 async function emptyFixture(): Promise<RaceFixture> {
@@ -332,15 +342,15 @@ async function addActor(fixture: RaceFixture, name: ActorName): Promise<RaceActo
         new HttpDeliveryTransport("https://relay.test", { fetch: fixture.fetch }),
         fixture.gate,
     );
-    const client = await MurmurClient.open({ store, transport, now: fixture.clock.now });
+    const client = await MurmurClient.open(ctx, { store, transport, now: fixture.clock.now });
     const actor: RaceActor = { name, store, transport, updates: [], client };
     fixture.actors.set(name, actor);
     return actor;
 }
 
 async function reopen(actor: RaceActor, fixture: RaceFixture): Promise<void> {
-    actor.client.close();
-    actor.client = await MurmurClient.open({
+    actor.client.close(ctx);
+    actor.client = await MurmurClient.open(ctx, {
         store: actor.store,
         transport: actor.transport,
         now: fixture.clock.now,
@@ -352,8 +362,8 @@ async function reopenWithStore(
     fixture: RaceFixture,
     store: MurmurStore,
 ): Promise<void> {
-    actor.client.close();
-    actor.client = await MurmurClient.open({
+    actor.client.close(ctx);
+    actor.client = await MurmurClient.open(ctx, {
         store,
         transport: actor.transport,
         now: fixture.clock.now,
@@ -361,15 +371,15 @@ async function reopenWithStore(
 }
 
 async function abandonAndReopen(actor: RaceActor, fixture: RaceFixture): Promise<void> {
-    actor.client = await MurmurClient.open({
+    actor.client = await MurmurClient.open(ctx, {
         store: actor.store,
         transport: actor.transport,
         now: fixture.clock.now,
     });
 }
 
-function updateHook(actor: RaceActor): (updates: readonly MurmurUpdate[]) => void {
-    return (updates) => {
+function updateHook(actor: RaceActor): (_ctx: Context, updates: readonly MurmurUpdate[]) => void {
+    return (_ctx, updates) => {
         for (const update of updates) {
             actor.updates.push({
                 id: update.id,
@@ -382,6 +392,7 @@ function updateHook(actor: RaceActor): (updates: readonly MurmurUpdate[]) => voi
 
 async function synchronize(actor: RaceActor, limit: number = 256) {
     return actor.client.synchronize(
+        ctx,
         { waitMilliseconds: 0, limit },
         { onUpdates: updateHook(actor) },
     );
@@ -402,7 +413,7 @@ function publicSession(session: MurmurSession | undefined): unknown {
 async function storeCounts(store: MurmurStore): Promise<Record<string, number>> {
     const counts: Record<string, number> = {};
     for (const prefix of [...OUTBOX_PREFIXES, INTENT_PREFIX]) {
-        counts[prefix] = (await store.scan(prefix, { limit: STORE_LIMIT })).size;
+        counts[prefix] = (await store.scan(ctx, prefix, { limit: STORE_LIMIT })).size;
     }
     return counts;
 }
@@ -412,8 +423,8 @@ async function snapshot(actors: readonly RaceActor[], sessionId: Uint8Array): Pr
     for (const actor of actors) {
         values.push({
             actor: actor.name,
-            session: publicSession(await actor.client.session(sessionId)),
-            issues: (await actor.client.issues()).map(({ code, operationId }) => ({
+            session: publicSession(await actor.client.session(ctx, sessionId)),
+            issues: (await actor.client.issues(ctx)).map(({ code, operationId }) => ({
                 code,
                 operationId: operationId ?? null,
             })),
@@ -457,20 +468,20 @@ async function activeFixture(
     const carol = await addActor(fixture, "carol");
     const dave = await addActor(fixture, "dave");
     const erin = await addActor(fixture, "erin");
-    const session = await alice.client.createSession({
+    const session = await alice.client.createSession(ctx, {
         descriptor: utf8Encode("commit race chaos"),
-        members: [await bob.client.createKeyPackage(), await carol.client.createKeyPackage()],
+        members: [await bob.client.createKeyPackage(ctx), await carol.client.createKeyPackage(ctx)],
         adminsAssignAdmins: true,
         anyoneCanAddMembers: options.anyoneCanAddMembers ?? true,
     });
     await synchronize(alice);
     await synchronize(bob);
     await synchronize(carol);
-    await bob.client.activateSession(session.id);
-    await carol.client.activateSession(session.id);
+    await bob.client.activateSession(ctx, session.id);
+    await carol.client.activateSession(ctx, session.id);
     await synchronize(alice);
     if (options.grantBob ?? true) {
-        await alice.client.grantAdmin(session.id, bob.client.accountKey);
+        await alice.client.grantAdmin(ctx, session.id, bob.client.accountKey);
     }
     await settle(fixture, session.id, ["alice", "bob", "carol"]);
     for (const actor of fixture.actors.values()) {
@@ -483,7 +494,7 @@ async function activeFixture(
 async function closeFixture(fixture: RaceFixture): Promise<void> {
     for (const actor of fixture.actors.values()) {
         try {
-            actor.client.close();
+            actor.client.close(ctx);
         } catch {
             // A test can deliberately terminate while an obsolete client is unwinding.
         }
@@ -550,8 +561,8 @@ async function releaseMany(
 }
 
 async function activateIfPending(actor: RaceActor, sessionId: Uint8Array): Promise<void> {
-    const session = await actor.client.session(sessionId);
-    if (session?.status === "pending") await actor.client.activateSession(sessionId);
+    const session = await actor.client.session(ctx, sessionId);
+    if (session?.status === "pending") await actor.client.activateSession(ctx, sessionId);
 }
 
 async function addAndActivate(
@@ -559,7 +570,11 @@ async function addAndActivate(
     inviter: RaceActor,
     invited: RaceActor,
 ): Promise<void> {
-    await inviter.client.addMember(fixture.session.id, await invited.client.createKeyPackage());
+    await inviter.client.addMember(
+        ctx,
+        fixture.session.id,
+        await invited.client.createKeyPackage(ctx),
+    );
     await settle(fixture, fixture.session.id, ["alice", "bob", "carol", invited.name]);
     await activateIfPending(invited, fixture.session.id);
     await settle(fixture, fixture.session.id, ["alice", "bob", "carol", invited.name]);
@@ -649,21 +664,21 @@ describe("Commit race and intent convergence chaos", () => {
         async () => {
             const fixture = await activeFixture();
             try {
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: false,
                 });
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: false,
                 });
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol"]);
-                const final = await fixture.alice.client.session(fixture.session.id);
+                const final = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(final?.policies.anyoneCanAddMembers).toBe(false);
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol]) {
-                    expect(publicSession(await actor.client.session(fixture.session.id))).toEqual(
-                        publicSession(final),
-                    );
+                    expect(
+                        publicSession(await actor.client.session(ctx, fixture.session.id)),
+                    ).toEqual(publicSession(final));
                 }
                 const commitEvents = fixture.alice.transport.publications.filter(
                     ({ ciphertext }) => ciphertext[0] === COMMIT_KIND,
@@ -683,12 +698,14 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 await fixture.alice.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.erin.client.createKeyPackage(),
+                    await fixture.erin.client.createKeyPackage(ctx),
                 );
                 const pending = await stageTwo(fixture, fixture.alice, fixture.bob);
                 const [winner] = await releaseTwo(fixture, fixture.bob, fixture.alice, [
@@ -713,7 +730,7 @@ describe("Commit race and intent convergence chaos", () => {
                     "erin",
                 ]);
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol]) {
-                    const session = await actor.client.session(fixture.session.id);
+                    const session = await actor.client.session(ctx, fixture.session.id);
                     expect(memberCount(session, fixture.dave)).toBe(1);
                     expect(memberCount(session, fixture.erin)).toBe(1);
                 }
@@ -731,12 +748,14 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 await fixture.alice.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 const pending = await stageTwo(fixture, fixture.alice, fixture.bob);
                 await releaseTwo(fixture, fixture.alice, fixture.bob, pending);
@@ -745,7 +764,10 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol, fixture.dave]) {
                     expect(
-                        memberCount(await actor.client.session(fixture.session.id), fixture.dave),
+                        memberCount(
+                            await actor.client.session(ctx, fixture.session.id),
+                            fixture.dave,
+                        ),
                     ).toBe(1);
                 }
                 await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol, fixture.dave]);
@@ -763,34 +785,40 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await addAndActivate(fixture, fixture.alice, fixture.dave);
                 await fixture.alice.client.removeMember(
+                    ctx,
                     fixture.session.id,
                     fixture.dave.client.accountKey,
                 );
                 await synchronize(fixture.alice);
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await settle(fixture, fixture.session.id, ["bob", "alice", "carol", "dave"]);
                 expect(
-                    (await fixture.bob.client.issues()).filter(
+                    (await fixture.bob.client.issues(ctx)).filter(
                         ({ code }) => code === "add_intent_removal_generation_advanced",
                     ),
                 ).toHaveLength(1);
                 expect(
-                    memberCount(await fixture.bob.client.session(fixture.session.id), fixture.dave),
+                    memberCount(
+                        await fixture.bob.client.session(ctx, fixture.session.id),
+                        fixture.dave,
+                    ),
                 ).toBe(0);
 
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 await activateIfPending(fixture.dave, fixture.session.id);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 expect(
                     memberCount(
-                        await fixture.alice.client.session(fixture.session.id),
+                        await fixture.alice.client.session(ctx, fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(1);
@@ -809,12 +837,14 @@ describe("Commit race and intent convergence chaos", () => {
             try {
                 await addAndActivate(fixture, fixture.alice, fixture.dave);
                 await fixture.alice.client.removeMember(
+                    ctx,
                     fixture.session.id,
                     fixture.dave.client.accountKey,
                 );
                 await synchronize(fixture.alice);
                 await synchronize(fixture.bob);
                 await fixture.dave.client.send(
+                    ctx,
                     fixture.session.id,
                     utf8Encode("after-removal-parent"),
                 );
@@ -830,7 +860,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 expect(
                     memberCount(
-                        await fixture.alice.client.session(fixture.session.id),
+                        await fixture.alice.client.session(ctx, fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(0);
@@ -847,10 +877,11 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 await fixture.carol.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: false,
                 });
@@ -859,12 +890,12 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "carol", "bob", "dave"], 20);
                 expect(
                     memberCount(
-                        await fixture.alice.client.session(fixture.session.id),
+                        await fixture.alice.client.session(ctx, fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(0);
                 await assertNoOutboxes([fixture.alice, fixture.bob, fixture.carol]);
-                const terminalIssues = (await fixture.carol.client.issues()).filter(
+                const terminalIssues = (await fixture.carol.client.issues(ctx)).filter(
                     ({ operationId }) => operationId !== undefined,
                 );
                 expect({
@@ -884,10 +915,11 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: false,
                 });
@@ -898,7 +930,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 expect(
                     memberCount(
-                        await fixture.alice.client.session(fixture.session.id),
+                        await fixture.alice.client.session(ctx, fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(1);
@@ -916,11 +948,13 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture({ grantBob: false, anyoneCanAddMembers: false });
             try {
                 await fixture.alice.client.grantAdmin(
+                    ctx,
                     fixture.session.id,
                     fixture.bob.client.accountKey,
                 );
                 await expect(
                     fixture.bob.client.removeMember(
+                        ctx,
                         fixture.session.id,
                         fixture.carol.client.accountKey,
                     ),
@@ -928,13 +962,14 @@ describe("Commit race and intent convergence chaos", () => {
                 expect((await storeCounts(fixture.bob.store))[INTENT_PREFIX]).toBe(0);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol"]);
                 await fixture.bob.client.removeMember(
+                    ctx,
                     fixture.session.id,
                     fixture.carol.client.accountKey,
                 );
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol"]);
                 expect(
                     memberCount(
-                        await fixture.alice.client.session(fixture.session.id),
+                        await fixture.alice.client.session(ctx, fixture.session.id),
                         fixture.carol,
                     ),
                 ).toBe(0);
@@ -952,10 +987,12 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture({ anyoneCanAddMembers: false });
             try {
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await fixture.alice.client.revokeAdmin(
+                    ctx,
                     fixture.session.id,
                     fixture.bob.client.accountKey,
                 );
@@ -964,7 +1001,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 await activateIfPending(fixture.dave, fixture.session.id);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
-                const final = await fixture.alice.client.session(fixture.session.id);
+                const final = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(memberCount(final, fixture.dave)).toBe(1);
                 expect(final?.admins.map(encodeBase64Url)).not.toContain(
                     encodeBase64Url(fixture.bob.client.accountKey),
@@ -982,10 +1019,12 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture({ anyoneCanAddMembers: false });
             try {
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await fixture.alice.client.revokeAdmin(
+                    ctx,
                     fixture.session.id,
                     fixture.bob.client.accountKey,
                 );
@@ -994,12 +1033,12 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 20);
                 expect(
                     memberCount(
-                        await fixture.alice.client.session(fixture.session.id),
+                        await fixture.alice.client.session(ctx, fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(0);
                 await assertNoOutboxes([fixture.alice, fixture.bob, fixture.carol]);
-                const terminalIssues = (await fixture.bob.client.issues()).filter(
+                const terminalIssues = (await fixture.bob.client.issues(ctx)).filter(
                     ({ operationId }) => operationId !== undefined,
                 );
                 expect({
@@ -1052,7 +1091,7 @@ describe("Commit race and intent convergence chaos", () => {
                     for (const name of permutation) {
                         const delivery = deliveries.get(name);
                         if (delivery === undefined) throw new Error(`Missing ${name} candidate`);
-                        eventIds.push((await transport.publish(delivery)).eventId);
+                        eventIds.push((await transport.publish(ctx, delivery)).eventId);
                     }
                     expect([...eventIds].sort()).toEqual(eventIds);
                     expect(eventIds[0]! < eventIds[1]!).toBe(true);
@@ -1080,6 +1119,7 @@ describe("Commit race and intent convergence chaos", () => {
             const labels = ["before", "between-1", "between-2"] as const;
             try {
                 await fixture.bob.client.removeMember(
+                    ctx,
                     fixture.session.id,
                     fixture.carol.client.accountKey,
                 );
@@ -1094,10 +1134,10 @@ describe("Commit race and intent convergence chaos", () => {
                 await firstAttempt;
                 fixture.gate.disarm();
                 for (const label of labels) {
-                    await fixture.bob.client.send(fixture.session.id, utf8Encode(label));
+                    await fixture.bob.client.send(ctx, fixture.session.id, utf8Encode(label));
                 }
 
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
@@ -1151,14 +1191,14 @@ describe("Commit race and intent convergence chaos", () => {
                 const response = new Promise<void>((resolve) => {
                     releaseResponse = resolve;
                 });
-                const first = transport.publish(aliceCommit).then(async (outcome) => {
+                const first = transport.publish(ctx, aliceCommit).then(async (outcome) => {
                     firstAccepted = outcome;
                     accepted?.();
                     await response;
                     return outcome;
                 });
                 await acceptance;
-                const second = await transport.publish(bobCommit);
+                const second = await transport.publish(ctx, bobCommit);
                 if (firstAccepted === undefined) throw new Error("First response was not accepted");
                 expect(firstAccepted.eventId < second.eventId).toBe(true);
                 releaseResponse?.();
@@ -1175,13 +1215,14 @@ describe("Commit race and intent convergence chaos", () => {
         async () => {
             const fixture = await activeFixture();
             try {
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 const pending = await stageTwo(fixture, fixture.alice, fixture.bob);
                 const [winner, second] = await releaseTwo(
@@ -1200,7 +1241,10 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(attempted.every((through) => through === priorCursor)).toBe(true);
                 expect(second.code).toBe("stale_session_epoch");
                 expect(
-                    memberCount(await fixture.bob.client.session(fixture.session.id), fixture.dave),
+                    memberCount(
+                        await fixture.bob.client.session(ctx, fixture.session.id),
+                        fixture.dave,
+                    ),
                 ).toBe(0);
             } finally {
                 await closeFixture(fixture);
@@ -1215,8 +1259,9 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 fixture.gate.arm();
                 const losing = synchronize(fixture.bob);
@@ -1226,29 +1271,29 @@ describe("Commit race and intent convergence chaos", () => {
                 await losing;
                 fixture.gate.disarm();
                 await synchronize(fixture.dave);
-                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                expect(await fixture.dave.client.session(ctx, fixture.session.id)).toBeUndefined();
                 expect(
                     fixture.bob.transport.publications.filter(
                         ({ ciphertext }) => ciphertext[0] === 1,
                     ),
                 ).toHaveLength(0);
 
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
                 await synchronize(fixture.alice);
                 await synchronize(fixture.alice);
                 await settle(fixture, fixture.session.id, ["bob", "alice", "carol", "dave"], 60);
-                expect(await fixture.dave.client.session(fixture.session.id)).toMatchObject({
+                expect(await fixture.dave.client.session(ctx, fixture.session.id)).toMatchObject({
                     status: "pending",
                     policies: { adminsAssignAdmins: false, anyoneCanAddMembers: true },
                 });
-                await fixture.dave.client.activateSession(fixture.session.id);
+                await fixture.dave.client.activateSession(ctx, fixture.session.id);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"]);
                 expect(
                     memberCount(
-                        await fixture.dave.client.session(fixture.session.id),
+                        await fixture.dave.client.session(ctx, fixture.session.id),
                         fixture.dave,
                     ),
                 ).toBe(1);
@@ -1275,10 +1320,11 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
@@ -1292,7 +1338,7 @@ describe("Commit race and intent convergence chaos", () => {
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 60);
                 await activateIfPending(fixture.dave, fixture.session.id);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 60);
-                const final = await fixture.alice.client.session(fixture.session.id);
+                const final = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(checkpoints).toHaveLength(7);
                 expect(memberCount(final, fixture.dave)).toBe(1);
                 expect(final?.policies).toEqual({
@@ -1314,9 +1360,13 @@ describe("Commit race and intent convergence chaos", () => {
             const fixture = await activeFixture();
             try {
                 for (let index = 0; index < 65; index += 1) {
-                    await fixture.bob.client.send(fixture.session.id, utf8Encode(`prior-${index}`));
+                    await fixture.bob.client.send(
+                        ctx,
+                        fixture.session.id,
+                        utf8Encode(`prior-${index}`),
+                    );
                 }
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
@@ -1328,8 +1378,8 @@ describe("Commit race and intent convergence chaos", () => {
                     fixture.alice.updates.filter(({ text }) => text.startsWith("prior-")).length,
                 ).toBe(64);
 
-                await fixture.bob.client.send(fixture.session.id, utf8Encode("expired-prior"));
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.bob.client.send(ctx, fixture.session.id, utf8Encode("expired-prior"));
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: true,
                     anyoneCanAddMembers: true,
                 });
@@ -1342,7 +1392,11 @@ describe("Commit race and intent convergence chaos", () => {
                     "expired-prior",
                 );
 
-                await fixture.bob.client.send(fixture.session.id, utf8Encode("current-progress"));
+                await fixture.bob.client.send(
+                    ctx,
+                    fixture.session.id,
+                    utf8Encode("current-progress"),
+                );
                 await synchronize(fixture.bob);
                 await synchronize(fixture.alice);
                 expect(fixture.alice.updates.map(({ text }) => text)).toContain("current-progress");
@@ -1371,13 +1425,14 @@ describe("Commit race and intent convergence chaos", () => {
                     const schedule: boolean[] = [];
                     for (let index = 0; index < 100; index += 1) {
                         schedule.push(random.oneIn(2));
-                        await fixture.alice.client.setPolicies(fixture.session.id, {
+                        await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                             adminsAssignAdmins: false,
                             anyoneCanAddMembers: false,
                         });
                     }
                     for (let index = 0; index < 50; index += 1) {
                         await fixture.bob.client.send(
+                            ctx,
                             fixture.session.id,
                             utf8Encode(`campaign-${index.toString().padStart(2, "0")}`),
                         );
@@ -1391,13 +1446,13 @@ describe("Commit race and intent convergence chaos", () => {
                     expect(messages).toHaveLength(50);
                     expect(new Set(messages.map(({ id }) => id))).toHaveLength(50);
                     await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
-                    const final = await fixture.alice.client.session(fixture.session.id);
+                    const final = await fixture.alice.client.session(ctx, fixture.session.id);
                     return {
                         labels: messages.map(({ text }) => text),
                         schedule,
                         policies: final?.policies,
                         members: final?.members.map(encodeBase64Url).sort().length,
-                        issues: (await fixture.alice.client.issues()).map(({ code }) => code),
+                        issues: (await fixture.alice.client.issues(ctx)).map(({ code }) => code),
                     };
                 } finally {
                     await closeFixture(fixture);
@@ -1426,29 +1481,32 @@ describe("Commit race and intent convergence chaos", () => {
             const frank = await addActor(fixture, "frank");
             try {
                 const parent = publicSession(
-                    await fixture.alice.client.session(fixture.session.id),
-                );
-                expect(publicSession(await fixture.bob.client.session(fixture.session.id))).toEqual(
-                    parent,
+                    await fixture.alice.client.session(ctx, fixture.session.id),
                 );
                 expect(
-                    publicSession(await fixture.carol.client.session(fixture.session.id)),
+                    publicSession(await fixture.bob.client.session(ctx, fixture.session.id)),
                 ).toEqual(parent);
-                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
-                expect(await fixture.erin.client.session(fixture.session.id)).toBeUndefined();
-                expect(await frank.client.session(fixture.session.id)).toBeUndefined();
+                expect(
+                    publicSession(await fixture.carol.client.session(ctx, fixture.session.id)),
+                ).toEqual(parent);
+                expect(await fixture.dave.client.session(ctx, fixture.session.id)).toBeUndefined();
+                expect(await fixture.erin.client.session(ctx, fixture.session.id)).toBeUndefined();
+                expect(await frank.client.session(ctx, fixture.session.id)).toBeUndefined();
 
                 await fixture.alice.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.erin.client.createKeyPackage(),
+                    await fixture.erin.client.createKeyPackage(ctx),
                 );
                 await fixture.carol.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await frank.client.createKeyPackage(),
+                    await frank.client.createKeyPackage(ctx),
                 );
                 const candidates = [fixture.alice, fixture.bob, fixture.carol] as const;
                 const pending = await stageMany(fixture, candidates);
@@ -1483,10 +1541,10 @@ describe("Commit race and intent convergence chaos", () => {
                     80,
                 );
                 const terminal = publicSession(
-                    await fixture.alice.client.session(fixture.session.id),
+                    await fixture.alice.client.session(ctx, fixture.session.id),
                 );
                 for (const actor of participants) {
-                    const session = await actor.client.session(fixture.session.id);
+                    const session = await actor.client.session(ctx, fixture.session.id);
                     expect(publicSession(session)).toEqual(terminal);
                     for (const joiner of [fixture.dave, fixture.erin, frank]) {
                         expect(memberCount(session, joiner)).toBe(1);
@@ -1494,7 +1552,7 @@ describe("Commit race and intent convergence chaos", () => {
                 }
                 expect(
                     (
-                        await Promise.all(candidates.map(async (actor) => actor.client.issues()))
+                        await Promise.all(candidates.map(async (actor) => actor.client.issues(ctx)))
                     ).flatMap((issues) => issues.filter(({ operationId }) => operationId)),
                 ).toEqual([]);
                 await assertNoOrphans(participants);
@@ -1514,29 +1572,32 @@ describe("Commit race and intent convergence chaos", () => {
                 await addAndActivate(fixture, fixture.alice, fixture.dave);
                 const current = [fixture.alice, fixture.bob, fixture.carol, fixture.dave] as const;
                 const parent = publicSession(
-                    await fixture.alice.client.session(fixture.session.id),
+                    await fixture.alice.client.session(ctx, fixture.session.id),
                 );
                 for (const actor of current) {
-                    expect(publicSession(await actor.client.session(fixture.session.id))).toEqual(
-                        parent,
-                    );
+                    expect(
+                        publicSession(await actor.client.session(ctx, fixture.session.id)),
+                    ).toEqual(parent);
                 }
 
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await frank.client.createKeyPackage(),
+                    await frank.client.createKeyPackage(ctx),
                 );
                 await fixture.carol.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.erin.client.createKeyPackage(),
+                    await fixture.erin.client.createKeyPackage(ctx),
                 );
                 await fixture.dave.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await frank.client.createKeyPackage(),
+                    await frank.client.createKeyPackage(ctx),
                 );
                 const pending = await stageMany(fixture, current);
                 const accepted = await releaseMany(
@@ -1566,7 +1627,7 @@ describe("Commit race and intent convergence chaos", () => {
                     participants.map(({ name }) => name),
                     100,
                 );
-                const terminal = await fixture.alice.client.session(fixture.session.id);
+                const terminal = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
@@ -1574,7 +1635,7 @@ describe("Commit race and intent convergence chaos", () => {
                 });
                 expect(terminal?.members).toHaveLength(6);
                 for (const actor of participants.filter(({ name }) => name !== "frank")) {
-                    const session = await actor.client.session(fixture.session.id);
+                    const session = await actor.client.session(ctx, fixture.session.id);
                     expect(publicSession(session), `${actor.name} terminal snapshot`).toEqual(
                         publicSession(terminal),
                     );
@@ -1582,7 +1643,7 @@ describe("Commit race and intent convergence chaos", () => {
                     expect(memberCount(session, frank)).toBe(1);
                 }
                 await assertNoOrphans(participants);
-                const frankTerminal = await frank.client.session(fixture.session.id);
+                const frankTerminal = await frank.client.session(ctx, fixture.session.id);
                 expect(frankTerminal?.status).toBe("active");
                 expect(memberCount(frankTerminal, frank)).toBe(1);
                 expect(memberCount(frankTerminal, fixture.erin)).toBe(1);
@@ -1603,15 +1664,16 @@ describe("Commit race and intent convergence chaos", () => {
             const resets: MurmurResetEvent[] = [];
             const bobIdentity = fixture.bob.client.identity;
             try {
-                const parent = await fixture.bob.client.session(fixture.session.id);
+                const parent = await fixture.bob.client.session(ctx, fixture.session.id);
                 expect(parent?.status).toBe("active");
                 expect(memberCount(parent, fixture.carol)).toBe(1);
 
                 await fixture.bob.client.removeMember(
+                    ctx,
                     fixture.session.id,
                     fixture.carol.client.accountKey,
                 );
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
@@ -1625,6 +1687,7 @@ describe("Commit race and intent convergence chaos", () => {
                     fetch: fixture.fetch,
                 });
                 await transport.publish(
+                    ctx,
                     createSignedDelivery(
                         expiringSender,
                         [fixture.bob.client.deviceKey],
@@ -1643,19 +1706,20 @@ describe("Commit race and intent convergence chaos", () => {
                 });
                 fixture.gate.disarm();
                 await expect(
-                    fixture.bob.client.synchronize({ waitMilliseconds: 0 }),
+                    fixture.bob.client.synchronize(ctx, { waitMilliseconds: 0 }),
                 ).rejects.toMatchObject({
                     name: "MurmurResetRequiredError",
                     committed: false,
                 } satisfies Partial<MurmurResetRequiredError>);
-                expect(await fixture.bob.store.get("murmur/reset/v1/pending")).toBeDefined();
-                expect(await fixture.bob.client.session(fixture.session.id)).toBeDefined();
+                expect(await fixture.bob.store.get(ctx, "murmur/reset/v1/pending")).toBeDefined();
+                expect(await fixture.bob.client.session(ctx, fixture.session.id)).toBeDefined();
 
                 await expect(
                     fixture.bob.client.synchronize(
+                        ctx,
                         { waitMilliseconds: 0 },
                         {
-                            onReset: (reset) => {
+                            onReset: (_ctx, reset) => {
                                 resets.push(reset);
                             },
                         },
@@ -1668,10 +1732,11 @@ describe("Commit race and intent convergence chaos", () => {
                 expect(resets[0]!.sessions).toHaveLength(1);
                 expect(equalBytes(resets[0]!.sessions[0]!.id, fixture.session.id)).toBe(true);
                 expect(equalBytes(fixture.bob.client.identity, bobIdentity)).toBe(true);
-                expect(await fixture.bob.client.session(fixture.session.id)).toBeUndefined();
+                expect(await fixture.bob.client.session(ctx, fixture.session.id)).toBeUndefined();
                 await assertNoOrphans([fixture.bob]);
 
                 await fixture.alice.client.send(
+                    ctx,
                     fixture.session.id,
                     utf8Encode("refresh restored race roster"),
                 );
@@ -1688,17 +1753,17 @@ describe("Commit race and intent convergence chaos", () => {
                         }
                     }
                 }
-                await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
-                    { status: "pending" },
-                );
-                await fixture.bob.client.activateSession(fixture.session.id);
-                await expect(fixture.bob.client.session(fixture.session.id)).resolves.toMatchObject(
-                    {
-                        status: "active",
-                    },
-                );
+                await expect(
+                    fixture.bob.client.session(ctx, fixture.session.id),
+                ).resolves.toMatchObject({ status: "pending" });
+                await fixture.bob.client.activateSession(ctx, fixture.session.id);
+                await expect(
+                    fixture.bob.client.session(ctx, fixture.session.id),
+                ).resolves.toMatchObject({
+                    status: "active",
+                });
                 await settle(fixture, fixture.session.id, ["alice", "carol", "bob"], 80);
-                const terminal = await fixture.alice.client.session(fixture.session.id);
+                const terminal = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
@@ -1710,9 +1775,9 @@ describe("Commit race and intent convergence chaos", () => {
                     "PRODUCT FINDING RACE-19/I06/I15/I24: the relay-first winner must retain Carol after restored-device convergence",
                 ).toBe(1);
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol]) {
-                    expect(publicSession(await actor.client.session(fixture.session.id))).toEqual(
-                        publicSession(terminal),
-                    );
+                    expect(
+                        publicSession(await actor.client.session(ctx, fixture.session.id)),
+                    ).toEqual(publicSession(terminal));
                 }
                 await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
             } finally {
@@ -1728,12 +1793,13 @@ describe("Commit race and intent convergence chaos", () => {
         async () => {
             const fixture = await activeFixture();
             try {
-                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                expect(await fixture.dave.client.session(ctx, fixture.session.id)).toBeUndefined();
                 await fixture.bob.client.addMember(
+                    ctx,
                     fixture.session.id,
-                    await fixture.dave.client.createKeyPackage(),
+                    await fixture.dave.client.createKeyPackage(ctx),
                 );
-                await fixture.alice.client.setPolicies(fixture.session.id, {
+                await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                 });
@@ -1744,7 +1810,7 @@ describe("Commit race and intent convergence chaos", () => {
                 ]);
                 expect(winner.candidateId).not.toBe(loser.candidateId);
                 await synchronize(fixture.dave);
-                expect(await fixture.dave.client.session(fixture.session.id)).toBeUndefined();
+                expect(await fixture.dave.client.session(ctx, fixture.session.id)).toBeUndefined();
                 expect(
                     fixture.bob.transport.publications.filter(
                         ({ ciphertext }) => ciphertext[0] === 1,
@@ -1752,19 +1818,19 @@ describe("Commit race and intent convergence chaos", () => {
                 ).toHaveLength(0);
 
                 await settle(fixture, fixture.session.id, ["carol", "alice", "bob", "dave"], 80);
-                expect(await fixture.dave.client.session(fixture.session.id)).toMatchObject({
+                expect(await fixture.dave.client.session(ctx, fixture.session.id)).toMatchObject({
                     status: "pending",
                 });
                 await activateIfPending(fixture.dave, fixture.session.id);
                 await settle(fixture, fixture.session.id, ["alice", "bob", "carol", "dave"], 80);
-                const terminal = await fixture.alice.client.session(fixture.session.id);
+                const terminal = await fixture.alice.client.session(ctx, fixture.session.id);
                 expect(terminal?.policies).toEqual({
                     adminsAssignAdmins: false,
                     anyoneCanAddMembers: true,
                     sendPolicy: "everyone",
                 });
                 for (const actor of [fixture.alice, fixture.bob, fixture.carol, fixture.dave]) {
-                    const session = await actor.client.session(fixture.session.id);
+                    const session = await actor.client.session(ctx, fixture.session.id);
                     expect(publicSession(session)).toEqual(publicSession(terminal));
                     expect(memberCount(session, fixture.dave)).toBe(1);
                 }
@@ -1789,13 +1855,14 @@ describe("Commit race and intent convergence chaos", () => {
                 const fixture = await activeFixture();
                 try {
                     const parent = publicSession(
-                        await fixture.bob.client.session(fixture.session.id),
+                        await fixture.bob.client.session(ctx, fixture.session.id),
                     );
                     expect(parent).toEqual(
-                        publicSession(await fixture.alice.client.session(fixture.session.id)),
+                        publicSession(await fixture.alice.client.session(ctx, fixture.session.id)),
                     );
                     const bobIdentity = fixture.bob.client.identity;
                     await fixture.bob.client.removeMember(
+                        ctx,
                         fixture.session.id,
                         fixture.carol.client.accountKey,
                     );
@@ -1810,17 +1877,17 @@ describe("Commit race and intent convergence chaos", () => {
                     await staged;
                     fixture.gate.disarm();
                     for (const label of labels) {
-                        await fixture.bob.client.send(fixture.session.id, utf8Encode(label));
+                        await fixture.bob.client.send(ctx, fixture.session.id, utf8Encode(label));
                     }
 
-                    await fixture.alice.client.setPolicies(fixture.session.id, {
+                    await fixture.alice.client.setPolicies(ctx, fixture.session.id, {
                         adminsAssignAdmins: false,
                         anyoneCanAddMembers: true,
                     });
                     await synchronize(fixture.alice);
                     await synchronize(fixture.alice);
 
-                    const indexes = await fixture.bob.store.scan(POST_COMMIT_OUTBOX_PREFIX, {
+                    const indexes = await fixture.bob.store.scan(ctx, POST_COMMIT_OUTBOX_PREFIX, {
                         limit: STORE_LIMIT,
                     });
                     const oldIds = [...indexes.keys()]
@@ -1852,7 +1919,7 @@ describe("Commit race and intent convergence chaos", () => {
                     for (const actor of [fixture.alice, fixture.bob]) {
                         expect(new Set(actor.updates.map(({ id }) => id)).size).toBe(labels.length);
                     }
-                    const terminal = await fixture.alice.client.session(fixture.session.id);
+                    const terminal = await fixture.alice.client.session(ctx, fixture.session.id);
                     expect(terminal?.policies).toEqual({
                         adminsAssignAdmins: false,
                         anyoneCanAddMembers: true,
@@ -1860,7 +1927,7 @@ describe("Commit race and intent convergence chaos", () => {
                     });
                     expect(memberCount(terminal, fixture.carol)).toBe(0);
                     expect(
-                        publicSession(await fixture.bob.client.session(fixture.session.id)),
+                        publicSession(await fixture.bob.client.session(ctx, fixture.session.id)),
                     ).toEqual(publicSession(terminal));
                     await assertNoOrphans([fixture.alice, fixture.bob, fixture.carol]);
                 } finally {

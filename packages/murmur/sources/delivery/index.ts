@@ -24,7 +24,7 @@ export {
     MURMUR_INTERNAL_INBOX_HANDLER,
     TerminalInboxDeliveryError,
 } from "./impl/inboxProcessor.js";
-export { StagedStoreTransaction } from "./impl/storeTransactionStage.js";
+export { StagedMurmurStore } from "./impl/storeTransactionStage.js";
 export {
     containsRecipient,
     createSignedDelivery,

@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import { RelayService, SqliteRelayStore, createRelayFetchHandler } from "@slopus/murmur-relay";
 import { describe, expect, test } from "vitest";
 import {
@@ -13,10 +14,12 @@ import {
     destroyIdentity,
     generateIdentityKeyPair,
 } from "../../crypto/index.js";
-import { MemoryMurmurStore, type MurmurStore, type StoreTransaction } from "../../storage/index.js";
+import { MemoryMurmurStore, type MurmurStore } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode, zeroBytes } from "../../utils/index.js";
 import { MurmurClient, type MurmurSessionLimits, type MurmurUpdate } from "../index.js";
 import { decodeSessionRecord, encodeSessionRecord } from "../impl/sessionRecords.js";
+
+const ctx = createRootContext().named("test");
 
 const NOW = 1_700_000_000_000;
 
@@ -25,7 +28,7 @@ function relayFetch(relay: RelayService): DeliveryFetch {
         requireRemoteAddress: false,
         defaultAdmissionPrincipal: "session-tests",
     });
-    return async (input, init): Promise<Response> => handler(new Request(input, init));
+    return async (_ctx, input, init): Promise<Response> => handler(new Request(input, init));
 }
 
 async function client(
@@ -33,7 +36,7 @@ async function client(
     store = new MemoryMurmurStore(),
     limits: MurmurSessionLimits = {},
 ): Promise<MurmurClient> {
-    return MurmurClient.open({
+    return MurmurClient.open(ctx, {
         relay: "https://relay.test",
         fetch: relayFetch(relay),
         store,
@@ -47,7 +50,7 @@ async function activate(
     id: Uint8Array,
     process?: (update: MurmurUpdate) => void | Promise<void>,
 ): Promise<number> {
-    await value.activateSession(id);
+    await value.activateSession(ctx, id);
     return process === undefined ? 0 : consume(value, process);
 }
 
@@ -57,9 +60,10 @@ async function consume(
 ): Promise<number> {
     let consumed = 0;
     await value.synchronize(
+        ctx,
         { waitMilliseconds: 0 },
         {
-            onUpdates: async (updates) => {
+            onUpdates: async (_ctx, updates) => {
                 for (const update of updates) await process(update);
                 consumed += updates.length;
             },
@@ -69,7 +73,7 @@ async function consume(
 }
 
 async function prefixCount(store: MurmurStore, prefix: string): Promise<number> {
-    const entries = await store.scan(prefix, { limit: 256 });
+    const entries = await store.scan(ctx, prefix, { limit: 256 });
     try {
         return entries.size;
     } finally {
@@ -90,10 +94,10 @@ describe("stateful MLS sessions", () => {
         const changed = new Promise<Awaited<ReturnType<MurmurClient["devices"]>>>((resolve) => {
             report = resolve;
         });
-        const realtime = value.sync({
+        const realtime = value.sync(ctx, {
             abort: controller.signal,
-            onConnected: connect,
-            onDevicesChanged: report,
+            onConnected: () => connect(),
+            onDevicesChanged: (_ctx, devices) => report(devices),
         });
         try {
             await connected;
@@ -106,7 +110,7 @@ describe("stateful MLS sessions", () => {
         } finally {
             controller.abort();
             await realtime;
-            value.close();
+            value.close(ctx);
             await relay.close();
         }
     });
@@ -119,40 +123,42 @@ describe("stateful MLS sessions", () => {
         });
         let dropFirstConfirmation = true;
         const transport: DeliveryTransport = {
-            publish: (delivery, signal) => base.publish(delivery, signal),
-            deleteSession: (delivery, signal) => base.deleteSession(delivery, signal),
-            deleteAccount: async (delivery, signal) => {
-                await base.deleteAccount(delivery, signal);
+            publish: (_ctx, delivery, signal) => base.publish(ctx, delivery, signal),
+            deleteSession: (_ctx, delivery, signal) => base.deleteSession(ctx, delivery, signal),
+            deleteAccount: async (_ctx, delivery, signal) => {
+                await base.deleteAccount(ctx, delivery, signal);
                 if (dropFirstConfirmation) {
                     dropFirstConfirmation = false;
                     throw new DeliveryTransportError(0, "connection_lost");
                 }
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
-            uploadDirectoryPrekeys: (delivery, signal) =>
-                base.uploadDirectoryPrekeys(delivery, signal),
-            claimDirectory: (account, ticket, signal) =>
-                base.claimDirectory(account, ticket, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
+            uploadDirectoryPrekeys: (_ctx, delivery, signal) =>
+                base.uploadDirectoryPrekeys(ctx, delivery, signal),
+            claimDirectory: (_ctx, account, ticket, signal) =>
+                base.claimDirectory(ctx, account, ticket, signal),
         };
-        const value = await MurmurClient.open({ transport, store, now: () => NOW });
+        const value = await MurmurClient.open(ctx, { transport, store, now: () => NOW });
         const account = value.identity;
         try {
-            await store.set("application/unrelated", new Uint8Array([1, 2, 3]));
-            await expect(value.deleteAccount()).rejects.toMatchObject({
+            await store.set(ctx, "application/unrelated", new Uint8Array([1, 2, 3]));
+            await expect(value.deleteAccount(ctx)).rejects.toMatchObject({
                 code: "connection_lost",
             });
             expect(await prefixCount(store, "")).toBeGreaterThan(0);
             expect(await relay.readDeviceRoster(account)).toBeUndefined();
 
-            await expect(value.deleteAccount()).resolves.toBeUndefined();
+            await expect(value.deleteAccount(ctx)).resolves.toBeUndefined();
             expect(await prefixCount(store, "")).toBe(0);
             expect(() => value.identity).toThrow("closed");
-            await expect(value.sessions()).rejects.toThrow("closed");
+            await expect(value.sessions(ctx)).rejects.toThrow("closed");
         } finally {
-            value.close();
+            value.close(ctx);
             await relay.close();
         }
     });
@@ -165,16 +171,18 @@ describe("stateful MLS sessions", () => {
             fetch: relayFetch(relay),
         });
         const recording: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 published.push(delivery);
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        let alice = await MurmurClient.open({
+        let alice = await MurmurClient.open(ctx, {
             transport: recording,
             store: aliceStore,
             now: () => NOW,
@@ -182,46 +190,46 @@ describe("stateful MLS sessions", () => {
         const bobStore = new MemoryMurmurStore();
         const bob = await client(relay, bobStore);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("offline group"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            const first = await alice.send(session.id, utf8Encode("first offline"));
-            const second = await alice.send(session.id, utf8Encode("second offline"));
+            const first = await alice.send(ctx, session.id, utf8Encode("first offline"));
+            const second = await alice.send(ctx, session.id, utf8Encode("second offline"));
 
             expect(published).toEqual([]);
-            expect(await alice.session(session.id)).toMatchObject({ status: "creating" });
+            expect(await alice.session(ctx, session.id)).toMatchObject({ status: "creating" });
             expect(
                 (
-                    await aliceStore.scan("murmur/session-outbox/", {
+                    await aliceStore.scan(ctx, "murmur/session-outbox/", {
                         limit: 10,
                     })
                 ).size,
             ).toBe(5);
             expect(
                 (
-                    await aliceStore.scan("murmur/post-commit-outboxes/", {
+                    await aliceStore.scan(ctx, "murmur/post-commit-outboxes/", {
                         limit: 10,
                     })
                 ).size,
             ).toBe(3);
 
             const aliceIdentity = alice.deviceKey;
-            alice.close();
-            alice = await MurmurClient.open({
+            alice.close(ctx);
+            alice = await MurmurClient.open(ctx, {
                 transport: recording,
                 store: aliceStore,
                 now: () => NOW,
             });
 
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 3,
                 pendingOutboxes: 3,
                 transientPublicationFailures: 0,
                 terminalPublicationFailures: 0,
             });
             expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([3, 1, 2]);
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 3,
                 pendingOutboxes: 0,
                 transientPublicationFailures: 0,
@@ -244,8 +252,8 @@ describe("stateful MLS sessions", () => {
                 ),
             );
 
-            await bob.synchronize({ waitMilliseconds: 0 });
-            expect(await bob.session(session.id)).toMatchObject({ status: "pending" });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await bob.session(ctx, session.id)).toMatchObject({ status: "pending" });
             const received: string[] = [];
             expect(
                 await activate(bob, session.id, async (update) => {
@@ -254,8 +262,8 @@ describe("stateful MLS sessions", () => {
             ).toBe(2);
             expect(received).toEqual(["first offline", "second offline"]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -271,12 +279,12 @@ describe("stateful MLS sessions", () => {
         let bobRealtime: Promise<void> | undefined;
         let resumed: Promise<void> | undefined;
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("realtime SSE"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
             const received: string[] = [];
@@ -286,16 +294,16 @@ describe("stateful MLS sessions", () => {
             });
             let connected = 0;
             let disconnected = 0;
-            aliceRealtime = alice.sync({ abort: aliceController.signal });
-            bobRealtime = bob.sync({
+            aliceRealtime = alice.sync(ctx, { abort: aliceController.signal });
+            bobRealtime = bob.sync(ctx, {
                 abort: bobController.signal,
-                onConnected: () => {
+                onConnected: (_ctx) => {
                     connected += 1;
                 },
-                onDisconnected: () => {
+                onDisconnected: (_ctx) => {
                     disconnected += 1;
                 },
-                onUpdates: async (updates) => {
+                onUpdates: async (_ctx, updates) => {
                     for (const update of updates) {
                         received.push(utf8Decode(update.bytes));
                     }
@@ -305,8 +313,8 @@ describe("stateful MLS sessions", () => {
                     }
                 },
             });
-            await alice.send(session.id, utf8Encode("first"));
-            await alice.send(session.id, utf8Encode("second"));
+            await alice.send(ctx, session.id, utf8Encode("first"));
+            await alice.send(ctx, session.id, utf8Encode("second"));
             let timeout: ReturnType<typeof setTimeout> | undefined;
             try {
                 await Promise.race([
@@ -329,9 +337,9 @@ describe("stateful MLS sessions", () => {
             const secondComplete = new Promise<void>((resolve) => {
                 finishSecond = resolve;
             });
-            resumed = bob.sync({
+            resumed = bob.sync(ctx, {
                 abort: resumedController.signal,
-                onUpdates: async (updates) => {
+                onUpdates: async (_ctx, updates) => {
                     for (const update of updates) {
                         received.push(utf8Decode(update.bytes));
                     }
@@ -367,8 +375,8 @@ describe("stateful MLS sessions", () => {
                     (value): value is Promise<void> => value !== undefined,
                 ),
             );
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -378,31 +386,32 @@ describe("stateful MLS sessions", () => {
         const alice = await client(relay);
         const bob = await client(relay);
         try {
-            const first = await alice.createSession({
+            const first = await alice.createSession(ctx, {
                 descriptor: utf8Encode("first session"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await bob.activateSession(first.id);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await bob.activateSession(ctx, first.id);
 
-            const second = await alice.createSession({
+            const second = await alice.createSession(ctx, {
                 descriptor: utf8Encode("second session"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await bob.activateSession(second.id);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await bob.activateSession(ctx, second.id);
 
-            await alice.send(first.id, utf8Encode("first update"));
-            await alice.send(second.id, utf8Encode("second update"));
-            await alice.synchronize();
+            await alice.send(ctx, first.id, utf8Encode("first update"));
+            await alice.send(ctx, second.id, utf8Encode("second update"));
+            await alice.synchronize(ctx);
 
             const batches: (readonly MurmurUpdate[])[] = [];
             await bob.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (updates) => {
+                    onUpdates: async (_ctx, updates) => {
                         batches.push(updates);
                     },
                 },
@@ -417,11 +426,11 @@ describe("stateful MLS sessions", () => {
                 encodeBase64Url(second.id),
             ]);
             expect(batches[0]![0]!.id < batches[0]![1]!.id).toBe(true);
-            expect(await bob.session(first.id)).toMatchObject({ bufferedEvents: 0 });
-            expect(await bob.session(second.id)).toMatchObject({ bufferedEvents: 0 });
+            expect(await bob.session(ctx, first.id)).toMatchObject({ bufferedEvents: 0 });
+            expect(await bob.session(ctx, second.id)).toMatchObject({ bufferedEvents: 0 });
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -432,35 +441,35 @@ describe("stateful MLS sessions", () => {
         const bobStore = new MemoryMurmurStore();
         const bob = await client(relay, bobStore);
         try {
-            const bobKeyPackage = await bob.createKeyPackage();
-            const created = await alice.createSession({
+            const bobKeyPackage = await bob.createKeyPackage(ctx);
+            const created = await alice.createSession(ctx, {
                 descriptor: utf8Encode("opaque descriptor"),
                 members: [bobKeyPackage],
             });
 
-            await alice.synchronize();
-            await bob.synchronize();
-            const pending = await bob.session(created.id);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            const pending = await bob.session(ctx, created.id);
             expect(pending).toMatchObject({
                 status: "pending",
                 bufferedEvents: 0,
             });
             expect(utf8Decode(pending!.descriptor)).toBe("opaque descriptor");
 
-            await expect(bob.send(created.id, utf8Encode("from pending"))).resolves.toEqual(
+            await expect(bob.send(ctx, created.id, utf8Encode("from pending"))).resolves.toEqual(
                 expect.any(String),
             );
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             const aliceReceived: string[] = [];
             await consume(alice, async (event) => {
                 aliceReceived.push(utf8Decode(event.bytes));
             });
             expect(aliceReceived).toEqual(["from pending"]);
 
-            await alice.send(created.id, utf8Encode("hello"));
-            await alice.synchronize();
-            await bob.synchronize();
-            expect(await bob.session(created.id)).toMatchObject({
+            await alice.send(ctx, created.id, utf8Encode("hello"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, created.id)).toMatchObject({
                 status: "pending",
                 bufferedEvents: 2,
             });
@@ -468,13 +477,13 @@ describe("stateful MLS sessions", () => {
             const received: string[] = [];
             await activate(bob, created.id, async (event) => {
                 received.push(utf8Decode(event.bytes));
-                await bobStore.set("application/last", event.bytes);
+                await bobStore.set(ctx, "application/last", event.bytes);
             });
             expect(received).toEqual(["from pending", "hello"]);
-            expect(utf8Decode((await bobStore.get("application/last"))!)).toBe("hello");
+            expect(utf8Decode((await bobStore.get(ctx, "application/last"))!)).toBe("hello");
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -484,12 +493,12 @@ describe("stateful MLS sessions", () => {
         const store = new MemoryMurmurStore();
         const first = await client(relay, store);
         const identity = first.identity;
-        first.close();
+        first.close(ctx);
         const reopened = await client(relay, store);
         try {
             expect(reopened.identity).toEqual(identity);
         } finally {
-            reopened.close();
+            reopened.close(ctx);
             await relay.close();
         }
     });
@@ -499,40 +508,37 @@ describe("stateful MLS sessions", () => {
         const supplied = generateIdentityKeyPair();
         let encodedIdentity: Uint8Array | undefined;
         const store: MurmurStore = {
-            get: (key) => backing.get(key),
-            set: (key, value) => backing.set(key, value),
-            delete: (key) => backing.delete(key),
-            list: (prefix) => backing.list(prefix),
-            scan: (prefix, options) => backing.scan(prefix, options),
-            transaction: async <Result>(
-                operation: (transaction: StoreTransaction) => Promise<Result>,
+            get: (storeContext, key) => backing.get(storeContext, key),
+            set: (storeContext, key, value) => {
+                encodedIdentity = value;
+                return backing.set(storeContext, key, value);
+            },
+            delete: (storeContext, key) => backing.delete(storeContext, key),
+            list: (storeContext, prefix) => backing.list(storeContext, prefix),
+            scan: (storeContext, prefix, options) => backing.scan(storeContext, prefix, options),
+            tx: async <Result>(
+                transactionContext: Context,
+                operation: (ctx: Context) => Promise<Result>,
             ): Promise<Result> =>
-                backing.transaction(async (transaction) => {
-                    const rejecting: StoreTransaction = {
-                        ...transaction,
-                        set: async (key, value) => {
-                            encodedIdentity = value;
-                            await transaction.set(key, value);
-                        },
-                    };
-                    await operation(rejecting);
+                backing.tx(transactionContext, async (transaction) => {
+                    await operation(transaction);
                     throw new Error("injected commit rejection");
                 }),
         };
         const transport: DeliveryTransport = {
-            publish: async () => {
+            publish: async (_ctx) => {
                 throw new Error("unused");
             },
-            read: async () => {
+            read: async (_ctx) => {
                 throw new Error("unused");
             },
-            acknowledge: async () => {
+            acknowledge: async (_ctx) => {
                 throw new Error("unused");
             },
         };
         try {
             await expect(
-                MurmurClient.open({
+                MurmurClient.open(ctx, {
                     identity: supplied,
                     store,
                     transport,
@@ -553,91 +559,91 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("group"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            await alice.synchronize();
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize();
-            await carol.synchronize();
-            expect((await alice.session(session.id))?.members).toHaveLength(3);
-            expect((await bob.session(session.id))?.members).toHaveLength(3);
-            expect((await carol.session(session.id))?.status).toBe("pending");
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            await alice.synchronize(ctx);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx);
+            await carol.synchronize(ctx);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await carol.session(ctx, session.id))?.status).toBe("pending");
             await activate(carol, session.id);
 
-            await bob.send(session.id, utf8Encode("from bob"));
-            await bob.synchronize();
-            await alice.synchronize();
-            await carol.synchronize();
+            await bob.send(ctx, session.id, utf8Encode("from bob"));
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
+            await carol.synchronize(ctx);
             const carolEvents: string[] = [];
             await consume(carol, async (event) => {
                 carolEvents.push(utf8Decode(event.bytes));
             });
             expect(carolEvents).toEqual(["from bob"]);
 
-            await expect(bob.removeMember(session.id, carol.identity)).rejects.toThrow(
+            await expect(bob.removeMember(ctx, session.id, carol.identity)).rejects.toThrow(
                 "Only an admin",
             );
-            await alice.grantAdmin(session.id, bob.identity);
-            await alice.synchronize();
-            await bob.synchronize();
-            expect((await bob.session(session.id))?.admins).toContainEqual(bob.identity);
+            await alice.grantAdmin(ctx, session.id, bob.identity);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            expect((await bob.session(ctx, session.id))?.admins).toContainEqual(bob.identity);
 
-            await expect(bob.grantAdmin(session.id, carol.identity)).rejects.toThrow(
+            await expect(bob.grantAdmin(ctx, session.id, carol.identity)).rejects.toThrow(
                 "may not grant admin",
             );
-            await alice.setPolicies(session.id, {
+            await alice.setPolicies(ctx, session.id, {
                 adminsAssignAdmins: true,
                 anyoneCanAddMembers: false,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
 
-            await bob.grantAdmin(session.id, carol.identity);
+            await bob.grantAdmin(ctx, session.id, carol.identity);
             for (
                 let cycle = 0;
                 cycle < 8 &&
-                !(await alice.session(session.id))?.admins.some(
+                !(await alice.session(ctx, session.id))?.admins.some(
                     (admin) => encodeBase64Url(admin) === encodeBase64Url(carol.identity),
                 );
                 cycle += 1
             ) {
-                await bob.synchronize({ waitMilliseconds: 0 });
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await carol.synchronize({ waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await carol.synchronize(ctx, { waitMilliseconds: 0 });
             }
-            expect((await alice.session(session.id))?.admins).toContainEqual(carol.identity);
-            await expect(bob.revokeAdmin(session.id, carol.identity)).rejects.toThrow(
+            expect((await alice.session(ctx, session.id))?.admins).toContainEqual(carol.identity);
+            await expect(bob.revokeAdmin(ctx, session.id, carol.identity)).rejects.toThrow(
                 "Only the session owner",
             );
-            await alice.revokeAdmin(session.id, carol.identity);
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            expect((await bob.session(session.id))?.admins).not.toContainEqual(carol.identity);
+            await alice.revokeAdmin(ctx, session.id, carol.identity);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            expect((await bob.session(ctx, session.id))?.admins).not.toContainEqual(carol.identity);
 
-            await bob.removeMember(session.id, carol.identity);
-            await bob.synchronize();
-            await alice.synchronize();
-            await bob.synchronize();
-            await carol.synchronize();
-            expect((await alice.session(session.id))?.members).toHaveLength(2);
-            expect((await bob.session(session.id))?.members).toHaveLength(2);
-            expect(await carol.session(session.id)).toBeUndefined();
-            expect((await alice.session(session.id))?.owner).toEqual(alice.identity);
+            await bob.removeMember(ctx, session.id, carol.identity);
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await carol.synchronize(ctx);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(2);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(2);
+            expect(await carol.session(ctx, session.id)).toBeUndefined();
+            expect((await alice.session(ctx, session.id))?.owner).toEqual(alice.identity);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     }, 120_000);
@@ -650,22 +656,23 @@ describe("stateful MLS sessions", () => {
         const carol = await client(relay);
         const dave = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("unauthorized add"),
-                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
             await activate(carol, session.id);
 
             // Model a compromised client that lies to its own local authorization check.
             const stateKey = `murmur/session-states/${encodeBase64Url(session.id)}`;
-            const state = (await bobStore.get(stateKey))!;
+            const state = (await bobStore.get(ctx, stateKey))!;
             const record = decodeSessionRecord(state);
             try {
                 await bobStore.set(
+                    ctx,
                     stateKey,
                     encodeSessionRecord({
                         ...record,
@@ -678,14 +685,14 @@ describe("stateful MLS sessions", () => {
                 zeroBytes(state);
             }
 
-            await bob.addMember(session.id, await dave.createKeyPackage());
-            await expect(bob.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
+            await bob.addMember(ctx, session.id, await dave.createKeyPackage(ctx));
+            await expect(bob.synchronize(ctx, { waitMilliseconds: 0 })).resolves.toMatchObject({
                 transientPublicationFailures: 1,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
 
-            expect(await alice.session(session.id)).toMatchObject({
+            expect(await alice.session(ctx, session.id)).toMatchObject({
                 members: expect.arrayContaining([alice.identity, bob.identity, carol.identity]),
                 policies: {
                     adminsAssignAdmins: false,
@@ -693,15 +700,15 @@ describe("stateful MLS sessions", () => {
                     sendPolicy: "everyone",
                 },
             });
-            expect((await alice.session(session.id))?.members).toHaveLength(3);
-            expect((await carol.session(session.id))?.members).toHaveLength(3);
-            expect(await alice.issues()).toEqual([]);
-            expect(await carol.issues()).toEqual([]);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
+            expect(await alice.issues(ctx)).toEqual([]);
+            expect(await carol.issues(ctx)).toEqual([]);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
-            dave.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
+            dave.close(ctx);
             await relay.close();
         }
     });
@@ -716,10 +723,11 @@ describe("stateful MLS sessions", () => {
         let aliceDeviceIdentity: ReturnType<typeof decodeIdentityRoot> | undefined;
         let tamperCreation = true;
         const transport: DeliveryTransport = {
-            publish: (delivery, signal) => {
+            publish: (_ctx, delivery, signal) => {
                 if (tamperCreation && delivery.sessionControl?.type === "create") {
                     tamperCreation = false;
                     return base.publish(
+                        ctx,
                         createSignedDelivery(aliceDeviceIdentity!, [], delivery.ciphertext, {
                             id: delivery.id,
                             createdAt: delivery.createdAt,
@@ -738,24 +746,26 @@ describe("stateful MLS sessions", () => {
                         signal,
                     );
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
-            uploadDirectoryPrekeys: (delivery, signal) =>
-                base.uploadDirectoryPrekeys(delivery, signal),
-            claimDirectory: (account, ticket, signal) =>
-                base.claimDirectory(account, ticket, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
+            uploadDirectoryPrekeys: (_ctx, delivery, signal) =>
+                base.uploadDirectoryPrekeys(ctx, delivery, signal),
+            claimDirectory: (_ctx, account, ticket, signal) =>
+                base.claimDirectory(ctx, account, ticket, signal),
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             identity: aliceIdentity,
             transport,
             store: aliceStore,
             now: () => NOW,
         });
-        const storedDevice = await aliceStore.get("murmur/identity/root");
+        const storedDevice = await aliceStore.get(ctx, "murmur/identity/root");
         if (storedDevice === undefined) throw new Error("Missing test device identity");
         try {
             aliceDeviceIdentity = decodeIdentityRoot(storedDevice);
@@ -765,12 +775,12 @@ describe("stateful MLS sessions", () => {
         const bobStore = new MemoryMurmurStore();
         const bob = await client(relay, bobStore);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("bootstrap visible mismatch"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            const outcome = await bob.synchronize();
+            await alice.synchronize(ctx);
+            const outcome = await bob.synchronize(ctx);
 
             expect(outcome.issues).toEqual(
                 expect.arrayContaining([
@@ -780,11 +790,11 @@ describe("stateful MLS sessions", () => {
                     }),
                 ]),
             );
-            expect(await bob.session(session.id)).toBeUndefined();
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
             expect(await prefixCount(bobStore, "murmur/pending-membership-controls/")).toBe(0);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             if (aliceDeviceIdentity !== undefined) destroyIdentity(aliceDeviceIdentity);
             destroyIdentity(aliceIdentity);
             await relay.close();
@@ -802,7 +812,7 @@ describe("stateful MLS sessions", () => {
         let bobDeviceIdentity: ReturnType<typeof decodeIdentityRoot> | undefined;
         let tamperNextApplication = false;
         const transport: DeliveryTransport = {
-            publish: (delivery, signal) => {
+            publish: (_ctx, delivery, signal) => {
                 if (
                     tamperNextApplication &&
                     delivery.sessionControl?.type === "message" &&
@@ -810,6 +820,7 @@ describe("stateful MLS sessions", () => {
                 ) {
                     tamperNextApplication = false;
                     return base.publish(
+                        ctx,
                         createSignedDelivery(bobDeviceIdentity!, [], delivery.ciphertext, {
                             id: delivery.id,
                             createdAt: delivery.createdAt,
@@ -825,24 +836,26 @@ describe("stateful MLS sessions", () => {
                         signal,
                     );
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
-            uploadDirectoryPrekeys: (delivery, signal) =>
-                base.uploadDirectoryPrekeys(delivery, signal),
-            claimDirectory: (account, ticket, signal) =>
-                base.claimDirectory(account, ticket, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
+            uploadDirectoryPrekeys: (_ctx, delivery, signal) =>
+                base.uploadDirectoryPrekeys(ctx, delivery, signal),
+            claimDirectory: (_ctx, account, ticket, signal) =>
+                base.claimDirectory(ctx, account, ticket, signal),
         };
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             identity: bobIdentity,
             transport,
             store: bobStore,
             now: () => NOW,
         });
-        const storedDevice = await bobStore.get("murmur/identity/root");
+        const storedDevice = await bobStore.get(ctx, "murmur/identity/root");
         if (storedDevice === undefined) throw new Error("Missing test device identity");
         try {
             bobDeviceIdentity = decodeIdentityRoot(storedDevice);
@@ -850,18 +863,18 @@ describe("stateful MLS sessions", () => {
             zeroBytes(storedDevice);
         }
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("visible mismatch"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
             tamperNextApplication = true;
-            await bob.send(session.id, utf8Encode("must quarantine"));
-            await bob.synchronize();
-            const outcome = await alice.synchronize();
+            await bob.send(ctx, session.id, utf8Encode("must quarantine"));
+            await bob.synchronize(ctx);
+            const outcome = await alice.synchronize(ctx);
             expect(outcome.issues).toEqual(
                 expect.arrayContaining([
                     expect.objectContaining({
@@ -876,8 +889,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual([]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             if (bobDeviceIdentity !== undefined) destroyIdentity(bobDeviceIdentity);
             destroyIdentity(bobIdentity);
             await relay.close();
@@ -889,25 +902,25 @@ describe("stateful MLS sessions", () => {
         const alice = await client(relay);
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("leave"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
 
-            await bob.leave(session.id);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.leave(ctx, session.id);
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
 
-            expect((await alice.session(session.id))?.members).toEqual([alice.identity]);
-            expect(await bob.session(session.id)).toBeUndefined();
+            expect((await alice.session(ctx, session.id))?.members).toEqual([alice.identity]);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -919,67 +932,69 @@ describe("stateful MLS sessions", () => {
         });
         let blockBobCommit = false;
         const bobTransport: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 if (blockBobCommit && delivery.ciphertext[0] === 3) {
                     throw new DeliveryTransportError(429, "commit_blocked");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
         const alice = await client(relay);
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             transport: bobTransport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("concurrent commits"),
-                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
             await activate(carol, session.id);
 
-            await alice.grantAdmin(session.id, bob.identity);
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.grantAdmin(ctx, session.id, bob.identity);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
 
             blockBobCommit = true;
-            await bob.removeMember(session.id, carol.identity);
-            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            await bob.removeMember(ctx, session.id, carol.identity);
+            expect(await bob.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 transientPublicationFailures: 1,
             });
-            await bob.send(session.id, utf8Encode("survives losing commit"));
+            await bob.send(ctx, session.id, utf8Encode("survives losing commit"));
 
-            await alice.setPolicies(session.id, {
+            await alice.setPolicies(ctx, session.id, {
                 adminsAssignAdmins: false,
                 anyoneCanAddMembers: true,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
 
             blockBobCommit = false;
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
 
             const received: string[] = [];
             await consume(alice, async (update) => {
                 received.push(utf8Decode(update.bytes));
             });
             expect(received).toEqual(["survives losing commit"]);
-            expect(await alice.session(session.id)).toMatchObject({
+            expect(await alice.session(ctx, session.id)).toMatchObject({
                 members: expect.arrayContaining([alice.identity, bob.identity]),
                 policies: {
                     adminsAssignAdmins: false,
@@ -987,13 +1002,13 @@ describe("stateful MLS sessions", () => {
                     sendPolicy: "everyone",
                 },
             });
-            expect((await alice.session(session.id))?.members).toHaveLength(2);
-            expect((await bob.session(session.id))?.members).toHaveLength(2);
-            expect(await carol.session(session.id)).toBeUndefined();
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(2);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(2);
+            expect(await carol.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1004,29 +1019,29 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("removal generation"),
-                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
             await activate(carol, session.id);
 
-            await alice.grantAdmin(session.id, bob.identity);
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.grantAdmin(ctx, session.id, bob.identity);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
 
-            await bob.removeMember(session.id, carol.identity);
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.removeMember(ctx, session.id, carol.identity);
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
 
             // Alice has not observed Bob's removal yet, so this snapshots the old generation.
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            await alice.synchronize({ waitMilliseconds: 0 });
-            expect((await alice.session(session.id))?.members).toHaveLength(2);
-            expect(await alice.issues()).toEqual(
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(2);
+            expect(await alice.issues(ctx)).toEqual(
                 expect.arrayContaining([
                     expect.objectContaining({
                         code: "add_intent_removal_generation_advanced",
@@ -1035,23 +1050,23 @@ describe("stateful MLS sessions", () => {
                 ]),
             );
 
-            await carol.synchronize({ waitMilliseconds: 0 });
-            expect(await carol.session(session.id)).toBeUndefined();
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await carol.session(ctx, session.id)).toBeUndefined();
 
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(carol, session.id);
 
-            expect((await alice.session(session.id))?.members).toHaveLength(3);
-            expect((await bob.session(session.id))?.members).toHaveLength(3);
-            expect((await carol.session(session.id))?.members).toHaveLength(3);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1073,44 +1088,46 @@ describe("stateful MLS sessions", () => {
             const carol = await client(relay, carolStore);
             const dave = await client(relay, daveStore);
             try {
-                const session = await alice.createSession({
+                const session = await alice.createSession(ctx, {
                     descriptor: utf8Encode(`authorization loss ${authority}`),
-                    members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                    members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
                     anyoneCanAddMembers: authority === "policy",
                 });
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await bob.synchronize({ waitMilliseconds: 0 });
-                await carol.synchronize({ waitMilliseconds: 0 });
-                await bob.activateSession(session.id);
-                await carol.activateSession(session.id);
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.synchronize(ctx, { waitMilliseconds: 0 });
+                await carol.synchronize(ctx, { waitMilliseconds: 0 });
+                await bob.activateSession(ctx, session.id);
+                await carol.activateSession(ctx, session.id);
 
                 const actor = authority === "admin" ? bob : carol;
                 const actorStore = authority === "admin" ? bobStore : carolStore;
                 if (authority === "admin") {
-                    await alice.grantAdmin(session.id, bob.identity);
-                    await alice.synchronize({ waitMilliseconds: 0 });
-                    await alice.synchronize({ waitMilliseconds: 0 });
-                    await bob.synchronize({ waitMilliseconds: 0 });
-                    await carol.synchronize({ waitMilliseconds: 0 });
-                    expect((await bob.session(session.id))?.admins).toContainEqual(bob.identity);
+                    await alice.grantAdmin(ctx, session.id, bob.identity);
+                    await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                    await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                    await bob.synchronize(ctx, { waitMilliseconds: 0 });
+                    await carol.synchronize(ctx, { waitMilliseconds: 0 });
+                    expect((await bob.session(ctx, session.id))?.admins).toContainEqual(
+                        bob.identity,
+                    );
                 }
 
-                await actor.addMember(session.id, await dave.createKeyPackage());
+                await actor.addMember(ctx, session.id, await dave.createKeyPackage(ctx));
                 expect(await prefixCount(actorStore, "murmur/session-intents/")).toBe(1);
                 if (authority === "admin") {
-                    await alice.revokeAdmin(session.id, bob.identity);
+                    await alice.revokeAdmin(ctx, session.id, bob.identity);
                 } else {
-                    await alice.setPolicies(session.id, {
+                    await alice.setPolicies(ctx, session.id, {
                         adminsAssignAdmins: false,
                         anyoneCanAddMembers: false,
                     });
                 }
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await alice.synchronize({ waitMilliseconds: 0 });
-                await actor.synchronize({ waitMilliseconds: 0 });
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await alice.synchronize(ctx, { waitMilliseconds: 0 });
+                await actor.synchronize(ctx, { waitMilliseconds: 0 });
 
                 expect(await prefixCount(actorStore, "murmur/session-intents/")).toBe(0);
-                const issues = (await actor.issues()).filter(
+                const issues = (await actor.issues(ctx)).filter(
                     (issue) => issue.code === "intent_authorization_lost",
                 );
                 expect(issues).toEqual([
@@ -1121,19 +1138,19 @@ describe("stateful MLS sessions", () => {
                         operationId: expect.any(String),
                     }),
                 ]);
-                await actor.synchronize({ waitMilliseconds: 0 });
+                await actor.synchronize(ctx, { waitMilliseconds: 0 });
                 expect(
-                    (await actor.issues()).filter(
+                    (await actor.issues(ctx)).filter(
                         (issue) => issue.code === "intent_authorization_lost",
                     ),
                 ).toHaveLength(1);
-                expect((await actor.session(session.id))?.members).toHaveLength(3);
-                expect(await dave.session(session.id)).toBeUndefined();
+                expect((await actor.session(ctx, session.id))?.members).toHaveLength(3);
+                expect(await dave.session(ctx, session.id)).toBeUndefined();
             } finally {
-                alice.close();
-                bob.close();
-                carol.close();
-                dave.close();
+                alice.close(ctx);
+                bob.close(ctx);
+                carol.close(ctx);
+                dave.close(ctx);
                 await relay.close();
             }
         };
@@ -1149,59 +1166,61 @@ describe("stateful MLS sessions", () => {
         });
         let blockBobCommit = false;
         const bobTransport: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 if (blockBobCommit && delivery.ciphertext[0] === 3) {
                     throw new DeliveryTransportError(429, "commit_blocked");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
         const alice = await client(relay);
         const bobStore = new MemoryMurmurStore();
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             transport: bobTransport,
             store: bobStore,
             now: () => NOW,
         });
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("retried welcome"),
                 anyoneCanAddMembers: true,
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             expect(await prefixCount(bobStore, "murmur/admission-barriers/")).toBe(0);
             await activate(bob, session.id);
 
             blockBobCommit = true;
-            await bob.addMember(session.id, await carol.createKeyPackage());
-            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            await bob.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            expect(await bob.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 transientPublicationFailures: 1,
             });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            expect(await carol.session(session.id)).toBeUndefined();
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await carol.session(ctx, session.id)).toBeUndefined();
 
-            await alice.setPolicies(session.id, {
+            await alice.setPolicies(ctx, session.id, {
                 adminsAssignAdmins: true,
                 anyoneCanAddMembers: true,
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
 
             blockBobCommit = false;
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            expect(await carol.session(session.id)).toBeUndefined();
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await carol.session(ctx, session.id)).toBeUndefined();
 
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            expect(await carol.session(session.id)).toMatchObject({
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await carol.session(ctx, session.id)).toMatchObject({
                 status: "pending",
                 policies: {
                     adminsAssignAdmins: true,
@@ -1210,16 +1229,16 @@ describe("stateful MLS sessions", () => {
                 },
             });
 
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(carol, session.id);
-            expect((await alice.session(session.id))?.members).toHaveLength(3);
-            expect((await bob.session(session.id))?.members).toHaveLength(3);
-            expect((await carol.session(session.id))?.members).toHaveLength(3);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1231,60 +1250,62 @@ describe("stateful MLS sessions", () => {
         });
         let blockBobAdd = false;
         const bobTransport: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 if (blockBobAdd && (delivery.ciphertext[0] === 1 || delivery.ciphertext[0] === 3)) {
                     throw new DeliveryTransportError(429, "add_blocked");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
         const alice = await client(relay);
-        const bob = await MurmurClient.open({
+        const bob = await MurmurClient.open(ctx, {
             transport: bobTransport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("same account add"),
                 anyoneCanAddMembers: true,
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
 
             blockBobAdd = true;
-            await bob.addMember(session.id, await carol.createKeyPackage());
-            expect(await bob.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            await bob.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            expect(await bob.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 transientPublicationFailures: 1,
             });
 
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            expect((await carol.session(session.id))?.members).toHaveLength(3);
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
 
             blockBobAdd = false;
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(carol, session.id);
 
-            expect((await alice.session(session.id))?.members).toHaveLength(3);
-            expect((await bob.session(session.id))?.members).toHaveLength(3);
-            expect((await carol.session(session.id))?.members).toHaveLength(3);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1296,16 +1317,18 @@ describe("stateful MLS sessions", () => {
             fetch: relayFetch(relay),
         });
         const transport: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 published.push(delivery);
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
@@ -1313,20 +1336,20 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("offline add"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize({ waitMilliseconds: 0 });
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
             await activate(bob, session.id);
             published.length = 0;
 
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            const messageId = await alice.send(session.id, utf8Encode("welcome carol"));
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            const messageId = await alice.send(ctx, session.id, utf8Encode("welcome carol"));
             expect(published).toEqual([]);
 
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
                 pendingOutboxes: 3,
             });
@@ -1349,14 +1372,14 @@ describe("stateful MLS sessions", () => {
                 ].sort(),
             ]);
 
-            expect(await alice.synchronize({ waitMilliseconds: 0 })).toMatchObject({
+            expect(await alice.synchronize(ctx, { waitMilliseconds: 0 })).toMatchObject({
                 published: 3,
                 pendingOutboxes: 1,
             });
             expect(published.map((delivery) => delivery.ciphertext[0])).toEqual([2, 2, 3, 3, 1, 2]);
             expect(published.at(-2)?.recipients).toEqual([carol.deviceKey]);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            await carol.synchronize({ waitMilliseconds: 0 });
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            await carol.synchronize(ctx, { waitMilliseconds: 0 });
             const bobReceived: string[] = [];
             const carolReceived: string[] = [];
             await consume(bob, async (update) => {
@@ -1368,9 +1391,9 @@ describe("stateful MLS sessions", () => {
             expect(bobReceived).toEqual(["welcome carol"]);
             expect(carolReceived).toEqual([]);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1383,55 +1406,57 @@ describe("stateful MLS sessions", () => {
         });
         let failPublish = false;
         const unreliable: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 if (failPublish) throw new DeliveryTransportError(429, "queue_full");
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        let alice = await MurmurClient.open({
+        let alice = await MurmurClient.open(ctx, {
             transport: unreliable,
             store: aliceStore,
             now: () => NOW,
         });
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("restart"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
             failPublish = true;
-            await expect(alice.send(session.id, utf8Encode("durable"))).resolves.toEqual(
+            await expect(alice.send(ctx, session.id, utf8Encode("durable"))).resolves.toEqual(
                 expect.any(String),
             );
-            await expect(alice.synchronize()).resolves.toMatchObject({
+            await expect(alice.synchronize(ctx)).resolves.toMatchObject({
                 pendingOutboxes: 1,
                 transientPublicationFailures: 2,
                 terminalPublicationFailures: 0,
             });
-            alice.close();
-            alice = await MurmurClient.open({
+            alice.close(ctx);
+            alice = await MurmurClient.open(ctx, {
                 transport: base,
                 store: aliceStore,
                 now: () => NOW,
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             const received: string[] = [];
             await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["durable"]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1445,16 +1470,17 @@ describe("stateful MLS sessions", () => {
         });
         try {
             await transport.publish(
+                ctx,
                 createSignedDelivery(attacker, [alice.deviceKey], new Uint8Array([99, 1]), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
                 }),
             );
-            expect((await alice.synchronize()).inbox.rejected).toBe(1);
-            await alice.synchronize();
+            expect((await alice.synchronize(ctx)).inbox.rejected).toBe(1);
+            await alice.synchronize(ctx);
         } finally {
             destroyIdentity(attacker);
-            alice.close();
+            alice.close(ctx);
             await relay.close();
         }
     });
@@ -1465,59 +1491,61 @@ describe("stateful MLS sessions", () => {
         const bobStore = new MemoryMurmurStore();
         const bob = await client(relay, bobStore);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("activation"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await alice.send(session.id, utf8Encode("buffered"));
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.send(ctx, session.id, utf8Encode("buffered"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
 
-            await bob.activateSession(session.id);
-            await bob.synchronize({ waitMilliseconds: 0 });
-            expect(await bob.session(session.id)).toMatchObject({
+            await bob.activateSession(ctx, session.id);
+            await bob.synchronize(ctx, { waitMilliseconds: 0 });
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 bufferedEvents: 1,
             });
             let firstId: string | undefined;
             await expect(
                 bob.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onUpdates: async (updates) => {
+                        onUpdates: async (_ctx, updates) => {
                             expect(updates).toHaveLength(1);
                             firstId = updates[0]!.id;
-                            await bobStore.set("application/staged", updates[0]!.bytes);
+                            await bobStore.set(ctx, "application/staged", updates[0]!.bytes);
                             throw new Error("application update failed");
                         },
                     },
                 ),
             ).rejects.toThrow("application update failed");
-            expect(await bob.session(session.id)).toMatchObject({
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 bufferedEvents: 1,
             });
 
             let replayId: string | undefined;
             await bob.synchronize(
+                ctx,
                 { waitMilliseconds: 0 },
                 {
-                    onUpdates: async (updates) => {
+                    onUpdates: async (_ctx, updates) => {
                         replayId = updates[0]?.id;
                     },
                 },
             );
             expect(replayId).toBe(firstId);
-            expect(utf8Decode((await bobStore.get("application/staged"))!)).toBe("buffered");
-            expect(await bob.session(session.id)).toMatchObject({
+            expect(utf8Decode((await bobStore.get(ctx, "application/staged"))!)).toBe("buffered");
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 bufferedEvents: 0,
             });
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1529,19 +1557,19 @@ describe("stateful MLS sessions", () => {
             maximumBufferedEventsPerSession: 1,
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("bounded"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
-            await alice.send(session.id, utf8Encode("first"));
-            await alice.send(session.id, utf8Encode("second"));
-            await alice.synchronize();
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toMatchObject({
+            await alice.send(ctx, session.id, utf8Encode("first"));
+            await alice.send(ctx, session.id, utf8Encode("second"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 bufferedEvents: 1,
             });
@@ -1551,8 +1579,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(events).toEqual(["first"]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1564,21 +1592,21 @@ describe("stateful MLS sessions", () => {
             maximumBufferedEventsPerSession: 1,
         });
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("pending overflow"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await alice.send(session.id, utf8Encode("first"));
-            await alice.send(session.id, utf8Encode("second"));
-            await alice.synchronize();
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.send(ctx, session.id, utf8Encode("first"));
+            await alice.send(ctx, session.id, utf8Encode("second"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
+            await bob.synchronize(ctx);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1589,19 +1617,19 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("old epoch"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            await alice.synchronize();
-            await bob.send(session.id, utf8Encode("from prior epoch"));
-            await bob.synchronize();
-            await alice.synchronize();
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            await alice.synchronize(ctx);
+            await bob.send(ctx, session.id, utf8Encode("from prior epoch"));
+            await bob.synchronize(ctx);
+            await alice.synchronize(ctx);
 
             const events: string[] = [];
             await consume(alice, async (event) => {
@@ -1609,9 +1637,9 @@ describe("stateful MLS sessions", () => {
             });
             expect(events).toEqual(["from prior epoch"]);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1623,19 +1651,21 @@ describe("stateful MLS sessions", () => {
         });
         let rejectPublications = false;
         const isolated: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 if (rejectPublications) {
                     throw new DeliveryTransportError(413, "limit");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
         const aliceStore = new MemoryMurmurStore();
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: isolated,
             store: aliceStore,
             now: () => NOW,
@@ -1643,21 +1673,22 @@ describe("stateful MLS sessions", () => {
         const attacker = generateIdentityKeyPair();
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("isolated outbox"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await alice.send(session.id, utf8Encode("will be rejected"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await alice.send(ctx, session.id, utf8Encode("will be rejected"));
             rejectPublications = true;
             await base.publish(
+                ctx,
                 createSignedDelivery(attacker, [alice.deviceKey], new Uint8Array([99, 1]), {
                     createdAt: NOW,
                     expiresAt: NOW + 60_000,
                 }),
             );
-            const outcome = await alice.synchronize();
+            const outcome = await alice.synchronize(ctx);
             expect(outcome).toMatchObject({
                 pendingOutboxes: 0,
                 terminalPublicationFailures: 2,
@@ -1666,16 +1697,16 @@ describe("stateful MLS sessions", () => {
             expect(outcome.issues[0]?.code).toContain("outbox_application_limit");
             expect(
                 (
-                    await aliceStore.scan("murmur/session-outbox-order/", {
+                    await aliceStore.scan(ctx, "murmur/session-outbox-order/", {
                         limit: 10,
                     })
                 ).size,
             ).toBe(0);
-            await alice.synchronize();
+            await alice.synchronize(ctx);
         } finally {
             destroyIdentity(attacker);
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1687,57 +1718,61 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("corrupt outbox"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
 
-            const corruptedId = await alice.send(session.id, utf8Encode("corrupted"));
-            await aliceStore.set(`murmur/session-outbox/${corruptedId}`, new Uint8Array([1, 2, 3]));
-            expect(await alice.synchronize()).toMatchObject({
+            const corruptedId = await alice.send(ctx, session.id, utf8Encode("corrupted"));
+            await aliceStore.set(
+                ctx,
+                `murmur/session-outbox/${corruptedId}`,
+                new Uint8Array([1, 2, 3]),
+            );
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 pendingOutboxes: 0,
                 terminalPublicationFailures: 1,
                 issues: [{ code: "corrupt_outbox" }],
             });
             expect(
                 (
-                    await aliceStore.scan("murmur/session-outbox-order/", {
+                    await aliceStore.scan(ctx, "murmur/session-outbox-order/", {
                         limit: 10,
                     })
                 ).size,
             ).toBe(0);
             expect(
                 (
-                    await aliceStore.scan("murmur/epoch-outboxes/", {
+                    await aliceStore.scan(ctx, "murmur/epoch-outboxes/", {
                         limit: 10,
                     })
                 ).size,
             ).toBe(0);
 
-            await alice.send(session.id, utf8Encode("healthy"));
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.send(ctx, session.id, utf8Encode("healthy"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             const received: string[] = [];
             await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["healthy"]);
 
-            await alice.addMember(session.id, await carol.createKeyPackage());
-            await alice.synchronize();
-            await alice.synchronize({ waitMilliseconds: 0 });
-            await bob.synchronize();
-            await carol.synchronize();
-            expect((await alice.session(session.id))?.members).toHaveLength(3);
-            expect((await bob.session(session.id))?.members).toHaveLength(3);
-            expect((await carol.session(session.id))?.members).toHaveLength(3);
+            await alice.addMember(ctx, session.id, await carol.createKeyPackage(ctx));
+            await alice.synchronize(ctx);
+            await alice.synchronize(ctx, { waitMilliseconds: 0 });
+            await bob.synchronize(ctx);
+            await carol.synchronize(ctx);
+            expect((await alice.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(3);
+            expect((await carol.session(ctx, session.id))?.members).toHaveLength(3);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1749,11 +1784,11 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("corrupt multi-Welcome"),
-                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
             });
-            const outboxes = await aliceStore.scan("murmur/session-outbox/", {
+            const outboxes = await aliceStore.scan(ctx, "murmur/session-outbox/", {
                 limit: 10,
             });
             const bootstrapIds: string[] = [];
@@ -1769,11 +1804,12 @@ describe("stateful MLS sessions", () => {
             }
             expect(bootstrapIds).toHaveLength(2);
             await aliceStore.set(
+                ctx,
                 `murmur/session-outbox/${bootstrapIds.at(-1)!}`,
                 new Uint8Array([1, 2, 3]),
             );
 
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 0,
                 pendingOutboxes: 0,
                 terminalPublicationFailures: 1,
@@ -1785,15 +1821,15 @@ describe("stateful MLS sessions", () => {
                     },
                 ],
             });
-            expect(await alice.session(session.id)).toBeUndefined();
-            await bob.synchronize();
-            await carol.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
-            expect(await carol.session(session.id)).toBeUndefined();
+            expect(await alice.session(ctx, session.id)).toBeUndefined();
+            await bob.synchronize(ctx);
+            await carol.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
+            expect(await carol.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1804,31 +1840,31 @@ describe("stateful MLS sessions", () => {
         const alice = await client(relay, aliceStore);
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("missing Welcome index"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            const indexes = await aliceStore.scan("murmur/bootstrap-outboxes/", {
+            const indexes = await aliceStore.scan(ctx, "murmur/bootstrap-outboxes/", {
                 limit: 10,
             });
             expect(indexes.size).toBe(1);
             for (const [key, value] of indexes) {
                 zeroBytes(value);
-                await aliceStore.delete(key);
+                await aliceStore.delete(ctx, key);
             }
 
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 0,
                 pendingOutboxes: 0,
                 terminalPublicationFailures: 1,
                 issues: [{ code: "corrupt_membership_operation", sessionId: session.id }],
             });
-            expect(await alice.session(session.id)).toBeUndefined();
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
+            expect(await alice.session(ctx, session.id)).toBeUndefined();
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1840,44 +1876,45 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const damaged = await alice.createSession({
+            const damaged = await alice.createSession(ctx, {
                 descriptor: utf8Encode("damaged state"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             await activate(bob, damaged.id);
 
-            const healthy = await alice.createSession({
+            const healthy = await alice.createSession(ctx, {
                 descriptor: utf8Encode("healthy state"),
-                members: [await carol.createKeyPackage()],
+                members: [await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await carol.synchronize();
+            await alice.synchronize(ctx);
+            await carol.synchronize(ctx);
             await activate(carol, healthy.id);
 
             await aliceStore.set(
+                ctx,
                 `murmur/session-states/${encodeBase64Url(damaged.id)}`,
                 new Uint8Array([1, 2, 3]),
             );
-            await alice.send(healthy.id, utf8Encode("still delivered"));
-            expect(await alice.synchronize()).toMatchObject({
+            await alice.send(ctx, healthy.id, utf8Encode("still delivered"));
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 terminalPublicationFailures: 1,
                 pendingOutboxes: 0,
                 issues: [{ code: "corrupt_session_state", sessionId: damaged.id }],
             });
-            await alice.synchronize();
-            await carol.synchronize();
+            await alice.synchronize(ctx);
+            await carol.synchronize(ctx);
             const received: string[] = [];
             await consume(carol, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["still delivered"]);
-            expect(await alice.session(damaged.id)).toBeUndefined();
+            expect(await alice.session(ctx, damaged.id)).toBeUndefined();
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -1894,34 +1931,34 @@ describe("stateful MLS sessions", () => {
         });
         try {
             await expect(
-                outboxConstrained.createSession({
+                outboxConstrained.createSession(ctx, {
                     descriptor: utf8Encode("too many outboxes"),
-                    members: [await bob.createKeyPackage()],
+                    members: [await bob.createKeyPackage(ctx)],
                 }),
             ).rejects.toThrow("outbox capacity");
-            expect((await outboxConstrained.sessions()).sessions).toEqual([]);
+            expect((await outboxConstrained.sessions(ctx)).sessions).toEqual([]);
 
-            const session = await ciphertextConstrained.createSession({
+            const session = await ciphertextConstrained.createSession(ctx, {
                 descriptor: utf8Encode("bounded send"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await ciphertextConstrained.synchronize();
-            await bob.synchronize();
+            await ciphertextConstrained.synchronize(ctx);
+            await bob.synchronize(ctx);
             await expect(
-                ciphertextConstrained.send(session.id, new Uint8Array(100_000)),
+                ciphertextConstrained.send(ctx, session.id, new Uint8Array(100_000)),
             ).rejects.toThrow("configured limit");
-            await ciphertextConstrained.send(session.id, utf8Encode("small"));
-            await ciphertextConstrained.synchronize();
-            await bob.synchronize();
+            await ciphertextConstrained.send(ctx, session.id, utf8Encode("small"));
+            await ciphertextConstrained.synchronize(ctx);
+            await bob.synchronize(ctx);
             const received: string[] = [];
             await activate(bob, session.id, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["small"]);
         } finally {
-            outboxConstrained.close();
-            ciphertextConstrained.close();
-            bob.close();
+            outboxConstrained.close(ctx);
+            ciphertextConstrained.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1936,24 +1973,24 @@ describe("stateful MLS sessions", () => {
         const alice = await client(relay);
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("clock skew"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            expect((await alice.synchronize()).transientPublicationFailures).toBe(0);
-            await bob.synchronize();
+            expect((await alice.synchronize(ctx)).transientPublicationFailures).toBe(0);
+            await bob.synchronize(ctx);
             await activate(bob, session.id);
-            await alice.send(session.id, utf8Encode("accepted"));
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.send(ctx, session.id, utf8Encode("accepted"));
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             const events: string[] = [];
             await consume(bob, async (event) => {
                 events.push(utf8Decode(event.bytes));
             });
             expect(events).toEqual(["accepted"]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -1966,29 +2003,31 @@ describe("stateful MLS sessions", () => {
         });
         let failWelcome = true;
         const welcomeFailing: DeliveryTransport = {
-            publish: (delivery, signal) => {
+            publish: (_ctx, delivery, signal) => {
                 if (failWelcome && delivery.ciphertext[0] === 1) {
                     throw new DeliveryTransportError(413, "limit");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: welcomeFailing,
             store: aliceStore,
             now: () => NOW,
         });
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("failed add"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            const outcome = await alice.synchronize();
+            const outcome = await alice.synchronize(ctx);
             expect(outcome).toMatchObject({
                 published: 1,
                 terminalPublicationFailures: 0,
@@ -1999,32 +2038,32 @@ describe("stateful MLS sessions", () => {
                 kind: "bootstrap",
                 sessionId: session.id,
             });
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
-            expect(await alice.session(session.id)).toMatchObject({
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
+            expect(await alice.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 members: [alice.identity, bob.identity],
             });
-            const queued = await alice.send(session.id, utf8Encode("queued while offline"));
+            const queued = await alice.send(ctx, session.id, utf8Encode("queued while offline"));
             expect(queued).toEqual(expect.any(String));
             expect(
                 (
-                    await aliceStore.scan("murmur/post-commit-outboxes/", {
+                    await aliceStore.scan(ctx, "murmur/post-commit-outboxes/", {
                         limit: 10,
                     })
                 ).size,
             ).toBe(2);
 
             failWelcome = false;
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 3,
                 pendingOutboxes: 1,
             });
-            await bob.synchronize();
-            expect(await alice.session(session.id)).toMatchObject({
+            await bob.synchronize(ctx);
+            expect(await alice.session(ctx, session.id)).toMatchObject({
                 status: "active",
             });
-            expect(await bob.session(session.id)).toMatchObject({
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "pending",
             });
             const received: string[] = [];
@@ -2033,8 +2072,8 @@ describe("stateful MLS sessions", () => {
             });
             expect(received).toEqual(["queued while offline"]);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -2046,19 +2085,21 @@ describe("stateful MLS sessions", () => {
         });
         let failPrivateOnce = false;
         const ordered: DeliveryTransport = {
-            publish: (delivery, signal) => {
+            publish: (_ctx, delivery, signal) => {
                 if (failPrivateOnce && delivery.ciphertext[0] === 2) {
                     failPrivateOnce = false;
                     throw new DeliveryTransportError(503, "overloaded");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: ordered,
             store: new MemoryMurmurStore(),
             now: () => NOW,
@@ -2066,38 +2107,38 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("ordered outboxes"),
-                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await carol.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await carol.synchronize(ctx);
             await activate(bob, session.id);
             await activate(carol, session.id);
 
-            await alice.removeMember(session.id, carol.identity);
-            const sendId = await alice.send(session.id, utf8Encode("after remove"));
+            await alice.removeMember(ctx, session.id, carol.identity);
+            const sendId = await alice.send(ctx, session.id, utf8Encode("after remove"));
             expect(sendId).toEqual(expect.any(String));
             failPrivateOnce = true;
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 2,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 2,
             });
-            await alice.synchronize();
-            await alice.synchronize();
-            await bob.synchronize();
+            await alice.synchronize(ctx);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
             const received: string[] = [];
             await consume(bob, async (event) => {
                 received.push(utf8Decode(event.bytes));
             });
             expect(received).toEqual(["after remove"]);
-            expect((await bob.session(session.id))?.members).toHaveLength(2);
+            expect((await bob.session(ctx, session.id))?.members).toHaveLength(2);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -2109,56 +2150,58 @@ describe("stateful MLS sessions", () => {
         });
         let failCommit = true;
         const recoverable: DeliveryTransport = {
-            publish: (delivery, signal) => {
+            publish: (_ctx, delivery, signal) => {
                 if (failCommit && delivery.ciphertext[0] === 3) {
                     throw new DeliveryTransportError(413, "limit");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: recoverable,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("recover commit"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            const blocked = await alice.synchronize();
+            const blocked = await alice.synchronize(ctx);
             expect(blocked).toMatchObject({
                 published: 0,
                 transientPublicationFailures: 1,
                 pendingOutboxes: 3,
             });
             expect(blocked.issues.some((issue) => issue.kind === "commit")).toBe(true);
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toBeUndefined();
-            expect(await alice.session(session.id)).toMatchObject({ status: "creating" });
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toBeUndefined();
+            expect(await alice.session(ctx, session.id)).toMatchObject({ status: "creating" });
 
             failCommit = false;
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 published: 3,
                 pendingOutboxes: 1,
             });
-            expect(await alice.session(session.id)).toMatchObject({
+            expect(await alice.session(ctx, session.id)).toMatchObject({
                 status: "active",
                 members: [alice.identity, bob.identity],
             });
-            await bob.synchronize();
-            expect(await bob.session(session.id)).toMatchObject({
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, session.id)).toMatchObject({
                 status: "pending",
                 members: [alice.identity, bob.identity],
             });
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -2169,24 +2212,24 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("remove"),
-                members: [await bob.createKeyPackage(), await carol.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx), await carol.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            await bob.synchronize();
-            await carol.synchronize();
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await carol.synchronize(ctx);
             await activate(bob, session.id);
             await activate(carol, session.id);
 
-            await alice.removeMember(session.id, carol.identity);
-            await alice.synchronize();
-            await bob.synchronize();
-            await carol.send(session.id, utf8Encode("after removal"));
-            await expect(carol.synchronize()).resolves.toMatchObject({
+            await alice.removeMember(ctx, session.id, carol.identity);
+            await alice.synchronize(ctx);
+            await bob.synchronize(ctx);
+            await carol.send(ctx, session.id, utf8Encode("after removal"));
+            await expect(carol.synchronize(ctx)).resolves.toMatchObject({
                 terminalPublicationFailures: 1,
             });
-            const outcome = await alice.synchronize();
+            const outcome = await alice.synchronize(ctx);
             expect(outcome.inbox.rejected).toBe(0);
             const events: string[] = [];
             await consume(alice, async (event) => {
@@ -2194,9 +2237,9 @@ describe("stateful MLS sessions", () => {
             });
             expect(events).toEqual([]);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -2207,24 +2250,24 @@ describe("stateful MLS sessions", () => {
         const bob = await client(relay);
         const carol = await client(relay);
         try {
-            await alice.createSession({
+            await alice.createSession(ctx, {
                 descriptor: utf8Encode("first page"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.createSession({
+            await alice.createSession(ctx, {
                 descriptor: utf8Encode("second page"),
-                members: [await carol.createKeyPackage()],
+                members: [await carol.createKeyPackage(ctx)],
             });
-            const first = await alice.sessions({ limit: 1 });
+            const first = await alice.sessions(ctx, { limit: 1 });
             expect(first.sessions).toHaveLength(1);
             expect(first.cursor).not.toBeNull();
-            const second = await alice.sessions({ limit: 1, after: first.cursor! });
+            const second = await alice.sessions(ctx, { limit: 1, after: first.cursor! });
             expect(second.sessions).toHaveLength(1);
             expect(second.sessions[0]?.id).not.toEqual(first.sessions[0]?.id);
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             await relay.close();
         }
     });
@@ -2234,20 +2277,20 @@ describe("stateful MLS sessions", () => {
         const alice = await client(relay);
         const bob = await client(relay);
         try {
-            const keyPackage = await bob.createKeyPackage();
-            await alice.createSession({
+            const keyPackage = await bob.createKeyPackage(ctx);
+            await alice.createSession(ctx, {
                 descriptor: utf8Encode("first use"),
                 members: [keyPackage],
             });
             await expect(
-                alice.createSession({
+                alice.createSession(ctx, {
                     descriptor: utf8Encode("second use"),
                     members: [keyPackage],
                 }),
             ).rejects.toThrow("already used");
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -2258,38 +2301,40 @@ describe("stateful MLS sessions", () => {
             fetch: relayFetch(relay),
         });
         const blocked: DeliveryTransport = {
-            publish: (delivery, signal) => {
+            publish: (_ctx, delivery, signal) => {
                 if (delivery.ciphertext[0] === 1) {
                     throw new DeliveryTransportError(413, "limit");
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        const alice = await MurmurClient.open({
+        const alice = await MurmurClient.open(ctx, {
             transport: blocked,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         const bob = await client(relay);
         try {
-            const session = await alice.createSession({
+            const session = await alice.createSession(ctx, {
                 descriptor: utf8Encode("abandon"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            expect(await alice.synchronize()).toMatchObject({
+            expect(await alice.synchronize(ctx)).toMatchObject({
                 pendingOutboxes: 2,
                 transientPublicationFailures: 1,
             });
-            await alice.abandonSession(session.id);
-            expect(await alice.session(session.id)).toBeUndefined();
-            expect((await alice.synchronize()).pendingOutboxes).toBe(0);
+            await alice.abandonSession(ctx, session.id);
+            expect(await alice.session(ctx, session.id)).toBeUndefined();
+            expect((await alice.synchronize(ctx)).pendingOutboxes).toBe(0);
         } finally {
-            alice.close();
-            bob.close();
+            alice.close(ctx);
+            bob.close(ctx);
             await relay.close();
         }
     });
@@ -2306,48 +2351,50 @@ describe("stateful MLS sessions", () => {
         const carolIdentity = generateIdentityKeyPair();
         let capturedBootstrap: SignedDelivery | undefined;
         const capturing: DeliveryTransport = {
-            publish: async (delivery, signal) => {
+            publish: async (_ctx, delivery, signal) => {
                 if (delivery.ciphertext[0] === 1 && capturedBootstrap === undefined) {
                     capturedBootstrap = delivery;
                     return { eventId: delivery.id, duplicate: false };
                 }
-                return base.publish(delivery, signal);
+                return base.publish(ctx, delivery, signal);
             },
-            read: (request, signal) => base.read(request, signal),
-            acknowledge: (request, signal) => base.acknowledge(request, signal),
-            readDeviceRoster: (account, signal) => base.readDeviceRoster(account, signal),
-            mutateDeviceRoster: (delivery, signal) => base.mutateDeviceRoster(delivery, signal),
+            read: (_ctx, request, signal) => base.read(ctx, request, signal),
+            acknowledge: (_ctx, request, signal) => base.acknowledge(ctx, request, signal),
+            readDeviceRoster: (_ctx, account, signal) =>
+                base.readDeviceRoster(ctx, account, signal),
+            mutateDeviceRoster: (_ctx, delivery, signal) =>
+                base.mutateDeviceRoster(ctx, delivery, signal),
         };
-        const carol = await MurmurClient.open({
+        const carol = await MurmurClient.open(ctx, {
             identity: carolIdentity,
             transport: capturing,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
         try {
-            const first = await alice.createSession({
+            const first = await alice.createSession(ctx, {
                 descriptor: utf8Encode("first pending"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await alice.synchronize();
-            const second = await carol.createSession({
+            await alice.synchronize(ctx);
+            const second = await carol.createSession(ctx, {
                 descriptor: utf8Encode("capacity retry"),
-                members: [await bob.createKeyPackage()],
+                members: [await bob.createKeyPackage(ctx)],
             });
-            await carol.synchronize();
-            await bob.synchronize();
-            expect(await bob.session(first.id)).toMatchObject({ status: "pending" });
-            expect(await bob.session(second.id)).toBeUndefined();
+            await carol.synchronize(ctx);
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, first.id)).toMatchObject({ status: "pending" });
+            expect(await bob.session(ctx, second.id)).toBeUndefined();
 
-            await bob.ignoreSession(first.id);
+            await bob.ignoreSession(ctx, first.id);
             expect(capturedBootstrap).toBeDefined();
-            await base.publish(capturedBootstrap!);
-            await bob.synchronize();
-            expect(await bob.session(second.id)).toMatchObject({ status: "pending" });
+            await base.publish(ctx, capturedBootstrap!);
+            await bob.synchronize(ctx);
+            expect(await bob.session(ctx, second.id)).toMatchObject({ status: "pending" });
         } finally {
-            alice.close();
-            bob.close();
-            carol.close();
+            alice.close(ctx);
+            bob.close(ctx);
+            carol.close(ctx);
             destroyIdentity(carolIdentity);
             await relay.close();
         }
@@ -2363,11 +2410,11 @@ describe("stateful MLS sessions", () => {
             readStarted = resolve;
         });
         const transport: DeliveryTransport = {
-            publish: async () => ({
+            publish: async (_ctx) => ({
                 eventId: "018bcfe5-6800-7000-8000-000000000000",
                 duplicate: false,
             }),
-            read: async () => {
+            read: async (_ctx) => {
                 readStarted();
                 await readGate;
                 return {
@@ -2377,23 +2424,23 @@ describe("stateful MLS sessions", () => {
                     exhausted: true,
                 };
             },
-            acknowledge: async () => ({ removed: 0 }),
+            acknowledge: async (_ctx) => ({ removed: 0 }),
         };
-        const murmur = await MurmurClient.open({
+        const murmur = await MurmurClient.open(ctx, {
             transport,
             store: new MemoryMurmurStore(),
             now: () => NOW,
         });
-        const synchronizing = murmur.synchronize();
+        const synchronizing = murmur.synchronize(ctx);
         await started;
-        const discovering = murmur.createKeyPackage();
-        expect(() => murmur.close()).toThrow("operation is pending");
+        const discovering = murmur.createKeyPackage(ctx);
+        expect(() => murmur.close(ctx)).toThrow("operation is pending");
         releaseRead();
         await synchronizing;
         await discovering;
-        const reading = murmur.sessions();
-        expect(() => murmur.close()).toThrow("operation is pending");
+        const reading = murmur.sessions(ctx);
+        expect(() => murmur.close(ctx)).toThrow("operation is pending");
         await reading;
-        murmur.close();
+        murmur.close(ctx);
     });
 });

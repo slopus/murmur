@@ -1,4 +1,5 @@
 import { ed25519 } from "@noble/curves/ed25519";
+import { createRootContext } from "@steve.kite/stdlib";
 import {
     WebSocketDeliveryTransport,
     createSignedDelivery,
@@ -31,6 +32,7 @@ import {
 } from "../index.js";
 
 const NOW = 1_720_000_000_000;
+const ctx = createRootContext().named("test");
 const ENDPOINT = "wss://relay.test/v2/connect";
 const TOKEN_SECRET = new Uint8Array(32).fill(19);
 const textEncoder = new TextEncoder();
@@ -289,12 +291,14 @@ describe("negotiated relay sessions", () => {
                 new Uint8Array([2]),
                 { createdAt: NOW, expiresAt: NOW + 60_000 },
             );
-            const published = await transport.publish(delivery);
+            const published = await transport.publish(ctx, delivery);
             const page = await transport.read(
+                ctx,
                 createSignedInboxRead(identityKeyPair, { createdAt: NOW }),
             );
             expect(page.deliveries).toHaveLength(1);
             const acknowledgement = await transport.acknowledge(
+                ctx,
                 createSignedInboxAck(identityKeyPair, published.eventId, NOW),
             );
             expect(acknowledgement).toEqual({
@@ -304,6 +308,7 @@ describe("negotiated relay sessions", () => {
             });
             await expect(
                 transport.read(
+                    ctx,
                     createSignedInboxRead(identityKeyPair, {
                         after: published.eventId,
                         createdAt: NOW,
@@ -316,8 +321,8 @@ describe("negotiated relay sessions", () => {
                 canonicalJson({ version: 1, type: "delete_account" }),
                 { createdAt: NOW, expiresAt: NOW + 60_000 },
             );
-            await expect(transport.deleteAccount(deletion)).resolves.toBeUndefined();
-            await expect(transport.deleteAccount(deletion)).rejects.toMatchObject({
+            await expect(transport.deleteAccount(ctx, deletion)).resolves.toBeUndefined();
+            await expect(transport.deleteAccount(ctx, deletion)).rejects.toMatchObject({
                 status: 409,
                 code: "replay",
             });

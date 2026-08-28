@@ -1,4 +1,6 @@
-import type { MurmurStore, StoreScanOptions, StoreTransaction } from "../../storage/index.js";
+import type { Context } from "@steve.kite/stdlib";
+
+import type { MurmurStore, StoreScanOptions } from "../../storage/index.js";
 import type {
     ChaosAtomicEffect,
     ChaosDelayHandler,
@@ -147,22 +149,18 @@ async function afterMap(
     return value;
 }
 
-class FaultInjectingStoreView implements StoreTransaction {
-    readonly #delegate: StoreTransaction;
+class FaultInjectingStoreView implements MurmurStore {
+    readonly #delegate: MurmurStore;
     readonly #context: StoreFaultContext;
     readonly #scope: "store" | "transaction";
 
-    constructor(
-        delegate: StoreTransaction,
-        context: StoreFaultContext,
-        scope: "store" | "transaction",
-    ) {
+    constructor(delegate: MurmurStore, context: StoreFaultContext, scope: "store" | "transaction") {
         this.#delegate = delegate;
         this.#context = context;
         this.#scope = scope;
     }
 
-    async get(key: string): Promise<Uint8Array | undefined> {
+    async get(ctx: Context, key: string): Promise<Uint8Array | undefined> {
         const operation = this.#operation("get");
         const ordinal = nextOrdinal(this.#context, operation);
         if (
@@ -173,7 +171,7 @@ class FaultInjectingStoreView implements StoreTransaction {
         ) {
             return undefined;
         }
-        const value = await this.#delegate.get(key);
+        const value = await this.#delegate.get(ctx, key);
         return afterBytes(
             this.#context,
             point(this.#context, operation, "after", ordinal, key),
@@ -181,7 +179,7 @@ class FaultInjectingStoreView implements StoreTransaction {
         );
     }
 
-    async set(key: string, input: Uint8Array): Promise<void> {
+    async set(ctx: Context, key: string, input: Uint8Array): Promise<void> {
         const operation = this.#operation("set");
         const ordinal = nextOrdinal(this.#context, operation);
         const before = point(this.#context, operation, "before", ordinal, key);
@@ -204,11 +202,11 @@ class FaultInjectingStoreView implements StoreTransaction {
                 unsupported(effect, before);
             }
         }
-        if (!dropped) await this.#delegate.set(key, value);
+        if (!dropped) await this.#delegate.set(ctx, key, value);
         await this.#afterMutation(operation, ordinal, key);
     }
 
-    async delete(key: string): Promise<void> {
+    async delete(ctx: Context, key: string): Promise<void> {
         const operation = this.#operation("delete");
         const ordinal = nextOrdinal(this.#context, operation);
         const before = point(this.#context, operation, "before", ordinal, key);
@@ -226,11 +224,11 @@ class FaultInjectingStoreView implements StoreTransaction {
                 unsupported(effect, before);
             }
         }
-        if (!dropped) await this.#delegate.delete(key);
+        if (!dropped) await this.#delegate.delete(ctx, key);
         await this.#afterMutation(operation, ordinal, key);
     }
 
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+    async list(ctx: Context, prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
         const operation = this.#operation("list");
         const ordinal = nextOrdinal(this.#context, operation);
         if (
@@ -244,11 +242,12 @@ class FaultInjectingStoreView implements StoreTransaction {
         return afterMap(
             this.#context,
             point(this.#context, operation, "after", ordinal, prefix),
-            await this.#delegate.list(prefix),
+            await this.#delegate.list(ctx, prefix),
         );
     }
 
     async scan(
+        ctx: Context,
         prefix: string,
         options: StoreScanOptions,
     ): Promise<ReadonlyMap<string, Uint8Array>> {
@@ -265,8 +264,12 @@ class FaultInjectingStoreView implements StoreTransaction {
         return afterMap(
             this.#context,
             point(this.#context, operation, "after", ordinal, prefix),
-            await this.#delegate.scan(prefix, options),
+            await this.#delegate.scan(ctx, prefix, options),
         );
+    }
+
+    async tx<Result>(ctx: Context, operation: (ctx: Context) => Promise<Result>): Promise<Result> {
+        return this.#delegate.tx(ctx, operation);
     }
 
     async #afterMutation(operation: string, ordinal: number, key: string): Promise<void> {
@@ -296,7 +299,7 @@ class FaultInjectingStoreView implements StoreTransaction {
 export class FaultInjectingMurmurStore implements MurmurStore {
     readonly #delegate: MurmurStore;
     readonly #context: StoreFaultContext;
-    readonly #view: FaultInjectingStoreView;
+    readonly #activeTransactions = new WeakMap<Context, number>();
 
     constructor(options: FaultInjectingStoreOptions) {
         if (options.actor.length < 1) throw new Error("Chaos store actor cannot be empty");
@@ -307,7 +310,6 @@ export class FaultInjectingMurmurStore implements MurmurStore {
             delay: options.delay ?? (() => undefined),
             counts: new Map(),
         };
-        this.#view = new FaultInjectingStoreView(this.#delegate, this.#context, "store");
     }
 
     /** Defensive snapshot of per-operation call ordinals. */
@@ -315,32 +317,31 @@ export class FaultInjectingMurmurStore implements MurmurStore {
         return new Map(this.#context.counts);
     }
 
-    async get(key: string): Promise<Uint8Array | undefined> {
-        return this.#view.get(key);
+    async get(ctx: Context, key: string): Promise<Uint8Array | undefined> {
+        return this.#view(ctx).get(ctx, key);
     }
 
-    async set(key: string, value: Uint8Array): Promise<void> {
-        await this.#view.set(key, value);
+    async set(ctx: Context, key: string, value: Uint8Array): Promise<void> {
+        await this.#view(ctx).set(ctx, key, value);
     }
 
-    async delete(key: string): Promise<void> {
-        await this.#view.delete(key);
+    async delete(ctx: Context, key: string): Promise<void> {
+        await this.#view(ctx).delete(ctx, key);
     }
 
-    async list(prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#view.list(prefix);
+    async list(ctx: Context, prefix: string): Promise<ReadonlyMap<string, Uint8Array>> {
+        return this.#view(ctx).list(ctx, prefix);
     }
 
     async scan(
+        ctx: Context,
         prefix: string,
         options: StoreScanOptions,
     ): Promise<ReadonlyMap<string, Uint8Array>> {
-        return this.#view.scan(prefix, options);
+        return this.#view(ctx).scan(ctx, prefix, options);
     }
 
-    async transaction<Result>(
-        operation: (transaction: StoreTransaction) => Promise<Result>,
-    ): Promise<Result> {
+    async tx<Result>(ctx: Context, operation: (ctx: Context) => Promise<Result>): Promise<Result> {
         const ordinal = nextOrdinal(this.#context, "transaction");
         const before = point(this.#context, "transaction", "before", ordinal);
         for (const effect of chaosEffects(this.#context.schedule.decide(before))) {
@@ -355,27 +356,32 @@ export class FaultInjectingMurmurStore implements MurmurStore {
             }
         }
 
-        const result = await this.#delegate.transaction(async (delegateTransaction) => {
-            const transaction = new FaultInjectingStoreView(
-                delegateTransaction,
-                this.#context,
-                "transaction",
-            );
-            const value = await operation(transaction);
-            const commitOrdinal = nextOrdinal(this.#context, "transaction.commit");
-            const commit = point(this.#context, "transaction.commit", "before", commitOrdinal);
-            for (const effect of chaosEffects(this.#context.schedule.decide(commit))) {
-                await control(effect, commit, this.#context.delay);
-                if (
-                    effect.type !== "continue" &&
-                    effect.type !== "throw" &&
-                    effect.type !== "crash" &&
-                    effect.type !== "delay"
-                ) {
-                    unsupported(effect, commit);
+        const result = await this.#delegate.tx(ctx, async (tx) => {
+            this.#activeTransactions.set(tx, (this.#activeTransactions.get(tx) ?? 0) + 1);
+            try {
+                const value = await operation(tx);
+                const commitOrdinal = nextOrdinal(this.#context, "transaction.commit");
+                const commit = point(this.#context, "transaction.commit", "before", commitOrdinal);
+                for (const effect of chaosEffects(this.#context.schedule.decide(commit))) {
+                    await control(effect, commit, this.#context.delay);
+                    if (
+                        effect.type !== "continue" &&
+                        effect.type !== "throw" &&
+                        effect.type !== "crash" &&
+                        effect.type !== "delay"
+                    ) {
+                        unsupported(effect, commit);
+                    }
+                }
+                return value;
+            } finally {
+                const depth = this.#activeTransactions.get(tx) ?? 1;
+                if (depth === 1) {
+                    this.#activeTransactions.delete(tx);
+                } else {
+                    this.#activeTransactions.set(tx, depth - 1);
                 }
             }
-            return value;
         });
 
         const after = point(this.#context, "transaction", "after", ordinal);
@@ -394,5 +400,13 @@ export class FaultInjectingMurmurStore implements MurmurStore {
             }
         }
         return result;
+    }
+
+    #view(ctx: Context): FaultInjectingStoreView {
+        return new FaultInjectingStoreView(
+            this.#delegate,
+            this.#context,
+            (this.#activeTransactions.get(ctx) ?? 0) > 0 ? "transaction" : "store",
+        );
     }
 }

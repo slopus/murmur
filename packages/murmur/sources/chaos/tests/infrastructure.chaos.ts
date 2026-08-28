@@ -1,3 +1,4 @@
+import { createRootContext, type Context } from "@steve.kite/stdlib";
 import { describe, expect, test } from "vitest";
 import type {
     DeliveryPublishOutcome,
@@ -18,6 +19,8 @@ import {
     SeededRandom,
     settleChaos,
 } from "../index.js";
+
+const ctx = createRootContext().named("test");
 
 const IDENTITY = new Uint8Array(32).fill(1);
 const SECOND_IDENTITY = new Uint8Array(32).fill(2);
@@ -79,7 +82,7 @@ class RecordingTransport implements DeliveryTransport {
         exhausted: true,
     };
 
-    async publish(input: SignedDelivery): Promise<DeliveryPublishOutcome> {
+    async publish(_ctx: Context, input: SignedDelivery): Promise<DeliveryPublishOutcome> {
         this.publishCalls += 1;
         const existing = this.accepted.get(input.id);
         if (existing !== undefined) return { eventId: existing, duplicate: true };
@@ -88,12 +91,15 @@ class RecordingTransport implements DeliveryTransport {
         return { eventId, duplicate: false };
     }
 
-    async read(): Promise<InboxPage> {
+    async read(_ctx: Context): Promise<InboxPage> {
         this.readCalls += 1;
         return this.page;
     }
 
-    async acknowledge(request: SignedInboxAck): Promise<{ readonly removed: number }> {
+    async acknowledge(
+        _ctx: Context,
+        request: SignedInboxAck,
+    ): Promise<{ readonly removed: number }> {
         this.acknowledgeCalls += 1;
         if (this.acknowledgedThrough !== null && request.through <= this.acknowledgedThrough) {
             return { removed: 0 };
@@ -171,13 +177,13 @@ describe("chaos infrastructure", () => {
         });
 
         await expect(
-            store.transaction(async (transaction) => {
-                await transaction.set("a", new Uint8Array([1]));
-                await transaction.set("b", new Uint8Array([2]));
+            store.tx(ctx, async (transaction) => {
+                await store.set(transaction, "a", new Uint8Array([1]));
+                await store.set(transaction, "b", new Uint8Array([2]));
             }),
         ).rejects.toThrow("injected callback failure");
-        expect(await delegate.get("a")).toBeUndefined();
-        expect(await delegate.get("b")).toBeUndefined();
+        expect(await delegate.get(ctx, "a")).toBeUndefined();
+        expect(await delegate.get(ctx, "b")).toBeUndefined();
         schedule.assertConsumed();
     });
 
@@ -197,13 +203,13 @@ describe("chaos infrastructure", () => {
         });
 
         await expect(
-            store.transaction(async (transaction) => {
-                await transaction.set("a", new Uint8Array([1]));
-                await transaction.set("b", new Uint8Array([2]));
+            store.tx(ctx, async (transaction) => {
+                await store.set(transaction, "a", new Uint8Array([1]));
+                await store.set(transaction, "b", new Uint8Array([2]));
             }),
         ).rejects.toThrow("injected lost response");
-        expect(await delegate.get("a")).toEqual(new Uint8Array([1]));
-        expect(await delegate.get("b")).toEqual(new Uint8Array([2]));
+        expect(await delegate.get(ctx, "a")).toEqual(new Uint8Array([1]));
+        expect(await delegate.get(ctx, "b")).toEqual(new Uint8Array([2]));
         schedule.assertConsumed();
     });
 
@@ -216,14 +222,14 @@ describe("chaos infrastructure", () => {
             schedule,
         });
         const source = new Uint8Array([1, 2, 3]);
-        await store.set("copy/a", source);
+        await store.set(ctx, "copy/a", source);
         source[0] = 9;
-        const first = await store.get("copy/a");
+        const first = await store.get(ctx, "copy/a");
         first![1] = 9;
-        const page = await store.scan("copy/", { limit: 10 });
+        const page = await store.scan(ctx, "copy/", { limit: 10 });
         page.get("copy/a")![2] = 9;
 
-        expect(await store.get("copy/a")).toEqual(new Uint8Array([1, 2, 3]));
+        expect(await store.get(ctx, "copy/a")).toEqual(new Uint8Array([1, 2, 3]));
     });
 
     test("INF-07 rejects a publish before delegate acceptance", async () => {
@@ -247,9 +253,9 @@ describe("chaos infrastructure", () => {
         });
         const input = delivery("delivery-1");
 
-        await expect(transport.publish(input)).rejects.toThrow("injected relay outage");
+        await expect(transport.publish(ctx, input)).rejects.toThrow("injected relay outage");
         expect(delegate.publishCalls).toBe(0);
-        await expect(transport.publish(input)).resolves.toMatchObject({ duplicate: false });
+        await expect(transport.publish(ctx, input)).resolves.toMatchObject({ duplicate: false });
         expect(delegate.publishCalls).toBe(1);
         schedule.assertConsumed();
     });
@@ -275,8 +281,8 @@ describe("chaos infrastructure", () => {
         });
         const input = delivery("delivery-1");
 
-        await expect(transport.publish(input)).rejects.toThrow("lost publish response");
-        await expect(transport.publish(input)).resolves.toMatchObject({ duplicate: true });
+        await expect(transport.publish(ctx, input)).rejects.toThrow("lost publish response");
+        await expect(transport.publish(ctx, input)).resolves.toMatchObject({ duplicate: true });
         expect(delegate.publishCalls).toBe(2);
         expect(delegate.accepted.size).toBe(1);
         schedule.assertConsumed();
@@ -314,7 +320,7 @@ describe("chaos infrastructure", () => {
             schedule,
         });
 
-        const page = await transport.read(readRequest());
+        const page = await transport.read(ctx, readRequest());
         expect(page.deliveries.map((item) => item.eventId)).toEqual(["event-3", "event-2"]);
         expect(page.exhausted).toBe(false);
         expect(delegate.page.deliveries.map((item) => item.eventId)).toEqual([
@@ -345,10 +351,10 @@ describe("chaos infrastructure", () => {
             schedule,
         });
 
-        await expect(transport.acknowledge(ackRequest("event-3"))).rejects.toBeInstanceOf(
+        await expect(transport.acknowledge(ctx, ackRequest("event-3"))).rejects.toBeInstanceOf(
             ChaosInjectedError,
         );
-        await expect(transport.acknowledge(ackRequest("event-3"))).resolves.toEqual({
+        await expect(transport.acknowledge(ctx, ackRequest("event-3"))).resolves.toEqual({
             removed: 0,
         });
         expect(delegate.acknowledgedThrough).toBe("event-3");
@@ -390,8 +396,8 @@ describe("chaos infrastructure", () => {
             delegate,
             schedule,
         });
-        await store.set("murmur/public-test-key", secret);
-        await transport.publish({ ...delivery("public-id"), ciphertext: secret });
+        await store.set(ctx, "murmur/public-test-key", secret);
+        await transport.publish(ctx, { ...delivery("public-id"), ciphertext: secret });
 
         const serialized = JSON.stringify(schedule.trace);
         expect(serialized).not.toContain("do-not-leak-this-secret");
@@ -429,7 +435,7 @@ describe("chaos infrastructure", () => {
         const alreadyAborted = new AbortController();
         alreadyAborted.abort(new Error("stop before publish"));
         await expect(
-            immediate.publish(delivery("aborted-1"), alreadyAborted.signal),
+            immediate.publish(ctx, delivery("aborted-1"), alreadyAborted.signal),
         ).rejects.toThrow("stop before publish");
 
         const controller = new AbortController();
@@ -450,9 +456,9 @@ describe("chaos infrastructure", () => {
                 controller.abort(new Error("stop during delay"));
             },
         });
-        await expect(delayed.publish(delivery("aborted-2"), controller.signal)).rejects.toThrow(
-            "stop during delay",
-        );
+        await expect(
+            delayed.publish(ctx, delivery("aborted-2"), controller.signal),
+        ).rejects.toThrow("stop during delay");
         expect(clock.now()).toBe(1_700_000_000_010);
         expect(delegate.publishCalls).toBe(0);
         schedule.assertConsumed();

@@ -1,3 +1,5 @@
+import type { Context } from "@steve.kite/stdlib";
+
 import { decodeBase64Url, encodeBase64Url, utf8Decode } from "../../utils/index.js";
 import type {
     DeliveryFetch,
@@ -314,7 +316,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         if (this.#baseUrl.protocol !== "https:" && this.#baseUrl.protocol !== "http:") {
             throw new Error("Delivery relay URL must use HTTP or HTTPS");
         }
-        this.#fetch = options.fetch ?? globalThis.fetch.bind(globalThis);
+        this.#fetch = options.fetch ?? ((_ctx, input, init) => globalThis.fetch(input, init));
         this.#maximumResponseBytes = options.maximumResponseBytes ?? DEFAULT_MAXIMUM_RESPONSE_BYTES;
         this.#requestTimeoutMilliseconds = options.requestTimeoutMilliseconds ?? 45_000;
         this.#streamHeartbeatTimeoutMilliseconds =
@@ -339,18 +341,26 @@ export class HttpDeliveryTransport implements DeliveryTransport {
     }
 
     /** Publish one exact sender-signed delivery. */
-    async publish(delivery: SignedDelivery, signal?: AbortSignal): Promise<DeliveryPublishOutcome> {
+    async publish(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<DeliveryPublishOutcome> {
         const value = object(
-            await this.#post("/v1/deliveries", signedDeliveryToJson(delivery), signal),
+            await this.#post(ctx, "/v1/deliveries", signedDeliveryToJson(delivery), signal),
         );
         exact(value, ["eventId", "duplicate"]);
         if (typeof value.duplicate !== "boolean") throw new Error("Invalid relay response");
         return { eventId: uuid(value.eventId), duplicate: value.duplicate };
     }
 
-    async deleteSession(delivery: SignedDelivery, signal?: AbortSignal): Promise<number> {
+    async deleteSession(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<number> {
         const value = object(
-            await this.#post("/v1/sessions/delete", signedDeliveryToJson(delivery), signal),
+            await this.#post(ctx, "/v1/sessions/delete", signedDeliveryToJson(delivery), signal),
         );
         exact(value, ["removed"]);
         if (
@@ -363,21 +373,27 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         return value.removed;
     }
 
-    async deleteAccount(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+    async deleteAccount(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<void> {
         const value = object(
-            await this.#post("/v1/accounts/delete", signedDeliveryToJson(delivery), signal),
+            await this.#post(ctx, "/v1/accounts/delete", signedDeliveryToJson(delivery), signal),
         );
         exact(value, ["deleted"]);
         if (value.deleted !== true) throw new Error("Invalid relay response");
     }
 
     async readDeviceRoster(
+        ctx: Context,
         accountKey: Uint8Array,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster | undefined> {
         if (accountKey.length !== 32) throw new Error("Invalid account identity key");
         const value = object(
             await this.#post(
+                ctx,
                 "/v1/device-rosters/read",
                 { version: 1, accountKey: encodeBase64Url(accountKey) },
                 signal,
@@ -388,20 +404,30 @@ export class HttpDeliveryTransport implements DeliveryTransport {
     }
 
     async mutateDeviceRoster(
+        ctx: Context,
         delivery: SignedDelivery,
         signal?: AbortSignal,
     ): Promise<DeliveryDeviceRoster> {
         const value = object(
-            await this.#post("/v1/device-rosters/mutate", signedDeliveryToJson(delivery), signal),
+            await this.#post(
+                ctx,
+                "/v1/device-rosters/mutate",
+                signedDeliveryToJson(delivery),
+                signal,
+            ),
         );
         exact(value, ["roster"]);
         return roster(value.roster);
     }
 
     /** Upload one account-signed per-device directory replacement or replenishment. */
-    async uploadDirectoryPrekeys(delivery: SignedDelivery, signal?: AbortSignal): Promise<void> {
+    async uploadDirectoryPrekeys(
+        ctx: Context,
+        delivery: SignedDelivery,
+        signal?: AbortSignal,
+    ): Promise<void> {
         const value = object(
-            await this.#post("/v1/directory/upload", signedDeliveryToJson(delivery), signal),
+            await this.#post(ctx, "/v1/directory/upload", signedDeliveryToJson(delivery), signal),
         );
         exact(value, ["uploaded"]);
         if (value.uploaded !== true) throw new Error("Invalid relay response");
@@ -409,6 +435,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
 
     /** Spend one opaque authentication ticket on an exact account identity claim. */
     async claimDirectory(
+        ctx: Context,
         accountKey: Uint8Array,
         ticket: Uint8Array,
         signal?: AbortSignal,
@@ -418,6 +445,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         }
         const claim = directoryClaim(
             await this.#post(
+                ctx,
                 "/v1/directory/claim",
                 {
                     version: 1,
@@ -434,9 +462,9 @@ export class HttpDeliveryTransport implements DeliveryTransport {
     }
 
     /** Read one bounded page from an identity inbox. */
-    async read(request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
+    async read(ctx: Context, request: SignedInboxRead, signal?: AbortSignal): Promise<InboxPage> {
         const page = parseInboxPage(
-            await this.#post("/v1/queue/read", signedInboxReadToJson(request), signal),
+            await this.#post(ctx, "/v1/queue/read", signedInboxReadToJson(request), signal),
             request.limit,
         );
         if (page.deliveries.length > request.limit) {
@@ -447,11 +475,12 @@ export class HttpDeliveryTransport implements DeliveryTransport {
 
     /** Acknowledge and trim one durably processed inbox prefix. */
     async acknowledge(
+        ctx: Context,
         request: SignedInboxAck,
         signal?: AbortSignal,
     ): Promise<InboxAcknowledgement> {
         const value = object(
-            await this.#post("/v1/queue/ack", signedInboxAckToJson(request), signal),
+            await this.#post(ctx, "/v1/queue/ack", signedInboxAckToJson(request), signal),
         );
         exact(value, ["removed", "sequence", "generation"]);
         if (
@@ -478,6 +507,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
 
     /** Stream exact queued deliveries over one recipient-authenticated SSE response. */
     async *stream(
+        ctx: Context,
         request: SignedInboxRead,
         signal?: AbortSignal,
         hooks: DeliveryStreamHooks = {},
@@ -496,7 +526,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
             controller.abort(new Error("Delivery event stream connection timed out"));
         }, this.#requestTimeoutMilliseconds);
         try {
-            const response = await this.#fetch(new URL("/v1/queue/events", this.#baseUrl), {
+            const response = await this.#fetch(ctx, new URL("/v1/queue/events", this.#baseUrl), {
                 method: "POST",
                 headers: {
                     accept: "text/event-stream",
@@ -518,9 +548,10 @@ export class HttpDeliveryTransport implements DeliveryTransport {
                 throw new DeliveryTransportError(0, "invalid_stream");
             }
             clearTimeout(timeout);
-            await hooks.onConnected?.();
+            await hooks.onConnected?.(ctx);
             try {
                 yield* decodeDeliveryEventStream(
+                    ctx,
                     response,
                     controller,
                     this.#maximumResponseBytes,
@@ -551,7 +582,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         }
     }
 
-    async #post(path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
+    async #post(ctx: Context, path: string, body: unknown, signal?: AbortSignal): Promise<unknown> {
         const controller = new AbortController();
         const forwardAbort = (): void => controller.abort(signal?.reason);
         if (signal?.aborted === true) {
@@ -565,7 +596,7 @@ export class HttpDeliveryTransport implements DeliveryTransport {
         let response: Response;
         let value: unknown;
         try {
-            response = await this.#fetch(new URL(path, this.#baseUrl), {
+            response = await this.#fetch(ctx, new URL(path, this.#baseUrl), {
                 method: "POST",
                 headers: { "content-type": "application/json" },
                 body: JSON.stringify(body),

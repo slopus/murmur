@@ -1,3 +1,4 @@
+import { createRootContext } from "@steve.kite/stdlib";
 import {
     LocalDirectoryTicketIssuer,
     RelayService,
@@ -7,10 +8,12 @@ import {
 import { describe, expect, test } from "vitest";
 import { ACCOUNT_PEER_ROSTER_PREFIX, serializeDeviceRoster } from "../index.js";
 import { generateIdentityKeyPair } from "../../crypto/index.js";
-import { HttpDeliveryTransport } from "../../delivery/index.js";
+import { HttpDeliveryTransport, type DeliveryFetch } from "../../delivery/index.js";
 import { MurmurClient } from "../../sessions/index.js";
 import { MemoryMurmurStore } from "../../storage/index.js";
 import { encodeBase64Url, utf8Decode, utf8Encode } from "../../utils/index.js";
+
+const ctx = createRootContext().named("test");
 
 describe("restored-account device registration", () => {
     test("registers sibling devices and updates owner-encrypted metadata in place", async () => {
@@ -21,7 +24,7 @@ describe("restored-account device registration", () => {
             defaultAdmissionPrincipal: "test",
             requireRemoteAddress: false,
         });
-        const fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+        const fetch: DeliveryFetch = (_ctx, input, init): Promise<Response> =>
             handler(new Request(input, init));
         const transport = (): HttpDeliveryTransport =>
             new HttpDeliveryTransport("https://relay.test", { fetch });
@@ -35,20 +38,20 @@ describe("restored-account device registration", () => {
         let firstMetadataDevice: Uint8Array | undefined;
         let secondMetadataDevice: Uint8Array | undefined;
         try {
-            first = await MurmurClient.open({
+            first = await MurmurClient.open(ctx, {
                 identity: account,
                 transport: transport(),
                 store: firstStore,
-                encryptDeviceMetadata: (deviceKey) => {
+                encryptDeviceMetadata: (_ctx, deviceKey) => {
                     firstMetadataDevice = deviceKey.slice();
                     return new Uint8Array([1]);
                 },
             });
-            second = await MurmurClient.open({
+            second = await MurmurClient.open(ctx, {
                 identity: account,
                 transport: transport(),
                 store: secondStore,
-                encryptDeviceMetadata: async (deviceKey) => {
+                encryptDeviceMetadata: async (_ctx, deviceKey) => {
                     secondMetadataDevice = deviceKey.slice();
                     return new Uint8Array([2]);
                 },
@@ -56,7 +59,7 @@ describe("restored-account device registration", () => {
             expect(firstMetadataDevice).toEqual(first.deviceKey);
             expect(secondMetadataDevice).toEqual(second.deviceKey);
 
-            const registered = await transport().readDeviceRoster(account.publicKey);
+            const registered = await transport().readDeviceRoster(ctx, account.publicKey);
             expect(registered?.devices).toHaveLength(2);
             expect(registered?.devices.map((entry) => entry.encryptedMetadata[0]).sort()).toEqual([
                 1, 2,
@@ -69,44 +72,45 @@ describe("restored-account device registration", () => {
                 first.deviceKey,
                 firstRegistered!.lastAccessedAt + 1_000,
             );
-            const refreshed = await first.devices();
+            const refreshed = await first.devices(ctx);
             expect(
                 refreshed.find(
                     (entry) =>
                         encodeBase64Url(entry.deviceKey) === encodeBase64Url(first!.deviceKey),
                 )?.lastAccessedAt,
             ).toBe(firstRegistered!.lastAccessedAt + 1_000);
-            expect((await transport().readDeviceRoster(account.publicKey))?.revision).toBe(
+            expect((await transport().readDeviceRoster(ctx, account.publicKey))?.revision).toBe(
                 registered?.revision,
             );
             const secondGeneration = registered?.devices.find(
                 (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(second!.deviceKey),
             )?.resetGeneration;
 
-            claimant = await MurmurClient.open({
+            claimant = await MurmurClient.open(ctx, {
                 transport: transport(),
                 store: new MemoryMurmurStore(),
             });
             const beforeUpdate = await claimant.claimAccount(
+                ctx,
                 account.publicKey,
                 issuer.issue({ expiresAt: Date.now() + 60_000, claimBudget: 2 }),
             );
             expect(beforeUpdate.members).toHaveLength(2);
 
             const secondDeviceKey = second.deviceKey;
-            second.close();
+            second.close(ctx);
             second = undefined;
-            reopened = await MurmurClient.open({
+            reopened = await MurmurClient.open(ctx, {
                 identity: account,
                 transport: transport(),
                 store: secondStore,
-                encryptDeviceMetadata: (deviceKey) => {
+                encryptDeviceMetadata: (_ctx, deviceKey) => {
                     expect(deviceKey).toEqual(secondDeviceKey);
                     return new Uint8Array([3]);
                 },
             });
 
-            const updated = await transport().readDeviceRoster(account.publicKey);
+            const updated = await transport().readDeviceRoster(ctx, account.publicKey);
             const updatedSecond = updated?.devices.find(
                 (entry) => encodeBase64Url(entry.deviceKey) === encodeBase64Url(secondDeviceKey),
             );
@@ -117,15 +121,16 @@ describe("restored-account device registration", () => {
             expect(updated?.devices).toHaveLength(2);
 
             const afterUpdate = await claimant.claimAccount(
+                ctx,
                 account.publicKey,
                 issuer.issue({ expiresAt: Date.now() + 60_000, claimBudget: 2 }),
             );
             expect(afterUpdate.members).toHaveLength(2);
         } finally {
-            first?.close();
-            second?.close();
-            reopened?.close();
-            claimant?.close();
+            first?.close(ctx);
+            second?.close(ctx);
+            reopened?.close(ctx);
+            claimant?.close(ctx);
             await relay.close();
         }
     });
@@ -136,54 +141,54 @@ describe("restored-account device registration", () => {
             defaultAdmissionPrincipal: "test",
             requireRemoteAddress: false,
         });
-        const fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+        const fetch: DeliveryFetch = (_ctx, input, init): Promise<Response> =>
             handler(new Request(input, init));
         const account = generateIdentityKeyPair();
-        const first = await MurmurClient.open({
+        const first = await MurmurClient.open(ctx, {
             identity: account,
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
-        const peer = await MurmurClient.open({
+        const peer = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
-        const session = await first.createSession({
+        const session = await first.createSession(ctx, {
             descriptor: utf8Encode("device-roster-convergence"),
-            members: [await peer.createKeyPackage()],
+            members: [await peer.createKeyPackage(ctx)],
         });
         for (let round = 0; round < 4; round += 1) {
-            await first.synchronize({ waitMilliseconds: 0 });
-            await peer.synchronize({ waitMilliseconds: 0 });
+            await first.synchronize(ctx, { waitMilliseconds: 0 });
+            await peer.synchronize(ctx, { waitMilliseconds: 0 });
         }
-        if ((await peer.session(session.id))?.status === "pending") {
-            await peer.activateSession(session.id);
+        if ((await peer.session(ctx, session.id))?.status === "pending") {
+            await peer.activateSession(ctx, session.id);
         }
-        const second = await MurmurClient.open({
+        const second = await MurmurClient.open(ctx, {
             identity: account,
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
         try {
-            const firstNotification = await first.synchronize({ waitMilliseconds: 0 });
-            const secondNotification = await second.synchronize({ waitMilliseconds: 0 });
+            const firstNotification = await first.synchronize(ctx, { waitMilliseconds: 0 });
+            const secondNotification = await second.synchronize(ctx, { waitMilliseconds: 0 });
             expect(firstNotification.inbox.processed).toBeGreaterThan(0);
             expect(secondNotification.inbox.processed).toBeGreaterThan(0);
             for (let round = 0; round < 8; round += 1) {
-                await first.synchronize({ waitMilliseconds: 0 });
-                await peer.synchronize({ waitMilliseconds: 0 });
-                await second.synchronize({ waitMilliseconds: 0 });
+                await first.synchronize(ctx, { waitMilliseconds: 0 });
+                await peer.synchronize(ctx, { waitMilliseconds: 0 });
+                await second.synchronize(ctx, { waitMilliseconds: 0 });
             }
-            expect((await second.session(session.id))?.status).toBe("pending");
-            await second.activateSession(session.id);
-            expect((await second.session(session.id))?.status).toBe("active");
-            expect(await first.devices()).toHaveLength(2);
-            await first.removeDevice(second.deviceKey);
-            expect(await first.devices()).toHaveLength(1);
+            expect((await second.session(ctx, session.id))?.status).toBe("pending");
+            await second.activateSession(ctx, session.id);
+            expect((await second.session(ctx, session.id))?.status).toBe("active");
+            expect(await first.devices(ctx)).toHaveLength(2);
+            await first.removeDevice(ctx, second.deviceKey);
+            expect(await first.devices(ctx)).toHaveLength(1);
         } finally {
-            first.close();
-            second.close();
-            peer.close();
+            first.close(ctx);
+            second.close(ctx);
+            peer.close(ctx);
             await relay.close();
         }
     });
@@ -194,12 +199,13 @@ describe("restored-account device registration", () => {
             defaultAdmissionPrincipal: "test",
             requireRemoteAddress: false,
         });
-        const relayFetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+        const relayFetch: DeliveryFetch = (_ctx, input, init): Promise<Response> =>
             handler(new Request(input, init));
         let trackSenderPublications = false;
         const staleResponses: unknown[] = [];
         const successfulPublications: Record<string, unknown>[] = [];
-        const senderFetch = async (
+        const senderFetch: DeliveryFetch = async (
+            _ctx,
             input: RequestInfo | URL,
             init?: RequestInit,
         ): Promise<Response> => {
@@ -217,36 +223,36 @@ describe("restored-account device registration", () => {
             return response;
         };
         const senderStore = new MemoryMurmurStore();
-        const sender = await MurmurClient.open({
+        const sender = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch: senderFetch }),
             store: senderStore,
         });
         const targetAccount = generateIdentityKeyPair();
-        const firstTarget = await MurmurClient.open({
+        const firstTarget = await MurmurClient.open(ctx, {
             identity: targetAccount,
             transport: new HttpDeliveryTransport("https://relay.test", { fetch: relayFetch }),
             store: new MemoryMurmurStore(),
         });
         let secondTarget: MurmurClient | undefined;
         try {
-            const session = await firstTarget.createSession({
+            const session = await firstTarget.createSession(ctx, {
                 descriptor: utf8Encode("stale-roster-retry"),
-                members: [await sender.createKeyPackage()],
+                members: [await sender.createKeyPackage(ctx)],
             });
             for (let round = 0; round < 4; round += 1) {
-                await firstTarget.synchronize({ waitMilliseconds: 0 });
-                await sender.synchronize({ waitMilliseconds: 0 });
+                await firstTarget.synchronize(ctx, { waitMilliseconds: 0 });
+                await sender.synchronize(ctx, { waitMilliseconds: 0 });
             }
-            if ((await sender.session(session.id))?.status === "pending") {
-                await sender.activateSession(session.id);
+            if ((await sender.session(ctx, session.id))?.status === "pending") {
+                await sender.activateSession(ctx, session.id);
             }
             const staleRoster = await new HttpDeliveryTransport("https://relay.test", {
                 fetch: relayFetch,
-            }).readDeviceRoster(targetAccount.publicKey);
+            }).readDeviceRoster(ctx, targetAccount.publicKey);
             if (staleRoster === undefined) throw new Error("Target roster was not registered");
 
             const secondStore = new MemoryMurmurStore();
-            secondTarget = await MurmurClient.open({
+            secondTarget = await MurmurClient.open(ctx, {
                 identity: targetAccount,
                 transport: new HttpDeliveryTransport("https://relay.test", {
                     fetch: relayFetch,
@@ -254,31 +260,34 @@ describe("restored-account device registration", () => {
                 store: secondStore,
             });
             await senderStore.set(
+                ctx,
                 `${ACCOUNT_PEER_ROSTER_PREFIX}${encodeBase64Url(targetAccount.publicKey)}`,
                 serializeDeviceRoster(staleRoster),
             );
 
             trackSenderPublications = true;
-            await sender.send(session.id, utf8Encode("expanded roster delivery"));
-            await expect(sender.synchronize({ waitMilliseconds: 0 })).resolves.toMatchObject({
+            await sender.send(ctx, session.id, utf8Encode("expanded roster delivery"));
+            await expect(sender.synchronize(ctx, { waitMilliseconds: 0 })).resolves.toMatchObject({
                 transientPublicationFailures: 1,
                 terminalPublicationFailures: 0,
             });
             let retriedPublications = 0;
             for (let round = 0; round < 12; round += 1) {
-                const retried = await sender.synchronize({ waitMilliseconds: 0 });
+                const retried = await sender.synchronize(ctx, { waitMilliseconds: 0 });
                 retriedPublications += retried.published;
                 expect(retried).toMatchObject({
                     transientPublicationFailures: 0,
                     terminalPublicationFailures: 0,
                 });
-                await firstTarget.synchronize({ waitMilliseconds: 0 });
-                await secondTarget.synchronize({ waitMilliseconds: 0 });
+                await firstTarget.synchronize(ctx, { waitMilliseconds: 0 });
+                await secondTarget.synchronize(ctx, { waitMilliseconds: 0 });
             }
             expect(retriedPublications).toBeGreaterThanOrEqual(2);
-            expect(await secondTarget.session(session.id)).toMatchObject({ status: "pending" });
-            expect(await secondTarget.issues()).toEqual([]);
-            await secondTarget.activateSession(session.id);
+            expect(await secondTarget.session(ctx, session.id)).toMatchObject({
+                status: "pending",
+            });
+            expect(await secondTarget.issues(ctx)).toEqual([]);
+            await secondTarget.activateSession(ctx, session.id);
 
             expect(staleResponses).toEqual([
                 expect.objectContaining({ error: "stale_epoch_coverage" }),
@@ -301,9 +310,10 @@ describe("restored-account device registration", () => {
             const received: string[] = [];
             for (let round = 0; round < 4; round += 1) {
                 await secondTarget.synchronize(
+                    ctx,
                     { waitMilliseconds: 0 },
                     {
-                        onUpdates: (updates) => {
+                        onUpdates: (_ctx, updates) => {
                             received.push(...updates.map((update) => utf8Decode(update.bytes)));
                         },
                     },
@@ -311,9 +321,9 @@ describe("restored-account device registration", () => {
             }
             expect(received).toContain("expanded roster delivery");
         } finally {
-            sender.close();
-            firstTarget.close();
-            secondTarget?.close();
+            sender.close(ctx);
+            firstTarget.close(ctx);
+            secondTarget?.close(ctx);
             await relay.close();
         }
     });
@@ -333,13 +343,13 @@ describe("identity directory", () => {
             defaultAdmissionPrincipal: "test",
             requireRemoteAddress: false,
         });
-        const fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+        const fetch: DeliveryFetch = (_ctx, input, init): Promise<Response> =>
             handler(new Request(input, init));
-        const owner = await MurmurClient.open({
+        const owner = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
-        const claimant = await MurmurClient.open({
+        const claimant = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
@@ -349,25 +359,26 @@ describe("identity directory", () => {
                 claimBudget: 8,
             });
             for (let index = 0; index < 4; index += 1) {
-                const claim = await claimant.claimAccount(owner.identity, ticket);
+                const claim = await claimant.claimAccount(ctx, owner.identity, ticket);
                 expect(claim.members).toHaveLength(1);
                 expect(claim.members[0]?.source).toBe("one_time");
             }
-            const replenished = await owner.synchronize({ waitMilliseconds: 0 });
+            const replenished = await owner.synchronize(ctx, { waitMilliseconds: 0 });
             expect(replenished.inbox.processed).toBeGreaterThanOrEqual(4);
-            expect((await claimant.claimAccount(owner.identity, ticket)).members[0]?.source).toBe(
-                "one_time",
-            );
+            expect(
+                (await claimant.claimAccount(ctx, owner.identity, ticket)).members[0]?.source,
+            ).toBe("one_time");
 
-            await owner.rotate();
+            await owner.rotate(ctx);
             const afterRotation = await claimant.claimAccount(
+                ctx,
                 owner.identity,
                 issuer.issue({ expiresAt: Date.now() + 60_000, claimBudget: 1 }),
             );
             expect(afterRotation.members[0]?.source).toBe("one_time");
         } finally {
-            owner.close();
-            claimant.close();
+            owner.close(ctx);
+            claimant.close(ctx);
             await relay.close();
         }
     });
@@ -385,17 +396,17 @@ describe("identity directory", () => {
             defaultAdmissionPrincipal: "test",
             requireRemoteAddress: false,
         });
-        const fetch = (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+        const fetch: DeliveryFetch = (_ctx, input, init): Promise<Response> =>
             handler(new Request(input, init));
-        const target = await MurmurClient.open({
+        const target = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
-        const firstClaimant = await MurmurClient.open({
+        const firstClaimant = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
-        const secondClaimant = await MurmurClient.open({
+        const secondClaimant = await MurmurClient.open(ctx, {
             transport: new HttpDeliveryTransport("https://relay.test", { fetch }),
             store: new MemoryMurmurStore(),
         });
@@ -405,47 +416,48 @@ describe("identity directory", () => {
                 claimBudget: 8,
             });
             for (let index = 0; index < 4; index += 1) {
-                await firstClaimant.claimAccount(target.identity, ticket);
+                await firstClaimant.claimAccount(ctx, target.identity, ticket);
             }
-            const firstClaim = await firstClaimant.claimAccount(target.identity, ticket);
-            const secondClaim = await secondClaimant.claimAccount(target.identity, ticket);
+            const firstClaim = await firstClaimant.claimAccount(ctx, target.identity, ticket);
+            const secondClaim = await secondClaimant.claimAccount(ctx, target.identity, ticket);
             expect(firstClaim.members[0]?.source).toBe("last_resort");
             expect(secondClaim.members[0]?.source).toBe("last_resort");
             expect(firstClaim.members[0]?.keyPackage).toEqual(secondClaim.members[0]?.keyPackage);
 
-            const firstSession = await firstClaimant.createSession({
+            const firstSession = await firstClaimant.createSession(ctx, {
                 descriptor: utf8Encode("first-last-resort-session"),
                 members: [firstClaim],
             });
-            const secondSession = await secondClaimant.createSession({
+            const secondSession = await secondClaimant.createSession(ctx, {
                 descriptor: utf8Encode("second-last-resort-session"),
                 members: [secondClaim],
             });
             for (let round = 0; round < 8; round += 1) {
-                await firstClaimant.synchronize({ waitMilliseconds: 0 });
-                await secondClaimant.synchronize({ waitMilliseconds: 0 });
-                await target.synchronize({ waitMilliseconds: 0 });
+                await firstClaimant.synchronize(ctx, { waitMilliseconds: 0 });
+                await secondClaimant.synchronize(ctx, { waitMilliseconds: 0 });
+                await target.synchronize(ctx, { waitMilliseconds: 0 });
             }
-            expect((await target.session(firstSession.id))?.status).toBe("pending");
-            expect((await target.session(secondSession.id))?.status).toBe("pending");
-            await target.activateSession(firstSession.id);
-            await target.activateSession(secondSession.id);
+            expect((await target.session(ctx, firstSession.id))?.status).toBe("pending");
+            expect((await target.session(ctx, secondSession.id))?.status).toBe("pending");
+            await target.activateSession(ctx, firstSession.id);
+            await target.activateSession(ctx, secondSession.id);
 
             const secondAccountClaim = await firstClaimant.claimAccount(
+                ctx,
                 secondClaimant.identity,
                 issuer.issue({ expiresAt: Date.now() + 60_000, claimBudget: 1 }),
             );
-            await firstClaimant.addMember(firstSession.id, secondAccountClaim);
+            await firstClaimant.addMember(ctx, firstSession.id, secondAccountClaim);
             for (let round = 0; round < 8; round += 1) {
-                await firstClaimant.synchronize({ waitMilliseconds: 0 });
-                await target.synchronize({ waitMilliseconds: 0 });
-                await secondClaimant.synchronize({ waitMilliseconds: 0 });
+                await firstClaimant.synchronize(ctx, { waitMilliseconds: 0 });
+                await target.synchronize(ctx, { waitMilliseconds: 0 });
+                await secondClaimant.synchronize(ctx, { waitMilliseconds: 0 });
             }
-            expect((await secondClaimant.session(firstSession.id))?.status).toBe("pending");
+            expect((await secondClaimant.session(ctx, firstSession.id))?.status).toBe("pending");
         } finally {
-            target.close();
-            firstClaimant.close();
-            secondClaimant.close();
+            target.close(ctx);
+            firstClaimant.close(ctx);
+            secondClaimant.close(ctx);
             await relay.close();
         }
     });
