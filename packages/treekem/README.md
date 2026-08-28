@@ -1,7 +1,7 @@
 # `@slopus/treekem`
 
 Small, stateless TreeKEM group key agreement for browsers and Node.js. Every
-member sees the same three-field group shape. The package keeps no hidden state:
+member sees the same group view. The package keeps no hidden state:
 each operation consumes opaque private state and returns its replacement.
 
 ```ts
@@ -12,7 +12,7 @@ const bob = treekem.keyPair();
 
 const created = treekem.create(alice);
 
-const added = treekem.update(created.secretState, {
+const added = treekem.update(created.group.secretState, {
     add: [bob.publicKey],
 });
 
@@ -22,10 +22,10 @@ const rotated = treekem.update(joined.secretState);
 
 const applied = treekem.apply(added.group.secretState, rotated.publicGroupMessage);
 
-// rotated.group and applied now have the same secretKey and members.
+// rotated.group and applied have the same secretKey, members, and epoch.
 ```
 
-Every local group has exactly this shape:
+Every local group has this shape:
 
 ```ts
 interface TreeKemKeyPair {
@@ -37,12 +37,13 @@ interface TreeKemGroup {
     readonly secretState: Uint8Array;
     readonly secretKey: Uint8Array;
     readonly members: readonly string[];
+    readonly epoch: string;
 }
 ```
 
-`secretState` is different for every member. `secretKey` and `members` converge
-after everyone consumes the same update. Members are represented by their
-stable admission public keys in tree-leaf order.
+`secretState` is different for every member. `secretKey`, `members`, and `epoch`
+converge after everyone consumes the same update. Members are represented by
+their stable admission public keys in tree-leaf order.
 
 Admission public and secret keys are canonical base64url strings, as are the
 public keys in `members`. The group `secretKey`, opaque `secretState`, and public
@@ -53,10 +54,17 @@ TreeKEM position and group secret. The package loads the binary `secretKey` from
 that state and returns it for immediate cryptographic use. Applications do not
 need to persist `secretKey` separately.
 
-`update()` additionally returns one opaque `publicGroupMessage` for all existing
-members and a recipient-keyed `publicWelcome` object for newly added members:
+`create()` returns the creator's private group and an initial signed
+`publicGroupMessage`. `update()` returns the replacement private group, a new
+`publicGroupMessage` for all existing members, and a recipient-keyed
+`publicWelcome` object for newly added members:
 
 ```ts
+interface TreeKemCreateResult {
+    readonly group: TreeKemGroup;
+    readonly publicGroupMessage: Uint8Array;
+}
+
 interface TreeKemUpdateResult {
     readonly group: TreeKemGroup;
     readonly publicGroupMessage: Uint8Array;
@@ -68,6 +76,72 @@ Existing members consume `publicGroupMessage` with `apply()`. Every added member
 has a unique Welcome encrypted to its admission public key and consumes only
 `publicWelcome[publicKey]` with `join()`. A Welcome contains the public group
 state needed to join, so joining never requires both messages.
+
+## Public group state
+
+`publicGroupMessage` is an authenticated public membership transition. A server
+applies it without receiving any group secrets:
+
+```ts
+const publicCreated = treekem.applyPublic(undefined, created.publicGroupMessage);
+
+const publicAdded = treekem.applyPublic(
+    publicCreated.publicState,
+    added.publicGroupMessage,
+    added.publicWelcome,
+);
+```
+
+```ts
+interface TreeKemPublicGroup {
+    readonly publicState: Uint8Array;
+    readonly members: readonly string[];
+    readonly epoch: string;
+}
+```
+
+`publicState` contains the group identifier, epoch, public tree, and the keys
+needed to authenticate the next transition. It contains no path secrets or
+group secret. The server persists the newest `publicState`; `members` and
+`epoch` are views loaded from it and do not need separate persistence.
+
+`applyPublic()` verifies that the message's parent epoch equals the supplied
+public state's current epoch and that the message was signed by a current
+member. When additions are present, it also verifies that `publicWelcome`
+contains exactly one Welcome for every added public key. The embedding server
+still decides who may change membership and checks that delivery recipients
+cover every required member.
+
+The initial public message is self-signed by the creator. The embedding server
+must authenticate and authorize that creator before registering the group.
+
+## Epochs
+
+An epoch is a canonical UUIDv7 string identifying one exact group state.
+`create()` generates the initial epoch. Every `update()` names its current epoch
+as `parentEpoch` inside the signed `publicGroupMessage` and generates a fresh
+UUIDv7 as the resulting epoch. `join()`, `apply()`, and `applyPublic()` expose
+that resulting epoch.
+
+The epoch is an opaque version identifier. Its embedded timestamp is useful for
+operations and indexing, but it never decides which concurrent update wins and
+clients must not compare UUID values to resolve conflicts.
+
+Group transitions are serialized with an atomic compare-and-swap. The server
+accepts a `publicGroupMessage` only when its signed `parentEpoch` exactly equals
+`publicGroup.epoch`. The accepted message replaces `publicState` and its new
+UUID becomes the current epoch. Every competing message built from the previous
+epoch is stale and rejected, regardless of its UUID timestamp or lexical order.
+
+The sender keeps its previously accepted `secretState` until its update is
+accepted. After rejection it destroys the tentative returned group, applies the
+accepted competing transition to the old state, and recreates its desired
+change from the new epoch.
+
+Application-message envelopes should carry the UUID epoch they encrypted for.
+The server can reject a new publication whose epoch differs from the current
+public group, while already accepted deliveries retain their established queue
+order.
 
 The application must authenticate a member's public admission key before
 adding it. Ongoing updates are signed and verified by the package. Any current
@@ -83,20 +157,24 @@ untrusted server must not be the recipient's source of inviter identity.
 
 An untrusted public server may persist and deliver only the public values:
 
-| Value                         | Server storage      | Contents                                   |
-| ----------------------------- | ------------------- | ------------------------------------------ |
-| `keyPair().publicKey`         | Yes                 | Public admission material                  |
-| `group.members`               | Yes                 | Current stable member public keys          |
-| `update().publicGroupMessage` | Yes, until consumed | Signed update for existing members         |
-| `update().publicWelcome[key]` | Yes, until consumed | Recipient-encrypted joining state          |
-| `keyPair().secretKey`         | Never               | One-use admission secret                   |
-| `group.secretState`           | Never               | Local signing key and private TreeKEM path |
-| `group.secretKey`             | Never               | Shared epoch secret                        |
+| Value                         | Server storage      | Contents                                      |
+| ----------------------------- | ------------------- | --------------------------------------------- |
+| `keyPair().publicKey`         | Yes                 | Public admission material                     |
+| `publicGroup.publicState`     | Yes                 | Public tree and transition-verification state |
+| `publicGroup.members`         | Derived             | Current stable member public keys             |
+| `publicGroup.epoch`           | Derived             | Current UUIDv7 group version                  |
+| `create().publicGroupMessage` | Yes, until applied  | Signed initial public group                   |
+| `update().publicGroupMessage` | Yes, until applied  | Signed membership and tree transition         |
+| `update().publicWelcome[key]` | Yes, until consumed | Recipient-encrypted joining state             |
+| `keyPair().secretKey`         | Never               | One-use admission secret                      |
+| `group.secretState`           | Never               | Local signing key and private TreeKEM path    |
+| `group.secretKey`             | Never               | Shared epoch secret                           |
 
-The server treats every message as exact opaque bytes. Delete each Welcome after
-its intended recipient consumes it: later compromise of an admission secret
-could decrypt retained historical joining data. The server can observe update
-timing, size, group identifiers, leaf indices, and public membership changes.
+The server handles exact message bytes through `applyPublic()` rather than
+decoding the wire format itself. Delete each Welcome after its intended
+recipient consumes it: later compromise of an admission secret could decrypt
+retained historical joining data. The server can observe update timing, size,
+group identifiers, epochs, leaf indices, and public membership changes.
 
 There is deliberately no public-tree API. A public tree alone cannot recover a
 member's lost private path.
@@ -113,7 +191,8 @@ versioned wire format. It is not an MLS wire implementation.
 ## API
 
 - `keyPair(): TreeKemKeyPair` creates a one-use string admission key pair.
-- `create(keyPair): TreeKemGroup` creates a group containing only the creator.
+- `create(keyPair): TreeKemCreateResult` creates a group containing only the
+  creator and its initial public group message.
 - `update(secretState, changes?): TreeKemUpdateResult` refreshes the sender path
   and atomically adds or removes zero or more members. Removals happen before
   additions. It returns the replacement local `group`, one
@@ -122,6 +201,9 @@ versioned wire format. It is not an MLS wire implementation.
   an existing member.
 - `join(secretKey, publicWelcome): TreeKemGroup` decrypts one member's unique
   joining state.
+- `applyPublic(publicState, publicGroupMessage, publicWelcome?): TreeKemPublicGroup`
+  verifies a public transition and returns replacement server state, membership,
+  and epoch. Pass `undefined` as `publicState` only for group creation.
 - `destroy(...values): void` overwrites caller-owned secret-state and group-key
   byte arrays. Admission secret keys are strings; JavaScript strings are
   immutable and cannot be zeroed.
