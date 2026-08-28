@@ -102,6 +102,7 @@ export type {
     MurmurClaimedSessionMember,
     MurmurSessionPage,
     MurmurSessionPolicies,
+    MurmurSessionChangedEvent,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,

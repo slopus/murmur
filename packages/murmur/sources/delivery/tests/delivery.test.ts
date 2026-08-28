@@ -88,6 +88,141 @@ describe("delivery client", () => {
         }
     });
 
+    test("rolls back and exactly retries a deferred inbox delivery", async () => {
+        const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
+        const http = new HttpDeliveryTransport("https://relay.test", {
+            fetch: relayFetch(relay),
+        });
+        const alice = generateIdentityKeyPair();
+        const bob = generateIdentityKeyPair();
+        const store = new MemoryMurmurStore();
+        let acknowledgements = 0;
+        const transport: DeliveryTransport = {
+            publish: (_ctx, delivery, signal) => http.publish(ctx, delivery, signal),
+            read: (_ctx, read, signal) => http.read(ctx, read, signal),
+            acknowledge: async (_ctx, acknowledgement, signal) => {
+                acknowledgements += 1;
+                return http.acknowledge(ctx, acknowledgement, signal);
+            },
+        };
+        try {
+            await transport.publish(
+                ctx,
+                createSignedDelivery(alice, [bob.publicKey], utf8Encode("defer once"), {
+                    createdAt: NOW,
+                    expiresAt: NOW + 60_000,
+                }),
+            );
+            let attempts = 0;
+            const processor = new InboxProcessor(
+                { identity: bob, store, transport },
+                async (transaction, staged, queued) => {
+                    attempts += 1;
+                    await store.set(transaction, "application/direct", utf8Encode("written"));
+                    await staged.set(transaction, "application/staged", queued.delivery.ciphertext);
+                    if (attempts === 1) return "deferred";
+                    return undefined;
+                },
+                { now: () => NOW },
+            );
+
+            await expect(processor.synchronize(ctx)).resolves.toEqual({
+                processed: 0,
+                rejected: 0,
+                cursor: null,
+                exhausted: false,
+            });
+            expect(await processor.continuity(ctx)).toMatchObject({ sequence: 0 });
+            expect(await store.get(ctx, "application/direct")).toBeUndefined();
+            expect(await store.get(ctx, "application/staged")).toBeUndefined();
+            expect(
+                (await store.scan(ctx, "murmur/delivery/replay/entries/", { limit: 1 })).size,
+            ).toBe(0);
+            expect(acknowledgements).toBe(0);
+
+            await expect(processor.synchronize(ctx)).resolves.toMatchObject({
+                processed: 1,
+                rejected: 0,
+                exhausted: true,
+            });
+            expect(attempts).toBe(2);
+            expect(await store.get(ctx, "application/direct")).toEqual(utf8Encode("written"));
+            expect(await store.get(ctx, "application/staged")).toEqual(utf8Encode("defer once"));
+            expect(acknowledgements).toBe(1);
+        } finally {
+            await relay.close();
+        }
+    });
+
+    test("returns a deferred stream event for exact reconnect retry", async () => {
+        const identity = generateIdentityKeyPair();
+        const eventId = relayEventId(1);
+        const delivery = createSignedDelivery(
+            identity,
+            [identity.publicKey],
+            utf8Encode("stream retry"),
+            { createdAt: NOW, expiresAt: NOW + 60_000 },
+        );
+        let acknowledgements = 0;
+        const transport: DeliveryTransport = {
+            publish: async (_ctx) => {
+                throw new Error("unexpected publish");
+            },
+            read: async (_ctx) => {
+                throw new Error("unexpected read");
+            },
+            acknowledge: async (_ctx) => {
+                acknowledgements += 1;
+                return { removed: 1 };
+            },
+            stream: async function* () {
+                yield {
+                    type: "continuity" as const,
+                    generation: new Uint8Array(32),
+                    head: eventId,
+                    headSequence: 1,
+                    acknowledgedThrough: null,
+                    acknowledgedSequence: 0,
+                };
+                yield { eventId, sequence: 1, delivery };
+            },
+        };
+        const store = new MemoryMurmurStore();
+        let attempts = 0;
+        const processor = new InboxProcessor(
+            { identity, store, transport },
+            async () => {
+                attempts += 1;
+                return attempts === 1 ? "deferred" : undefined;
+            },
+            { now: () => NOW },
+        );
+        const signal = new AbortController().signal;
+
+        const first = processor.stream(ctx, { signal });
+        await expect(first.next()).resolves.toEqual({
+            done: false,
+            value: {
+                processed: 0,
+                rejected: 0,
+                cursor: null,
+                exhausted: false,
+            },
+        });
+        await expect(first.next()).resolves.toMatchObject({ done: true });
+        expect(await processor.cursor(ctx)).toBeNull();
+        expect(acknowledgements).toBe(0);
+
+        const retried = processor.stream(ctx, { signal });
+        await expect(retried.next()).resolves.toMatchObject({
+            done: false,
+            value: { processed: 1, rejected: 0, cursor: eventId },
+        });
+        expect(attempts).toBe(2);
+        expect(acknowledgements).toBe(1);
+        await retried.return(undefined);
+    });
+
     test("retries acknowledgement after a crash without applying twice", async () => {
         const relay = new RelayService(new SqliteRelayStore(":memory:"), {}, undefined, () => NOW);
         const http = new HttpDeliveryTransport("https://relay.test", {

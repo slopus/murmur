@@ -93,6 +93,7 @@ import type {
     MurmurAccountClaim,
     MurmurClaimedSessionMember,
     MurmurSessionPolicyChanges,
+    MurmurSessionChangedEvent,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,
@@ -117,6 +118,7 @@ export type {
     MurmurSessionPolicyChanges,
     MurmurSessionSendPolicy,
     MurmurSessionDeletedEvent,
+    MurmurSessionChangedEvent,
     MurmurResetEvent,
     MurmurResetSession,
     MurmurSyncOptions,
@@ -354,6 +356,8 @@ export class MurmurClient {
     #consumedDeviceRosterChangeVersion = 0;
     #syncRetryTimer: ReturnType<typeof setTimeout> | undefined;
     #updatesActive = false;
+    #reportedIssueVersion = -1;
+    #reportedIssueFingerprint: string | undefined;
     #accountDeletionActive = false;
     #peerRosterRefreshOrdinal = 0;
     #peerRosterCursor = 0;
@@ -1617,7 +1621,13 @@ export class MurmurClient {
         options: MurmurSynchronizeOptions = {},
         lifecycle: Pick<
             MurmurSyncOptions,
-            "onUpdates" | "onDeviceAdded" | "onDeviceRevoked" | "onReset" | "onDeviceDormant"
+            | "onUpdates"
+            | "onSessionsChanged"
+            | "onIssues"
+            | "onDeviceAdded"
+            | "onDeviceRevoked"
+            | "onReset"
+            | "onDeviceDormant"
         > = {},
     ): Promise<MurmurSynchronizeResult> {
         if (this.#syncActive) {
@@ -1775,7 +1785,12 @@ export class MurmurClient {
         ctx: Context,
         lifecycle: Pick<
             MurmurSyncOptions,
-            "onUpdates" | "onDeviceAdded" | "onDeviceRevoked" | "onDeviceDormant"
+            | "onUpdates"
+            | "onSessionsChanged"
+            | "onIssues"
+            | "onDeviceAdded"
+            | "onDeviceRevoked"
+            | "onDeviceDormant"
         >,
     ): Promise<number> {
         if (this.#updatesActive) return 0;
@@ -1783,22 +1798,37 @@ export class MurmurClient {
         this.#pendingOperations += 1;
         let delivered = 0;
         try {
-            if (lifecycle.onDeviceDormant !== undefined) {
-                const dormant = await this.dormantDevices(ctx);
-                if (dormant.length > 0) await lifecycle.onDeviceDormant(ctx, dormant);
-            }
+            await this.#deliverIssues(ctx, lifecycle.onIssues);
             for (;;) {
                 await this.#exclusive(ctx, () => this.#queueAccountWork(ctx));
                 const prepared = await this.#exclusive(ctx, () => this.#engine.prepareUpdates(ctx));
-                const decisions: SessionRouteDecision[] = [];
-                const consumedKeys = new Set<string>();
-                const consumedDeletionKeys = new Set<string>();
-                const globalUpdates: MurmurUpdate[] = [];
-                let accountEvents: PreparedAccountEvents | undefined;
-                let deferredRoutes = false;
-                let deferredUpdates = false;
                 try {
-                    for (const route of prepared.routes) {
+                    const ordered = [
+                        ...prepared.routes.map((event) => ({
+                            type: "route" as const,
+                            id: event.eventId,
+                            priority: 0,
+                            event,
+                        })),
+                        ...prepared.sessionChanges.map((event) => ({
+                            type: "session" as const,
+                            id: event.id,
+                            priority: 1,
+                            event,
+                        })),
+                        ...prepared.updates.map((event) => ({
+                            type: "update" as const,
+                            id: event.id,
+                            priority: 2,
+                            event,
+                        })),
+                    ].sort(
+                        (left, right) =>
+                            left.id.localeCompare(right.id) || left.priority - right.priority,
+                    );
+                    const head = ordered[0];
+                    if (head?.type === "route") {
+                        const route = head.event;
                         let owner: SessionRouteDecision["owner"] | undefined;
                         for (const [serviceId, service] of [...this.#services].sort(
                             ([left], [right]) => left.localeCompare(right),
@@ -1818,105 +1848,213 @@ export class MurmurClient {
                             }
                         }
                         if (owner === undefined && this.#services.size === 0) {
-                            deferredRoutes = true;
-                        } else {
-                            decisions.push({
-                                key: route.key,
-                                sessionId: route.session.id.slice(),
-                                owner: owner ?? { version: 1, owner: "ignored" },
-                            });
+                            break;
                         }
+                        const decision: SessionRouteDecision = {
+                            key: route.key,
+                            sessionId: route.session.id.slice(),
+                            owner: owner ?? { version: 1, owner: "ignored" },
+                        };
+                        try {
+                            await this.#exclusive(ctx, () =>
+                                this.#engine.commitUpdates(
+                                    ctx,
+                                    prepared,
+                                    [decision],
+                                    new Set(),
+                                    new Set(),
+                                    new Set(),
+                                ),
+                            );
+                        } finally {
+                            zeroBytes(decision.sessionId);
+                        }
+                        continue;
                     }
-                    for (const update of prepared.updates) {
-                        if (update.owner?.owner === "ignored") {
-                            consumedKeys.add(update.key);
-                            continue;
-                        }
-                        if (update.owner === undefined && lifecycle.onUpdates === undefined) {
-                            deferredUpdates = true;
-                            continue;
-                        }
-                        const publicUpdate: MurmurUpdate = Object.freeze({
-                            id: update.id,
-                            sessionId: update.sessionId.slice(),
-                            sender: update.sender.slice(),
-                            bytes: update.bytes.slice(),
-                            ...(update.owner?.owner === "service"
-                                ? { service: update.owner.serviceId }
-                                : {}),
+                    if (head?.type === "session") {
+                        const event = head.event;
+                        const publicEvent: MurmurSessionChangedEvent = Object.freeze({
+                            id: event.id,
+                            service: event.service,
+                            sessionId: event.sessionId.slice(),
+                            status: event.status,
+                            descriptor: event.descriptor.slice(),
+                            members: Object.freeze(event.members.map((member) => member.slice())),
+                            owner: event.owner.slice(),
+                            admins: Object.freeze(event.admins.map((admin) => admin.slice())),
+                            policies: Object.freeze({ ...event.policies }),
+                            ...(event.reAdmission === true ? { reAdmission: true } : {}),
                         });
-                        if (update.owner?.owner === "service") {
-                            const service = this.#services.get(update.owner.serviceId);
-                            if (service === undefined) {
+                        await lifecycle.onSessionsChanged?.(ctx, Object.freeze([publicEvent]));
+                        await this.#exclusive(ctx, () =>
+                            this.#engine.commitUpdates(
+                                ctx,
+                                prepared,
+                                [],
+                                new Set(),
+                                new Set(),
+                                new Set([event.key]),
+                            ),
+                        );
+                        delivered += 1;
+                        continue;
+                    }
+                    if (head?.type === "update") {
+                        const updates: Extract<(typeof ordered)[number], { type: "update" }>[] = [];
+                        for (const item of ordered) {
+                            if (item.type !== "update") break;
+                            updates.push(item);
+                        }
+                        const consumedKeys = new Set<string>();
+                        const globalUpdates: MurmurUpdate[] = [];
+                        let blocked = false;
+                        for (const { event: update } of updates) {
+                            if (update.owner?.owner === "ignored") {
                                 consumedKeys.add(update.key);
                                 continue;
                             }
-                            await service.onUpdate(ctx, publicUpdate);
+                            if (update.owner === undefined && lifecycle.onUpdates === undefined) {
+                                blocked = true;
+                                break;
+                            }
+                            const publicUpdate: MurmurUpdate = Object.freeze({
+                                id: update.id,
+                                sessionId: update.sessionId.slice(),
+                                sender: update.sender.slice(),
+                                bytes: update.bytes.slice(),
+                                ...(update.owner?.owner === "service"
+                                    ? { service: update.owner.serviceId }
+                                    : {}),
+                            });
+                            if (update.owner?.owner === "service") {
+                                const service = this.#services.get(update.owner.serviceId);
+                                if (service === undefined) {
+                                    consumedKeys.add(update.key);
+                                    continue;
+                                }
+                                await service.onUpdate(ctx, publicUpdate);
+                            }
+                            globalUpdates.push(publicUpdate);
+                            consumedKeys.add(update.key);
                         }
-                        globalUpdates.push(publicUpdate);
-                        consumedKeys.add(update.key);
+                        if (blocked && consumedKeys.size === 0) break;
+                        if (globalUpdates.length > 0) {
+                            await lifecycle.onUpdates?.(ctx, Object.freeze(globalUpdates));
+                        }
+                        await this.#exclusive(ctx, () =>
+                            this.#engine.commitUpdates(
+                                ctx,
+                                prepared,
+                                [],
+                                consumedKeys,
+                                new Set(),
+                                new Set(),
+                            ),
+                        );
+                        delivered += consumedKeys.size;
+                        continue;
                     }
+
+                    const consumedDeletionKeys = new Set<string>();
                     for (const deletion of prepared.deletions) {
                         const service = this.#services.get(deletion.service);
-                        if (service !== undefined) {
-                            await service.onSessionDeleted?.(
-                                ctx,
-                                Object.freeze({
-                                    id: deletion.id,
-                                    sessionId: deletion.sessionId.slice(),
-                                    owner: deletion.owner.slice(),
-                                    service: deletion.service,
-                                }),
-                            );
-                        }
+                        await service?.onSessionDeleted?.(
+                            ctx,
+                            Object.freeze({
+                                id: deletion.id,
+                                sessionId: deletion.sessionId.slice(),
+                                owner: deletion.owner.slice(),
+                                service: deletion.service,
+                            }),
+                        );
                         consumedDeletionKeys.add(deletion.key);
                     }
-                    accountEvents = await prepareAccountEvents(ctx, this.#store);
-                    if (
-                        decisions.length === 0 &&
-                        consumedKeys.size === 0 &&
-                        consumedDeletionKeys.size === 0 &&
-                        accountEvents.keys.length === 0
-                    ) {
-                        break;
+                    if (lifecycle.onDeviceDormant !== undefined) {
+                        const dormant = await this.dormantDevices(ctx);
+                        if (dormant.length > 0) await lifecycle.onDeviceDormant(ctx, dormant);
                     }
-                    if (globalUpdates.length > 0) {
-                        await lifecycle.onUpdates?.(ctx, Object.freeze(globalUpdates));
-                    }
+                    const accountEvents: PreparedAccountEvents = await prepareAccountEvents(
+                        ctx,
+                        this.#store,
+                    );
                     if (accountEvents.added.length > 0) {
                         await lifecycle.onDeviceAdded?.(ctx, accountEvents.added);
                     }
                     if (accountEvents.revoked.length > 0) {
                         await lifecycle.onDeviceRevoked?.(ctx, accountEvents.revoked);
                     }
-                    const committedAccountEvents = accountEvents;
+                    if (consumedDeletionKeys.size === 0 && accountEvents.keys.length === 0) {
+                        if (!prepared.exhausted) continue;
+                        break;
+                    }
                     await this.#exclusive(ctx, () =>
                         this.#engine.commitUpdates(
                             ctx,
                             prepared,
-                            decisions,
-                            consumedKeys,
+                            [],
+                            new Set(),
                             consumedDeletionKeys,
+                            new Set(),
                             async (transaction) => {
                                 await deletePreparedAccountEvents(
                                     transaction,
                                     this.#store,
-                                    committedAccountEvents,
+                                    accountEvents,
                                 );
                             },
                         ),
                     );
-                    delivered += consumedKeys.size + consumedDeletionKeys.size;
-                    if (deferredRoutes || deferredUpdates) break;
+                    delivered += consumedDeletionKeys.size;
                 } finally {
-                    for (const decision of decisions) zeroBytes(decision.sessionId);
                     this.#zeroPreparedUpdates(prepared);
                 }
             }
+            await this.#deliverIssues(ctx, lifecycle.onIssues);
             return delivered;
         } finally {
             this.#pendingOperations -= 1;
             this.#updatesActive = false;
+        }
+    }
+
+    async #deliverIssues(ctx: Context, onIssues: MurmurSyncOptions["onIssues"]): Promise<void> {
+        if (onIssues === undefined || this.#reportedIssueVersion === this.#engine.issueVersion) {
+            return;
+        }
+        const issues = await this.#exclusive(ctx, () => this.#engine.issues(ctx));
+        const observedVersion = this.#engine.issueVersion;
+        const fingerprint = JSON.stringify(
+            issues.map((issue) => ({
+                id: issue.id,
+                code: issue.code,
+                sessionId: issue.sessionId === undefined ? null : encodeBase64Url(issue.sessionId),
+                kind: issue.kind ?? null,
+                operationId: issue.operationId ?? null,
+            })),
+        );
+        try {
+            if (issues.length > 0 && fingerprint !== this.#reportedIssueFingerprint) {
+                await onIssues(
+                    ctx,
+                    Object.freeze(
+                        issues.map((issue) =>
+                            Object.freeze({
+                                ...issue,
+                                ...(issue.sessionId === undefined
+                                    ? {}
+                                    : { sessionId: issue.sessionId.slice() }),
+                            }),
+                        ),
+                    ),
+                );
+            }
+            this.#reportedIssueVersion = observedVersion;
+            this.#reportedIssueFingerprint = fingerprint;
+            if (this.#engine.issueVersion !== observedVersion) this.#signalSync();
+        } finally {
+            for (const issue of issues) {
+                if (issue.sessionId !== undefined) zeroBytes(issue.sessionId);
+            }
         }
     }
 
@@ -1936,6 +2074,13 @@ export class MurmurClient {
         for (const deletion of prepared.deletions) {
             zeroBytes(deletion.sessionId);
             zeroBytes(deletion.owner);
+        }
+        for (const change of prepared.sessionChanges) {
+            zeroBytes(change.sessionId);
+            zeroBytes(change.descriptor);
+            zeroBytes(change.owner);
+            for (const admin of change.admins) zeroBytes(admin);
+            for (const member of change.members) zeroBytes(member);
         }
     }
 

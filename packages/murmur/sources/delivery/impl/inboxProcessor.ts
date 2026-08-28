@@ -108,6 +108,13 @@ export class InboxStateRollbackError extends Error {
     }
 }
 
+class DeferredInboxDeliveryError extends Error {
+    constructor() {
+        super("Inbox delivery deferred");
+        this.name = "DeferredInboxDeliveryError";
+    }
+}
+
 /** Certain evidence that the relay inbox can no longer be processed gaplessly. */
 export class InboxContinuityLossError extends Error {
     readonly reason: "generation_changed" | "sequence_gap" | "state_missing";
@@ -474,6 +481,14 @@ export class InboxProcessor {
                         processingNow,
                         continuity.generation,
                     );
+                    if (outcome === "deferred") {
+                        return {
+                            processed: 0,
+                            rejected: 0,
+                            cursor,
+                            exhausted: false,
+                        } satisfies InboxSyncResult;
+                    }
                     cursor = queued.eventId;
                     await this.#pruneReplay(ctx, processingNow);
                     await this.#acknowledge(ctx, cursor, options.signal);
@@ -485,6 +500,7 @@ export class InboxProcessor {
                     } satisfies InboxSyncResult;
                 });
                 yield result;
+                if (result.processed === 0 && result.rejected === 0) return;
             }
         } finally {
             this.#streamActive = false;
@@ -686,6 +702,7 @@ export class InboxProcessor {
         }
 
         previous = cursor;
+        let deferred = false;
         for (const delivery of deliveries) {
             const outcome = await this.#process(
                 ctx,
@@ -694,6 +711,10 @@ export class InboxProcessor {
                 relayEventTime(delivery.eventId),
                 generation,
             );
+            if (outcome === "deferred") {
+                deferred = true;
+                break;
+            }
             processed += outcome === "processed" ? 1 : 0;
             rejected += outcome === "rejected" ? 1 : 0;
             previous = delivery.eventId;
@@ -703,7 +724,12 @@ export class InboxProcessor {
             await this.#pruneReplay(ctx, relayEventTime(cursor));
             await this.#acknowledge(ctx, cursor, options.signal);
         }
-        return { processed, rejected, cursor, exhausted: page.exhausted };
+        return {
+            processed,
+            rejected,
+            cursor,
+            exhausted: page.exhausted && !deferred,
+        };
     }
 
     async #process(
@@ -712,83 +738,94 @@ export class InboxProcessor {
         expectedCursor: string | null,
         processingNow: number,
         generation: Uint8Array,
-    ): Promise<"processed" | "rejected"> {
-        return this.#dependencies.store.tx(ctx, async (tx) => {
-            const actualCursor = parseCursor(await this.#dependencies.store.get(tx, CURSOR_KEY));
-            if (actualCursor !== expectedCursor) {
-                throw new Error("Inbox cursor changed during synchronization");
-            }
-            const actualContinuity = parseContinuity(
-                await this.#dependencies.store.get(tx, CONTINUITY_KEY),
-            );
-            if (
-                actualContinuity === undefined ||
-                !equalBytes(actualContinuity.generation, generation) ||
-                queued.sequence === undefined ||
-                queued.sequence !== actualContinuity.sequence + 1
-            ) {
-                throw new Error("Inbox continuity changed during synchronization");
-            }
-            let rejection: string | undefined;
-            const digest = this.#replayDigest(queued);
-            if (queued.delivery.expiresAt <= processingNow) {
-                rejection = "expired_delivery";
-            } else if (await this.#terminalContains(tx, digest, processingNow)) {
-                rejection = "probable_terminal_replay";
-            } else if (!verifySignedDelivery(queued.delivery)) {
-                rejection = "invalid_delivery";
-                if (queued.delivery.expiresAt > processingNow) {
-                    await this.#addTerminal(tx, digest, processingNow);
+    ): Promise<"processed" | "rejected" | "deferred"> {
+        try {
+            return await this.#dependencies.store.tx(ctx, async (tx) => {
+                const actualCursor = parseCursor(
+                    await this.#dependencies.store.get(tx, CURSOR_KEY),
+                );
+                if (actualCursor !== expectedCursor) {
+                    throw new Error("Inbox cursor changed during synchronization");
                 }
-            } else if (
-                queued.delivery.sessionControl === null &&
-                !containsRecipient(queued.delivery, this.#dependencies.identity.publicKey)
-            ) {
-                rejection = "invalid_recipient";
-                if (queued.delivery.expiresAt > processingNow) {
-                    await this.#addTerminal(tx, digest, processingNow);
+                const actualContinuity = parseContinuity(
+                    await this.#dependencies.store.get(tx, CONTINUITY_KEY),
+                );
+                if (
+                    actualContinuity === undefined ||
+                    !equalBytes(actualContinuity.generation, generation) ||
+                    queued.sequence === undefined ||
+                    queued.sequence !== actualContinuity.sequence + 1
+                ) {
+                    throw new Error("Inbox continuity changed during synchronization");
                 }
-            } else if (
-                queued.delivery.expiresAt - processingNow >
-                MAXIMUM_DELIVERY_TTL_MILLISECONDS
-            ) {
-                rejection = "delivery_ttl_too_long";
-            } else if (
-                queued.delivery.createdAt >
-                processingNow + this.#maximumFutureSkewMilliseconds
-            ) {
-                rejection = "future_delivery";
-            } else {
-                const replay = await this.#registerReplay(tx, queued, processingNow);
-                if (replay !== "new") {
-                    rejection = replay;
+                let rejection: string | undefined;
+                const digest = this.#replayDigest(queued);
+                if (queued.delivery.expiresAt <= processingNow) {
+                    rejection = "expired_delivery";
+                } else if (await this.#terminalContains(tx, digest, processingNow)) {
+                    rejection = "probable_terminal_replay";
+                } else if (!verifySignedDelivery(queued.delivery)) {
+                    rejection = "invalid_delivery";
+                    if (queued.delivery.expiresAt > processingNow) {
+                        await this.#addTerminal(tx, digest, processingNow);
+                    }
+                } else if (
+                    queued.delivery.sessionControl === null &&
+                    !containsRecipient(queued.delivery, this.#dependencies.identity.publicKey)
+                ) {
+                    rejection = "invalid_recipient";
+                    if (queued.delivery.expiresAt > processingNow) {
+                        await this.#addTerminal(tx, digest, processingNow);
+                    }
+                } else if (
+                    queued.delivery.expiresAt - processingNow >
+                    MAXIMUM_DELIVERY_TTL_MILLISECONDS
+                ) {
+                    rejection = "delivery_ttl_too_long";
+                } else if (
+                    queued.delivery.createdAt >
+                    processingNow + this.#maximumFutureSkewMilliseconds
+                ) {
+                    rejection = "future_delivery";
                 } else {
-                    const staged = new StagedMurmurStore(
-                        this.#dependencies.store,
-                        tx,
-                        this.#allowMurmurMutations,
-                    );
-                    try {
-                        await this.#handler(tx, staged, queued);
-                        await staged.commit(tx);
-                    } catch (error: unknown) {
-                        staged.discard();
-                        if (!(error instanceof TerminalInboxDeliveryError)) throw error;
-                        rejection = error.code;
+                    const replay = await this.#registerReplay(tx, queued, processingNow);
+                    if (replay !== "new") {
+                        rejection = replay;
+                    } else {
+                        const staged = new StagedMurmurStore(
+                            this.#dependencies.store,
+                            tx,
+                            this.#allowMurmurMutations,
+                        );
+                        try {
+                            const outcome = await this.#handler(tx, staged, queued);
+                            if (outcome === "deferred") {
+                                staged.discard();
+                                throw new DeferredInboxDeliveryError();
+                            }
+                            await staged.commit(tx);
+                        } catch (error: unknown) {
+                            staged.discard();
+                            if (!(error instanceof TerminalInboxDeliveryError)) throw error;
+                            rejection = error.code;
+                        }
                     }
                 }
-            }
-            if (rejection !== undefined) {
-                await this.#storeRejection(tx, queued.eventId, rejection);
-            }
-            await this.#dependencies.store.set(tx, CURSOR_KEY, cursorBytes(queued.eventId));
-            await this.#dependencies.store.set(
-                tx,
-                CONTINUITY_KEY,
-                continuityBytes({ generation, sequence: queued.sequence }),
-            );
-            return rejection === undefined ? "processed" : "rejected";
-        });
+                if (rejection !== undefined) {
+                    await this.#storeRejection(tx, queued.eventId, rejection);
+                }
+                await this.#dependencies.store.set(tx, CURSOR_KEY, cursorBytes(queued.eventId));
+                await this.#dependencies.store.set(
+                    tx,
+                    CONTINUITY_KEY,
+                    continuityBytes({ generation, sequence: queued.sequence }),
+                );
+                return rejection === undefined ? "processed" : "rejected";
+            });
+        } catch (error: unknown) {
+            if (error instanceof DeferredInboxDeliveryError) return "deferred";
+            throw error;
+        }
     }
 
     #continuityLoss(

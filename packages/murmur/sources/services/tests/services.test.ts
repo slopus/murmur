@@ -14,11 +14,23 @@ const service: MurmurService = {
 describe("Murmur services", () => {
     it("strictly validates stable registrations", () => {
         expect(() => validateServiceId("chat.v1")).not.toThrow();
+        expect(() => validateServiceId("crdt.loro")).not.toThrow();
         expect(() =>
             validateMurmurServiceRegistration({ id: "messaging.v1", service }),
         ).not.toThrow();
 
-        for (const id of ["", "Chat", "chat/v1", "chat..v1", ".chat", "chat_", "a".repeat(65)]) {
+        for (const id of [
+            "",
+            "Chat",
+            "/chat",
+            "chat/",
+            "chat/v1",
+            "chat//v1",
+            "chat..v1",
+            ".chat",
+            "chat_",
+            "a".repeat(65),
+        ]) {
             expect(() => validateServiceId(id)).toThrow("Invalid Murmur service ID");
         }
         expect(() =>

@@ -340,13 +340,15 @@ export interface CreateInboxReadOptions {
 
 /**
  * Durable handler invoked inside the cursor transaction by low-level
- * `InboxProcessor` integrations. Ordinary applications use sync callbacks.
+ * `InboxProcessor` integrations. Returning `"deferred"` rolls back the complete
+ * delivery transaction without cursor, continuity, replay, rejection, or
+ * acknowledgement advancement. Ordinary applications use sync callbacks.
  */
 export type InboxDeliveryHandler = (
     ctx: Context,
     store: MurmurStore,
     delivery: InboxDelivery,
-) => Promise<void>;
+) => Promise<void | "deferred">;
 
 /** Construction policy for advanced applications using `InboxProcessor` directly. */
 export interface InboxProcessorOptions {

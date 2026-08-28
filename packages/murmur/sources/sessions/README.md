@@ -17,6 +17,10 @@ resolves.
 
 The implementation persists session records, active and staged epochs, intents,
 outboxes, replay markers, routing decisions, and queue progress atomically.
+For service-owned sessions it also persists complete confirmed lifecycle
+snapshots with the bootstrap or Commit that produced them. The identity-wide
+callback settles those records only after it resolves, and a removed local
+account receives its final snapshot before the session is destroyed.
 
 Creation selects an `everyone` or `admins` send policy. Policy changes are
 owner-only and Commit-bound; local sends and exact-epoch remote senders are

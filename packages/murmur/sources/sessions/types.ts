@@ -101,6 +101,22 @@ export interface MurmurSessionDeletedEvent {
     readonly service: string;
 }
 
+/** Complete confirmed state of one service-owned session after a durable lifecycle change. */
+export interface MurmurSessionChangedEvent {
+    /** Stable bootstrap or Commit delivery ID reused when the callback retries. */
+    readonly id: string;
+    readonly service: string;
+    readonly sessionId: Uint8Array;
+    readonly status: "active" | "removed";
+    readonly descriptor: Uint8Array;
+    readonly members: readonly Uint8Array[];
+    readonly owner: Uint8Array;
+    readonly admins: readonly Uint8Array[];
+    readonly policies: MurmurSessionPolicies;
+    /** True when this local session was recreated by continuity-reset convergence. */
+    readonly reAdmission?: boolean;
+}
+
 /** Optional lifecycle configuration for the single identity-wide synchronization loop. */
 export interface MurmurSyncOptions {
     /** Stops the persistent loop when aborted. Without it, sync runs until a fatal error. */
@@ -123,6 +139,21 @@ export interface MurmurSyncOptions {
      * omitting the hook leaves updates pending.
      */
     readonly onUpdates?: (ctx: Context, updates: readonly MurmurUpdate[]) => void | Promise<void>;
+    /**
+     * Runs for complete confirmed snapshots of service-owned sessions.
+     *
+     * Murmur records each snapshot with the bootstrap or Commit that produced
+     * it. Throwing keeps the same event IDs pending across retries and restarts.
+     */
+    readonly onSessionsChanged?: (
+        ctx: Context,
+        events: readonly MurmurSessionChangedEvent[],
+    ) => void | Promise<void>;
+    /** Reports the bounded durable issue set when its public contents change. */
+    readonly onIssues?: (
+        ctx: Context,
+        issues: readonly MurmurSessionIssue[],
+    ) => void | Promise<void>;
     /** Runs when a device of this account is durably authorized. */
     readonly onDeviceAdded?: (
         ctx: Context,

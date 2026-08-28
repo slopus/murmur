@@ -153,6 +153,8 @@ await murmur.sync(ctx, {
     onConnected: (_ctx) => console.log("connected"),
     onDisconnected: (_ctx, error) => console.log("disconnected", error),
     onUpdates: async (_ctx, updates) => applyAtomically(updates),
+    onSessionsChanged: async (_ctx, sessions) => applySessionSnapshotsAtomically(sessions),
+    onIssues: async (_ctx, issues) => recordSessionIssues(issues),
     onDeviceAdded: async (_ctx, events) => recordAddedDevices(events),
     onDeviceRevoked: async (_ctx, events) => recordRevokedDevices(events),
     onDeviceDormant: async (_ctx, events) => reviewDormantDevices(events),
@@ -163,6 +165,40 @@ await murmur.sync(ctx, {
 Murmur drains an application-update batch only after `onUpdates` resolves.
 Throwing leaves the same durable batch available for retry. Stable relay event
 IDs support application-level idempotency.
+
+`onSessionsChanged` receives complete confirmed snapshots of service-owned
+sessions after activation and every adopted membership, device, role, or policy
+Commit. Each snapshot includes the stable relay event ID, registered service ID,
+status, descriptor, members, owner, admins, and policies. A device removed from a
+session receives one final `removed` snapshot before Murmur destroys that local
+session. Throwing retries the same event across restarts. Omitting the optional
+hook drains these snapshots without retaining unused lifecycle history.
+
+Murmur durably indexes every route decision, application update, and confirmed
+service lifecycle snapshot by its authenticated relay event ID. The identity-wide
+queue is drained strictly from its global head: one route decision, one lifecycle
+snapshot, or one contiguous application-update segment at a time. A failed
+callback or unresolved route blocks every later relay-derived effect, including
+effects for other sessions. Pending updates and every pending-session snapshot
+are indexed immediately; after a route claim commits, the bootstrap-time
+snapshot is delivered before later pending updates and Commit snapshots.
+
+Snapshots never coalesce. Active records reuse the ordinary session descriptor
+instead of copying it into every Commit record, and each callback retry receives
+the same immutable relay ID and content. The identity-wide effect queue has a
+hard 1,000-record limit. An effect-producing inbox delivery that would exceed it
+is transactionally deferred without advancing replay, cursor, continuity, or
+acknowledgement state; synchronization drains durable effects and retries that
+exact relay event. Corruption recovery removes and reports only malformed effect
+records or indexes without reordering healthy effects. When a Commit removes the
+local account, earlier updates and lifecycle snapshots retain the descriptor and
+service owner, drain before the final `removed` snapshot, and only then release
+their retained delivery state. Local owner deletion remains terminal and purges
+that session's pending callbacks.
+`onIssues` exposes Murmur's existing bounded durable issue set when it changes;
+malformed issue records are dropped rather than wedging synchronization.
+Applications use stable operation IDs on valid issues for idempotent
+terminal-failure handling.
 
 ## Sessions
 
@@ -176,6 +212,10 @@ The application owns opaque descriptors and update bytes. Murmur exposes:
 - terminal `deleteAccount`;
 - `grantAdmin`, `revokeAdmin`, and `setPolicies`;
 - optional typed services registered under stable IDs.
+
+Service IDs are lowercase identifiers of up to 64 characters. Dots and hyphens
+may separate non-empty alphanumeric segments, for example `notes.v1` or
+`crdt.loro`.
 
 The immutable session owner is always an admin. Policy controls whether admins
 may assign admins, whether every member may add another member, and whether

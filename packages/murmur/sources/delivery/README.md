@@ -7,6 +7,10 @@ polling, SSE, and negotiated WebSocket transports.
 `InboxProcessor` commits protocol effects, replay markers, rejection records,
 and queue cursor progress in one store transaction before acknowledgement.
 Terminal malformed items are isolated so later queue work can continue.
+An advanced inbox handler may instead return `"deferred"`; the complete
+transaction rolls back, a paged read stops with `exhausted: false`, and a stream
+returns control so durable application effects can drain before reconnecting and
+retrying the same event.
 
 Applications may use `HttpDeliveryTransport`, `WebSocketDeliveryTransport`, or
 provide the exact `DeliveryTransport` seam. Every page and stream record carries

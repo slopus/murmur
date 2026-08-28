@@ -5,8 +5,10 @@ import {
     decodeBase64Url,
     encodeBase64Url,
     utf8Decode,
+    zeroBytes,
     type JsonValue,
 } from "../../utils/index.js";
+import { validateServiceId } from "../../services/impl/serviceId.js";
 import { decodeSessionRoles, encodeSessionRoles, type SessionRoles } from "./sessionFrames.js";
 
 export interface SessionRecord {
@@ -101,7 +103,21 @@ export interface SessionDeletedEventRecord {
     readonly serviceId?: string;
 }
 
+/** Durable complete service-owned session snapshot retained until callback settlement. */
+export interface SessionChangedEventRecord {
+    readonly version: 1;
+    readonly id: string;
+    readonly serviceId?: string;
+    readonly sessionId: Uint8Array;
+    readonly status: "active" | "removed";
+    readonly descriptor?: Uint8Array;
+    readonly members: readonly Uint8Array[];
+    readonly roles: SessionRoles;
+    readonly reAdmission?: true;
+}
+
 const DELIVERY_ID = /^[A-Za-z0-9_-]{32}$/;
+const RELAY_EVENT_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function object(value: unknown, name: string): Record<string, unknown> {
     if (value === null || typeof value !== "object" || Array.isArray(value)) {
@@ -614,4 +630,102 @@ export function decodeSessionDeletedEvent(value: Uint8Array): SessionDeletedEven
         owner: bytes(input.owner, 32, "deleted session owner"),
         ...(input.serviceId === null ? {} : { serviceId: input.serviceId }),
     };
+}
+
+export function encodeSessionChangedEvent(record: SessionChangedEventRecord): Uint8Array {
+    return canonicalJsonBytes({
+        version: 1,
+        id: record.id,
+        serviceId: record.serviceId ?? null,
+        sessionId: encodeBase64Url(record.sessionId),
+        status: record.status,
+        descriptor: record.descriptor === undefined ? null : encodeBase64Url(record.descriptor),
+        members: record.members.map(encodeBase64Url),
+        roles: encodeBase64Url(encodeSessionRoles(record.roles)),
+        ...(record.reAdmission === true ? { reAdmission: true } : {}),
+    });
+}
+
+export function decodeSessionChangedEvent(value: Uint8Array): SessionChangedEventRecord {
+    const input = json(value, 2 * 1024 * 1024, "session changed event");
+    exact(
+        input,
+        [
+            "version",
+            "id",
+            "serviceId",
+            "sessionId",
+            "status",
+            "descriptor",
+            "members",
+            "roles",
+            ...(Object.hasOwn(input, "reAdmission") ? ["reAdmission"] : []),
+        ],
+        "session changed event",
+    );
+    if (
+        input.version !== 1 ||
+        typeof input.id !== "string" ||
+        !RELAY_EVENT_ID.test(input.id) ||
+        (input.serviceId !== null && typeof input.serviceId !== "string") ||
+        (input.status !== "active" && input.status !== "removed") ||
+        (input.descriptor !== null && typeof input.descriptor !== "string") ||
+        (input.status === "removed") !== (input.descriptor !== null) ||
+        !Array.isArray(input.members) ||
+        input.members.length < 1 ||
+        input.members.length > 256 ||
+        typeof input.roles !== "string" ||
+        (input.reAdmission !== undefined && input.reAdmission !== true)
+    ) {
+        throw new Error("Invalid session changed event");
+    }
+    let members: Uint8Array[] = [];
+    let roles: SessionRoles | undefined;
+    let roleBytes: Uint8Array | undefined;
+    let sessionId: Uint8Array | undefined;
+    let descriptor: Uint8Array | undefined;
+    try {
+        if (input.serviceId !== null) validateServiceId(input.serviceId);
+        for (const member of input.members) {
+            members.push(bytes(member, 32, "session changed member"));
+        }
+        sessionId = bytes(input.sessionId, 32, "changed session ID");
+        descriptor =
+            input.descriptor === null
+                ? undefined
+                : bytes(input.descriptor, 1024 * 1024, "changed session descriptor");
+        roleBytes = bytes(input.roles, 64 * 1024, "changed session roles");
+        roles = decodeSessionRoles(roleBytes);
+        zeroBytes(roleBytes);
+        roleBytes = undefined;
+        const encodedMembers = new Set(members.map(encodeBase64Url));
+        if (
+            encodedMembers.size !== members.length ||
+            !encodedMembers.has(encodeBase64Url(roles.owner)) ||
+            roles.admins.some((admin) => !encodedMembers.has(encodeBase64Url(admin)))
+        ) {
+            throw new Error("Invalid session changed event");
+        }
+        return {
+            version: 1,
+            id: input.id,
+            ...(input.serviceId === null ? {} : { serviceId: input.serviceId }),
+            sessionId,
+            status: input.status,
+            ...(descriptor === undefined ? {} : { descriptor }),
+            members,
+            roles,
+            ...(input.reAdmission === true ? { reAdmission: true } : {}),
+        };
+    } catch {
+        for (const member of members) zeroBytes(member);
+        if (roles !== undefined) {
+            zeroBytes(roles.owner);
+            for (const admin of roles.admins) zeroBytes(admin);
+        }
+        if (sessionId !== undefined) zeroBytes(sessionId);
+        if (descriptor !== undefined) zeroBytes(descriptor);
+        if (roleBytes !== undefined) zeroBytes(roleBytes);
+        throw new Error("Invalid session changed event");
+    }
 }

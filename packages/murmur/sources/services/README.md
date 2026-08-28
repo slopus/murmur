@@ -35,6 +35,38 @@ Deletion state is already terminal when `onSessionDeleted` runs. Throwing
 retains the same durable event ID and retries the callback without restoring or
 reprocessing the deleted session.
 
+The identity-wide synchronization options also expose `onSessionsChanged`.
+It receives complete confirmed snapshots for every claimed-session activation
+and adopted membership, device, role, or policy Commit, including one final
+`removed` snapshot when the local account leaves. The callback is global rather
+than a fourth service handler so one application transaction can settle all
+session metadata alongside its other identity-wide synchronization effects.
+Throwing retains the same stable relay event IDs across retries and restarts.
+When the optional hook is absent, Murmur drains the snapshots instead of
+retaining unused lifecycle history.
+
+Every pending route, application update, and service lifecycle snapshot is
+durably indexed by its authenticated relay event ID. Murmur drains only the
+global head: it commits one route before re-preparing, settles one lifecycle
+snapshot before re-preparing, or settles one contiguous update segment ending at
+the next route or lifecycle boundary. An unresolved route or failed callback
+therefore blocks all later relay-derived effects across every session.
+
+Lifecycle snapshots never coalesce. A delayed service claim preserves and then
+delivers the bootstrap-time snapshot, every pending update, and every pending
+Commit snapshot in relay order. The shared effect queue is hard-bounded at 1,000
+records; an inbox event that would add effects beyond that limit is deferred with
+its complete inbox transaction rolled back, then retried after the queue drains.
+Terminal destruction purges stale snapshots, while corruption recovery drops and
+reports only malformed records or indexes. A local-account removal preserves
+earlier updates and snapshots ahead of its final `removed` snapshot. The
+identity-wide `onIssues` hook exposes Murmur's existing bounded durable issues
+when that set changes, for terminal operation handling without adding another
+service method; malformed issue records are dropped.
+
+Stable service IDs may use dots and hyphens between lowercase alphanumeric
+segments; `crdt.loro` is valid.
+
 Murmur persists only the session-to-service owner mapping. Custom services own
 any application state through persistence they choose; Murmur does not provide
 service storage or expose `MurmurStore` to them.
