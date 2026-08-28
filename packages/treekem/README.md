@@ -4,6 +4,18 @@ Small, stateless TreeKEM group key agreement for browsers and Node.js. Every
 member sees the same group view. The package keeps no hidden state:
 each operation consumes opaque private state and returns its replacement.
 
+## Requirements
+
+- Provide a simple NaCl-style API that abstracts away TreeKEM, group encryption,
+  and membership mechanics.
+- Assume an honest-but-untrusted public server, or another external coordinator,
+  facilitates epochs by authenticating, serializing, persisting, and delivering
+  public group transitions.
+- Expose the member list to that public facilitator so it can enforce complete
+  delivery, reject stale or unauthorized group changes, and require a fresh
+  re-key before accepting further activity. The facilitator cannot perform the
+  re-key itself and never receives group secrets.
+
 ```ts
 import * as treekem from "@slopus/treekem";
 
