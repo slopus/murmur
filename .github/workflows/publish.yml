@@ -79,7 +79,10 @@ jobs:
                   done
                   mkdir -p "$PACKAGE_SMOKE_DIRECTORY"
                   printf '{"private":true,"type":"module"}\n' > "$PACKAGE_SMOKE_DIRECTORY/package.json"
-                  pnpm --dir "$PACKAGE_SMOKE_DIRECTORY" add "$GITHUB_WORKSPACE"/.context/release/slopus-murmur-*.tgz
+                  stdlib_version="$(node -p "require('./packages/murmur/package.json').dependencies['@steve.kite/stdlib']")"
+                  pnpm --dir "$PACKAGE_SMOKE_DIRECTORY" add \
+                      "$GITHUB_WORKSPACE"/.context/release/slopus-murmur-*.tgz \
+                      "@steve.kite/stdlib@$stdlib_version"
                   MURMUR_PACKAGE_DIRECTORY="$PACKAGE_SMOKE_DIRECTORY" \
                       pnpm --filter @slopus/murmur exec vitest run tests/packageCompatibility.test.ts
 
